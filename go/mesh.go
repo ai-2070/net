@@ -38,6 +38,15 @@ var (
 	ErrMeshTransport = errors.New("mesh transport error")
 	ErrChannel       = errors.New("channel error")
 	ErrChannelAuth   = errors.New("channel: unauthorized")
+	// A stream handle names a session incarnation the peer no longer
+	// has (NET_ERR_MESH_SESSION_SUPERSEDED, -117). Distinct from
+	// ErrNotConnected: the peer IS connected and the stream id may
+	// well be open on its successor session, which this handle does
+	// not own. Terminal for the handle — re-open; retrying the same
+	// handle can never succeed, which is why `SendWithRetry` and
+	// `SendBlocking` propagate it immediately instead of absorbing
+	// it like ErrBackpressure.
+	ErrSessionSuperseded = errors.New("stream session superseded")
 
 	// NAT traversal errors. One sentinel per `TraversalError`
 	// variant so callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
@@ -78,6 +87,8 @@ func meshErrorFromCode(code C.int) error {
 		return ErrChannel
 	case -116:
 		return ErrChannelAuth
+	case -117:
+		return ErrSessionSuperseded
 	case -130:
 		return ErrTraversalReflexTimeout
 	case -131:
@@ -821,7 +832,9 @@ func (s *MeshStream) free() {
 }
 
 // Close closes the underlying core stream and releases the handle.
-// Idempotent.
+// Idempotent, and it **discards the close status** — its signature is
+// unchanged so existing `defer stream.Close()` callers keep working.
+// Use [MeshStream.CloseErr] when the refusal matters.
 //
 // This used to call only `net_mesh_stream_free`, which drops the FFI
 // handle and its Arc without touching core stream state. The state
@@ -831,14 +844,29 @@ func (s *MeshStream) free() {
 // first open's config stayed in force. `net_mesh_close_stream` does
 // both halves.
 func (s *MeshStream) Close() {
+	_ = s.CloseErr()
+}
+
+// CloseErr is [MeshStream.Close] with the core close status reported.
+//
+// The C close is handle-addressed and therefore lifetime-fenced: it
+// refuses with [ErrSessionSuperseded] when this handle's session has
+// been displaced, and with [ErrNotConnected] when a close+reopen on
+// that same session replaced the stream lifetime. Either way the Go
+// handle is still released and the finalizer cleared — it is inert
+// regardless, and leaking it would be worse — so the error is
+// information about whose state was NOT torn down, not a signal to
+// retry. A second call is a no-op returning nil.
+func (s *MeshStream) CloseErr() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.handle == nil {
-		return
+		return nil
 	}
-	C.net_mesh_close_stream(s.handle)
+	code := C.net_mesh_close_stream(s.handle)
 	s.handle = nil
 	runtime.SetFinalizer(s, nil)
+	return meshErrorFromCode(code)
 }
 
 // payloadPtrs builds the parallel (pointers, lengths) arrays the C
