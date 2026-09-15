@@ -3931,6 +3931,19 @@ impl MeshNode {
                                 // binds to the authenticated session peer.
                                 // `frame` is the preflight's stripped frame
                                 // (E1.6 / §8) — never the raw `inbound`.
+                                //
+                                // The hand-off itself is where Net's
+                                // ordering contract is observable: this
+                                // task drains one receiver and disposes of
+                                // each frame before the next, so the
+                                // sequence a witness sees here is the order
+                                // the stream delivered. Fired inline, so an
+                                // observation cannot reorder relative to
+                                // the dispatch it is observing.
+                                #[cfg(any(test, feature = "fixtures"))]
+                                if let Some(observe) = mesh_for_bridge.rpc_dispatch_observer() {
+                                    observe(&service_for_bridge, frame.from_node, &frame.payload);
+                                }
                                 if let Err(e) = fold.lock().apply_inbound(&frame) {
                                     tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                                 }

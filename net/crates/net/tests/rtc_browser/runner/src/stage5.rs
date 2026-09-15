@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilityRequirement};
 use net::adapter::net::cortex::{
-    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    EventMeta, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::{MeshNode, Reliability, StreamConfig, StreamError, MAX_EVENT_SIZE};
 
@@ -1394,11 +1394,11 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok());
         let want_direct_id = u64::from_str_radix(&want_direct_hex, 16).ok();
-        let label_forwarded_inner =
-            forwarded.get("label").and_then(|v| v.as_str()) == Some("abi-direct")
-                && forwarded_id.is_some()
-                && forwarded_id == want_direct_id
-                && forwarded.get("reliability").and_then(|v| v.as_str()) == Some("reliable");
+        let label_forwarded_inner = forwarded.get("label").and_then(|v| v.as_str())
+            == Some("abi-direct")
+            && forwarded_id.is_some()
+            && forwarded_id == want_direct_id
+            && forwarded.get("reliability").and_then(|v| v.as_str()) == Some("reliable");
         let options_forwarded = options_parsed && label_forwarded_inner;
         let direct_is_direct = direct_open
             .stats
@@ -1665,6 +1665,45 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 StreamConfig::new().with_reliability(Reliability::Reliable),
             )
             .map_err(|e| e.to_string());
+        // WHERE THIS WITNESS MEASURES ORDER, AND WHY IT MOVED.
+        //
+        // Net's ordering contract is on DELIVERY: one reliable
+        // stream is released in sequence order, and the nRPC serve
+        // bridge drains its inbound receiver from a single task and
+        // disposes of each frame before it looks at the next. So the
+        // sequence the bridge hands to the fold IS the order that
+        // stream delivered, and this observation records exactly
+        // that hand-off, inline, in the bridge's own task.
+        //
+        // It is NOT handler entry order, and it used to be. The fold
+        // spawns one task per call ON PURPOSE — a slow or parked
+        // handler must not hold its source's successors, which
+        // `server_fold_runs_one_sources_handlers_concurrently` and
+        // `a_long_first_poll_does_not_delay_its_sources_successors`
+        // both pin — so when each handler BODY starts belongs to the
+        // scheduler and nothing else. An earlier round chained
+        // handler entry per source and added this leg against that
+        // chain; the chain was removed (it raced neither
+        // cancellation nor the deadline, and its queue was
+        // unbounded), and measuring a withdrawn mechanism would
+        // quietly re-impose it. Measured at a handler, 40 requests
+        // delivered in order enter as e.g. 1, 0, 2, 4, 3, 14, 21, 6
+        // — the scheduler, not the transport.
+        //
+        // Everything else this leg asserted is unchanged and still
+        // asserted below: all 40 bodies arrive, byte-exact, exactly
+        // once, settled inside the window.
+        let handoff: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&handoff);
+            cx.anchor.set_rpc_dispatch_observer_for_test(Arc::new(
+                move |_service, _from, frame| {
+                    if let Some(meta) = EventMeta::from_bytes(frame) {
+                        sink.lock().expect("handoff log").push(meta.seq_or_ts);
+                    }
+                },
+            ));
+        }
         let recover_open = script
             .run(
                 "a",
@@ -1712,20 +1751,26 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let all_arrived = recover_bodies
             .iter()
             .all(|body| recover_seen.contains(body));
-        // A RELIABLE stream delivers in sequence order, so the
-        // handler's arrival order must be the send order even though
-        // the wire order was deliberately scrambled. Duplicates are
-        // tolerated in the ORDER check only to the extent that the
-        // first occurrence of each body is monotonic; an out-of-order
-        // first delivery fails it.
-        let mut first_seen: Vec<usize> = Vec::with_capacity(recover_bodies.len());
-        for body in &recover_bodies {
-            if let Some(at) = recover_seen.iter().position(|s| s == body) {
-                first_seen.push(at);
-            }
-        }
-        let in_order =
-            first_seen.len() == recover_bodies.len() && first_seen.windows(2).all(|w| w[0] < w[1]);
+        // DELIVERY order, at the hand-off the observation above
+        // records: the call ids the bridge gave the fold, for this
+        // burst only (its ids are `0x5B00 + i`; the fire-and-forget
+        // witness above used `0x5000 + i` on the same service). Each
+        // has to appear, once, strictly ascending — the wire order
+        // was scrambled and eight datagrams were elided, so this is
+        // the statement that the receiver put the stream back into
+        // sequence order and the retransmit filled the holes before
+        // anything was handed up.
+        let handed: Vec<u64> = handoff
+            .lock()
+            .expect("handoff log")
+            .iter()
+            .copied()
+            .filter(|id| (0x5B00..0x5B00 + ABI_RELIABLE_EVENTS as u64).contains(id))
+            .collect();
+        let want: Vec<u64> = (0..ABI_RELIABLE_EVENTS as u64)
+            .map(|i| 0x5B00 + i)
+            .collect();
+        let delivered_in_order = handed == want;
         let exactly_once = recover_bodies
             .iter()
             .all(|body| recover_seen.iter().filter(|s| *s == body).count() == 1);
@@ -1755,7 +1800,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 && reordered > 0
                 && recovered
                 && all_arrived
-                && in_order
+                && delivered_in_order
                 && exactly_once,
             format!(
                 "DELIBERATE RELIABLE LOSS **AND** REORDER, recovered. \
@@ -1771,10 +1816,17 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  nothing was reordered proves nothing and FAILS here. The anchor's REAL \
                  handler then saw {} invocation(s) within 45 s (settled={recovered}); every \
                  one of the {ABI_RELIABLE_EVENTS} bodies arrived={all_arrived}, each \
-                 exactly once={exactly_once}, and their FIRST deliveries are strictly \
-                 increasing in send order={in_order} — so the receiver reassembled the \
-                 scrambled wire order back into sequence order and the sender's retransmit \
-                 replaced what was elided. The fire-and-forget witness above, on the same \
+                 exactly once={exactly_once}, and the nRPC serve bridge handed the fold \
+                 all {ABI_RELIABLE_EVENTS} call ids strictly ascending in send \
+                 order={delivered_in_order} ({} handed over) — so the receiver reassembled \
+                 the scrambled wire order back into sequence order and the sender's \
+                 retransmit replaced what was elided BEFORE anything reached the \
+                 application. That hand-off is where the ordering contract lives: per \
+                 stream DELIVERY order, one bridge task, each frame disposed of before the \
+                 next. Handler ENTRY order is deliberately NOT ordered — the fold spawns \
+                 one task per call so a slow handler cannot hold its source's successors — \
+                 so this leg measures the bridge, not the scheduler. \
+                 The fire-and-forget witness above, on the same \
                  path with only the drop hook, LOSES those events; that contrast is what \
                  makes this a reliability result rather than a link that happened to be \
                  clean. The ANCHOR had opened its side of the same stream \
@@ -1786,6 +1838,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 dropped > 0,
                 reordered > 0,
                 recover_seen.len(),
+                handed.len(),
                 peer_state(cx.anchor, node_id),
             ),
         );
