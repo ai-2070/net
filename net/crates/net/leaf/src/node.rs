@@ -340,6 +340,23 @@ pub struct LeafNode {
     /// only correct cadence; cleared for a peer when its session
     /// goes, because the anchor's roster entry goes with it.
     reply_subscriptions: std::collections::HashSet<(NodeId, u64)>,
+    /// `(peer, carrier stream id)` the **nRPC plane owns** on the
+    /// receive side.
+    ///
+    /// This is the plane-ownership registry the event-plane
+    /// classifier reads, and it is the *only* thing that can make
+    /// an inbound event-plane frame an nRPC reply — see
+    /// [`LeafNode::handle_event_plane`]. One entry per reply channel
+    /// this leaf's nRPC client subscribed to in order to be answered
+    /// (`<service>.replies.<own origin>`), held as the stream id a
+    /// publisher of that channel derives, which is exactly the
+    /// carrier a pending call's `CallOwner` demands. Written only by
+    /// [`LeafNode::ensure_reply_subscription`] — application
+    /// `subscribe` / `publish` / `open_stream` never reach it — and
+    /// cleared with `reply_subscriptions` when the session goes,
+    /// because a carrier whose subscription the anchor forgot is not
+    /// one the RPC plane still owns.
+    rpc_reply_carriers: std::collections::HashSet<(NodeId, u64)>,
     /// `(incarnation, stream id)` whose **send** half this leaf gave
     /// up on, and will not send on again.
     ///
@@ -418,6 +435,7 @@ impl LeafNode {
             peer_rtc_addr: HashMap::new(),
             next_nonce: 1,
             reply_subscriptions: std::collections::HashSet::new(),
+            rpc_reply_carriers: std::collections::HashSet::new(),
             send_failed: std::collections::HashSet::new(),
             recv_failed: std::collections::HashSet::new(),
             rx_closed: std::collections::HashSet::new(),
@@ -560,6 +578,7 @@ impl LeafNode {
             // a reply channel subscribed on it is not subscribed on
             // this one.
             self.reply_subscriptions.retain(|(p, _)| *p != peer);
+            self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
             self.stream_kinds.retain(|(p, _), _| *p != peer);
         }
         self.events.push(LeafEvent::Connected {
@@ -598,6 +617,7 @@ impl LeafNode {
         // The anchor's roster entry died with the session, so a
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
+        self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
         self.events.push(LeafEvent::Disconnected {
             peer_node: peer,
             reason: reason.into(),
@@ -698,6 +718,21 @@ impl LeafNode {
                 // above tells the peer to reset its receive cursor
                 // for this id, and `next_tx_seq` does not rewind to
                 // match it.
+                //
+                // Terminal also means the reservation ends. The wire
+                // dropped this stream's descriptors when its retries
+                // ran out, so nothing of its can be rebuilt — but its
+                // header stamps were only released by a cumulative
+                // ack or by destroying the session, and a stream that
+                // ended this way will never be acked. The slots sat
+                // occupied by an owner that owned nothing, and the
+                // session's stamp budget is shared, so enough ended
+                // streams permanently refused fresh ones with
+                // `ReliableWindowFull` — exactly the recovery that
+                // error tells the caller to attempt. Retiring by the
+                // exact owner keeps the cap intact and evicts nothing
+                // live.
+                session.retire_stream_stamps(stream_id);
                 self.send_failed.insert((incarnation, stream_id));
                 self.counters.drop_for(DropReason::StreamFailed);
                 self.events.push(LeafEvent::StreamFailed {
@@ -1082,6 +1117,15 @@ impl LeafNode {
         // subscribe must not mark the channel as subscribed, or
         // every later call on it strands its reply silently.
         self.reply_subscriptions.insert(key);
+        // The same fact, in the form the receive path classifies
+        // on: from here the RPC plane OWNS this carrier, so a frame
+        // arriving on it is RPC-plane traffic and a frame arriving
+        // anywhere else is not. `key.1` is the reply channel's
+        // canonical hash, and `route_stream_id` is the derivation
+        // both its publisher and `call`'s
+        // `CallOwner::carrier_stream_id` use.
+        self.rpc_reply_carriers
+            .insert((peer, route_stream_id(key.1)));
         Ok(true)
     }
 
@@ -1328,6 +1372,7 @@ impl LeafNode {
             let owed = match session.note_received(
                 opened.stream_id,
                 opened.reliable,
+                opened.mode_boundary,
                 opened.sequence,
                 event_frame_bytes(&opened.events),
             ) {
@@ -1342,11 +1387,79 @@ impl LeafNode {
                 }
                 None => None,
             };
+            // **The ack says what arrived; the NACK says what is
+            // missing, and only one of them a sender can act on.**
+            // This arrival already mints a window frame carrying
+            // `ack_seq` — "everything below N is mine" — which is
+            // exactly the fact a sender holding descriptors for
+            // N..M cannot use: a frontier that has not moved is
+            // equally consistent with a lost packet and with
+            // packets still in flight. When the arrival REVEALED a
+            // hole, the receiver knows which sequence, and that is
+            // the moment to say so; deferring it to the periodic
+            // sweep costs a whole tick of recovery latency for
+            // nothing, and on a promoted stream it costs more than
+            // latency — the reliable region cannot be conceded, so
+            // until the retransmit arrives every later record is
+            // held.
+            //
+            // Bounded by the gap, not by the traffic: the flag is
+            // taken, so eight arrivals stacked behind one loss
+            // report that loss once, and only a new disjoint hole
+            // reports again.
+            let gap_nack = session
+                .opened_gap_nack(opened.stream_id)
+                .and_then(|nack| {
+                    session
+                        .build_packets(
+                            net_wire::session::CONTROL_STREAM_ID,
+                            SUBPROTOCOL_STREAM_NACK,
+                            0,
+                            self.identity.origin_hash(),
+                            false,
+                            &nack.encode(),
+                        )
+                        .ok()
+                })
+                .unwrap_or_default();
             match owed {
                 Some((frame, true)) => self.send_stream_window(peer, incarnation, frame),
                 Some((frame, false)) => self.maybe_grant(peer, incarnation, frame),
                 None => {}
             }
+            for packet in gap_nack {
+                self.counters.packet_out();
+                self.outbound.push_back(Outbound { peer, packet });
+            }
+        }
+
+        // **The consumer's mode is decided at ADMISSION of the
+        // packet, not at emission of a completed record.** A
+        // reliable message can span fragments, and its head's
+        // arrival is where its receive obligation begins: until the
+        // group completes there is no record to carry the mode, so
+        // a promotion deferred to completion left the consumer
+        // fire-and-forget while the group assembled. A small
+        // fire-and-forget message arriving between head and tail
+        // then skipped the cursor past the reliable head's
+        // sequence, and the assembled message — every fragment
+        // present, nothing lost anywhere — was refused as a
+        // duplicate of sequences the cursor had already walked
+        // over.
+        //
+        // So the packet promotes the stream, and the same call
+        // applies the sender's signalled boundary, which may
+        // concede a fire-and-forget prefix and release what was
+        // held behind it. Stream-control traffic is exempt for the
+        // same reason it is exempt from the credit loop and from
+        // reordering.
+        let mut delivered: Vec<StreamRecord> = Vec::new();
+        if opened.reliable && !crate::session::is_stream_control(subprotocol_id) {
+            let stream = self
+                .rx_streams
+                .entry((incarnation, opened.stream_id))
+                .or_insert_with(|| RxStream::new(Reliability::Reliable));
+            delivered.extend(stream.promote(opened.mode_boundary, &self.counters));
         }
 
         // Reassembly is per (incarnation, fragment group): a
@@ -1399,7 +1512,11 @@ impl LeafNode {
                 }),
             }
         }
-        if records.is_empty() {
+        // `delivered` may already hold what the promotion above
+        // released — a boundary that conceded a fire-and-forget
+        // prefix unblocks records held behind it whether or not
+        // this packet also completed one.
+        if records.is_empty() && delivered.is_empty() {
             self.dispose_abandoned_groups();
             return;
         }
@@ -1433,7 +1550,6 @@ impl LeafNode {
         // a reassembled group carries its first fragment's plane
         // and mode, so the packet that completes it cannot move it
         // to another plane or change how its stream treats a gap.
-        let mut delivered: Vec<StreamRecord> = Vec::new();
         for record in records {
             if crate::session::is_stream_control(record.subprotocol_id) {
                 delivered.push(record);
@@ -1490,10 +1606,10 @@ impl LeafNode {
         self.dispose_abandoned_groups();
     }
 
-    /// Turn every group the reassembler gave up on into its
-    /// stream's terminal disposition.
+    /// Disposition every group the reassembler gave up on — by its
+    /// own mode's contract.
     ///
-    /// **An acknowledged group is owned.** The receive path
+    /// **An acknowledged RELIABLE group is owned.** The receive path
     /// acknowledges a fragment's sequence before the group is
     /// complete — it has to, or the sender's window never opens —
     /// and that acknowledgement retires the sender's only copy.
@@ -1503,9 +1619,20 @@ impl LeafNode {
     /// leaves the consumer waiting forever on a stream that has
     /// stopped delivering with no event at all. So the stream ends
     /// here, named and typed, exactly as a reorder overflow does.
+    ///
+    /// **A fire-and-forget group is a permitted loss.** Its
+    /// sequences were never retransmittable, so no acknowledgement
+    /// took anything away, and an incomplete group is precisely the
+    /// outcome its mode's contract allows. Applying
+    /// complete-or-terminal to it made one expected fragment loss
+    /// permanently fatal to every later message on that stream id —
+    /// a policy strictly worse than the loss it was reacting to, and
+    /// one nobody asked for. It is counted where it is reaped
+    /// ([`DropReason::ReassemblyExpired`] and the other reassembly
+    /// reasons) and the stream carries on.
     fn dispose_abandoned_groups(&mut self) {
         let abandoned = self.reassembler.take_abandoned();
-        if abandoned.is_empty() {
+        if abandoned.iter().all(|group| !group.reliable) {
             return;
         }
         // A group's scope is its session's incarnation, which is
@@ -1516,6 +1643,9 @@ impl LeafNode {
             .filter_map(|peer| self.sessions.get(peer).map(|s| (s.incarnation(), peer)))
             .collect();
         for group in abandoned {
+            if !group.reliable {
+                continue;
+            }
             // The session that owned the scope is gone. Its whole
             // receive lifetime was retired with it and the
             // consumer was told about that, so there is no live
@@ -1758,47 +1888,61 @@ impl LeafNode {
     /// An event-plane frame: an nRPC reply for one of our calls, or
     /// an application message.
     ///
-    /// **Which of the two is decided by the CARRIER, never by the
-    /// leading bytes alone.** One event-plane subprotocol carries
-    /// both, and this used to tell them apart by trying to parse
-    /// the payload as a reply first. That is not a discrimination,
-    /// it is a guess against application-chosen bytes, and it lost
-    /// data: `DISPATCH_RPC_DEADLINE_EXCEEDED` is the single byte
-    /// `0x13` at offset 0 of a frame with **no body at all**, so
-    /// every application payload of 24 B or more whose first byte
-    /// happened to be `0x13` decoded as a complete deadline reply,
-    /// went to the call table, matched no call, and was counted
-    /// away — acknowledged on the wire and never delivered. The
-    /// browser matrix showed it as one payload in twelve missing
-    /// from a reliable stream with `unknown_call: 1` and every
-    /// other counter at zero, at the 12-in-256 rate a burst of
-    /// twelve consecutive first bytes predicts; a subscribed
-    /// channel was losing 1 message in 256 the same way, with the
-    /// same single counter to show for it.
+    /// **Which of the two is decided by PLANE OWNERSHIP, never by
+    /// the payload.** One event-plane subprotocol carries both, and
+    /// the two earlier attempts to tell them apart both read the
+    /// bytes:
     ///
-    /// The frame states which channel it belongs to, so the check
-    /// is **exact and costs nothing**: a reply rides
-    /// `route_stream_id` of the route it declares. Every reply the
-    /// call table can accept satisfies that by construction —
+    /// 1. *Parse it as a reply first.* That is not a discrimination,
+    ///    it is a guess against application-chosen bytes, and it
+    ///    lost data: `DISPATCH_RPC_DEADLINE_EXCEEDED` is the single
+    ///    byte `0x13` at offset 0 of a frame with **no body at
+    ///    all**, so every application payload of 24 B or more whose
+    ///    first byte happened to be `0x13` decoded as a complete
+    ///    deadline reply, went to the call table, matched no call,
+    ///    and was counted away — acknowledged on the wire and never
+    ///    delivered. The browser matrix showed it as one payload in
+    ///    twelve missing from a reliable stream with
+    ///    `unknown_call: 1` and every other counter at zero, at the
+    ///    12-in-256 rate a burst of twelve consecutive first bytes
+    ///    predicts; a subscribed channel was losing 1 message in
+    ///    256 the same way, with the same single counter to show
+    ///    for it.
+    /// 2. *Also require the frame to name its own carrier* — the
+    ///    route at offset 24..32 having `route_stream_id` equal to
+    ///    the arrival stream. Narrower, and still the payload
+    ///    deciding: bytes that are self-consistent are not an
+    ///    identity. Opaque application bytes that begin `0x13` and
+    ///    carry their own channel's canonical route — a forwarder
+    ///    relaying RPC-shaped records, a log frame, a fixture —
+    ///    satisfy it deterministically, with no hash collision and
+    ///    nothing forged, and were refused as `UnknownCall`.
+    ///
+    /// So the question is not *what do these bytes look like* but
+    /// **whose plane sent them**, and that is answered before the
+    /// payload is touched. The nRPC plane's receive-side identity is
+    /// the set of reply carriers it subscribed to for its own calls
+    /// ([`LeafNode::rpc_reply_carriers`], written only by
+    /// [`LeafNode::ensure_reply_subscription`]). A frame on one of
+    /// those carriers is RPC-plane traffic; a frame on anything else
+    /// is application bytes, delivered byte-exact whatever they look
+    /// like. Nothing deliverable is turned away, because
+    /// [`LeafNode::call`] registers the carrier **before** it
+    /// registers the call, and
     /// [`CallTable::deliver`](crate::rpc::CallTable::deliver)
-    /// requires the presented route AND the presented carrier to
-    /// equal the entry's, and the entry's carrier *is*
-    /// `route_stream_id` of the entry's route — so nothing
-    /// deliverable is turned away. Application bytes would have to
-    /// name their own carrier in eight exact bytes at offset 24 to
-    /// be mistaken for one.
+    /// accepts only a pending entry whose `carrier_stream_id` is
+    /// that same derivation — so every reply the call table can
+    /// accept arrives on a carrier this set holds.
+    ///
+    /// The route and carrier checks below are **kept**, unchanged,
+    /// for the frames that genuinely are RPC: plane ownership says
+    /// which plane a frame belongs to, those checks say which *call*
+    /// within it. This replaces the sniffing; it relaxes no fencing.
     fn handle_event_plane(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes) {
-        let reply = match rpc_wire::decode_reply_frame(payload.clone()) {
-            Ok(Some(frame)) => rpc_wire::decode_route(&payload)
-                .filter(|route| route_stream_id(*route) == record.stream_id)
-                .map(|route| (frame, route)),
-            // Well-formed but not the client half, or not an nRPC
-            // frame at all.
-            Ok(None) | Err(_) => None,
-        };
-        let Some((frame, reply_route)) = reply else {
-            // An application message, and which surface it belongs
-            // to is the stream's business.
+        if !self.rpc_reply_carriers.contains(&(peer, record.stream_id)) {
+            // No RPC plane owns this carrier, so these are
+            // application bytes — and which surface they belong to
+            // is the stream's business, not the payload's.
             match self.classify(peer, record.stream_id) {
                 StreamKind::Stream => self.events.push(LeafEvent::StreamData {
                     stream_id: record.stream_id,
@@ -1811,6 +1955,23 @@ impl LeafNode {
                     payload,
                 }),
             }
+            return;
+        }
+        let reply = match rpc_wire::decode_reply_frame(payload.clone()) {
+            Ok(Some(frame)) => rpc_wire::decode_route(&payload)
+                .filter(|route| route_stream_id(*route) == record.stream_id)
+                .map(|route| (frame, route)),
+            // Well-formed but not the client half, or not an nRPC
+            // frame at all.
+            Ok(None) | Err(_) => None,
+        };
+        let Some((frame, reply_route)) = reply else {
+            // A reply carrier is not an application surface: this
+            // leaf subscribed to it to be answered, and an answer is
+            // the only thing that rides it. A frame here that is not
+            // one is refused out loud rather than handed to a
+            // consumer as a channel message it cannot interpret.
+            self.drop_counted(DropReason::UnknownCall);
             return;
         };
         // What a reply must present to be *this* call's reply: the
@@ -3017,11 +3178,11 @@ mod tests {
     /// burst covers twelve consecutive first bytes, so 12 seeds in
     /// 256 lose exactly one payload — the rate the matrix showed.
     ///
-    /// The plane is decided by the **stream** now: an id this leaf
-    /// holds as an application stream delivers its bytes opaque. A
-    /// reply carrier can never be that id — a call's carrier is
-    /// `publish_stream_id(reply_route)`, which always sets bit 48
-    /// and therefore always classifies as a channel.
+    /// The plane is decided by **ownership** now: the RPC plane owns
+    /// exactly the reply carriers it subscribed to for its own
+    /// calls, and this leaf makes no call here — so every id in this
+    /// test is application-owned and its bytes are delivered opaque,
+    /// whatever dispatch byte they open on.
     ///
     /// `0x2108` is the harness's own seed form with the low byte
     /// that puts `0x11` (RESPONSE) at payload 9 and `0x13` at
@@ -3114,19 +3275,44 @@ mod tests {
 
     /// **The other half of the defect.** A payload consumed after
     /// this leaf acknowledged it must be observable by the
-    /// consumer, not just by a counter nobody polls — a reply that
-    /// names this leaf's own reply carrier and matches no call is
-    /// the one remaining way an acknowledged payload is discarded,
-    /// and it now raises [`LeafEvent::Dropped`] as well as moving
-    /// `unknown_call`.
+    /// consumer, not just by a counter nobody polls — a frame on a
+    /// carrier the RPC plane **owns** that matches no pending call
+    /// is the one remaining way an acknowledged payload is
+    /// discarded, and it raises [`LeafEvent::Dropped`] as well as
+    /// moving `unknown_call`.
+    ///
+    /// The ownership is established the only way it can be: this
+    /// leaf calls a service, which subscribes it to that service's
+    /// reply carrier, and the call then ends on its own deadline.
+    /// The carrier stays RPC-owned; the reply that lands on it
+    /// belongs to no pending call. That is a late reply — the exact
+    /// case `unknown_call` names — and it is refused out loud
+    /// instead of being handed to a consumer that never asked for
+    /// bytes on a reply channel.
     #[test]
     fn a_reply_that_matches_no_call_is_surfaced_as_well_as_counted() {
         let (mut a, mut b) = pair();
-        let bid = b.node_id();
-        // The carrier a reply must ride, built from the route the
-        // frame itself declares — so this reaches the call table
-        // rather than being read as application bytes.
-        let route = 0x0BAD_C0DE_1234_5678u64;
+        let (aid, bid) = (a.node_id(), b.node_id());
+        // One real call, so the RPC plane owns its reply carrier —
+        // a frame on a carrier no plane owns is application bytes by
+        // contract, and this witness is about the other case.
+        let service = "late.reply.svc";
+        let _pending = b.call(aid, service, b"q", Some(1)).expect("call");
+        let later = clock::now() + std::time::Duration::from_millis(2);
+        assert_eq!(
+            b.tick(later),
+            1,
+            "the call must end on its deadline, so the reply below \
+             matches nothing while its carrier stays RPC-owned"
+        );
+        b.take_outbound();
+        b.drain_events();
+
+        // The carrier that call subscribed to, and the route a reply
+        // on it declares.
+        let route = Channel::new(&b.reply_channel_for(service).expect("reply channel"))
+            .expect("valid channel name")
+            .canonical();
         let carrier = route_stream_id(route);
         let mut frame = crate::rpc_wire::EventMeta::new(
             crate::rpc_wire::DISPATCH_RPC_DEADLINE_EXCEEDED,
@@ -4001,6 +4187,226 @@ mod tests {
         assert!(
             !a.take_outbound().is_empty(),
             "the verdict is per stream, not per session"
+        );
+    }
+
+    /// **L5: a terminal send half must give its stamp reservation
+    /// back.** Every retained reliable descriptor also needs a header
+    /// stamp, and the stamps live in ONE session-wide table whose cap
+    /// X4 made deliberately non-evicting: `build_packets` refuses a
+    /// message it cannot stamp rather than deleting another stream's
+    /// ownership. The only paths that released a slot were a
+    /// cumulative ack and destroying the session — and a stream whose
+    /// retransmits ran out will never be acked. So streams that had
+    /// already ended terminally kept their slots forever while owning
+    /// no descriptor at all, and enough of them closed the session's
+    /// reliable admission permanently, refusing exactly the "use
+    /// another stream id" recovery `ReliableWindowFull` offers.
+    ///
+    /// Driven end-to-end on the real mechanisms: the table is filled
+    /// through the public handle-send path until the session itself
+    /// refuses (the stream count is discovered, not assumed), the
+    /// terminal verdict comes from the wire's own RTO/retry ladder
+    /// with nothing ever delivered or acknowledged, and what is
+    /// asserted is what a caller can observe — a fresh id admitted
+    /// again after the owners ended.
+    ///
+    /// The cap itself is untouched, and
+    /// `LeafSession::retire_stream_stamps` is bounded to the one
+    /// `stream_id` that died; that nothing live is ever evicted is
+    /// X4's `a_full_stamp_table_refuses_a_new_stream_rather_than_evicting_an_owned_one`.
+    #[test]
+    fn an_exhausted_stream_returns_its_stamps_so_a_fresh_id_is_admitted() {
+        let (mut a, b) = pair();
+        let bid = b.node_id();
+        let base = 0x0002_0000_0000_0020u64;
+        let per_stream = net_wire::reliability::ReliableStream::max_pending_for_window(
+            net_wire::stream::DEFAULT_STREAM_WINDOW_BYTES,
+        );
+
+        // Fill the shared table: successive ids, each kept inside its
+        // own per-stream descriptor window so no per-stream check is
+        // what refuses, until the session-wide stamp budget is what
+        // does.
+        let mut owners: Vec<u64> = Vec::new();
+        let refusal = loop {
+            let id = base + owners.len() as u64;
+            let handle = a
+                .open_stream(bid, "", Reliability::Reliable, Some(id), None)
+                .expect("the session is established");
+            let mut refusal = None;
+            for _ in 0..per_stream {
+                if let Err(e) = a.stream_send(handle, b"x") {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+            a.take_outbound();
+            match refusal {
+                Some(e) => break e,
+                None => owners.push(id),
+            }
+            assert!(
+                owners.len() < 64,
+                "the session-wide stamp cap must be reachable this way"
+            );
+        };
+        assert!(
+            matches!(refusal, LeafError::ReliableWindowFull { .. }),
+            "precondition: the stamp table must be full, got {refusal:?}"
+        );
+        assert!(
+            owners.len() > 1,
+            "precondition: the defect needs more than one stream in the table"
+        );
+
+        // Nothing is ever delivered to `b`, so nothing is ever
+        // acknowledged, and the wire's own doubling-RTO ladder gives
+        // up. Waited against `give_up_horizon` rather than an
+        // iteration count, and read through the clock seam — the
+        // dependency-boundary test denies a direct `Instant` anywhere
+        // in this file, test code included.
+        let horizon = net_wire::reliability::ReliableStream::give_up_horizon(
+            net_wire::reliability::ReliableStream::DEFAULT_RTO,
+            net_wire::reliability::ReliableStream::DEFAULT_MAX_RETRIES,
+        );
+        let started = clock::now();
+        let mut dead: Vec<u64> = Vec::new();
+        while started.elapsed() < horizon * 3 && dead.len() < owners.len() {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            a.tick(clock::now());
+            a.take_outbound();
+            let (_, failed) = drained(&mut a);
+            for (stream_id, reason) in failed {
+                if owners.contains(&stream_id) && reason == StreamFailure::RetransmitsExhausted {
+                    dead.push(stream_id);
+                }
+            }
+        }
+        assert_eq!(
+            dead.len(),
+            owners.len(),
+            "precondition: every owner's send half must fail terminally on its own"
+        );
+
+        // The recovery the refusal advertises. A fresh id needs a
+        // stamp, and the whole budget was held by streams that can
+        // never rebuild anything again.
+        let fresh = base + owners.len() as u64 + 1;
+        let handle = a
+            .open_stream(bid, "", Reliability::Reliable, Some(fresh), None)
+            .expect("a fresh id is not a failed one");
+        a.stream_send(handle, b"x")
+            .expect("ended streams must not hold the session's stamp budget forever");
+        assert!(
+            !a.take_outbound().is_empty(),
+            "and the admitted message must actually be queued"
+        );
+    }
+
+    /// **After promotion, a still-open fire-and-forget handle's
+    /// send is delivered under the reliable contract.** Kyra's R3-3
+    /// closure is disjunctive — older producers inherit the stream's
+    /// mode, *or* a fire-and-forget send on a promoted stream is
+    /// refused typed — and this leaf inherits. The observable
+    /// consequence, and the whole reason the choice matters, is what
+    /// happens to that send when an earlier reliable sequence is
+    /// lost: it is HELD behind the gap and retained for retransmit,
+    /// so both messages arrive in sequence order. Left
+    /// fire-and-forget it would have been released immediately, past
+    /// a hole its own stream still owed, and the reliable message
+    /// behind it would then have been refused as a duplicate of a
+    /// sequence the cursor had already walked over.
+    ///
+    /// Nothing here inspects a flag: the recovery runs entirely
+    /// through production paths — the receiver's gap report, the
+    /// sender's retained descriptor, a rebuild with a fresh AEAD
+    /// counter — and the assertion is the application's own byte
+    /// stream, in order.
+    #[test]
+    fn a_fire_and_forget_send_after_promotion_is_held_and_recovered_in_order() {
+        const STREAM: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x5B;
+        let (mut a, mut b) = pair();
+        let bid = b.node_id();
+        let faf = a
+            .open_stream(bid, "", Reliability::FireAndForget, Some(STREAM), None)
+            .expect("fire-and-forget handle");
+        let reliable = a
+            .open_stream(bid, "", Reliability::Reliable, Some(STREAM), None)
+            .expect("a reliable handle promotes the stream");
+
+        // The promoting send, lost on the wire.
+        a.stream_send(reliable, b"reliable-head").expect("send");
+        assert_eq!(a.take_outbound().len(), 1, "one packet, and it is lost");
+
+        // The older handle is still valid and still asks for
+        // fire-and-forget. The stream's mode is the contract.
+        a.stream_send(faf, b"through-the-old-handle").expect("send");
+        assert_eq!(pump(&mut a, &mut b), 1);
+        assert!(
+            delivered(&mut b).is_empty(),
+            "a send on a promoted stream must not be released past a \
+             reliable hole the stream still owes"
+        );
+
+        // Production recovery: b's gap report reaches a, a rebuilds
+        // the descriptor it retained, and b releases both in order.
+        assert!(pump(&mut b, &mut a) > 0, "the receiver must ask");
+        assert!(pump(&mut a, &mut b) > 0, "the sender must answer");
+        assert_eq!(
+            delivered(&mut b),
+            vec![
+                b"reliable-head".to_vec(),
+                b"through-the-old-handle".to_vec()
+            ],
+            "both messages, in sequence order, after recovery"
+        );
+    }
+
+    /// **The boundary signal is applied at admission of the head,
+    /// not at emission of the completed message.** A reliable
+    /// fragment head produces no delivery record — the group is not
+    /// yet complete — so a receive path that learns the mode
+    /// boundary from records never learns it from a fragmented
+    /// message's first packet. Here the prefix the boundary
+    /// concedes is a genuinely lost fire-and-forget sequence: no
+    /// retransmit can ever produce it, so a consumer that has not
+    /// been told where the reliable region starts holds the
+    /// assembled message forever behind a hole nothing can fill.
+    #[test]
+    fn a_boundary_on_a_fragment_head_concedes_the_lost_prefix_before_the_group_completes() {
+        const STREAM: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x5C;
+        let (mut a, mut b) = pair();
+        let bid = b.node_id();
+        let faf = a
+            .open_stream(bid, "", Reliability::FireAndForget, Some(STREAM), None)
+            .expect("fire-and-forget handle");
+        a.stream_send(faf, b"faf-0").expect("send");
+        assert_eq!(pump(&mut a, &mut b), 1);
+        assert_eq!(delivered(&mut b), vec![b"faf-0".to_vec()]);
+
+        // Sequence 1, fire-and-forget and genuinely lost: its sender
+        // retained nothing, so it is unrecoverable by construction.
+        a.stream_send(faf, b"faf-1").expect("send");
+        assert_eq!(a.take_outbound().len(), 1, "dropped, never rebuilt");
+
+        // The promotion arrives as a two-fragment reliable message,
+        // so the boundary rides a packet that completes nothing.
+        let reliable = a
+            .open_stream(bid, "", Reliability::Reliable, Some(STREAM), None)
+            .expect("reliable handle");
+        let body = vec![0x5a; 9000];
+        a.stream_send(reliable, &body).expect("send");
+        let pieces = a.take_outbound();
+        assert_eq!(pieces.len(), 2, "the boundary is on a fragment head");
+        for piece in pieces {
+            b.on_datagram(a.node_id(), piece.packet, clock::now());
+        }
+        assert_eq!(
+            delivered(&mut b),
+            vec![body],
+            "the head's boundary concedes the lost fire-and-forget \
+             prefix, so the completed reliable message is delivered"
         );
     }
 }

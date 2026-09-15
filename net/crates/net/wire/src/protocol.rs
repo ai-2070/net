@@ -88,6 +88,31 @@ impl PacketFlags {
     pub const HANDSHAKE: Self = Self(0b0001_0000);
     /// Heartbeat/keepalive
     pub const HEARTBEAT: Self = Self(0b0010_0000);
+    /// **The reliable/fire-and-forget mode boundary.** This
+    /// packet's `sequence` is the FIRST reliable sequence its
+    /// sender put on this stream: every lower sequence was
+    /// fire-and-forget and can never be retransmitted, every
+    /// sequence from here on is reliable and must be received or
+    /// NACKed.
+    ///
+    /// A stream's mode is monotonic — a channel's publish stream id
+    /// is derived from the channel, so fire-and-forget and reliable
+    /// producers share one id and the stronger contract wins — but
+    /// *where* it became reliable is not something a receiver can
+    /// count its way to. Inferring the boundary from arrivals
+    /// ("eight higher sequences arrived, so the hole must have been
+    /// fire-and-forget") acknowledges a sequence nobody received;
+    /// waiting on it unconditionally strands the reliable suffix
+    /// behind a fire-and-forget loss nothing can rebuild. So the
+    /// sender states it, on the packet that establishes it.
+    ///
+    /// The signal cannot be permanently lost: it rides the first
+    /// RELIABLE packet, so it is retransmitted until acknowledged.
+    /// Until it arrives the receiver assumes the conservative
+    /// boundary — its own cursor, so nothing is skipped — and NACKs
+    /// the hole; the signal then raises the boundary and concedes
+    /// what was actually fire-and-forget.
+    pub const MODE_BOUNDARY: Self = Self(0b0100_0000);
 
     /// Create flags from raw bits
     #[inline]
@@ -135,6 +160,13 @@ impl PacketFlags {
     #[inline]
     pub const fn is_reliable(self) -> bool {
         self.contains(Self::RELIABLE)
+    }
+
+    /// Whether this packet declares its sequence to be its stream's
+    /// reliable-mode boundary. See [`Self::MODE_BOUNDARY`].
+    #[inline]
+    pub const fn is_mode_boundary(self) -> bool {
+        self.contains(Self::MODE_BOUNDARY)
     }
 
     /// Check if this is a NACK packet

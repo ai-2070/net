@@ -45,6 +45,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::counters::{DropReason, LeafCounters};
+pub use net_wire::reliability::StreamMode;
 
 /// Per-stream delivery mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +194,7 @@ pub struct ReorderOverflow {
 /// The consumer side of one inbound stream.
 #[derive(Debug)]
 pub struct RxStream {
-    reliability: Reliability,
+    mode: StreamMode,
     next_expected: u64,
     held: BTreeMap<u64, StreamRecord>,
 }
@@ -203,16 +204,35 @@ impl RxStream {
     /// `StreamState::next_tx_seq` produces first on the other side.
     pub fn new(reliability: Reliability) -> Self {
         Self {
-            reliability,
+            mode: match reliability {
+                // Reliable from its first sequence: nothing on this
+                // id preceded the reliable contract.
+                Reliability::Reliable => StreamMode::Reliable {
+                    boundary: 0,
+                    signalled: false,
+                },
+                Reliability::FireAndForget => StreamMode::FireAndForget,
+            },
             next_expected: 0,
             held: BTreeMap::new(),
         }
     }
 
-    /// This stream's mode.
+    /// This stream's mode **and where it began** — the fact the gap
+    /// disposition is decided by.
+    #[inline]
+    pub fn mode(&self) -> StreamMode {
+        self.mode
+    }
+
+    /// This stream's mode, without the boundary.
     #[inline]
     pub fn reliability(&self) -> Reliability {
-        self.reliability
+        if self.mode.is_reliable() {
+            Reliability::Reliable
+        } else {
+            Reliability::FireAndForget
+        }
     }
 
     /// The next sequence that would be delivered in order.
@@ -239,8 +259,18 @@ impl RxStream {
             .is_some_and(|(start, rec)| start.saturating_add(rec.span) > seq)
     }
 
-    /// Make this stream reliable if it is not already, returning
-    /// whether the mode was upgraded.
+    /// Release everything that is now contiguous, in sequence order.
+    fn drain(&mut self) -> Vec<StreamRecord> {
+        let mut out = Vec::new();
+        while let Some(record) = self.held.remove(&self.next_expected) {
+            self.next_expected = self.next_expected.saturating_add(record.span.max(1));
+            out.push(record);
+        }
+        out
+    }
+
+    /// Apply the stream's reliable-mode promotion, returning
+    /// whatever that released.
     ///
     /// **Reliability is decided by the traffic, not by whichever
     /// record touched the id first.** A channel's publish stream id
@@ -253,16 +283,74 @@ impl RxStream {
     /// gap-free delivery in sequence order, so the stronger mode
     /// wins and never downgrades.
     ///
-    /// The cursor needs no adjustment: the fire-and-forget half
-    /// advanced `next_expected` past every sequence it skipped or
-    /// delivered, which is exactly where the reliable half must
-    /// resume — those sequences are unrecoverable (their sender
-    /// retained nothing) and must not be waited for.
+    /// **Where** it won is the other half, and it is what this
+    /// carries. `signalled` is `Some(seq)` for a packet stamped
+    /// [`PacketFlags::MODE_BOUNDARY`](net_wire::protocol::PacketFlags::MODE_BOUNDARY)
+    /// — its sender's first reliable sequence on this stream, so
+    /// everything below it was fire-and-forget and is conceded, and
+    /// everything from it on is a reliable obligation. `None` is a
+    /// reliable arrival whose boundary signal has not landed yet:
+    /// the promotion then takes the **conservative** boundary, this
+    /// cursor, which concedes nothing — the cursor needs no
+    /// adjustment, because the fire-and-forget half already advanced
+    /// it past every sequence it skipped or delivered.
+    ///
+    /// The first signalled boundary is final. Promotion happens
+    /// once, so a second signal naming a different one can only be
+    /// a retransmit of the first — or a peer asking this consumer to
+    /// concede reliable sequences it is already holding.
+    pub fn promote(&mut self, signalled: Option<u64>, counters: &LeafCounters) -> Vec<StreamRecord> {
+        let boundary = match (self.mode, signalled) {
+            (StreamMode::Reliable { signalled: true, .. }, _) => return Vec::new(),
+            (StreamMode::Reliable { .. }, None) => return Vec::new(),
+            (StreamMode::FireAndForget, None) => {
+                self.mode = StreamMode::Reliable {
+                    boundary: self.next_expected,
+                    signalled: false,
+                };
+                return Vec::new();
+            }
+            (_, Some(boundary)) => boundary,
+        };
+        self.mode = StreamMode::Reliable {
+            boundary,
+            signalled: true,
+        };
+        if boundary <= self.next_expected {
+            return Vec::new();
+        }
+        let conceded = boundary - self.next_expected;
+        self.next_expected = boundary;
+        // Records held below the new boundary arrived under
+        // fire-and-forget, and their sequence space is now conceded.
+        // They are bytes this consumer HAS: withholding them to
+        // honour a cursor that moved past them would be loss
+        // invented by the repair, and fire-and-forget promises no
+        // order to violate. Released in sequence order, ahead of
+        // whatever the boundary itself unblocks.
+        let above = self.held.split_off(&self.next_expected);
+        let mut out: Vec<StreamRecord> = core::mem::replace(&mut self.held, above)
+            .into_values()
+            .collect();
+        counters.drop_n(
+            DropReason::FireAndForgetGap,
+            conceded.saturating_sub(out.len() as u64),
+        );
+        out.extend(self.drain());
+        out
+    }
+
+    /// Make this stream reliable if it is not already, returning
+    /// whether the mode was upgraded. The conservative boundary —
+    /// see [`Self::promote`].
     pub fn ensure_reliable(&mut self) -> bool {
-        if self.reliability.is_reliable() {
+        if self.mode.is_reliable() {
             return false;
         }
-        self.reliability = Reliability::Reliable;
+        self.mode = StreamMode::Reliable {
+            boundary: self.next_expected,
+            signalled: false,
+        };
         true
     }
 
@@ -287,7 +375,12 @@ impl RxStream {
         let seq = record.seq;
         let stream_id = record.stream_id;
         // A reliable record makes the stream reliable, whatever
-        // opened it — see `ensure_reliable`.
+        // opened it — see `promote`. The signalled boundary is
+        // applied at the ADMISSION of its packet, which is earlier:
+        // a reliable fragment group's head promotes the stream
+        // before the group completes, so fire-and-forget traffic
+        // arriving between head and tail cannot skip the cursor past
+        // a reliable message that is still assembling.
         if record.reliable {
             self.ensure_reliable();
         }
@@ -300,12 +393,25 @@ impl RxStream {
             return Ok(Vec::new());
         }
 
-        if seq > self.next_expected && !self.reliability.is_reliable() {
-            // Fire-and-forget: the gap is a loss, counted once per
-            // skipped sequence but in one arithmetic step, and the
-            // consumer is not stalled.
-            counters.drop_n(DropReason::FireAndForgetGap, seq - self.next_expected);
-            self.next_expected = seq;
+        // **A gap is skippable exactly below the boundary.** A
+        // fire-and-forget sequence was sent by a mode that retained
+        // no descriptor, so no retransmit can ever produce it and
+        // waiting is a permanent stall; a reliable one is owed, and
+        // skipping it discards records the sender is still entitled
+        // to have delivered. One cursor spans both halves of a
+        // promoted stream, so the concession stops at the boundary
+        // rather than at the arriving sequence: for a stream that
+        // never promoted the boundary is `u64::MAX` and every gap is
+        // a loss, which is the fire-and-forget contract unchanged.
+        let concede_to = seq.min(self.mode.skippable_below());
+        if concede_to > self.next_expected {
+            // Counted once per skipped sequence, in one arithmetic
+            // step, so loss is measurable rather than invisible.
+            counters.drop_n(
+                DropReason::FireAndForgetGap,
+                concede_to - self.next_expected,
+            );
+            self.next_expected = concede_to;
         }
 
         self.held.insert(seq, record);
@@ -324,12 +430,7 @@ impl RxStream {
             return Err(overflow);
         }
 
-        let mut out = Vec::new();
-        while let Some(record) = self.held.remove(&self.next_expected) {
-            self.next_expected = self.next_expected.saturating_add(record.span.max(1));
-            out.push(record);
-        }
-        Ok(out)
+        Ok(self.drain())
     }
 }
 

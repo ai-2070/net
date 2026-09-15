@@ -25,7 +25,7 @@ use crate::route_hop::SharedHopReplayWindow;
 use crate::parsed_packet::ParsedPacket;
 use crate::pool::SharedLocalPool;
 use crate::reliability::{
-    create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor,
+    create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor, StreamMode,
 };
 use crate::stream::DEFAULT_STREAM_WINDOW_BYTES;
 
@@ -114,6 +114,20 @@ pub struct NetSession {
     /// subsequent reopen. Entries are inserted on `close_stream` and
     /// lazily garbage-collected by `is_grant_quarantined` on read.
     recently_closed: DashMap<u64, Instant>,
+    /// Streams whose RECEIVE half ended locally and whose peer has
+    /// not been told yet (NR2/NR4).
+    ///
+    /// The send-side give-up already has a channel — the per-stream
+    /// `take_failed` flag that [`Self::take_failed_stream_ids`]
+    /// collects — but a receive-half terminal has no stream state
+    /// left to carry it: the reason it is terminal is that the state
+    /// was destroyed (a reassembly group that acknowledged bytes it
+    /// can never deliver, a cap sweep evicting frames this receiver
+    /// alone still held). So it is recorded on the session, and the
+    /// retransmit tick drains it into the same `StreamReset` the
+    /// send-side give-up emits. Bounded by the number of distinct
+    /// stream ids, deduplicated on push: one stream ends once.
+    receive_terminals: parking_lot::Mutex<Vec<u64>>,
     /// Monotonic sequence counter for subprotocol control packets
     /// (grants, membership acks, etc.) that don't belong to a
     /// user-opened stream. Using a separate counter keeps control
@@ -206,6 +220,7 @@ impl NetSession {
             active: AtomicBool::new(true),
             stream_epoch_counter: AtomicU64::new(1),
             recently_closed: DashMap::new(),
+            receive_terminals: parking_lot::Mutex::new(Vec::new()),
             control_tx_seq: AtomicU64::new(0),
             cached_node_id: AtomicU64::new(0),
             // Unlike `tx_key`, the route-hop keys ARE retained: a
@@ -314,12 +329,23 @@ impl NetSession {
         self.control_tx_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Allocate a unique epoch for a freshly-opened stream.
+    /// Allocate a unique epoch for a freshly-created stream.
     ///
     /// Monotonic **within one session** — a stream closed and reopened
     /// on the same session gets a new epoch, which is how stale
-    /// `Stream` handles and `TxSlotGuard`s are kept off a different
-    /// lifetime of the same `stream_id` *on that session*.
+    /// `Stream` handles, `TxSlotGuard`s and `ControlDebitGuard`s are
+    /// kept off a different lifetime of the same `stream_id` *on that
+    /// session*.
+    ///
+    /// Every creation path allocates one, **including the implicit
+    /// ones** ([`Self::implicit_stream_state`]). An implicit stream is
+    /// exactly as replaceable as an explicitly opened one — its id is
+    /// derived from a channel or a subprotocol, so close+recreate
+    /// under the same id is the normal case — and when implicit
+    /// creation left the epoch at a shared sentinel, a predecessor's
+    /// uncommitted `ControlDebitGuard` passed the equality check
+    /// against its *successor* and refunded the successor's committed
+    /// bytes plus its sequence (Kyra R3-5).
     ///
     /// It says nothing across sessions. The counter restarts at 1 for
     /// every `NetSession`, so the first stream of a successor session
@@ -333,6 +359,25 @@ impl NetSession {
     #[inline]
     fn next_stream_epoch(&self) -> u64 {
         self.stream_epoch_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Build the `StreamState` for an **implicit** creation: a control
+    /// producer or an arriving packet touching a `stream_id` nobody
+    /// explicitly opened.
+    ///
+    /// Identical to `StreamState::new(reliable)` except that it
+    /// allocates a lifetime id from the same counter
+    /// `open_stream_full` uses. See [`Self::next_stream_epoch`] for
+    /// why sharing one sentinel across implicit lifetimes is not an
+    /// ownership identity.
+    #[inline]
+    fn implicit_stream_state(&self, reliable: bool) -> StreamState {
+        StreamState::new_full_with_epoch(
+            reliable,
+            1,
+            DEFAULT_STREAM_WINDOW_BYTES,
+            self.next_stream_epoch(),
+        )
     }
 
     /// Get the session ID
@@ -361,14 +406,19 @@ impl NetSession {
         &self.rx_cipher
     }
 
-    /// Get or create stream state
+    /// Get or create stream state.
+    ///
+    /// A stream created here is *implicit* — nobody opened it through
+    /// the typed handle API — but it still gets a unique lifetime id,
+    /// because guards minted against it (notably
+    /// [`ControlDebitGuard`]) compare that id before they refund.
     pub fn get_or_create_stream(
         &self,
         stream_id: u64,
     ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
         self.streams
             .entry(stream_id)
-            .or_insert_with(|| StreamState::new(self.default_reliable))
+            .or_insert_with(|| self.implicit_stream_state(self.default_reliable))
     }
 
     /// Allocate the next TX sequence on `stream_id`, debit
@@ -437,7 +487,7 @@ impl NetSession {
         let stream = self
             .streams
             .entry(stream_id)
-            .or_insert_with(|| StreamState::new(reliable));
+            .or_insert_with(|| self.implicit_stream_state(reliable));
         if reliable {
             stream.ensure_reliable();
         }
@@ -516,6 +566,28 @@ impl NetSession {
             }
         }
         out
+    }
+
+    /// Record that `stream_id`'s RECEIVE half ended locally, so the
+    /// peer is told instead of waiting on data that will never come
+    /// (NR2/NR4).
+    ///
+    /// Idempotent per stream: a burst of destroyed groups on one
+    /// stream is one terminal, exactly as the leaf's receive-half
+    /// latch produces one `StreamFailed` per stream rather than one
+    /// per group.
+    pub fn note_receive_terminal(&self, stream_id: u64) {
+        let mut pending = self.receive_terminals.lock();
+        if !pending.contains(&stream_id) {
+            pending.push(stream_id);
+        }
+    }
+
+    /// Take-and-clear the receive-half terminals this session owes
+    /// its peer. Drained by the retransmit tick, which emits the
+    /// `StreamReset` for each.
+    pub fn take_receive_terminals(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.receive_terminals.lock())
     }
 
     /// Look up stream state without creating it. Returns `None` if the
@@ -1215,14 +1287,61 @@ impl NetSession {
     }
 
     /// Hold one out-of-order arrival on `stream_id` until the
-    /// sequences in front of it have been delivered. A no-op for a
-    /// stream that no longer exists — its consumer is gone.
-    pub fn hold_in_order_frame(&self, stream_id: u64, seq: u64, frame: HeldFrame) {
-        if let Some(state) = self.streams.get(&stream_id) {
-            if state.hold_out_of_order(seq, frame) {
-                self.inorder_held.fetch_add(1, Ordering::Relaxed);
-            }
+    /// sequences in front of it have been delivered.
+    ///
+    /// **NR4: the hold is bound to the exact lifetime that accepted
+    /// the sequence.** The accepting stream's `(session_id, epoch)`
+    /// travels with the frame from acceptance to insertion, and this
+    /// re-acquisition refuses to insert into anything else. Without
+    /// it, the ingress dropped the stream's map guard after
+    /// acceptance and looked the stream up again by ID: a
+    /// close/reopen landing in between put the OLD frame into the
+    /// REPLACEMENT's reorder buffer, where it could be released
+    /// under a frontier that never accepted its sequence and never
+    /// reserved its bytes. "The stream vanished, so the consumer is
+    /// gone" was sound; "the stream was REPLACED" was not.
+    ///
+    /// `false` means the frame was not held: either the stream is
+    /// gone (its consumer with it), the lifetime no longer matches,
+    /// or the reorder buffer refused the sequence.
+    pub fn hold_in_order_frame(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        lifetime: StreamLifetime,
+        frame: HeldFrame,
+    ) -> bool {
+        if lifetime.session_id != self.session_id {
+            tracing::warn!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                accepted_on = lifetime.session_id,
+                session_id = self.session_id,
+                "in-order hold refused: the frame was accepted by another \
+                 session's incarnation"
+            );
+            return false;
         }
+        let Some(state) = self.streams.get(&stream_id) else {
+            return false;
+        };
+        if state.epoch() != lifetime.epoch {
+            tracing::warn!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                accepted_epoch = lifetime.epoch,
+                live_epoch = state.epoch(),
+                "in-order hold refused: the stream was replaced between the \
+                 sequence's acceptance and its insertion, and the \
+                 replacement never accepted it"
+            );
+            return false;
+        }
+        if state.hold_out_of_order(seq, frame) {
+            self.inorder_held.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Take the next arrival a reliable stream is holding that is
@@ -1278,6 +1397,19 @@ impl NetSession {
     /// keeping the active count at or below `max_streams` by LRU-evicting
     /// the oldest if still over cap. Returns the number of streams
     /// evicted. Called from the session owner's heartbeat loop.
+    ///
+    /// **NR4: an eviction that discards ACK-owned data is terminal.**
+    /// A gapped reliable stream can be holding arrivals this receiver
+    /// has already acknowledged — after which the sender has dropped
+    /// its only copy — so dropping the `StreamState` destroys data
+    /// nothing can rebuild. Pre-fix both removal branches did exactly
+    /// that behind an eviction log, and left the session's
+    /// `inorder_held` fast-path count counting frames that no longer
+    /// existed. Now the hold is released through the one path allowed
+    /// to discard it (so the count stays true) and the stream's
+    /// receive half ends typed: the peer gets a `StreamReset` and
+    /// fails its pending read instead of waiting out a timeout for
+    /// bytes this node threw away.
     pub fn evict_idle_streams(
         &self,
         max_idle: Duration,
@@ -1300,11 +1432,23 @@ impl NetSession {
                 state.deactivate();
                 self.recently_closed.insert(sid, SystemClock::now());
                 evicted += 1;
-                tracing::debug!(
-                    stream_id = format!("{:#x}", sid),
-                    reason = reason_tag,
-                    "stream evicted: idle timeout"
-                );
+                let discarded = self.forget_in_order_hold(&state);
+                if discarded > 0 {
+                    self.note_receive_terminal(sid);
+                    tracing::warn!(
+                        stream_id = format!("{:#x}", sid),
+                        reason = reason_tag,
+                        discarded,
+                        "stream evicted: idle timeout discarded acknowledged \
+                         arrivals held in order, so its receive half ends typed"
+                    );
+                } else {
+                    tracing::debug!(
+                        stream_id = format!("{:#x}", sid),
+                        reason = reason_tag,
+                        "stream evicted: idle timeout"
+                    );
+                }
             }
         }
 
@@ -1338,11 +1482,20 @@ impl NetSession {
                             state.deactivate();
                             self.recently_closed.insert(sid, SystemClock::now());
                             evicted += 1;
+                            // NR4: the cap branch is the sharper half
+                            // — it can take a gapped stream that is
+                            // still owed recovery, not merely one the
+                            // sender has given up on.
+                            let discarded = self.forget_in_order_hold(&state);
+                            if discarded > 0 {
+                                self.note_receive_terminal(sid);
+                            }
                             tracing::warn!(
                                 stream_id = format!("{:#x}", sid),
                                 reason = "cap_exceeded",
                                 total_streams = self.streams.len(),
                                 max_streams = max_streams,
+                                discarded,
                                 "stream evicted: max_streams cap"
                             );
                         }
@@ -1584,6 +1737,37 @@ pub struct StreamState {
     /// the first open, is what decides whether it is owed: see
     /// [`Self::ensure_reliable`].
     reliable_mode: AtomicBool,
+    /// **Where** this stream became reliable on the RECEIVE side:
+    /// the first reliable sequence the peer put on it, or
+    /// `u64::MAX` while the stream is still fire-and-forget.
+    ///
+    /// `reliable_mode` says the contract changed;
+    /// [`Self::rx_stream_mode`] pairs it with this to say where, and
+    /// that is the fact the ACK accounting and the consumer cursor
+    /// both need: below the boundary a gap is a fire-and-forget loss
+    /// no retransmit can fill, at or above it a gap is a reliable
+    /// obligation that must never be acknowledged unreceived.
+    rx_mode_boundary: AtomicU64,
+    /// Whether `rx_mode_boundary` is the sender's STATED boundary
+    /// ([`crate::protocol::PacketFlags::MODE_BOUNDARY`]) or the
+    /// conservative one this receiver assumed on seeing reliable
+    /// traffic without the signal. An assumed boundary may be
+    /// raised by the signal; a stated one is final, so a peer
+    /// cannot re-signal a higher boundary to make this receiver
+    /// concede reliable sequences it already holds.
+    rx_boundary_signalled: AtomicBool,
+    /// **Where** this stream became reliable on the SEND side: the
+    /// first reliable sequence this sender put on it, or `u64::MAX`
+    /// while it has sent none.
+    ///
+    /// Tracked separately from the receive half because the two
+    /// directions of one stream id are independent: a peer sending
+    /// us reliable traffic does not promote what we send, and only
+    /// the send half may stamp the boundary flag. Its other job is
+    /// the producer contract — once a stream is promoted, a
+    /// still-open fire-and-forget handle's flag is a *request* and
+    /// this is the contract (see `LeafSession::build_packets`).
+    tx_mode_boundary: AtomicU64,
     /// Fair-scheduler quantum multiplier (1 = equal share).
     fairness_weight: u8,
     /// Configured initial credit window in **bytes** for this stream's
@@ -1643,15 +1827,20 @@ pub struct StreamState {
     credit_grants_sent: AtomicU64,
     /// Receive-side credit bookkeeping. See [`RxCreditState`].
     rx_credit: RxCreditState,
-    /// Monotonic epoch issued by the owning `NetSession` at open time.
-    /// Close + reopen of the same `stream_id` produces a fresh
-    /// `StreamState` with a new epoch; stale `Stream` handles and
-    /// `TxSlotGuard`s must fail an equality check against this value
-    /// before acting on the state.
+    /// Monotonic lifetime id issued by the owning `NetSession` when
+    /// this state was created. Close + recreate of the same
+    /// `stream_id` produces a fresh `StreamState` with a new epoch;
+    /// stale `Stream` handles, `TxSlotGuard`s and `ControlDebitGuard`s
+    /// must fail an equality check against this value before acting
+    /// on the state.
     ///
-    /// `0` is the "no epoch recorded" sentinel for legacy paths
-    /// (`get_or_create_stream`, `send_to_peer` / `send_routed`) that
-    /// don't go through the typed handle API.
+    /// **Every** session-owned state carries a real one: the implicit
+    /// creation paths (`get_or_create_stream`,
+    /// `get_or_create_stream_for_packet`) allocate from the same
+    /// counter `open_stream_full` uses. `0` only appears on a
+    /// `StreamState` built standalone through
+    /// [`Self::new`]/[`Self::new_full`] and never installed in a
+    /// session's map, where there is no successor to confuse it with.
     epoch: u64,
     /// Out-of-order arrivals this receiver is holding so a reliable
     /// stream delivers in sequence order. Empty for every
@@ -1659,6 +1848,24 @@ pub struct StreamState {
     /// link that is not reordering, which is why it is created lazily
     /// rather than allocated per stream. See [`InOrderBuffer`].
     inorder: parking_lot::Mutex<InOrderBuffer>,
+}
+
+/// The exact stream lifetime one arrival was accepted by (NR4).
+///
+/// A stream id is reusable: close and reopen produces a fresh
+/// [`StreamState`] with a new [`StreamState::epoch`] under the same
+/// id, and a fresh handshake produces a whole new session whose
+/// epoch counter restarts. So neither half identifies a lifetime on
+/// its own — the pair does. It is captured where a sequence is
+/// ACCEPTED and checked where its frame is INSERTED, which is the
+/// only way a receive path that releases its map guard between the
+/// two can prove it is still talking to the same stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLifetime {
+    /// The session incarnation that accepted the sequence.
+    pub session_id: u64,
+    /// That session's per-stream lifetime id.
+    pub epoch: u64,
 }
 
 /// One arrival a reliable stream is holding until the sequences
@@ -1868,8 +2075,8 @@ impl StreamState {
     /// Create a new stream state with a fair-scheduler weight.
     ///
     /// Uses [`DEFAULT_STREAM_WINDOW_BYTES`] for the initial credit
-    /// window — auto-created receive-side streams (via
-    /// `get_or_create_stream`) inherit the default so
+    /// window — implicitly created receive-side streams (via
+    /// `NetSession::get_or_create_stream`) inherit the default so
     /// `RxCreditState` can mint grants on threshold crossings.
     /// Callers that need a specific window go through
     /// [`Self::new_full`].
@@ -1877,20 +2084,27 @@ impl StreamState {
         Self::new_full(reliable, fairness_weight, DEFAULT_STREAM_WINDOW_BYTES)
     }
 
-    /// Create a new stream state with full config (weight + tx window).
-    /// Epoch defaults to `0` (the "no epoch" sentinel used by legacy
-    /// auto-create paths); sessions that go through `open_stream_full`
-    /// allocate a fresh epoch via [`Self::new_full_with_epoch`].
+    /// Create a new stream state with full config (weight + tx window)
+    /// and **no** lifetime id.
+    ///
+    /// Epoch `0` is only safe for a state the caller owns outright and
+    /// never installs in a `NetSession`'s stream map: with no
+    /// predecessor or successor under the same id, nothing compares
+    /// against it. Every session-owned state — explicit
+    /// (`open_stream_full`) or implicit
+    /// (`NetSession::implicit_stream_state`) — allocates a real one
+    /// through [`Self::new_full_with_epoch`].
     pub fn new_full(reliable: bool, fairness_weight: u8, tx_window: u32) -> Self {
         Self::new_full_with_epoch(reliable, fairness_weight, tx_window, 0)
     }
 
-    /// Create a new stream state with a caller-supplied epoch.
+    /// Create a new stream state with a caller-supplied lifetime id.
     ///
-    /// Sessions call this via `open_stream_full` with a monotonic
-    /// epoch; stale `Stream` handles / `TxSlotGuard`s from a prior
-    /// close/reopen cycle will fail the epoch check against the new
-    /// state.
+    /// Sessions call this from `open_stream_full` and
+    /// `implicit_stream_state` with a monotonic epoch; stale `Stream`
+    /// handles, `TxSlotGuard`s and `ControlDebitGuard`s from a prior
+    /// lifetime of the same `stream_id` fail the epoch check against
+    /// the new state.
     pub fn new_full_with_epoch(
         reliable: bool,
         fairness_weight: u8,
@@ -1910,6 +2124,9 @@ impl StreamState {
             active: AtomicBool::new(true),
             last_activity: AtomicU64::new(current_timestamp()),
             reliable_mode: AtomicBool::new(reliable),
+            rx_mode_boundary: AtomicU64::new(if reliable { 0 } else { u64::MAX }),
+            rx_boundary_signalled: AtomicBool::new(false),
+            tx_mode_boundary: AtomicU64::new(u64::MAX),
             fairness_weight: fairness_weight.max(1),
             tx_window,
             // Implicit initial window: the sender starts with full
@@ -1986,31 +2203,134 @@ impl StreamState {
     /// deep as the traffic the id already carried, NACK sequences
     /// that were never lost, and hold every later arrival behind a
     /// gap nothing can fill.
+    ///
+    /// This is the **assumed** boundary — the conservative one, for
+    /// a receiver that has seen reliable traffic but not yet the
+    /// sender's [`crate::protocol::PacketFlags::MODE_BOUNDARY`]
+    /// signal. It concedes nothing above what has already arrived
+    /// contiguously, so a reliable packet lost at the boundary is
+    /// NACKed rather than acknowledged away. When the signal lands,
+    /// [`Self::ensure_reliable_at`] raises the boundary and concedes
+    /// what was genuinely fire-and-forget.
     pub fn ensure_reliable(&self) -> bool {
-        if self.reliable_mode.load(Ordering::Acquire) {
+        self.promote_rx(None)
+    }
+
+    /// Make this stream reliable at the sender's **stated**
+    /// boundary, or raise an assumed boundary to it. Returns
+    /// whether anything changed.
+    ///
+    /// `boundary` is the sequence of a packet carrying
+    /// [`crate::protocol::PacketFlags::MODE_BOUNDARY`]: the first
+    /// reliable sequence its sender put on this stream. Everything
+    /// below it is fire-and-forget — unrebuildable, so conceded —
+    /// and everything from it on is reliable.
+    ///
+    /// The first stated boundary is final. A later one is ignored:
+    /// mode promotion happens once, so a second signal naming a
+    /// higher boundary could only be a peer asking this receiver to
+    /// concede reliable sequences it is already holding.
+    pub fn ensure_reliable_at(&self, boundary: u64) -> bool {
+        self.promote_rx(Some(boundary))
+    }
+
+    /// The receive-side promotion, whichever half asked for it.
+    ///
+    /// One function because the two halves are one transition seen
+    /// at different times, and splitting them is what let the wire's
+    /// accounting and the consumer's cursor disagree about where the
+    /// boundary was.
+    fn promote_rx(&self, signalled: Option<u64>) -> bool {
+        // Lock-free fast path: every reliable arrival asks for this
+        // (`get_or_create_stream_for_packet`), and for a stream
+        // already promoted at a stated boundary — or asked without
+        // a signal — there is nothing to do. Two atomic loads
+        // instead of the reliability mutex.
+        if self.reliable_mode.load(Ordering::Acquire)
+            && (signalled.is_none() || self.rx_boundary_signalled.load(Ordering::Acquire))
+        {
             return false;
         }
         let mut guard = self.reliability.lock();
-        // Re-check under the lock: two concurrent upgraders must
-        // produce one replacement, not two.
         if self.reliable_mode.load(Ordering::Acquire) {
-            return false;
+            // Already reliable. The only thing left to do is raise
+            // an assumed boundary to a stated one.
+            let Some(boundary) = signalled else {
+                return false;
+            };
+            if self.rx_boundary_signalled.swap(true, Ordering::AcqRel) {
+                return false;
+            }
+            self.rx_mode_boundary.store(boundary, Ordering::Release);
+            let moved = guard.concede_rx_below(boundary);
+            drop(guard);
+            return moved;
         }
         // Always a RESUME, never a fresh cursor: an upgraded stream
-        // has a peer that is already mid-sequence, and the arrival
-        // that lands next is what places the cursor
-        // (`ReliableStream::on_receive`). The high-water mark is the
-        // floor below which everything is conceded — those sequences
-        // were sent under a mode that retained nothing, so no NACK
-        // could ever produce them.
-        let floor = guard.rx_accepted_high_water().map_or(0, |seen| seen + 1);
+        // has a peer that is already mid-sequence. The boundary is
+        // the sender's if it stated one, and otherwise the
+        // contiguous frontier — the only sequence this receiver can
+        // name without claiming receipt of something it never got.
+        let boundary = match signalled {
+            Some(boundary) => boundary,
+            None => guard.rx_accepted_high_water().map_or(0, |seen| seen + 1),
+        };
         let mut upgraded =
             create_reliability_mode(true, ReliableStream::max_pending_for_window(self.tx_window));
-        upgraded.resume_rx_at(floor);
+        upgraded.resume_rx_at(boundary);
         *guard = upgraded;
+        self.rx_mode_boundary.store(boundary, Ordering::Release);
+        self.rx_boundary_signalled
+            .store(signalled.is_some(), Ordering::Release);
         self.reliable_mode.store(true, Ordering::Release);
         drop(guard);
         true
+    }
+
+    /// This stream's receive-side mode and, if it is reliable,
+    /// where it became so.
+    ///
+    /// The single fact the wire's ACK accounting, the consumer's
+    /// reorder cursor and the stream's producers all read.
+    #[inline]
+    pub fn rx_stream_mode(&self) -> StreamMode {
+        match self.rx_mode_boundary.load(Ordering::Acquire) {
+            u64::MAX => StreamMode::FireAndForget,
+            boundary => StreamMode::Reliable {
+                boundary,
+                signalled: self.rx_boundary_signalled.load(Ordering::Acquire),
+            },
+        }
+    }
+
+    /// Whether this sender has already promoted its send half of
+    /// this stream to reliable.
+    ///
+    /// **The stream's mode is the contract; a handle's flag is a
+    /// request.** After promotion a still-open fire-and-forget
+    /// producer's packets are sent reliable: reliability is strictly
+    /// stronger, so upgrading a fire-and-forget send violates
+    /// nothing its caller asked for, whereas leaving it
+    /// fire-and-forget puts an unrebuildable sequence inside the
+    /// reliable region of a shared sequence space — which the
+    /// receiver must then either hold forever or skip, and skipping
+    /// it discards the reliable records behind it.
+    #[inline]
+    pub fn tx_promoted(&self) -> bool {
+        self.tx_mode_boundary.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// Claim `seq` as this send half's reliable-mode boundary.
+    ///
+    /// `true` exactly once per stream — for the first reliable
+    /// packet it sends, whose header then carries
+    /// [`crate::protocol::PacketFlags::MODE_BOUNDARY`] so the
+    /// receiver never has to infer the split.
+    #[inline]
+    pub fn promote_tx_at(&self, seq: u64) -> bool {
+        self.tx_mode_boundary
+            .compare_exchange(u64::MAX, seq, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Bytes of out-of-order frames this stream may hold at once.
@@ -2102,8 +2422,10 @@ impl StreamState {
         self.fairness_weight
     }
 
-    /// Monotonic per-session epoch captured at construction time.
-    /// `0` means "no epoch recorded" (legacy auto-create path).
+    /// Monotonic per-session lifetime id captured at construction
+    /// time. Unique across every creation on its session, explicit or
+    /// implicit. `0` only on a session-less standalone state
+    /// ([`Self::new_full`]).
     #[inline]
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -2389,6 +2711,14 @@ impl StreamState {
     /// and only the remainder becomes application credit. The
     /// `min(window)` clamp bounds a hostile grant; it never
     /// substituted for this.
+    ///
+    /// **And it pays at full width.** The debt ledger is `u64`; the
+    /// application-credit representation is `u32`. Narrowing the delta
+    /// before repayment capped one grant's repayment at `u32::MAX`
+    /// while the *full* consumed total had already advanced
+    /// `max_consumed_seen` — so the unpaid excess could never be
+    /// re-presented and the window stayed shut forever. Settle from
+    /// the `u64` delta, then narrow what survives.
     pub fn apply_authoritative_grant(&self, total_consumed: u64) {
         self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
         if self.tx_window == 0 {
@@ -2422,9 +2752,22 @@ impl StreamState {
                 Err(current) => prev = current,
             }
         };
+        // Order matters, and so does width. `overdraft` and the
+        // consumed watermarks are `u64`; only the application-credit
+        // *representation* (`tx_credit_remaining`) is `u32`. So the
+        // delta settles control debt at full width first, and only the
+        // surviving remainder is narrowed to that representation.
+        //
+        // Clamping first was Kyra R3-6: a debt above `u32::MAX` got
+        // `u32::MAX` of repayment out of a larger delta, the excess
+        // was dropped on the floor, and because the *full* consumed
+        // total had already advanced `max_consumed_seen`, no later
+        // grant could re-present those bytes — the remaining debt was
+        // stranded and the application window never reopened.
+        //
         // Under honest receiver accounting
-        // (`total_consumed <= tx_bytes_sent`) the delta is bounded by
-        // the outstanding window, so `saturating_add` is a no-op
+        // (`total_consumed <= tx_bytes_sent`) the remainder is bounded
+        // by the outstanding window, so `saturating_add` is a no-op
         // against overflow and the final value naturally stays at or
         // below `tx_window`.
         //
@@ -2435,9 +2778,11 @@ impl StreamState {
         // clamp caps credit at the configured window regardless of
         // the reported delta — a safety bound, not a correctness
         // requirement under honest operation.
-        let grant_add = delta.min(u32::MAX as u64) as u32;
-        let paid = self.retire_overdraft(grant_add as u64) as u32;
-        let credit_add = grant_add - paid;
+        //
+        // `retire_overdraft` returns `prev.min(amount)`, so the
+        // subtraction cannot underflow.
+        let paid = self.retire_overdraft(delta);
+        let credit_add = (delta - paid).min(u32::MAX as u64) as u32;
         if credit_add == 0 {
             return;
         }

@@ -312,6 +312,14 @@ pub struct OpenedPacket {
     pub sequence: u64,
     /// Whether the sender marked it reliable.
     pub reliable: bool,
+    /// `Some(sequence)` when the sender stamped this packet
+    /// [`PacketFlags::MODE_BOUNDARY`]: its sequence is the FIRST
+    /// reliable one on this stream, so everything below is
+    /// fire-and-forget and conceded and everything from here on is
+    /// a reliable obligation. `None` on every other packet — which
+    /// is not "the boundary is zero", it is "this packet says
+    /// nothing about the boundary".
+    pub mode_boundary: Option<u64>,
     /// Fragment group id.
     pub fragment_id: u16,
     /// Byte offset of this piece within its group.
@@ -443,11 +451,44 @@ impl LeafSession {
         } else {
             0
         };
-        let flags = if reliable {
-            PacketFlags::RELIABLE
-        } else {
-            PacketFlags::NONE
-        };
+        // **The stream's mode is the contract; a handle's flag is a
+        // request.** A channel's publish stream id is derived from
+        // the channel, so fire-and-forget and reliable producers
+        // land on one id and one sequence space, and a
+        // still-open fire-and-forget handle keeps sending after a
+        // reliable one promoted the stream. Leaving those packets
+        // fire-and-forget puts unrebuildable sequences INSIDE the
+        // reliable region of a shared sequence space: the receiver
+        // must then either wait forever for a retransmit that
+        // cannot come, or skip past them — and skipping takes the
+        // cursor past reliable records it is still assembling, which
+        // is how a complete reliable message came to be discarded as
+        // a duplicate.
+        //
+        // So the promoted stream inherits, and the alternative —
+        // refusing a fire-and-forget send on a promoted stream,
+        // typed — is deliberately NOT what happens here. Refusing
+        // would break a working publisher because some unrelated
+        // subscriber on the same channel asked for reliability,
+        // turning a third party's choice into this caller's error.
+        // Inheriting cannot break anyone: reliable is strictly
+        // stronger than fire-and-forget, so a caller that asked for
+        // "may be lost" and got "will not be lost" received
+        // everything it asked for. It also costs the send a
+        // retransmit descriptor and a stamp, which is exactly what
+        // makes the receiver's obligation answerable.
+        //
+        // Stream-control traffic is exempt: it is the credit and
+        // reliability loop itself and rides `CONTROL_STREAM_ID`
+        // outside the window, for the same reason the receive path
+        // does not reorder it.
+        let control = is_stream_control(subprotocol_id);
+        let reliable = reliable
+            || (!control
+                && self
+                    .session
+                    .try_stream(stream_id)
+                    .is_some_and(|s| s.tx_promoted()));
         self.session.open_stream_with(stream_id, reliable, 1);
 
         // The stream-control subprotocols carry the credit loop
@@ -455,7 +496,7 @@ impl LeafSession {
         // to replenish would deadlock the stream it is refilling, so
         // they ride outside the window — the same reason the receive
         // path does not reorder them.
-        if !is_stream_control(subprotocol_id) {
+        if !control {
             // **Three independent bounds, all checked before any
             // sequence is consumed.** Credit is bytes; the
             // retransmit window is a count of descriptors, and
@@ -528,7 +569,24 @@ impl LeafSession {
         for fragment in fragments {
             let offset = fragment.offset;
             let frag_flags = fragment.flags;
-            let seq = self.session.get_or_create_stream(stream_id).next_tx_seq();
+            let stream = self.session.get_or_create_stream(stream_id);
+            let seq = stream.next_tx_seq();
+            // The promotion boundary is STAMPED, not inferred: this
+            // is the sender's first reliable sequence on the stream,
+            // and saying so is what lets the receiver concede the
+            // fire-and-forget sequences below it without
+            // acknowledging a packet it never got. True exactly
+            // once per stream, and the flag rides the descriptor
+            // too, so a lost boundary packet re-announces itself on
+            // retransmit.
+            let flags = match reliable {
+                true if stream.promote_tx_at(seq) => {
+                    PacketFlags::RELIABLE.with(PacketFlags::MODE_BOUNDARY)
+                }
+                true => PacketFlags::RELIABLE,
+                false => PacketFlags::NONE,
+            };
+            drop(stream);
             let events = [fragment.data];
             let mut builder = self.session.thread_local_pool().get();
             builder.set_channel_hash(channel_hash);
@@ -613,6 +671,39 @@ impl LeafSession {
         }
     }
 
+    /// Retire **every** stamp `stream_id` owns, at any sequence: its
+    /// send half has ended terminally, so no descriptor of its can
+    /// ever be rebuilt again.
+    ///
+    /// Returns how many were retired, which is what a caller reports.
+    ///
+    /// This is the other end of the `MAX_RETRANSMIT_STAMPS` cap. That
+    /// cap is deliberately non-evicting — [`Self::build_packets`]
+    /// refuses a message it cannot stamp rather than deleting another
+    /// stream's ownership — so the only ways a slot came back were a
+    /// cumulative ack and destroying the whole session. A stream whose
+    /// retransmits exhausted satisfies neither: it held its slots
+    /// forever while owning nothing, and enough ended streams closed
+    /// the session's reliable admission permanently — against the
+    /// "use another stream id" recovery that
+    /// [`LeafError::ReliableWindowFull`] exists to offer.
+    ///
+    /// The reservation therefore ends with **the exact owner**. The
+    /// range is bounded to this one `stream_id`, so a live stream's
+    /// stamps are untouched: the cap is enforced rather than relaxed,
+    /// and nothing is taken from work that can still be rebuilt.
+    pub fn retire_stream_stamps(&self, stream_id: u64) -> usize {
+        let mut stamps = self.stamps.borrow_mut();
+        let owned: Vec<(u64, u64)> = stamps
+            .range((stream_id, 0)..=(stream_id, u64::MAX))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in &owned {
+            stamps.remove(key);
+        }
+        owned.len()
+    }
+
     /// Rebuild `descriptors` into packets with fresh AEAD counters.
     ///
     /// A retransmit cannot replay the original ciphertext — the
@@ -657,6 +748,15 @@ impl LeafSession {
     /// Record one accepted inbound packet against the wire's
     /// receive state, and return the grant owed to its sender.
     ///
+    /// `mode_boundary` is the arriving packet's
+    /// [`OpenedPacket::mode_boundary`]: applied BEFORE the sequence
+    /// is offered to the reliability mode, because it is what
+    /// decides whether the sequences below it are a conceded
+    /// fire-and-forget prefix or a reliable gap this receiver must
+    /// keep NACKing. Applied after, the boundary packet's own
+    /// sequence would be measured against a cursor the boundary was
+    /// about to move.
+    ///
     /// `None` when the reliability layer refused the sequence (a
     /// duplicate, or past its acceptance horizon): crediting those
     /// bytes would refund the sender window for traffic that never
@@ -665,12 +765,16 @@ impl LeafSession {
         &self,
         stream_id: u64,
         reliable: bool,
+        mode_boundary: Option<u64>,
         sequence: u64,
         event_bytes: usize,
     ) -> Option<StreamWindow> {
         let stream = self
             .session
             .get_or_create_stream_for_packet(stream_id, reliable);
+        if let Some(boundary) = mode_boundary {
+            stream.ensure_reliable_at(boundary);
+        }
         if !stream.with_reliability(|r| r.on_receive(sequence)) {
             return None;
         }
@@ -682,6 +786,30 @@ impl LeafSession {
             stream_id,
             total_consumed,
             ack_seq,
+        })
+    }
+
+    /// The NACK this session owes `stream_id` **right now**,
+    /// because the arrival just processed revealed a hole no NACK
+    /// has reported yet.
+    ///
+    /// `None` when nothing new was revealed — so a burst stacked
+    /// behind one loss reports that loss once, and steady-state
+    /// traffic costs nothing. See
+    /// [`ReliabilityMode::take_gap_opened`](net_wire::reliability::ReliabilityMode::take_gap_opened)
+    /// for why the cumulative ack the same arrival already sends
+    /// cannot do this job.
+    pub fn opened_gap_nack(&self, stream_id: u64) -> Option<StreamNack> {
+        let stream = self.session.try_stream(stream_id)?;
+        let payload = stream.with_reliability(|r| {
+            r.take_gap_opened()
+                .then(|| r.build_nack())
+                .flatten()
+        })?;
+        Some(StreamNack {
+            stream_id,
+            next_expected: payload.next_expected,
+            missing_bitmap: payload.missing_bitmap,
         })
     }
 
@@ -790,6 +918,11 @@ impl LeafSession {
             stream_id: parsed.header.stream_id,
             sequence: parsed.header.sequence,
             reliable: parsed.header.flags.is_reliable(),
+            mode_boundary: parsed
+                .header
+                .flags
+                .is_mode_boundary()
+                .then_some(parsed.header.sequence),
             fragment_id: parsed.header.fragment_id,
             fragment_offset: parsed.header.fragment_offset,
             frag_flags: parsed.header.frag_flags,

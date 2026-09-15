@@ -267,6 +267,22 @@ pub struct Abandoned {
     pub scope: u64,
     /// The stream whose sequences the group consumed.
     pub stream_id: u64,
+    /// The mode the group's FIRST fragment declared.
+    ///
+    /// **The complete-or-terminal rule is reliability's, not
+    /// sequencing's.** The paragraph above is exactly true of a
+    /// reliable group: its sequences were acknowledged, the
+    /// acknowledgement retired the sender's only copy, and giving
+    /// up on the bytes afterwards is loss of data this leaf claimed
+    /// as progress — so the stream ends, typed. A fire-and-forget
+    /// group's contract is the opposite one. Its sequences were
+    /// never retransmittable in the first place, an incomplete
+    /// group is the loss its mode already permits, and ending the
+    /// stream over it makes an expected loss permanently fatal to
+    /// every later message on that id. So the mode rides out with
+    /// the group and the node dispositions each kind by its own
+    /// contract.
+    pub reliable: bool,
 }
 
 /// Report a group whose retained bytes are being given up on.
@@ -280,6 +296,7 @@ fn note_abandoned(abandoned: &mut Vec<Abandoned>, scope: u64, partial: &Partial)
         abandoned.push(Abandoned {
             scope,
             stream_id: partial.first.stream_id,
+            reliable: partial.first.reliable,
         });
     }
 }
@@ -1181,7 +1198,8 @@ mod tests {
             r.take_abandoned(),
             vec![Abandoned {
                 scope: 9,
-                stream_id: 4
+                stream_id: 4,
+                reliable: true
             }],
             "the reap must surrender the stream's ownership, not just count it"
         );
@@ -1253,7 +1271,8 @@ mod tests {
             r.take_abandoned(),
             vec![Abandoned {
                 scope: 2,
-                stream_id: 4
+                stream_id: 4,
+                reliable: true
             }]
         );
     }

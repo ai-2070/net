@@ -17,6 +17,67 @@ use crate::clock::{Clock, Instant, SystemClock};
 
 use crate::protocol::{NackPayload, PacketFlags};
 
+/// One stream's delivery mode **and where it began** — the single
+/// answer the wire's acknowledgement accounting, the consumer's
+/// reorder cursor and the stream's producers all read.
+///
+/// A stream id is shared: a channel's publish stream id is derived
+/// from the channel, so fire-and-forget and reliable producers land
+/// on one id and the stronger contract wins. "This stream is
+/// reliable" is therefore not enough to disposition a gap — the
+/// sequences the stream carried *before* it was promoted were sent
+/// by a mode that retained no descriptor, so no NACK can ever
+/// produce them, while everything from the promotion on must be
+/// delivered or the stream must fail. One boolean cannot separate
+/// those two halves of one sequence space, and three owners each
+/// guessing at the split is what produced an ACK for a packet
+/// nobody received, a consumer stalled behind a fire-and-forget
+/// loss, and a complete reliable message discarded as a duplicate.
+///
+/// So the split is a value, it is carried here, and it is
+/// **signalled** rather than inferred: see
+/// [`PacketFlags::MODE_BOUNDARY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// Never retransmitted, never held. Every gap is a loss, and
+    /// every gap is skippable.
+    FireAndForget,
+    /// Reliable from `boundary` on.
+    Reliable {
+        /// The first reliable sequence on this stream. Sequences
+        /// below it were fire-and-forget: conceded, skippable,
+        /// never NACKed. `boundary` and above are reliable:
+        /// NACKed, held, never skipped, never acknowledged unless
+        /// received.
+        boundary: u64,
+        /// Whether the boundary is the sender's stated one
+        /// ([`PacketFlags::MODE_BOUNDARY`]) rather than the
+        /// conservative one the receiver assumed until the signal
+        /// arrives. An assumed boundary may be raised by the
+        /// signal; a stated one is final.
+        signalled: bool,
+    },
+}
+
+impl StreamMode {
+    /// Whether this mode retransmits, holds and NACKs.
+    #[inline]
+    pub const fn is_reliable(self) -> bool {
+        matches!(self, Self::Reliable { .. })
+    }
+
+    /// The sequence below which a gap may be skipped without loss
+    /// of a reliable obligation: the promotion boundary, or
+    /// `u64::MAX` for a stream that never became reliable.
+    #[inline]
+    pub const fn skippable_below(self) -> u64 {
+        match self {
+            Self::FireAndForget => u64::MAX,
+            Self::Reliable { boundary, .. } => boundary,
+        }
+    }
+}
+
 /// Pre-encryption inputs needed to rebuild a packet for
 /// retransmission.
 ///
@@ -70,6 +131,29 @@ pub trait ReliabilityMode: Send + Sync {
 
     /// Build a NACK payload if there are missing sequences
     fn build_nack(&self) -> Option<NackPayload>;
+
+    /// Take-and-clear "an arrival just opened a hole no NACK has
+    /// reported yet".
+    ///
+    /// **A cumulative ack cannot ask for a retransmit.** The
+    /// receive path already sends its sender a window frame on
+    /// arrival, carrying `ack_seq` — "I have everything below N" —
+    /// and that is exactly the wrong shape for recovery: it says
+    /// nothing about WHICH sequence at or above N is missing, so a
+    /// sender holding descriptors for N..M learns only that its
+    /// frontier has not moved, which is equally consistent with
+    /// packets still in flight. The NACK is the actionable half,
+    /// and delaying it to the next periodic sweep delays recovery
+    /// by a whole tick for no reason: the arrival that revealed the
+    /// hole is the moment the receiver knows.
+    ///
+    /// Taken, so one hole costs one report. Eight arrivals stacked
+    /// behind one loss reveal the same hole once; only a NEW
+    /// disjoint hole sets it again. Default `false` — a mode that
+    /// tracks no gaps has none to open.
+    fn take_gap_opened(&mut self) -> bool {
+        false
+    }
 
     /// Process a received NACK and return descriptors for the
     /// caller to rebuild + dispatch. The returned `Arc` clones
@@ -201,14 +285,33 @@ pub trait ReliabilityMode: Send + Sync {
         None
     }
 
-    /// Receiver-side: expect `next_expected` next, with nothing
-    /// recorded as missing below it.
+    /// Receiver-side: the promotion boundary — expect
+    /// `next_expected` next, with nothing recorded as missing below
+    /// it.
     ///
     /// The other half of the upgrade handoff: everything below
     /// `next_expected` arrived under a mode that retained no
     /// descriptor for it, so it is as acknowledged as it will ever
     /// be and must not be NACKed. Default no-op.
     fn resume_rx_at(&mut self, _next_expected: u64) {}
+
+    /// Receiver-side: RAISE the promotion boundary to `boundary`,
+    /// conceding the fire-and-forget sequences between the old one
+    /// and the new, and keeping every reliable range above it.
+    /// Returns whether the boundary moved.
+    ///
+    /// Only a SIGNALLED boundary
+    /// ([`crate::protocol::PacketFlags::MODE_BOUNDARY`]) may call
+    /// this, and only upward. Until the signal lands, a receiver
+    /// that sees reliable traffic promotes at its own cursor — the
+    /// conservative boundary, which concedes nothing and NACKs the
+    /// hole. When the signal then names a higher boundary, the
+    /// sequences below it were fire-and-forget after all, and this
+    /// is what releases the stream from a hole no retransmit could
+    /// ever fill. Default no-op returning `false`.
+    fn concede_rx_below(&mut self, _boundary: u64) -> bool {
+        false
+    }
 
     /// Get the name of this reliability mode
     fn name(&self) -> &'static str;
@@ -345,19 +448,13 @@ pub struct ReliableStream {
     /// order and reassembled by seq — so memory is
     /// O([`Self::MAX_REORDER_RANGES`]).
     received_ranges: VecDeque<(u64, u64)>,
-    /// Set while this mode is RESUMING a stream that carried
-    /// fire-and-forget traffic before it became reliable
-    /// ([`crate::session::StreamState::ensure_reliable`]): the
-    /// sequence below which everything is conceded, and above which
-    /// the first arrival defines the reliable baseline. `None` once
-    /// that arrival has landed, which is every ordinary stream from
-    /// its first packet.
-    resume_floor: Option<u64>,
-    /// Sequences above [`Self::resume_floor`] that have arrived while
-    /// the floor itself has not. The evidence a concession needs.
-    resume_above: u64,
     /// Out-of-order arrivals accepted into the range index (R-2).
     oo_accepted: u64,
+    /// Set when an arrival opened a hole nobody has reported yet
+    /// (`insert_received`), and taken by
+    /// [`ReliabilityMode::take_gap_opened`]. One report per hole:
+    /// eight arrivals behind one loss produce one NACK, not eight.
+    gap_opened: bool,
     /// Arrivals rejected past the reorder horizon (R-2).
     oo_dropped_horizon: u64,
     /// Arrivals rejected because the range index was at
@@ -490,12 +587,27 @@ impl ReliableStream {
     /// against the receive half it had just retired. Attempts are
     /// now paced by [`Self::retransmit_timeout`]'s doubling ladder,
     /// so the budget spans a real horizon instead of a burst:
-    /// `50 + 100 + 200 + 400 + 800 + 1600 + 2000` ms ≈ 5.15 s at
-    /// [`Self::DEFAULT_RTO`], capped per attempt by
-    /// [`Self::MAX_RTO`]. That is 25× the worst receiver stall
-    /// measured against this transport and well inside the 30 s
+    /// `50 + 100 + 200 + 400 + 800 + 1600 + 2000 + 2000` ms
+    /// = **7 150 ms** at [`Self::DEFAULT_RTO`], each attempt capped
+    /// by [`Self::MAX_RTO`]. Against the same worst receiver stall
+    /// the old figure divided into 5.15 s to get 25×, that is ≈35×,
+    /// and it stays well inside the 30 s
     /// transfer timeout above it, while a genuinely dead peer still
     /// fails its stream loudly and bounded.
+    ///
+    /// **Count the terms.** This comment said 5.15 s for two rounds,
+    /// and the sum was right for the list it wrote down — the list
+    /// was short one term. [`Self::give_up_horizon`] sums
+    /// [`Self::retransmit_timeout`] over `0..=max_retries`, which is
+    /// EIGHT steps at `max_retries = 7`, because the horizon is the
+    /// seven attempts *plus the final timeout that gives up*; the
+    /// eighth doubling would be 6 400 ms and clamps to a second
+    /// [`Self::MAX_RTO`] of 2 000 ms. Anyone re-deriving 5.15 s from
+    /// a seven-term list will conclude the code is wrong; it is not,
+    /// the list was. Do not restate this figure anywhere — read it
+    /// from `give_up_horizon`, which is public for exactly that
+    /// reason, and which `give_up_horizon_is_the_documented_ladder`
+    /// pins term by term.
     pub const DEFAULT_MAX_RETRIES: u8 = 7;
 
     /// Cap on tracked out-of-order received ranges (R-2). An insert
@@ -506,20 +618,6 @@ impl ReliableStream {
     /// window is pathological sustained reordering; the sender's RTO
     /// recovers whatever a reject drops.
     pub const MAX_REORDER_RANGES: usize = 32;
-
-    /// How many later sequences must arrive without the resume floor
-    /// before a RESUMED stream concedes it (see `on_receive`).
-    ///
-    /// Two properties fix the number. It has to exceed ordinary
-    /// reordering depth, or a reliable packet merely late would be
-    /// conceded while its own retransmit was in flight. And it has to
-    /// be small enough that a boundary hole the sender genuinely
-    /// cannot rebuild — a fire-and-forget sequence it retained
-    /// nothing for — is conceded within the same burst rather than
-    /// stalling the stream to its transfer timeout. Eight arrivals is
-    /// several NACK ticks' worth of chances for a recoverable packet
-    /// and a small fraction of any real burst.
-    pub const RESUME_CONCESSION_ARRIVALS: u64 = 8;
 
     /// Cap on the reorder-acceptance horizon in packets (R-2). Equal
     /// to the retransmit-window cap — accepting further ahead than
@@ -568,9 +666,8 @@ impl ReliableStream {
         Self {
             next_expected: 0,
             received_ranges: VecDeque::new(),
-            resume_floor: None,
-            resume_above: 0,
             oo_accepted: 0,
+            gap_opened: false,
             oo_dropped_horizon: 0,
             oo_dropped_capacity: 0,
             last_sacked: Vec::new(),
@@ -901,13 +998,21 @@ impl ReliableStream {
             self.oo_accepted += 1;
             return true;
         }
-        // Fresh disjoint range.
+        // Fresh disjoint range — which means this arrival did not
+        // touch anything already indexed, so the sequences between
+        // it and whatever precedes it are a hole nobody has reported
+        // yet. THE gap-opening event, and the one the receiver owes
+        // its sender a NACK for immediately: the cumulative ack it
+        // sends alongside says "I have through N" and cannot say
+        // which sequence above N is missing, so without this the
+        // sender learns nothing actionable until the next NACK tick.
         if self.received_ranges.len() >= Self::MAX_REORDER_RANGES {
             self.oo_dropped_capacity += 1;
             return false;
         }
         self.received_ranges.insert(idx, (seq, seq + 1));
         self.oo_accepted += 1;
+        self.gap_opened = true;
         true
     }
 }
@@ -960,53 +1065,36 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
-        // **A RESUMED stream's head gap is ambiguous, and is asked
-        // for before it is conceded.** A stream that carried
-        // fire-and-forget traffic before it became reliable
-        // (`crate::session::StreamState::ensure_reliable`) resumes at
-        // the sequence after the last one it observed — but under
-        // fire-and-forget a sequence can simply have been lost, so
-        // that floor may name a hole no retransmit can ever produce:
-        // its sender retained no descriptor for it. Waiting on it
-        // forever holds every reliable arrival behind a permanent
-        // stall, which is worse than the loss.
+        // **No arrival count establishes receipt.** This used to
+        // treat a resumed stream's first expected sequence as a
+        // provisional floor and CONCEDE it once eight higher
+        // sequences had arrived without it — the reasoning being
+        // that a fire-and-forget sequence lost before the upgrade
+        // can never be retransmitted, so waiting on it stalls the
+        // stream forever. The reasoning was right; the mechanism
+        // acknowledged a packet nobody received. `next_expected` is
+        // the cumulative ACK ([`Self::rx_ack_seq`]), so conceding a
+        // hole told the sender to retire the only copy of a
+        // sequence that never arrived — and the ordinary ack path
+        // then did it for a genuinely reliable packet too, on the
+        // evidence of nothing but eight later arrivals.
         //
-        // So the floor is treated as a gap FIRST — it is NACKed like
-        // any other, and a genuinely reliable packet lost at the
-        // boundary is recovered normally — and conceded only once
-        // [`Self::RESUME_CONCESSION_ARRIVALS`] later sequences have
-        // arrived without it. That is the evidence that the sender
-        // has moved on and cannot rebuild it. The concession then
-        // starts the stream at the lowest sequence actually received,
-        // so everything held behind the phantom hole is released in
-        // order rather than discarded.
-        if let Some(floor) = self.resume_floor {
-            if seq < floor {
-                return false;
-            }
-            if seq == floor {
-                self.resume_floor = None;
-                self.resume_above = 0;
-            } else {
-                self.resume_above += 1;
-                if self.resume_above >= Self::RESUME_CONCESSION_ARRIVALS {
-                    self.resume_floor = None;
-                    self.resume_above = 0;
-                    self.next_expected = self
-                        .received_ranges
-                        .front()
-                        .map_or(seq, |&(start, _)| start.min(seq));
-                    if let Some(&(start, end)) = self.received_ranges.front() {
-                        if start == self.next_expected {
-                            self.next_expected = end;
-                            self.received_ranges.pop_front();
-                        }
-                    }
-                }
-            }
-        }
+        // Where a stream became reliable is now a SIGNALLED fact,
+        // not an inferred one: the sender stamps
+        // [`crate::protocol::PacketFlags::MODE_BOUNDARY`] on the
+        // first reliable packet it puts on the stream, and
+        // `StreamState::ensure_reliable_at` turns that into
+        // [`Self::resume_rx_at`] plus, if a conservative boundary
+        // was assumed in the meantime,
+        // [`Self::concede_rx_below`]. Everything below the boundary
+        // is fire-and-forget and conceded by the boundary itself;
+        // everything at or above it is reliable and is NACKed until
+        // it arrives. So there is nothing left for this path to
+        // guess.
+        //
         // Anything below next_expected has already been received
-        // contiguously; reject as a duplicate.
+        // contiguously, or was conceded below the boundary; reject
+        // as a duplicate either way.
         if seq < self.next_expected {
             return false;
         }
@@ -1191,6 +1279,11 @@ impl ReliabilityMode for ReliableStream {
 
     fn take_failed(&mut self) -> bool {
         std::mem::take(&mut self.failed)
+    }
+
+    #[inline]
+    fn take_gap_opened(&mut self) -> bool {
+        std::mem::take(&mut self.gap_opened)
     }
 
     fn ack_frontier(&self) -> Option<u64> {
@@ -1390,8 +1483,6 @@ impl ReliabilityMode for ReliableStream {
     fn reset_rx(&mut self) {
         self.next_expected = 0;
         self.received_ranges.clear();
-        self.resume_floor = None;
-        self.resume_above = 0;
     }
 
     /// The contiguous frontier: everything below `next_expected` is
@@ -1405,11 +1496,31 @@ impl ReliabilityMode for ReliableStream {
     fn resume_rx_at(&mut self, next_expected: u64) {
         self.next_expected = next_expected;
         self.received_ranges.clear();
-        // The floor is a GAP, not a concession: it is NACKed first,
-        // and only conceded once enough later sequences have arrived
-        // without it. See `on_receive`.
-        self.resume_floor = Some(next_expected);
-        self.resume_above = 0;
+    }
+
+    fn concede_rx_below(&mut self, boundary: u64) -> bool {
+        if boundary <= self.next_expected {
+            return false;
+        }
+        self.next_expected = boundary;
+        // Everything the index still holds below the new boundary
+        // is inside conceded territory; a range straddling it keeps
+        // only its upper half, and one that becomes contiguous with
+        // the boundary is absorbed. Ranges are ascending and merged,
+        // so this walk stops at the first range that survives whole.
+        while let Some(&(start, end)) = self.received_ranges.front() {
+            if end <= self.next_expected {
+                self.received_ranges.pop_front();
+                continue;
+            }
+            if start <= self.next_expected {
+                self.next_expected = end;
+                self.received_ranges.pop_front();
+                continue;
+            }
+            break;
+        }
+        true
     }
 
     #[inline]
@@ -1463,6 +1574,73 @@ mod tests {
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
         })
+    }
+
+    /// `give_up_horizon` is the ladder its own documentation
+    /// describes, term by term — not merely the same total.
+    ///
+    /// This exists because the `DEFAULT_MAX_RETRIES` comment stated
+    /// the horizon as 5.15 s for two rounds. The sum was right for
+    /// the list written down; the list was one term short, because
+    /// `give_up_horizon` covers `0..=max_retries` — the attempts
+    /// PLUS the final timeout that gives up — and the eighth
+    /// doubling clamps to a second `MAX_RTO`. A hand-summed constant
+    /// is what went unchecked, so nothing here restates one: the
+    /// expected value is summed from `retransmit_timeout` over the
+    /// documented range.
+    ///
+    /// Checking the shape and not just the total is deliberate. A
+    /// change that shortened the ladder by one step and lengthened
+    /// another to compensate would leave a total-only assertion
+    /// green while the pacing every layer above reasons against had
+    /// changed.
+    #[test]
+    fn give_up_horizon_is_the_documented_ladder() {
+        let rto = ReliableStream::DEFAULT_RTO;
+        let retries = ReliableStream::DEFAULT_MAX_RETRIES;
+
+        // The ladder, derived: one step per attempt in `0..=retries`.
+        let steps: Vec<Duration> = (0..=retries)
+            .map(|n| ReliableStream::retransmit_timeout(rto, n))
+            .collect();
+        assert_eq!(
+            steps.len(),
+            usize::from(retries) + 1,
+            "the horizon covers the retry attempts PLUS the final timeout that \
+             gives up; a ladder of {} steps for {retries} retries is the \
+             off-by-one that produced the 5.15 s figure",
+            steps.len()
+        );
+
+        // Each step doubles until `MAX_RTO` clamps it, and the clamp
+        // is reached — the last two steps being equal is what the
+        // short list lost.
+        for (n, step) in steps.iter().enumerate() {
+            let want = rto.saturating_mul(1u32 << n).min(ReliableStream::MAX_RTO);
+            assert_eq!(*step, want, "step {n} of the backoff ladder");
+        }
+        assert_eq!(
+            steps[steps.len() - 1],
+            ReliableStream::MAX_RTO,
+            "the ladder must reach the per-attempt cap, or `MAX_RTO` is not \
+             bounding anything"
+        );
+
+        let summed: Duration = steps.iter().fold(Duration::ZERO, |a, b| a + *b);
+        assert_eq!(
+            ReliableStream::give_up_horizon(rto, retries),
+            summed,
+            "`give_up_horizon` must be exactly the sum of its own ladder"
+        );
+        // And the documented figure, stated once, here, where it is
+        // checked rather than asserted in prose.
+        assert_eq!(
+            summed,
+            Duration::from_millis(7_150),
+            "50 + 100 + 200 + 400 + 800 + 1600 + 2000 + 2000 ms = 7150 ms; if \
+             this moved, every doc and report that names the horizon has to \
+             move with it"
+        );
     }
 
     #[test]
