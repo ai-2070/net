@@ -2445,6 +2445,34 @@ established) and the anchorless "nothing dropped" assertion at
 `a020feb22`. R3's native-window and reliable loss/reorder evidence
 still owed as real witnesses.
 
+**Second repair round delivered (`0fad0d648`…`b66752643`); Kyra: HOLD
+at `b66752643`, credit widening.** All 25 reviewer probes green;
+F1/F4/F7 closed outright, L2/L4/L5/L6/L7 and N2/N4/N5 credited (N4:
+the id-addressed core/SDK APIs restored beside the fenced ones, no
+weakening found); wasm 15/15 + 2/2 + 24/24; Chromium **and Firefox
+21/21**. The one CI red at that head was an invented leader roster
+(18 of 24 pinned names nonexistent) — fixed in `f958775f7`. Three
+new counterexamples (reviewer reproduced 3/2; brief
+`spikes/S5_R3_BRIEF.md`): **P1** an acknowledged fragment group
+expires silently (tail ACKed into a headless group, no `StreamFailed`);
+**P2** same-session close/reopen strands the peer's next sequence;
+**P3** a control overdraft is forgotten when a partial grant arrives
+(withheld application bytes refunded). Eleven source-established
+ownership branches (RESET vs partials, `send_subprotocol` bypassing
+the terminal guard, fragment plane provenance, stamp-cap eviction,
+connect-cancellation resource cleanup, follower-announce union, proxied
+server reborrow, pre-send debit refund, native retirement atomicity,
+replacement/sweep reassembly cleanup, native fragment metadata). **Two
+owner questions surfaced, not decided:** announcement expiry — the
+leaf pins inclusive freshness (TTL-zero authority within the issuing
+second) while native expires at `age >= ttl` (opposite outcomes;
+reviewer's default is to match native at nanosecond precision); and
+N4's residue — new `StreamStats` fields / `StreamError` variants are
+source breaks for downstream Rust (`#[non_exhaustive]` + constructor,
+or a minor-version bump with a note). Also from Kyra: the uncharged
+event-batch producers predate Stage 5 — a scoped byte-conservation
+limitation to document, not an N1 attribution.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
