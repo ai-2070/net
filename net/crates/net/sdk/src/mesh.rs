@@ -1118,7 +1118,12 @@ impl Mesh {
     /// Returns [`SdkError::Backpressure`] when the stream's per-stream
     /// in-flight window is full (no events were sent — the caller
     /// decides whether to drop, retry, or buffer). [`SdkError::NotConnected`]
-    /// when the peer session is gone. All other failures surface as
+    /// when the peer session is gone. [`SdkError::EventTooLarge`] — with
+    /// the limit in it — when one event is bigger than a single Net
+    /// packet can carry: nothing is sent, and no receiver in the mesh
+    /// would have accepted it. Compare against
+    /// [`MAX_EVENT_SIZE`](net::adapter::net::MAX_EVENT_SIZE) to split
+    /// before sending. All other failures surface as
     /// [`SdkError::Adapter`].
     pub async fn send_on_stream(&self, stream: &Stream, events: &[Bytes]) -> Result<()> {
         self.node

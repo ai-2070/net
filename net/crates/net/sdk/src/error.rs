@@ -82,6 +82,23 @@ pub enum SdkError {
     #[error("stream's session has been replaced by a successor")]
     SessionSuperseded,
 
+    /// One event handed to a stream send is larger than a single Net
+    /// packet can carry, so nothing was sent.
+    ///
+    /// Mirrored from `StreamError::EventTooLarge` rather than
+    /// stringified, and it carries the limit: the bound is not
+    /// otherwise discoverable, and the pre-repair transport answered
+    /// an over-cap send with `Ok` and delivered nothing. Retrying is
+    /// pointless — split the payload at the application layer, or
+    /// use a producer that fragments.
+    #[error("stream event of {size} bytes exceeds the {limit}-byte per-event limit")]
+    EventTooLarge {
+        /// The offending event's length in bytes.
+        size: usize,
+        /// The largest event the transport can carry, in bytes.
+        limit: usize,
+    },
+
     /// A publisher's `Ack` rejected a Subscribe / Unsubscribe
     /// request. `None` means the rejection arrived without a
     /// structured reason. Gated behind `net` because
@@ -124,6 +141,7 @@ impl From<net::adapter::net::StreamError> for SdkError {
             StreamError::NotConnected => SdkError::NotConnected,
             StreamError::SessionSuperseded => SdkError::SessionSuperseded,
             StreamError::Transport(msg) => SdkError::Adapter(msg),
+            StreamError::EventTooLarge { size, limit } => SdkError::EventTooLarge { size, limit },
             // `StreamError` is `#[non_exhaustive]`: a variant this SDK
             // predates must surface as a failure, and specifically not
             // as `Backpressure` (which a caller retries) or

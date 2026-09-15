@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use net_wire::clock::Instant;
-use net_wire::protocol::{EventFrame, MAX_PAYLOAD_SIZE};
+use net_wire::protocol::MAX_EVENT_SIZE;
 
 use crate::counters::{DropReason, LeafCounters};
 use crate::error::{LeafError, Result};
@@ -55,9 +55,15 @@ use crate::error::{LeafError, Result};
 // single fragmentation vocabulary.
 pub use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
 
-/// The largest single event that fits in one packet: the payload cap
-/// minus the event frame's 4-byte length prefix.
-pub const MAX_FRAGMENT_PAYLOAD: usize = MAX_PAYLOAD_SIZE - EventFrame::LEN_SIZE;
+/// The largest single event that fits in one packet.
+///
+/// The wire crate's [`MAX_EVENT_SIZE`] — the payload cap minus the
+/// event frame's 4-byte length prefix — under the name this module
+/// reasons in. One definition, because the native send path refuses
+/// above exactly this bound and the leaf fragments at exactly it: two
+/// derivations of the same number could drift apart and turn a
+/// refusal into a drop.
+pub const MAX_FRAGMENT_PAYLOAD: usize = MAX_EVENT_SIZE;
 
 /// Fragments per group, capped so every `fragment_offset` is
 /// representable in the header's `u16`.
@@ -685,6 +691,7 @@ impl Reassembler {
 mod tests {
     use super::*;
     use crate::clock::now;
+    use net_wire::protocol::{EventFrame, MAX_PAYLOAD_SIZE};
 
     fn payload(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()

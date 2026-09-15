@@ -199,6 +199,25 @@ pub enum StreamError {
     /// Underlying transport failure (socket error, encryption error).
     /// Wraps the originating adapter-level error's message.
     Transport(String),
+    /// One event in the batch is larger than a single packet can
+    /// carry, so no send path could ever deliver it. Nothing was
+    /// enqueued — the refusal happens before any packet of the call
+    /// reaches the wire.
+    ///
+    /// Names the limit on purpose. The bound is
+    /// [`MAX_EVENT_SIZE`](crate::protocol::MAX_EVENT_SIZE) —
+    /// `MAX_PAYLOAD_SIZE` minus the event frame's 4-byte length
+    /// prefix — and a caller that cannot see it in the error has no
+    /// way to discover it except by losing data. Retrying is
+    /// pointless; the payload has to be split by the application, or
+    /// carried by a producer that fragments (the browser leaf's
+    /// `frame` module is the only one that does).
+    EventTooLarge {
+        /// The offending event's length in bytes.
+        size: usize,
+        /// The largest event this transport can carry, in bytes.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for StreamError {
@@ -210,6 +229,13 @@ impl fmt::Display for StreamError {
                 write!(f, "stream's session has been replaced by a successor")
             }
             StreamError::Transport(msg) => write!(f, "stream transport error: {}", msg),
+            StreamError::EventTooLarge { size, limit } => write!(
+                f,
+                "stream event of {} bytes exceeds the {}-byte per-event limit \
+                 (MAX_EVENT_SIZE); nothing was sent — split the payload at the \
+                 application layer",
+                size, limit
+            ),
         }
     }
 }

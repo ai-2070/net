@@ -989,6 +989,13 @@ mod mesh_bindings {
             StreamError::Transport(msg) => {
                 PyRuntimeError::new_err(format!("stream transport error: {}", msg))
             }
+            // `ValueError`, not a transport error: the payload is the
+            // problem and no amount of retrying changes it.
+            StreamError::EventTooLarge { size, limit } => PyValueError::new_err(format!(
+                "stream event of {} bytes exceeds the {}-byte per-event limit; \
+                 nothing was sent",
+                size, limit
+            )),
         }
     }
 

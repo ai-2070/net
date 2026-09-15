@@ -93,6 +93,11 @@ pub(crate) const NET_ERR_CHANNEL_AUTH: c_int = -116;
 /// and the stream id may be open on its successor session, which this
 /// handle does not own. Re-open; retrying the handle cannot succeed.
 pub(crate) const NET_ERR_MESH_SESSION_SUPERSEDED: c_int = -117;
+/// One event in the batch is larger than a single Net packet can
+/// carry. Nothing was sent. Distinct from `TRANSPORT`: no I/O was
+/// attempted, the payload itself is the fault, and retrying cannot
+/// help — the caller must split it.
+pub(crate) const NET_ERR_MESH_EVENT_TOO_LARGE: c_int = -118;
 
 // Identity + token error codes. Block -120..-129 mirrors the
 // `"identity: ..."` / `"token: <kind>"` prefix convention used by
@@ -351,6 +356,7 @@ fn stream_err_to_code(err: &StreamError) -> c_int {
         StreamError::NotConnected => NET_ERR_MESH_NOT_CONNECTED,
         StreamError::SessionSuperseded => NET_ERR_MESH_SESSION_SUPERSEDED,
         StreamError::Transport(_) => NET_ERR_MESH_TRANSPORT,
+        StreamError::EventTooLarge { .. } => NET_ERR_MESH_EVENT_TOO_LARGE,
         // `StreamError` is `#[non_exhaustive]`, so a variant this ABI
         // has never heard of can reach here. It becomes the generic
         // failure code and NOTHING else: mapping an unrecognised

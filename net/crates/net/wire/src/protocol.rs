@@ -35,6 +35,24 @@ pub const MAX_PACKET_SIZE: usize = 8192;
 /// Maximum payload size (packet - header - tag)
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
 
+/// The largest single event any one packet can carry: the payload
+/// cap minus the event frame's own 4-byte length prefix.
+///
+/// This is the size a producer is actually bounded by, and it is
+/// stated here — beside the cap it derives from — because both ends
+/// of every transport need the same number. A batch of events is
+/// split across packets by the batching layer, but **one event is
+/// never split by any native send path**: nothing on the native side
+/// fragments an outbound stream event, and the only receivers that
+/// reassemble fragments at all are the browser leaf
+/// (`net-mesh-leaf`'s `frame` module) and the native RTC ingress.
+/// Every other receive path reads into a [`MAX_PACKET_SIZE`] buffer
+/// and `NetHeader::validate` refuses an over-cap `payload_len`, so an
+/// event above this bound cannot arrive anywhere — which is why
+/// `MeshNode::send_on_stream` refuses it at the sender instead of
+/// returning `Ok` for bytes that will never be delivered.
+pub const MAX_EVENT_SIZE: usize = MAX_PAYLOAD_SIZE - EventFrame::LEN_SIZE;
+
 /// `frag_flags` bit 0: this packet carries a piece of a payload
 /// that did not fit one packet.
 ///

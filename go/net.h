@@ -66,6 +66,12 @@ typedef enum {
      * the stream id may be open on its successor session, which the handle
      * does not own. Re-open; retrying the handle cannot succeed. */
     NET_ERR_MESH_SESSION_SUPERSEDED = -117,
+    /* One payload in the batch is larger than a single Net packet can
+     * carry (MAX_EVENT_SIZE = MAX_PAYLOAD_SIZE - 4). Nothing was sent.
+     * Not a transport fault and not retryable: no receive path accepts
+     * an over-cap packet, so the payload must be split by the caller.
+     * The detail string names the limit. */
+    NET_ERR_MESH_EVENT_TOO_LARGE = -118,
     /* Identity + permission-token surface (compiled when the Rust
      * cdylib has the `net` feature on). Codes below -119 — one per
      * `TokenError` kind so Go callers can `errors.Is` without

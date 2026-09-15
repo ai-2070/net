@@ -134,10 +134,17 @@ mesh.close_stream(&stream)?;
 - `Reliability::Reliable` — FIFO delivery within the stream. Gaps trigger NACK-driven retransmission; the receive side reorders into sequence.
 - `Reliability::FireAndForget` — best-effort. Sequence numbers are monotonic on the wire so callers who care can detect loss / reorder themselves, but the transport performs no recovery.
 - **No ordering across streams.** A later-sent packet on stream A may arrive before an earlier-sent packet on stream B. Fair scheduling prevents starvation; cross-stream timing is unsynchronized.
+- **The ordering survives dispatch.** A consumer that spawns per event would hand the order it was just given back to the scheduler. The unary nRPC server does not: requests from one source (`from_node`, receiving session, caller origin — one channel-keyed publisher stream) ENTER their handlers in the order the stream delivered them, while their bodies still execute concurrently. The chain passes at each handler's entry, never at its completion, so a handler that never returns delays nothing (`adapter/net/cortex/rpc.rs`, `RpcServerFold`'s entry chain).
 
 **Stream IDs are opaque.** No range has reserved meaning at the transport layer. Subprotocol dispatch uses the `subprotocol_id` field in the header; do not conflate.
 
 **Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
+
+**Payload size, and it is refused rather than dropped.** One event must fit one packet. The bound is `MAX_EVENT_SIZE` (8 104 B = `MAX_PAYLOAD_SIZE` 8 108 − the event frame's 4-byte length prefix), re-exported from `net::adapter::net` so a caller can check before sending. A batch is split across packets by the batching layer, but **no native send path splits a single event**: `send_on_stream` refuses any event above `MAX_EVENT_SIZE` with `StreamError::EventTooLarge { size, limit }` — before the peer is resolved, before a sequence is consumed, and whole, so the fitting prefix of a mixed batch never reaches the wire either. Retrying cannot help; split at the application layer or open a second stream.
+
+*Why a refusal and not fragmentation.* `NetHeader` carries `fragment_id` / `fragment_offset` / `frag_flags` and two receivers interpret them: the browser leaf (`net-mesh-leaf`'s `frame` module, which fragments **and** reassembles) and the native RTC ingress (`adapter/net/rtc/fragment.rs`, which reassembles what a leaf sent). Every other receive path — UDP included — reads into a `MAX_PACKET_SIZE` buffer and `NetHeader::validate` refuses an over-cap `payload_len`, and no native node reassembles. Fragmenting in a transport-agnostic send would therefore hand a native peer's application N partial events as if each were a message: a silent corruption in place of a silent drop. The refusal is uniform and discoverable instead.
+
+*Both directions read the same.* Leaf → native: the leaf fragments up to 8 pieces (64 832 B) and a native receiver does not reassemble them, so a leaf keeps its own traffic under the cap unless the peer is another leaf or the RTC ingress; above 64 832 B the leaf refuses with a typed `LeafError::Wire` naming streams. Native → leaf: the sender refuses above `MAX_EVENT_SIZE` with `StreamError::EventTooLarge`. Neither direction truncates, and neither answers `Ok` for bytes it will not deliver.
 
 **Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when the stream's remaining send credit is below the payload size it wants to push. Credit is measured in **bytes**, seeded at open time from `StreamConfig::window_bytes` (default 64 KB; `0` disables backpressure entirely), decremented on each socket send, and replenished by receiver-driven `StreamWindow` grants (subprotocol `0x0B00`). The signal catches both concurrent callers racing on the same window AND a serial sender outrunning a slow receiver across the network — the latter no longer surfaces as `StreamError::Transport(String)` when the kernel buffer fills.
 
@@ -151,6 +158,11 @@ match mesh.send_on_stream(&stream, &[event]).await {
     Err(StreamError::Transport(e)) => tracing::warn!(error = %e, "send failed"),
     Err(StreamError::NotConnected) => {/* peer gone */}
     Err(StreamError::SessionSuperseded) => {/* re-open against the current session */}
+    Err(StreamError::EventTooLarge { size, limit }) => {
+        // Nothing was sent, and retrying is futile — split it.
+        tracing::error!(size, limit, "event exceeds what one packet carries");
+    }
+    Err(e) => tracing::warn!(error = %e, "send failed"), // non_exhaustive
 }
 
 // 2. Retry with backoff — best for important events.

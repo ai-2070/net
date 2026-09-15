@@ -1161,6 +1161,14 @@ mod mesh_bindings {
             StreamError::Transport(msg) => {
                 Error::from_reason(format!("stream transport error: {}", msg))
             }
+            // Not prefix-sniffable on purpose: there is no retry or
+            // reconnect for this, so `sdk-ts` lets it through as a
+            // plain `Error` whose message carries the limit.
+            StreamError::EventTooLarge { size, limit } => Error::from_reason(format!(
+                "stream event too large: {} bytes exceeds the {}-byte per-event limit; \
+                 nothing was sent",
+                size, limit
+            )),
         }
     }
 
