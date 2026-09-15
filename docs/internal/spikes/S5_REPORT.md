@@ -1612,7 +1612,94 @@ Corrections, each executed rather than asserted:
   which had been 40 tests of slack, enough to lose five whole
   binaries and still pass.
 
-### 13.5 Owner questions — stated, not decided
+### 13.5 Two regressions this round caused, and its own evidence caught
+
+Both were found by the browser matrix after every lane reported
+green, and both were diagnosed from evidence earlier rounds had added
+to the witnesses rather than by re-running until something looked
+different.
+
+**The mode boundary was stamped by the leaf and read by nobody
+else.** R3-1's `PacketFlags::MODE_BOUNDARY` had exactly one reader in
+the tree — the leaf — because `ensure_reliable_at` had exactly one
+caller. The native receive path still used the conservative ASSUMED
+boundary of "rx high-water + 1", and the same commit deleted
+`RESUME_CONCESSION_ARRIVALS` from the SHARED wire path, which is what
+had been covering the native receiver until then. Neither mechanism
+was left.
+
+The consequence is exact, not probabilistic: the fire-and-forget
+witness rides the same stream id and always elides its LAST datagram,
+so the anchor's assumed boundary named a fire-and-forget sequence
+whose sender retained no descriptor. Nothing could ever produce it,
+every reliable arrival above it was held, the cumulative ack never
+advanced, and the ladder exhausted into a typed failure — on a link
+where every reliable byte was recoverable. The counters said it
+plainly: `stream_failed: 2` with every gap and duplicate counter at
+zero.
+
+The boundary now lives on the one call every receive path makes, so a
+third path cannot forget it, and the leaf's separate call is deleted
+rather than left as a second way to do the same thing. A leaf-to-leaf
+reproduction of the browser's exact shape recovers 40/40 — both ends
+of a leaf pair stamp AND read the signal, which is why no leaf probe
+could ever have seen this. The cheap witness is pinned.
+
+**An oracle outlived the mechanism it measured.** Round 3 added the
+per-source handler-entry chain and a witness leg for it in the same
+commit. Round 4 removed the chain — deliberately, on the reviewer's
+analysis, with two tests pinned for the opposite — and left the leg
+measuring handler ENTRY order, which the fold no longer provides and
+Net does not promise. Measured with a throwaway probe: 40 requests
+handed to `apply_inbound` in order, fully synchronous handler, enter
+as 1, 0, 2, 4, 3, 5, 14, 21, 6, with no transport involved at all.
+
+The leg moved to the boundary where the contract lives, via a
+fixtures-gated observer firing INLINE in the serve bridge's own task
+immediately before `apply_inbound` — the hand-off itself, so an
+observation cannot reorder relative to the dispatch it observes.
+Every other assertion is unchanged, and the two pinned fold tests
+were not touched. This is a re-scope and the witness text says so:
+restoring entry order instead would have reinstated, through the back
+door, the semantics this round was told to withdraw.
+
+**And a process finding worth as much as either.** `leaf/pkg` and
+`browser-ts/dist` on disk predated this round's leaf commits by two
+hours, so part of a failing matrix run was measuring a stale bundle.
+A browser result is only about the tree if the bundle was rebuilt
+from it; the rebuild is now documented as part of running the matrix:
+
+```
+cd net/crates/net/leaf && cargo build --release --target wasm32-unknown-unknown \
+  && wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/net_leaf.wasm
+cd net/crates/net/browser-ts && npm run build
+```
+
+### 13.6 The day the disk filled
+
+Recorded because it shaped the round's evidence and because the
+detection technique is worth keeping. C: reached zero bytes free
+twice while five lanes were editing. ENOSPC on a write TRUNCATES the
+file rather than rolling back, and `git status` reports the result as
+an ordinary ` M` — indistinguishable from a normal edit. Four source
+files were truncated to zero or one line across the two events
+(`go/mesh.go`, `leaf/src/session.rs`, `wire/src/protocol.rs`,
+`tests/rtc_repairs.rs`).
+
+Nothing shipped truncated, for one reason: every lane compared line
+counts against `git show HEAD:<path>` and then re-verified by
+CONSTRUCT — grepping for each symbol it had added — rather than
+trusting a plausible-looking file. One lane also restored a shared
+file from a `cp` backup and correctly flagged that it could have
+rolled back a sibling's landed hunk; it had not, and the technique
+was dropped in favour of targeted edits for the rest of the round.
+
+The lesson that belongs in the repo rather than in a person's memory:
+after any ENOSPC, line count is the cheap detector and construct
+grep is the real one, and a restore that rewrites a whole shared file
+is never safe while siblings are editing it.
+
+### 13.7 Owner questions — stated, not decided
 
 Four, none of them ours to settle. Each is stated with what we would
 recommend and what it costs, so a decision is cheap to make and
