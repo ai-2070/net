@@ -66,7 +66,12 @@ def main() -> int:
         if args.mode == "fn":
             pattern = re.compile(rf"\bfn\s+{re.escape(name)}\s*\(")
         else:
-            pattern = re.compile(rf'"{re.escape(name)}"')
+            # Rust uses `"name"`, JavaScript uses `'name'` or a
+            # template literal. Accepting only one of them would fail
+            # a roster whose witnesses are perfectly fine, which is
+            # the same false alarm this script exists to prevent.
+            quoted = re.escape(name)
+            pattern = re.compile(rf"""(?:"{quoted}"|'{quoted}'|`{quoted}`)""")
         return any(pattern.search(text) for text in texts.values())
 
     bad = [name for name in args.names if not declared(name)]

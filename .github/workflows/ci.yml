@@ -5317,7 +5317,14 @@ jobs:
             real_wasm_reads_stream_options_the_way_the_package_declares_them
             real_wasm_refuses_a_channel_hash_it_would_otherwise_silence
             real_wasm_keeps_u64_stream_ids_off_the_number_path
+            real_package_exports_every_symbol_the_browser_harness_imports
           "
+          # The roster is checked against the probe file before the
+          # probes run: a pinned name the file does not contain can
+          # never pass, and reads exactly like a regression.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "browser package ABI" --mode literal \
+            --source tests/abi_real_package.mjs $REQUIRED
           node tests/abi_real_package.mjs | tee /tmp/abi-real.log
           for required in $REQUIRED; do
             grep -q "\"$required\"" /tmp/abi-real.log || {
@@ -5544,6 +5551,11 @@ jobs:
           stage5_udp_blocked_surfaces_a_typed_failure
           stage5_reconnect_displaces_a_busy_incumbent
           stage5_direct_event_callback_may_reenter_the_node
+          stage5_direct_stream_carries_native_bytes_to_callback_and_iterator
+          stage5_native_stream_sustains_traffic_beyond_the_credit_window
+          stage5_reliable_stream_recovers_injected_loss_and_reorder
+          stage5_large_messages_cross_the_public_api_in_both_directions
+          stage5_leader_proxied_stream_carries_native_bytes_both_ways
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
@@ -5571,14 +5583,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 21)"
+            echo "[$engine] $passes passed, $fails failed (floor 26)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 21 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 21 — \
+            if [ "$passes" -lt 26 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 26 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
@@ -5588,7 +5600,7 @@ jobs:
                 exit 1
               fi
             done
-            echo "[$engine] inventory complete: 12 Stage 4b + 9 Stage 5"
+            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5"
           done
 
       # WebKit's verdicts are surfaced, never gated.
