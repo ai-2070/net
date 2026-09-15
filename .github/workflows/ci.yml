@@ -5021,6 +5021,16 @@ jobs:
             kyra_expired_announcement_is_not_discovery_or_signal_authority
             kyra_incomplete_fragment_coverage_is_rejected
             kyra_reliable_packet_build_retains_retransmit_owner
+            kyra_subscribe_then_publish_consumes_one_sequence_space
+            kyra_other_channel_membership_control
+            kyra_retransmitted_fragment_does_not_destroy_acknowledged_partial
+            kyra_reliable_reorder_overflow_delivers_all_or_fails_typed
+            kyra_correct_inner_route_does_not_authorize_wrong_outer_channel
+            kyra_old_leaf_stream_handle_is_refused_after_replacement
+            kyra_fresh_handle_after_replacement_control
+            kyra_fragment_group_cannot_change_stream_or_provenance
+            kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure
+            kyra_lossfree_fragment_delivery_control
           "
           set -o pipefail
           # No `--test` form: the integration-test pin guard
