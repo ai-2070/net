@@ -34,7 +34,15 @@ jobs:
   natsim:
     name: netns NAT scenario matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    env:
+      # The browser drivers run as ROOT inside the namespaces (netns and
+      # nft need root), so Playwright would otherwise look under root's
+      # HOME and find nothing the build user installed.
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    # Cold wasm + npm + runner builds are ~10 min, and the two relayed
+    # rows each wait out a real 60 s ICE deadline — that wait IS the
+    # measurement, not slack.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -52,7 +60,94 @@ jobs:
           # `conntrack` is for the post-scenario NAT snapshot: it renders
           # the mappings far more readably than /proc/net/nf_conntrack,
           # which run_scenario.sh falls back to if it is missing.
-          sudo apt-get install -y -q nftables iproute2 conntrack
+          # `libnss3-tools` provides certutil, which seeds the run's CA
+          # into the Firefox control row's profile NSS database. The
+          # driver REFUSES the run if it cannot seed it, so without this
+          # the control row fails loudly rather than running untrusted.
+          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools
+
+      # FIRST, deliberately: this is the drift guard. It parses
+      # `run_scenario.sh`'s own `browser_*` case arms and fails if they
+      # disagree with the Rust row table, so a row that would provision
+      # one topology and assert another dies here in seconds instead of
+      # twenty minutes into the matrix. No root, no netns.
+      - name: Matrix table + counter arithmetic (no root, no netns)
+        working-directory: net/crates/net
+        run: |
+          set -o pipefail
+          cargo test --test natsim_browser --features net,nat-traversal,webrtc \
+            -- --nocapture 2>&1 | tee /tmp/natsim_rows.log
+          ROWS_WITNESSES="
+          the_matrix_is_the_six_derived_rows
+          the_control_row_is_row_one_on_the_other_engine
+          run_scenario_matrix_matches_the_rust_table
+          the_two_good_shapes_pass
+          the_anchor_bootstrap_dialog_is_counted_in_every_expectation
+          an_all_zero_side_fails_rather_than_passing_vacuously
+          an_outcome_total_above_attempted_is_a_broken_partition
+          an_attempt_with_no_outcome_yet_fails_in_the_same_assertion
+          a_row_that_landed_the_other_way_fails_both_directions
+          a_retry_shows_as_a_third_attempt
+          a_missing_term_is_an_error_and_never_a_zero
+          counter_terms_survive_values_a_js_number_would_round
+          a_well_formed_direct_verdict_passes_its_row
+          a_relayed_verdict_is_typed_ice_timeout_at_the_page_surface
+          udp_blocked_is_refused_as_over_claiming_on_a_nat_row
+          the_offerer_and_the_answerer_must_agree
+          a_typed_failure_reaches_no_disposition
+          a_runner_error_fails_the_row_before_any_counter_is_read
+          an_errored_verdict_reports_the_runners_reason_not_a_parse_complaint
+          a_miswired_scenario_fails_even_with_perfect_counters
+          a_relayed_row_with_a_broken_anchor_dialog_fails
+          the_gateways_discriminate_direct_from_relayed
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "natsim matrix table" --mode fn \
+            --source tests/natsim_browser.rs $ROWS_WITNESSES
+          for w in $ROWS_WITNESSES; do
+            grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
+              echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
+          done
+          grep -q "^test result: ok. 22 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 22 matrix-table witnesses"; exit 1; }
+
+      - name: Add wasm32 to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      # Pinned, like ci.yml's browser-package job: wasm-bindgen's CLI and
+      # the crate must agree exactly or the bundle is unloadable.
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Build the leaf bundle
+        working-directory: net/crates/net/leaf
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+
+      # `npm install`, not `npm ci`: the repo does not track
+      # package-lock.json, so `npm ci` has nothing to install from.
+      - name: Build @net-mesh/browser
+        working-directory: net/crates/net/browser-ts
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build the natsim browser runner
+        run: cargo build --release --manifest-path net/crates/net/tests/natsim/browser/Cargo.toml
+
+      - name: Install the browser driver + engines
+        working-directory: net/crates/net/tests/natsim/browser/driver
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium firefox
 
       - name: Build helper + test binaries
         working-directory: net/crates/net
@@ -66,8 +161,35 @@ jobs:
       - name: Run scenario matrix
         working-directory: net/crates/net
         run: |
+          set -o pipefail
+          BROWSER_ROW_WITNESSES="
+          natsim_browser_cone_cone_is_direct
+          natsim_browser_cone_portrestricted_is_direct
+          natsim_browser_portrestricted_portrestricted_is_direct
+          natsim_browser_cone_symmetric_is_direct
+          natsim_browser_portrestricted_symmetric_is_relayed
+          natsim_browser_symmetric_symmetric_is_relayed
+          natsim_browser_cone_cone_is_direct_on_firefox
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "NAT conformance rows" --mode fn \
+            --source tests/natsim.rs $BROWSER_ROW_WITNESSES
           cargo test --test natsim --features net,nat-traversal,webrtc \
-            -- --ignored --test-threads=1 --nocapture
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/natsim.log
+          ran=$(grep -c '^test .* \.\.\. ok$' /tmp/natsim.log || true)
+          echo "natsim scenarios: $ran"
+          # 6 pre-existing native scenarios + 7 browser rows.
+          if [ "${ran:-0}" -lt 13 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 13 — \
+          lower the floor deliberately or restore the row"
+            exit 1
+          fi
+          # A NAT conformance matrix that quietly stops running behind
+          # NATs is worth nothing, so every row is pinned by name.
+          for w in $BROWSER_ROW_WITNESSES; do
+            grep -q "^test $w \.\.\. ok$" /tmp/natsim.log || {
+              echo "::error::the NAT conformance row $w did not run and pass"; exit 1; }
+          done
 
       - name: Teardown (paranoia)
         if: always()

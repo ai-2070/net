@@ -943,7 +943,17 @@ jobs:
       # `--bins` compiles them into the binary's test harness.
       - name: Run Deck unit tests
         if: ${{ !cancelled() }}
-        run: cargo test -p net-deck --bins
+        run: |
+          set -o pipefail
+          cargo test -p net-deck --bins 2>&1 | tee /tmp/deck.log
+          ran=$(grep -c '^test .* \.\.\. ok$' /tmp/deck.log || true)
+          echo "deck unit tests: $ran"
+          # Stage 6 added the ICE column's ledger + rollup tests.
+          if [ "$ran" -lt 31 ]; then
+            echo "::error::net-deck ran $ran tests, floor is 31 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
 
   # ===================================================================
   # Integration suite — split across parallel jobs by FEATURE FAMILY.
@@ -4726,6 +4736,7 @@ jobs:
             --test rtc_loopback \
             --test rtc_backpressure \
             --test rtc_repairs \
+            --test rtc_ice_telemetry \
             --test rtc_routed_restore \
             --test rtc_install_race \
             --test rtc_reclaim \
@@ -4768,6 +4779,7 @@ jobs:
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
             --floor rtc_repairs=43 \
+            --floor rtc_ice_telemetry=6 \
             --floor rtc_routed_restore=5 \
             --floor rtc_install_race=8 \
             --floor rtc_reclaim=5 \
@@ -4825,6 +4837,12 @@ jobs:
           rtc_repairs:evicting_an_acknowledged_in_order_hold_ends_the_receive_half
           rtc_repairs:one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it
           rtc_repairs:a_stated_mode_boundary_releases_a_reliable_stream_over_a_lost_prefix
+          rtc_ice_telemetry:one_attempt_is_one_dialog_not_one_peer
+          rtc_ice_telemetry:a_peers_reject_is_counted_failed_once_and_a_late_duplicate_adds_nothing
+          rtc_ice_telemetry:the_four_outcomes_sum_to_the_denominator_once_nothing_is_in_flight
+          rtc_ice_telemetry:an_in_flight_attempt_is_the_exact_shortfall_in_the_identity
+          rtc_ice_telemetry:zero_attempts_has_no_ratio_and_one_refused_attempt_has_a_zero_one
+          rtc_ice_telemetry:a_node_without_rtc_has_no_ledger_rather_than_a_ledger_of_zeros
           rtc_repairs:a_control_frame_and_an_application_packet_conserve_bytes_on_one_stream
           rtc_repairs:a_displaced_sessions_handle_cannot_address_its_successor
           rtc_repairs:a_native_control_frame_debits_the_bytes_its_receiver_charges
