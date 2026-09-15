@@ -4767,8 +4767,8 @@ jobs:
             --junit "$RUNNER_TEMP/rtc-junit.xml" --multi \
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
-            --floor rtc_repairs=34 \
-            --floor rtc_routed_restore=4 \
+            --floor rtc_repairs=42 \
+            --floor rtc_routed_restore=5 \
             --floor rtc_install_race=8 \
             --floor rtc_reclaim=5 \
             --floor rtc_classifier=2 \
@@ -4816,6 +4816,22 @@ jobs:
           rtc_repairs:a_swept_dead_peers_partial_fragment_group_is_retired
           rtc_repairs:a_closed_sessions_partial_fragment_group_is_retired_and_cannot_be_recreated
           rtc_repairs:a_control_frame_shares_the_sequence_space_of_the_stream_it_rides
+          rtc_repairs:an_abandoned_fragment_group_ends_the_streams_receive_half
+          rtc_repairs:a_quiet_sessions_expired_fragment_group_is_reaped_on_the_timer
+          rtc_repairs:a_fragment_group_whose_sequences_are_not_contiguous_is_refused
+          rtc_repairs:a_stream_reset_retires_the_native_groups_of_that_receive_lifetime
+          rtc_repairs:a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassembly
+          rtc_repairs:an_in_order_hold_cannot_cross_a_stream_replacement
+          rtc_repairs:evicting_an_acknowledged_in_order_hold_ends_the_receive_half
+          rtc_repairs:one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it
+          rtc_repairs:a_control_frame_and_an_application_packet_conserve_bytes_on_one_stream
+          rtc_repairs:a_displaced_sessions_handle_cannot_address_its_successor
+          rtc_repairs:a_native_control_frame_debits_the_bytes_its_receiver_charges
+          rtc_repairs:a_peer_that_superseded_its_own_channel_is_not_locked_out_by_it
+          rtc_repairs:a_peers_stream_reset_leaves_our_send_side_alone
+          rtc_repairs:a_reopened_streams_state_survives_its_predecessors_close
+          rtc_routed_restore:a_busy_routed_responder_still_defers_to_its_relay_session
+          rtc_routed_restore:an_idle_routed_stream_is_replaced_cleanly_by_the_rtc_pair
           rtc_routed_restore:routed_then_direct_then_loss_then_manually_restored_routed
           rtc_routed_restore:an_nrpc_call_round_trips_over_the_datachannel
           rtc_routed_restore:a_capability_fold_applies_a_remote_fact_received_over_rtc
@@ -5086,8 +5102,8 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 209 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 209 — \
+          if [ "$total" -lt 249 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 249 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi

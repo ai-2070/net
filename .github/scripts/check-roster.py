@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail BEFORE a suite runs if a pinned witness name does not exist.
+"""A LEXICAL PREFLIGHT: fail a roster whose pinned name no source mentions.
 
 Every roster in this workflow pins witnesses by name against a log
 produced by the run. That catches a witness that vanished, but not a
@@ -8,13 +8,41 @@ at verification time, and reads exactly like a regression. That cost a
 red CI round once already, with a roster of twenty-four pins of which
 eighteen named nothing in the file (see the `wasm_leader` roster).
 
-So a roster is checked against its SOURCE first. A pinned name that no
-source declares is a bad pin, reported as such, before a single test
-runs. This is the complement of the by-name log check, not a
-replacement for it:
+So a roster is checked against its SOURCE. A pinned name that no
+source mentions is a bad pin, reported as such. This is the complement
+of the by-name log check, NOT a replacement for it:
 
-    pinned but absent from source  -> this script, up front
+    pinned but absent from source  -> this script
     present in source, did not run -> the log loop, afterwards
+
+WHAT THIS IS NOT. Read the two limits below before citing this script
+as evidence of anything; both have been overstated in a report.
+
+1. It is LEXICAL, not a test-inventory parser. `declared()` searches
+   raw file text for `fn <name>(` or for the name in quotes. It does
+   not parse Rust or JavaScript, does not evaluate `cfg`, and does not
+   know whether a match is a live test. A commented-out declaration,
+   an ordinary helper function, a declaration behind a `cfg` that is
+   off in this build, or a witness literal that nothing ever emits all
+   satisfy it. It also does not deduplicate the roster and does not
+   assert set EQUALITY between source and pins — a witness present in
+   source but absent from the roster is invisible here, which is what
+   the separate cardinality floors are for. The downstream "this exact
+   name appeared as passed in the log" loops are therefore load-
+   bearing, not belt-and-braces: they are the only check that a pinned
+   name corresponds to a test that RAN.
+
+2. It does NOT run before every suite. Its callers, exhaustively:
+   the leaf review-probe roster and the `wasm_leaf` / `wasm_leader`
+   rosters are checked before their `cargo test` invocations, and the
+   browser-package ABI roster before `node abi_real_package.mjs` — for
+   those four, "before the suite runs" is accurate. The browser-matrix
+   roster is checked in the post-run inventory step: before the ENGINE
+   LOGS are read, but after both engines have already executed, so it
+   saves the inventory from a bad pin and saves nothing else. The
+   native RTC rosters have no preflight here at all; they use the
+   existing JUnit checker. Any claim that every roster in this
+   workflow is checked before its suite runs is false.
 
 Usage:
     check-roster.py --label wasm_leader --mode fn \\
@@ -22,7 +50,7 @@ Usage:
         name_one name_two ...
 
 Modes:
-    fn       the name is declared as `fn <name>(` in some source file.
+    fn       the name appears as `fn <name>(` in some source file.
     literal  the name appears as a quoted string in some source file
              (harness witnesses, which are emitted by name at runtime).
 """
