@@ -4767,7 +4767,7 @@ jobs:
             --junit "$RUNNER_TEMP/rtc-junit.xml" --multi \
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
-            --floor rtc_repairs=42 \
+            --floor rtc_repairs=43 \
             --floor rtc_routed_restore=5 \
             --floor rtc_install_race=8 \
             --floor rtc_reclaim=5 \
@@ -4824,6 +4824,7 @@ jobs:
           rtc_repairs:an_in_order_hold_cannot_cross_a_stream_replacement
           rtc_repairs:evicting_an_acknowledged_in_order_hold_ends_the_receive_half
           rtc_repairs:one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it
+          rtc_repairs:a_stated_mode_boundary_releases_a_reliable_stream_over_a_lost_prefix
           rtc_repairs:a_control_frame_and_an_application_packet_conserve_bytes_on_one_stream
           rtc_repairs:a_displaced_sessions_handle_cannot_address_its_successor
           rtc_repairs:a_native_control_frame_debits_the_bytes_its_receiver_charges
