@@ -111,12 +111,36 @@ pub struct VerifiedAnnouncement {
 }
 
 impl VerifiedAnnouncement {
-    /// Is this announcement still inside the lifetime it declared?
+    /// Is this announcement still inside the lifetime it declared,
+    /// as of `now_unix_secs`?
     ///
-    /// Literal: `issued + ttl_secs`, with no "0 means forever"
-    /// escape. A record that declares no lifetime has declared an
-    /// expired one, and a peer that wants to be discoverable says
-    /// for how long — which is what the leaf's own writer does.
+    /// Exact semantics, all three of which are load-bearing and none
+    /// of which is a rounding accident:
+    ///
+    /// 1. **Second granularity.** The issue instant is
+    ///    `timestamp_ns / 1_000_000_000` — integer truncation, so an
+    ///    announcement stamped anywhere inside second *S* is treated
+    ///    as issued at the start of *S*. The comparison is made in
+    ///    whole seconds because `ttl_secs` is.
+    /// 2. **Inclusive at the expiry second.** `now == issued + ttl`
+    ///    is still fresh; `now == issued + ttl + 1` is not. A TTL of
+    ///    `n` therefore covers `n + 1` distinct second values. The
+    ///    inclusive end is the direction that cannot strand a
+    ///    correctly-issued record: with truncation, a record stamped
+    ///    at `S + 0.999 s` and a reader at `S + ttl + 0.001 s` are
+    ///    barely `ttl` apart in real time and would otherwise be
+    ///    refused.
+    /// 3. **No "0 means forever" escape.** `ttl_secs == 0` is a
+    ///    literal zero-second lifetime: valid for the remainder of
+    ///    the second it was issued in, and expired from the next
+    ///    second onward. A record that declares no lifetime has
+    ///    declared an exhausted one, and a peer that wants to be
+    ///    discoverable says for how long — which is what the leaf's
+    ///    own writer does.
+    ///
+    /// `saturating_add` keeps a hostile `timestamp_ns`/`ttl_secs`
+    /// pair from wrapping the sum into the past and making an
+    /// expired record look fresh.
     pub fn is_fresh(&self, now_unix_secs: u64) -> bool {
         let issued = self.timestamp_ns / 1_000_000_000;
         now_unix_secs <= issued.saturating_add(u64::from(self.ttl_secs))
@@ -419,10 +443,24 @@ impl AnnouncementStore {
     /// is evaluated at READ time rather than by a sweep, so a
     /// re-announce restores discoverability immediately.
     pub fn query(&self, capability: &str) -> Vec<&VerifiedAnnouncement> {
-        let now = crate::clock::now_unix_secs();
+        self.query_at(capability, crate::clock::now_unix_secs())
+    }
+
+    /// [`Self::query`] evaluated against an explicit wall-clock
+    /// second.
+    ///
+    /// One clock reading for the whole scan — the same shape as
+    /// `clock::Deadline::expired_at`, and the same reason: a sweep
+    /// over many records must judge them all against one instant, or
+    /// a second that ticks mid-scan makes the answer depend on
+    /// iteration order. It is also the entrypoint that lets the
+    /// expiry boundary be exercised at an exact second instead of
+    /// whatever second the host clock happens to be in; see
+    /// [`VerifiedAnnouncement::is_fresh`] for the boundary.
+    pub fn query_at(&self, capability: &str, now_unix_secs: u64) -> Vec<&VerifiedAnnouncement> {
         self.by_node
             .values()
-            .filter(|a| a.is_fresh(now) && a.capabilities.iter().any(|c| c == capability))
+            .filter(|a| a.is_fresh(now_unix_secs) && a.capabilities.iter().any(|c| c == capability))
             .collect()
     }
 
@@ -432,8 +470,16 @@ impl AnnouncementStore {
     /// so the same expiry that removes a peer from discovery removes
     /// its authority to authorise a signal.
     pub fn get(&self, node: u64) -> Option<&VerifiedAnnouncement> {
-        let now = crate::clock::now_unix_secs();
-        self.by_node.get(&node).filter(|a| a.is_fresh(now))
+        self.get_at(node, crate::clock::now_unix_secs())
+    }
+
+    /// [`Self::get`] evaluated against an explicit wall-clock second
+    /// — the authority lookup with its expiry boundary made
+    /// addressable.
+    pub fn get_at(&self, node: u64, now_unix_secs: u64) -> Option<&VerifiedAnnouncement> {
+        self.by_node
+            .get(&node)
+            .filter(|a| a.is_fresh(now_unix_secs))
     }
 
     /// The record for `node` whether or not it is fresh — for the
@@ -650,5 +696,95 @@ mod tests {
              integers above 2^53: {json}"
         );
         assert_eq!(store.query_json("absent"), "[]");
+    }
+
+    /// The expiry boundary, pinned at the exact second on the
+    /// PRODUCTION authority lookup (`get_at`) and the production
+    /// discovery scan (`query_at`) — not on `is_fresh` alone.
+    ///
+    /// `get` is what the signal verifier reads a peer's key from, so
+    /// "one second either side of expiry" is the difference between a
+    /// peer still being able to authorise a signal and not. The
+    /// contract [`VerifiedAnnouncement::is_fresh`] states is
+    /// inclusive at `issued + ttl` and exclusive one second later;
+    /// both directions are asserted here, and the announcement goes
+    /// through the real `build_announcement` → `verify_announcement`
+    /// → `ingest` path so the stored `timestamp_ns`/`ttl_secs` are
+    /// the signed ones.
+    #[test]
+    fn the_authority_lookup_expires_one_second_after_issue_plus_ttl() {
+        let id = identity();
+        let issued: u64 = 1_700_000_000;
+        let ttl: u32 = 300;
+        // Stamp deliberately mid-second: `is_fresh` truncates to the
+        // second, so the sub-second remainder must not shift the
+        // boundary by one.
+        let stamp = issued * 1_000_000_000 + 999_999_999;
+
+        let mut store = AnnouncementStore::new();
+        store.ingest(
+            verify_announcement(
+                &build_announcement(&id, &["gpu".to_string()], 1, stamp, ttl).expect("build"),
+            )
+            .expect("verify"),
+        );
+        let node = id.node_id();
+        let expiry = issued + u64::from(ttl);
+
+        assert!(
+            store.get_at(node, expiry - 1).is_some(),
+            "a second before expiry the peer is still a key authority"
+        );
+        assert!(
+            store.get_at(node, expiry).is_some(),
+            "the expiry second itself is INCLUSIVE — a record issued \
+             at {issued}.999 with ttl {ttl} is still authoritative at \
+             {expiry}"
+        );
+        assert!(
+            store.get_at(node, expiry + 1).is_none(),
+            "one second past expiry the peer has no authority left"
+        );
+
+        // Discovery uses the same boundary, and the record is still
+        // held either way — expiry is a read-time filter, not a
+        // deletion, so a re-announce restores it.
+        assert_eq!(store.query_at("gpu", expiry).len(), 1);
+        assert!(store.query_at("gpu", expiry + 1).is_empty());
+        assert!(
+            store.get_including_expired(node).is_some(),
+            "the expired record is retained for the version comparison"
+        );
+    }
+
+    /// `ttl_secs == 0` is a literal zero-second lifetime, not
+    /// "forever" and not "already dead": authoritative for the
+    /// remainder of the second it was issued in, expired from the
+    /// next second onward. The pre-existing ancient-zero-TTL probe
+    /// only covers a 1970 stamp, where both readings are expired.
+    #[test]
+    fn a_zero_ttl_announcement_is_authoritative_only_within_its_issuing_second() {
+        let id = identity();
+        let issued: u64 = 1_700_000_000;
+        let mut store = AnnouncementStore::new();
+        store.ingest(
+            verify_announcement(
+                &build_announcement(&id, &["gpu".to_string()], 1, issued * 1_000_000_000 + 1, 0)
+                    .expect("build"),
+            )
+            .expect("verify"),
+        );
+        let node = id.node_id();
+
+        assert!(
+            store.get_at(node, issued).is_some(),
+            "ttl 0 is not 'already expired': the issuing second counts"
+        );
+        assert_eq!(store.query_at("gpu", issued).len(), 1);
+        assert!(
+            store.get_at(node, issued + 1).is_none(),
+            "ttl 0 is not 'forever': the next second is expired"
+        );
+        assert!(store.query_at("gpu", issued + 1).is_empty());
     }
 }
