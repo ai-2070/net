@@ -61,6 +61,11 @@ typedef enum {
     NET_ERR_MESH_TRANSPORT = -114,
     NET_ERR_CHANNEL = -115,
     NET_ERR_CHANNEL_AUTH = -116,
+    /* Stream handle names a session incarnation the peer no longer has.
+     * Distinct from NET_ERR_MESH_NOT_CONNECTED: the peer is connected and
+     * the stream id may be open on its successor session, which the handle
+     * does not own. Re-open; retrying the handle cannot succeed. */
+    NET_ERR_MESH_SESSION_SUPERSEDED = -117,
     /* Identity + permission-token surface (compiled when the Rust
      * cdylib has the `net` feature on). Codes below -119 — one per
      * `TokenError` kind so Go callers can `errors.Is` without
@@ -395,9 +400,14 @@ void     net_mesh_stream_free(net_mesh_stream_t* handle);
  * under a new configuration — without it the original "first open
  * wins" config stays in force for the life of the node.
  *
- * Returns 0 on success or a negative NET_ERR_* code. Null your handle
+ * Returns 0 on success or a negative NET_ERR_* code. The handle is
+ * freed either way, including on a refusal. Null your handle
  * afterwards; calling it or net_mesh_stream_free twice on the same
- * pointer is undefined. */
+ * pointer is undefined.
+ *
+ * Returns NET_ERR_MESH_SESSION_SUPERSEDED when the peer's session was
+ * replaced since the handle was opened: the stream id may be live on
+ * the successor session and closing it is not this handle's to do. */
 int      net_mesh_close_stream(net_mesh_stream_t* handle);
 
 /* Send a batch of payloads on an open stream.
