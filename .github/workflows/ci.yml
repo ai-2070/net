@@ -5184,6 +5184,55 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      # R11: the TS/Rust ABI asserted through the artefacts a page
+      # actually loads — the built `dist/` and the wasm-bindgen `pkg`
+      # beside it. Stage 5's unit suite was green against a test
+      # double written from the hand-maintained declarations, so
+      # every place those declarations were wrong the double was
+      # wrong identically. Pinned by name: a probe that stops running
+      # is a failure, not a smaller roster.
+      - name: TS/Rust ABI through the real built package (R11)
+        run: |
+          set -o pipefail
+          REQUIRED="
+            real_package_decodes_every_pinned_stream_event
+            real_package_decodes_the_same_events_on_a_proxied_stream
+            real_package_matches_hex_handle_ids_against_decimal_event_ids
+            real_package_drops_another_streams_event
+            real_wasm_exposes_the_effective_option_readers
+            real_wasm_parses_rtc_ice_server_objects
+            real_wasm_refuses_an_ice_server_shape_it_cannot_configure
+            real_wasm_reads_stream_options_the_way_the_package_declares_them
+            real_wasm_refuses_a_channel_hash_it_would_otherwise_silence
+            real_wasm_keeps_u64_stream_ids_off_the_number_path
+          "
+          node tests/abi_real_package.mjs | tee /tmp/abi-real.log
+          for required in $REQUIRED; do
+            grep -q "\"$required\"" /tmp/abi-real.log || {
+              echo "::error::ABI probe $required did not run"; exit 1; }
+          done
+          if grep -q '"pass": false' /tmp/abi-real.log; then
+            echo "::error::an ABI probe failed against the built package"; exit 1
+          fi
+          echo "R11 ABI probes: 10/10 against the real package"
+
+      # Kyra's JS probes, landed verbatim beside her leaf ones.
+      - name: Kyra's JS review probes (Stage 5)
+        run: |
+          set -o pipefail
+          node tests/kyra_review.mjs | tee /tmp/kyra-js.log
+          for required in typescript_byte_callback_control \
+                          typescript_real_rust_callback_shape \
+                          firefox_unseeded_launch_control \
+                          firefox_successfully_seeded_profile_reaches_launch; do
+            grep -q "\"$required\"" /tmp/kyra-js.log || {
+              echo "::error::Kyra's JS probe $required did not run"; exit 1; }
+          done
+          if grep -q '"pass": false' /tmp/kyra-js.log; then
+            echo "::error::a Kyra JS probe failed"; exit 1
+          fi
+          echo "Kyra's JS probes: 4/4"
+
       - name: Download size (exit criterion)
         run: node scripts/size.mjs --assert --require-leaf
 

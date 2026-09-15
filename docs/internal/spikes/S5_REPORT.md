@@ -403,3 +403,92 @@ that quietly relied on native reassembly would be asserting a
 property this stage does not have. A native-side reassembly arm is
 the prerequisite for leaf → native over-cap payloads, and it is
 named in §8.
+
+---
+
+## 10. The repair round (Kyra's HOLD at `9f8bde0c7`, R1–R16)
+
+Her 15 leaf probes landed VERBATIM first (`0162fce73`) as
+`leaf/tests/kyra_review.rs` and reproduced exactly what she reported:
+**12 failing, 3 controls passing**. Her JS probes landed beside them.
+All 15 are green now, and both rosters are pinned by name in CI.
+
+**One adaptation, in the JS probes only**: her absolute worktree path
+`C:/.../kyra-stage5-9f8bde0c7` cannot resolve here, so the repo root
+is derived from the file's own location. Every assertion is
+untouched. Her leaf file gained a `//!` header and nothing else,
+because the crate denies `missing_docs` on every target.
+
+| Row | Change, or scoped disposition | Witness | Inverse reaching the original defect | Restored positive |
+| --- | --- | --- | --- | --- |
+| **R1** | `node_id_for_entity` derives the node id from the signing key; `verify_announcement` refuses a mismatch before store replacement or any authority use | `kyra_other_entity_cannot_replace_victim_and_authorize_signal` | remove the derivation check → the attacker's record replaces the victim's and its signals are accepted | the honest announcement path and the store tests |
+| **R2** | `CallOwner {peer, incarnation, reply_route}` recorded at registration, matched on all three BEFORE consuming; no route discriminator ⇒ cannot end a call | `kyra_reply_from_another_session_cannot_complete_call`, `kyra_same_peer_wrong_reply_route_cannot_complete_call`, `a_reply_is_refused_unless_peer_incarnation_and_route_all_match` | restore match-by-call-id → both probes fail as at `0162fce73`; drop only `reply_route` → the wrong-route probe alone reds, so the fields are independently load-bearing | `kyra_correct_peer_and_route_reply_control`, the enrollment round trip |
+| **R3** | reliable sends register retransmit descriptors (rebuilt with a fresh AEAD counter), receives return grants and ACKs, `tick` retransmits and NACKs, exhaustion is typed; credit admitted for the whole payload before any sequence is consumed | `kyra_reliable_packet_build_retains_retransmit_owner`, loss+reorder over the mock, `stage5_reliable_round_trip` (64 sequential round trips, ordered bodies) | strip the `on_send` registration → `has_unacked()` false again and the loss witness stalls | the small-reliable control, the fragment control |
+| **R4** | fragments consume the sequences they carry; reassembly hands the reorder buffer the group's FIRST sequence; coverage validated; NATIVE reassembly at the RTC ingress (`src/adapter/net/rtc/fragment.rs`, feature-gated, bounded by the existing byte budget) | `kyra_reliable_fragmented_payload_is_delivered`, `kyra_incomplete_fragment_coverage_is_rejected`, 7 core fragment tests | hand the reorder buffer the LAST sequence again → the delivery probe hangs on sequences never offered | `kyra_fire_and_forget_fragment_control` |
+| **R5** | receive, reorder, reassembly, stream and RPC state keyed by session incarnation; the old incarnation retired exactly once, typed | `kyra_session_replacement_resets_receive_sequence`, `kyra_session_replacement_fails_old_pending_call` | retain the predecessor's reorder state → the successor's sequence-zero traffic is suppressed again | successor traffic and partial-fragment retention |
+| **R6** | classification by registered namespace (subscribed channel / opened stream), wire format unchanged | `kyra_channel_publication_is_not_misclassified_as_stream` | classify on bit 49 again → a channel whose hash carries that bit is delivered as stream data | stream traffic on real stream ids |
+| **R7** | the reorder buffer holds `(seq, origin, channel, bytes)` records and delivers each with its own provenance; O(1) gap accounting with a max-gap refusal | `kyra_reordered_stream_events_keep_their_own_sequences` | buffer bytes only → arrival 2,0,1 emits labels 0,1,1 | mixed-metadata delivery |
+| **R8** | replay key carries a BLAKE2s payload digest; hard cap 4096 with oldest-first eviction; freshness enforced at read time for discovery AND key authority, literal `issued + ttl` | `kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup`, `kyra_expired_announcement_is_not_discovery_or_signal_authority` | restore the `(from, dialog, kind)` key → the second candidate is refused; skip the freshness filter → an expired peer is discoverable and still a signal authority | multi-candidate traffic, re-announce restoring discovery |
+| **R9** | stand-down is ordered: revoke the generation lease, shut the backend down (cancel in-flight, fail pending once, typed `LeaderLost`), then release the lock; every outbound effect consults the lease; `IdentityVault::fence` gained its caller (interval revalidation against the store) | `standing_down_fences_then_retires_the_node_then_releases_the_lock` over a real node with a real Noise session, a real pending call and an operation parked before dispatch; `a_leader_revalidates_its_generation_against_the_store_and_stands_down` | delete the `revoke` → the fencing witness fails | the ordinary leader/follower lifecycle |
+| **R10** | attaches queued until the backend exists and replayed on the first Leadership broadcast; `closed` checked at publish with requeue/abort; stream handles carry their opening generation and end their iterators on lifecycle loss; `announce()` updates restoration state; followers own a local deadline with an honest indeterminate outcome | one witness per schedule in `wasm_leader.rs` + the TS leader tests | drop the attach queue → subscriptions vanish across promotion | promotion, restoration and follower calls |
+| **R11** | one contract: Rust emits its canonical event JSON and TS decodes it; numeric `channelHash`; `RTCIceServer` parsed with credentials; ids matched numerically; the fake WASM mirrors the real shape | 10 ABI probes against the REAL built package, direct and leader-proxied, plus Kyra's two TS probes | reintroduce the string/bytes mismatch → `typescript_real_rust_callback_shape` reds | `typescript_byte_callback_control` |
+| **R12** | native `Stream` handles carry the session incarnation; send/close/credit refuse a mismatch with typed `SessionSuperseded`; `close_stream` is handle-addressed and fenced, `close_stream_id` is the explicit unfenced form; the error reaches the C ABI, both SDKs and both bindings, and is never retried | `a_displaced_sessions_handle_cannot_address_its_successor` (one identity in two processes, real displacement, successor's epoch walked to EXACTLY the stale handle's), `test_regression_equal_epochs_across_sessions_are_not_the_same_lifetime` | compare epoch only → the stale handle addresses the successor again | the initiator/routed refusal, the install CAS, 75 RTC tests |
+| **R13** | the IndexedDB transaction's `complete` is awaited and `abort` propagated | abort-after-put, concurrent first creation, ciphertext tamper, wrapping-key export refusal | await only the put → an aborted transaction reads as a successful write | ordinary vault reads and writes |
+| **R14** | **scoped disposition**: `AnchorControlPlane::signal` refuses with a typed error naming the peer, instead of serialising a frame the Stage 4b listener discards while reporting delivery. Carrying envelopes end to end needs a forwarding route with an acknowledgement — generic peer coordination, Stage 6's. D1 and the module doc corrected to what ships | the typed refusal; the anchorless mock carries the identical envelopes for real | send the `type: "signal"` frame again → the anchor discards it and the caller is told it was delivered | `wasm_anchorless`, unchanged |
+| **R15** | two-tab PASS gates follower RPC and the leader-close/pending-work/restoration schedule; the busy-responder witness reaches Noise and install; the reconnect leg requires an extant busy incumbent; the sequential-RPC assertion replaced by the retransmission/reorder property (64 round trips, ordered); nft narrowed to address+port; new native names pinned | the strengthened witnesses themselves | each predicate's own before/after | no coverage reduced, no retry, no floor, no timeout inflated |
+| **R16** | credited by the reviewer; kept green | Firefox 19/19 in CI | — | — |
+
+### Why six rows share one commit
+
+R2, R3, R4, R5, R6 and R7 all land in the leaf's receive path and the
+types it hands to. Splitting them would have produced commits that do
+not compile rather than commits that isolate a change; each row's
+production change, witness and inverse is listed separately above.
+
+### R3's tail: what the strengthened witness found
+
+R15's 64-round-trip witness failed at 5 of 64 when it first ran, and
+three defects were behind it, each hidden by the one in front:
+
+1. **The leaf acknowledged nothing.** `maybe_grant` gated the whole
+   `StreamWindow` frame on a 32 KiB volume threshold, but the frame
+   carries `ack_seq` as well as `total_consumed`, and an nRPC body is
+   ~150 wire bytes. Fixed: the ack leaves as soon as it advances;
+   credit keeps the volume cadence.
+2. **The leaf deferred inbound work to its 50 ms ticker**, against a
+   sender whose initial RTO is 50 ms — measured at 62 ms between
+   consecutive acks. The RTC sink delivers immediately now.
+3. **The core never accounted for a reliable frame carrying a control
+   subprotocol on a real stream id** — which is exactly the leaf's
+   channel Subscribe — because every control arm of
+   `process_local_packet` returned before the event-plane accounting.
+   The leaf retransmitted to exhaustion and reset the stream, and the
+   reset arm called `close_stream`, destroying the anchor's own SEND
+   half for that id: `tx_seq` restarted at 0 on the stream it
+   publishes replies on. One stream is one sequence space whatever
+   subprotocol a frame carries; a reset drops only the receive half.
+
+Both core defects are pinned natively in `rtc_repairs.rs` with their
+inverses verified red (remove the accounting hoist → 21 retransmits;
+restore `close_stream` → the anchor loses its own stream). This is
+R3's native-window closure arriving through the witness that demanded
+it rather than as a separate exercise.
+
+### Secondary audit notes, adjudicated
+
+- **Credential `Debug` in the leaf** — redacted with the same
+  treatment `OfferRequest`/`OfferResponse` got in Stage 4b.
+- **JS dialog safe-integer validation** — every u64 crosses the
+  wasm-bindgen boundary as a decimal string, and R11 made the stream
+  path match ids numerically via BigInt; a supplied number is now
+  refused rather than silently dropped.
+- **Packet-builder lease reset** — the fragment stamp is one-shot and
+  a wire test asserts an unstamped builder emits the pre-Stage-5
+  header byte for byte.
+- **wasm32 unchecked length arithmetic**, **bootstrap URL prefix /
+  override validation**, **probe setup failure vs negative network
+  evidence**, **reduced-fold / canonical verifier parity** — stated,
+  not fixed in this round: each is a real observation, none is
+  reachable from a probe in the roster, and taking them here would
+  mean shipping changes with no discriminating witness. They belong
+  to the next scoped slice.
