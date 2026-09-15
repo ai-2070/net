@@ -100,8 +100,37 @@ pub struct NetSession {
     thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
-    /// Session is active
+    /// Session is active.
+    ///
+    /// A LOCAL, ADVISORY marker, and deliberately nothing more: it
+    /// means "this handle is not currently considered live here". It
+    /// is set by session replacement, by shutdown, by tests, and by
+    /// the SDK on a session it no longer wants to treat as live —
+    /// while the peer remains a legitimate selection and traffic on
+    /// the session keeps flowing. See
+    /// [`Self::is_receive_lifetime_retired`] for the DIFFERENT
+    /// question "is this incarnation's receive lifetime over", which
+    /// must never be answered with this flag.
     active: AtomicBool,
+    /// This incarnation's RECEIVE LIFETIME is over (**NR3**).
+    ///
+    /// One-way, expires with nothing, and orthogonal to `active`.
+    /// Where `active` says "not considered live right now", this says
+    /// "this exact incarnation has been retired: nothing captured
+    /// against it may be decrypted, dispatched or reassembled, ever
+    /// again". Only the retirement paths set it — session
+    /// replacement/eviction and node shutdown — and it is the
+    /// authority the ingress uses to refuse a frame that was admitted
+    /// against this handle before the retirement landed.
+    ///
+    /// The two are separate ON PURPOSE. They were briefly the same
+    /// flag, and the conflation broke a real contract: a session the
+    /// SDK had locally deactivated — still pinned, still the sensed
+    /// selection, still sending — had its peer's replies silently
+    /// refused at its own ingress. `active` has many local writers
+    /// and no retirement meaning; this flag has exactly one meaning
+    /// and only retirement writes it.
+    receive_lifetime_retired: AtomicBool,
     /// Monotonic generator for per-`StreamState` epochs. Each opened
     /// stream captures a unique epoch at construction time so that
     /// stale `Stream` handles or `TxSlotGuard`s from a previous
@@ -218,6 +247,7 @@ impl NetSession {
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
+            receive_lifetime_retired: AtomicBool::new(false),
             stream_epoch_counter: AtomicU64::new(1),
             recently_closed: DashMap::new(),
             receive_terminals: parking_lot::Mutex::new(Vec::new()),
@@ -1694,16 +1724,48 @@ impl NetSession {
         now.saturating_sub(last) > timeout_ns
     }
 
-    /// Check if session is active
+    /// Is this session considered live LOCALLY?
+    ///
+    /// Advisory local state (see the `active` field). NOT a
+    /// receive-lifetime predicate: an inactive session is still a
+    /// legitimate peer whose frames must be processed, so an ingress
+    /// asking "may I still process work captured against this
+    /// incarnation?" MUST ask
+    /// [`Self::is_receive_lifetime_retired`] instead.
     #[inline]
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
 
-    /// Deactivate the session
+    /// Mark the session not-live locally. See [`Self::is_active`];
+    /// this does NOT retire the receive lifetime.
     #[inline]
     pub fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    /// End this incarnation's receive lifetime (**NR3**). One-way.
+    ///
+    /// Called only by the retirement paths. Deliberately distinct
+    /// from [`Self::deactivate`] — see the
+    /// `receive_lifetime_retired` field for why merging them is a
+    /// bug, not a simplification.
+    #[inline]
+    pub fn retire_receive_lifetime(&self) {
+        self.receive_lifetime_retired.store(true, Ordering::Release);
+    }
+
+    /// Has this incarnation's receive lifetime ended (**NR3**)?
+    ///
+    /// `true` ⇒ the handle a captured frame carries names a retired
+    /// incarnation, and that frame must be refused before decrypt,
+    /// dispatch or reassembly. Unlike the reassembly retirement
+    /// marker this never expires and is never evicted, so it still
+    /// answers for a frame that outlived `GROUP_TTL` or lost its
+    /// marker to `MAX_RETIRED_SESSIONS` churn.
+    #[inline]
+    pub fn is_receive_lifetime_retired(&self) -> bool {
+        self.receive_lifetime_retired.load(Ordering::Acquire)
     }
 
     /// Get all stream IDs

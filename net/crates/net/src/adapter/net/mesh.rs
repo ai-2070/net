@@ -421,20 +421,32 @@ fn dispose_abandoned_rtc_groups(
 /// End one session's receive lifetime for reassembly purposes
 /// (**NR3**).
 ///
-/// Two acts, always together. The reassembly marker is a *bounded*
+/// Three acts, always together. The reassembly marker is a *bounded*
 /// fence — it expires with `GROUP_TTL` and gives way under
 /// `MAX_RETIRED_SESSIONS` churn — so it cannot be the whole
 /// retirement authority for work that was captured before it ran.
-/// Deactivating the session is: the dispatch path holds that exact
-/// `Arc` alongside the frame, the flag is one-way, and it expires
-/// with nothing. `MeshNode::process_local_packet` refuses a frame
-/// whose session is no longer active, which is what bounds
+/// `NetSession::retire_receive_lifetime` is: the dispatch path holds
+/// that exact `Arc` alongside the frame, the flag is one-way, and it
+/// expires with nothing. `MeshNode::process_local_packet` refuses a
+/// frame whose incarnation is retired, which is what bounds
 /// capture-to-dispatch rather than hoping the marker outlives it.
+///
+/// The retirement flag is NOT `active`, and the two calls below are
+/// not redundant. `active` is advisory local liveness with many
+/// writers (tests and the SDK mark sessions inactive that are still
+/// legitimate, still-sending selections); retirement is this
+/// incarnation being over. They were the same flag for one round,
+/// and the ingress guard keyed on `active` silently refused the
+/// inbound half of a live conversation whose session had merely been
+/// marked inactive locally. A retired session is also no longer live
+/// here, so this path still sets both — but only this one is the
+/// ingress predicate.
 #[cfg(feature = "webrtc")]
 fn retire_session_receive_lifetime(
     reassembly: &super::rtc::RtcReassembly,
     session: &Arc<NetSession>,
 ) {
+    session.retire_receive_lifetime();
     session.deactivate();
     reassembly.retire_session(session.session_id(), std::time::Instant::now());
 }
@@ -1109,9 +1121,9 @@ impl PeerEvictionCtx {
                     // fragment groups it opened are released and
                     // the session is fenced against the packets
                     // already past their session lookup. NR3: and
-                    // the session handle itself is deactivated, so a
-                    // frame captured under it is refused at dispatch
-                    // however long it was held.
+                    // the session handle's own receive lifetime is
+                    // retired, so a frame captured under it is
+                    // refused at dispatch however long it was held.
                     retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
                     true
                 });
@@ -26333,7 +26345,18 @@ impl MeshNode {
             let mut table = self.rtc_dialogs.lock().await;
             table.remove(claimed_node_id, dialog)
         };
+        // **The `remove` returning `Some` is what makes this
+        // terminal exactly once** (plan §10's partition): a dialog
+        // whose channel already opened left the table in
+        // `spawn_dialog_completion` step 2, so a late close here
+        // finds nothing and the completion owner's own outcome —
+        // `ice_direct` or `ice_failed` — stands unduplicated. When
+        // the entry IS still here the browser went away before the
+        // channel opened, which is `ice_failed` and not
+        // `ice_relayed`: the attempt did not run out of time, it
+        // lost its peer.
         if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
+            driver.stats().note_ice_failed();
             let _ = driver.close(entry.peer).await;
         }
         self.release_signal_budget(claimed_node_id, dialog);
@@ -26385,6 +26408,18 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     fn rtc_stats_opt(&self) -> Option<&Arc<super::rtc::RtcStats>> {
         self.rtc_driver.as_ref().map(|d| d.stats())
+    }
+
+    /// This node's ICE attempt ledger (plan §10's field telemetry),
+    /// or `None` when this node has no RTC driver — no driver is no
+    /// ledger, which is not the same as a ledger reading zero.
+    ///
+    /// Powers `DeckClient::ice_stats`, Deck's ICE column and
+    /// `net-mesh anchor stats`. This node's OWN attempts: an attempt
+    /// ledger is not announced and cannot be read across the mesh.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_ice_stats(&self) -> Option<super::rtc::IceStats> {
+        self.rtc_stats_opt().map(|s| s.ice_snapshot())
     }
 
     /// Release one dialog's `SignalBudget` slot (R5).
@@ -26659,6 +26694,17 @@ impl MeshNode {
                     driver.stats().note_ice_direct();
                 }
                 Err(e) => {
+                    // The attempt is terminal and it did not
+                    // install. `ice_failed`, never `ice_relayed`:
+                    // its DataChannel OPENED (step 1 above), so ICE
+                    // connected — what failed was Noise, the key
+                    // lookup, the install, or the deadline landing
+                    // inside them. Counting this as relayed would
+                    // report "ICE could not connect" about an
+                    // attempt where it demonstrably did. The dialog
+                    // left the expiry table at step 2, so the
+                    // expiry sweep cannot count this attempt again.
+                    driver.stats().note_ice_failed();
                     tracing::debug!(
                         error = %e,
                         peer = format!("{peer_node_id:#x}"),
@@ -28164,7 +28210,8 @@ impl MeshNode {
                                     // Nothing else will: the rotation
                                     // leaves no close notification and
                                     // no endpoint removal behind it.
-                                    // NR3: deactivated with it.
+                                    // NR3: its receive lifetime is
+                                    // retired with it.
                                     #[cfg(feature = "webrtc")]
                                     retire_session_receive_lifetime(
                                         &ctx.rtc_reassembly,
@@ -28469,17 +28516,29 @@ impl MeshNode {
     /// answer: it expires with `GROUP_TTL` and is evicted under
     /// churn, and a frame that outlives it recreated state under the
     /// retired session id. The session handle CAN be: it is the very
-    /// object this frame was admitted against, deactivation is
-    /// one-way, and `retire_session_receive_lifetime` performs it on
-    /// every retirement path. A frame whose incarnation is gone is
-    /// refused before it is decrypted, dispatched or reassembled.
+    /// object this frame was admitted against,
+    /// `NetSession::retire_receive_lifetime` is one-way and expires
+    /// with nothing, and every retirement path performs it.
+    ///
+    /// The predicate is RETIREMENT, never `is_active`. Those are two
+    /// different questions and asking the wrong one here is a
+    /// regression that has already happened once: `active` is
+    /// advisory local state with many writers — replacement,
+    /// shutdown, tests, and an SDK marking a session it no longer
+    /// treats as live — and a locally deactivated session is still a
+    /// legitimate peer that is still sending and still owed its
+    /// replies. Refusing its frames here silently blackholed the
+    /// inbound half of a live conversation. A frame whose
+    /// INCARNATION is retired is refused before it is decrypted,
+    /// dispatched or reassembled; a frame from a merely inactive
+    /// session is processed normally.
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
         session: &NetSession,
         ctx: &DispatchCtx,
     ) {
-        if !session.is_active() {
+        if session.is_receive_lifetime_retired() {
             tracing::debug!(
                 session_id = session.session_id(),
                 from_node = format!("{from_node:#x}"),
@@ -31680,8 +31739,9 @@ impl MeshNode {
                                 // runs. Without this, a peer the
                                 // failure detector gave up on left
                                 // its acknowledged partial bytes
-                                // pinned in the mesh-owned map. NR3:
-                                // deactivated with it.
+                                // pinned in the mesh-owned map.
+                                // NR3: its receive lifetime is
+                                // retired with it.
                                 #[cfg(feature = "webrtc")]
                                 retire_session_receive_lifetime(
                                     &rtc_reassembly_evict,
@@ -37439,11 +37499,13 @@ impl MeshNode {
         ctx.rtc_reassembly.run_dispatch_pause();
         // NR3, second half of the capture-to-dispatch bound. The
         // top-of-dispatch check refuses a frame whose incarnation is
-        // gone; this is the same question asked immediately before the
-        // only write that could recreate retired state, so a
-        // retirement that lands between the two still finds the
-        // session's own entry guard (X9) and the marker behind it.
-        if !session.is_active() {
+        // retired; this is the same question — retirement, NOT the
+        // advisory `is_active` flag, see `process_local_packet` —
+        // asked immediately before the only write that could recreate
+        // retired state, so a retirement that lands between the two
+        // still finds the session's own entry guard (X9) and the
+        // marker behind it.
+        if session.is_receive_lifetime_retired() {
             tracing::debug!(
                 session_id = session.session_id(),
                 fragment_id = parsed.header.fragment_id,
@@ -37692,7 +37754,8 @@ impl MeshNode {
         ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
         ctx.provisional_endpoints.remove(&endpoint);
         // N3: the breach path ends the session too, so its partial
-        // fragment groups go with it. NR3: deactivated with it.
+        // fragment groups go with it. NR3: its receive lifetime is
+        // retired with it.
         retire_session_receive_lifetime(&ctx.rtc_reassembly, &breached.session);
         if let Some(stats) = ctx.rtc_stats.as_ref() {
             stats.note_admission_reclaimed();
@@ -47060,12 +47123,17 @@ impl Adapter for MeshNode {
             egress.close_and_join().await;
         }
 
-        // Deactivate all sessions. NR3: this is also what refuses
-        // every frame still in flight past its session lookup — a
-        // deactivated session is not dispatched
+        // Retire every session's receive lifetime, and mark it not
+        // live. NR3: the retirement is also what refuses every frame
+        // still in flight past its session lookup — a frame captured
+        // under a retired incarnation is not dispatched
         // (`process_local_packet`), so no late arrival can rebuild
-        // receive state on a node that is going away.
+        // receive state on a node that is going away. The `active`
+        // flag is not that predicate: see
+        // `retire_session_receive_lifetime` for why the two are
+        // separate.
         for entry in self.peers.iter() {
+            entry.value().session.retire_receive_lifetime();
             entry.value().session.deactivate();
         }
 

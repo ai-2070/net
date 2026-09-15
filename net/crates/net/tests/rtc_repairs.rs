@@ -3840,6 +3840,80 @@ async fn a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassemb
     a.rtc_reassembly().set_dispatch_pause(None);
 }
 
+/// **NR3's other half**: the ingress predicate is RETIREMENT, and a
+/// session that is merely marked inactive LOCALLY still receives.
+///
+/// `NetSession::deactivate` and receive-lifetime retirement are two
+/// different facts about a session, and this witness exists because
+/// they were briefly one flag. `active` is advisory local liveness
+/// with many writers — session replacement, node shutdown, tests, and
+/// an SDK marking a session it no longer treats as live while the
+/// peer stays pinned, stays selected and keeps sending. Retirement is
+/// "this incarnation is over". Keying the dispatch guard on `active`
+/// blackholed the INBOUND half of a live conversation: the peer's
+/// replies were dropped at this node's own ingress, and the sender
+/// saw an ack timeout with nothing refused anywhere.
+///
+/// So: B marks its session to A inactive, retires nothing, and every
+/// payload A sends must still be delivered on B. The companion
+/// witness above establishes the opposite direction — a frame under a
+/// RETIRED incarnation is still refused — and the pair is what keeps
+/// the two meanings from collapsing into each other again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_locally_deactivated_session_still_receives_its_peers_frames() {
+    let (a, b, _id_a, _) = pair_with(rtc_config(), rtc_config()).await;
+    let a_id = a.node_id();
+
+    // The local mark, on the RECEIVING node, through the same public
+    // call the SDK and the sensing witness use. Nothing is retired:
+    // asserted, so this cannot pass by retiring nothing and also
+    // marking nothing.
+    let session = b
+        .peer_session_for_test(a_id)
+        .expect("B's session to A")
+        .clone();
+    session.deactivate();
+    assert!(
+        !session.is_active(),
+        "precondition: B's session to A is marked not-live locally"
+    );
+    assert!(
+        !session.is_receive_lifetime_retired(),
+        "and its receive lifetime is NOT retired: deactivation is not \
+         retirement, which is the whole distinction under test"
+    );
+
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let stream = a
+        .open_stream(b.node_id(), 0x0053, cfg)
+        .expect("open_stream");
+
+    const N: usize = 4;
+    let payloads = tagged_payloads(b"NR3LV", N);
+    for payload in &payloads {
+        a.send_with_retry(&stream, std::slice::from_ref(payload), 16)
+            .await
+            .expect("send_with_retry");
+    }
+
+    let seen = collect_tagged(&b, b"NR3LV", N, Duration::from_secs(30)).await;
+    let distinct: HashSet<&Vec<u8>> = seen.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        N,
+        "a locally deactivated session must still deliver its peer's frames: \
+         {} of {N} distinct payloads arrived ({} deliveries). A shortfall here \
+         means the ingress is refusing on local liveness again",
+        distinct.len(),
+        seen.len()
+    );
+    assert!(
+        !session.is_receive_lifetime_retired(),
+        "and nothing about receiving retired the incarnation"
+    );
+}
+
 /// **NR4**: an in-order hold is bound to the exact stream lifetime
 /// that accepted the sequence.
 ///

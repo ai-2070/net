@@ -718,11 +718,14 @@ impl RtcReassembly {
     /// [`GROUP_TTL`] and gives way to [`MAX_RETIRED_SESSIONS`]
     /// churn — so it cannot be the whole retirement authority. The
     /// authority is the session handle itself: every caller of this
-    /// function deactivates the `NetSession` it is retiring, and the
-    /// ingress refuses a frame whose session is no longer active
-    /// before it ever reaches here. That flag is captured with the
-    /// frame, is one-way, and expires with nothing. The marker
-    /// remains as the cheap in-window refusal.
+    /// function calls `NetSession::retire_receive_lifetime` on the
+    /// session it is retiring, and the ingress refuses a frame whose
+    /// incarnation is retired before it ever reaches here. That flag
+    /// is captured with the frame, is one-way, and expires with
+    /// nothing. It is deliberately NOT the session's `active` flag,
+    /// which is advisory local liveness with many writers and says
+    /// nothing about a lifetime being over. The marker remains as
+    /// the cheap in-window refusal.
     pub fn retire_session(&self, session_id: u64, now: Instant) {
         let mut abandoned = Vec::new();
         {
