@@ -28114,7 +28114,7 @@ impl MeshNode {
         // session's own control-sequence counter
         // (`NetSession::next_control_tx_seq`), not a stream's, and no
         // sender tracks them for retransmit.
-        if parsed.header.subprotocol_id != 0
+        if Self::accounts_inbound_subprotocol(parsed.header.subprotocol_id)
             && parsed.header.stream_id != CONTROL_STREAM_ID
             && !parsed.header.flags.is_handshake()
             && !Self::account_inbound_stream_packet(
@@ -29647,6 +29647,78 @@ impl MeshNode {
     ///   ack, repeated. Staying silent would leave the sender to
     ///   exhaust its retries and reset a stream that arrived intact.
     ///   No bytes are consumed on that path, so the credit half is
+    /// Does this node DISPATCH `subprotocol_id`, and therefore owe
+    /// its sender receive-side accounting?
+    ///
+    /// R3 hoisted the accounting above the dispatch chain because a
+    /// stream is one sequence space whatever subprotocol its frames
+    /// carry. Hoisting it above the chain must not hoist it above
+    /// the DECISION: an unknown subprotocol is dropped and counted,
+    /// and a dropped frame must leave no receive-side stream behind
+    /// — `unknown_subprotocol_is_dropped_not_surfaced_as_events`
+    /// pins exactly that, and the first cut of the hoist broke it.
+    ///
+    /// The list is the dispatch chain below, in wire order. A new
+    /// dispatched subprotocol belongs here in the same commit that
+    /// adds its arm; one that is absent is treated as unknown, which
+    /// is the safe direction (its sender retransmits and gives up,
+    /// loudly) rather than the unsafe one (state allocated for
+    /// frames nobody handles).
+    fn accounts_inbound_subprotocol(subprotocol_id: u16) -> bool {
+        const ACCOUNTED: &[u16] = &[
+            SUBPROTOCOL_MIGRATION,
+            super::state::causal::SUBPROTOCOL_CAUSAL,
+            super::state::causal::SUBPROTOCOL_SNAPSHOT,
+            super::subprotocol::SUBPROTOCOL_NEGOTIATION,
+            super::continuity::SUBPROTOCOL_CONTINUITY,
+            super::continuity::SUBPROTOCOL_FORK_ANNOUNCE,
+            super::continuity::SUBPROTOCOL_CONTINUITY_PROOF,
+            super::contested::SUBPROTOCOL_PARTITION,
+            super::contested::SUBPROTOCOL_RECONCILE,
+            super::compute::replica_group::SUBPROTOCOL_REPLICA_GROUP,
+            net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_WINDOW,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_NACK,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_RESET,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_ACK,
+            super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN,
+            super::behavior::broadcast::SUBPROTOCOL_ROUTE_WITHDRAW,
+            super::behavior::broadcast::SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+            super::traversal::SUBPROTOCOL_REFLEX,
+            super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            sensing::SUBPROTOCOL_SENSING_INTEREST,
+            sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+        ];
+        ACCOUNTED.contains(&subprotocol_id)
+            || Self::accounts_inbound_subprotocol_gated(subprotocol_id)
+    }
+
+    /// The feature-gated half of [`Self::accounts_inbound_subprotocol`].
+    fn accounts_inbound_subprotocol_gated(subprotocol_id: u16) -> bool {
+        #[cfg(feature = "webrtc")]
+        if subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
+            return true;
+        }
+        #[cfg(feature = "redex")]
+        if subprotocol_id == super::redex::SUBPROTOCOL_REDEX {
+            return true;
+        }
+        #[cfg(feature = "meshdb")]
+        if subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
+            return true;
+        }
+        #[cfg(feature = "cortex")]
+        if subprotocol_id == super::behavior::fold::SUBPROTOCOL_FOLD {
+            return true;
+        }
+        #[cfg(feature = "dataforts")]
+        if subprotocol_id == super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER {
+            return true;
+        }
+        let _ = subprotocol_id;
+        false
+    }
+
     ///   unchanged.
     fn account_inbound_stream_packet(
         parsed: &ParsedPacket,
