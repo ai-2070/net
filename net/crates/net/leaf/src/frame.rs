@@ -158,6 +158,26 @@ pub struct PieceMeta {
     pub origin_hash: u64,
     /// The `u16` channel-hash hint.
     pub channel_hash: u16,
+    /// The subprotocol that put the piece on the stream.
+    ///
+    /// Carried per piece for exactly the reason the stream and the
+    /// origin are: a group's plane belongs to its **first**
+    /// fragment. Reading it off whichever packet completed the
+    /// group let one session-authenticated producer send a prefix
+    /// under one plane and the finishing piece under another, and
+    /// have the whole assembled payload dispatched under the
+    /// second — an event body decoded as channel membership, or
+    /// membership decoded as an event, after both planes'
+    /// sequences were already acknowledged.
+    pub subprotocol_id: u16,
+    /// Whether the piece's packet declared the reliable mode.
+    ///
+    /// The mode is what decides the consumer cursor's gap
+    /// disposition — hold and recover, or skip and count — so a
+    /// group assembled out of pieces that disagree about it has no
+    /// single answer to give the reorder buffer. Bound here, so
+    /// there is one.
+    pub reliable: bool,
 }
 
 /// A complete payload, and the stream sequences it consumed.
@@ -212,18 +232,57 @@ struct Partial {
     ///
     /// Fixing it is the point. The group key is only
     /// `(scope, fragment_id)`, so without this one payload could be
-    /// assembled out of pieces claiming different streams, origins
-    /// and channels, and would be delivered under whichever piece
-    /// happened to carry the lowest sequence.
+    /// assembled out of pieces claiming different streams, origins,
+    /// channels, planes and modes, and would be delivered under
+    /// whichever piece happened to carry the lowest sequence —
+    /// while the rest of its provenance came from whichever piece
+    /// happened to arrive last.
     first: PieceMeta,
     /// Whether the caller supplies stream sequences for this group.
     sequenced: bool,
+}
+
+/// A fragment group whose retained bytes were given up on after its
+/// sequences had already been acknowledged.
+///
+/// The reassembler's bounds are real — a TTL, a group count, a
+/// consistency rule — and each of them can end a group whose
+/// pieces the receive path already acknowledged. The
+/// acknowledgement is what retires the sender's only copy: from
+/// that moment the bytes cannot come back, because the peer has
+/// nothing left to rebuild from and no wire gap remains to NACK.
+/// Removing them and moving a counter is therefore silent loss of
+/// data this leaf claimed as progress. So a group names the stream
+/// it owned on its way out, and the node turns that into the
+/// stream's typed terminal disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Abandoned {
+    /// Session incarnation the group belonged to.
+    pub scope: u64,
+    /// The stream whose sequences the group consumed.
+    pub stream_id: u64,
+}
+
+/// Report a group whose retained bytes are being given up on.
+///
+/// Only a **sequenced** group is reported. It is the one whose
+/// pieces consumed stream sequences the receive path acknowledged;
+/// the sequence-less control path owns no stream and no
+/// acknowledgement, so nothing there can be stranded by a reap.
+fn note_abandoned(abandoned: &mut Vec<Abandoned>, scope: u64, partial: &Partial) {
+    if partial.sequenced {
+        abandoned.push(Abandoned {
+            scope,
+            stream_id: partial.first.stream_id,
+        });
+    }
 }
 
 /// Inbound reassembly, bounded in both directions.
 #[derive(Debug, Default)]
 pub struct Reassembler {
     groups: HashMap<(u64, u16), Partial>,
+    abandoned: Vec<Abandoned>,
 }
 
 impl Reassembler {
@@ -247,6 +306,43 @@ impl Reassembler {
     /// is what keeps a re-handshake from mixing them.
     pub fn retire(&mut self, scope: u64) {
         self.groups.retain(|(s, _), _| *s != scope);
+    }
+
+    /// Drop every group of one stream's receive lifetime.
+    ///
+    /// A RESET ends that lifetime: the peer's send half gave up and
+    /// may restart the id from sequence zero, so the cursor and the
+    /// reliability ranges are reset. A partial group retained from
+    /// before the reset is not part of the lifetime that follows it
+    /// — leave it and an old delayed tail completes it afterwards,
+    /// and a payload from before the reset is delivered against the
+    /// fresh cursor, behind the `PeerReset` the consumer was already
+    /// given. Nothing is reported as abandoned: the reset **is** the
+    /// stream's terminal disposition, and the caller owns it.
+    pub fn retire_stream(&mut self, scope: u64, stream_id: u64, counters: &LeafCounters) {
+        let before = self.groups.len();
+        self.groups
+            .retain(|(s, _), p| *s != scope || !p.sequenced || p.first.stream_id != stream_id);
+        for _ in 0..(before - self.groups.len()) {
+            counters.drop_for(DropReason::StreamFailed);
+        }
+    }
+
+    /// Take the groups whose acknowledged ownership was given up on.
+    ///
+    /// Drained rather than counted: a counter cannot name the stream
+    /// that lost its bytes, and naming it is the whole difference
+    /// between a bounded reassembler and one that acknowledges data
+    /// it then discards.
+    pub fn take_abandoned(&mut self) -> Vec<Abandoned> {
+        core::mem::take(&mut self.abandoned)
+    }
+
+    /// Remove `key`, reporting whatever ownership it was holding.
+    fn abandon(&mut self, key: (u64, u16)) {
+        if let Some(partial) = self.groups.remove(&key) {
+            note_abandoned(&mut self.abandoned, key.0, &partial);
+        }
     }
 
     /// Offer one inbound piece, without sequence context.
@@ -341,11 +437,18 @@ impl Reassembler {
         now: Instant,
         counters: &LeafCounters,
     ) -> bool {
-        if flags & FRAG_FRAGMENTED == 0 || self.groups.contains_key(&(scope, fragment_id)) {
+        if flags & FRAG_FRAGMENTED == 0 {
             return true;
         }
+        // Before the open-group shortcut, not after it. A group
+        // that is past its deadline is not an open group, and
+        // answering `true` for one is how a late piece was
+        // acknowledged and then found its own group reaped by the
+        // very next step.
         self.expire(now, counters);
-        if self.groups.len() < MAX_OUTSTANDING_REASSEMBLIES {
+        if self.groups.contains_key(&(scope, fragment_id))
+            || self.groups.len() < MAX_OUTSTANDING_REASSEMBLIES
+        {
             return true;
         }
         counters.drop_for(DropReason::ReassemblyRefused);
@@ -420,16 +523,19 @@ impl Reassembler {
         };
 
         // Group-wide delivery metadata. Every piece must claim the
-        // stream, origin and channel the group's first piece
-        // claimed. A piece that does not is not a piece of this
-        // group, whatever its fragment id says — and accepting it
-        // would deliver one peer's bytes under another's stream.
+        // stream, origin, channel, plane and mode the group's first
+        // piece claimed. A piece that does not is not a piece of
+        // this group, whatever its fragment id says — and accepting
+        // it would deliver one peer's bytes under another's stream,
+        // or one plane's bytes decoded as another's.
         if meta.is_some_and(|m| {
             m.stream_id != partial.first.stream_id
                 || m.origin_hash != partial.first.origin_hash
                 || m.channel_hash != partial.first.channel_hash
+                || m.subprotocol_id != partial.first.subprotocol_id
+                || m.reliable != partial.first.reliable
         }) {
-            self.groups.remove(&key);
+            self.abandon(key);
             counters.drop_for(DropReason::ReassemblyInconsistent);
             return None;
         }
@@ -474,7 +580,7 @@ impl Reassembler {
                     .iter()
                     .any(|p| p.offset as usize + p.data.len() > end));
         if inconsistent {
-            self.groups.remove(&key);
+            self.abandon(key);
             counters.drop_for(DropReason::ReassemblyInconsistent);
             return None;
         }
@@ -508,12 +614,14 @@ impl Reassembler {
         let mut covered = 0usize;
         for piece in &partial.pieces {
             if piece.offset as usize != covered {
+                note_abandoned(&mut self.abandoned, scope, &partial);
                 counters.drop_for(DropReason::ReassemblyInconsistent);
                 return None;
             }
             covered += piece.data.len();
         }
         if covered != total {
+            note_abandoned(&mut self.abandoned, scope, &partial);
             counters.drop_for(DropReason::ReassemblyInconsistent);
             return None;
         }
@@ -533,6 +641,7 @@ impl Reassembler {
             let seqs = &mut seqs[..partial.pieces.len()];
             seqs.sort_unstable();
             if seqs.windows(2).any(|w| w[1] != w[0] + 1) {
+                note_abandoned(&mut self.abandoned, scope, &partial);
                 counters.drop_for(DropReason::ReassemblyInconsistent);
                 return None;
             }
@@ -553,12 +662,19 @@ impl Reassembler {
         })
     }
 
-    /// Reap groups older than [`REASSEMBLY_TTL_MS`], counting each.
+    /// Reap groups older than [`REASSEMBLY_TTL_MS`], counting each,
+    /// and reporting the acknowledged ownership each one held.
     pub fn expire(&mut self, now: Instant, counters: &LeafCounters) {
         let ttl = core::time::Duration::from_millis(REASSEMBLY_TTL_MS);
         let before = self.groups.len();
-        self.groups
-            .retain(|_, p| now.saturating_duration_since(p.touched) < ttl);
+        let abandoned = &mut self.abandoned;
+        self.groups.retain(|key, p| {
+            if now.saturating_duration_since(p.touched) < ttl {
+                return true;
+            }
+            note_abandoned(abandoned, key.0, p);
+            false
+        });
         for _ in 0..(before - self.groups.len()) {
             counters.drop_for(DropReason::ReassemblyExpired);
         }
@@ -748,6 +864,8 @@ mod tests {
             stream_id: 4,
             origin_hash: 5,
             channel_hash: 6,
+            subprotocol_id: 0x0A00,
+            reliable: true,
         }
     }
 
@@ -886,10 +1004,8 @@ mod tests {
             )
             .is_none());
         let elsewhere = PieceMeta {
-            sequence: 1,
             stream_id: 40,
-            origin_hash: 5,
-            channel_hash: 6,
+            ..provenance(1)
         };
         assert!(
             r.accept_piece(
@@ -942,5 +1058,244 @@ mod tests {
             "the head was reaped, so the tail cannot assemble a payload"
         );
         assert_eq!(c.drops(DropReason::ReassemblyExpired), 1);
+    }
+
+    /// The plane and the mode are group-wide facts too, and the
+    /// group key does not carry them. A producer that keeps the
+    /// stream, origin, channel and sequence span honest and changes
+    /// only the completing piece's subprotocol would otherwise have
+    /// its whole payload dispatched under that piece's plane —
+    /// after both planes' sequences were acknowledged.
+    #[test]
+    fn a_group_cannot_change_its_plane() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now(),
+                &c
+            )
+            .is_none());
+        let other_plane = PieceMeta {
+            subprotocol_id: 0x0B00,
+            ..provenance(1)
+        };
+        assert!(
+            r.accept_piece(
+                1,
+                other_plane,
+                3,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                now(),
+                &c
+            )
+            .is_none(),
+            "a piece claiming another plane is not a piece of this group"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 1);
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// Same for the reliable bit: it is what the consumer cursor's
+    /// gap disposition is chosen from, so a group whose pieces
+    /// disagree about it has no single answer to give.
+    #[test]
+    fn a_group_cannot_change_its_mode() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now(),
+                &c
+            )
+            .is_none());
+        let other_mode = PieceMeta {
+            reliable: false,
+            ..provenance(1)
+        };
+        assert!(
+            r.accept_piece(
+                1,
+                other_mode,
+                3,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                now(),
+                &c
+            )
+            .is_none(),
+            "a piece claiming another mode is not a piece of this group"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyInconsistent), 1);
+        assert_eq!(r.outstanding(), 0);
+    }
+
+    /// A reap of a sequenced group names the stream whose
+    /// acknowledged sequences it was holding. Counting the loss is
+    /// what the caller cannot act on: the stream id is.
+    #[test]
+    fn a_reaped_sequenced_group_names_the_stream_it_owned() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        assert!(r
+            .accept_piece(
+                9,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                t0,
+                &c
+            )
+            .is_none());
+        assert!(r.take_abandoned().is_empty(), "nothing is lost yet");
+        r.expire(
+            t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS),
+            &c,
+        );
+        assert_eq!(
+            r.take_abandoned(),
+            vec![Abandoned {
+                scope: 9,
+                stream_id: 4
+            }],
+            "the reap must surrender the stream's ownership, not just count it"
+        );
+        assert!(
+            r.take_abandoned().is_empty(),
+            "a drained report is not reported twice"
+        );
+    }
+
+    /// The sequence-less control path owns no stream and no
+    /// acknowledgement, so its reap strands nothing and must not
+    /// manufacture a terminal disposition for stream zero.
+    #[test]
+    fn a_reaped_control_group_strands_no_stream() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        assert!(r
+            .accept(
+                1,
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                t0,
+                &c
+            )
+            .is_none());
+        r.expire(
+            t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS),
+            &c,
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyExpired), 1);
+        assert!(r.take_abandoned().is_empty());
+    }
+
+    /// A contradicted group has usually already been acknowledged
+    /// too, so destroying it surrenders the same ownership a reap
+    /// does.
+    #[test]
+    fn a_contradicted_sequenced_group_names_the_stream_it_owned() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        assert!(r
+            .accept_piece(
+                2,
+                provenance(0),
+                3,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                now(),
+                &c
+            )
+            .is_none());
+        assert!(r
+            .accept_piece(
+                2,
+                provenance(1),
+                3,
+                2,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"overlap"),
+                now(),
+                &c
+            )
+            .is_none());
+        assert_eq!(
+            r.take_abandoned(),
+            vec![Abandoned {
+                scope: 2,
+                stream_id: 4
+            }]
+        );
+    }
+
+    /// A stream's receive lifetime ending takes its partial groups
+    /// with it, and only its own: another stream in the same session
+    /// and the sequence-less control groups are untouched.
+    #[test]
+    fn retiring_one_stream_takes_only_its_own_groups() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let elsewhere = PieceMeta {
+            stream_id: 40,
+            ..provenance(0)
+        };
+        for (fragment_id, meta) in [(3u16, provenance(0)), (4, elsewhere)] {
+            assert!(r
+                .accept_piece(
+                    1,
+                    meta,
+                    fragment_id,
+                    0,
+                    FRAG_FRAGMENTED,
+                    Bytes::from_static(b"head"),
+                    now(),
+                    &c
+                )
+                .is_none());
+        }
+        assert!(r
+            .accept(
+                1,
+                5,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"ctl"),
+                now(),
+                &c
+            )
+            .is_none());
+        assert_eq!(r.outstanding(), 3);
+        r.retire_stream(1, 4, &c);
+        assert_eq!(r.outstanding(), 2, "only stream 4's group goes");
+        assert_eq!(c.drops(DropReason::StreamFailed), 1);
+        assert!(
+            r.take_abandoned().is_empty(),
+            "the reset is the disposition; retirement must not add a second one"
+        );
+        r.retire_stream(2, 4, &c);
+        assert_eq!(r.outstanding(), 2, "another scope's stream 4 is not ours");
     }
 }

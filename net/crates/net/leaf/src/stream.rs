@@ -153,6 +153,15 @@ pub struct StreamRecord {
     /// an application body as channel membership. One sequence
     /// space, one cursor, and every record keeps its own plane.
     pub subprotocol_id: u16,
+    /// The mode the record's packet — or, for a reassembled group,
+    /// its FIRST fragment — declared.
+    ///
+    /// Held with the record for the same reason the plane is: the
+    /// mode decides whether a gap ahead of this record is held for
+    /// recovery or skipped and counted, and taking it from
+    /// whichever arrival completed a fragment group let a reliable
+    /// group's head open its stream's cursor in fire-and-forget.
+    pub reliable: bool,
     /// The publisher's full 64-bit origin hash.
     pub origin_hash: u64,
     /// The `u16` channel-hash hint from its header.
@@ -305,6 +314,7 @@ mod tests {
             origin_hash: 0xA1 + seq,
             channel_hash: tag as u16,
             payloads: vec![Bytes::from(vec![tag])],
+            reliable: true,
         }
     }
 

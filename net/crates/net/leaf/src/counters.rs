@@ -93,6 +93,13 @@ pub enum DropReason {
     /// A reliable stream whose retransmits were exhausted, or that
     /// the peer reset. Terminal for that stream.
     StreamFailed,
+    /// A record for a stream whose consumer called `close`. The
+    /// receive cursor stays live for the rest of the session — the
+    /// peer's transmit sequence was never rewound, so a reopen has
+    /// to resume where the peer actually is — but there is no
+    /// consumer to deliver to, so the bytes are counted here rather
+    /// than queued for one that may never come back.
+    StreamClosed,
 }
 
 impl DropReason {
@@ -117,12 +124,13 @@ impl DropReason {
             Self::UnknownCall => "unknown_call",
             Self::SequenceGapTooLarge => "sequence_gap_too_large",
             Self::StreamFailed => "stream_failed",
+            Self::StreamClosed => "stream_closed",
         }
     }
 
     /// Every reason, in declaration order. Used by the snapshot so a
     /// new variant appears in the JSON without a second edit.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::NotAddressedToUs,
         Self::RoutingExpired,
         Self::UnknownSubprotocol,
@@ -141,6 +149,7 @@ impl DropReason {
         Self::UnknownCall,
         Self::SequenceGapTooLarge,
         Self::StreamFailed,
+        Self::StreamClosed,
     ];
 }
 

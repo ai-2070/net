@@ -5,6 +5,19 @@
 //! below is the parent's. They reproduced 7 failures out of 10 when
 //! they landed; each repair row turns named probes green without
 //! touching the file.
+//!
+//! One mechanical exception, forced by the repair the reviewer
+//! herself specified. Round-3 row X3 reads: "`PieceMeta` lacks
+//! subprotocol/reliability provenance; completion takes them from
+//! the finishing packet — bind them group-wide like
+//! stream/origin/channel." Rust struct literals are exhaustive, so
+//! `kyra_fragment_group_cannot_change_stream_or_provenance` below
+//! cannot construct the repaired `PieceMeta` without naming the two
+//! new fields. Both of its literals were therefore given the **same**
+//! `subprotocol_id` and `reliable` values, so the probe still
+//! discriminates exactly what its name and its failure message name
+//! — stream, origin and channel — and nothing else. No name, helper,
+//! assertion or message changed.
 use net_leaf::rpc_wire::{EventMeta, RpcStatus, DISPATCH_RPC_RESPONSE};
 use net_leaf::stream::LEAF_STREAM_DISCRIMINATOR;
 use net_leaf::{Channel, LeafEvent, LeafIdentity, LeafNode, Reliability};
@@ -97,12 +110,16 @@ fn kyra_fragment_group_cannot_change_stream_or_provenance() {
         stream_id: 10,
         origin_hash: 20,
         channel_hash: 30,
+        subprotocol_id: 0x0A00,
+        reliable: true,
     };
     let b = PieceMeta {
         sequence: 1,
         stream_id: 11,
         origin_hash: 21,
         channel_hash: 31,
+        subprotocol_id: 0x0A00,
+        reliable: true,
     };
     assert!(r
         .accept_piece(

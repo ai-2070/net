@@ -55,6 +55,30 @@ const POOL_SIZE: usize = 4;
 /// with. It is retired when the peer's cumulative ack passes its
 /// sequence, so the live set is the reliable window; the cap is the
 /// backstop for a peer that never acks, at ~32 bytes an entry.
+///
+/// **A session bound over per-stream ownership, so it is RESERVED at
+/// admission rather than enforced by eviction.** Descriptors are
+/// per stream and each stream's own retransmit window bounds them,
+/// so nine streams each admitting 128 tiny reliable packets own
+/// 1 152 descriptors while every per-stream check still passes. The
+/// pre-repair table absorbed that by deleting its smallest key —
+/// ordered `(stream_id, seq)`, so the casualty was the *lowest*
+/// stream's oldest stamp, a packet another stream had been admitted
+/// to own and could no longer rebuild ([`LeafSession::rebuild`]
+/// skips a descriptor with no stamp, and neither a NACK nor an RTO
+/// recovers it). One stream's traffic could therefore silently
+/// strip a different stream's recoverability.
+///
+/// Sizing the table to the sum of the per-stream bounds is not
+/// available: stream ids are created on demand and each new one adds
+/// its whole window, so that sum has no ceiling and a cap derived
+/// from it would not be a cap. The bound stays, and
+/// [`LeafSession::build_packets`] refuses a message it cannot stamp
+/// — the same whole-message admission the per-stream descriptor
+/// check already performs, reported as
+/// [`LeafError::ReliableWindowFull`]. Refusing is recoverable (an
+/// ack retires stamps and the caller retries); evicting another
+/// stream's ownership is not.
 const MAX_RETRANSMIT_STAMPS: usize = 1_024;
 
 /// Process-wide session incarnation counter.
@@ -432,7 +456,7 @@ impl LeafSession {
         // they ride outside the window — the same reason the receive
         // path does not reorder them.
         if !is_stream_control(subprotocol_id) {
-            // **Two independent bounds, both checked before any
+            // **Three independent bounds, all checked before any
             // sequence is consumed.** Credit is bytes; the
             // retransmit window is a count of descriptors, and
             // small messages exhaust the second first — 129
@@ -444,6 +468,17 @@ impl LeafSession {
             // an RTO recovers it. So packet ownership is reserved
             // as well as byte credit, and the whole message is
             // admitted or refused — never half-owned.
+            //
+            // The third bound is the session's, not the stream's:
+            // every retained descriptor also needs a header stamp,
+            // and the stamp table is shared by every stream
+            // ([`MAX_RETRANSMIT_STAMPS`]). Per-stream descriptor
+            // headroom can therefore be available on THIS stream
+            // while the session has no stamp left, and the
+            // pre-repair table made room by deleting another
+            // stream's oldest stamp. Reserving here is what makes
+            // "admitted" mean the sender can still rebuild every
+            // packet it owns — on every stream, not just this one.
             if reliable {
                 let headroom = self
                     .session
@@ -457,6 +492,15 @@ impl LeafSession {
                             remaining,
                         });
                     }
+                }
+                let stamp_headroom =
+                    MAX_RETRANSMIT_STAMPS.saturating_sub(self.stamps.borrow().len());
+                if fragments.len() > stamp_headroom {
+                    return Err(LeafError::ReliableWindowFull {
+                        stream_id,
+                        needed: fragments.len(),
+                        remaining: stamp_headroom,
+                    });
                 }
             }
             let needed: u32 = fragments
@@ -514,6 +558,17 @@ impl LeafSession {
 
     /// Hand one just-built reliable packet to the stream's
     /// reliability mode, and keep the header its rebuild needs.
+    ///
+    /// Claims nothing it cannot honour: the stamp slot is checked
+    /// before the descriptor is registered, so a retransmit
+    /// obligation never outlives the header its rebuild needs. The
+    /// capacity was already reserved for this whole message by
+    /// [`Self::build_packets`], which is why the refusal below is a
+    /// defensive floor rather than a reachable path — and why it is
+    /// a refusal at all. Making room by deleting the table's
+    /// smallest key, as this used to, evicted the LOWEST stream's
+    /// oldest stamp: another stream's admitted, still-unacknowledged
+    /// packet, silently made unrebuildable by this stream's traffic.
     fn retain_retransmit(
         &self,
         stream_id: u64,
@@ -522,6 +577,15 @@ impl LeafSession {
         flags: PacketFlags,
         stamp: PacketStamp,
     ) {
+        if self.stamps.borrow().len() >= MAX_RETRANSMIT_STAMPS {
+            debug_assert!(
+                false,
+                "build_packets reserved {} stamp slots before admitting this message; \
+                 reaching the cap here means a reliable send bypassed admission",
+                MAX_RETRANSMIT_STAMPS
+            );
+            return;
+        }
         let descriptor = Arc::new(RetransmitDescriptor {
             seq,
             stream_id,
@@ -533,14 +597,7 @@ impl LeafSession {
         };
         stream.with_reliability(|r| r.on_send(descriptor));
         drop(stream);
-        let mut stamps = self.stamps.borrow_mut();
-        stamps.insert((stream_id, seq), stamp);
-        while stamps.len() > MAX_RETRANSMIT_STAMPS {
-            let Some(oldest) = stamps.keys().next().copied() else {
-                break;
-            };
-            stamps.remove(&oldest);
-        }
+        self.stamps.borrow_mut().insert((stream_id, seq), stamp);
     }
 
     /// Retire the stamps for every sequence below `ack_seq` on
@@ -966,5 +1023,72 @@ mod tests {
             assert_ne!(leaf.next_fragment_id(), 0, "id 0 means unfragmented");
         }
         assert_ne!(leaf.next_fragment_id(), 0);
+    }
+
+    /// **X4: one stream's traffic must not strip another stream's
+    /// recoverability.** Descriptors are per stream and each stream's
+    /// own retransmit window bounds them, but the header stamps every
+    /// descriptor needs to be rebuilt from live in ONE session-wide
+    /// table. Eight streams each admitting a full window of tiny
+    /// reliable packets fill it while every per-stream check still
+    /// passes, and the pre-repair table made room by deleting its
+    /// smallest key — the LOWEST stream's oldest stamp, a packet that
+    /// stream had been admitted to own.
+    ///
+    /// Two halves. The ninth stream is refused typed, whole-message,
+    /// before any sequence is consumed; and the first stream's first
+    /// packet is still rebuildable, which is the ownership the
+    /// eviction used to destroy silently ([`LeafSession::rebuild`]
+    /// skips a descriptor whose stamp is gone, so the packet is on the
+    /// wire with nothing able to resend it).
+    #[test]
+    fn a_full_stamp_table_refuses_a_new_stream_rather_than_evicting_an_owned_one() {
+        let (leaf, _) = established();
+        let base = 0x0002_0000_0000_0010u64;
+        // Per-stream descriptor headroom on the default window; the
+        // table holds `MAX_RETRANSMIT_STAMPS`, so this is how many
+        // streams it takes to fill it exactly.
+        let per_stream = net_wire::reliability::ReliableStream::max_pending_for_window(
+            net_wire::stream::DEFAULT_STREAM_WINDOW_BYTES,
+        );
+        let streams = MAX_RETRANSMIT_STAMPS / per_stream;
+        assert!(
+            streams > 1,
+            "the defect needs more than one stream to fit in the table"
+        );
+
+        for n in 0..streams {
+            for _ in 0..per_stream {
+                leaf.build_packets(base + n as u64, 0, 0, 0, true, b"x")
+                    .expect("each stream stays inside its own window");
+            }
+        }
+
+        let refused = leaf.build_packets(base + streams as u64, 0, 0, 0, true, b"x");
+        assert!(
+            matches!(
+                refused,
+                Err(LeafError::ReliableWindowFull {
+                    needed: 1,
+                    remaining: 0,
+                    ..
+                })
+            ),
+            "a message the session cannot stamp must be refused, got {refused:?}"
+        );
+
+        // The first stream's first packet — the eviction's casualty —
+        // still has the header its rebuild needs.
+        let owned = Arc::new(RetransmitDescriptor {
+            seq: 0,
+            stream_id: base,
+            events: vec![Bytes::from_static(b"x")],
+            flags: PacketFlags::RELIABLE,
+        });
+        assert_eq!(
+            leaf.rebuild(&[owned]).len(),
+            1,
+            "another stream's traffic silently made this packet unrebuildable"
+        );
     }
 }
