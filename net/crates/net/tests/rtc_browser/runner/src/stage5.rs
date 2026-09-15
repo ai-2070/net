@@ -39,7 +39,7 @@ use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilityRequir
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
-use net::adapter::net::{MeshNode, Reliability, StreamConfig};
+use net::adapter::net::{MeshNode, Reliability, StreamConfig, StreamError, MAX_EVENT_SIZE};
 
 use crate::browser::{Driver, Engine, LaunchSpec};
 use crate::udp_block::UdpProfile;
@@ -123,7 +123,8 @@ const ABI_RELIABLE_REORDER_EVERY: u64 = 3;
 /// The three sizes the large-message witness uses, and why each is
 /// the size it is.
 ///
-/// `MAX_PAYLOAD_SIZE` is 8 104 B and no NATIVE node reassembles leaf
+/// `MAX_EVENT_SIZE` is 8 104 B (`MAX_PAYLOAD_SIZE` minus the event
+/// frame's 4-byte length prefix) and no NATIVE node reassembles leaf
 /// fragments (§9.2), so the largest body that can round-trip leaf →
 /// native → leaf through `call()` is one that fits, with its nRPC
 /// framing, in a single event. `ABI_CEILING_SIZE` sits just under
@@ -135,8 +136,10 @@ const ABI_CEILING_SIZE: usize = 7_800;
 /// the far side — which is the contract, where "96 KiB works" is
 /// not.
 const ABI_OVER_LIMIT_SIZE: usize = 96 * 1024;
-/// Native → leaf on a stream, over `MAX_PAYLOAD_SIZE`, so the
-/// fragment/reassembly path carries it rather than the nRPC one.
+/// Native → leaf on a stream, over `MAX_EVENT_SIZE`. Nothing on the
+/// native side fragments a stream event, so this is the size at which
+/// the sender must REFUSE, typed, naming the limit — the leg that
+/// used to return `Ok` and deliver nothing.
 const ABI_STREAM_LARGE_SIZE: usize = 32 * 1024;
 
 /// Payloads the leader-PROXIED stream witness pushes native → leaf.
@@ -1644,7 +1647,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // §9.2 of the report states the payload-size interoperability
         // this stage has and the two it does NOT: no native node
         // reassembles leaf fragments, so a leaf → native payload
-        // above `MAX_PAYLOAD_SIZE` (8 104 B) arrives as N partial
+        // above `MAX_EVENT_SIZE` (8 104 B) arrives as N partial
         // events and is not put back together; and above 64 832 B
         // the leaf does not even attempt it, returning a typed
         // `LeafError::Wire` that names streams as the way out —
@@ -1654,17 +1657,20 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // therefore be asserting a property the stage explicitly
         // disclaims — measuring the wrong layer, and failing for a
         // reason that is documentation rather than defect. So the
-        // three legs here are the three things that ARE contracts:
+        // four legs here are the four things that ARE contracts:
         //
         //   1. at the ceiling, the round trip is byte-exact in both
         //      directions through the public `call()`;
         //   2. past the hard limit, the refusal is TYPED and the
         //      anchor's handler is never entered — no truncation,
         //      no partial delivery, no silence;
-        //   3. native → leaf on a stream, an over-`MAX_PAYLOAD_SIZE`
-        //      payload either arrives byte-exact or is refused at
-        //      the sender with a typed `StreamError`; what it may
-        //      never do is arrive truncated or vanish after an `Ok`.
+        //   3. native → leaf on a stream AT the ceiling, byte-exact
+        //      on both of the package's consumers;
+        //   4. native → leaf on a stream ABOVE `MAX_EVENT_SIZE`, the
+        //      symmetric half of §9.2: the sender refuses with a
+        //      typed `StreamError::EventTooLarge` that names the
+        //      limit, and the payload never appears. `Ok` plus
+        //      silence was the defect; a truncation would be worse.
         echo_log.lock().expect("echo log").clear();
         let ceiling_seed = 0x4400 ^ (rand_u64() & 0xFFFF);
         let ceiling_body = gen_bytes(ceiling_seed, ABI_CEILING_SIZE);
@@ -1736,21 +1742,33 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // ceiling, so "both directions" covers the stream API and
         // not only nRPC.
         //
-        // Leg 3b, RECORDED and deliberately NOT gated: the same
-        // send at 32 KiB, over `MAX_PAYLOAD_SIZE`. §9.2 states the
-        // leaf → native direction (native does not reassemble); it
-        // says nothing about native → leaf, and this probe is how
-        // that direction gets a measured answer instead of an
-        // assumption. Gating it would be asserting a contract
-        // nobody has written; dropping it would be hiding the
-        // measurement. It is reported with its exact outcome and
-        // named in §12 for the owner.
+        // Leg 3b, now GATED as well: the same send at 32 KiB, over
+        // the per-event cap. This leg was RECORDED for one round
+        // because §9.2 stated the leaf → native direction only and
+        // gating a contract nobody had written would have been
+        // asserting an assumption. The measurement came back
+        // `Ok` + nothing delivered, and that is now repaired: the
+        // native sender refuses an event above `MAX_EVENT_SIZE`
+        // with a typed `StreamError::EventTooLarge` that NAMES the
+        // limit, before any packet of the call reaches the wire.
+        // Fragmentation was the alternative and was rejected on the
+        // merits: `send_on_stream` is transport-agnostic, only the
+        // browser leaf and the native RTC ingress reassemble, and
+        // every other receive path reads into a `MAX_PACKET_SIZE`
+        // buffer — so fragmenting here would hand a native peer's
+        // application N partial events, trading a silent drop for a
+        // silent corruption. The contract now reads the same in both
+        // directions (§9.2), so this leg gates.
         let stream_ceiling = gen_bytes(over_seed ^ 0x3C3C, ABI_CEILING_SIZE);
         let want_stream_ceiling = Mark::of(&stream_ceiling);
         let stream_large = gen_bytes(over_seed ^ 0x5A5A, ABI_STREAM_LARGE_SIZE);
         let want_stream_large = Mark::of(&stream_large);
         let mut ceiling_send_error: Option<String> = None;
         let mut stream_large_error: Option<String> = None;
+        // The TYPED refusal, not its Display form: a stringly-typed
+        // check would pass on any error at all, including the
+        // transport faults this leg must not accept.
+        let mut stream_large_refusal: Option<(usize, usize)> = None;
         if let Ok(stream) = &direct_native {
             let at_ceiling = Bytes::from(stream_ceiling.clone());
             if let Err(e) = cx
@@ -1767,19 +1785,38 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 .await
             {
                 stream_large_error = Some(e.to_string());
+                if let StreamError::EventTooLarge { size, limit } = e {
+                    stream_large_refusal = Some((size, limit));
+                }
             }
         } else {
             ceiling_send_error = Some("the anchor never opened the direct stream".into());
             stream_large_error = ceiling_send_error.clone();
         }
+        // Only the CEILING payload is expected to arrive, so the wait
+        // ends as soon as it does. The settle below is what catches a
+        // regression that put the over-cap payload on the wire after
+        // all: a second read once the link has gone quiet.
+        let _ceiling_wait = script
+            .run(
+                "a",
+                Step5::StreamInbox {
+                    id: 0,
+                    handle: "direct".into(),
+                    expect: ABI_DIRECT_EVENTS + 1,
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let large_inbox = script
             .run(
                 "a",
                 Step5::StreamInbox {
                     id: 0,
                     handle: "direct".into(),
-                    expect: ABI_DIRECT_EVENTS + 2,
-                    timeout_ms: 30_000,
+                    expect: ABI_DIRECT_EVENTS + 1,
+                    timeout_ms: 5_000,
                 },
             )
             .await;
@@ -1801,28 +1838,46 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let stream_down = ceiling_send_error.is_none()
             && extra.first() == Some(&want_stream_ceiling)
             && extra_iter.first() == Some(&want_stream_ceiling);
-        // RECORDED: what the over-cap one did.
-        let over_cap_outcome = if stream_large_error.is_some() {
-            "REFUSED at the native sender with a typed StreamError"
+        // GATED: the over-cap send is refused TYPED, the error names
+        // BOTH the offending size and the limit, and nothing beyond
+        // the ceiling payload ever arrives on either consumer. An
+        // `Ok` with nothing delivered, a truncation, and a late
+        // delivery each fail here.
+        let over_cap_refused = stream_large_refusal
+            == Some((ABI_STREAM_LARGE_SIZE, MAX_EVENT_SIZE))
+            && extra.len() == 1
+            && extra_iter.len() == 1;
+        let over_cap_outcome = if over_cap_refused {
+            "REFUSED at the native sender, typed, naming the limit, and nothing arrived"
+        } else if stream_large_refusal.is_some() {
+            "REFUSED typed, but something else also arrived on the stream"
+        } else if stream_large_error.is_some() {
+            "refused with the WRONG error — not EventTooLarge"
         } else if extra.iter().any(|m| *m == want_stream_large) {
-            "ACCEPTED and delivered byte-exact"
+            "ACCEPTED and delivered byte-exact — the sender no longer refuses"
         } else if extra.len() > 1 || extra_iter.len() > 1 {
             "ACCEPTED and something OTHER than the payload arrived — a truncation"
         } else {
-            "ACCEPTED with Ok and NOTHING arrived — a silent drop in the native → leaf \
-             direction, which §9.2 does not cover"
+            "ACCEPTED with Ok and NOTHING arrived — the silent drop is back"
         };
 
         ledger.record(
             WITNESSES[12],
-            sized.ok && request_up && reply_down && refused_typed && stream_down,
+            sized.ok
+                && request_up
+                && reply_down
+                && refused_typed
+                && stream_down
+                && over_cap_refused,
             format!(
                 "LARGE MESSAGES THROUGH THE PUBLIC API, BOTH DIRECTIONS — measured against \
-                 the interoperability §9.2 actually claims, not against a size it \
-                 explicitly disclaims. (§9.2: no NATIVE node reassembles leaf fragments, so \
-                 leaf → native above MAX_PAYLOAD_SIZE = 8 104 B is not put back together; \
-                 above 64 832 B the leaf attempts nothing and returns a typed \
-                 `LeafError::Wire` naming streams — never a truncation, never a drop.) \
+                 the interoperability §9.2 claims, in BOTH directions. (§9.2: no NATIVE \
+                 node reassembles leaf fragments, so leaf → native above MAX_EVENT_SIZE = \
+                 {MAX_EVENT_SIZE} B is not put back together, and above 64 832 B the leaf \
+                 attempts nothing and returns a typed `LeafError::Wire` naming streams; \
+                 native → leaf, the native sender refuses above the same \
+                 {MAX_EVENT_SIZE} B with a typed `StreamError::EventTooLarge` naming the \
+                 limit. Never a truncation, never a drop, in either direction.) \
                  LEG 1, AT THE CEILING: one `call('{ECHO_SERVICE}', <{ABI_CEILING_SIZE} B>)` \
                  through the package's public API (ok={}{}); the page built \
                  {got_request:?} and the ANCHOR's real handler recorded a body matching \
@@ -1842,16 +1897,27 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  package's callback AND iterator each received {want_stream_ceiling:?} \
                  byte-exact as the first payload after the {ABI_DIRECT_EVENTS} this stream \
                  already carried={stream_down}. \
-                 LEG 3b, RECORDED AND NOT GATED — a measurement, not a contract: the same \
-                 send at {ABI_STREAM_LARGE_SIZE} B, over MAX_PAYLOAD_SIZE. §9.2 states the \
-                 LEAF → NATIVE direction only (native does not reassemble leaf fragments); \
-                 it says nothing about NATIVE → LEAF, so this probe measures it rather \
-                 than assuming it. Outcome: {over_cap_outcome}. Native send result \
-                 {stream_large_error:?}; expected {want_stream_large:?}; everything that \
-                 actually arrived beyond the earlier traffic: {extra:?} (iterator: \
-                 {extra_iter:?}). This is NOT gated, because gating it would assert a \
-                 contract nobody has written; it is reported here and named for the owner \
-                 in §12 rather than dropped. \
+                 LEG 3b, NOW GATED — the contract, not a measurement: the same send at \
+                 {ABI_STREAM_LARGE_SIZE} B, over MAX_EVENT_SIZE = {MAX_EVENT_SIZE} B. This \
+                 leg was RECORDED for one round, because §9.2 stated the LEAF → NATIVE \
+                 direction only and the NATIVE → LEAF answer was unwritten; the \
+                 measurement came back `Ok` plus NOTHING delivered — a silent drop on a \
+                 reliable path — and it is repaired. The anchor's `send_with_retry` must \
+                 now fail with the TYPED variant, checked as a variant and not as a \
+                 string, carrying the offending size AND the limit: observed \
+                 {stream_large_refusal:?}, required \
+                 Some(({ABI_STREAM_LARGE_SIZE}, {MAX_EVENT_SIZE})); Display was \
+                 {stream_large_error:?}. AND the payload must never appear: after a 2 s \
+                 settle on a quiet link, everything that arrived beyond the \
+                 {ABI_DIRECT_EVENTS} this stream already carried is {extra:?} (iterator: \
+                 {extra_iter:?}) — exactly ONE payload, the ceiling one, with \
+                 {want_stream_large:?} absent. Outcome: {over_cap_outcome} \
+                 (over_cap_refused={over_cap_refused}). An `Ok` with nothing delivered, a \
+                 truncation, a late delivery, or an untyped/misnamed error each FAIL. \
+                 Fragmenting instead was rejected on the merits: `send_on_stream` is \
+                 transport-agnostic and only the browser leaf and the native RTC ingress \
+                 reassemble, so fragmenting there would hand a native peer's application N \
+                 partial events — a silent corruption in place of a silent drop. \
                  ANCHOR STATE: {}",
                 sized.ok,
                 sized
