@@ -5023,7 +5023,13 @@ jobs:
             kyra_reliable_packet_build_retains_retransmit_owner
           "
           set -o pipefail
-          cargo test --features mock-control-plane --test kyra_review 2>&1 \
+          # No `--test` form: the integration-test pin guard
+          # inventories the root crate's `tests/`, and the leaf is
+          # its own workspace, so a `--test kyra_review` pin reads to
+          # that guard as a pin naming a crate it cannot attribute.
+          # Running the whole crate covers the same binary, and the
+          # by-name loop below is what keeps the roster honest.
+          cargo test --features mock-control-plane 2>&1 \
             | tee /tmp/kyra-review.log
           for required in $REQUIRED; do
             grep -q "^test $required \.\.\. ok$" /tmp/kyra-review.log || {

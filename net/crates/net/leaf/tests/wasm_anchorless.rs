@@ -559,9 +559,20 @@ async fn two_leaves_reach_one_direct_session_through_a_carrier_that_relays_no_pa
         route,
         b"pong",
     );
+    // **The reply must ride the route the call registered** (R2).
+    // A response is matched on (peer, session incarnation, reply
+    // channel) before it can consume the pending entry, so answering
+    // on `echo.replies` — a channel nobody subscribed — is now
+    // correctly ignored. The canonical route is
+    // `<service>.replies.<caller origin>`, which is what the caller
+    // subscribed to when it issued the call.
+    let reply_channel = format!(
+        "echo.replies.{:016x}",
+        a.node.borrow().identity().origin_hash()
+    );
     b.node
         .borrow_mut()
-        .publish(an, "echo.replies", &reply)
+        .publish(an, &reply_channel, &reply)
         .expect("B answers the call");
 
     let body = call
