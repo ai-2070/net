@@ -3723,7 +3723,11 @@ mod tests {
             net_wire::reliability::ReliableStream::DEFAULT_RTO,
             net_wire::reliability::ReliableStream::DEFAULT_MAX_RETRIES,
         );
-        let started = std::time::Instant::now();
+        // Through the seam, not `std::time::Instant`: the boundary
+        // test denies a direct clock read anywhere in this file,
+        // including test code, because a `#[cfg(test)]` exception
+        // would be one grep away from becoming a production one.
+        let started = clock::now();
         let mut failure = None;
         while started.elapsed() < horizon * 2 {
             std::thread::sleep(std::time::Duration::from_millis(30));
