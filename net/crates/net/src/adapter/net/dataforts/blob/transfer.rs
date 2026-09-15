@@ -541,7 +541,7 @@ impl BlobTransferEngine {
         if let Some(mesh) = self.mesh.upgrade() {
             // Receive side: this engine never opened the stream, so it
             // holds no handle and closes by id (R12).
-            mesh.close_stream_id(holder, stream_id);
+            mesh.close_stream(holder, stream_id);
         }
     }
 }
@@ -637,7 +637,9 @@ async fn serve_chunk(
     // session that owned this stream is gone, which reclaimed the
     // stream with it, and the successor's streams are not ours to
     // close.
-    let _ = mesh.close_stream_graceful(&stream, TRANSFER_TIMEOUT).await;
+    let _ = mesh
+        .close_stream_graceful_handle(&stream, TRANSFER_TIMEOUT)
+        .await;
 }
 
 fn postcard_event<T: Serialize>(value: &T) -> Bytes {

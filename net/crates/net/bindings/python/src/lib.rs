@@ -2023,9 +2023,18 @@ mod mesh_bindings {
         /// ``send_on_stream`` is the handle-addressed operation and it
         /// *is* fenced — it raises ``SessionSupersededError`` once the
         /// peer's session has been replaced (S5-R12).
+        ///
+        /// **This close is deliberately NOT lifetime-fenced.** The
+        /// Python surface hands callers a ``(peer_node_id,
+        /// stream_id)`` pair rather than an opaque core handle, so
+        /// there is no lifetime to fence against. Having the
+        /// ``SessionSupersededError`` class registered does not make
+        /// this method fenced. C and Go own an opaque handle and
+        /// therefore call the fenced core operation
+        /// (``net_mesh_close_stream``).
         fn close_stream(&self, peer_node_id: u64, stream_id: u64) -> PyResult<()> {
             let node = self.get_node()?;
-            node.close_stream_id(peer_node_id, stream_id);
+            node.close_stream(peer_node_id, stream_id);
             Ok(())
         }
 
@@ -3653,9 +3662,10 @@ mod mesh_bindings {
 
         /// Close whatever stream is open under
         /// ``(peer_node_id, stream_id)``. Sync — idempotent local
-        /// operation, id-addressed (see ``NetMesh.close_stream``).
+        /// operation, id-addressed and deliberately not
+        /// lifetime-fenced (see ``NetMesh.close_stream``).
         fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
-            self.node.close_stream_id(peer_node_id, stream_id);
+            self.node.close_stream(peer_node_id, stream_id);
         }
 
         /// Snapshot of per-stream stats.

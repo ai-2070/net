@@ -1707,7 +1707,7 @@ pub unsafe extern "C" fn net_mesh_close_stream(handle: *mut MeshStreamHandle) ->
         // session's stream of the same id. A refusal is reported and
         // the handle is still freed — it is inert either way, and
         // leaking it would be worse.
-        if let Err(e) = h._node.close_stream(&h.stream) {
+        if let Err(e) = h._node.close_stream_handle(&h.stream) {
             let code = stream_err_to_code(&e);
             drop(_op);
             unsafe { net_mesh_stream_free(handle) };

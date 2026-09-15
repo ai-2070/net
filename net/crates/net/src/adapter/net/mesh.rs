@@ -525,10 +525,53 @@ fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
         .saturating_add(PACKET_WIRE_OVERHEAD)
         .min(u32::MAX as usize) as u32
 }
+
+/// Allocate the TX sequence for one outbound subprotocol frame, and
+/// debit its wire bytes from the same stream's send ledger **exactly
+/// when the receiver will charge them** (N1).
+///
+/// The send-side mirror of the receive-side decision, and it has to
+/// stay a mirror: the receiver charges a frame's wire bytes when the
+/// subprotocol is accounted ([`MeshNode::accounts_inbound_subprotocol`]),
+/// the stream is not `CONTROL_STREAM_ID`, and the subprotocol is not
+/// the credit loop itself ([`MeshNode::charges_inbound_bytes`]).
+/// Every native producer of such a frame routes its sequence through
+/// here so the two halves of the ledger move together.
+///
+/// Why the leaf's producers did not need this: `leaf::session`
+/// acquires byte credit for every non-stream-control subprotocol it
+/// sends. The native side allocated a sequence and nothing else, so a
+/// control frame riding an application stream's id shifted the
+/// receiver's cumulative-consumed total ahead of the sender's
+/// `tx_bytes_sent` watermark, and the next authoritative grant
+/// refunded window for application bytes still in flight.
+///
+/// Handshake frames are excluded on the receive side by
+/// `flags.is_handshake()`; no producer here builds one.
+fn outbound_subprotocol_tx_seq(
+    session: &NetSession,
+    stream_id: u64,
+    subprotocol_id: u16,
+    events: &[Bytes],
+) -> u64 {
+    if stream_id != CONTROL_STREAM_ID
+        && MeshNode::accounts_inbound_subprotocol(subprotocol_id)
+        && MeshNode::charges_inbound_bytes(subprotocol_id)
+    {
+        session.next_tx_seq_charged(
+            stream_id,
+            wire_bytes_for_payload(EventFrame::calculate_size(events)),
+        )
+    } else {
+        session.get_or_create_stream(stream_id).next_tx_seq()
+    }
+}
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
-use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
+use super::session::{
+    NetSession, StreamCloseOutcome, StreamDrainState, TxAdmit, CONTROL_STREAM_ID,
+};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
     route_hop::AuthenticatedNextHop, DropReason, ProtectedRelayStats, SubnetAuthError,
@@ -835,6 +878,12 @@ struct PeerEvictionCtx {
     /// `KYRA_CLOSE peer_gone=true provisional_projection=1`).
     #[cfg(feature = "webrtc")]
     provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// Leaf-fragment reassembly, so a session that ends releases the
+    /// partial groups it opened (N3). The map is mesh-owned and
+    /// outlives every session in it, so nothing but this — and the
+    /// group TTL, which only runs when traffic arrives — ever frees
+    /// a closed peer's held bytes.
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
     peer_transitions: PeerTransitions,
 }
 
@@ -891,6 +940,12 @@ impl PeerEvictionCtx {
                     ack_ranges_peer_cache.remove(&node_id);
                     #[cfg(feature = "webrtc")]
                     self.provisional_endpoints.remove(&endpoint);
+                    // N3: the session is gone, so the partial
+                    // fragment groups it opened are released and
+                    // the session is fenced against the packets
+                    // already past their session lookup.
+                    self.rtc_reassembly
+                        .retire_session(session_id, std::time::Instant::now());
                     true
                 });
                 (evicted, evicted)
@@ -926,6 +981,9 @@ impl PeerEvictionCtx {
                     // exact-session path.
                     #[cfg(feature = "webrtc")]
                     self.provisional_endpoints.remove(&old_info.addr());
+                    // N3, on the exact-session path.
+                    self.rtc_reassembly
+                        .retire_session(session_id, std::time::Instant::now());
                     true
                 });
                 (evicted, evicted)
@@ -972,6 +1030,9 @@ impl PeerEvictionCtx {
                     // peer's state, so ordinary eviction clears it.
                     #[cfg(feature = "webrtc")]
                     self.provisional_endpoints.remove(&addr);
+                    // N3, on the ordinary close path.
+                    self.rtc_reassembly
+                        .retire_session(old_session_id, std::time::Instant::now());
                     true
                 });
                 (evicted, evicted)
@@ -5414,7 +5475,8 @@ async fn run_route_withdrawal_flood(
     let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
     let events = [Bytes::copy_from_slice(&payload)];
     for (addr, session) in targets {
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let seq =
+            outbound_subprotocol_tx_seq(&session, stream_id, SUBPROTOCOL_ROUTE_WITHDRAW, &events);
         let packet = {
             let mut builder = session.thread_local_pool().get();
             builder.build_subprotocol(
@@ -6676,7 +6738,7 @@ fn build_sensing_frame_datagram(
     // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
     // carries the §4.4 continuity-bearing flag (see
     // `sensing::SENSING_PROVISIONAL_STREAM`).
-    let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+    let seq = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol, &events);
     let packet = {
         let mut builder = session.thread_local_pool().get();
         builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
@@ -18737,6 +18799,17 @@ impl MeshNode {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
     }
 
+    /// The RTC leaf-fragment reassembler.
+    ///
+    /// A witness for N3 has to assert what a session actually
+    /// **holds**, before and after that session is retired, rather
+    /// than infer retirement from the absence of a peer entry.
+    #[doc(hidden)]
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_reassembly(&self) -> &Arc<super::rtc::RtcReassembly> {
+        &self.rtc_reassembly
+    }
+
     /// Put one already-built packet on the wire to `node_id`.
     ///
     /// The fragment witness needs to send a packet whose
@@ -22793,6 +22866,7 @@ impl MeshNode {
             ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
             #[cfg(feature = "webrtc")]
             provisional_endpoints: Arc::clone(&self.provisional_endpoints),
+            rtc_reassembly: Arc::clone(&self.rtc_reassembly),
             peer_transitions: self.peer_transitions.clone(),
         }
     }
@@ -28120,6 +28194,7 @@ impl MeshNode {
             && !Self::account_inbound_stream_packet(
                 &parsed,
                 (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64,
+                Self::charges_inbound_bytes(parsed.header.subprotocol_id),
                 session,
                 ctx,
             )
@@ -28248,12 +28323,13 @@ impl MeshNode {
                                     tokio::spawn(async move {
                                         let pool = dest_sess.thread_local_pool();
                                         let mut builder = pool.get();
-                                        let seq = {
-                                            let stream = dest_sess
-                                                .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                            stream.next_tx_seq()
-                                        };
                                         let events = vec![payload];
+                                        let seq = outbound_subprotocol_tx_seq(
+                                            &dest_sess,
+                                            SUBPROTOCOL_MIGRATION as u64,
+                                            SUBPROTOCOL_MIGRATION,
+                                            &events,
+                                        );
                                         let packet = builder.build_subprotocol(
                                             SUBPROTOCOL_MIGRATION as u64,
                                             seq,
@@ -28299,12 +28375,13 @@ impl MeshNode {
                             tokio::spawn(async move {
                                 let pool = dest_sess.thread_local_pool();
                                 let mut builder = pool.get();
-                                let seq = {
-                                    let stream = dest_sess
-                                        .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                    stream.next_tx_seq()
-                                };
                                 let events = vec![reply];
+                                let seq = outbound_subprotocol_tx_seq(
+                                    &dest_sess,
+                                    SUBPROTOCOL_MIGRATION as u64,
+                                    SUBPROTOCOL_MIGRATION,
+                                    &events,
+                                );
                                 let packet = builder.build_subprotocol(
                                     SUBPROTOCOL_MIGRATION as u64,
                                     seq,
@@ -28940,13 +29017,13 @@ impl MeshNode {
                         tokio::spawn(async move {
                             let pool = dest_sess.thread_local_pool();
                             let mut builder = pool.get();
-                            let seq = {
-                                let stream = dest_sess.get_or_create_stream(
-                                    super::traversal::SUBPROTOCOL_REFLEX as u64,
-                                );
-                                stream.next_tx_seq()
-                            };
                             let events = vec![response];
+                            let seq = outbound_subprotocol_tx_seq(
+                                &dest_sess,
+                                super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                super::traversal::SUBPROTOCOL_REFLEX,
+                                &events,
+                            );
                             let packet = builder.build_subprotocol(
                                 super::traversal::SUBPROTOCOL_REFLEX as u64,
                                 seq,
@@ -29271,7 +29348,7 @@ impl MeshNode {
         // through to here, so the guard keeps a packet from being
         // charged twice.
         if parsed.header.subprotocol_id == 0
-            && !Self::account_inbound_stream_packet(&parsed, payload_bytes, session, ctx)
+            && !Self::account_inbound_stream_packet(&parsed, payload_bytes, true, session, ctx)
         {
             return;
         }
@@ -29631,7 +29708,8 @@ impl MeshNode {
     /// Two properties this centralises, both of which a stream's
     /// *sender* depends on to make progress:
     ///
-    /// - **Credit.** Only *accepted* bytes are charged. `on_receive`
+    /// - **Credit.** Only *accepted* bytes are charged, and only when
+    ///   `charge_bytes` says the sender debited them. `on_receive`
     ///   returns `false` for duplicates and for sequences past the
     ///   reliable receive window; crediting those would refund send
     ///   credit for retransmissions, letting a chatty peer inflate
@@ -29648,9 +29726,20 @@ impl MeshNode {
     ///   exhaust its retries and reset a stream that arrived intact.
     ///   No bytes are consumed on that path, so the credit half is
     ///   unchanged.
+    ///
+    /// `charge_bytes == false` is the third case, and it is the
+    /// sequence/byte split made explicit: a frame whose sender does
+    /// not debit its bytes must not be charged here either. Sequence
+    /// ownership and byte ownership are different invariants, and
+    /// charging one without the other moves the receiver's
+    /// cumulative-consumed total ahead of the sender's watermark —
+    /// whereupon the next grant refunds credit for bytes a *different*
+    /// producer on that stream still has in flight. See
+    /// [`Self::charges_inbound_bytes`].
     fn account_inbound_stream_packet(
         parsed: &ParsedPacket,
         payload_bytes: u64,
+        charge_bytes: bool,
         session: &NetSession,
         ctx: &DispatchCtx,
     ) -> bool {
@@ -29678,12 +29767,19 @@ impl MeshNode {
             }
             let stream = session
                 .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
-            if stream.with_reliability(|r| r.on_receive(parsed.header.sequence)) {
+            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
+            if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
+            }
+            if accepted && charge_bytes {
                 stream.on_bytes_consumed(payload_bytes)
-            } else if stream.reliable_mode() && stream.rx_credit().window_bytes() != 0 {
-                // Refused sequence on a reliable stream: nothing is
-                // consumed, but the ack is owed again.
+            } else if stream.rx_credit().window_bytes() != 0 && (accepted || stream.reliable_mode())
+            {
+                // Nothing was consumed against the window, but the
+                // ack is still owed: either the sequence was refused
+                // on a reliable stream (a retransmit whose ack the
+                // peer never heard), or the frame is the credit loop
+                // itself and rides outside the window it refills.
                 Some(stream.rx_credit().consumed())
             } else {
                 None
@@ -29810,6 +29906,31 @@ impl MeshNode {
         }
         let _ = subprotocol_id;
         false
+    }
+
+    /// Does a frame carrying `subprotocol_id` have its **bytes**
+    /// charged to the receiving stream's credit ledger?
+    ///
+    /// Narrower than [`Self::accounts_inbound_subprotocol`], which
+    /// answers the *sequence* question. Every accounted subprotocol
+    /// consumes a sequence on the stream it rides and is owed an ack;
+    /// the four stream-control subprotocols are the credit loop
+    /// itself, and a grant/ack/nack/reset that had to buy window from
+    /// the very window it exists to refill would deadlock the stream.
+    /// The leaf's sender excludes exactly this set from its debit
+    /// (`leaf::session::is_stream_control`), and native's grants ride
+    /// `CONTROL_STREAM_ID`, which is excluded on both sides anyway —
+    /// so this predicate is what keeps a leaf's on-stream feedback
+    /// frames from being charged against a ledger their sender never
+    /// debited.
+    fn charges_inbound_bytes(subprotocol_id: u16) -> bool {
+        !matches!(
+            subprotocol_id,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_WINDOW
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_NACK
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_RESET
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_ACK
+        )
     }
 
     /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
@@ -35790,16 +35911,19 @@ impl MeshNode {
         }
 
         let stream_id = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
-        let seq = {
-            let stream = session.get_or_create_stream(stream_id);
-            stream.next_tx_seq()
-        };
+        let events = [Bytes::from(encoded)];
+        let seq = outbound_subprotocol_tx_seq(
+            &session,
+            stream_id,
+            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+            &events,
+        );
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
         let packet = builder.build_subprotocol(
             stream_id,
             seq,
-            &[Bytes::from(encoded)],
+            &events,
             PacketFlags::NONE,
             super::rtc::SUBPROTOCOL_RTC_SIGNAL,
         );
@@ -36898,6 +37022,10 @@ impl MeshNode {
         ctx.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
         ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
         ctx.provisional_endpoints.remove(&endpoint);
+        // N3: the breach path ends the session too, so its partial
+        // fragment groups go with it.
+        ctx.rtc_reassembly
+            .retire_session(session_id, std::time::Instant::now());
         if let Some(stats) = ctx.rtc_stats.as_ref() {
             stats.note_admission_reclaimed();
         }
@@ -37529,11 +37657,13 @@ impl MeshNode {
                 let stream_id = SUBPROTOCOL_SCOPED_CAPABILITY_ANN as u64;
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session.get_or_create_stream(stream_id);
-                    stream.next_tx_seq()
-                };
                 let events = vec![Bytes::copy_from_slice(&frame)];
+                let seq = outbound_subprotocol_tx_seq(
+                    session,
+                    stream_id,
+                    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     stream_id,
                     seq,
@@ -37592,11 +37722,13 @@ impl MeshNode {
                 let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session.get_or_create_stream(stream_id);
-                    stream.next_tx_seq()
-                };
                 let events = vec![Bytes::copy_from_slice(&payload)];
+                let seq = outbound_subprotocol_tx_seq(
+                    session,
+                    stream_id,
+                    SUBPROTOCOL_CAPABILITY_ANN,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     stream_id,
                     seq,
@@ -37693,12 +37825,13 @@ impl MeshNode {
             tokio::spawn(async move {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session
-                        .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                    stream.next_tx_seq()
-                };
                 let events = vec![body];
+                let seq = outbound_subprotocol_tx_seq(
+                    &session,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                     seq,
@@ -37861,12 +37994,13 @@ impl MeshNode {
         tokio::spawn(async move {
             let pool = a_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream =
-                    a_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![intro_to_a];
+            let seq = outbound_subprotocol_tx_seq(
+                &a_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 seq,
@@ -37883,12 +38017,13 @@ impl MeshNode {
         tokio::spawn(async move {
             let pool = b_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream =
-                    b_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![intro_to_b];
+            let seq = outbound_subprotocol_tx_seq(
+                &b_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 seq,
@@ -38222,12 +38357,13 @@ impl MeshNode {
             .encode();
             let pool = coord_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream = coord_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![ack_body];
+            let seq = outbound_subprotocol_tx_seq(
+                &coord_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 seq,
@@ -38298,12 +38434,13 @@ impl MeshNode {
         tokio::spawn(async move {
             let pool = dest_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream = dest_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![body];
+            let seq = outbound_subprotocol_tx_seq(
+                &dest_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
                 seq,
@@ -39075,11 +39212,13 @@ impl MeshNode {
             let pool = dest_sess.thread_local_pool();
             let mut builder = pool.get();
             let stream_id = SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
-            let seq = {
-                let stream = dest_sess.get_or_create_stream(stream_id);
-                stream.next_tx_seq()
-            };
             let events = vec![bytes];
+            let seq = outbound_subprotocol_tx_seq(
+                &dest_sess,
+                stream_id,
+                SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 stream_id,
                 seq,
@@ -40059,12 +40198,16 @@ impl MeshNode {
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
 
-        let seq = {
-            let stream = session.get_or_create_stream(stream_id);
-            stream.next_tx_seq()
-        };
-
         let events = vec![Bytes::copy_from_slice(payload)];
+        // N1: the receiver charges this frame's wire bytes to the
+        // stream's credit ledger when it accounts the subprotocol, so
+        // this producer debits them. Pre-fix a control frame sharing
+        // an application stream's id moved the receiver's cumulative
+        // total without moving the sender's watermark, and the next
+        // grant refunded window for application bytes the receiver
+        // had never seen.
+        let seq = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol_id, &events);
+
         let packet =
             builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
@@ -41815,8 +41958,13 @@ impl MeshNode {
         })?);
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
         let events = [bytes];
+        let seq = outbound_subprotocol_tx_seq(
+            &session,
+            stream_id,
+            super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
+            &events,
+        );
         let packet = builder.build_subprotocol(
             stream_id,
             seq,
@@ -43467,68 +43615,79 @@ impl MeshNode {
     /// Idempotent for the lifetime the handle names: closing a stream
     /// that is already gone is `Ok(())`.
     ///
-    /// Refuses with [`StreamError::SessionSuperseded`] when the peer's
-    /// current session is not the one the handle was opened against
-    /// (R12). That refusal is the point: a close addressed by
-    /// `(peer, stream_id)` alone would tear down the **successor's**
-    /// stream of the same id — the displaced session's owner
-    /// destroying live state belonging to the session that replaced
-    /// it. Callers holding no handle — a peer-driven reset, a
-    /// receive-side teardown — use [`Self::close_stream_id`], which is
-    /// explicit about addressing whatever is open under that id.
-    pub fn close_stream(&self, stream: &Stream) -> Result<(), StreamError> {
+    /// **Lifetime-fenced, and the comparison is atomic with the
+    /// removal.** Refuses with [`StreamError::SessionSuperseded`] when
+    /// the peer's current session is not the one the handle was opened
+    /// against, and with [`StreamError::NotConnected`] when a
+    /// close+reopen on that same session has replaced the stream
+    /// lifetime (R12, N2). Both checks and the removal happen inside
+    /// [`NetSession::close_stream_for_lifetime`], under one write
+    /// guard: checking through a released read guard and then removing
+    /// unconditionally let a concurrent same-id reopen land in the gap
+    /// and be torn down by the stale handle.
+    ///
+    /// Callers holding no handle — a peer-driven reset, a receive-side
+    /// teardown, the id-addressed language bindings — use
+    /// [`Self::close_stream`], which is explicit about addressing
+    /// whatever is open under that id.
+    pub fn close_stream_handle(&self, stream: &Stream) -> Result<(), StreamError> {
         let Some(peer) = self.peers.get(&stream.peer_node_id()) else {
             // No session at all: the lifetime this handle named is
             // definitively over, and there is nothing to tear down.
             return Ok(());
         };
-        if peer.session.session_id() != stream.session_id() {
-            return Err(StreamError::SessionSuperseded);
+        match peer.session.close_stream_for_lifetime(
+            stream.stream_id(),
+            stream.session_id(),
+            stream.epoch(),
+        ) {
+            // Absent is the idempotent case: this lifetime is over and
+            // nothing was removed, so a stream opened under that id
+            // after the guard was taken is left alone.
+            StreamCloseOutcome::Closed | StreamCloseOutcome::Absent => Ok(()),
+            StreamCloseOutcome::LifetimeMismatch => Err(StreamError::NotConnected),
+            StreamCloseOutcome::SessionSuperseded => Err(StreamError::SessionSuperseded),
         }
-        // Epoch check inside the same lookup: a close+reopen on this
-        // session is a different lifetime too, and closing it would
-        // drop the successor stream's retransmit window.
-        let stale = peer
-            .session
-            .try_stream(stream.stream_id())
-            .is_some_and(|state| state.epoch() != stream.epoch());
-        if stale {
-            return Err(StreamError::NotConnected);
-        }
-        peer.session.close_stream(stream.stream_id());
-        Ok(())
     }
 
-    /// Close whatever stream is open under `(peer_node_id, stream_id)`,
-    /// for callers that hold no [`Stream`] handle: an inbound
-    /// `StreamReset`, a receive-side transfer teardown, the
-    /// language bindings' id-addressed surface.
+    /// Close whatever stream is open under `(peer_node_id, stream_id)`.
     ///
-    /// Idempotent, and deliberately *not* fenced — there is no handle
-    /// to fence against. Anyone holding a handle must use
-    /// [`Self::close_stream`] instead, or they can close a successor
-    /// session's stream with a displaced session's coordinates.
-    pub fn close_stream_id(&self, peer_node_id: u64, stream_id: u64) {
+    /// Idempotent. `CloseBehavior::DrainThenClose` is honored only to
+    /// the extent the router's scheduler has already flushed; there is
+    /// no wire "drain-then-close" signal in v1.
+    ///
+    /// **Unfenced by contract** — it addresses an id, not a lifetime,
+    /// which is exactly what a peer-driven `StreamReset`, a
+    /// receive-side transfer teardown and the id-addressed language
+    /// bindings need. A caller that holds a [`Stream`] handle must use
+    /// [`Self::close_stream_handle`] instead: closing by id with a
+    /// displaced session's coordinates tears down whichever lifetime
+    /// is current, including a **successor** session's stream of the
+    /// same id.
+    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
         if let Some(peer) = self.peers.get(&peer_node_id) {
             peer.session.close_stream(stream_id);
         }
     }
 
-    /// Close a reliable stream **gracefully** (H-7, `DrainThenClose`):
-    /// wait until the reliability layer has no unacked packets — i.e. the
-    /// receiver has acked everything (with H-9 ack-pruning, `pending`
-    /// empties as grants arrive) — or `timeout` elapses, then close. Use
-    /// after the last bytes of a reliable send so retransmit can still
-    /// fill gaps before teardown; closing eagerly ([`Self::close_stream`])
-    /// drops the retransmit window and can strand a lost tail packet on a
-    /// lossy link. A fire-and-forget stream (nothing tracked) drains
-    /// instantly.
+    /// Close the stream this handle owns **gracefully** (H-7,
+    /// `DrainThenClose`): wait until the reliability layer has no
+    /// unacked packets — i.e. the receiver has acked everything (with
+    /// H-9 ack-pruning, `pending` empties as grants arrive) — or
+    /// `timeout` elapses, then close. Use after the last bytes of a
+    /// reliable send so retransmit can still fill gaps before
+    /// teardown; closing eagerly
+    /// ([`Self::close_stream_handle`]) drops the retransmit window
+    /// and can strand a lost tail packet on a lossy link. A
+    /// fire-and-forget stream (nothing tracked) drains instantly.
     ///
-    /// Fenced exactly like [`Self::close_stream`], and the drain loop
-    /// itself stops as soon as the handle's session is gone — waiting
-    /// for a successor's unacked data to settle would be waiting on
-    /// somebody else's stream.
-    pub async fn close_stream_graceful(
+    /// Fenced exactly like [`Self::close_stream_handle`], and the
+    /// drain loop refuses **immediately** rather than waiting out the
+    /// timeout when the lifetime it named is gone: waiting on a
+    /// successor's unacked data is waiting on somebody else's stream.
+    /// The probe releases its guard before each sleep — nothing is
+    /// held across the wait.
+    pub async fn close_stream_graceful_handle(
         &self,
         stream: &Stream,
         timeout: Duration,
@@ -43536,12 +43695,49 @@ impl MeshNode {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let drained = match self.peers.get(&stream.peer_node_id()) {
-                Some(p) if p.session.session_id() != stream.session_id() => {
-                    return Err(StreamError::SessionSuperseded)
-                }
+                Some(p) => match p.session.drain_state_for_lifetime(
+                    stream.stream_id(),
+                    stream.session_id(),
+                    stream.epoch(),
+                ) {
+                    StreamDrainState::SessionSuperseded => {
+                        return Err(StreamError::SessionSuperseded)
+                    }
+                    StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
+                    StreamDrainState::Pending => false,
+                    // Absent → nothing left to drain.
+                    StreamDrainState::Drained | StreamDrainState::Absent => true,
+                },
+                None => true, // peer gone → nothing to drain
+            };
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.close_stream_handle(stream)
+    }
+
+    /// Close whatever reliable stream is open under `(peer_node_id,
+    /// stream_id)` **gracefully** — drain unacked packets, then close.
+    ///
+    /// **Unfenced by contract**, the graceful counterpart of
+    /// [`Self::close_stream`]: the drain waits on whichever lifetime
+    /// holds that id, and the close removes whichever lifetime holds
+    /// it when the wait ends. A caller holding a [`Stream`] handle
+    /// wants [`Self::close_stream_graceful_handle`].
+    pub async fn close_stream_graceful(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match self.peers.get(&peer_node_id) {
                 Some(p) => p
                     .session
-                    .try_stream(stream.stream_id())
+                    .try_stream(stream_id)
                     .map(|s| !s.with_reliability(|r| r.has_pending()))
                     .unwrap_or(true), // stream already gone → nothing to drain
                 None => true, // peer gone → nothing to drain
@@ -43551,7 +43747,7 @@ impl MeshNode {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        self.close_stream(stream)
+        self.close_stream(peer_node_id, stream_id);
     }
 
     /// Send a batch of events on an explicit stream.
@@ -44010,6 +44206,8 @@ impl MeshNode {
             tx_window: state.tx_window(),
             credit_grants_received: state.credit_grants_received(),
             credit_grants_sent: state.credit_grants_sent(),
+            tx_bytes_sent: state.tx_bytes_sent(),
+            max_consumed_seen: state.max_consumed_seen(),
         })
     }
 
@@ -44040,6 +44238,8 @@ impl MeshNode {
                         tx_window: state.tx_window(),
                         credit_grants_received: state.credit_grants_received(),
                         credit_grants_sent: state.credit_grants_sent(),
+                        tx_bytes_sent: state.tx_bytes_sent(),
+                        max_consumed_seen: state.max_consumed_seen(),
                     },
                 ))
             })

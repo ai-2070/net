@@ -1088,20 +1088,29 @@ impl Mesh {
     /// Close the stream this handle owns: drop its `StreamState` and
     /// free the window. Idempotent for the lifetime the handle names.
     ///
-    /// Returns [`SdkError::SessionSuperseded`] when the peer's session
-    /// has been replaced since the handle was opened — the handle is
-    /// inert, and the stream id it names may be live on the successor
-    /// session, which is not this handle's to tear down.
-    pub fn close_stream(&self, stream: &Stream) -> Result<()> {
-        self.node.close_stream(stream).map_err(SdkError::from)
+    /// Lifetime-fenced. Returns [`SdkError::SessionSuperseded`] when
+    /// the peer's session has been replaced since the handle was
+    /// opened — the handle is inert, and the stream id it names may be
+    /// live on the successor session, which is not this handle's to
+    /// tear down. Returns [`SdkError::NotConnected`] when the stream
+    /// was closed and reopened on that same session: a different
+    /// lifetime holds the id.
+    pub fn close_stream_handle(&self, stream: &Stream) -> Result<()> {
+        self.node
+            .close_stream_handle(stream)
+            .map_err(SdkError::from)
     }
 
-    /// Close whatever stream is open under `(peer_node_id, stream_id)`,
-    /// for callers that hold no [`Stream`] handle. Idempotent, and
-    /// unfenced — there is no handle to fence against. Prefer
-    /// [`Self::close_stream`] whenever a handle is in hand.
-    pub fn close_stream_id(&self, peer_node_id: u64, stream_id: u64) {
-        self.node.close_stream_id(peer_node_id, stream_id);
+    /// Close whatever stream is open under `(peer_node_id, stream_id)`:
+    /// drop its `StreamState` and free the window. Idempotent.
+    ///
+    /// **Unfenced by contract** — it addresses an id, not a lifetime.
+    /// Prefer [`Self::close_stream_handle`] whenever a handle is in
+    /// hand; closing by id with a displaced session's coordinates
+    /// tears down whichever lifetime is current, including a
+    /// successor session's stream of the same id.
+    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+        self.node.close_stream(peer_node_id, stream_id);
     }
 
     /// Send a batch of events on an explicit stream.

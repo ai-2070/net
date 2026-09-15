@@ -142,7 +142,7 @@ fn arrange_next_stream_epoch(node: &Arc<MeshNode>, peer: u64, target: u64) {
             .open_stream(peer, SCRATCH, StreamConfig::new())
             .expect("scratch open");
         let epoch = probe.epoch();
-        node.close_stream(&probe).expect("scratch close");
+        node.close_stream_handle(&probe).expect("scratch close");
         assert!(
             epoch < target,
             "this session's epoch counter is already at {epoch}, past the \
@@ -1292,7 +1292,7 @@ async fn a_displaced_sessions_handle_cannot_address_its_successor() {
         "a displaced session's handle must not transmit into its \
          successor; got {sent:?}",
     );
-    let closed = a.close_stream(&stale);
+    let closed = a.close_stream_handle(&stale);
     assert!(
         matches!(closed, Err(StreamError::SessionSuperseded)),
         "nor tear the successor's stream down; got {closed:?}",
@@ -1314,7 +1314,7 @@ async fn a_displaced_sessions_handle_cannot_address_its_successor() {
         "exactly the successor's payload, once, at the peer that replaced \
          the displaced session",
     );
-    a.close_stream(&fresh)
+    a.close_stream_handle(&fresh)
         .expect("and the successor's handle may close its own stream");
 }
 
@@ -2160,4 +2160,476 @@ async fn a_peers_stream_reset_leaves_our_send_side_alone() {
         "the reset says nothing about our send side, so the sequence \
          continues rather than restarting"
     );
+}
+
+/// **N1a — a native control frame debits exactly the bytes the
+/// receiver charges.**
+///
+/// The R3 hoist made the receiver charge a recognized control
+/// frame's full wire bytes to the stream it rides. Native's
+/// producers only allocated a sequence: no credit acquire, no
+/// `tx_bytes_sent` debit. Sequence ownership and byte ownership are
+/// different invariants, and moving one without the other puts the
+/// receiver's cumulative-consumed total ahead of the sender's
+/// watermark.
+///
+/// The receiver is partitioned for the whole test, so nothing can
+/// grant the bytes back and the debit is observable as an exact
+/// number rather than a transient dip. The producer is the
+/// production one — `send_subprotocol_to_node`, which is what
+/// `subscribe_channel` and the capability fan-out call.
+///
+/// Inverse: make `StreamState::note_tx_bytes_sent` a no-op, or route
+/// this producer's sequence back through
+/// `get_or_create_stream(..).next_tx_seq()`. Credit then reads the
+/// full window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_control_frame_debits_the_bytes_its_receiver_charges() {
+    use net::adapter::net::{EventFrame, HEADER_SIZE, TAG_SIZE};
+
+    let (a, b) = udp_pair().await;
+    let b_id = b.node_id();
+    let a_addr = a.local_addr();
+    const SHARED: u64 = net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
+    const WINDOW: u32 = 8192;
+
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::FireAndForget;
+    cfg.window_bytes = WINDOW;
+    let _stream = a.open_stream(b_id, SHARED, cfg).expect("open_stream");
+    assert_eq!(
+        a.stream_stats(b_id, SHARED).expect("stats").tx_window,
+        WINDOW,
+        "the test's own window must be the one the stream installed"
+    );
+
+    // Nothing that leaves A can be acknowledged while B drops it in
+    // `dispatch_packet`, so the debit stands still.
+    b.block_peer(a_addr);
+    let payload = [0xA5u8; 64];
+    a.send_subprotocol_to_node(
+        b_id,
+        net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+        &payload,
+    )
+    .await
+    .expect("control frame leaves the sender");
+
+    let expected = (HEADER_SIZE + TAG_SIZE + EventFrame::LEN_SIZE + payload.len()) as u32;
+    let stats = a.stream_stats(b_id, SHARED).expect("stats");
+    assert_eq!(
+        stats.tx_credit_remaining,
+        WINDOW - expected,
+        "the control frame's {expected} wire bytes — header, AEAD tag, \
+         event frame and payload, the same total the receiver charges \
+         — must be debited from the stream's send ledger"
+    );
+    assert_eq!(
+        stats.tx_seq, 1,
+        "and it still takes exactly one sequence from the stream it rides"
+    );
+}
+
+/// **N1b — UDP byte conservation across a shared control/application
+/// stream.**
+///
+/// The consequence of the asymmetry N1a pins: with the receiver's
+/// cumulative total running ahead of the sender's watermark, the
+/// next authoritative grant — clamped to `tx_bytes_sent`, which
+/// bounds the counter but says nothing about arrival — refunds
+/// window for application bytes the receiver never saw.
+///
+/// The schedule Kyra specified, on real UDP through production
+/// entrypoints:
+///
+/// 1. A opens a stream at the membership subprotocol's id with an
+///    explicit window, so one stream carries both control and
+///    application traffic (the same sharing
+///    `a_control_frame_shares_the_sequence_space_of_the_stream_it_rides`
+///    pins).
+/// 2. `subscribe_channel` puts a control frame on it and resolves
+///    only when B has answered with a membership Ack — so the frame
+///    provably arrived and was charged.
+/// 3. B is partitioned and ONE application packet is sent: debited
+///    here, never consumed there.
+/// 4. B is un-partitioned and a second application packet is sent.
+///    B consumes it and grants, so the grant's `total_consumed`
+///    covers the control frame and the second packet but not the
+///    withheld one.
+///
+/// Conservation at that settled boundary: remaining credit is the
+/// window minus exactly the withheld packet's wire bytes. Pre-fix
+/// the uncharged control frame's receiver-side surplus was larger
+/// than the withheld packet, so the clamped grant reported every
+/// byte the sender had committed and credit came back to the FULL
+/// window — the sender re-opening its window for data that never
+/// arrived.
+///
+/// Inverse: as N1a.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_frame_and_an_application_packet_conserve_bytes_on_one_stream() {
+    use net::adapter::net::{EventFrame, HEADER_SIZE, TAG_SIZE};
+
+    let (a, b) = udp_pair().await;
+    let b_id = b.node_id();
+    let a_addr = a.local_addr();
+    const SHARED: u64 = net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
+    const WINDOW: u32 = 8192;
+
+    // Fire-and-forget on purpose: a withheld packet must stay
+    // withheld. A reliable stream would retransmit it the moment the
+    // partition heals and there would be nothing unconsumed left to
+    // account for.
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::FireAndForget;
+    cfg.window_bytes = WINDOW;
+    let stream = a.open_stream(b_id, SHARED, cfg).expect("open_stream");
+
+    // (2) The control frame, through production `subscribe_channel`.
+    // Its bytes are charged by B; wait for the grant that reports
+    // them so the boundary below is settled rather than mid-flight.
+    a.subscribe_channel(b_id, ChannelName::new("s5.conserve").expect("channel"))
+        .await
+        .expect("subscribe_channel");
+    assert!(
+        wait_for(
+            || {
+                a.stream_stats(b_id, SHARED).is_some_and(|s| {
+                    s.credit_grants_received > 0 && s.tx_bytes_sent == s.max_consumed_seen
+                })
+            },
+            Duration::from_secs(5)
+        )
+        .await,
+        "the control frame round-tripped, so its bytes are consumed and \
+         refunded: a control frame costs the application window only \
+         while it is in flight (sent {}, consumed {}, credit {} of \
+         {WINDOW}, grants {})",
+        a.stream_stats(b_id, SHARED).expect("stats").tx_bytes_sent,
+        a.stream_stats(b_id, SHARED)
+            .expect("stats")
+            .max_consumed_seen,
+        a.stream_stats(b_id, SHARED)
+            .expect("stats")
+            .tx_credit_remaining,
+        a.stream_stats(b_id, SHARED)
+            .expect("stats")
+            .credit_grants_received
+    );
+
+    // (3) One application packet that never reaches B's accounting.
+    // `block_peer` drops it in `dispatch_packet`, before decrypt, so
+    // the bytes left A and were charged to nobody.
+    let withheld = Bytes::from_static(b"W");
+    let consumed_later = Bytes::from_static(b"S5N1B");
+    let one_packet_wire_bytes =
+        (HEADER_SIZE + TAG_SIZE + EventFrame::LEN_SIZE + withheld.len()) as u32;
+    b.block_peer(a_addr);
+    a.send_on_stream(&stream, std::slice::from_ref(&withheld))
+        .await
+        .expect("the withheld packet still leaves the sender");
+    assert_eq!(
+        a.stream_stats(b_id, SHARED)
+            .expect("stats")
+            .tx_credit_remaining,
+        WINDOW - one_packet_wire_bytes,
+        "the withheld packet is debited like any other"
+    );
+
+    // The filter runs in `dispatch_packet`, i.e. AFTER the datagram
+    // has been read off B's socket. Unblocking immediately would let
+    // B's receive loop pick the still-buffered datagram up with the
+    // filter already lifted and account it after all, so hold the
+    // partition until B has provably had its turn — the control
+    // below is what makes "withheld" a fact rather than a hope.
+    let withheld_seen = collect_tagged(&b, b"W", 1, Duration::from_millis(500)).await;
+    assert!(
+        withheld_seen.is_empty(),
+        "the partition must actually have dropped the withheld packet, \
+         or this test measures nothing: {withheld_seen:?}"
+    );
+
+    // (4) Heal, then one packet B does consume, so B grants.
+    b.unblock_peer(&a_addr);
+    a.send_on_stream(&stream, std::slice::from_ref(&consumed_later))
+        .await
+        .expect("second application packet");
+    let seen = collect_tagged(&b, b"S5N1B", 1, Duration::from_secs(10)).await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "the second packet must actually be delivered, or the grant \
+         this test reads has nothing to report"
+    );
+
+    // Settled boundary. A committed control + 2 packets; B consumed
+    // control + 1. The ledger identity says the gap between the two
+    // halves is exactly the withheld packet, and the credit that
+    // follows from it is the window minus those bytes.
+    let settled = wait_for(
+        || {
+            a.stream_stats(b_id, SHARED).is_some_and(|s| {
+                s.tx_bytes_sent - s.max_consumed_seen == u64::from(one_packet_wire_bytes)
+            })
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let s = a.stream_stats(b_id, SHARED).expect("stats");
+    assert!(
+        settled,
+        "the sender's committed total must exceed the receiver's \
+         reported total by exactly the withheld packet's \
+         {one_packet_wire_bytes} wire bytes: sent = {}, consumed = {}, \
+         gap = {} (grants received {})",
+        s.tx_bytes_sent,
+        s.max_consumed_seen,
+        s.tx_bytes_sent - s.max_consumed_seen,
+        s.credit_grants_received
+    );
+    assert!(
+        s.credit_grants_received > 0,
+        "the assertion above is only a conservation claim if a grant \
+         actually arrived"
+    );
+    assert_eq!(
+        u64::from(s.tx_credit_remaining) + (s.tx_bytes_sent - s.max_consumed_seen),
+        u64::from(WINDOW),
+        "remaining + in-flight == window"
+    );
+    assert_eq!(
+        s.tx_credit_remaining,
+        WINDOW - one_packet_wire_bytes,
+        "so credit is the window minus the withheld packet, not the \
+         full window: a grant may only refund what it reports"
+    );
+    // Hold it: a later grant must not retroactively refund the
+    // withheld packet either.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = a.stream_stats(b_id, SHARED).expect("stats");
+    assert_eq!(
+        held.tx_bytes_sent - held.max_consumed_seen,
+        u64::from(one_packet_wire_bytes),
+        "and it stays there — nothing refunds bytes the receiver never \
+         reported consuming"
+    );
+}
+
+/// **N2 — a stale handle's close must not tear down the successor
+/// lifetime, and must not wait on it either.**
+///
+/// `close_stream_handle` compared the epoch through a `try_stream`
+/// read guard, released it, and then removed unconditionally; a
+/// close+reopen landing in that gap was destroyed by the old handle.
+/// The comparison and the removal now happen under one `Entry` write
+/// guard (`NetSession::close_stream_for_lifetime`), and the race
+/// itself is driven in
+/// `net_wire::session::tests::a_conditional_close_never_removes_a_concurrent_reopen`.
+///
+/// What this witness adds is the *operational* half through the
+/// public API: after a close+reopen, the retained handle is refused,
+/// the successor keeps its epoch and its state, fresh traffic on the
+/// successor still arrives, and a graceful close on the stale handle
+/// refuses IMMEDIATELY rather than waiting out its timeout on
+/// somebody else's retransmit window.
+///
+/// Inverse: drop the epoch half of `close_stream_for_lifetime` (or
+/// the `LifetimeMismatch` arm in `close_stream_handle`) and the
+/// successor's state disappears; drop the `LifetimeMismatch` arm of
+/// `close_stream_graceful_handle` and the elapsed-time assertion
+/// goes red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_streams_state_survives_its_predecessors_close() {
+    let (a, b) = udp_pair().await;
+    let b_id = b.node_id();
+    const ID: u64 = 0x5EED;
+
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let first = a.open_stream(b_id, ID, cfg).expect("open first");
+
+    // Close by id (the unfenced, handle-less entrypoint) and reopen:
+    // same id, same session, different lifetime.
+    a.close_stream(b_id, ID);
+    let second = a.open_stream(b_id, ID, cfg).expect("reopen");
+    let successor_epoch = second.epoch();
+    assert_ne!(
+        successor_epoch,
+        first.epoch(),
+        "a reopen must allocate a fresh epoch, or this test proves nothing"
+    );
+    assert_eq!(
+        second.session_id(),
+        first.session_id(),
+        "same session — the epoch, not the incarnation, is what \
+         separates these two lifetimes"
+    );
+
+    // Put traffic on the successor so it has state worth losing.
+    let payloads = tagged_payloads(b"S5N2A", 3);
+    for payload in &payloads {
+        a.send_with_retry(&second, std::slice::from_ref(payload), 16)
+            .await
+            .expect("successor send");
+    }
+    let before = a.stream_stats(b_id, ID).expect("successor stats");
+
+    // The predecessor's handle-addressed close is refused...
+    let refused = a.close_stream_handle(&first);
+    assert!(
+        matches!(refused, Err(StreamError::NotConnected)),
+        "a close naming a lifetime that is over must be refused, not \
+         applied to whichever lifetime is current: {refused:?}"
+    );
+    // ...and the successor is untouched: still open, same epoch,
+    // same sequence counter, same credit.
+    let after = a
+        .stream_stats(b_id, ID)
+        .expect("the successor must still be open after the stale close");
+    assert_eq!(after.tx_seq, before.tx_seq, "sequence space preserved");
+    assert_eq!(
+        after.tx_credit_remaining, before.tx_credit_remaining,
+        "credit ledger preserved"
+    );
+    assert_eq!(
+        a.open_stream(b_id, ID, StreamConfig::new())
+            .expect("idempotent re-open returns the live lifetime")
+            .epoch(),
+        successor_epoch,
+        "the live lifetime is still the successor's"
+    );
+
+    // The graceful form refuses immediately instead of draining a
+    // successor's unacked data to the deadline.
+    let started = tokio::time::Instant::now();
+    let graceful = a
+        .close_stream_graceful_handle(&first, Duration::from_secs(5))
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(graceful, Err(StreamError::NotConnected)),
+        "a graceful close on a replaced lifetime is a refusal: {graceful:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the refusal must be immediate — waiting on a successor's \
+         retransmit window is waiting on somebody else's stream \
+         (waited {elapsed:?} of a 5 s timeout)"
+    );
+
+    // And the successor still delivers.
+    let fresh = tagged_payloads(b"S5N2B", 2);
+    for payload in &fresh {
+        a.send_with_retry(&second, std::slice::from_ref(payload), 16)
+            .await
+            .expect("post-refusal send on the successor");
+    }
+    let seen = collect_tagged(&b, b"S5N2B", 2, Duration::from_secs(10)).await;
+    let distinct: HashSet<&Vec<u8>> = seen.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "the successor must keep working after refusing its \
+         predecessor's close: {} distinct of 2",
+        distinct.len()
+    );
+
+    // The successor's own handle closes its own stream.
+    a.close_stream_handle(&second)
+        .expect("the live lifetime's handle closes it");
+    assert!(a.stream_stats(b_id, ID).is_none());
+}
+
+/// N3: a session that ends releases the partial fragment groups it
+/// opened, and cannot have them recreated.
+///
+/// The reassembly map is mesh-owned and outlives every session in
+/// it, so nothing but an explicit retirement frees a closed peer's
+/// held bytes — the TTL only runs when traffic arrives, and a quiet
+/// mesh has none. The head here is a real fragmented Net packet
+/// sealed by B's real session and carried by the real DataChannel
+/// into A's real ingress: only a leaf fragments, so no native send
+/// path produces one. The retirement is the production close path
+/// (`rtc_driver().close` → the close notifier → the ordinary peer
+/// removal transaction); the late piece afterwards is offered to the
+/// helper directly, which is the one part of this that is not
+/// production ingress.
+///
+/// Inverses: drop `retire_session`'s `groups.retain` — the held
+/// bytes survive the close; drop the retirement fence in `accept` —
+/// the late piece re-opens the group that was just released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_sessions_partial_fragment_group_is_retired_and_cannot_be_recreated() {
+    use net::adapter::net::rtc::FragmentOutcome;
+    use net_wire::protocol::{PacketFlags, FRAG_FRAGMENTED};
+
+    const STREAM: u64 = 0x0779;
+    let (a, b, id_a, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+
+    // One leaf-shaped head: fragmented, no LAST, so the group can
+    // never complete on its own.
+    let head = {
+        let session = b
+            .peer_session_for_test(a_id)
+            .expect("B's session to A")
+            .clone();
+        let seq = session.get_or_create_stream(STREAM).next_tx_seq();
+        let mut builder = session.thread_local_pool().get();
+        builder.set_channel_hash(0);
+        builder.set_origin_hash(b_id);
+        builder.set_fragment(7, 0, FRAG_FRAGMENTED);
+        builder
+            .build_subprotocol(
+                STREAM,
+                seq,
+                &[Bytes::from_static(b"native fragment head")],
+                PacketFlags::NONE,
+                0,
+            )
+            .to_vec()
+    };
+    b.send_built_packet_for_test(a_id, &head)
+        .await
+        .expect("the head leaves B");
+
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(session_id) > 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the fragment must reach production ingress and be buffered, or this \
+         witness proves nothing about what retirement releases"
+    );
+
+    a.rtc_driver()
+        .expect("driver")
+        .close(id_a)
+        .await
+        .expect("close");
+    assert!(
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(5)).await,
+        "the close must evict the peer through the ordinary removal path"
+    );
+
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "the retired session must hold no bytes"
+    );
+    assert_eq!(
+        a.rtc_reassembly().accept(
+            session_id,
+            9,
+            0,
+            FRAG_FRAGMENTED,
+            Bytes::from_static(b"late"),
+            std::time::Instant::now(),
+        ),
+        Err(FragmentOutcome::Retired),
+        "a packet already admitted before the retirement must not recreate it"
+    );
+    assert_eq!(a.rtc_reassembly().held_bytes(session_id), 0);
 }

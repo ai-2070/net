@@ -244,6 +244,24 @@ pub struct StreamStats {
     /// Cumulative `StreamWindow` grants emitted to the peer since the
     /// stream opened (receiver side).
     pub credit_grants_sent: u64,
+    /// Cumulative wire bytes this side has committed to the wire on
+    /// this stream — the sender-side half of the byte ledger. Every
+    /// producer that puts a packet on this stream moves it, whether
+    /// it went through credit admission
+    /// (`try_acquire_tx_credit`) or through the control-plane debit
+    /// (`note_tx_bytes_sent`).
+    pub tx_bytes_sent: u64,
+    /// Highest cumulative-consumed total the receiver has reported
+    /// for this stream — the receiver-side half of the same ledger.
+    ///
+    /// Conservation: `tx_credit_remaining + (tx_bytes_sent -
+    /// max_consumed_seen) == tx_window` at every settled point, and
+    /// `tx_bytes_sent - max_consumed_seen` is exactly the bytes in
+    /// flight or lost. A producer that skips its debit breaks the
+    /// identity by letting the receiver's total run past
+    /// `tx_bytes_sent`, whereupon the grant clamp refunds window for
+    /// data that never arrived.
+    pub max_consumed_seen: u64,
 }
 
 // The `Stream` **handle** deliberately does NOT live here.

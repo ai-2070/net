@@ -359,6 +359,27 @@ impl NetSession {
             .or_insert_with(|| StreamState::new(self.default_reliable))
     }
 
+    /// Allocate the next TX sequence on `stream_id` **and** debit
+    /// `wire_bytes` against the same stream's send ledger, under one
+    /// map lookup.
+    ///
+    /// The control-plane counterpart of the admission path
+    /// ([`Self::try_acquire_tx_credit_for_lifetime`], which returns
+    /// credit and sequence together for exactly this reason): a
+    /// producer that took its sequence from one lookup and its debit
+    /// from another could have a close+reopen land in between and
+    /// charge the predecessor's ledger for the successor's sequence.
+    ///
+    /// See [`StreamState::note_tx_bytes_sent`] for why the debit has
+    /// no refusal path. `wire_bytes` must be what the *receiver*
+    /// charges for the same packet — payload plus fixed per-packet
+    /// wire overhead — or the two halves of the ledger drift.
+    pub fn next_tx_seq_charged(&self, stream_id: u64, wire_bytes: u32) -> u64 {
+        let stream = self.get_or_create_stream(stream_id);
+        stream.note_tx_bytes_sent(wire_bytes);
+        stream.next_tx_seq()
+    }
+
     /// Like [`Self::get_or_create_stream`], but the receiver-side stream
     /// is created reliable when the arriving packet is `RELIABLE`-flagged
     /// — the sender's reliability is a property of the traffic, not of
@@ -506,6 +527,28 @@ impl NetSession {
         self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
     }
 
+    /// Like [`Self::try_acquire_tx_credit_guard`], but additionally
+    /// rejects the admission if the live `StreamState`'s epoch
+    /// differs from `expected_epoch`.
+    ///
+    /// **Epoch-only, and therefore unfenced against peer
+    /// replacement.** The epoch counter restarts at 1 for every
+    /// session incarnation, so a successor's first stream carries
+    /// exactly the epoch the predecessor's first stream carried and
+    /// admits here. Callers that hold the session incarnation their
+    /// handle was minted against want
+    /// [`Self::try_acquire_tx_credit_for_lifetime`], which checks
+    /// both halves; this entrypoint is retained for callers
+    /// addressing whatever lifetime is current under `stream_id`.
+    pub fn try_acquire_tx_credit_matching_epoch(
+        self: &Arc<Self>,
+        stream_id: u64,
+        expected_epoch: u64,
+        bytes: u32,
+    ) -> TxAdmit {
+        self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "seq is set Some on every code path that reaches the Acquired branch; the if-admitted flow guarantees this"
@@ -598,6 +641,41 @@ impl NetSession {
         }
         false
     }
+}
+
+/// Outcome of [`NetSession::close_stream_for_lifetime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCloseOutcome {
+    /// The named lifetime was live and has been removed.
+    Closed,
+    /// No stream was open under that id at the instant the write
+    /// guard was taken. Nothing was removed — a stream opened after
+    /// that instant is a different lifetime and is left alone.
+    Absent,
+    /// A stream is open under that id, but it is a different
+    /// lifetime (a close+reopen on this same session). Nothing was
+    /// removed.
+    LifetimeMismatch,
+    /// The caller addressed a session incarnation this is not.
+    /// Nothing was removed.
+    SessionSuperseded,
+}
+
+/// Outcome of [`NetSession::drain_state_for_lifetime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDrainState {
+    /// The named lifetime is live and its reliability layer has no
+    /// unacked packets.
+    Drained,
+    /// The named lifetime is live and still has unacked packets.
+    Pending,
+    /// Nothing is open under that id — nothing left to drain.
+    Absent,
+    /// A different lifetime holds that id now. Its unacked data is
+    /// not the caller's to wait for.
+    LifetimeMismatch,
+    /// The caller addressed a session incarnation this is not.
+    SessionSuperseded,
 }
 
 /// Outcome of [`NetSession::try_acquire_tx_credit_for_lifetime`].
@@ -827,6 +905,75 @@ impl NetSession {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
             self.recently_closed.insert(stream_id, SystemClock::now());
+        }
+    }
+
+    /// Close `stream_id` **only if** the live state is the exact
+    /// lifetime `(session_id, expected_epoch)` names.
+    ///
+    /// The unconditional [`Self::close_stream`] cannot be made safe
+    /// for a handle-addressed caller by checking first and removing
+    /// after: `try_stream` hands back a `DashMap` read guard that is
+    /// released when the comparison ends, so a concurrent
+    /// close+reopen of the same id lands in the gap and the removal
+    /// takes the *successor's* state — dropping a live retransmit
+    /// window, credit ledger and buffered delivery that belong to
+    /// somebody else. An absent-at-check stream followed by a
+    /// concurrent open in the same gap is removed the same way.
+    ///
+    /// The comparison and the removal therefore happen under ONE
+    /// `Entry` write guard. Both halves of the lifetime are checked
+    /// and neither implies the other, for the reason
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] documents: the
+    /// epoch counter restarts at 1 per incarnation.
+    pub fn close_stream_for_lifetime(
+        &self,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+    ) -> StreamCloseOutcome {
+        if session_id != self.session_id {
+            return StreamCloseOutcome::SessionSuperseded;
+        }
+        use dashmap::mapref::entry::Entry;
+        match self.streams.entry(stream_id) {
+            Entry::Vacant(_) => StreamCloseOutcome::Absent,
+            Entry::Occupied(occupied) => {
+                if occupied.get().epoch() != expected_epoch {
+                    return StreamCloseOutcome::LifetimeMismatch;
+                }
+                let (_, state) = occupied.remove_entry();
+                state.deactivate();
+                self.recently_closed.insert(stream_id, SystemClock::now());
+                StreamCloseOutcome::Closed
+            }
+        }
+    }
+
+    /// Whether the exact lifetime `(session_id, expected_epoch)`
+    /// names still has unacked reliable data.
+    ///
+    /// One lookup, and the guard is released before returning, so a
+    /// caller polling this in a graceful-close loop holds nothing
+    /// across its `await`. Distinguishing
+    /// [`StreamDrainState::LifetimeMismatch`] from
+    /// [`StreamDrainState::Pending`] is what stops a stale handle
+    /// from waiting out its whole timeout on a *successor* stream's
+    /// retransmit window.
+    pub fn drain_state_for_lifetime(
+        &self,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+    ) -> StreamDrainState {
+        if session_id != self.session_id {
+            return StreamDrainState::SessionSuperseded;
+        }
+        match self.streams.get(&stream_id) {
+            None => StreamDrainState::Absent,
+            Some(state) if state.epoch() != expected_epoch => StreamDrainState::LifetimeMismatch,
+            Some(state) if state.with_reliability(|r| r.has_pending()) => StreamDrainState::Pending,
+            Some(_) => StreamDrainState::Drained,
         }
     }
 
@@ -1564,6 +1711,46 @@ impl StreamState {
             }
             // CAS lost — retry with the fresh value.
         }
+    }
+
+    /// Debit `bytes` against this stream's send ledger **without
+    /// admission** — the ledger half of [`Self::try_acquire_tx_credit`]
+    /// with no refusal path.
+    ///
+    /// Sender and receiver keep two halves of one ledger. The receiver
+    /// charges every packet it accepts on a stream to
+    /// `rx_credit.consumed` and ships that cumulative total in its
+    /// authoritative `StreamWindow` grant; the sender reconciles the
+    /// grant against `tx_bytes_sent`. A producer that puts bytes on the
+    /// wire without moving `tx_bytes_sent` therefore lets the
+    /// receiver's total run ahead of the sender's watermark, and the
+    /// next grant refunds credit for bytes some *other* producer on
+    /// that stream still has in flight — the window re-opens for data
+    /// the receiver never saw. Clamping the grant to `tx_bytes_sent`
+    /// bounds the total at the ceiling; it does not make the refunded
+    /// bytes have arrived.
+    ///
+    /// Control-plane producers have no caller to return
+    /// `Backpressure` to (a membership ack or a capability
+    /// announcement is protocol progress, not application traffic), so
+    /// they debit unconditionally and the remaining credit floors at
+    /// zero rather than refusing. The bytes are still fully refunded
+    /// by the grant that reports them consumed, so a control frame
+    /// costs the application window only while it is in flight.
+    ///
+    /// Same publication order as `try_acquire_tx_credit`: remaining
+    /// first, then the watermark.
+    pub fn note_tx_bytes_sent(&self, bytes: u32) {
+        if self.tx_window == 0 {
+            return;
+        }
+        self.tx_credit_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(bytes))
+            })
+            .ok();
+        self.tx_bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Refund `bytes` of send credit. Called by `TxSlotGuard::drop`
@@ -3490,5 +3677,290 @@ mod tests {
                 "rejected heartbeat must not advance last_activity ({bad_len} bytes)"
             );
         }
+    }
+
+    /// N2: the four outcomes of a lifetime-conditional close, and the
+    /// one that matters — a stale epoch must leave the live state
+    /// alone rather than remove "whatever is current".
+    #[test]
+    fn a_conditional_close_removes_only_the_lifetime_it_names() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9001".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let e1 = session.open_stream_full(7, true, 1, 4096);
+
+        // Wrong incarnation: refused, nothing removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid ^ 1, e1),
+            StreamCloseOutcome::SessionSuperseded
+        );
+        assert!(
+            session.try_stream(7).is_some(),
+            "a predecessor's close must not remove the current lifetime"
+        );
+
+        // Right incarnation, wrong epoch: refused, nothing removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1 + 1),
+            StreamCloseOutcome::LifetimeMismatch
+        );
+        assert_eq!(
+            session.try_stream(7).map(|s| s.epoch()),
+            Some(e1),
+            "a stale epoch must not remove the live stream"
+        );
+
+        // Exact lifetime: removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::Closed
+        );
+        assert!(session.try_stream(7).is_none());
+
+        // Idempotent: closing a lifetime that is already gone is
+        // `Absent`, not an error.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::Absent
+        );
+
+        // Reopen allocates a new epoch, and the old handle's close
+        // cannot reach it.
+        let e2 = session.open_stream_full(7, true, 1, 4096);
+        assert_ne!(e2, e1, "a reopen is a new lifetime");
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::LifetimeMismatch
+        );
+        assert!(session.try_stream(7).is_some());
+    }
+
+    /// N2, the race itself: a close that names one lifetime must
+    /// never remove a successor installed between its comparison and
+    /// its removal.
+    ///
+    /// Pre-fix these were two operations —
+    /// `try_stream(id).is_some_and(|s| s.epoch() != want)` released
+    /// its read guard, then `close_stream(id)` removed
+    /// **unconditionally**. Two reachable schedules follow, and Kyra
+    /// named both:
+    ///
+    /// - The close observes its own matching epoch, a concurrent
+    ///   close+reopen installs a successor, and the resumed close
+    ///   removes the successor — returning `Ok(())` while a live
+    ///   stream's credit ledger, sequence space and retransmit
+    ///   window are destroyed.
+    /// - The close observes *nothing* open (not stale either), a
+    ///   concurrent open lands, and the same unconditional removal
+    ///   takes it.
+    ///
+    /// Each round drives one of the two, and the invariant is the
+    /// one the gap breaks: **the reopener's stream is always open at
+    /// the end of a round.** The reopener installs its lifetime
+    /// last, so the only way for it to be missing is a close that
+    /// removed state it does not own.
+    ///
+    /// Inverse: replace the `Entry`-guarded body of
+    /// `close_stream_for_lifetime` with the two-step
+    /// check-then-`close_stream` form.
+    #[test]
+    fn a_conditional_close_never_removes_a_concurrent_reopen() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9002".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        const ROUNDS: usize = 20_000;
+
+        let barrier = Arc::new(Barrier::new(2));
+        // The epoch the closing side will name this round: the live
+        // one, so its comparison PASSES and it proceeds to remove.
+        let target_epoch = Arc::new(AtomicU64::new(0));
+        let lost = Arc::new(AtomicUsize::new(0));
+
+        let reopener = {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            let lost = Arc::clone(&lost);
+            std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    if round % 2 == 0 {
+                        // Successor under the same id.
+                        session.close_stream(1_000);
+                    }
+                    session.open_stream_full(1_000, true, 1, 4096);
+                    barrier.wait();
+                    if session.try_stream(1_000).is_none() {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                    }
+                    barrier.wait();
+                }
+            })
+        };
+
+        for round in 0..ROUNDS {
+            // Set up this round's starting lifetime. On odd rounds
+            // leave the id ABSENT so the closing side sees nothing
+            // open — the second schedule above.
+            if round % 2 == 0 {
+                let epoch = session.open_stream_full(1_000, true, 1, 4096);
+                target_epoch.store(epoch, Ordering::Relaxed);
+            } else {
+                session.close_stream(1_000);
+                target_epoch.store(u64::MAX, Ordering::Relaxed);
+            }
+            barrier.wait();
+            let _ =
+                session.close_stream_for_lifetime(1_000, sid, target_epoch.load(Ordering::Relaxed));
+            barrier.wait();
+            barrier.wait();
+        }
+        reopener.join().expect("reopener thread");
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            0,
+            "a lifetime-conditional close removed a stream it does not \
+             own in {} of {ROUNDS} races",
+            lost.load(Ordering::Relaxed)
+        );
+    }
+
+    /// N2 complement: the lifetime-scoped drain probe distinguishes
+    /// "my stream still has unacked data" from "a different lifetime
+    /// holds this id now", so a graceful close cannot wait out its
+    /// timeout on a successor's retransmit window.
+    #[test]
+    fn the_drain_probe_separates_pending_from_a_replaced_lifetime() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9003".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let e1 = session.open_stream_full(11, true, 1, 4096);
+
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::Drained,
+            "a stream with nothing outstanding is drained"
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid ^ 1, e1),
+            StreamDrainState::SessionSuperseded
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1 + 1),
+            StreamDrainState::LifetimeMismatch
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(404, sid, e1),
+            StreamDrainState::Absent
+        );
+
+        // Register one unacked reliable packet, then re-probe.
+        {
+            let state = session.try_stream(11).expect("stream");
+            let descriptor = Arc::new(RetransmitDescriptor {
+                seq: 0,
+                stream_id: 11,
+                events: vec![Bytes::from_static(b"x")],
+                flags: crate::protocol::PacketFlags::RELIABLE,
+            });
+            state.with_reliability(|r| r.on_send(descriptor));
+        }
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::Pending,
+            "an unacked packet is what a graceful close waits for"
+        );
+        // And a reopen under the same id stops being our wait:
+        // the successor's unacked data is not ours to drain.
+        session.close_stream(11);
+        session.open_stream_full(11, true, 1, 4096);
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::LifetimeMismatch
+        );
+    }
+
+    /// N1: the unconditional ledger debit moves BOTH halves, so the
+    /// grant that reports those bytes consumed refunds exactly them
+    /// — a control frame costs the application window only while it
+    /// is in flight.
+    #[test]
+    fn an_unadmitted_debit_is_refunded_by_the_grant_that_reports_it() {
+        let state = StreamState::new_full(false, 1, 100);
+
+        // 30 bytes of control traffic: no refusal, ledger moves.
+        state.note_tx_bytes_sent(30);
+        assert_eq!(state.tx_credit_remaining(), 70);
+        assert_eq!(state.tx_bytes_sent(), 30);
+
+        // 50 bytes of application traffic through admission.
+        assert!(state.try_acquire_tx_credit(50));
+        assert_eq!(state.tx_credit_remaining(), 20);
+        assert_eq!(state.tx_bytes_sent(), 80);
+
+        // The receiver consumed the control frame and the first 50
+        // application bytes: full window back.
+        state.apply_authoritative_grant(80);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            100,
+            "every byte the receiver charged was debited here, so the \
+             grant returns the whole window"
+        );
+
+        // Now the discriminating half: 40 bytes sent, only the
+        // control-free prefix of 10 consumed. Credit must be the
+        // window minus the 30 bytes still unconsumed — a grant can
+        // only refund what it reports.
+        state.note_tx_bytes_sent(10);
+        assert!(state.try_acquire_tx_credit(30));
+        state.apply_authoritative_grant(90);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            70,
+            "remaining + (sent - consumed) == window at every settled point"
+        );
+        assert_eq!(state.tx_bytes_sent(), 120);
+        assert_eq!(state.max_consumed_seen(), 90);
+    }
+
+    /// The debit floors at zero instead of refusing: a control frame
+    /// has no caller to return `Backpressure` to, and wedging the
+    /// credit loop behind the window it refills would deadlock the
+    /// stream.
+    #[test]
+    fn an_unadmitted_debit_floors_at_zero_and_never_refuses() {
+        let state = StreamState::new_full(false, 1, 10);
+        state.note_tx_bytes_sent(4);
+        assert_eq!(state.tx_credit_remaining(), 6);
+        state.note_tx_bytes_sent(100);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            0,
+            "remaining floors at zero rather than wrapping"
+        );
+        assert_eq!(
+            state.tx_bytes_sent(),
+            104,
+            "the watermark records what actually went on the wire"
+        );
+        // An unbounded stream keeps ignoring the ledger entirely.
+        let unbounded = StreamState::new_full(false, 1, 0);
+        unbounded.note_tx_bytes_sent(1234);
+        assert_eq!(unbounded.tx_bytes_sent(), 0);
     }
 }

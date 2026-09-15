@@ -2004,13 +2004,23 @@ mod mesh_bindings {
         /// lifetime. `sendOnStream` is the handle-addressed operation
         /// and it *is* fenced — it throws `stream session superseded`
         /// once the peer's session has been replaced (R12).
+        ///
+        /// **This close is deliberately NOT lifetime-fenced.** The
+        /// N-API surface hands JavaScript a `(peerNodeId, streamId)`
+        /// pair rather than an opaque core handle, so there is no
+        /// lifetime to fence against and nothing here can distinguish
+        /// a displaced caller from a current one. Receiving the
+        /// `SessionSupersededError` class from `sendOnStream` does not
+        /// make this method fenced. C and Go own an opaque handle and
+        /// therefore call the fenced core operation
+        /// (`net_mesh_close_stream`).
         #[napi]
         pub fn close_stream(&self, peer_node_id: BigInt, stream_id: BigInt) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let peer_u64 = crate::common::bigint_u64(peer_node_id)?;
             let stream_u64 = crate::common::bigint_u64(stream_id)?;
-            node.close_stream_id(peer_u64, stream_u64);
+            node.close_stream(peer_u64, stream_u64);
             Ok(())
         }
 
