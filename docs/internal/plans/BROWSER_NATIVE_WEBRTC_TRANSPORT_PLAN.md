@@ -2398,6 +2398,34 @@ the 12 Stage 4b names. Kyra's own summary: the forged-announcement
 issue "limits authority correctness, not the fact that these
 mechanisms execute."
 
+**Stage 5 repair round delivered (`0162fce73`…`a020feb22`); Kyra:
+HOLD again at `886064aba`, "substantial original repairs are
+verified".** All 15 original probes closed (191 Rust, 158 TS);
+Chromium **and Firefox 20/20**; her R1–R16 original counterexamples
+each closed. Seven new executable counterexamples (reviewer reproduced
+7/3 at `a020feb22`; brief `spikes/S5_R2_BRIEF.md`): **F1** membership
+consumes sequence 0 but only event-plane frames advance the reorder
+cursor — subscribe-then-publish stalls; **F2** a legitimate
+retransmitted fragment wipes the retained partial group; **F3**
+reliable reorder overflow drops sequence 0 silently, no
+`StreamFailed`; **F4** a RESPONSE on the wrong carrier channel with the
+expected inner route completes the call; **F5** a stale leaf stream
+handle sends through the successor session; **F6** fragment groups
+accept conflicting provenance; **F7** unexpired replay entries evicted
+under capacity pressure. Source-established: close-during-promotion
+cannot cancel the suspended factory holding the lock; TS iterators not
+ended on generation change; callbacks under `Inner`'s mutable borrow;
+native UDP byte conservation broken by the control-accounting hoist;
+a same-session close epoch-check/remove race; **a compatibility
+gate** — core/SDK close signatures replaced and the public
+`NetSession` epoch API removed (fenced APIs must sit beside compatible
+entrypoints or the owner gets a versioned break); Go maps -117 to a
+generic error. Also open: `hedge_loser_handler_observes_cancellation`
+red 3/3 at the reviewed head (file unchanged; causality not
+established) and the anchorless "nothing dropped" assertion at
+`a020feb22`. R3's native-window and reliable loss/reorder evidence
+still owed as real witnesses.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
