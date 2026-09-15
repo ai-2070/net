@@ -194,7 +194,13 @@ pub async fn handle_signal(
             match driver.accept_answer(peer, sdp).await {
                 Ok(()) => SignalOutcome::AnswerApplied { dialog, peer },
                 Err(_) => {
+                    // Terminal: the dialog is gone from the table,
+                    // so the expiry sweep will never see it. An
+                    // answer this driver cannot apply is `ice_failed`
+                    // — the attempt cannot work, as distinct from
+                    // running out of time.
                     dialogs.remove(from_node, dialog);
+                    driver.stats().note_ice_failed();
                     SignalOutcome::Reject {
                         dialog,
                         reason: RtcRejectReason::Declined,
@@ -217,6 +223,14 @@ pub async fn handle_signal(
         }
         RtcSignalMsg::Reject { dialog, reason } => {
             if let Some(entry) = dialogs.remove(from_node, dialog) {
+                // Terminal, and counted here because the removal is
+                // what takes the attempt away from the expiry
+                // sweep. The peer refused: `ice_failed`, not
+                // `ice_relayed`. `Ignored` below counts nothing —
+                // a Reject for a dialog we do not hold is a late
+                // frame for an attempt that already terminated, and
+                // charging it would double-count that attempt.
+                driver.stats().note_ice_failed();
                 let driver = driver.clone();
                 let peer = entry.peer;
                 tokio::spawn(async move {

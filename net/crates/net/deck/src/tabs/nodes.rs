@@ -30,12 +30,13 @@ pub fn render(
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
     anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     let has_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
     let has_local = local.is_some();
     if has_peers || has_local {
         if let Some(s) = snapshot {
-            render_live_nodes_table(frame, area, s, cursor, local, anchors);
+            render_live_nodes_table(frame, area, s, cursor, local, anchors, ice);
         }
     } else {
         render_empty_nodes_table(frame, area);
@@ -69,6 +70,11 @@ pub(crate) fn render_nodes_view(
     // (not an anchor); a build that cannot read the fields at all
     // says so, because those are not the same statement.
     anchors: &crate::app::AnchorRollup,
+    // Stage 6: plan §10's `ice_direct / ice_attempted` field
+    // telemetry. NOT a per-peer fact — an attempt ledger is this
+    // node's own and is not announced — so the column paints the
+    // local row and `—` everywhere else.
+    ice: &crate::app::IceRollup,
 ) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
@@ -109,6 +115,7 @@ pub(crate) fn render_nodes_view(
         cell_dim("DAEMONS"),
         cell_dim("MAINT"),
         cell_dim("ANCHOR"),
+        cell_dim("ICE"),
     ])
     .height(1);
 
@@ -220,6 +227,7 @@ pub(crate) fn render_nodes_view(
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
             Cell::from(Span::styled(maint_text, maint_style)),
             Cell::from(anchor_span(anchors, peer_id)),
+            Cell::from(ice_span(ice, is_local_row)),
         ]));
     }
 
@@ -236,7 +244,8 @@ pub(crate) fn render_nodes_view(
             Constraint::Length(5),  // SAT
             Constraint::Length(8),  // DAEMONS
             Constraint::Length(10), // MAINT
-            Constraint::Min(21),    // ANCHOR (rtc_addr / bootstrap host)
+            Constraint::Length(21), // ANCHOR (rtc_addr / bootstrap host)
+            Constraint::Min(24),    // ICE (direct/attempts + pending)
         ],
     )
     .header(header)
@@ -267,6 +276,31 @@ fn anchor_span(anchors: &crate::app::AnchorRollup, peer_id: u64) -> Span<'static
         Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
         None => Span::styled("—".to_string(), theme::chrome()),
     }
+}
+
+/// The ICE cell for one node row — plan §10's
+/// `ice_direct / ice_attempted` deployment metric.
+///
+/// **The denominator is ATTEMPTS, not sessions**, and the cell
+/// spells it out (`6/9 67%`, not a bare `67%`) for exactly that
+/// reason: an attempt is one signalling dialog, so a peer reached
+/// on a retry spends two of them, and the percentage is not a
+/// session success rate. A relayed session is not a failed one.
+///
+/// Only the local row carries a value. An attempt ledger is this
+/// node's own and is never announced, so a remote row gets `—`
+/// meaning "not this node's ledger" — the same glyph the ANCHOR
+/// column uses for its own "not this" fact, and for the same
+/// reason: a number there would be a claim about a peer that
+/// nothing on this node can support.
+fn ice_span(ice: &crate::app::IceRollup, is_local_row: bool) -> Span<'static> {
+    if !is_local_row {
+        return Span::styled("—".to_string(), theme::chrome());
+    }
+    if ice.not_this_build() || ice.ledger().is_none() {
+        return Span::styled(ice.cell(), theme::dim());
+    }
+    Span::styled(ice.cell(), theme::cyan())
 }
 
 /// Map the local node's `MaintenanceStateSnapshot` (state machine
@@ -323,6 +357,7 @@ fn render_live_nodes_table(
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
     anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     use net_sdk::deck::PeerHealthSnapshot;
 
@@ -368,6 +403,7 @@ fn render_live_nodes_table(
         local_id,
         local_maintenance_mirror,
         anchors,
+        ice,
     );
 }
 

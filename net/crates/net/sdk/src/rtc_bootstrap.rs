@@ -1545,3 +1545,98 @@ pub fn serve_anchor_directory(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::Ser
     })
     .map_err(|e| e.to_string())
 }
+
+// ===================================================================
+// The anchor ICE-stats service (Stage 6 slice 5)
+// ===================================================================
+
+/// The nRPC service an anchor serves so operator tooling can read
+/// **its own** ICE attempt ledger — plan §10's
+/// `ice_direct / ice_attempted` field telemetry.
+pub const ANCHOR_ICE_STATS_SERVICE: &str = "net.mesh.anchor.ice";
+
+/// [`ANCHOR_ICE_STATS_SERVICE`]'s reply: the answering anchor's ICE
+/// attempt ledger.
+///
+/// **The denominator is attempts, not sessions.** [`Self::attempted`]
+/// counts direct-path attempts — one per signalling dialog the
+/// answering node drove, which on an anchor includes the bootstrap
+/// dialog of every browser that arrived. A caller that retries after
+/// a timeout spends two attempts; an ICE restart inside one dialog
+/// is one.
+///
+/// The ratio is **not** a session success rate: a relayed session is
+/// not a failed one. `direct + relayed + failed + pending ==
+/// attempted` holds here, and plan §10's fourth outcome
+/// `udp_blocked` is absent because a node signalling over UDP cannot
+/// have UDP blocked — that term belongs to the browser leaf, which
+/// can establish it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorIceStats {
+    /// The answering node's id, hex — the ledger is its own and
+    /// cannot be read across the mesh, so the reply names whose it
+    /// is.
+    pub node: String,
+    /// `false` when the answering node has no RTC driver, in which
+    /// case it keeps **no attempt ledger at all** and every counter
+    /// below is a placeholder zero rather than an observation.
+    ///
+    /// This flag is the difference between "nothing has gone direct
+    /// here" and "this node does not do direct paths", which a bare
+    /// row of zeros cannot express.
+    pub rtc_configured: bool,
+    /// **The denominator.** Direct-path attempts started: one per
+    /// signalling dialog.
+    pub attempted: u64,
+    /// Attempts that ended with an installed direct RTC endpoint.
+    pub direct: u64,
+    /// Attempts that reached their deadline with ICE never
+    /// connected. For a peer dialog: the pair stayed on the anchor —
+    /// a supported disposition, not a failure.
+    pub relayed: u64,
+    /// Attempts that ended without a direct path for a reason other
+    /// than their deadline.
+    pub failed: u64,
+    /// Attempts counted in the denominator that have not reached any
+    /// outcome yet. The four terms sum to [`Self::attempted`] only
+    /// when this is zero.
+    pub pending: u64,
+    /// `direct / attempted`, or `null` when nothing has been
+    /// attempted. **`null` is not zero**: a node that has never
+    /// attempted a direct path has no direct-path ratio, and `0.0`
+    /// would report total failure where nothing has happened.
+    pub direct_ratio: Option<f64>,
+}
+
+/// Serve the anchor's own ICE attempt ledger on `mesh`.
+///
+/// **Why a service and not a local read.** Same reason the anchor
+/// directory is one (R6): the CLI's in-process Deck client has no
+/// `MeshNode`, so reading this locally would report the ledger of a
+/// node the operator just created and which has attempted nothing.
+/// An attempt ledger is also not announced — it is not fold state —
+/// so the only node that can answer for it is the node that owns it.
+///
+/// Read-only. It publishes four counters about this node's own
+/// direct-path attempts and nothing about any peer.
+pub fn serve_anchor_ice_stats(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::ServeHandle, String> {
+    let node = Arc::clone(mesh.node());
+    mesh.serve_rpc_raw_bytes(ANCHOR_ICE_STATS_SERVICE, move |_request| {
+        let node = Arc::clone(&node);
+        async move {
+            let ledger = node.rtc_ice_stats();
+            let reply = AnchorIceStats {
+                node: format!("{:#x}", node.node_id()),
+                rtc_configured: ledger.is_some(),
+                attempted: ledger.as_ref().map(|s| s.attempted).unwrap_or(0),
+                direct: ledger.as_ref().map(|s| s.direct).unwrap_or(0),
+                relayed: ledger.as_ref().map(|s| s.relayed).unwrap_or(0),
+                failed: ledger.as_ref().map(|s| s.failed).unwrap_or(0),
+                pending: ledger.as_ref().map(|s| s.pending()).unwrap_or(0),
+                direct_ratio: ledger.as_ref().and_then(|s| s.direct_ratio()),
+            };
+            serde_json::to_vec(&reply).map_err(|e| e.to_string())
+        }
+    })
+    .map_err(|e| e.to_string())
+}

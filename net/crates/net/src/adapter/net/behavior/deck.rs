@@ -803,6 +803,22 @@ impl DeckClient {
             .unwrap_or_default()
     }
 
+    /// This node's own ICE attempt ledger — plan §10's
+    /// `ice_direct / ice_attempted` field telemetry.
+    ///
+    /// `None` when no `MeshNode` is wired in or the node has no RTC
+    /// driver: there is then no attempt ledger at all, which is a
+    /// different statement from a ledger reading zero, and the
+    /// surfaces that render this keep them apart.
+    ///
+    /// **This node's own attempts**, never a peer's: an attempt
+    /// ledger is not announced and cannot be read across the mesh.
+    /// Powers Deck's ICE column and `net-mesh anchor stats`.
+    #[cfg(feature = "webrtc")]
+    pub fn ice_stats(&self) -> Option<crate::adapter::net::rtc::IceStats> {
+        self.mesh.as_ref().and_then(|m| m.rtc_ice_stats())
+    }
+
     /// Aggregate gateway counters for `net gateway stats`.
     /// Returns `None` when the mesh has no installed
     /// `ChannelConfigRegistry` — in that case the gateway isn't

@@ -54,6 +54,26 @@ pub enum AnchorCommand {
     /// build cannot act on is a listing with nothing behind it.
     #[cfg(feature = "rtc-bootstrap")]
     Ls(LsArgs),
+    /// Read an anchor's ICE attempt ledger: plan §10's
+    /// `ice_direct / ice_attempted` deployment telemetry.
+    ///
+    /// **The denominator is ATTEMPTS, not sessions.** One attempt is
+    /// one signalling dialog — the offer the anchor sent, or an
+    /// offer it accepted (which on an anchor includes the bootstrap
+    /// dialog of every browser that arrived). A caller that retries
+    /// after a timeout spends two attempts; an ICE restart inside
+    /// one dialog is one.
+    ///
+    /// The ratio is reported, never gated, and it is NOT a success
+    /// rate for sessions: a relayed session is not a failed one —
+    /// the routed path through an anchor is a supported disposition.
+    /// Nor is it a per-pair fact; ask the pair whether a pair is
+    /// direct.
+    ///
+    /// Requires the `rtc-bootstrap` build: the ledger is not fold
+    /// state, so it is read from the live node that owns it.
+    #[cfg(feature = "rtc-bootstrap")]
+    Stats(StatsArgs),
     /// Serve the browser bootstrap listener on this node.
     ///
     /// Requires the `rtc-bootstrap` build, which is the one that
@@ -84,6 +104,29 @@ pub struct LsArgs {
     /// signature-verified announcements a LIVE mesh has ingested, so
     /// this listing needs a mesh — the Deck client the CLI builds
     /// in-process has none (R6).
+    #[command(flatten)]
+    pub remote: crate::commands::aggregator::RemoteAttachArgs,
+}
+
+/// `net-mesh anchor stats`.
+#[cfg(feature = "rtc-bootstrap")]
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    /// Operator identity file.
+    #[arg(long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Supervisor node to query.
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+
+    /// How long to wait for the anchor to answer.
+    #[arg(long = "wait-secs", default_value_t = 5)]
+    pub wait_secs: u64,
+
+    /// The anchor to ask. An ICE attempt ledger is the answering
+    /// node's OWN and is never announced, so — unlike fold state —
+    /// there is no local view of it to fall back on.
     #[command(flatten)]
     pub remote: crate::commands::aggregator::RemoteAttachArgs,
 }
@@ -221,6 +264,70 @@ struct AnchorRow {
     noise_pubkey: Option<String>,
 }
 
+/// What `net-mesh anchor stats` prints.
+///
+/// Every field the operator needs to read the ratio correctly is in
+/// the row — the denominator, the residual, and the denominator's
+/// own definition — because a ratio whose denominator is ambiguous
+/// is a metric that gets misread for a year.
+#[cfg(feature = "rtc-bootstrap")]
+#[derive(serde::Serialize)]
+struct IceStatsRow {
+    /// The anchor that answered. The ledger is its own.
+    node: String,
+    /// `false` when that node has no RTC driver: it keeps no attempt
+    /// ledger at all, and the counters below are placeholders rather
+    /// than observations.
+    rtc_configured: bool,
+    /// **The denominator**: direct-path attempts, one per signalling
+    /// dialog.
+    ice_attempted: u64,
+    /// Attempts that ended with an installed direct RTC endpoint.
+    ice_direct: u64,
+    /// Attempts that hit their deadline with ICE never connected —
+    /// for a peer dialog, the pair stayed on the anchor. Not a
+    /// failure.
+    ice_relayed: u64,
+    /// Attempts that ended for a reason other than their deadline.
+    ice_failed: u64,
+    /// Attempts still in flight. The outcome terms sum to
+    /// `ice_attempted` only when this is zero.
+    ice_pending: u64,
+    /// `ice_direct / ice_attempted`, or `null` when nothing has been
+    /// attempted. **`null` is not `0.0`** — no attempts is not zero
+    /// per cent.
+    ice_direct_ratio: Option<f64>,
+    /// The ratio as an operator reads it out loud, denominator
+    /// included (`"6/9 attempts (67%)"`), or the reason there is no
+    /// number. Rendered, never parsed.
+    ice_direct_display: String,
+    /// What the denominator IS, carried with the numbers so the
+    /// ratio cannot be quoted without it.
+    denominator: &'static str,
+    /// What the ratio does NOT mean.
+    caveat: &'static str,
+}
+
+/// The one-line prose form of the denominator, printed with every
+/// row.
+#[cfg(feature = "rtc-bootstrap")]
+const ICE_DENOMINATOR: &str = "ice_attempted = direct-path ATTEMPTS, one per signalling dialog \
+     (the offer this anchor sent, or an offer it accepted — including each browser's bootstrap \
+     dialog, and on a browser leaf its own bootstrap dialog with its anchor, so a page that went \
+     direct with one peer reports TWO attempts). Not sessions, not peers: a retry after a timeout \
+     spends two attempts, and an ICE restart inside one dialog is one. PER PARTICIPANT, never per \
+     system: this is THIS node's own ledger. Two browsers going direct through one anchor is three \
+     dialogs in the system, and no counter reports three — each browser reports two and this \
+     anchor reports two. Summing ledgers across nodes double-counts every pair dialog.";
+
+/// The one-line prose form of what the ratio is not.
+#[cfg(feature = "rtc-bootstrap")]
+const ICE_CAVEAT: &str = "Reported, never gated. NOT a success rate for sessions: a relayed \
+     session is not a failed one — the routed path through an anchor is a supported disposition, \
+     and ICE reaching `connected` is not a health gate. NOT a per-pair fact either: ask the pair \
+     (`peer_endpoint`) whether a given pair is direct. `udp_blocked` is absent because a node \
+     signalling over UDP cannot have UDP blocked; that term belongs to the browser leaf.";
+
 pub async fn run(
     cmd: AnchorCommand,
     output: Option<OutputFormat>,
@@ -242,6 +349,8 @@ pub async fn run(
         }
         #[cfg(feature = "rtc-bootstrap")]
         AnchorCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
+        #[cfg(feature = "rtc-bootstrap")]
+        AnchorCommand::Stats(args) => run_stats(args, output, config_path, profile_name).await,
         #[cfg(feature = "rtc-bootstrap")]
         AnchorCommand::Serve(args) => run_serve(*args, output, config_path, profile_name).await,
     }
@@ -325,6 +434,125 @@ async fn run_ls(
     emit_value(OutputFormat::resolve_oneshot(output), &rows)
         .map_err(|e| generic(format!("write anchor ls: {e}")))?;
     Ok(())
+}
+
+/// `net-mesh anchor stats` — the answering anchor's ICE attempt
+/// ledger.
+///
+/// Remote by construction, and not for the reason `ls` is: an
+/// attempt ledger is not fold state and is never announced, so there
+/// is no local projection of it that could be read instead. The node
+/// that owns the ledger is the only node that can answer for it.
+#[cfg(feature = "rtc-bootstrap")]
+async fn run_stats(
+    args: StatsArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let remote_node_id = args
+        .remote
+        .remote_node_id
+        .clone()
+        .or_else(|| profile.node_id.clone())
+        .ok_or_else(|| {
+            invalid_args(
+                "anchor stats reads an ICE attempt ledger from the node that owns it, and a \
+                 ledger is never announced — so there is nothing local to fall back on: pass \
+                 --node-id (or set a profile default) to address the anchor",
+            )
+        })?;
+    let remote = resolve_remote_attach(
+        &profile,
+        args.remote.node_addr.as_deref(),
+        args.remote.node_pubkey.as_deref(),
+        args.remote.remote_node_id.as_deref(),
+        args.remote.psk_hex.as_deref(),
+    )?
+    .ok_or_else(|| {
+        invalid_args(
+            "an ICE attempt ledger belongs to the node that owns it and is never \
+             announced, so anchor stats has nothing local to read: pass \
+             --node-addr / --node-pubkey / --node-id / --psk-hex, or set them in \
+             your profile",
+        )
+    })?;
+    let ctx =
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
+    let mesh = ctx.require_mesh()?;
+    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
+        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
+    let raw = tokio::time::timeout(
+        Duration::from_secs(args.wait_secs.max(1)),
+        mesh.call_raw_bytes(
+            target,
+            net_sdk::rtc_bootstrap::ANCHOR_ICE_STATS_SERVICE,
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|_| generic("the anchor's ICE stats did not answer in time"))?
+    .map_err(|e| {
+        generic(format!(
+            "the anchor's ICE stats did not answer ({e}) — is this node running \
+             `net-mesh anchor serve`?"
+        ))
+    })?;
+    let stats = serde_json::from_slice::<net_sdk::rtc_bootstrap::AnchorIceStats>(&raw)
+        .map_err(|e| generic(format!("the anchor's ICE stats reply did not parse: {e}")))?;
+    let row = IceStatsRow {
+        ice_direct_display: ice_direct_display(&stats),
+        node: stats.node,
+        rtc_configured: stats.rtc_configured,
+        ice_attempted: stats.attempted,
+        ice_direct: stats.direct,
+        ice_relayed: stats.relayed,
+        ice_failed: stats.failed,
+        ice_pending: stats.pending,
+        ice_direct_ratio: stats.direct_ratio,
+        denominator: ICE_DENOMINATOR,
+        caveat: ICE_CAVEAT,
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &row)
+        .map_err(|e| generic(format!("write anchor stats: {e}")))?;
+    Ok(())
+}
+
+/// The ratio spelled out with its denominator, or the reason there
+/// is no ratio to spell.
+///
+/// Three distinct absences, never collapsed into a number:
+/// "no rtc driver" (no ledger exists), "no attempts" (the ledger is
+/// empty — **not** `0%`, which would report total failure where
+/// nothing has happened), and the ratio itself, which always carries
+/// `n/m attempts` so it cannot be quoted as a session success rate.
+#[cfg(feature = "rtc-bootstrap")]
+fn ice_direct_display(stats: &net_sdk::rtc_bootstrap::AnchorIceStats) -> String {
+    if !stats.rtc_configured {
+        return "no rtc driver — this node keeps no attempt ledger".to_string();
+    }
+    let Some(ratio) = stats.direct_ratio else {
+        return "no attempts yet — no direct-path ratio exists (this is not 0%)".to_string();
+    };
+    let head = format!(
+        "{}/{} attempts ({}%)",
+        stats.direct,
+        stats.attempted,
+        (ratio * 100.0).round() as u64
+    );
+    if stats.pending == 0 {
+        head
+    } else {
+        format!(
+            "{head}, {} attempt(s) still in flight — the outcome terms sum to \
+             ice_attempted only once that is 0",
+            stats.pending
+        )
+    }
 }
 
 async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
@@ -677,6 +905,11 @@ async fn run_serve(
     // R6: operator tooling reads the anchors THIS node has ingested.
     let _directory = net_sdk::rtc_bootstrap::serve_anchor_directory(&mesh)
         .map_err(|e| generic(format!("serving the anchor directory: {e}")))?;
+    // Stage 6 slice 5: and the anchor's own ICE attempt ledger, for
+    // the same reason the directory is a service — the ledger is not
+    // fold state, so only the node that owns it can answer for it.
+    let _ice_stats = net_sdk::rtc_bootstrap::serve_anchor_ice_stats(&mesh)
+        .map_err(|e| generic(format!("serving the anchor ICE stats: {e}")))?;
     let node = std::sync::Arc::clone(mesh.node());
     let handle = serve_bootstrap(node, listener_config)
         .await

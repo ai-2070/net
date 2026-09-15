@@ -53,6 +53,7 @@ pub fn render(
     snapshot: &MeshOsSnapshot,
     local: Option<LocalMemberRow<'_>>,
     anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -62,7 +63,7 @@ pub fn render(
         .split(area);
 
     render_header(frame, chunks[0], focus, snapshot);
-    render_members(frame, chunks[1], focus, snapshot, local, anchors);
+    render_members(frame, chunks[1], focus, snapshot, local, anchors, ice);
 }
 
 fn render_header(
@@ -138,6 +139,7 @@ fn render_members(
     snapshot: &MeshOsSnapshot,
     local: Option<LocalMemberRow<'_>>,
     anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     if focus.members.is_empty() {
         let block = Block::default()
@@ -232,6 +234,10 @@ fn render_members(
         // ANCHOR: a subnet member that announced the anchor role
         // is one here too, and the rollup is keyed by node id.
         anchors,
+        // ICE too, and the same way the NODES tab paints it: the
+        // ledger is this node's own, so it lands on the local
+        // member's row and nowhere else.
+        ice,
     );
 }
 

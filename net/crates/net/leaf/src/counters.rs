@@ -163,6 +163,7 @@ pub struct LeafCounters {
     reassembled: Cell<u64>,
     ice_attempted: Cell<u64>,
     ice_direct: Cell<u64>,
+    ice_relayed: Cell<u64>,
     ice_failed: Cell<u64>,
     udp_blocked: Cell<u64>,
     credit_grants_sent: Cell<u64>,
@@ -241,6 +242,45 @@ impl LeafCounters {
         bump(&self.ice_direct);
     }
 
+    /// §10 `ice_relayed` — the attempt reached its own deadline with
+    /// ICE never connected.
+    ///
+    /// **Not a failure.** For a peer dialog this is literally "the
+    /// pair stayed on the anchor": the routed session was never
+    /// replaced and the peer is still reachable, which §9 step 6
+    /// makes an expected disposition rather than an error. For the
+    /// anchor-bootstrap dialog there is no routed fallback to stay
+    /// on, so here it means only "the attempt timed out".
+    ///
+    /// **The anchor-bootstrap dialog is an attempt too.** A leaf
+    /// spends one dialog reaching its anchor before it can offer a
+    /// peer anything, so a page that went direct with one peer
+    /// reports TWO attempts, not one. A field reader computing
+    /// `ice_direct / ice_attempted` who is not expecting that will
+    /// find their ratio a fraction of what they predicted.
+    ///
+    /// These counts are PER PARTICIPANT, never per system: this is
+    /// this leaf's own ledger. Two leaves going direct through one
+    /// anchor is three dialogs in the system and no counter reports
+    /// three — each leaf reports two and the anchor reports two.
+    /// Summing ledgers across nodes double-counts every pair dialog.
+    ///
+    /// Exactly one of `ice_direct`, `ice_relayed`, `ice_failed` and
+    /// `udp_blocked` moves per counted attempt, which is what makes
+    /// §10's identity
+    /// `ice_direct + ice_relayed + ice_failed + udp_blocked ==
+    /// ice_attempted` assertable. The residual,
+    /// `ice_attempted - (the four)`, is the attempts still IN
+    /// FLIGHT — the identity is exact only once that residual is
+    /// zero, so assert it together with the sum rather than after a
+    /// hopeful wait. At the deadline the evidence takes precedence:
+    /// `UdpBlockedEvidence` established means `udp_blocked` and not
+    /// this counter.
+    #[inline]
+    pub fn ice_relayed(&self) {
+        bump(&self.ice_relayed);
+    }
+
     /// §10 `ice_failed`.
     #[inline]
     pub fn ice_failed(&self) {
@@ -304,6 +344,7 @@ impl LeafCounters {
             self.ice_attempted.get()
         ));
         out.push_str(&format!(",\"ice_direct\":\"{}\"", self.ice_direct.get()));
+        out.push_str(&format!(",\"ice_relayed\":\"{}\"", self.ice_relayed.get()));
         out.push_str(&format!(",\"ice_failed\":\"{}\"", self.ice_failed.get()));
         out.push_str(&format!(",\"udp_blocked\":\"{}\"", self.udp_blocked.get()));
         out.push_str(&format!(

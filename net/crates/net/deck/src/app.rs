@@ -142,6 +142,162 @@ fn collect_rtc_anchors(
     AnchorRollup(rows)
 }
 
+/// One node's ICE attempt ledger, as the ICE column renders it —
+/// plan §10's `ice_direct / ice_attempted` field telemetry.
+///
+/// **The denominator is attempts, not sessions**, and the column
+/// prints it alongside the percentage for that reason.
+///
+/// A local value type, not the core's `IceStats`, for the same
+/// reason [`AnchorAddresses`] is not the core's `RtcAnchorRow`: the
+/// core type exists only in a `webrtc` build, and this column has to
+/// render — saying "not in this build" — in a Deck that has no RTC
+/// at all.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IceLedger {
+    /// **The denominator.** Direct-path attempts: one per signalling
+    /// dialog.
+    pub attempted: u64,
+    /// Attempts that ended with an installed direct RTC endpoint.
+    pub direct: u64,
+    /// Attempts that hit their deadline with ICE never connected —
+    /// the pair stayed on the anchor. Not a failure.
+    pub relayed: u64,
+    /// Attempts that ended for a reason other than their deadline.
+    pub failed: u64,
+}
+
+impl IceLedger {
+    /// Attempts counted in the denominator with no outcome yet.
+    /// Saturating: the counters are independent relaxed atomics, so
+    /// a read can straddle a terminating attempt.
+    pub fn pending(&self) -> u64 {
+        self.attempted
+            .saturating_sub(self.direct)
+            .saturating_sub(self.relayed)
+            .saturating_sub(self.failed)
+    }
+
+    /// `direct / attempted`, or `None` when nothing was attempted.
+    /// **`None` is not zero** — see [`IceRollup::cell`].
+    pub fn direct_ratio(&self) -> Option<f64> {
+        if self.attempted == 0 {
+            return None;
+        }
+        Some(self.direct as f64 / self.attempted as f64)
+    }
+}
+
+/// The ICE column's data for one frame: plan §10's
+/// `ice_direct / ice_attempted` field telemetry for **the Deck's own
+/// node**, or the statement that this build cannot read it.
+///
+/// Three states, because they are three different facts and a bare
+/// number can only express one:
+///
+/// * `None` — this build has no RTC at all, so "no attempts" is a
+///   claim it is not entitled to make. The column says so, rather
+///   than borrowing the `—` that means something else.
+/// * `Some(None)` — an RTC-capable build whose node has no RTC
+///   driver: there is no attempt ledger. Not the same as a ledger
+///   reading zero.
+/// * `Some(Some(ledger))` — the ledger. Whose ratio may still be
+///   absent, because zero attempts has no ratio and `0/0` is not
+///   `0 %`.
+///
+/// **It is this node's own ledger, not a per-peer fact.** An attempt
+/// ledger is not announced and cannot be read across the mesh, so
+/// the column populates the local row and shows `—` on every remote
+/// one. To ask whether a given pair is direct, ask the pair.
+#[derive(Clone, Debug)]
+pub struct IceRollup(
+    /// What `DeckClient::ice_stats` returned, or `None` on a build
+    /// that cannot read it.
+    ///
+    /// Not an intra-doc link on purpose, for the same reason
+    /// [`AnchorRollup`]'s field is not: that accessor is
+    /// `#[cfg(feature = "webrtc")]` on the core crate and does not
+    /// exist in the documentation configuration CI builds.
+    Option<Option<IceLedger>>,
+);
+
+impl IceRollup {
+    /// The ledger, when this build can read one and the node has
+    /// one.
+    pub fn ledger(&self) -> Option<&IceLedger> {
+        self.0.as_ref().and_then(|inner| inner.as_ref())
+    }
+
+    /// `true` when this build cannot read the ICE ledger at all, so
+    /// a row's `—` must not be read as "no attempts".
+    pub fn not_this_build(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The cell text for the local node's row.
+    ///
+    /// Every branch is a distinct statement, and none of them is a
+    /// number that could be misread:
+    ///
+    /// * `not in this build` — nothing to read.
+    /// * `no rtc driver` — this node keeps no attempt ledger.
+    /// * `no attempts` — the ledger exists and is empty. **Not
+    ///   `0 %`**: a node that has never attempted a direct path has
+    ///   no direct-path ratio, and `0 %` would report total failure
+    ///   where nothing has happened.
+    /// * `6/9 67%` — direct over ATTEMPTS, the denominator spelled
+    ///   out next to the percentage so the ratio cannot be read as
+    ///   a session success rate.
+    /// * a trailing `+1 pending` when attempts are still in flight,
+    ///   because that is exactly when the four outcomes do not yet
+    ///   sum to the denominator.
+    pub fn cell(&self) -> String {
+        let Some(inner) = self.0.as_ref() else {
+            return "not in this build".to_string();
+        };
+        let Some(stats) = inner.as_ref() else {
+            return "no rtc driver".to_string();
+        };
+        let Some(ratio) = stats.direct_ratio() else {
+            return "no attempts".to_string();
+        };
+        let pending = stats.pending();
+        let head = format!(
+            "{}/{} {}%",
+            stats.direct,
+            stats.attempted,
+            (ratio * 100.0).round() as u64
+        );
+        if pending == 0 {
+            head
+        } else {
+            format!("{head} +{pending} pending")
+        }
+    }
+}
+
+/// Read the ICE ledger off the deck client.
+///
+/// Same wiring as [`collect_rtc_anchors`]: `DeckClient::ice_stats`
+/// reads the `MeshNode` attached with `DeckClient::with_mesh`, and
+/// returns `None` when there is no node or no RTC driver behind it.
+fn collect_ice_stats(
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
+) -> IceRollup {
+    #[cfg(feature = "webrtc")]
+    let ledger = Some(deck.ice_stats().map(|s| IceLedger {
+        attempted: s.attempted,
+        direct: s.direct,
+        relayed: s.relayed,
+        failed: s.failed,
+    }));
+    // No RTC in this build: there is no attempt ledger to read and
+    // nothing to claim about one.
+    #[cfg(not(feature = "webrtc"))]
+    let ledger = None;
+    IceRollup(ledger)
+}
+
 /// Navigation half of [`LogsBackTarget`] — the three
 /// contexts `filter_logs_for_id` is reachable from.
 #[derive(Clone, Debug)]
@@ -314,6 +470,12 @@ pub struct App {
     /// [`AnchorRollup::not_this_build`] on a build without `webrtc`,
     /// which is also a build that cannot use them.
     pub rtc_anchors: AnchorRollup,
+    /// Stage 6: this node's own ICE attempt ledger, refreshed with
+    /// the snapshot — plan §10's `ice_direct / ice_attempted` field
+    /// telemetry, which does not ride `PeerSnapshot` either and is
+    /// not a per-peer fact at all, so the NODES table's ICE column
+    /// paints it on the local row only.
+    pub ice: IceRollup,
     /// Memoized SUBNETS-tab derivation against the current
     /// snapshot. `subnet_rollups_with_local` and
     /// `aggregator_source_subnets` get called every frame on
@@ -726,6 +888,7 @@ impl App {
     ) -> Self {
         let snapshot = Arc::new(deck.status());
         let rtc_anchors = collect_rtc_anchors(&deck);
+        let ice = collect_ice_stats(&deck);
         let (toast_tx, toast_rx) = std::sync::mpsc::channel();
         let crate::streams::Tails {
             logs: logs_tail,
@@ -759,6 +922,7 @@ impl App {
             snapshot,
             rtc_anchors,
             subnet_view_cache: std::cell::RefCell::new(SubnetViewCache::default()),
+            ice,
             groups_cursor: DaemonCursor::default(),
             daemons_cursor: 0,
             netmap_cursor: 0,
@@ -826,6 +990,7 @@ impl App {
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
         self.rtc_anchors = collect_rtc_anchors(&self.deck);
+        self.ice = collect_ice_stats(&self.deck);
         // Snapshot just swapped — every memoized derivation
         // against it is now stale.
         self.subnet_view_cache.borrow_mut().invalidate();
@@ -3421,6 +3586,7 @@ impl App {
                 &self.snapshot,
                 Some(local_row),
                 &self.rtc_anchors,
+                &self.ice,
             );
             widgets::footer::render(
                 frame,
@@ -3464,6 +3630,7 @@ impl App {
                     self.nodes_cursor,
                     Some(local_row),
                     &self.rtc_anchors,
+                    &self.ice,
                 );
             }
             Tab::Daemons => {
@@ -3650,7 +3817,7 @@ impl App {
 
 #[cfg(test)]
 mod anchor_cell_tests {
-    use super::{AnchorAddresses, AnchorRollup};
+    use super::{AnchorAddresses, AnchorRollup, IceRollup};
 
     /// Draw the NODES tab into an offscreen terminal and return
     /// every symbol it painted. Row-major, so a cell's text is
@@ -3667,7 +3834,18 @@ mod anchor_cell_tests {
         let mut terminal = Terminal::new(TestBackend::new(150, 8)).expect("offscreen terminal");
         terminal
             .draw(|frame| {
-                crate::tabs::nodes::render(frame, frame.area(), Some(&snapshot), 0, None, rollup);
+                crate::tabs::nodes::render(
+                    frame,
+                    frame.area(),
+                    Some(&snapshot),
+                    0,
+                    None,
+                    rollup,
+                    // No local row here, so the ICE column paints
+                    // nothing either way: this helper is about the
+                    // ANCHOR cell.
+                    &IceRollup(Some(None)),
+                );
             })
             .expect("draw NODES");
         terminal
@@ -3847,6 +4025,157 @@ mod anchor_cell_tests {
             row.cell(),
             "203.0.113.7:7101",
             "the cell the operator actually sees"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ice_cell_tests {
+    use super::{IceLedger, IceRollup};
+
+    fn stats(attempted: u64, direct: u64, relayed: u64, failed: u64) -> IceLedger {
+        IceLedger {
+            attempted,
+            direct,
+            relayed,
+            failed,
+        }
+    }
+
+    /// Draw the NODES tab **with a local row** into an offscreen
+    /// terminal and return every symbol it painted. The local row is
+    /// the only one the ICE column populates: an attempt ledger is
+    /// this node's own.
+    fn nodes_tab_text(ice: &IceRollup) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut snapshot = net_sdk::deck::MeshOsSnapshot::default();
+        snapshot
+            .peers
+            .insert(0xA11CE, net_sdk::deck::PeerSnapshot::default());
+        let local_peer = net_sdk::deck::PeerSnapshot::default();
+        // Wide enough that the ICE column (the last, `Min(24)`) gets
+        // real width after the eleven fixed columns.
+        let mut terminal = Terminal::new(TestBackend::new(170, 8)).expect("offscreen terminal");
+        terminal
+            .draw(|frame| {
+                let local = crate::tabs::nodes::LocalNodeRow {
+                    id: 0x10CA1,
+                    peer: &local_peer,
+                    local_maintenance: &snapshot.local_maintenance,
+                };
+                crate::tabs::nodes::render(
+                    frame,
+                    frame.area(),
+                    Some(&snapshot),
+                    0,
+                    Some(local),
+                    &super::AnchorRollup(Some(Default::default())),
+                    ice,
+                );
+            })
+            .expect("draw NODES");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The column reaches the operator's screen carrying **its own
+    /// denominator**: `6/9`, not a bare `67%`.
+    ///
+    /// That is the whole point of the slice. A lone percentage is
+    /// the thing that gets read as "a third of our sessions are
+    /// broken" for a year; `6/9` on the screen says what was
+    /// counted.
+    #[test]
+    fn the_ice_column_paints_the_ratio_with_its_denominator_not_a_bare_percentage() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(9, 6, 2, 1)))));
+        assert!(
+            painted.contains("ICE"),
+            "the column must be in the header: {painted}"
+        );
+        assert!(
+            painted.contains("6/9 67%"),
+            "the cell must carry direct-over-ATTEMPTS and the percentage: {painted}"
+        );
+        assert_eq!(
+            painted.matches("6/9").count(),
+            1,
+            "and only on the local row — an attempt ledger is this node's own, so a \
+             remote row showing it would be a claim about a peer that nothing on \
+             this node can support: {painted}"
+        );
+    }
+
+    /// **The degenerate case is rendered as an absence.** A node that
+    /// has attempted nothing has no ratio; painting `0%` would report
+    /// total failure where nothing has happened.
+    #[test]
+    fn zero_attempts_is_painted_as_no_attempts_and_never_as_zero_percent() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(0, 0, 0, 0)))));
+        assert!(
+            painted.contains("no attempts"),
+            "an empty ledger says so: {painted}"
+        );
+        assert!(
+            !painted.contains("0%"),
+            "0/0 is not 0 per cent, and the column must not print one: {painted}"
+        );
+    }
+
+    /// An attempt in flight is shown, because that is exactly when
+    /// the outcome terms do not sum to the denominator.
+    #[test]
+    fn attempts_still_in_flight_are_named_in_the_cell() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(4, 1, 0, 0)))));
+        assert!(
+            painted.contains("1/4 25% +3 pending"),
+            "the residual belongs next to the ratio: three attempts are counted in \
+             the denominator and in no outcome yet: {painted}"
+        );
+    }
+
+    /// Three absences, three different statements — the same
+    /// discipline the ANCHOR column keeps.
+    #[test]
+    fn the_three_absences_are_distinguished_rather_than_collapsed() {
+        assert_eq!(
+            IceRollup(None).cell(),
+            "not in this build",
+            "no RTC in the build: 'no attempts' is a claim it cannot make"
+        );
+        assert_eq!(
+            IceRollup(Some(None)).cell(),
+            "no rtc driver",
+            "no driver is no ledger — not a ledger reading zero"
+        );
+        assert_eq!(
+            IceRollup(Some(Some(stats(0, 0, 0, 0)))).cell(),
+            "no attempts",
+            "a ledger that exists and is empty"
+        );
+        let painted = nodes_tab_text(&IceRollup(None));
+        assert!(
+            painted.contains("not in this build"),
+            "and the screen says it too: {painted}"
+        );
+    }
+
+    /// The cell rounds the percentage but never rounds the
+    /// denominator away: `2/3` stays `2/3` at 67 %, so two surfaces
+    /// reporting "67%" can still be told apart by what they counted.
+    #[test]
+    fn the_percentage_is_rounded_but_the_counts_are_exact() {
+        assert_eq!(IceRollup(Some(Some(stats(3, 2, 1, 0)))).cell(), "2/3 67%");
+        assert_eq!(
+            IceRollup(Some(Some(stats(9, 6, 3, 0)))).cell(),
+            "6/9 67%",
+            "the same percentage, a different population — which is why the counts \
+             are on the screen"
         );
     }
 }
