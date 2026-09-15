@@ -1757,57 +1757,49 @@ impl LeafNode {
 
     /// An event-plane frame: an nRPC reply for one of our calls, or
     /// an application message.
+    ///
+    /// **Which of the two is decided by the CARRIER, never by the
+    /// leading bytes alone.** One event-plane subprotocol carries
+    /// both, and this used to tell them apart by trying to parse
+    /// the payload as a reply first. That is not a discrimination,
+    /// it is a guess against application-chosen bytes, and it lost
+    /// data: `DISPATCH_RPC_DEADLINE_EXCEEDED` is the single byte
+    /// `0x13` at offset 0 of a frame with **no body at all**, so
+    /// every application payload of 24 B or more whose first byte
+    /// happened to be `0x13` decoded as a complete deadline reply,
+    /// went to the call table, matched no call, and was counted
+    /// away — acknowledged on the wire and never delivered. The
+    /// browser matrix showed it as one payload in twelve missing
+    /// from a reliable stream with `unknown_call: 1` and every
+    /// other counter at zero, at the 12-in-256 rate a burst of
+    /// twelve consecutive first bytes predicts; a subscribed
+    /// channel was losing 1 message in 256 the same way, with the
+    /// same single counter to show for it.
+    ///
+    /// The frame states which channel it belongs to, so the check
+    /// is **exact and costs nothing**: a reply rides
+    /// `route_stream_id` of the route it declares. Every reply the
+    /// call table can accept satisfies that by construction —
+    /// [`CallTable::deliver`](crate::rpc::CallTable::deliver)
+    /// requires the presented route AND the presented carrier to
+    /// equal the entry's, and the entry's carrier *is*
+    /// `route_stream_id` of the entry's route — so nothing
+    /// deliverable is turned away. Application bytes would have to
+    /// name their own carrier in eight exact bytes at offset 24 to
+    /// be mistaken for one.
     fn handle_event_plane(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes) {
-        match rpc_wire::decode_reply_frame(payload.clone()) {
-            Ok(Some(frame)) => {
-                // What a reply must present to be *this* call's
-                // reply: the authenticated peer it arrived from,
-                // the incarnation of that session, the canonical
-                // reply route the frame declares, **and the
-                // channel that actually carried it**. The route
-                // field alone is a self-declared claim — a
-                // contacted peer can stamp the expected reply
-                // route inside a RESPONSE it publishes on any
-                // channel at all, and before this the pending call
-                // completed on that unrelated carrier. Four facts
-                // now, all checked before the entry is removed.
-                //
-                // **Forwarded logical origin, stated rather than
-                // assumed.** The carrier is bound by the *stream
-                // id* the reply channel derives, not by the
-                // publisher: an anchor forwarding a service's
-                // RESPONSE is the transport anchor, and the
-                // service's own `origin_hash` travels inside the
-                // frame. So the transport peer proves who handed
-                // the frame over, the carrier stream proves which
-                // channel it was published on, and neither is
-                // treated as proof of who *produced* it. Equating
-                // the transport anchor with the logical publisher
-                // would break every routed call; equating an
-                // inner claim with the carrier is what let the
-                // wrong channel answer.
-                let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
-                    self.counters.drop_for(DropReason::UnknownCall);
-                    return;
-                };
-                let Some(reply_route) = rpc_wire::decode_route(&payload) else {
-                    self.counters.drop_for(DropReason::UnknownCall);
-                    return;
-                };
-                self.calls.deliver(
-                    frame,
-                    CallOwner {
-                        peer,
-                        incarnation,
-                        reply_route,
-                        carrier_stream_id: record.stream_id,
-                    },
-                    &self.counters,
-                );
-            }
+        let reply = match rpc_wire::decode_reply_frame(payload.clone()) {
+            Ok(Some(frame)) => rpc_wire::decode_route(&payload)
+                .filter(|route| route_stream_id(*route) == record.stream_id)
+                .map(|route| (frame, route)),
             // Well-formed but not the client half, or not an nRPC
-            // frame at all: an application message.
-            Ok(None) | Err(_) => match self.classify(peer, record.stream_id) {
+            // frame at all.
+            Ok(None) | Err(_) => None,
+        };
+        let Some((frame, reply_route)) = reply else {
+            // An application message, and which surface it belongs
+            // to is the stream's business.
+            match self.classify(peer, record.stream_id) {
                 StreamKind::Stream => self.events.push(LeafEvent::StreamData {
                     stream_id: record.stream_id,
                     seq: record.seq,
@@ -1818,7 +1810,59 @@ impl LeafNode {
                     origin_hash: record.origin_hash,
                     payload,
                 }),
+            }
+            return;
+        };
+        // What a reply must present to be *this* call's reply: the
+        // authenticated peer it arrived from, the incarnation of
+        // that session, the canonical reply route the frame
+        // declares, **and the channel that actually carried it**.
+        // The route field alone is a self-declared claim — a
+        // contacted peer can stamp the expected reply route inside
+        // a RESPONSE it publishes on any channel at all, and
+        // before this the pending call completed on that unrelated
+        // carrier. Four facts now, all checked before the entry is
+        // removed.
+        //
+        // **Forwarded logical origin, stated rather than
+        // assumed.** The carrier is bound by the *stream id* the
+        // reply channel derives, not by the publisher: an anchor
+        // forwarding a service's RESPONSE is the transport anchor,
+        // and the service's own `origin_hash` travels inside the
+        // frame. So the transport peer proves who handed the frame
+        // over, the carrier stream proves which channel it was
+        // published on, and neither is treated as proof of who
+        // *produced* it. Equating the transport anchor with the
+        // logical publisher would break every routed call;
+        // equating an inner claim with the carrier is what let the
+        // wrong channel answer.
+        //
+        // **A reply nothing can be done with is refused out
+        // loud.** Both arms below consume a payload that was
+        // already acknowledged to its sender, so both count and
+        // raise [`LeafEvent::Dropped`]: a counter alone is a rate
+        // nobody is watching, and a post-acknowledgement discard
+        // the consumer cannot observe is precisely how the loss
+        // above stayed invisible for three rounds.
+        let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
+            self.drop_counted(DropReason::UnknownCall);
+            return;
+        };
+        if !self.calls.deliver(
+            frame,
+            CallOwner {
+                peer,
+                incarnation,
+                reply_route,
+                carrier_stream_id: record.stream_id,
             },
+            &self.counters,
+        ) {
+            // `deliver` owns the counter; this is the event half
+            // of the same refusal.
+            self.events.push(LeafEvent::Dropped {
+                reason: DropReason::UnknownCall,
+            });
         }
     }
 
@@ -1917,7 +1961,7 @@ impl LeafNode {
                 return false;
             }
             signal::SignalAdmission::AtCapacity => {
-                self.drop_signal(DropReason::SignalCapacityRefused);
+                self.drop_counted(DropReason::SignalCapacityRefused);
                 return false;
             }
         }
@@ -1926,10 +1970,16 @@ impl LeafNode {
     }
 
     fn reject_signal(&mut self) {
-        self.drop_signal(DropReason::SignalRejected);
+        self.drop_counted(DropReason::SignalRejected);
     }
 
-    fn drop_signal(&mut self, reason: DropReason) {
+    /// Refuse one arrival: count it **and** tell the consumer.
+    ///
+    /// Both halves, always, because they answer different
+    /// questions — the counter is the rate, the event is the
+    /// occurrence — and a refusal with only one of them is how a
+    /// dropped payload goes unnoticed.
+    fn drop_counted(&mut self, reason: DropReason) {
         self.counters.drop_for(reason);
         self.events.push(LeafEvent::Dropped { reason });
     }
@@ -2930,6 +2980,191 @@ mod tests {
         assert!(
             delivered(&mut b).contains(&wanted),
             "a fragment refused for capacity was acknowledged and lost instead of resent"
+        );
+    }
+
+    /// The browser runner's `gen_bytes`, byte for byte.
+    ///
+    /// Its first byte is `seed & 0xFF` — which is the whole reason
+    /// the witness below is a *deterministic* reproduction of a
+    /// flake: a burst of `n` payloads from consecutive seeds covers
+    /// `n` consecutive first bytes.
+    fn gen_bytes(seed: u64, len: usize) -> Vec<u8> {
+        (0..len as u64)
+            .map(|i| (seed.wrapping_add(i * 167).wrapping_add((i >> 8) * 13) & 0xFF) as u8)
+            .collect()
+    }
+
+    /// **The flake that outlived R3's retransmit-budget fix.**
+    /// `stage5_direct_stream_carries_native_bytes_to_callback_and_iterator`
+    /// pushes 12 × 512 B of generated bytes down one reliable
+    /// application stream; about once in twenty runs it delivered
+    /// **11**, with the sender's ledger reading `tx_seq=12
+    /// pending=false ack_frontier=Some(12) abandoned=None
+    /// outstanding_gap=None` — every sequence acknowledged, nothing
+    /// outstanding — and every drop counter on the receiving leaf
+    /// at zero except `unknown_call: 1`. So a payload was
+    /// acknowledged and then consumed *inside* the leaf.
+    ///
+    /// It was consumed by **content sniffing on the event plane**.
+    /// One stream id carries application bytes and nRPC replies,
+    /// and `handle_event_plane` decided which by parsing the
+    /// payload: `DISPATCH_RPC_DEADLINE_EXCEEDED` is a single byte,
+    /// `0x13`, at offset 0 of a frame that carries **no body at
+    /// all**, so any application blob of 24 B or more whose first
+    /// byte is `0x13` decoded as a complete deadline reply, went to
+    /// the call table, matched no call, and was counted away. The
+    /// burst covers twelve consecutive first bytes, so 12 seeds in
+    /// 256 lose exactly one payload — the rate the matrix showed.
+    ///
+    /// The plane is decided by the **stream** now: an id this leaf
+    /// holds as an application stream delivers its bytes opaque. A
+    /// reply carrier can never be that id — a call's carrier is
+    /// `publish_stream_id(reply_route)`, which always sets bit 48
+    /// and therefore always classifies as a channel.
+    ///
+    /// `0x2108` is the harness's own seed form with the low byte
+    /// that puts `0x11` (RESPONSE) at payload 9 and `0x13` at
+    /// payload 11.
+    #[test]
+    fn an_application_stream_payload_is_never_decoded_as_an_nrpc_reply() {
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        let id = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x5a01;
+        let handle = a
+            .open_stream(bid, "abi-direct", Reliability::Reliable, Some(id), None)
+            .expect("open");
+        let sent: Vec<Vec<u8>> = (0..12u64).map(|n| gen_bytes(0x2108 + n, 512)).collect();
+        assert_eq!(
+            (sent[9][0], sent[11][0]),
+            (
+                crate::rpc_wire::DISPATCH_RPC_RESPONSE,
+                crate::rpc_wire::DISPATCH_RPC_DEADLINE_EXCEEDED
+            ),
+            "the seed must put both server-to-caller dispatch bytes in the \
+             burst, or this witness proves nothing"
+        );
+        for payload in &sent {
+            a.stream_send(handle, payload).expect("send");
+        }
+        assert_eq!(pump(&mut a, &mut b), 12, "one packet per payload");
+
+        let incarnation = b.sessions.get(aid).expect("session").incarnation();
+        let rx = b
+            .rx_streams
+            .get(&(incarnation, id))
+            .expect("the arrivals built a receive cursor");
+        let (next_expected, held, mode) = (rx.next_expected(), rx.held(), rx.reliability());
+        let unknown_call = b.counters().drops(DropReason::UnknownCall);
+        let got = delivered(&mut b);
+        assert_eq!(
+            got.len(),
+            sent.len(),
+            "every acknowledged payload must reach the consumer: the receive \
+             cursor is at {next_expected} in {mode:?} with {held} held (so \
+             nothing is waiting on a gap and no mode upgrade is mid-flight), \
+             unknown_call={unknown_call}, duplicate_sequence={}, \
+             stream_closed={}, unparsable={}",
+            b.counters().drops(DropReason::DuplicateSequence),
+            b.counters().drops(DropReason::StreamClosed),
+            b.counters().drops(DropReason::Unparsable),
+        );
+        assert_eq!(got, sent, "byte-exact and in order");
+        assert_eq!(
+            unknown_call, 0,
+            "application bytes must never be routed to the call table"
+        );
+    }
+
+    /// The same root cause on the surface with the bigger blast
+    /// radius: **pub/sub**. A subscribed channel's publications
+    /// ride the event plane too, so before the carrier check one
+    /// channel message in 256 — every payload whose first byte was
+    /// `0x13` — was parsed as a deadline reply and counted away
+    /// instead of delivered. This is the byte that used to do it,
+    /// on the real `subscribe`/`publish` pair.
+    #[test]
+    fn a_channel_message_that_begins_with_a_reply_dispatch_byte_is_still_delivered() {
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        b.subscribe(aid, "app.sink").expect("subscribe");
+        b.take_outbound();
+
+        let mut payload = vec![crate::rpc_wire::DISPATCH_RPC_DEADLINE_EXCEEDED];
+        payload.extend_from_slice(&[0x5Au8; 63]);
+        a.publish(bid, "app.sink", &payload).expect("publish");
+        assert_eq!(pump(&mut a, &mut b), 1);
+
+        let events = b.drain_events();
+        let got: Vec<Vec<u8>> = events
+            .iter()
+            .filter_map(|e| match e {
+                LeafEvent::ChannelMessage { payload, .. } => Some(payload.to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![payload],
+            "a subscribed channel's message must be delivered whatever byte \
+             it opens on; events were {events:?}"
+        );
+        assert_eq!(b.counters().drops(DropReason::UnknownCall), 0);
+    }
+
+    /// **The other half of the defect.** A payload consumed after
+    /// this leaf acknowledged it must be observable by the
+    /// consumer, not just by a counter nobody polls — a reply that
+    /// names this leaf's own reply carrier and matches no call is
+    /// the one remaining way an acknowledged payload is discarded,
+    /// and it now raises [`LeafEvent::Dropped`] as well as moving
+    /// `unknown_call`.
+    #[test]
+    fn a_reply_that_matches_no_call_is_surfaced_as_well_as_counted() {
+        let (mut a, mut b) = pair();
+        let bid = b.node_id();
+        // The carrier a reply must ride, built from the route the
+        // frame itself declares — so this reaches the call table
+        // rather than being read as application bytes.
+        let route = 0x0BAD_C0DE_1234_5678u64;
+        let carrier = route_stream_id(route);
+        let mut frame = crate::rpc_wire::EventMeta::new(
+            crate::rpc_wire::DISPATCH_RPC_DEADLINE_EXCEEDED,
+            0,
+            7,
+            9,
+            0,
+        )
+        .to_bytes()
+        .to_vec();
+        frame.extend_from_slice(&route.to_le_bytes());
+        let handle = a
+            .open_stream(
+                bid,
+                "reply-carrier",
+                Reliability::Reliable,
+                Some(carrier),
+                None,
+            )
+            .expect("open");
+        a.stream_send(handle, &frame).expect("send");
+        assert_eq!(pump(&mut a, &mut b), 1);
+
+        assert_eq!(
+            b.counters().drops(DropReason::UnknownCall),
+            1,
+            "no call is pending, so the reply is refused"
+        );
+        assert!(
+            b.drain_events().iter().any(|e| matches!(
+                e,
+                LeafEvent::Dropped {
+                    reason: DropReason::UnknownCall
+                }
+            )),
+            "an acknowledged payload this leaf consumed must reach the \
+             consumer as a typed refusal, or the next silent loss takes \
+             another three rounds to find"
         );
     }
 
