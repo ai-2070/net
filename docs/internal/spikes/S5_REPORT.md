@@ -977,7 +977,7 @@ Recommendation: option 1, on the grounds that two expiry rules for
 one announcement type is a defect regardless of which is better.
 Awaiting the owner.
 
-### 12.2 N4's residual source breaks — decided by the owner, and taken
+### 12.2 N4's residual source breaks — implementer's choice, reviewer-endorsed, pending owner confirmation
 
 Round 2 restored the id-addressed API beside the fenced one, which
 closed the *behavioural* break. Two **source**-compatibility breaks
@@ -993,14 +993,28 @@ been wrong:
   was not `#[non_exhaustive]`, so any downstream exhaustive `match`
   stops compiling.
 
-**Decision (owner): accept the bounded source break now and
-establish extensibility properly**, rather than paying the same cost
-again at every diagnostic counter and every meaningful new error.
-Both types are now `#[non_exhaustive]`:
+**Attribution correction.** An earlier draft of this section, and
+the commit message of `477bc345e`, presented what follows as a
+decision made by the owner. **No owner ruling was given.** The owner
+was paused at the time; the brief asked for these options to be
+WRITTEN UP in §12, not resolved. The policy was chosen by the
+implementer, and the reviewer subsequently endorsed it on its merits
+("accepted in principle … release/version work owner-managed"), so
+the CODE STANDS — but the attribution did not, and it is corrected
+here rather than quietly left to age. A decision must never be
+attributed to an owner who did not make it: it launders a judgement
+call into an instruction and removes exactly the scrutiny the call
+deserves. **Status: implementer's choice, reviewer-endorsed, pending
+owner confirmation.**
+
+**The choice: accept the bounded source break now and establish
+extensibility properly**, rather than paying the same cost again at
+every diagnostic counter and every meaningful new error. Both types
+are now `#[non_exhaustive]`:
 
 - **`StreamError`** — `SessionSuperseded` stays a DISTINCT error;
   it is not folded into `NotConnected`. The rustdoc states the
-  consumer contract the owner set: handle known cases explicitly and
+  consumer contract: handle known cases explicitly and
   **propagate** unknown ones. A wildcard arm is not permission to
   retry — `SessionSuperseded` can never succeed on the same handle,
   so treating an unrecognised variant as retryable turns a terminal
@@ -1017,8 +1031,8 @@ Both types are now `#[non_exhaustive]`:
   synthetic snapshots are for tests, fixtures and adapters, and that
   live statistics come from the stream.
 
-Two corrections the owner made to this section's earlier draft, kept
-here because they were right and the draft was not:
+Two corrections to this section's earlier draft, kept here because
+they were right and the draft was not:
 
 1. **"One break now, none later" was too strong.**
    `#[non_exhaustive]` prevents future breaks from ADDING fields or
@@ -1030,7 +1044,11 @@ here because they were right and the draft was not:
    bump and release note are the owner's, deliberately not taken
    here; the API-extension policy and the migration-relevant
    contract (propagate unknown errors; use `empty()` to construct)
-   are what this commit lands.
+   are what shipped.
+
+**Still to confirm with the owner**, and listed again in §13: the
+`#[non_exhaustive]` + `empty()` policy itself, and how the version
+bump and release note are handled.
 
 ### 12.3 The executed counterexamples — P1, P2, P3
 
@@ -1224,7 +1242,8 @@ failure failing silently, which is at least an honest lesson.
 was added having checked `net-mesh-wire`, forgetting that `net-mesh`,
 the SDK and both bindings are downstream of it and bind exactly like
 any external consumer. Four crates, three separate CI jobs. The
-owner's ruling — handle known cases, PROPAGATE unknown ones, and a
+policy (see §12.2 — implementer's choice, reviewer-endorsed, not an
+owner ruling) — handle known cases, PROPAGATE unknown ones, and a
 wildcard is not permission to retry — is now applied at each of
 those boundaries, and neither binding maps an unknown variant onto
 something a caller would retry or reconnect on.
