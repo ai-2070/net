@@ -428,11 +428,11 @@ because the crate denies `missing_docs` on every target.
 | **R5** | receive, reorder, reassembly, stream and RPC state keyed by session incarnation; the old incarnation retired exactly once, typed | `kyra_session_replacement_resets_receive_sequence`, `kyra_session_replacement_fails_old_pending_call` | retain the predecessor's reorder state → the successor's sequence-zero traffic is suppressed again | successor traffic and partial-fragment retention |
 | **R6** | classification by registered namespace (subscribed channel / opened stream), wire format unchanged | `kyra_channel_publication_is_not_misclassified_as_stream` | classify on bit 49 again → a channel whose hash carries that bit is delivered as stream data | stream traffic on real stream ids |
 | **R7** | the reorder buffer holds `(seq, origin, channel, bytes)` records and delivers each with its own provenance; O(1) gap accounting with a max-gap refusal | `kyra_reordered_stream_events_keep_their_own_sequences` | buffer bytes only → arrival 2,0,1 emits labels 0,1,1 | mixed-metadata delivery |
-| **R8** | replay key carries a BLAKE2s payload digest; hard cap 4096 with oldest-first eviction; freshness enforced at read time for discovery AND key authority, literal `issued + ttl` | `kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup`, `kyra_expired_announcement_is_not_discovery_or_signal_authority` | restore the `(from, dialog, kind)` key → the second candidate is refused; skip the freshness filter → an expired peer is discoverable and still a signal authority | multi-candidate traffic, re-announce restoring discovery |
+| **R8** | replay key carries a BLAKE2s payload digest; hard cap 4096 that **refuses new admissions** (typed `SignalAdmission::AtCapacity`, counted `signal_capacity_refused`) rather than evicting — the eviction path is gone, so no code can remove an unexpired entry; freshness enforced at read time for discovery AND key authority, literal `issued + ttl` | `kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup`, `kyra_expired_announcement_is_not_discovery_or_signal_authority`, `kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure` | restore the `(from, dialog, kind)` key → the second candidate is refused; skip the freshness filter → an expired peer is discoverable and still a signal authority | multi-candidate traffic, re-announce restoring discovery |
 | **R9** | stand-down is ordered: revoke the generation lease, shut the backend down (cancel in-flight, fail pending once, typed `LeaderLost`), then release the lock; every outbound effect consults the lease; `IdentityVault::fence` gained its caller (interval revalidation against the store) | `standing_down_fences_then_retires_the_node_then_releases_the_lock` over a real node with a real Noise session, a real pending call and an operation parked before dispatch; `a_leader_revalidates_its_generation_against_the_store_and_stands_down` | delete the `revoke` → the fencing witness fails | the ordinary leader/follower lifecycle |
 | **R10** | attaches queued until the backend exists and replayed on the first Leadership broadcast; `closed` checked at publish with requeue/abort; stream handles carry their opening generation and end their iterators on lifecycle loss; `announce()` updates restoration state; followers own a local deadline with an honest indeterminate outcome | one witness per schedule in `wasm_leader.rs` + the TS leader tests | drop the attach queue → subscriptions vanish across promotion | promotion, restoration and follower calls |
 | **R11** | one contract: Rust emits its canonical event JSON and TS decodes it; numeric `channelHash`; `RTCIceServer` parsed with credentials; ids matched numerically; the fake WASM mirrors the real shape | 10 ABI probes against the REAL built package, direct and leader-proxied, plus Kyra's two TS probes | reintroduce the string/bytes mismatch → `typescript_real_rust_callback_shape` reds | `typescript_byte_callback_control` |
-| **R12** | native `Stream` handles carry the session incarnation; send/close/credit refuse a mismatch with typed `SessionSuperseded`; `close_stream` is handle-addressed and fenced, `close_stream_id` is the explicit unfenced form; the error reaches the C ABI, both SDKs and both bindings, and is never retried | `a_displaced_sessions_handle_cannot_address_its_successor` (one identity in two processes, real displacement, successor's epoch walked to EXACTLY the stale handle's), `test_regression_equal_epochs_across_sessions_are_not_the_same_lifetime` | compare epoch only → the stale handle addresses the successor again | the initiator/routed refusal, the install CAS, 75 RTC tests |
+| **R12** | native `Stream` handles carry the session incarnation; send/close/credit refuse a mismatch with typed `SessionSuperseded`; the fenced operations are `close_stream_handle` / `close_stream_graceful_handle` / `try_acquire_tx_credit_for_lifetime`, added **beside** the restored id-addressed `close_stream` / `close_stream_graceful` / `try_acquire_tx_credit_matching_epoch` (see F/N §11, row N4 — this row's original wording described a replacement, which was the compatibility break Kyra held on); the error reaches the C ABI, both SDKs and both bindings, and is never retried | `a_displaced_sessions_handle_cannot_address_its_successor` (one identity in two processes, real displacement, successor's epoch walked to EXACTLY the stale handle's), `test_regression_equal_epochs_across_sessions_are_not_the_same_lifetime` | compare epoch only → the stale handle addresses the successor again | the initiator/routed refusal, the install CAS, 75 RTC tests |
 | **R13** | the IndexedDB transaction's `complete` is awaited and `abort` propagated | abort-after-put, concurrent first creation, ciphertext tamper, wrapping-key export refusal | await only the put → an aborted transaction reads as a successful write | ordinary vault reads and writes |
 | **R14** | **scoped disposition**: `AnchorControlPlane::signal` refuses with a typed error naming the peer, instead of serialising a frame the Stage 4b listener discards while reporting delivery. Carrying envelopes end to end needs a forwarding route with an acknowledgement — generic peer coordination, Stage 6's. D1 and the module doc corrected to what ships | the typed refusal; the anchorless mock carries the identical envelopes for real | send the `type: "signal"` frame again → the anchor discards it and the caller is told it was delivered | `wasm_anchorless`, unchanged |
 | **R15** | two-tab PASS gates follower RPC and the leader-close/pending-work/restoration schedule; the busy-responder witness reaches Noise and install; the reconnect leg requires an extant busy incumbent; the sequential-RPC assertion replaced by the retransmission/reorder property (64 round trips, ordered); nft narrowed to address+port; new native names pinned | the strengthened witnesses themselves | each predicate's own before/after | no coverage reduced, no retry, no floor, no timeout inflated |
@@ -518,3 +518,176 @@ wrong-route probe, which is why production needed no change.
   reachable from a probe in the roster, and taking them here would
   mean shipping changes with no discriminating witness. They belong
   to the next scoped slice.
+
+---
+
+## 11. Second repair round: the follow-up counterexamples, with raw inverse receipts
+
+Kyra's second HOLD kept every original probe green and raised seven
+NEW executable counterexamples, seven source-established lifecycle
+items, and five native ones. Her ten follow-up probes landed
+verbatim as `leaf/tests/kyra_followup.rs` as the round's first
+commit and reproduced **7 failures against 3 passing controls**; all
+ten names are pinned in CI beside the fifteen originals. No
+assertion in that file was edited.
+
+The receipts below are raw. For each row: the bounded source diff
+that undoes the repair, the **verbatim** failure text it produced,
+and the restored positive. Kyra's standard, adopted: *mutation
+descriptions are not raw inverse receipts.*
+
+### 11.1 Leaf data path — F1 to F7, and N3
+
+| row | defect | repair | inverse (source) | RED (verbatim) | restored |
+|---|---|---|---|---|---|
+| **F1** | membership consumed sequence 0, but only event-plane records entered the reorder buffer, so a publication at seq 1 was held against a hole nothing could fill | one sequence disposition: every non-feedback subprotocol on a real stream id advances the cursor when consumed; the exemption is exactly the four control-stream feedback messages the send side already excludes. `StreamRecord` carries its own subprotocol so deferred release still decodes correctly | `node.rs:1319` `!is_stream_control(subprotocol_id)` → `subprotocol_id != SUBPROTOCOL_EVENT_PLANE` | `kyra_followup.rs:183 ... membership sequence zero left the reliable publication blocked forever / left: [] / right: [[104, 101, 108, 108, 111]]` | 10/10; the other-channel control stayed green |
+| **F3a** | reliable reorder overflow released past the head gap — silent loss on the one mode whose contract is no loss | typed terminal `ReorderOverflow`; the receive half fails once and stays failed (further arrivals drop before credit/ack accounting, so it cannot re-fail once per bound); no RESET is sent, because RESET means "my SEND half gave up" and would make the peer re-accept sequences already delivered | `stream.rs:271` — the typed return replaced by "advance the cursor to the lowest held sequence" | `kyra_followup.rs:281 ... silently delivered 65 records, first=Some(1), without terminal failure=true` — byte-for-byte Kyra's reported result | typed `StreamFailed`, nothing past the hole |
+| **F3b** | admission counted bytes but not PACKETS, so tiny reliable messages outran the 128-descriptor retransmit window and evicted unacknowledged descriptors | a reliable send reserves descriptor ownership as well as byte credit before any sequence is consumed; new typed `ReliableWindowFull`, distinct from byte backpressure | `session.rs:447` — the 15-line reservation deleted | `node.rs:2779 ... admission must stop at the retransmit window's packet capacity / left: 736 / right: 128`, and a throwaway probe through the live receive→NACK→send path measured the consequence: inverse `admitted=200 recovered_after_nack=0`, repaired `admitted=128 recovered_after_nack=51` | both green |
+| **F4** | a RESPONSE on an unrelated carrier channel completed the call if it stamped the expected reply route inside itself — the frame authorising its own delivery | completion binds four facts compared as one: peer, incarnation, inner route, and the AUTHENTICATED carrier stream the frame arrived on, derived locally from the subscribed reply channel and never read from a frame | `rpc.rs:222` — the four-fact comparison expanded back to peer+incarnation+route | `kyra_followup.rs:215 ... self-declared expected inner route completed call carried on wrong channel` | wrong carrier leaves the call pending; the proper channel then completes it |
+| **F5** | a stale leaf stream handle sent through the successor session | handles carry their opening incarnation; send and close refuse typed on mismatch — the check lives where the handle is USED, because clearing internal maps cannot reach a value the caller holds | `node.rs:835` — `self.check_handle(handle)?;` deleted | `kyra_followup.rs:232 ... stale handle send accepted=true, queued=1` — byte-for-byte Kyra's result | typed Err, zero queued; reopen after replacement still delivers |
+| **F2** | head delivered, its ACK and the tail lost; the sender's legitimate retransmission WIPED the retained partial group | a byte-identical piece at the same offset and sequence is a counted duplicate (ACK repeats, nothing else); conflicting bytes stay a typed refusal; the group deadline runs from last progress, so a sender whose RTO exceeds the TTL cannot have its group reaped between two pieces it is still resending | `frame.rs` — the 17-line duplicate arm deleted, so an exact duplicate falls into the overlap branch again | `kyra_followup.rs:86 ... a legitimate retransmission destroyed the partial group, while receive ACKs accepted its sequences / left: [] / right: [[90, 90, ... 9000 bytes]]` | file restored byte-identically (md5 `d20c21a4…`); 10/10 |
+| **F6** | fragment groups accepted conflicting provenance | stream, origin and channel are fixed by the head and enforced on every fragment; sequence ownership is unique and CONTIGUOUS, so a min/max span cannot claim an intervening non-fragment record | see §11.4 | | |
+| **F7** | the replay set evicted its oldest entry under capacity pressure — an attacker could make room for the replay it wanted | at capacity it refuses NEW admissions: typed `SignalAdmission::AtCapacity`, counted `signal_capacity_refused`. The `order: VecDeque` field is GONE — there is no code left that can remove an unexpired entry, which is the structural half of the claim | see §11.4 | | |
+| **N3** | native partial groups were not retired with the session; expiry depended on a new group arriving | `retire_session` retires them explicitly; late tails cannot bypass the TTL; an admitted old packet cannot recreate a retired group | see §11.4 | | |
+
+Two in-crate tests were **deleted rather than re-pinned**, because
+each pinned exactly the behaviour a repair had to remove:
+`a_reliable_stream_abandons_its_head_gap_at_the_buffer_bound` and
+`a_duplicate_fragment_is_inconsistent_rather_than_double_counted`.
+Re-pinning either to the new text would have preserved the shape of
+a test whose subject no longer exists.
+
+`DropReason` is now 18: `ReassemblyDuplicate` and
+`SignalCapacityRefused` added, `ReorderBufferFull` removed because
+nothing emits it after F3. The counters JSON follows.
+
+**A sentence in §5 that was aspirational when written.** "…cannot be
+replayed inside the window either" became TRUE only with F7: before
+it, capacity pressure could evict the entry that refusal depended
+on. It is recorded here rather than left to read as though it had
+always held.
+
+### 11.2 Leader and TypeScript lifecycle — L1 to L7
+
+| row | defect | repair | inverse | RED (verbatim) | restored |
+|---|---|---|---|---|---|
+| **L1** | the granted lock and lease were held inside a suspended factory stack: a close during promotion could neither cancel nor release until the factory completed | the bootstrap future is owned by `Shared` and cancellable; close drops the wake; the woken frame releases the lock AFTER retiring what it installed. Cancellation is checked before the inner poll, so a factory completing in the same turn as the close cannot install | close no longer drops the cancel sender | `wasm_leader.rs:1720 — close must cancel the bootstrap, not wait for it: the factory future has to be dropped while parked / left: 0 / right: 1` | 24/24 |
+| **L2** | TS stream iterators ended only on an explicit loss notification, so an abrupt leader disappearance stranded every awaiting consumer | end on an observed generation transition too (read off the session, so a duplicate notification for the generation in force ends nothing); fence an `openStream` result that crossed the change before registration | the transition observation deleted; separately the `openedUnder` comparison dropped | `× ends a waiting stream iterator when the leader vanished without announcing it (5009ms — the iterator never settles)`; `× ends an openStream result that crossed the leadership change; AssertionError: expected false to be true` | 161/161 |
+| **L3** | `announce(C)` replaced the union with C; an empty union returned early, so the last capability-declaring follower's tag was never withdrawn | a leader's announce records its own intent and publishes the UNION; an empty union is published as an actual announcement; reconciliation's union subscriptions no longer leak into leader-local intent | announce publishes its argument; the `wanted.is_empty()` early return restored | `a leader's announce() is its own intent, and the document is the union / left: Some(["cap:leader-2"]) / right: Some(["cap:follower", "cap:leader-2"])`; `the departed follower's capability must be withdrawn by an actual announcement / left: Some(["cap:only"]) / right: Some([])` | 24/24 |
+| **L4** | a `None` follower timeout waited forever | the leaf's own default deadline is armed locally, keeping Indeterminate and never-retried | `timeout_ms.unwrap_or(DEFAULT)` → `Some(ms)` only | the call NEVER settles: the test hangs and the runner kills the driver at 126.2 s, exit 1 — which IS "a None follower timeout stays unbounded" | asserts `Indeterminate { deadline_ms: 30_000 }` and elapsed in 30_000..40_000 |
+| **L5** | a failed generation transaction propagated above the recovery path and stranded the tab | both failure branches share one fallback: release the lock, fail old pendings typed, surface `promotion_failed` (generation "0" when none was allocated — exact, the counter starts at 1), re-attach as a follower, re-queue | the fallback call deleted, error propagated | `wasm_leader.rs:1822 — the failure must be surfaced to the page, naming generation zero because none was allocated: ["{\"type\":\"leader_lost\",\"generation\":\"1\",\"failed\":\"0\"}"]` | 24/24. The break is a REAL storage failure — a database at the vault's own version whose `leader` store is missing, created through raw IndexedDB — not an injected one |
+| **L6** | direct callbacks were invoked while `Inner`'s mutable borrow was held, so a synchronous `send`/`close` from `onMessage` panicked the RefCell | events are collected under a short borrow, the borrow is released, then listeners are called; a callback's own send is picked up next turn. `LeafStream::close` was a no-op behind a real API and now calls the fenced close | `collect` restored to emitting inside the borrow | `RTCB FAIL stage5_direct_event_callback_may_reenter_the_node — counters() re-borrow returned 0 counters (read=false); openStream never reached (None); trapped=Some("counters")` — the RefCell panic, on the real browser path; the other 20 witnesses stayed green | 21/21, exit 0. The listener does two re-borrows of different kinds: `counters()` reads, `openStream()` mutates |
+| **L7** | the deferred `ProxyStream.close` checked the generation at spawn, not at dispatch | re-checked at dispatch; send's three dispositions documented — admission, transport refusal at the flush boundary, no ACK anywhere | — | — | see the honest gap below |
+
+### 11.3 Native seams — N1, N2, N4, N5, and the expiry boundary
+
+| row | defect | repair | inverse | RED (verbatim) | restored |
+|---|---|---|---|---|---|
+| **N1** | the R3 control-accounting hoist charged receive-consumed bytes for control packets while the native send path debited nothing: UDP byte conservation broken | `next_tx_seq_charged` allocates the sequence AND debits under one map lookup; every native `build_subprotocol` producer routes through one send-side mirror of the receive decision; the receive side skips the charge for exactly the four stream-control subprotocols the leaf already excludes. `StreamStats` exposes `tx_bytes_sent` and `max_consumed_seen`, so `remaining + (sent − consumed) == window` is observable | `note_tx_bytes_sent` returns early unconditionally (the pre-fix "allocate a sequence, debit nothing" producer) | `the control frame's 152 wire bytes — header, AEAD tag, event frame and payload, the same total the receiver charges — must be debited from the stream's send ledger`; `the sender's committed total must exceed the receiver's reported total by exactly the withheld packet's 89 wire bytes: sent = 182, consumed = 182, gap = 0 (grants received 2)` | both PASS. The RED numbers ARE the mechanism: uncharged, the receiver's surplus pushes its total above the sender's, the grant clamps to 182, and the withheld 89 bytes are refunded in full |
+| **N2** | the stream lookup was dropped before an unconditional removal, so a concurrent same-id reopen could be removed by the old handle | comparison and removal under ONE entry guard keyed by session id AND epoch; a vacant slot removes nothing; the graceful path returns immediately on mismatch rather than waiting out a successor's retransmit window; no guard held across the wait | the pre-fix two-step shape restored inside the conditional close | `a lifetime-conditional close removed a stream it does not own in 2118 of 20000 races / left: 2118 / right: 0`, and `left: Closed / right: Absent` for the absent-then-open case | 54/54 wire session tests |
+| **N4** | R12 REPLACED public signatures instead of adding to them — a silent compatibility break for every id-addressed consumer | `close_stream`, `close_stream_graceful` and `try_acquire_tx_credit_matching_epoch` restored verbatim under their original names and contracts, documented as unfenced; the fenced operations live beside them as `*_handle` / `*_for_lifetime`. The fence was NOT weakened — only the names moved. R12's `close_stream_id` is removed rather than left as a second convention beside the restored name | — | — | file-by-file disposition in §11.5 |
+| **N5** | Go mapped −117 to a freshly allocated "mesh unknown error (code −117)" that no caller can match, and `Close()` discarded the status | exported `ErrSessionSuperseded` sentinel carrying the same stable string the N-API surface emits, mapped in `meshErrorFromCode`, deliberately outside the backpressure retry loop; `CloseErr()` reports the status while `Close()` keeps its exact signature | the `case -117:` arm deleted | `stream_close_test.go:89: meshErrorFromCode(-117) = mesh unknown error (code -117), want ErrSessionSuperseded --- FAIL` | PASS. The parity test reads `NET_ERR_MESH_SESSION_SUPERSEDED` out of the header cgo compiles against, so constant and sentinel cannot drift |
+| **expiry** | the boundary was correct and undocumented, which is how it becomes incorrect later | rustdoc states the three load-bearing facts: second granularity by truncation, INCLUSIVE at `issued + ttl` and exclusive one second later, and `ttl_secs == 0` as a literal zero-second lifetime with no "forever" escape. `get_at`/`query_at` take the reading as a parameter — the same seam shape as `clock::Deadline::expired_at`, so one scan's answer cannot depend on a second ticking mid-iteration | — | — | the witness runs build → verify → ingest → production lookup with the stamp at `issued.999`, so truncation cannot shift what it proves |
+
+**Go execution, contrary to the previous round's report.** cgo does
+work on this host: the earlier failure was a `:`-separated `PATH` on
+Windows, not a broken gcc. With `;` separators plus
+`cargo build --release -p net-ffi` and `CGO_LDFLAGS`,
+`go test -run "TestSessionSuperseded|TestMeshStream_" -count=1`
+passes in 0.611 s. The previous round's "unproven locally" note is
+withdrawn.
+
+### 11.4 What ships without an executable witness, and why
+
+Stated here rather than discovered by the next reviewer.
+
+- **L3's subscription-ownership split** has no reachable public
+  schedule at this head: the polluted set is re-read only by
+  `reconcile` (which filters on `subscribed`) and by
+  `attach_as_follower`, and a tab cannot be promoted twice. Source
+  fix plus documentation, which is what the note asked for.
+- **L7's dispatch-time check** is bounded by the microtask boundary:
+  `spawn_local` resolves on a microtask while every path that moves
+  the generation is at least a macrotask, so the interleaving is
+  unreachable in one page without inventing a seam. The check is one
+  comparison; the row's other half — the documented dispositions —
+  is delivered.
+- **N5 end-to-end from Go**: producing −117 needs a session
+  displacement, and the Go surface exposes no session-replacement
+  entrypoint. The sentinel is proven at the mapping and
+  header-parity boundary; the fence that produces −117 is proven in
+  Rust and through the C ABI.
+- **F6, F7, N3 inverse receipts** are recorded in the lane report
+  rather than the table above; each was executed the same way (diff,
+  verbatim RED, restored positive).
+
+### 11.5 N4 consumer diff, file by file
+
+| file | disposition |
+|---|---|
+| `src/adapter/net/mesh.rs` | RESTORED `close_stream(peer, id)` and `close_stream_graceful(peer, id, timeout)` — base signatures, `()` returns, base bodies, documented as unfenced by contract. ADDED `close_stream_handle` / `close_stream_graceful_handle`. REMOVED `close_stream_id`. Net: base surface restored, two names added |
+| `wire/src/session.rs` | RESTORED `try_acquire_tx_credit_matching_epoch` — base signature, delegating exactly as base did. ADDED `note_tx_bytes_sent`, `next_tx_seq_charged`, `close_stream_for_lifetime`, `drain_state_for_lifetime`, `StreamCloseOutcome`, `StreamDrainState` |
+| `wire/src/stream.rs` | `StreamStats` gained two public fields. ADDITIVE with one caveat, flagged not hidden: a downstream consumer constructing the literal needs them. No in-repo consumer does. `StreamError::SessionSuperseded` remains a new variant on an enum that is not `#[non_exhaustive]` — unavoidable for a distinct terminal error, and marking it non-exhaustive now would be the same break |
+| `src/adapter/net/mod.rs` | re-export list extended. Additive |
+| `sdk/src/mesh.rs` | RESTORED `close_stream(peer, id)`; ADDED `close_stream_handle`; REMOVED `close_stream_id` |
+| `sdk/src/error.rs` | unchanged; the `SessionSuperseded` mapping is correct and retained |
+| `src/ffi/mesh.rs` | `net_mesh_close_stream` retargeted to the fenced call. No C ABI change — same symbol, signature and −117 disposition. Export baseline unaffected |
+| `dataforts/blob/transfer.rs` | receive side (no handle) → restored `close_stream`; serve side (owns a handle) → `close_stream_graceful_handle`. Behaviour preserved |
+| `bindings/node`, `bindings/python` | retargeted to the restored name; docs now state that the id-addressed close is deliberately NOT lifetime-fenced, because no opaque core handle crosses those boundaries |
+| `go/mesh.go`, `go/net.h` | no signature change; `CloseErr()` added. Additive |
+| `tests/rtc_repairs.rs`, `tests/three_node_integration.rs` | five handle-close callsites renamed. No assertion touched; Kyra's witness names preserved |
+
+### 11.6 The hedge failure: diagnosed, and NOT attributed to N1
+
+Kyra reported `mesh_rpc_hedge::hedge_loser_handler_observes_
+cancellation` failing 3/3 with the file unchanged. It passes here 5/5
+under both the plain and the full CI feature list, and 3× more after
+N1 landed. The honest result:
+
+- **The CANCEL is credit-gated.** `spawn_cancel_publish` publishes it
+  on the REQUEST channel's publish stream through `publish_to_peer`,
+  which charges wire bytes and admits through the credit guard;
+  `WindowFull` becomes `SendFailed`, the spawn discards the result
+  and never retries. **A single admission refusal silently drops the
+  CANCEL**, and the only backstop is keep-alive expiry. That is a
+  real, load-sensitive fragility of exactly the observed shape.
+- **N1 is not the cause, and we will not claim it is.** N1's error
+  direction is OVER-crediting the sender: the receiver's total runs
+  ahead, the grant clamps to `tx_bytes_sent`, outstanding becomes 0
+  and credit returns to the full window — visible in N1's own
+  inverse receipt (`sent = 182, consumed = 182, gap = 0`). A sender
+  cannot starve from being handed too much credit. The CANCEL also
+  rides subprotocol 0, whose charge is unconditional before and
+  after the change.
+- **The one coupling we can substantiate is weak**: the R3 hoist
+  makes recognized control frames create receive-side state and
+  enqueue grants, adding work to the single grant drainer under
+  load. That delays grants without ever lowering credit below its
+  honest value. A plausible latency contributor to a 3 s deadline on
+  a loaded runner; not a diagnosis.
+
+Disposition: the mechanism is named, the item stays OPEN against CI
+rather than being closed by attribution, and the single-shot
+credit-gated CANCEL publish is recorded as the thing to fix if it
+recurs.
+
+### 11.7 Residues named rather than silently carried
+
+- **`wasm_anchorless.rs:647`** and its fixture RefCell panic at
+  `:253` are NOT closed. The panic is the FIXTURE's own RefCell
+  (`Leaf::node`), not `wasm::Inner`, so L6 cannot address it: the
+  fixture holds `self.node.borrow_mut()` across `self.transport.
+  send(...)` in the responder arm and re-borrows within one pump.
+  Whoever takes it should look for a nested pump, not assume it is
+  the production re-entry finding.
+- **Event-plane batch senders** (`send_to_peer_node` / `send_routed`,
+  subprotocol 0) put bytes on the wire without a debit. That
+  asymmetry predates Stage 5 and was not raised; charging it would
+  change credit behaviour for the primary event-plane API. Flagged
+  as a known out-of-scope residue rather than silently fixed or
+  silently omitted.
+- **One harness flake observed**: on one of four local runs,
+  `mitm_anchor_fails_the_handshake_and_installs_nothing` failed on
+  the impostor-timing leg ("timeout: noise msg2") and passed on the
+  next run with identical source. Reported rather than buried: 3/4
+  green, in a Stage 4b witness untouched this round.

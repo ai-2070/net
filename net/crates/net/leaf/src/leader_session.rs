@@ -777,7 +777,7 @@ impl Lifecycle {
     ///
     /// A promotion that has not finished is a fourth owner, and the
     /// one this function used to be unable to see: the lock it was
-    /// granted lives in [`Shared::bootstrap`], not in `state.lock`, so
+    /// granted lives in the shared bootstrap cell, not in `state.lock`, so
     /// there was no server to retire, no lease to revoke and no lock
     /// to release — the origin's lock stayed held until the factory
     /// completed on its own. It is cancelled here and releases its own
