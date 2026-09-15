@@ -784,3 +784,129 @@ drop under load. The loss itself is environmental and not fixable in
 a harness. What was fixable — and is fixed — is that a single loss
 was unrecoverable, and was then reported as a missing anchor
 capability.
+
+---
+
+## 12. Third repair round
+
+Kyra's HOLD at `b66752643` widened the credit substantially: all 25
+earlier probes green, F1/F4/F7, L2/L4/L5/L6/L7 and N2/N4/N5 credited,
+`wasm_leaf` 15/15, anchorless 2/2, leader 24/24, and the browser
+matrix 21/21 on **both** gate engines. What remained was three new
+executable counterexamples, eleven source-established items, and two
+questions that are the owner's to answer rather than ours to decide
+quietly.
+
+Her five probes landed verbatim as `leaf/tests/kyra_round2_review.rs`
+and reproduced **3 failures against 2 controls** — her exact split.
+
+### 12.0 The roster defect that produced the one CI red
+
+The red job at `b66752643` was not a regression: `wasm_leader` ran
+24/24 green and the job failed anyway, because eighteen of the
+twenty-four names I had pinned did not exist. A pin that names
+nothing can never be satisfied, and when it fails it reads exactly
+like a witness that regressed.
+
+`.github/scripts/check-roster.py` makes that class impossible: every
+roster is checked against its SOURCE before the suite runs (`fn
+<name>(` for Rust, a quoted literal for harness witnesses), and the
+by-name log check still runs afterwards. They are complements —
+*pinned but absent from source* is caught up front, *present but did
+not run* is caught after. All four rosters are wired: leaf review
+probes, `wasm_leaf` replays, `wasm_leader` witnesses, browser matrix.
+
+Stale floors went to the real counts in the same commit — leaf native
+150 → 209, `wasm_leaf` 14 → 15, browser 19 → 21 — and the browser
+roster gained the two Stage 5 witnesses that had been running
+ungated. Firefox's log is now uploaded as an artifact: it is a gate,
+so its evidence should not require scrolling a job log.
+
+### 12.1 Owner question: announcement expiry, leaf vs native
+
+**These two rules disagree, and the disagreement is load-bearing.**
+
+| | rule | TTL-zero |
+|---|---|---|
+| leaf `announce.rs:144` | `now_secs <= floor(ts_ns / 1e9) + ttl` | authoritative for the remainder of the issuing second |
+| native `capability.rs:2841` | `age_secs >= ttl` ⇒ expired | expired at age zero |
+
+They are not two spellings of one policy. A TTL-zero announcement is
+an authority on the leaf and already dead natively; at the exact
+boundary second the leaf says fresh and the native side says expired.
+The native rule is deliberate and documented — it matches
+`PermissionToken::is_valid`, so the effective lifetime is exactly
+`ttl_secs`.
+
+Options:
+
+1. **Match native exactly** — nanosecond precision, `age >= ttl`.
+   The reviewer's stated default, and the answer that leaves one
+   rule in the system. Cost: it changes leaf behaviour at the
+   boundary and kills the TTL-zero-within-the-issuing-second case
+   that two leaf tests currently pin, so those move with it.
+2. **Keep the leaf's inclusive rule and document the divergence** as
+   deliberate: the leaf reads a second-granular clock (`clock::
+   now_unix_secs`) where the native side reads nanoseconds, and
+   rounding down an issue stamp then expiring inclusively is the
+   conservative direction under truncation.
+
+We are **not** flipping a comparison operator to make this go away.
+Recommendation: option 1, on the grounds that two expiry rules for
+one announcement type is a defect regardless of which is better.
+Awaiting the owner.
+
+### 12.2 N4's residual source breaks — decided by the owner, and taken
+
+Round 2 restored the id-addressed API beside the fenced one, which
+closed the *behavioural* break. Two **source**-compatibility breaks
+for downstream Rust remained, and calling them additive would have
+been wrong:
+
+- `StreamStats` gained public fields (`tx_bytes_sent`,
+  `max_consumed_seen`), so any downstream struct literal stops
+  compiling. No in-repo consumer constructs one — the Node and
+  Python bindings build their own from ours — but that is our tree,
+  not theirs.
+- `StreamError::SessionSuperseded` is a new variant on an enum that
+  was not `#[non_exhaustive]`, so any downstream exhaustive `match`
+  stops compiling.
+
+**Decision (owner): accept the bounded source break now and
+establish extensibility properly**, rather than paying the same cost
+again at every diagnostic counter and every meaningful new error.
+Both types are now `#[non_exhaustive]`:
+
+- **`StreamError`** — `SessionSuperseded` stays a DISTINCT error;
+  it is not folded into `NotConnected`. The rustdoc states the
+  consumer contract the owner set: handle known cases explicitly and
+  **propagate** unknown ones. A wildcard arm is not permission to
+  retry — `SessionSuperseded` can never succeed on the same handle,
+  so treating an unrecognised variant as retryable turns a terminal
+  condition into a loop.
+- **`StreamStats`** — fields stay public and readable; only
+  outside-crate literal construction closes. It is an evolving
+  diagnostic snapshot, and adding a counter should not repeatedly
+  break downstream construction or exhaustive destructuring.
+- **A stable entry point, deliberately not an all-counters
+  constructor.** `StreamStats::empty()` returns an all-zero snapshot
+  to assign fields on. A constructor taking every counter would
+  merely relocate the next break to the next counter, which is the
+  problem the attribute exists to solve. Its doc says plainly that
+  synthetic snapshots are for tests, fixtures and adapters, and that
+  live statistics come from the stream.
+
+Two corrections the owner made to this section's earlier draft, kept
+here because they were right and the draft was not:
+
+1. **"One break now, none later" was too strong.**
+   `#[non_exhaustive]` prevents future breaks from ADDING fields or
+   variants. It does nothing about removing a field, changing a
+   type, or changing a semantic — all of which remain breaking.
+2. **This does not discharge the release obligation.** Marking an
+   existing public type `#[non_exhaustive]` is itself a breaking
+   change and must be versioned and documented as one. The version
+   bump and release note are the owner's, deliberately not taken
+   here; the API-extension policy and the migration-relevant
+   contract (propagate unknown errors; use `empty()` to construct)
+   are what this commit lands.

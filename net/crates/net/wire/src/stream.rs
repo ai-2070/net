@@ -163,7 +163,16 @@ impl StreamConfig {
 }
 
 /// Errors a `Stream::send` call can surface to the caller.
+///
+/// `#[non_exhaustive]`: a meaningful new failure mode must be able to
+/// arrive without breaking every downstream `match`. That is not a
+/// licence to collapse the cases — handle the ones you know
+/// explicitly and PROPAGATE the rest. A wildcard arm is not
+/// permission to retry: [`Self::SessionSuperseded`] in particular can
+/// never succeed on the same handle, and treating an unrecognised
+/// variant as "retryable" turns a terminal condition into a loop.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamError {
     /// The stream's outbound queue is full. No packets were enqueued.
     /// Caller decides whether to retry, drop, or surface further.
@@ -209,7 +218,14 @@ impl std::error::Error for StreamError {}
 
 /// Per-stream statistics snapshot. Cheap to produce (reads a handful of
 /// atomics) and safe to poll at arbitrary frequency.
-#[derive(Debug, Clone, Copy)]
+///
+/// `#[non_exhaustive]`: this is an evolving DIAGNOSTIC snapshot, and
+/// adding a counter should not break downstream construction or
+/// exhaustive destructuring every time. Fields stay public and
+/// readable; only literal construction from outside the crate is
+/// closed, and [`StreamStats::empty`] is the stable way in.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct StreamStats {
     /// Next TX sequence number. Reflects "how many packets this stream
     /// has enqueued since open" because sequences start at 0.
@@ -262,6 +278,25 @@ pub struct StreamStats {
     /// `tx_bytes_sent`, whereupon the grant clamp refunds window for
     /// data that never arrived.
     pub max_consumed_seen: u64,
+}
+
+impl StreamStats {
+    /// An all-zero snapshot, for building a synthetic one field by
+    /// field.
+    ///
+    /// Deliberately NOT a constructor taking every counter: that
+    /// merely relocates the compatibility break to the next counter
+    /// added, which is the problem `#[non_exhaustive]` is here to
+    /// solve. Assign the fields you mean and leave the rest at zero.
+    ///
+    /// This is for tests, fixtures and adapters that must present a
+    /// stats-shaped value. LIVE statistics come from the stream —
+    /// `MeshNode::stream_stats` / `all_stream_stats` — never from a
+    /// value assembled by hand.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 // The `Stream` **handle** deliberately does NOT live here.
