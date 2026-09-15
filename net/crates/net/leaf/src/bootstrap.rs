@@ -67,7 +67,7 @@ pub const STUN_PROBE_MS: i32 = 2_000;
 /// the issuer signature (the recipient holds no key that could
 /// forge one, which is the point), and the leaf's job is to present
 /// the string unmodified.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credential {
     /// The whole credential string, presented verbatim to
     /// `POST /rtc/offer`.
@@ -87,6 +87,30 @@ pub struct Credential {
     pub bootstrap_url: String,
     /// Unix seconds after which the standing PSK half is dead.
     pub psk_expires_at: u64,
+}
+
+/// Redacting `Debug` (Stage 5 secondary audit).
+///
+/// The derived one printed `encoded` — the whole bearer credential —
+/// and `psk`, the trust domain's pre-shared key, into any error or
+/// trace that formatted a `Credential`. Stage 4b gave `OfferRequest`
+/// and `OfferResponse` the same treatment for the same reason: a
+/// bearer secret has no business in a log line, and the browser's
+/// console is a log line anyone with the page can read.
+impl core::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Credential")
+            .field("encoded", &"<redacted>")
+            .field("psk", &"<redacted>")
+            .field("invite", &self.invite)
+            .field(
+                "anchor_noise_pubkey",
+                &crate::identity::hex_lower(&self.anchor_noise_pubkey),
+            )
+            .field("bootstrap_url", &self.bootstrap_url)
+            .field("psk_expires_at", &self.psk_expires_at)
+            .finish()
+    }
 }
 
 impl Credential {

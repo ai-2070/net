@@ -140,6 +140,8 @@ pub struct LeafCounters {
     ice_direct: Cell<u64>,
     ice_failed: Cell<u64>,
     udp_blocked: Cell<u64>,
+    credit_grants_sent: Cell<u64>,
+    credit_grants_received: Cell<u64>,
 }
 
 impl LeafCounters {
@@ -228,6 +230,38 @@ impl LeafCounters {
         bump(&self.udp_blocked);
     }
 
+    /// One stream-window frame this leaf put on the wire — the
+    /// credit and cumulative ack a sender's window is replenished
+    /// and pruned by.
+    ///
+    /// Counted because "the transfer finished" is not evidence of
+    /// replenishment on its own: a window-sized transfer completes
+    /// on the implicit initial credit alone. Traffic past the window
+    /// plus a non-zero count here is.
+    #[inline]
+    pub fn credit_grant_sent(&self) {
+        bump(&self.credit_grants_sent);
+    }
+
+    /// One stream-window frame this leaf applied from its peer —
+    /// the replenishment its own send window is spending.
+    #[inline]
+    pub fn credit_grant_received(&self) {
+        bump(&self.credit_grants_received);
+    }
+
+    /// Stream-window frames emitted.
+    #[inline]
+    pub fn credit_grants_sent(&self) -> u64 {
+        self.credit_grants_sent.get()
+    }
+
+    /// Stream-window frames applied.
+    #[inline]
+    pub fn credit_grants_received(&self) -> u64 {
+        self.credit_grants_received.get()
+    }
+
     /// Every counter as a JSON object. u64s are decimal **strings**:
     /// these are counters a page may render, and `JSON.parse` rounds
     /// integers above 2^53.
@@ -247,6 +281,14 @@ impl LeafCounters {
         out.push_str(&format!(",\"ice_direct\":\"{}\"", self.ice_direct.get()));
         out.push_str(&format!(",\"ice_failed\":\"{}\"", self.ice_failed.get()));
         out.push_str(&format!(",\"udp_blocked\":\"{}\"", self.udp_blocked.get()));
+        out.push_str(&format!(
+            ",\"credit_grants_sent\":\"{}\"",
+            self.credit_grants_sent.get()
+        ));
+        out.push_str(&format!(
+            ",\"credit_grants_received\":\"{}\"",
+            self.credit_grants_received.get()
+        ));
         out.push_str(",\"drops\":{");
         for (i, reason) in DropReason::ALL.iter().enumerate() {
             if i > 0 {

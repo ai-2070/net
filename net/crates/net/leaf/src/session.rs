@@ -601,6 +601,31 @@ impl LeafSession {
         })
     }
 
+    /// The cumulative acknowledgement this session owes `stream_id`
+    /// right now, without recording any consumption.
+    ///
+    /// A reliable packet the reliability layer refuses is a
+    /// **retransmit**, and a retransmit is the peer saying it never
+    /// heard the ack for what it already delivered. Its bytes are
+    /// not progress — they were credited when the original arrived,
+    /// and crediting them again would refund the sender a window it
+    /// never spent — so nothing is consumed here. What is owed is
+    /// the ack, repeated.
+    ///
+    /// `None` for a stream that does not exist or is not reliable:
+    /// fire-and-forget has no cumulative ack to repeat.
+    pub fn repeat_ack(&self, stream_id: u64) -> Option<StreamWindow> {
+        let stream = self.session.try_stream(stream_id)?;
+        if !stream.reliable_mode() {
+            return None;
+        }
+        Some(StreamWindow {
+            stream_id,
+            total_consumed: stream.rx_credit().consumed(),
+            ack_seq: stream.with_reliability(|r| r.rx_ack_seq()),
+        })
+    }
+
     /// Apply a peer's cumulative ack: prune the retransmit window
     /// and the stamps that belong to it.
     pub fn apply_ack(&self, stream_id: u64, ack_seq: u64) {

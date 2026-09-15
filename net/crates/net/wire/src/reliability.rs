@@ -139,6 +139,15 @@ pub trait ReliabilityMode: Send + Sync {
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
 
+    /// Receiver-side: forget everything tracked about what the peer
+    /// has sent on this stream, leaving the send half untouched.
+    ///
+    /// Called when the peer resets the stream: the gap it gave up on
+    /// will never be filled, and it may reopen the id from sequence
+    /// 0, which a stale `next_expected` would reject as a duplicate.
+    /// Default no-op (fire-and-forget tracks no receive state).
+    fn reset_rx(&mut self) {}
+
     /// Get the name of this reliability mode
     fn name(&self) -> &'static str;
 }
@@ -1095,6 +1104,14 @@ impl ReliabilityMode for ReliableStream {
     #[inline]
     fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// Only the receive half: `pending`, the RTO/cwnd estimators and
+    /// the give-up flag all describe what WE sent, and the peer's
+    /// reset says nothing about that.
+    fn reset_rx(&mut self) {
+        self.next_expected = 0;
+        self.received_ranges.clear();
     }
 
     #[inline]

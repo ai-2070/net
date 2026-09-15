@@ -131,13 +131,21 @@ impl Inner {
         Ok(())
     }
 
-    /// Hand every queued datagram to the node, push everything the
-    /// node produced to the transport, and fire the listeners.
+    /// Deliver everything that has arrived: hand each queued
+    /// datagram to the node, push everything the node produced to
+    /// the transport, and fire the listeners.
     ///
-    /// A closed node pumps nothing. The ticker's own check is not
+    /// This is the arrival path, and it runs **without** the
+    /// periodic sweep: what an inbound packet owes its sender is an
+    /// acknowledgement, and that has to leave now, not on the next
+    /// tick (see the inbound sink for the RTO arithmetic). Sweeping
+    /// per packet would also make retransmit and deadline work
+    /// proportional to inbound traffic rather than to time.
+    ///
+    /// A closed node delivers nothing. The ticker's own check is not
     /// enough on its own: an operation that resumes after a
     /// stand-down pumps too, and this is the line that stops it.
-    fn pump(&mut self) {
+    fn deliver(&mut self) {
         if self.closed {
             return;
         }
@@ -151,7 +159,23 @@ impl Inner {
             }
             self.node.on_datagram(peer, bytes, now);
         }
-        self.node.tick(now);
+        self.flush();
+    }
+
+    /// Deliver, then run the node's time-driven work: retransmit
+    /// timers, call deadlines, reassembly expiry.
+    fn pump(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.deliver();
+        self.node.tick(clock::now());
+        self.flush();
+    }
+
+    /// Put everything the node queued on the wire and hand the
+    /// application everything it produced.
+    fn flush(&mut self) {
         for out in self.node.take_outbound() {
             if let Err(e) = self.transport.send(out.peer, out.packet) {
                 // Admission refusal. Typed, surfaced, and the
@@ -229,13 +253,28 @@ impl LeafNode {
             closed: false,
         }));
 
-        // The inbound sink queues; the pump drains. A `Weak` so the
-        // closure cannot keep a closed node alive.
+        // The inbound sink queues **and delivers**. A `Weak` so the
+        // closure cannot keep a closed node alive; a `try_borrow_mut`
+        // so a datagram that arrives while the pump already holds
+        // the node is left for the pump that is running.
+        //
+        // **Delivery cannot wait for the tick.** Queueing alone put
+        // up to `TICK_MS` between a packet arriving and the
+        // acknowledgement it owes going out, and a native sender's
+        // initial RTO is `ReliableStream::DEFAULT_RTO` — 50 ms, the
+        // same order. Every reply then timed out before its ack
+        // could physically arrive: the sender took each spurious
+        // timeout as congestion, collapsed its window to `MIN_CWND`,
+        // burned `DEFAULT_MAX_RETRIES` on packets the leaf already
+        // held, and stalled the stream. Measured round trip was
+        // ~62 ms against a 50 ms RTO. Arrival is the only moment at
+        // which the leaf can answer in time.
         let weak: Weak<RefCell<Inner>> = Rc::downgrade(&inner);
         let sink: crate::rtc::InboundSink = Rc::new(move |peer, bytes| {
             if let Some(inner) = weak.upgrade() {
                 if let Ok(mut inner) = inner.try_borrow_mut() {
                     inner.inbox.push_back((peer, bytes));
+                    inner.deliver();
                 }
             }
         });
@@ -419,7 +458,7 @@ impl LeafNode {
     /// in `0..=65535`) are used verbatim when present, so a stream
     /// can match a publish contract a native handler dispatches on.
     ///
-    /// Both are read by [`stream_options`], which
+    /// Both are read by `stream_options`, which
     /// [`crate::leader_session::MeshSession::open_stream`] also
     /// calls: the direct and the proxied surface cannot read the
     /// same option object two ways.

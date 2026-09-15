@@ -28093,6 +28093,40 @@ impl MeshNode {
             Err(_) => return,
         };
 
+        // **One stream, one sequence space.** A peer allocates every
+        // sequence on a stream from that stream's single counter,
+        // whatever subprotocol the frame carries: a browser leaf's
+        // channel `Subscribe` rides the channel's own publish stream
+        // id (`leaf::node::subscribe`), reliably, and an nRPC REQUEST
+        // on the same channel takes the next sequence after it.
+        //
+        // Every control-subprotocol arm below returns before the
+        // event-plane accounting at the foot of this function, so
+        // pre-fix such a frame was never recorded and never
+        // acknowledged. Its sender saw no ack, retransmitted to
+        // exhaustion and RESET the stream — on a leaf that killed the
+        // very stream the anchor publishes its RPC replies on — and
+        // the unrecorded sequence left a permanent hole below
+        // `next_expected`, so no later event on that stream could
+        // advance the cumulative ack either.
+        //
+        // `CONTROL_STREAM_ID` is excluded: those frames carry the
+        // session's own control-sequence counter
+        // (`NetSession::next_control_tx_seq`), not a stream's, and no
+        // sender tracks them for retransmit.
+        if parsed.header.subprotocol_id != 0
+            && parsed.header.stream_id != CONTROL_STREAM_ID
+            && !parsed.header.flags.is_handshake()
+            && !Self::account_inbound_stream_packet(
+                &parsed,
+                (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64,
+                session,
+                ctx,
+            )
+        {
+            return;
+        }
+
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
             // **R1-A: migration is a local effect too.** The
@@ -28436,7 +28470,12 @@ impl MeshNode {
         // Stream reset (STREAM_RETRANSMIT H-3): the sender gave up
         // retransmitting this stream. Fail any pending blob-transfer read
         // on it now (distinct error) instead of waiting for the caller's
-        // timeout, and drop the local receive-stream state.
+        // timeout, and drop the local receive-stream state — ONLY the
+        // receive state. A stream id is one bidirectional conversation,
+        // so the pre-fix `close_stream` let a peer's reset destroy what
+        // WE send on that id: `tx_seq` restarted at 0 mid-conversation
+        // and the grant quarantine then dropped the peer's acks for it.
+        // See `NetSession::reset_rx_stream`.
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_RESET {
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
@@ -28449,7 +28488,7 @@ impl MeshNode {
                         engine.on_reset(reset.stream_id);
                     }
                 }
-                session.close_stream(reset.stream_id);
+                session.reset_rx_stream(reset.stream_id);
             }
             return;
         }
@@ -29224,84 +29263,17 @@ impl MeshNode {
             }
         }
 
-        // Credit-window bookkeeping: charge only *accepted* inbound
-        // bytes against the stream's RxCreditState. `on_receive`
-        // returns `false` for duplicates (already-acked sequences)
-        // and for sequences past the Reliable receive window —
-        // crediting those would refund send credit for
-        // retransmissions / replays, letting a chatty peer inflate
-        // `tx_credit_remaining` past what it actually pushed through
-        // the protocol. Accounting runs at receive time (not drain
-        // time); this closes the v1 gap where a single serial sender
-        // ran `Transport(io::Error)` into a full kernel buffer. A
-        // separately slow daemon is still backstopped by the
-        // existing shard-queue-depth limits.
-        let grant_bytes = {
-            // Create the receive-side stream reliable when the packet is
-            // RELIABLE-flagged, so it tracks SACK and can NACK lost
-            // sequences. The sender's reliability is a property of the
-            // traffic (the flag), not the receiver's default_reliable.
-            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
-            // R3: a provisional sender's stream allocation is
-            // reserved BEFORE it happens — the two-stream and
-            // 64 KiB rules were declared constants that nothing
-            // checked, so arbitrary receive streams could be
-            // created pre-enrollment.
-            #[cfg(feature = "webrtc")]
-            if !Self::charge_provisional_stream(
-                &parsed.source,
-                stream_id,
-                payload_bytes as u64,
-                session,
-                ctx,
-            ) {
-                return;
-            }
-            let stream = session
-                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
-            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
-            if accepted {
-                stream.update_rx_seq(parsed.header.sequence);
-                stream.on_bytes_consumed(payload_bytes)
-            } else {
-                None
-            }
-        };
-
-        if let Some(total_consumed) = grant_bytes {
-            // Resolve the sending peer.
-            //
-            // PERF_AUDIT §2.8 — see `Self::resolve_grant_peer`:
-            // tier-1 cached-node-id load (session-id cross-checked),
-            // `addr_to_node` second tier, O(peers) scan last resort,
-            // and the fallback publishes the cache so subsequent
-            // packets take tier 1.
-            let peer = Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session);
-            if let Some((peer_addr, peer_session)) = peer {
-                if !ctx.partition_filter.contains(&peer_addr) {
-                    // Enqueue for the per-mesh drainer
-                    // (`spawn_stream_grant_drainer_loop`). Same-key
-                    // overwrites — the latest `total_consumed` wins
-                    // because grants are authoritative. Single
-                    // `Notify::notify_one` after the insert wakes
-                    // the drainer if it's currently sleeping;
-                    // sticky-permit semantics make a wake during an
-                    // in-flight drain safe (drainer will see the
-                    // new entry on its next cycle).
-                    {
-                        let mut guard = ctx.pending_stream_grants.lock();
-                        guard.insert(
-                            (peer_session.session_id(), stream_id),
-                            PendingStreamGrant {
-                                session: peer_session,
-                                peer_addr,
-                                total_consumed,
-                            },
-                        );
-                    }
-                    ctx.pending_stream_grants_notify.notify_one();
-                }
-            }
+        // Credit-window bookkeeping and the ack this receiver owes
+        // the sender — see `account_inbound_stream_packet`. This is
+        // the event plane's turn: every other subprotocol was
+        // accounted at the top of this function ("one stream, one
+        // sequence space"), and an unrecognised subprotocol id falls
+        // through to here, so the guard keeps a packet from being
+        // charged twice.
+        if parsed.header.subprotocol_id == 0
+            && !Self::account_inbound_stream_packet(&parsed, payload_bytes, session, ctx)
+        {
+            return;
         }
 
         // **Leaf fragments become one event here (Stage 5 R4).**
@@ -29647,6 +29619,117 @@ impl MeshNode {
             let _ = write!(event_id, "{}:{}", seq, i);
             queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
         }
+    }
+
+    /// Record one inbound packet against **its stream's** receive
+    /// state and enqueue the `StreamWindow` its sender is owed.
+    ///
+    /// Returns `false` when a provisional sender's stream allocation
+    /// was refused (R3) — the caller must drop the frame before any
+    /// further receive state exists.
+    ///
+    /// Two properties this centralises, both of which a stream's
+    /// *sender* depends on to make progress:
+    ///
+    /// - **Credit.** Only *accepted* bytes are charged. `on_receive`
+    ///   returns `false` for duplicates and for sequences past the
+    ///   reliable receive window; crediting those would refund send
+    ///   credit for retransmissions, letting a chatty peer inflate
+    ///   `tx_credit_remaining` past what it pushed through the
+    ///   protocol. Accounting runs at receive time (not drain time):
+    ///   the credit window protects the kernel buffer, and the
+    ///   application-side backstop is the shard queue depth.
+    /// - **The ack.** The same `StreamWindow` carries `ack_seq`, the
+    ///   cumulative acknowledgement the sender's retransmit window
+    ///   prunes against. A *duplicate* therefore still enqueues a
+    ///   grant: a retransmit is the peer saying it never heard the
+    ///   ack for what it already delivered, so what is owed is the
+    ///   ack, repeated. Staying silent would leave the sender to
+    ///   exhaust its retries and reset a stream that arrived intact.
+    ///   No bytes are consumed on that path, so the credit half is
+    ///   unchanged.
+    fn account_inbound_stream_packet(
+        parsed: &ParsedPacket,
+        payload_bytes: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) -> bool {
+        let stream_id = parsed.header.stream_id;
+        let total_consumed = {
+            // Create the receive-side stream reliable when the packet is
+            // RELIABLE-flagged, so it tracks SACK and can NACK lost
+            // sequences. The sender's reliability is a property of the
+            // traffic (the flag), not the receiver's default_reliable.
+            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            // R3: a provisional sender's stream allocation is
+            // reserved BEFORE it happens — the two-stream and
+            // 64 KiB rules were declared constants that nothing
+            // checked, so arbitrary receive streams could be
+            // created pre-enrollment.
+            #[cfg(feature = "webrtc")]
+            if !Self::charge_provisional_stream(
+                &parsed.source,
+                stream_id,
+                payload_bytes,
+                session,
+                ctx,
+            ) {
+                return false;
+            }
+            let stream = session
+                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
+            if stream.with_reliability(|r| r.on_receive(parsed.header.sequence)) {
+                stream.update_rx_seq(parsed.header.sequence);
+                stream.on_bytes_consumed(payload_bytes)
+            } else if stream.reliable_mode() && stream.rx_credit().window_bytes() != 0 {
+                // Refused sequence on a reliable stream: nothing is
+                // consumed, but the ack is owed again.
+                Some(stream.rx_credit().consumed())
+            } else {
+                None
+            }
+        };
+
+        let Some(total_consumed) = total_consumed else {
+            return true;
+        };
+        // Resolve the sending peer.
+        //
+        // PERF_AUDIT §2.8 — see `Self::resolve_grant_peer`:
+        // tier-1 cached-node-id load (session-id cross-checked),
+        // `addr_to_node` second tier, O(peers) scan last resort,
+        // and the fallback publishes the cache so subsequent
+        // packets take tier 1.
+        let Some((peer_addr, peer_session)) =
+            Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session)
+        else {
+            return true;
+        };
+        if ctx.partition_filter.contains(&peer_addr) {
+            return true;
+        }
+        // Enqueue for the per-mesh drainer
+        // (`spawn_stream_grant_drainer_loop`). Same-key
+        // overwrites — the latest `total_consumed` wins
+        // because grants are authoritative. Single
+        // `Notify::notify_one` after the insert wakes
+        // the drainer if it's currently sleeping;
+        // sticky-permit semantics make a wake during an
+        // in-flight drain safe (drainer will see the
+        // new entry on its next cycle).
+        {
+            let mut guard = ctx.pending_stream_grants.lock();
+            guard.insert(
+                (peer_session.session_id(), stream_id),
+                PendingStreamGrant {
+                    session: peer_session,
+                    peer_addr,
+                    total_consumed,
+                },
+            );
+        }
+        ctx.pending_stream_grants_notify.notify_one();
+        true
     }
 
     /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):

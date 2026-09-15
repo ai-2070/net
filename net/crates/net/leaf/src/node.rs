@@ -243,9 +243,16 @@ pub struct LeafNode {
     /// What this leaf has registered each `(peer, stream id)` as.
     stream_kinds: HashMap<(NodeId, u64), StreamKind>,
     /// `(incarnation, stream id)` → the receiver's cumulative
-    /// consumed-byte count as of the last grant this leaf sent, so
-    /// grants are emitted on a threshold rather than per packet.
+    /// consumed-byte count as of the last stream-window frame this
+    /// leaf sent, so *credit* is granted on a volume threshold
+    /// rather than per packet.
     grants_sent: HashMap<(u64, u64), u64>,
+    /// `(incarnation, stream id)` → the cumulative ack the last
+    /// stream-window frame carried. The peer's retransmit window
+    /// prunes against this number, and it is not a volume — see
+    /// [`LeafNode::maybe_grant`] for why it cannot share the
+    /// credit cadence.
+    acks_sent: HashMap<(u64, u64), u64>,
     announcements: AnnouncementStore,
     seen_signals: SeenSignals,
     counters: LeafCounters,
@@ -294,6 +301,7 @@ impl LeafNode {
             calls: CallTable::with_seed(call_id_seed),
             stream_kinds: HashMap::new(),
             grants_sent: HashMap::new(),
+            acks_sent: HashMap::new(),
             announcements: AnnouncementStore::new(),
             seen_signals: SeenSignals::new(),
             counters: LeafCounters::new(),
@@ -455,6 +463,7 @@ impl LeafNode {
     fn retire_incarnation(&mut self, incarnation: u64) {
         self.rx_streams.retain(|(i, _), _| *i != incarnation);
         self.grants_sent.retain(|(i, _), _| *i != incarnation);
+        self.acks_sent.retain(|(i, _), _| *i != incarnation);
         self.reassembler.retire(incarnation);
         self.calls.fail_incarnation(incarnation);
     }
@@ -1015,21 +1024,34 @@ impl LeafNode {
         let incarnation = session.incarnation();
         let subprotocol_id = opened.subprotocol_id;
 
-        // **Return the credit this packet consumed.** Sharing a
+        // **Feed the credit and acknowledgement loop.** Sharing a
         // `NetSession` does not advance its receive state; a leaf
         // that never did this let a native sender's window drain to
         // nothing on a loss-free DataChannel. The stream-control
         // subprotocols are exempt: crediting the credit loop would
         // be circular.
         if !crate::session::is_stream_control(subprotocol_id) {
-            let grant = session.note_received(
+            let owed = match session.note_received(
                 opened.stream_id,
                 opened.reliable,
                 opened.sequence,
                 event_frame_bytes(&opened.events),
-            );
-            if let Some(grant) = grant {
-                self.maybe_grant(peer, incarnation, grant);
+            ) {
+                Some(grant) => Some((grant, false)),
+                // The reliability layer refused the sequence, so
+                // this is a retransmit — the peer telling us our
+                // ack never reached it. Repeat it unconditionally:
+                // the cadence that was throttling it is exactly
+                // what is not working.
+                None if opened.reliable => {
+                    session.repeat_ack(opened.stream_id).map(|ack| (ack, true))
+                }
+                None => None,
+            };
+            match owed {
+                Some((frame, true)) => self.send_stream_window(peer, incarnation, frame),
+                Some((frame, false)) => self.maybe_grant(peer, incarnation, frame),
+                None => {}
             }
         }
 
@@ -1102,7 +1124,6 @@ impl LeafNode {
         } else {
             records
         };
-
         for record in delivered {
             for payload in record.payloads.clone() {
                 self.handle_event(peer, subprotocol_id, &record, payload, now);
@@ -1110,30 +1131,64 @@ impl LeafNode {
         }
     }
 
-    /// Queue a credit grant for `peer` when enough has been consumed
-    /// since the last one.
+    /// Queue the stream-window frame `peer` is owed for what just
+    /// arrived, when either half of it has something new to say.
     ///
-    /// One grant per inbound packet is what the wire's receive
-    /// accounting offers, and it would double this leaf's packet
-    /// count. Half a window is the cadence: the sender still has the
-    /// other half in hand when the grant is minted, so sustained
-    /// traffic never stalls, and a stream that went quiet gets its
-    /// outstanding grant flushed by the next one either way — grants
-    /// are authoritative and self-healing.
+    /// One frame carries two independent facts, and they do **not**
+    /// share a cadence.
+    ///
+    /// * `total_consumed` is **credit**. Credit is a volume, and one
+    ///   grant per inbound packet — what the wire's receive
+    ///   accounting offers — would double this leaf's packet count
+    ///   for no gain. Half a window is the cadence: the sender still
+    ///   has the other half in hand when the grant is minted, so
+    ///   sustained traffic never stalls, and grants are
+    ///   authoritative, so a skipped one is subsumed by the next.
+    ///
+    /// * `ack_seq` is the **cumulative acknowledgement**, and it is
+    ///   not a volume. The peer's retransmit window prunes against
+    ///   it and its congestion window is capped by what is still
+    ///   unacked: a native sender collapses that window to
+    ///   `MIN_CWND` the first time a packet's RTO elapses unacked
+    ///   and retires the packet after `DEFAULT_MAX_RETRIES`
+    ///   elapses, resetting the stream. nRPC bodies are ~100 bytes,
+    ///   so a leaf that only spoke every half window (32 KiB) never
+    ///   acknowledged at all — the anchor's reply stream stalled one
+    ///   RTO into a conversation and its `serve_rpc` publish began
+    ///   failing with backpressure. An advance of the ack position
+    ///   therefore goes out at once.
+    ///
+    /// A fire-and-forget stream has no cumulative ack (`ack_seq`
+    /// stays 0), so its frames keep the volume cadence exactly.
     fn maybe_grant(&mut self, peer: NodeId, incarnation: u64, grant: StreamWindow) {
         let key = (incarnation, grant.stream_id);
-        let last = self.grants_sent.get(&key).copied().unwrap_or(0);
-        let threshold = self
-            .sessions
-            .get(peer)
-            .and_then(|s| s.wire().try_stream(grant.stream_id))
-            .map(|s| u64::from(s.rx_credit().window_bytes()) / 2)
-            .unwrap_or(0)
-            .max(1);
-        if grant.total_consumed.saturating_sub(last) < threshold {
-            return;
+        let acknowledged = self.acks_sent.get(&key).copied().unwrap_or(0);
+        if grant.ack_seq <= acknowledged {
+            let last = self.grants_sent.get(&key).copied().unwrap_or(0);
+            let threshold = self
+                .sessions
+                .get(peer)
+                .and_then(|s| s.wire().try_stream(grant.stream_id))
+                .map(|s| u64::from(s.rx_credit().window_bytes()) / 2)
+                .unwrap_or(0)
+                .max(1);
+            if grant.total_consumed.saturating_sub(last) < threshold {
+                return;
+            }
         }
-        let payload = grant.encode();
+        self.send_stream_window(peer, incarnation, grant);
+    }
+
+    /// Put one stream-window frame on the wire and record both
+    /// watermarks it just made the peer's knowledge.
+    ///
+    /// The frame rides the control stream unreliably: it is
+    /// authoritative (it carries the receiver's whole picture, not a
+    /// delta), so the next one repairs a lost one, and retaining a
+    /// retransmit descriptor for an ack would put the credit loop
+    /// inside the machinery it exists to unblock.
+    fn send_stream_window(&mut self, peer: NodeId, incarnation: u64, frame: StreamWindow) {
+        let payload = frame.encode();
         if self
             .send_subprotocol(
                 peer,
@@ -1145,7 +1200,10 @@ impl LeafNode {
             )
             .is_ok()
         {
-            self.grants_sent.insert(key, grant.total_consumed);
+            self.counters.credit_grant_sent();
+            let key = (incarnation, frame.stream_id);
+            self.grants_sent.insert(key, frame.total_consumed);
+            self.acks_sent.insert(key, frame.ack_seq);
         }
     }
 
@@ -1178,6 +1236,7 @@ impl LeafNode {
             // them what arrives and puts what they produce on the
             // wire.
             Decoded::StreamWindow(grant) => {
+                self.counters.credit_grant_received();
                 let Some(session) = self.sessions.get(peer) else {
                     return;
                 };

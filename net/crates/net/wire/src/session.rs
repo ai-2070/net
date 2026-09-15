@@ -490,7 +490,7 @@ impl NetSession {
     /// catches a close+reopen *within* one session; the session id
     /// catches a handle minted against a session that has since been
     /// replaced — whose first stream reuses epoch 1 and would
-    /// otherwise admit here (see [`Self::next_stream_epoch`]).
+    /// otherwise admit here (see `next_stream_epoch`, private).
     ///
     /// Use from the typed-handle `send_on_stream` path.
     pub fn try_acquire_tx_credit_for_lifetime(
@@ -827,6 +827,34 @@ impl NetSession {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
             self.recently_closed.insert(stream_id, SystemClock::now());
+        }
+    }
+
+    /// Drop the **receive** half of a stream the peer has given up
+    /// sending on (a `StreamReset`), leaving everything this side
+    /// sends on that id untouched.
+    ///
+    /// A stream id names one bidirectional conversation: the same
+    /// [`StreamState`] holds the sequence counter and retransmit
+    /// window for what we send AND the receive tracking for what the
+    /// peer sends. A reset is a statement about the peer's outbound
+    /// half only, so answering it with [`Self::close_stream`] let a
+    /// peer destroy our send state — restarting `tx_seq` at 0 mid-
+    /// conversation (every later packet then looks like a duplicate
+    /// to the peer) and quarantining the very grants that would have
+    /// credited it.
+    ///
+    /// Resetting the receive tracking is what the reset is *for*: the
+    /// gap will never be filled, and the peer may reopen the id from
+    /// sequence 0. The receive-credit ledger stays as it is —
+    /// cumulative-consumed is monotonic by contract, and a reopened
+    /// sender clamps our grants to its own send watermark.
+    ///
+    /// Idempotent; a no-op for a stream that does not exist.
+    pub fn reset_rx_stream(&self, stream_id: u64) {
+        if let Some(state) = self.streams.get(&stream_id) {
+            state.reset_rx_seq();
+            state.with_reliability(|r| r.reset_rx());
         }
     }
 
@@ -1717,6 +1745,16 @@ impl StreamState {
     #[inline]
     pub fn current_rx_seq(&self) -> u64 {
         self.rx_seq.load(Ordering::Relaxed)
+    }
+
+    /// Forget the highest received sequence, so a peer that reopens
+    /// this stream id from 0 is not measured against the previous
+    /// lifetime's high-water mark. Send-side state is untouched —
+    /// see [`NetSession::reset_rx_stream`].
+    #[inline]
+    pub fn reset_rx_seq(&self) {
+        self.touch();
+        self.rx_seq.store(0, Ordering::Relaxed);
     }
 
     /// Access the reliability mode

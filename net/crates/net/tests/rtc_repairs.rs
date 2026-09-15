@@ -17,8 +17,8 @@ use net::adapter::net::rtc::{
     connect_rtc_loopback, open_rtc_channel, RtcConfig, RtcPeerId, RtcSubmitError,
 };
 use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, Reliability, SocketBufferConfig,
-    StreamConfig, StreamError,
+    ChannelName, EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, Reliability,
+    SocketBufferConfig, StreamConfig, StreamError,
 };
 use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
@@ -1928,5 +1928,236 @@ async fn a_busy_peer_cannot_starve_a_sibling_or_the_socket() {
         elapsed < Duration::from_secs(5),
         "under a bounded per-peer quantum the sibling is served while the busy \
          peer's backlog stands; took {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------
+// S5 — one stream, one sequence space (the ack the sender prunes on)
+// ---------------------------------------------------------------
+
+/// A plain-UDP pair. The two witnesses below are about the stream
+/// protocol itself, not about WebRTC: the defect they pin was FOUND
+/// through a browser leaf but lives entirely in the core's receive
+/// path, and a UDP pair says so without a DataChannel in the way.
+async fn udp_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+    let a = node(None).await;
+    let b = node(None).await;
+    let a_id = a.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_accept = Arc::clone(&b);
+    let accept = tokio::spawn(async move { b_accept.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b.node_id())
+        .await
+        .expect("connect");
+    accept.await.expect("accept task").expect("accept");
+    a.start();
+    b.start();
+    (a, b)
+}
+
+/// **One stream, one sequence space.** A control-subprotocol frame
+/// takes its sequence from the stream it is addressed to, so the
+/// receiver has to record and acknowledge it exactly like an
+/// event-plane packet on that stream.
+///
+/// Pre-fix every control arm of `process_local_packet` returned
+/// before the event-plane accounting at the foot of that function,
+/// so such a frame was never recorded. Two things broke at once: its
+/// sender never saw an ack for it, and the skipped sequence left a
+/// hole below the receiver's `next_expected` that no later packet
+/// could fill — so the cumulative ack froze, the sender's retransmit
+/// window never pruned, the RTO sweep resent the acknowledged
+/// prefix, and the give-up (H-3) reset the stream. A browser leaf
+/// hit this on every call: its channel `Subscribe` rides the
+/// channel's own publish stream id, and the reset it eventually sent
+/// tore down the very stream the anchor publishes RPC replies on.
+///
+/// This is that collision with no browser in it:
+/// `send_subprotocol_to_node` — the production path under
+/// `subscribe_channel` — addresses its frame to
+/// `stream_id == subprotocol_id`, so a reliable stream opened at
+/// that id shares one sequence space with it. The link is loss-free,
+/// so every retransmit counted here is a retransmit of a packet the
+/// receiver already has.
+///
+/// Inverse: delete the `account_inbound_stream_packet` call above
+/// the subprotocol branches in `process_local_packet`. B stops
+/// recording the membership frame's sequence, A's window stalls on
+/// it, and both the retransmit and the reset assertions go red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_frame_shares_the_sequence_space_of_the_stream_it_rides() {
+    let (a, b) = udp_pair().await;
+    let b_id = b.node_id();
+    // The stream the membership frame is addressed to.
+    const SHARED: u64 = net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
+
+    // Reliable FIRST: `open_stream` on an id that already has state
+    // keeps the existing mode, and the membership frame would have
+    // created it fire-and-forget.
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let stream = a.open_stream(b_id, SHARED, cfg).expect("open_stream");
+
+    const N: usize = 8;
+    let payloads = tagged_payloads(b"S5SEQ", N);
+
+    // One payload, then the control frame, then the rest: the hole
+    // the receiver used to leave sits in the MIDDLE of the stream,
+    // where a cumulative ack cannot step over it.
+    a.send_with_retry(&stream, std::slice::from_ref(&payloads[0]), 16)
+        .await
+        .expect("first payload");
+    // A real round trip: `subscribe_channel` resolves only when B
+    // has answered with a membership Ack, so the frame provably
+    // reached B and was processed — a stall after this cannot be
+    // blamed on a dropped datagram.
+    a.subscribe_channel(b_id, ChannelName::new("s5.seqspace").expect("channel"))
+        .await
+        .expect("subscribe_channel");
+    for payload in &payloads[1..] {
+        a.send_with_retry(&stream, std::slice::from_ref(payload), 16)
+            .await
+            .expect("payload");
+    }
+
+    let seen = collect_tagged(&b, b"S5SEQ", N, Duration::from_secs(10)).await;
+    let distinct: HashSet<&Vec<u8>> = seen.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        N,
+        "every payload must arrive: {} distinct of {N} ({} deliveries)",
+        distinct.len(),
+        seen.len()
+    );
+
+    // Past the give-up horizon: DEFAULT_RTO is 50 ms and the window
+    // is retried DEFAULT_MAX_RETRIES times, so anything still
+    // unacknowledged has resent several times and then reset the
+    // stream by now. A silent sender here IS an emptied retransmit
+    // window — that is the only way for the RTO sweep to have
+    // nothing to do.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let retransmits = a
+        .control_plane_stats()
+        .retransmit_packets_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        retransmits, 0,
+        "on a loss-free link every packet is acknowledged, so the retransmit \
+         window drains and the RTO sweep has nothing to resend \
+         (retransmit_packets_sent = {retransmits})"
+    );
+    let resets = a
+        .control_plane_stats()
+        .reset_packets_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        resets, 0,
+        "a stream whose every packet arrived must never be given up on \
+         (reset_packets_sent = {resets})"
+    );
+    // And the stream is still the one it was: no close, no reopen.
+    let stats = a.stream_stats(b_id, SHARED).expect("stream stats");
+    assert_eq!(
+        stats.tx_seq,
+        N as u64 + 1,
+        "the membership frame and the {N} payloads share one sequence \
+         counter, so the stream has issued {} sequences",
+        N + 1
+    );
+}
+
+/// A `StreamReset` names the **sender's** outbound half of a stream.
+///
+/// Pre-fix the receiver answered one with `close_stream`, which
+/// removes the whole `StreamState` — including what WE send on that
+/// id, because a stream id names one bidirectional conversation.
+/// `tx_seq` restarted at 0 mid-conversation, so every later packet
+/// looked like a duplicate to the peer's dedup and was discarded,
+/// and the grant quarantine then dropped the peer's acks for the
+/// stream too: a peer could kill our send side by giving up on its
+/// own.
+///
+/// Inverse: put `session.close_stream(reset.stream_id)` back in the
+/// `SUBPROTOCOL_STREAM_RESET` arm — the post-reset payload never
+/// reaches B and `tx_seq` reads 1 instead of 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peers_stream_reset_leaves_our_send_side_alone() {
+    let (a, b) = udp_pair().await;
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    const SID: u64 = 0x0051_A5E7;
+
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    let stream = a.open_stream(b_id, SID, cfg).expect("open_stream");
+
+    let before = Bytes::from_static(b"S5RSTbefore");
+    a.send_with_retry(&stream, std::slice::from_ref(&before), 16)
+        .await
+        .expect("pre-reset payload");
+    assert!(
+        !collect_tagged(&b, b"S5RST", 1, Duration::from_secs(10))
+            .await
+            .is_empty(),
+        "precondition: the stream works before the reset"
+    );
+
+    // B sends on the same id, so A has receive state to lose: after
+    // two packets A's `rx_seq` reads 1, and the reset is what puts
+    // it back to 0. That transition is how this witness knows the
+    // reset was PROCESSED before the send below — and it is the
+    // reset doing its actual job, dropping the receive half.
+    let b_stream = b.open_stream(a_id, SID, cfg).expect("B's half");
+    for payload in tagged_payloads(b"S5RSTb", 2) {
+        b.send_with_retry(&b_stream, std::slice::from_ref(&payload), 16)
+            .await
+            .expect("B's payload");
+    }
+    assert!(
+        wait_for(
+            || a.stream_stats(b_id, SID).is_some_and(|s| s.rx_seq == 1),
+            Duration::from_secs(10),
+        )
+        .await,
+        "precondition: A must have receive state on the stream before the reset"
+    );
+
+    // B gives up on ITS half of the stream.
+    b.send_subprotocol_to_node(
+        a_id,
+        net_wire::stream_window::SUBPROTOCOL_STREAM_RESET,
+        &net_wire::stream_window::StreamReset { stream_id: SID }.encode(),
+    )
+    .await
+    .expect("reset to A");
+    assert!(
+        wait_for(
+            || a.stream_stats(b_id, SID).is_some_and(|s| s.rx_seq == 0),
+            Duration::from_secs(10),
+        )
+        .await,
+        "A must apply the reset to its RECEIVE half and keep the stream: \
+         pre-fix the whole state was removed, so this reads None forever"
+    );
+
+    let after = Bytes::from_static(b"S5RSTafter");
+    a.send_with_retry(&stream, std::slice::from_ref(&after), 16)
+        .await
+        .expect("A's send side survives a peer's reset");
+    // `before` was already drained above, so one more is all that is
+    // outstanding.
+    let seen = collect_tagged(&b, b"S5RSTafter", 1, Duration::from_secs(10)).await;
+    assert!(
+        seen.iter().any(|p| p.as_slice() == after.as_ref()),
+        "the payload sent after the peer's reset must arrive: a restarted \
+         tx_seq would land on a sequence B already dedups; saw {seen:?}"
+    );
+    let stats = a.stream_stats(b_id, SID).expect("stream stats");
+    assert_eq!(
+        stats.tx_seq, 2,
+        "the reset says nothing about our send side, so the sequence \
+         continues rather than restarting"
     );
 }
