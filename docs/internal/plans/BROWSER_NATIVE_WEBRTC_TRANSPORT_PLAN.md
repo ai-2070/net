@@ -2473,6 +2473,45 @@ or a minor-version bump with a note). Also from Kyra: the uncharged
 event-batch producers predate Stage 5 — a scoped byte-conservation
 limitation to document, not an N1 attribution.
 
+**Third repair round delivered (`740fb70a3`…`f50454106`); Kyra: HOLD
+at `f50454106`, "closes substantial implementation and real-browser
+evidence gaps".** Exact-head CI **55/55**; Chromium **and Firefox
+26/26**; hosted native 5 805 units + 119 RTC; all 30 prior probes
+preserved and green. Credited: P1/P2/P3 originals, X1–X10 largely,
+X6/X7 closed, real direct/proxied ABI traffic, sustained native → leaf
+traffic across eight credit windows, real above-SCTP loss/reorder
+recovery, native exact oversize refusal, production signalling
+refusal, the corrected 27-name leader roster and 26-name browser
+roster. Twelve new probes, eight red (reviewer reproduced 8/4; brief
+`spikes/S5_R4_BRIEF.md`) — four of them one design: the round-3
+"first-open-wins" reliable promotion left wire ACK accounting, the
+consumer cursor and still-open FAF handles disagreeing about the mode
+boundary (a missing reliable sequence cumulatively ACKed; a lost FAF
+prefix stranding the reliable suffix; mixed-mode traffic discarding an
+assembled reliable message; an expected FAF loss permanently failing
+the stream). Plus a predecessor control debit rewinding its successor
+(implicit streams reuse epoch 0); `u32` truncation stranding control
+debt; payload-shaped RPC classification. Source-established native
+items (NR2 native `take_abandoned()` has no production consumer; NR3
+retirement markers expire before admitted work; NR4 reorder holds
+cross close/reopen without epoch). Kyra also flags the nRPC
+**first-poll handler serialization** as a semantic expansion beyond
+the warranted transport ordering — the reviewer adopts her
+recommendation to remove it or bring it as an owner question.
+
+**Record correction (reviewer):** commit `477bc345e` and
+`S5_REPORT.md` §12.2 attributed the N4 `#[non_exhaustive]` decision to
+"the owner". No owner ruling was given — the owner was paused and the
+brief asked for a write-up of options. Kyra credited the policy on its
+merits and the reviewer would have recommended it, so the code stands;
+the attribution is being rewritten as "implementer's choice,
+reviewer-endorsed, pending owner confirmation". **Owner questions
+still open:** N4 confirmation and version handling; announcement
+expiry (recommendation: match native); direct `BrowserNode.close`
+iterator lifetime (pre-existing); whether multi-fragment
+interoperability in both directions is a Stage 5 contract or an
+explicit bound.
+
 ## Stage 6 — Browser ↔ browser direct, NAT conformance, telemetry, demo
 
 - §9 end to end; `RtcStats`; browser network-change retry trigger; per-pair
