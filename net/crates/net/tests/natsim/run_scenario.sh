@@ -186,7 +186,16 @@ NATSIM_LOG="${RUST_LOG:-net::adapter::net=trace,net=info}"
 # from `runner.log`. A browser reports a refused WebSocket handshake as
 # a bare 1006 with no reason, so those lines are the ONLY place the
 # reason exists.
-NATSIM_BROWSER_LOG="${RUST_LOG:-net::adapter::net=trace,net_sdk=debug,net=info}"
+#
+# `str0m` and `is` (its ICE agent) are in for the same reason one level
+# deeper. Our wrapper calls `add_remote_candidate`, which returns `()`:
+# the agent can silently REJECT a candidate — component != 1, or a
+# candidate-level `ufrag` that differs from the negotiated remote
+# ufrag (`is/src/agent.rs`) — and report nothing to us. "Our wrapper
+# reported success" is not "the agent retained the candidate", and the
+# only place that difference is visible is the agent's own `debug!`.
+# Its logs redact through `Pii`, so no credential rides along.
+NATSIM_BROWSER_LOG="${RUST_LOG:-net::adapter::net=trace,net_sdk=debug,str0m=debug,is=debug,net=info}"
 
 launch() { # launch <netns> <logname> <args...>
   local ns="$1" log="$2"; shift 2
