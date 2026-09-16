@@ -3272,6 +3272,118 @@ mod tests {
         assert_eq!(node.counters().drops(DropReason::SignalRejected), 2);
     }
 
+    /// **The production witness for the owner's 2026-09-16 expiry
+    /// ruling.** An expired announcement is neither discoverable nor
+    /// a signal authority, observed through the two real lookups a
+    /// page actually calls — [`LeafNode::query`] (what the wasm
+    /// surface's `query` resolves to) and [`LeafNode::accept_signal`]
+    /// reached via [`LeafNode::on_datagram`] — not through
+    /// `AnnouncementStore::get_at_nanos` or any other test seam.
+    /// Both announcements arrive as real `0x0C00` frames on the
+    /// anchor session and both envelopes as real `0x0D02` frames, so
+    /// verification, ingest, the store and the freshness filter are
+    /// all the production ones reading the production clock.
+    ///
+    /// **Why the expired peer is stamped exactly `DEFAULT_TTL_SECS`
+    /// ago, on a whole second.** That instant is precisely where the
+    /// two rules disagreed: the leaf's old rule truncated the stamp
+    /// to its second and expired *inclusively*, so `age == ttl` was
+    /// still fresh and this peer answered `query` and authorised
+    /// signals; the native rule
+    /// (`behavior/capability.rs::is_expired`) expires at
+    /// `age >= ttl`, so it is gone. The forward direction here cannot
+    /// race the clock — age only grows between the stamp and the
+    /// lookup, so `age >= ttl` stays true however long the test takes.
+    ///
+    /// The fresh control peer is not decoration: without it, every
+    /// assertion below would also pass if ingest, discovery or signal
+    /// admission were simply broken.
+    #[test]
+    fn an_expired_announcement_is_not_discoverable_and_not_a_signal_authority() {
+        const CAP: &str = "expiry.witness";
+        let (mut node, anchor) = connected();
+        node.drain_events();
+
+        let ttl = announce::DEFAULT_TTL_SECS;
+        let stale_peer = identity(0x41);
+        let live_peer = identity(0x42);
+        let stale_stamp = (clock::now_unix_secs() - u64::from(ttl)) * 1_000_000_000;
+
+        for (who, stamp) in [
+            (&stale_peer, stale_stamp),
+            (&live_peer, clock::now_unix_nanos()),
+        ] {
+            let signed = announce::build_announcement(who, &[CAP.to_string()], 1, stamp, ttl)
+                .expect("build");
+            let packet = anchor_packet(
+                &anchor,
+                u64::from(SUBPROTOCOL_CAPABILITY_ANN),
+                SUBPROTOCOL_CAPABILITY_ANN,
+                0,
+                true,
+                &signed,
+            );
+            node.on_datagram(ANCHOR, packet, clock::now());
+        }
+        node.drain_events();
+
+        // Both verified and both are held — expiry is a read-time
+        // filter, so this is a discovery question, not an ingest one.
+        let discovery = node.query(CAP);
+        assert!(
+            !discovery.contains(&stale_peer.node_id().to_string()),
+            "a peer whose announcement is {ttl}s old with a {ttl}s ttl \
+             is past its declared lifetime and must not answer a \
+             capability query — got {discovery}"
+        );
+        assert!(
+            discovery.contains(&live_peer.node_id().to_string()),
+            "the fresh control peer must still answer, or this test \
+             proves nothing about expiry — got {discovery}"
+        );
+        assert!(
+            node.announcement_for(stale_peer.node_id()).is_none(),
+            "the authority lookup must not hand out an expired \
+             announcement's key"
+        );
+        assert!(node.announcement_for(live_peer.node_id()).is_some());
+
+        // And the same expiry costs it the right to authorise a
+        // signal. Two envelopes of identical shape, differing only in
+        // who signed them.
+        let refused_before = node.counters().drops(DropReason::SignalRejected);
+        let mut accepted = Vec::new();
+        for who in [&stale_peer, &live_peer] {
+            let envelope = signal::sign(
+                who,
+                node.node_id(),
+                0xA5,
+                SignalKind::Offer,
+                b"v=0".to_vec(),
+                clock::now_unix_secs() + 10,
+            );
+            let bytes = signal::encode(&envelope).expect("encode");
+            let packet = anchor_packet(&anchor, 0x0D02, 0x0D02, 0, true, &bytes);
+            node.on_datagram(ANCHOR, packet, clock::now());
+            if node.drain_events().contains(&LeafEvent::Signal(envelope)) {
+                accepted.push(who.node_id());
+            }
+        }
+        assert_eq!(
+            accepted,
+            vec![live_peer.node_id()],
+            "only the fresh peer may authorise a signal: the expired \
+             one has no announcement for the verifier to read a key \
+             from"
+        );
+        assert_eq!(
+            node.counters().drops(DropReason::SignalRejected) - refused_before,
+            1,
+            "the expired peer's envelope is refused and counted, not \
+             silently dropped"
+        );
+    }
+
     /// **The bug MergedRunner found, as a regression test.**
     ///
     /// Before this, `connect()` completed the handshake and stopped,

@@ -507,7 +507,7 @@ because the crate denies `missing_docs` on every target.
 | **R5** | receive, reorder, reassembly, stream and RPC state keyed by session incarnation; the old incarnation retired exactly once, typed | `kyra_session_replacement_resets_receive_sequence`, `kyra_session_replacement_fails_old_pending_call` | retain the predecessor's reorder state → the successor's sequence-zero traffic is suppressed again | successor traffic and partial-fragment retention |
 | **R6** | classification by registered namespace (subscribed channel / opened stream), wire format unchanged | `kyra_channel_publication_is_not_misclassified_as_stream` | classify on bit 49 again → a channel whose hash carries that bit is delivered as stream data | stream traffic on real stream ids |
 | **R7** | the reorder buffer holds `(seq, origin, channel, bytes)` records and delivers each with its own provenance; O(1) gap accounting with a max-gap refusal | `kyra_reordered_stream_events_keep_their_own_sequences` | buffer bytes only → arrival 2,0,1 emits labels 0,1,1 | mixed-metadata delivery |
-| **R8** | replay key carries a BLAKE2s payload digest; hard cap 4096 that **refuses new admissions** (typed `SignalAdmission::AtCapacity`, counted `signal_capacity_refused`) rather than evicting — the eviction path is gone, so no code can remove an unexpired entry; freshness enforced at read time for discovery AND key authority, literal `issued + ttl` | `kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup`, `kyra_expired_announcement_is_not_discovery_or_signal_authority`, `kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure` | restore the `(from, dialog, kind)` key → the second candidate is refused; skip the freshness filter → an expired peer is discoverable and still a signal authority | multi-candidate traffic, re-announce restoring discovery |
+| **R8** | replay key carries a BLAKE2s payload digest; hard cap 4096 that **refuses new admissions** (typed `SignalAdmission::AtCapacity`, counted `signal_capacity_refused`) rather than evicting — the eviction path is gone, so no code can remove an unexpired entry; freshness enforced at read time for discovery AND key authority, on the half-open interval `[stamp, stamp + ttl)` at nanosecond precision (owner ruling 2026-09-16, §14.1; this row read `literal issued + ttl` while the leaf still truncated to seconds) | `kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup`, `kyra_expired_announcement_is_not_discovery_or_signal_authority`, `kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure` | restore the `(from, dialog, kind)` key → the second candidate is refused; skip the freshness filter → an expired peer is discoverable and still a signal authority | multi-candidate traffic, re-announce restoring discovery |
 | **R9** | stand-down is ordered: revoke the generation lease, shut the backend down (cancel in-flight, fail pending once, typed `LeaderLost`), then release the lock; every outbound effect consults the lease; `IdentityVault::fence` gained its caller (interval revalidation against the store) | `standing_down_fences_then_retires_the_node_then_releases_the_lock` over a real node with a real Noise session, a real pending call and an operation parked before dispatch; `a_leader_revalidates_its_generation_against_the_store_and_stands_down` | delete the `revoke` → the fencing witness fails | the ordinary leader/follower lifecycle |
 | **R10** | attaches queued until the backend exists and replayed on the first Leadership broadcast; `closed` checked at publish with requeue/abort; stream handles carry their opening generation and end their iterators on lifecycle loss; `announce()` updates restoration state; followers own a local deadline with an honest indeterminate outcome | one witness per schedule in `wasm_leader.rs` + the TS leader tests | drop the attach queue → subscriptions vanish across promotion | promotion, restoration and follower calls |
 | **R11** | one contract: Rust emits its canonical event JSON and TS decodes it; numeric `channelHash`; `RTCIceServer` parsed with credentials; ids matched numerically; the fake WASM mirrors the real shape | 10 ABI probes against the REAL built package, direct and leader-proxied, plus Kyra's two TS probes | reintroduce the string/bytes mismatch → `typescript_real_rust_callback_shape` reds | `typescript_byte_callback_control` |
@@ -666,7 +666,7 @@ always held.
 | **N2** | the stream lookup was dropped before an unconditional removal, so a concurrent same-id reopen could be removed by the old handle | comparison and removal under ONE entry guard keyed by session id AND epoch; a vacant slot removes nothing; the graceful path returns immediately on mismatch rather than waiting out a successor's retransmit window; no guard held across the wait | the pre-fix two-step shape restored inside the conditional close | `a lifetime-conditional close removed a stream it does not own in 2118 of 20000 races / left: 2118 / right: 0`, and `left: Closed / right: Absent` for the absent-then-open case | 54/54 wire session tests |
 | **N4** | R12 REPLACED public signatures instead of adding to them — a silent compatibility break for every id-addressed consumer | `close_stream`, `close_stream_graceful` and `try_acquire_tx_credit_matching_epoch` restored verbatim under their original names and contracts, documented as unfenced; the fenced operations live beside them as `*_handle` / `*_for_lifetime`. The fence was NOT weakened — only the names moved. R12's `close_stream_id` is removed rather than left as a second convention beside the restored name | — | — | file-by-file disposition in §11.5 |
 | **N5** | Go mapped −117 to a freshly allocated "mesh unknown error (code −117)" that no caller can match, and `Close()` discarded the status | exported `ErrSessionSuperseded` sentinel carrying the same stable string the N-API surface emits, mapped in `meshErrorFromCode`, deliberately outside the backpressure retry loop; `CloseErr()` reports the status while `Close()` keeps its exact signature | the `case -117:` arm deleted | `stream_close_test.go:89: meshErrorFromCode(-117) = mesh unknown error (code -117), want ErrSessionSuperseded --- FAIL` | PASS. The parity test reads `NET_ERR_MESH_SESSION_SUPERSEDED` out of the header cgo compiles against, so constant and sentinel cannot drift |
-| **expiry** | the boundary was correct and undocumented, which is how it becomes incorrect later | rustdoc states the three load-bearing facts: second granularity by truncation, INCLUSIVE at `issued + ttl` and exclusive one second later, and `ttl_secs == 0` as a literal zero-second lifetime with no "forever" escape. `get_at`/`query_at` take the reading as a parameter — the same seam shape as `clock::Deadline::expired_at`, so one scan's answer cannot depend on a second ticking mid-iteration | — | — | the witness runs build → verify → ingest → production lookup with the stamp at `issued.999`, so truncation cannot shift what it proves |
+| **expiry** | the boundary was correct and undocumented, which is how it becomes incorrect later | rustdoc states the three load-bearing facts, AS REVISED by the owner's 2026-09-16 ruling (§14.1): NANOSECOND precision, EXCLUSIVE at `age == ttl` — the interval is `[stamp, stamp + ttl)` — and `ttl_secs == 0` as a lifetime that is over at the stamp itself, with no "forever" escape. The row's original wording (second granularity, inclusive at `issued + ttl`) described the pre-ruling leaf rule and is superseded, not deleted, because the divergence it documented is what the ruling settled. `get_at_nanos`/`query_at_nanos` take the reading as a parameter — the same seam shape as `clock::Deadline::expired_at`, so one scan's answer cannot depend on a second ticking mid-iteration | — | — | the witness runs build → verify → ingest → production lookup with the stamp at `issued.999`, so truncation cannot shift what it proves |
 
 **Go execution, contrary to the previous round's report.** cgo does
 work on this host: the earlier failure was a `:`-separated `PATH` on
@@ -1020,7 +1020,12 @@ Options:
 We are **not** flipping a comparison operator to make this go away.
 Recommendation: option 1, on the grounds that two expiry rules for
 one announcement type is a defect regardless of which is better.
-Awaiting the owner.
+**RULED 2026-09-16: option 1, match native.** Implemented in §14.1.
+The leaf's predicate is now the native one to the nanosecond, so the
+table at the top of this section describes a disagreement that no
+longer exists — it is kept because the disagreement is the reason the
+ruling was needed, and because one of the two rules in it had to lose
+for a reason, not by preference.
 
 ### 12.2 N4's residual source breaks — owner-confirmed 2026-09-16; versioning deferred to release
 
@@ -1710,17 +1715,24 @@ Four, none of them ours to settle. Each is stated with what we would
 recommend and what it costs, so a decision is cheap to make and
 nothing is pre-empted by our silence.
 
-**1. Announcement expiry: leaf inclusive vs native `age >= ttl`.**
-Still open from §12.1, unchanged. The leaf holds
+**1. Announcement expiry: leaf inclusive vs native `age >= ttl`.
+RULED — match native. Implemented in §14.1.** The leaf held
 `now <= floor(issued) + ttl` at second granularity; the native side
 expires at `age_secs >= ttl` at nanosecond precision, and documents
 that it matches `PermissionToken::is_valid`. A TTL-zero announcement
-is authoritative on the leaf and already dead natively. Recommendation
-unchanged: **match native** — nanosecond precision, inclusive expiry
-including the TTL-zero and fractional cases — on the grounds that two
-expiry rules for one announcement type is a defect whichever is
-nicer. Cost: two leaf tests that pin the TTL-zero-within-its-second
-case move with it.
+was authoritative on the leaf and already dead natively. The leaf now
+uses the native predicate.
+
+**A wording correction, because the error is the kind that survives
+into an implementation.** This item previously called the native rule
+"inclusive expiry". It is the opposite: `age >= ttl` means the
+instant `stamp + ttl` is EXPIRED, so the live interval is the
+half-open `[stamp, stamp + ttl)` and the rule is exclusive at its
+upper end. The leaf's old rule was the inclusive one. Getting this
+backwards in a sentence is free; getting it backwards in a comparison
+operator ships a peer that is an authority for one second after it
+said it would not be. Cost, as predicted: two leaf tests that pinned
+the TTL-zero-within-its-second case moved to the opposite assertion.
 
 **2. The N4 policy itself. RULED — owner-confirmed 2026-09-16;
 version bump and release note deferred to the release process.**
@@ -1757,3 +1769,149 @@ reassembly for the stream path, which is real work and a real
 decision) or the bound is written down as the accepted contract. We
 recommend writing down the bound for this stage and scoping
 reassembly separately; we have not decided it.
+
+
+## 14. Fifth round — the four owner rulings
+
+Round 4 closed every item the third review had established and stopped
+at four questions only the owner could settle (§13.7). All four are now
+ruled, and this round implements the rulings and nothing else.
+
+**Two framing facts a reviewer should have before reading the rows.**
+
+First, **ruling 4 is core work inside a Stage 5 round, by owner
+decision.** Native fragment reassembly and gated native-side
+fragmentation are changes to the core transport, not to the browser
+spike, and they were taken here because the owner decided the
+interoperability leg should be supplied now rather than scoped away.
+It should be reviewed as a core change — the same bar as any other
+change to the stream path — and not given spike latitude because of
+the section it is written in. Saying so is the point: the riskiest
+edit in this round is the one most easily waved through as "part of
+the browser work".
+
+Second, **this round stacks additively on round 4 (`e342007a0`), which
+has not been reviewed.** Nothing here rewrites a round-4 decision, so a
+verdict on round 4 cannot be contradicted by anything below.
+
+One commit per ruling. Each row states the ruling, the change, the
+witness, and the raw inverse receipt.
+
+### 14.1 Ruling 1 — announcement expiry matches native
+
+**Ruled:** match native. Nanosecond precision, expire at `age >= ttl`,
+including the TTL-zero and fractional cases. One expiry rule for one
+announcement type.
+
+**The change.** The leaf's freshness predicate is now the native one:
+
+```
+is_fresh_at_nanos(now) = now.saturating_sub(timestamp_ns)
+                       < u64::from(ttl_secs) * 1_000_000_000
+```
+
+This is not a nanosecond *approximation* of the native rule, it is the
+same rule: native computes `age_secs = (now_ns - ts_ns) / 1e9` then
+tests `age_secs >= ttl`, and for an integer `ttl`,
+`floor(age_ns / 1e9) >= ttl` holds exactly when `age_ns >= ttl * 1e9`.
+No precision is lost and none is invented.
+
+Three arithmetic details, each of which is a defect if taken casually:
+
+- **A clock that went backwards cannot expire the store.** `age` uses
+  `saturating_sub`, so a stamp in the future — a peer's clock ahead of
+  ours, or our own clock stepped back between stamp and read — yields
+  age zero, the youngest possible, instead of wrapping `u64` into
+  roughly 584 years and expiring every record at once. A clock
+  disagreement can only grant unearned lifetime, never fabricate
+  expiry. Native saturates in the same place.
+- **The TTL bound cannot wrap.** `ttl_secs` is `u32`, so the widened
+  product tops out at `4.295e18`, comfortably below `u64::MAX`
+  (`1.845e19`). The widening is the proof; it is documented on the
+  predicate rather than left to be re-derived.
+- **The store's readers take the reading as a parameter.**
+  `get_at_nanos` / `query_at_nanos` / `resolve_routing_id_at_nanos`,
+  with the un-suffixed callers reading `clock::now_unix_nanos()` once,
+  so a single scan's answer cannot change because a second ticked
+  mid-iteration.
+
+**The two moved tests.** Both pinned the TTL-zero-within-its-issuing-
+second case, which the ruling deletes. They now assert the opposite,
+correct outcome, and each carries the ruling's date and its reason in
+its comment:
+
+| was | is | the flip |
+|---|---|---|
+| `the_authority_lookup_expires_one_second_after_issue_plus_ttl` | `the_authority_lookup_expires_exactly_ttl_nanoseconds_after_the_stamp` | `stamp + ttl` was asserted `Some`; it is asserted `None`. Gained a `Some` at `stamp + ttl - 1ns` and a `Some` at `(issued + ttl) * 1e9`, so the stamp's sub-second remainder is proven no longer truncated away |
+| `a_zero_ttl_announcement_is_authoritative_only_within_its_issuing_second` | `a_zero_ttl_announcement_is_expired_from_the_instant_it_was_stamped` | `get_at(node, issued).is_some()` and a one-row `query_at` became `is_none()` and empty. Gained a read one nanosecond BEFORE the stamp that still gets `None`, pinning the saturating age |
+
+Neither is weakened: the boundary moved from a second to a nanosecond
+and each test gained an assertion it did not have.
+
+**The production authority-lookup witness** Kyra asked for, and it is
+the real path, not a helper:
+`node::tests::an_expired_announcement_is_not_discoverable_and_not_a_signal_authority`
+drives `LeafNode::on_datagram` with real `0x0C00` capability-
+announcement frames over a real anchor session, through
+`ingest_announcement` → `verify_announcement` → `AnnouncementStore::
+ingest`, and then reads back through **both** production readers: the
+discovery one (`LeafNode::query` → `query_json` → `query()`, which is
+what the wasm surface's `query` resolves to) and the authority one
+(`LeafNode::accept_signal` → `self.announcements.get(envelope.from)`,
+`node.rs:2401` — the accessor the signal verifier takes the peer's
+Ed25519 key from), reached by a real `0x0D02` signal frame.
+
+It asserts three negatives — absent from `query`, `announcement_for`
+is `None`, the real signed envelope is refused with
+`DropReason::SignalRejected` advancing by exactly one — and a fresh
+control peer ingested and signalled identically that is discoverable,
+held, and accepted. Without the control, all three negatives would
+pass on a path that was simply broken.
+
+**Raw inverse receipt.** Restore the pre-ruling leaf rule, one line out,
+two in, in `is_fresh_at_nanos`:
+
+```
+-        self.age_nanos(now_unix_nanos) < u64::from(self.ttl_secs) * NANOS_PER_SEC
++        let issued = self.timestamp_ns / NANOS_PER_SEC;
++        now_unix_nanos / NANOS_PER_SEC <= issued.saturating_add(u64::from(self.ttl_secs))
+```
+
+`cargo test -p net-mesh-leaf --features mock-control-plane --lib -- --exact`
+on the three names, exit **101**:
+
+```
+test announce::tests::the_authority_lookup_expires_exactly_ttl_nanoseconds_after_the_stamp ... FAILED
+test announce::tests::a_zero_ttl_announcement_is_expired_from_the_instant_it_was_stamped ... FAILED
+test node::tests::an_expired_announcement_is_not_discoverable_and_not_a_signal_authority ... FAILED
+
+---- the_authority_lookup_expires_exactly_ttl_nanoseconds_after_the_stamp ----
+panicked at src\announce.rs:922:9:
+at age == ttl the peer has no authority left: the interval a ttl of 300
+covers is [stamp, stamp + 300), half-open. The old inclusive rule called
+this instant fresh because it fell inside second 1700000300
+
+---- a_zero_ttl_announcement_is_expired_from_the_instant_it_was_stamped ----
+panicked at src\announce.rs:984:9:
+read at its own stamp, a zero-TTL record has already spent every
+nanosecond it declared
+
+---- an_expired_announcement_is_not_discoverable_and_not_a_signal_authority ----
+panicked at src\node.rs:3333:9:
+a peer whose announcement is 300s old with a 300s ttl is past its declared
+lifetime and must not answer a capability query — got [{"node_id":"787399…
+"capabilities":["expiry.witness","leaf","transport:rtc"],…}, {…}]
+
+test result: FAILED. 0 passed; 3 failed; 207 filtered out
+```
+
+The `node.rs` red is itself the proof the witness rides the production
+lookup: the failure message carries the JSON that `node.query(CAP)`
+actually returned, with both peers in it. Restored: `3 passed`, exit 0.
+
+**Counts and cross-checks.** Leaf 269 → **270** (+1 witness; the two
+moved tests were renamed, not added). `cargo check --target
+wasm32-unknown-unknown` clean. The `cross_lang_wire` fixtures that
+carry an announcement with a TTL still decode on both sides: **13
+passed, unchanged** — the ruling changes when a record is *believed*,
+not how it is *encoded*, and that distinction is why no fixture moved.

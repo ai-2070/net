@@ -76,6 +76,12 @@ pub const TAG_TRANSPORT_RTC: &str = "transport:rtc";
 /// fixtures pin.
 pub const DEFAULT_TTL_SECS: u32 = 300;
 
+/// Nanoseconds in a second.
+///
+/// The unit `timestamp_ns` is stamped in, and — since the owner's
+/// 2026-09-16 ruling — the unit the freshness comparison is made in.
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
 /// The two fields that sit **outside** the signed transcript.
 ///
 /// `signature` for the obvious reason; `hop_count` because a
@@ -111,39 +117,67 @@ pub struct VerifiedAnnouncement {
 }
 
 impl VerifiedAnnouncement {
+    /// How long ago this announcement was stamped, in nanoseconds,
+    /// as of `now_unix_nanos`.
+    ///
+    /// `saturating_sub` is what makes a stamp in the **future** safe.
+    /// A peer whose wall clock runs ahead of ours — or our own clock
+    /// stepping backwards between the stamp and the read — would
+    /// otherwise wrap `u64` and report an age of ~584 years, which
+    /// expires every record in the store at once. Saturating yields
+    /// age zero instead, the youngest an announcement can be, so a
+    /// clock disagreement can only ever grant a record lifetime it
+    /// has not yet earned and can never invent expiry. There is no
+    /// negative age and no wrap. The native side saturates in exactly
+    /// the same place (`behavior/capability.rs`'s `is_expired`).
+    pub fn age_nanos(&self, now_unix_nanos: u64) -> u64 {
+        now_unix_nanos.saturating_sub(self.timestamp_ns)
+    }
+
     /// Is this announcement still inside the lifetime it declared,
-    /// as of `now_unix_secs`?
+    /// as of `now_unix_nanos`?
     ///
-    /// Exact semantics, all three of which are load-bearing and none
-    /// of which is a rounding accident:
+    /// **This is the native rule, deliberately, and there is now
+    /// exactly one of them.** `behavior/capability.rs`'s
+    /// `CapabilityAnnouncement::is_expired` computes
+    /// `age_secs = (now_ns - timestamp_ns) / 1e9` and expires at
+    /// `age_secs >= ttl_secs`. For an integer `ttl_secs` that is
+    /// *identically* the comparison made here, because
+    /// `floor(age_ns / 1e9) >= ttl  ⟺  age_ns >= ttl * 1e9` — so
+    /// this spelling loses no precision and invents none. The owner
+    /// ruled on 2026-09-16 that the leaf adopts it: two expiry rules
+    /// for one announcement type is a defect whichever one is nicer,
+    /// and the native one is the documented match for
+    /// `PermissionToken::is_valid`, which makes the effective
+    /// lifetime exactly `ttl_secs` seconds.
     ///
-    /// 1. **Second granularity.** The issue instant is
-    ///    `timestamp_ns / 1_000_000_000` — integer truncation, so an
-    ///    announcement stamped anywhere inside second *S* is treated
-    ///    as issued at the start of *S*. The comparison is made in
-    ///    whole seconds because `ttl_secs` is.
-    /// 2. **Inclusive at the expiry second.** `now == issued + ttl`
-    ///    is still fresh; `now == issued + ttl + 1` is not. A TTL of
-    ///    `n` therefore covers `n + 1` distinct second values. The
-    ///    inclusive end is the direction that cannot strand a
-    ///    correctly-issued record: with truncation, a record stamped
-    ///    at `S + 0.999 s` and a reader at `S + ttl + 0.001 s` are
-    ///    barely `ttl` apart in real time and would otherwise be
-    ///    refused.
-    /// 3. **No "0 means forever" escape.** `ttl_secs == 0` is a
-    ///    literal zero-second lifetime: valid for the remainder of
-    ///    the second it was issued in, and expired from the next
-    ///    second onward. A record that declares no lifetime has
-    ///    declared an exhausted one, and a peer that wants to be
+    /// What follows from that arithmetic, all of it load-bearing:
+    ///
+    /// 1. **The stamp's sub-second remainder counts.** The issue
+    ///    instant is not truncated, so a record stamped at
+    ///    `S + 0.999 s` is authoritative until `S + ttl + 0.999 s`.
+    ///    The previous leaf rule truncated the stamp down to `S` and
+    ///    then compensated with an inclusive end; this needs no
+    ///    compensation, which is why the inclusive end is gone.
+    /// 2. **Exclusive at `age == ttl`.** A TTL of `n` covers the
+    ///    half-open interval `[stamp, stamp + n)` and nothing more.
+    /// 3. **`ttl_secs == 0` is expired at age zero.** Not "forever",
+    ///    and not "the rest of the issuing second" either: a record
+    ///    that declares no lifetime has declared an exhausted one,
+    ///    from the instant it was stamped. A peer that wants to be
     ///    discoverable says for how long — which is what the leaf's
-    ///    own writer does.
+    ///    own writer does ([`DEFAULT_TTL_SECS`]).
     ///
-    /// `saturating_add` keeps a hostile `timestamp_ns`/`ttl_secs`
-    /// pair from wrapping the sum into the past and making an
-    /// expired record look fresh.
-    pub fn is_fresh(&self, now_unix_secs: u64) -> bool {
-        let issued = self.timestamp_ns / 1_000_000_000;
-        now_unix_secs <= issued.saturating_add(u64::from(self.ttl_secs))
+    /// **No overflow on the bound.** `ttl_secs` is a `u32`, so the
+    /// widened product `u64::from(u32::MAX) * NANOS_PER_SEC` is
+    /// `4.294_967_295e18` — comfortably under `u64::MAX`
+    /// (`≈1.845e19`). A hostile `ttl_secs` cannot wrap the bound
+    /// into the past and make an expired record look fresh, and no
+    /// saturation is needed on this side of the comparison: the
+    /// widening does it. The other side is [`Self::age_nanos`],
+    /// which saturates.
+    pub fn is_fresh_at_nanos(&self, now_unix_nanos: u64) -> bool {
+        self.age_nanos(now_unix_nanos) < u64::from(self.ttl_secs) * NANOS_PER_SEC
     }
 }
 
@@ -443,24 +477,31 @@ impl AnnouncementStore {
     /// is evaluated at READ time rather than by a sweep, so a
     /// re-announce restores discoverability immediately.
     pub fn query(&self, capability: &str) -> Vec<&VerifiedAnnouncement> {
-        self.query_at(capability, crate::clock::now_unix_secs())
+        self.query_at_nanos(capability, crate::clock::now_unix_nanos())
     }
 
     /// [`Self::query`] evaluated against an explicit wall-clock
-    /// second.
+    /// nanosecond reading.
     ///
     /// One clock reading for the whole scan — the same shape as
     /// `clock::Deadline::expired_at`, and the same reason: a sweep
     /// over many records must judge them all against one instant, or
-    /// a second that ticks mid-scan makes the answer depend on
+    /// an instant that advances mid-scan makes the answer depend on
     /// iteration order. It is also the entrypoint that lets the
-    /// expiry boundary be exercised at an exact second instead of
-    /// whatever second the host clock happens to be in; see
-    /// [`VerifiedAnnouncement::is_fresh`] for the boundary.
-    pub fn query_at(&self, capability: &str, now_unix_secs: u64) -> Vec<&VerifiedAnnouncement> {
+    /// expiry boundary be exercised at an exact nanosecond instead of
+    /// whenever the host clock happens to be; see
+    /// [`VerifiedAnnouncement::is_fresh_at_nanos`] for the boundary.
+    pub fn query_at_nanos(
+        &self,
+        capability: &str,
+        now_unix_nanos: u64,
+    ) -> Vec<&VerifiedAnnouncement> {
         self.by_node
             .values()
-            .filter(|a| a.is_fresh(now_unix_secs) && a.capabilities.iter().any(|c| c == capability))
+            .filter(|a| {
+                a.is_fresh_at_nanos(now_unix_nanos)
+                    && a.capabilities.iter().any(|c| c == capability)
+            })
             .collect()
     }
 
@@ -470,16 +511,16 @@ impl AnnouncementStore {
     /// so the same expiry that removes a peer from discovery removes
     /// its authority to authorise a signal.
     pub fn get(&self, node: u64) -> Option<&VerifiedAnnouncement> {
-        self.get_at(node, crate::clock::now_unix_secs())
+        self.get_at_nanos(node, crate::clock::now_unix_nanos())
     }
 
-    /// [`Self::get`] evaluated against an explicit wall-clock second
-    /// — the authority lookup with its expiry boundary made
-    /// addressable.
-    pub fn get_at(&self, node: u64, now_unix_secs: u64) -> Option<&VerifiedAnnouncement> {
+    /// [`Self::get`] evaluated against an explicit wall-clock
+    /// nanosecond reading — the authority lookup with its expiry
+    /// boundary made addressable.
+    pub fn get_at_nanos(&self, node: u64, now_unix_nanos: u64) -> Option<&VerifiedAnnouncement> {
         self.by_node
             .get(&node)
-            .filter(|a| a.is_fresh(now_unix_secs))
+            .filter(|a| a.is_fresh_at_nanos(now_unix_nanos))
     }
 
     /// The record for `node` whether or not it is fresh — for the
@@ -514,15 +555,16 @@ impl AnnouncementStore {
     /// because choosing between them would be this function
     /// inventing a sender.
     pub fn resolve_routing_id(&self, routing_id: u32) -> Option<u64> {
-        self.resolve_routing_id_at(routing_id, crate::clock::now_unix_secs())
+        self.resolve_routing_id_at_nanos(routing_id, crate::clock::now_unix_nanos())
     }
 
     /// [`Self::resolve_routing_id`] against an explicit wall-clock
-    /// second, so the expiry boundary is testable natively.
-    pub fn resolve_routing_id_at(&self, routing_id: u32, now_unix_secs: u64) -> Option<u64> {
+    /// nanosecond reading, so the expiry boundary is testable
+    /// natively.
+    pub fn resolve_routing_id_at_nanos(&self, routing_id: u32, now_unix_nanos: u64) -> Option<u64> {
         let mut found = None;
         for node in self.by_node.values().filter_map(|a| {
-            a.is_fresh(now_unix_secs)
+            a.is_fresh_at_nanos(now_unix_nanos)
                 .then_some(a.node_id)
                 .filter(|id| *id as u32 == routing_id)
         }) {
@@ -607,13 +649,14 @@ mod tests {
         assert!(!text.contains("hop_count"), "a leaf originates at hop 0");
     }
 
-    /// A record with a chosen node id, fresh at `now`.
+    /// A record with a chosen node id, stamped at the exact start of
+    /// second `issued_unix_secs`.
     ///
     /// Hand-built rather than signed: the only field under test is
     /// `node_id`, and two node ids that collide in their low 32 bits
     /// cannot be reached by choosing entity secrets — the id is a
     /// hash of the key.
-    fn record(node_id: u64, now_unix_secs: u64) -> VerifiedAnnouncement {
+    fn record(node_id: u64, issued_unix_secs: u64) -> VerifiedAnnouncement {
         VerifiedAnnouncement {
             node_id,
             entity_id: format!("{node_id:016x}"),
@@ -622,7 +665,7 @@ mod tests {
             rtc_addr: None,
             rtc_bootstrap: None,
             version: 1,
-            timestamp_ns: now_unix_secs * 1_000_000_000,
+            timestamp_ns: issued_unix_secs * NANOS_PER_SEC,
             ttl_secs: DEFAULT_TTL_SECS,
         }
     }
@@ -633,27 +676,35 @@ mod tests {
     #[test]
     fn a_routing_id_resolves_to_the_announced_node_and_expires_with_it() {
         const NOW: u64 = 1_700_000_000;
+        let now_ns = NOW * NANOS_PER_SEC;
         let mut store = AnnouncementStore::new();
         store.ingest(record(0xAAAA_BBBB_1234_5678, NOW));
         store.ingest(record(0xCCCC_DDDD_9999_0000, NOW));
 
         assert_eq!(
-            store.resolve_routing_id_at(0x1234_5678, NOW),
+            store.resolve_routing_id_at_nanos(0x1234_5678, now_ns),
             Some(0xAAAA_BBBB_1234_5678)
         );
         assert_eq!(
-            store.resolve_routing_id_at(0x9999_0000, NOW),
+            store.resolve_routing_id_at_nanos(0x9999_0000, now_ns),
             Some(0xCCCC_DDDD_9999_0000)
         );
         assert_eq!(
-            store.resolve_routing_id_at(0xDEAD_BEEF, NOW),
+            store.resolve_routing_id_at_nanos(0xDEAD_BEEF, now_ns),
             None,
             "a projection nobody announced resolves to nobody"
         );
+        let ttl_ns = u64::from(DEFAULT_TTL_SECS) * NANOS_PER_SEC;
         assert_eq!(
-            store.resolve_routing_id_at(0x1234_5678, NOW + u64::from(DEFAULT_TTL_SECS) + 1),
+            store.resolve_routing_id_at_nanos(0x1234_5678, now_ns + ttl_ns - 1),
+            Some(0xAAAA_BBBB_1234_5678),
+            "one nanosecond of declared lifetime is still lifetime"
+        );
+        assert_eq!(
+            store.resolve_routing_id_at_nanos(0x1234_5678, now_ns + ttl_ns),
             None,
-            "the expiry that removes a peer from discovery removes it from here"
+            "the expiry that removes a peer from discovery removes it \
+             from here, and it lands at age == ttl exactly"
         );
     }
 
@@ -665,21 +716,22 @@ mod tests {
     #[test]
     fn two_announcements_sharing_a_routing_id_resolve_to_neither() {
         const NOW: u64 = 1_700_000_000;
+        let now_ns = NOW * NANOS_PER_SEC;
         let mut store = AnnouncementStore::new();
         store.ingest(record(0x1111_1111_4444_4444, NOW));
         store.ingest(record(0x2222_2222_4444_4444, NOW));
 
         assert_eq!(store.len(), 2, "both are held: they are different nodes");
         assert_eq!(
-            store.resolve_routing_id_at(0x4444_4444, NOW),
+            store.resolve_routing_id_at_nanos(0x4444_4444, now_ns),
             None,
             "ambiguity is refused, not guessed"
         );
         // And the ambiguity is confined to the projection: each is
         // still reachable by its full id, so a collision costs those
         // two peers the relayed path and nothing else.
-        assert!(store.get_at(0x1111_1111_4444_4444, NOW).is_some());
-        assert!(store.get_at(0x2222_2222_4444_4444, NOW).is_some());
+        assert!(store.get_at_nanos(0x1111_1111_4444_4444, now_ns).is_some());
+        assert!(store.get_at_nanos(0x2222_2222_4444_4444, now_ns).is_some());
     }
 
     /// One flipped byte anywhere in the signed transcript must fail.
@@ -756,9 +808,14 @@ mod tests {
     /// timestamp. Since R8 made freshness load-bearing (an expired
     /// announcement is neither discoverable nor a key authority), a
     /// 1970 stamp means expired, so the stand-in has to be a real
-    /// one. `nudge` keeps the two versions distinguishable.
+    /// one. It is read in NANOSECONDS, not a second truncated and
+    /// re-scaled: since the owner's 2026-09-16 ruling the stamp's
+    /// sub-second remainder is part of the issue instant, and a
+    /// truncated stand-in would silently donate up to a second of
+    /// the record's lifetime to the past. `nudge` keeps the two
+    /// versions distinguishable.
     fn fresh_stamp(nudge: u64) -> u64 {
-        crate::clock::now_unix_secs() * 1_000_000_000 + nudge
+        crate::clock::now_unix_nanos() + nudge
     }
 
     #[test]
@@ -817,28 +874,41 @@ mod tests {
         assert_eq!(store.query_json("absent"), "[]");
     }
 
-    /// The expiry boundary, pinned at the exact second on the
-    /// PRODUCTION authority lookup (`get_at`) and the production
-    /// discovery scan (`query_at`) — not on `is_fresh` alone.
+    /// The expiry boundary, pinned at the exact nanosecond on the
+    /// PRODUCTION authority lookup (`get_at_nanos`) and the
+    /// production discovery scan (`query_at_nanos`) — not on
+    /// `is_fresh_at_nanos` alone.
     ///
     /// `get` is what the signal verifier reads a peer's key from, so
-    /// "one second either side of expiry" is the difference between a
-    /// peer still being able to authorise a signal and not. The
-    /// contract [`VerifiedAnnouncement::is_fresh`] states is
-    /// inclusive at `issued + ttl` and exclusive one second later;
-    /// both directions are asserted here, and the announcement goes
-    /// through the real `build_announcement` → `verify_announcement`
-    /// → `ingest` path so the stored `timestamp_ns`/`ttl_secs` are
-    /// the signed ones.
+    /// one nanosecond either side of expiry is the difference between
+    /// a peer being able to authorise a signal and not. The
+    /// announcement goes through the real `build_announcement` →
+    /// `verify_announcement` → `ingest` path so the stored
+    /// `timestamp_ns`/`ttl_secs` are the signed ones.
+    ///
+    /// **This test MOVED, by the owner's 2026-09-16 ruling.** It used
+    /// to assert that the whole second `issued + ttl` was still
+    /// authoritative — the leaf's inclusive, second-granular rule —
+    /// and to be named for expiring "one second after issue plus
+    /// ttl". The instant asserted `None` below (`stamp + ttl`, which
+    /// falls inside that second) was asserted `Some` before. The
+    /// ruling is that one announcement type gets one expiry rule, and
+    /// the rule is the native one
+    /// (`behavior/capability.rs::is_expired`, `age >= ttl`, which is
+    /// documented as matching `PermissionToken::is_valid`): a leaf
+    /// and a native node must not disagree about whether a peer is
+    /// still an authority. This asserts the opposite outcome at the
+    /// boundary, not a vaguer one.
     #[test]
-    fn the_authority_lookup_expires_one_second_after_issue_plus_ttl() {
+    fn the_authority_lookup_expires_exactly_ttl_nanoseconds_after_the_stamp() {
         let id = identity();
         let issued: u64 = 1_700_000_000;
         let ttl: u32 = 300;
-        // Stamp deliberately mid-second: `is_fresh` truncates to the
-        // second, so the sub-second remainder must not shift the
-        // boundary by one.
-        let stamp = issued * 1_000_000_000 + 999_999_999;
+        // Stamp deliberately mid-second: the sub-second remainder is
+        // part of the issue instant now, so it must move the boundary
+        // rather than be truncated away.
+        let stamp = issued * NANOS_PER_SEC + 999_999_999;
+        let ttl_ns = u64::from(ttl) * NANOS_PER_SEC;
 
         let mut store = AnnouncementStore::new();
         store.ingest(
@@ -848,62 +918,97 @@ mod tests {
             .expect("verify"),
         );
         let node = id.node_id();
-        let expiry = issued + u64::from(ttl);
 
         assert!(
-            store.get_at(node, expiry - 1).is_some(),
-            "a second before expiry the peer is still a key authority"
+            store.get_at_nanos(node, stamp + ttl_ns - 1).is_some(),
+            "one nanosecond of declared lifetime is still lifetime"
         );
         assert!(
-            store.get_at(node, expiry).is_some(),
-            "the expiry second itself is INCLUSIVE — a record issued \
-             at {issued}.999 with ttl {ttl} is still authoritative at \
-             {expiry}"
+            store.get_at_nanos(node, stamp + ttl_ns).is_none(),
+            "at age == ttl the peer has no authority left: the \
+             interval a ttl of {ttl} covers is [stamp, stamp + {ttl}), \
+             half-open. The old inclusive rule called this instant \
+             fresh because it fell inside second {}",
+            issued + u64::from(ttl)
         );
         assert!(
-            store.get_at(node, expiry + 1).is_none(),
-            "one second past expiry the peer has no authority left"
+            store
+                .get_at_nanos(node, (issued + u64::from(ttl)) * NANOS_PER_SEC)
+                .is_some(),
+            "the stamp's remainder is NOT truncated to its second: a \
+             record issued at {issued}.999999999 has only spent \
+             {ttl}s − 0.999999999s of its lifetime here"
         );
 
         // Discovery uses the same boundary, and the record is still
         // held either way — expiry is a read-time filter, not a
         // deletion, so a re-announce restores it.
-        assert_eq!(store.query_at("gpu", expiry).len(), 1);
-        assert!(store.query_at("gpu", expiry + 1).is_empty());
+        assert_eq!(store.query_at_nanos("gpu", stamp + ttl_ns - 1).len(), 1);
+        assert!(store.query_at_nanos("gpu", stamp + ttl_ns).is_empty());
         assert!(
             store.get_including_expired(node).is_some(),
             "the expired record is retained for the version comparison"
         );
     }
 
-    /// `ttl_secs == 0` is a literal zero-second lifetime, not
-    /// "forever" and not "already dead": authoritative for the
-    /// remainder of the second it was issued in, expired from the
-    /// next second onward. The pre-existing ancient-zero-TTL probe
-    /// only covers a 1970 stamp, where both readings are expired.
+    /// `ttl_secs == 0` is a lifetime of zero nanoseconds: expired
+    /// from the instant it was stamped. Not "forever", and not "the
+    /// rest of the issuing second" either.
+    ///
+    /// **This test MOVED, by the owner's 2026-09-16 ruling.** It was
+    /// named `a_zero_ttl_announcement_is_authoritative_only_within_
+    /// its_issuing_second` and asserted that a zero-TTL record was a
+    /// key authority and discoverable for the remainder of the second
+    /// it was issued in. Natively the same record is already dead at
+    /// age zero (`age >= ttl` with `ttl == 0` is true immediately),
+    /// so the leaf and a native node disagreed about whether a peer
+    /// could authorise a signal — one announcement type with two
+    /// expiry rules, which is a defect whichever rule is nicer. The
+    /// owner ruled the leaf adopts the native one. Every assertion
+    /// below is the exact negation of the one it replaces.
+    ///
+    /// The pre-existing ancient-zero-TTL probe
+    /// (`tests/kyra_review.rs`'s
+    /// `kyra_expired_announcement_is_not_discovery_or_signal_authority`)
+    /// only covers a 1970 stamp, where both readings agree.
     #[test]
-    fn a_zero_ttl_announcement_is_authoritative_only_within_its_issuing_second() {
+    fn a_zero_ttl_announcement_is_expired_from_the_instant_it_was_stamped() {
         let id = identity();
         let issued: u64 = 1_700_000_000;
+        let stamp = issued * NANOS_PER_SEC + 1;
         let mut store = AnnouncementStore::new();
         store.ingest(
             verify_announcement(
-                &build_announcement(&id, &["gpu".to_string()], 1, issued * 1_000_000_000 + 1, 0)
-                    .expect("build"),
+                &build_announcement(&id, &["gpu".to_string()], 1, stamp, 0).expect("build"),
             )
             .expect("verify"),
         );
         let node = id.node_id();
 
         assert!(
-            store.get_at(node, issued).is_some(),
-            "ttl 0 is not 'already expired': the issuing second counts"
+            store.get_at_nanos(node, stamp).is_none(),
+            "read at its own stamp, a zero-TTL record has already \
+             spent every nanosecond it declared"
         );
-        assert_eq!(store.query_at("gpu", issued).len(), 1);
+        assert!(store.query_at_nanos("gpu", stamp).is_empty());
         assert!(
-            store.get_at(node, issued + 1).is_none(),
-            "ttl 0 is not 'forever': the next second is expired"
+            store.get_at_nanos(node, issued * NANOS_PER_SEC).is_none(),
+            "read one nanosecond BEFORE its stamp — a peer clock ahead \
+             of ours, or ours stepped back — the age saturates to zero \
+             and zero is still spent; a clock disagreement must not \
+             resurrect it"
         );
-        assert!(store.query_at("gpu", issued + 1).is_empty());
+        assert!(
+            store.get_at_nanos(node, stamp + NANOS_PER_SEC).is_none(),
+            "and it stays expired a second later"
+        );
+        assert!(store
+            .query_at_nanos("gpu", stamp + NANOS_PER_SEC)
+            .is_empty());
+        assert!(
+            store.get_including_expired(node).is_some(),
+            "expiry is a read-time filter: the record is retained for \
+             the version comparison `ingest` makes"
+        );
     }
 }
