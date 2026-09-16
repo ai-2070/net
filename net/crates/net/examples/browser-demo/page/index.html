@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>net-mesh — 60 Hz browser ↔ browser positions</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --flat: #46d17a;
+        --moving: #f2b544;
+        --dead: #6a7180;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b0d12;
+        color: #d7dbe4;
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      #scene {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+      }
+      #hud {
+        position: fixed;
+        z-index: 1;
+        top: 0;
+        left: 0;
+        padding: 10px 14px;
+        background: rgba(11, 13, 18, 0.82);
+        border-bottom-right-radius: 10px;
+        min-width: 420px;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #8e96a8;
+      }
+      table {
+        border-collapse: collapse;
+      }
+      th {
+        text-align: left;
+        font-weight: 400;
+        color: #8e96a8;
+        padding-right: 14px;
+        vertical-align: top;
+      }
+      td {
+        font-variant-numeric: tabular-nums;
+      }
+      .big {
+        font-size: 20px;
+        font-weight: 600;
+      }
+      .flat {
+        color: var(--flat);
+      }
+      .moving {
+        color: var(--moving);
+      }
+      .dead {
+        color: var(--dead);
+      }
+      #phase {
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      #note {
+        margin-top: 8px;
+        max-width: 560px;
+        color: #8e96a8;
+      }
+      #error {
+        margin-top: 8px;
+        color: #ff6b6b;
+        max-width: 560px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+    <div id="hud">
+      <h1>tab <span id="tab">?</span> · <span id="phase">booting</span></h1>
+      <table>
+        <tr>
+          <th>anchor forwarded_app_packets<br />(this pair, both directions)</th>
+          <td class="big" id="pair">—</td>
+        </tr>
+        <tr>
+          <th>flat for</th>
+          <td id="flat">—</td>
+        </tr>
+        <tr>
+          <th>pair session</th>
+          <td id="direct">—</td>
+        </tr>
+        <tr>
+          <th>positions sent / received</th>
+          <td id="frames">0 / 0</td>
+        </tr>
+        <tr>
+          <th>measured send / receive rate</th>
+          <td id="rate">— / —</td>
+        </tr>
+        <tr>
+          <th>signalling forwarded (0x0D02)</th>
+          <td id="signal">—</td>
+        </tr>
+        <tr>
+          <th>announcement tick the anchor resolves</th>
+          <td id="tick">—</td>
+        </tr>
+        <tr>
+          <th>this leaf / peer</th>
+          <td><span id="me">—</span> / <span id="peer">—</span></td>
+        </tr>
+        <tr>
+          <th>three.js frames</th>
+          <td id="gl">—</td>
+        </tr>
+      </table>
+      <div id="note"></div>
+      <div id="error"></div>
+    </div>
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>

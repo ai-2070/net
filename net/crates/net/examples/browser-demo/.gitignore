@@ -1,0 +1,10 @@
+# The host is its own cargo workspace, so `net/crates/net`'s target
+# rule does not reach it.
+host/target/
+# The run's scratch: the CA and leaf certificate this process mints
+# for itself. A new run mints new keys, so nothing here outlives it.
+work/
+# three.js and playwright-core, installed by `run.sh` / `run.ps1` on
+# first use — same convention as the browser harness's driver.
+node_modules/
+package-lock.json
