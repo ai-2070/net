@@ -39,6 +39,7 @@ const NSS_NICKNAME = 'net-mesh-natsim-harness-ca';
 
 let live = null;
 let page = null;
+let internals = null;
 
 function log(line) {
   process.stderr.write(line + '\n');
@@ -145,6 +146,22 @@ async function opLaunch(req) {
     });
     log(`chromium ${headed ? 'HEADED' : 'headless'}, ice log: ${iceLog}`);
     const context = await browser.newContext();
+    // Opened NOW, not at shutdown. `chrome://webrtc-internals` only
+    // records peer connections that exist while it is open, and the
+    // leaf closes its connection the moment `connect` gives up — so
+    // the first version of this dump caught the event list and an
+    // EMPTY candidate grid, which is the one part worth having. The
+    // tab lives for the row and is read before the browser closes.
+    try {
+      internals = await context.newPage();
+      await internals.goto('chrome://webrtc-internals', {
+        waitUntil: 'domcontentloaded',
+        timeout: 15_000,
+      });
+    } catch (e) {
+      internals = null;
+      log(`webrtc-internals open: ${e && e.message}`);
+    }
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
   }
@@ -173,30 +190,17 @@ async function opOpen(req) {
 // in its own tab so the row's page is untouched, and best-effort: a
 // dump that fails must not fail a row.
 async function dumpWebrtcInternals() {
-  if (!live || live.engine === 'firefox' || !live.context) return;
-  let tab;
+  if (!internals) return;
   try {
-    tab = await live.context.newPage();
-    await tab.goto('chrome://webrtc-internals', {
-      waitUntil: 'domcontentloaded',
-      timeout: 15_000,
-    });
-    // The page renders asynchronously from the browser's own event
-    // stream; give it a beat to populate rather than racing it.
-    await tab.waitForTimeout(1_500);
-    const text = await tab.evaluate(() => document.body.innerText || '');
+    // A beat for the page to render the last events it received.
+    await internals.waitForTimeout(1_500);
+    const text = await internals.evaluate(() => document.body.innerText || '');
     for (const line of text.split('\n')) {
       const trimmed = line.trim();
       if (trimmed) log(`[webrtc-internals] ${trimmed}`);
     }
   } catch (e) {
     log(`webrtc-internals: ${e && e.message}`);
-  } finally {
-    try {
-      if (tab) await tab.close();
-    } catch {
-      /* closing a dump tab is not a row failure */
-    }
   }
 }
 
@@ -210,6 +214,7 @@ async function opShutdown() {
   }
   live = null;
   page = null;
+  internals = null;
   return {};
 }
 
