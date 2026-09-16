@@ -203,6 +203,43 @@ function flushHeld() {
 }
 
 // ---------------------------------------------------------------------
+// the DataChannels this tab CREATED
+// ---------------------------------------------------------------------
+//
+// Recorded in creation order so a step can take the pair's transport
+// away and leave the session — which is what a lost direct path
+// actually is, and the interruption the network-change retry row
+// needs before a network change has anything to repair.
+//
+// `createDataChannel` only. `ondatachannel` belongs to the leaf
+// (`rtc.rs` sets it), and whoever assigns last wins, so patching it
+// would silently break the answerer's channel adoption. The
+// consequence is deliberate: this records the channels this tab
+// OFFERED, which is the side that owns the repair anyway.
+//
+// Index 0 is the anchor's — `connect()` creates it before any peer
+// attempt exists — so a step keeps the first N and closes the rest.
+const channels = [];
+
+(function trackDataChannels() {
+  if (typeof RTCPeerConnection === 'undefined') return;
+  const proto = RTCPeerConnection.prototype;
+  const create = proto.createDataChannel;
+  proto.createDataChannel = function patched(...args) {
+    const channel = create.apply(this, args);
+    channels.push({ index: channels.length, label: channel.label, channel });
+    return channel;
+  };
+})();
+
+/// Every recorded channel with its live `readyState`. Reported before
+/// AND after a close, so closing the wrong one is visible rather than
+/// assumed.
+function channelRows() {
+  return channels.map((c) => ({ index: c.index, label: c.label, state: c.channel.readyState }));
+}
+
+// ---------------------------------------------------------------------
 // error typing
 // ---------------------------------------------------------------------
 //
@@ -1128,6 +1165,221 @@ async function execute(step) {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
       return { ok: true, stats: { counters: node.counters() } };
+    }
+
+    // ── Stage 6 slice 3 ──
+
+    // `RtcStats` on the leaf. Both halves come back: `counters` under
+    // the NATIVE field names, and `not_applicable` — the native
+    // fields a leaf has no meaning for, each with the reason it has
+    // none rather than a zero that would read as an observation.
+    case 'peer_rtc_stats': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const s = node.rtcStats();
+        return {
+          ok: true,
+          stats: {
+            counters: s.counters,
+            not_applicable: s.notApplicable,
+            fields: Object.keys(s.counters).length,
+            not_applicable_fields: Object.keys(s.notApplicable).length,
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // Arm the network-change trigger. Opt-in, so this step is the
+    // difference between a leaf that repairs a pair after a network
+    // change and one that does not.
+    case 'peer_arm_retry': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        node.enableNetworkRetry();
+        // Armed twice on purpose: a second arming must install no
+        // second listener, because two listeners for one `online`
+        // event are two triggers for one network change.
+        node.enableNetworkRetry();
+        const r = node.retryReport();
+        return { ok: true, stats: { armed: r.armed, owned: r.owned } };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    case 'peer_retry_report': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const r = node.retryReport();
+        return {
+          ok: true,
+          stats: {
+            armed: r.armed,
+            online: r.online,
+            ice_failed: r.iceFailed,
+            triggers: r.triggers,
+            started: r.started,
+            coalesced: r.coalesced,
+            not_eligible: r.notEligible,
+            open_episodes: r.openEpisodes,
+            owned: r.owned,
+            last: r.last === null ? '' : r.last,
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // Take the pair's TRANSPORT away and leave the session — what a
+    // lost direct path is. `keep: 1` spares index 0, the anchor's
+    // channel, which `connect()` created before any peer attempt
+    // existed. The rows before and after are what make "I closed the
+    // right one" an assertion.
+    case 'peer_channels': {
+      const before = channelRows();
+      let closed = 0;
+      if (step.close) {
+        const keep = step.keep === undefined ? 1 : step.keep;
+        for (const entry of channels) {
+          if (entry.index < keep) continue;
+          const state = entry.channel.readyState;
+          // Checked before closing, so `closed` counts channels that
+          // were actually live: that count is what makes "the path
+          // really was up and I took it down" an assertion.
+          if (state === 'open' || state === 'connecting') {
+            entry.channel.close();
+            closed += 1;
+          }
+        }
+      }
+      await sleep(50); // one turn, so readyState settles out of 'closing'
+      return {
+        ok: true,
+        stats: { closed, before: JSON.stringify(before), after: JSON.stringify(channelRows()) },
+      };
+    }
+
+    // Ride out one network change.
+    //
+    // IN FLIGHT across the offline window, necessarily: this page's
+    // step queue is HTTP and `setOffline` fails the context's HTTP,
+    // so a page cannot be handed a step while its network is down
+    // and cannot post a result either. The runner spawns this, then
+    // toggles the context offline and back; this waits for the two
+    // events and only then answers.
+    case 'peer_network_change': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const before = { counters: node.counters(), retry: node.retryReport() };
+      let offlineSeen = 0;
+      let onlineSeen = 0;
+      const onOffline = () => {
+        offlineSeen += 1;
+      };
+      const onOnline = () => {
+        onlineSeen += 1;
+      };
+      window.addEventListener('offline', onOffline);
+      window.addEventListener('online', onOnline);
+      // **Published, so the runner can WAIT for it.** The first run
+      // of this row read `0 offline event(s)`: the runner toggled
+      // the context offline 250 ms after posting this step, and the
+      // page had not yet long-polled it off the queue — so the
+      // listeners were installed AFTER the transition they exist to
+      // observe. A fixed sleep cannot fix that; the runner now polls
+      // this flag and toggles only once the page says it is
+      // listening.
+      window.__netChangeArmed = navigator.onLine;
+      const limit = Date.now() + (step.wait_ms || 20000);
+      try {
+        while (offlineSeen === 0 && Date.now() < limit) await sleep(25);
+        while (onlineSeen === 0 && Date.now() < limit) await sleep(25);
+        // A SECOND `online` event for the SAME network change. Not a
+        // convenience: a browser is under no obligation to fire each
+        // observation once — an interface that flaps fires `online`
+        // as often as it flaps — and two triggers must still produce
+        // ONE re-attempt. This is the defect the row exists to
+        // catch, driven through the production listener.
+        window.dispatchEvent(new Event('online'));
+        // Then wait for the one re-attempt to reach a disposition.
+        let settled = null;
+        while (Date.now() < limit) {
+          const r = node.retryReport();
+          if (r.last !== null) {
+            settled = r.last;
+            break;
+          }
+          await sleep(25);
+        }
+        const after = node.retryReport();
+        let direct = false;
+        try {
+          direct = (await node.peerAttempt(step.peer_hex)).direct;
+        } catch (e) {
+          // No live attempt is a legitimate reading here and not a
+          // failure of this step: it means the re-attempt's dialog
+          // is already gone.
+          direct = false;
+        }
+        return {
+          ok: true,
+          stats: {
+            offline_events: offlineSeen,
+            online_events: onlineSeen,
+            settled: settled === null ? '' : settled,
+            direct,
+            online_line: navigator.onLine,
+            started_before: before.retry.started,
+            attempted_before: before.counters.ice_attempted,
+            armed: after.armed,
+            online: after.online,
+            ice_failed: after.iceFailed,
+            triggers: after.triggers,
+            started: after.started,
+            coalesced: after.coalesced,
+            not_eligible: after.notEligible,
+            last: after.last === null ? '' : after.last,
+            counters: node.counters(),
+            counters_before: before.counters,
+          },
+        };
+      } finally {
+        window.removeEventListener('offline', onOffline);
+        window.removeEventListener('online', onOnline);
+      }
+    }
+
+    // One spelling of a node id through `signal`, with the refusal
+    // verbatim. An assertion about the boundary, not a drive step:
+    // the page-facing surfaces must agree about what a node id IS.
+    case 'peer_signal_spelling': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        await node.signal(step.peer_hex, 0, 'offer', new Uint8Array([]));
+        return { ok: true, stats: { parsed: true, detail: '' } };
+      } catch (e) {
+        const out = typedFailure(e);
+        // A PARSE refusal names the spelling; the v1 carrier's own
+        // refusal (R14: `AnchorControlPlane` carries no envelope)
+        // means the id parsed and the call got as far as the
+        // carrier. Distinguishing them is the whole point.
+        return {
+          ok: true,
+          stats: {
+            parsed: !/is not a peer id/.test(out.error || ''),
+            detail: out.error || '',
+            kind: out.kind || '',
+          },
+        };
+      }
     }
 
     case 'close': {

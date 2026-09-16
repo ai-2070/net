@@ -213,6 +213,7 @@ use net_sdk::rtc_bootstrap::{serve_bootstrap, BootstrapConfig, BootstrapTls};
 
 use browser::{Driver, Engine, LaunchSpec};
 use stage5::{Bundle, Step5Queue, Step5Sender};
+use stage6::{Step6Queue, Step6Sender};
 
 /// The transport trust domain's PSK. One value for the anchor, the
 /// impostor and every credential: the MITM witness must fail on the
@@ -597,6 +598,12 @@ struct PageState {
     /// One Stage 5 queue per tab, so two tabs are driven
     /// independently and their results never cross.
     steps5: Arc<HashMap<String, Step5Queue>>,
+    /// One slice 2 queue per tab, on `/harness/step6`. `peer6.js`
+    /// speaks its own step vocabulary — application data on a
+    /// peer-addressed stream, and closing a DataChannel from the
+    /// page — so a Stage 5 step delivered there would be an unknown
+    /// kind, and one of its steps delivered to `leaf5.js` likewise.
+    steps6: Arc<HashMap<String, Step6Queue>>,
     pending: Pending,
 }
 
@@ -688,9 +695,12 @@ async fn serve_page(
         .route("/leaf_bg.wasm", get(leaf_wasm))
         .route("/leaf5.html", get(leaf5_html))
         .route("/leaf5.js", get(leaf5_js))
+        .route("/peer6.html", get(peer6_html))
+        .route("/peer6.js", get(peer6_js))
         .route("/browser/{*path}", get(browser_asset))
         .route("/harness/step", get(next_step))
         .route("/harness/step5", get(next_step5))
+        .route("/harness/step6", get(next_step6))
         .route("/harness/result", post(step_result))
         .route("/harness/log", post(browser_log))
         .with_state(state);
@@ -732,6 +742,12 @@ async fn leaf5_html(State(s): State<PageState>) -> Response {
 }
 async fn leaf5_js(State(s): State<PageState>) -> Response {
     file_response(&s.page.join("leaf5.js"), "text/javascript; charset=utf-8")
+}
+async fn peer6_html(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("peer6.html"), "text/html; charset=utf-8")
+}
+async fn peer6_js(State(s): State<PageState>) -> Response {
+    file_response(&s.page.join("peer6.js"), "text/javascript; charset=utf-8")
 }
 
 /// Serve `@net-mesh/browser`'s built bundle under one prefix, so the
@@ -793,6 +809,28 @@ async fn next_step5(State(s): State<PageState>, Query(q): Query<TabQuery>) -> Re
     match tokio::time::timeout(Duration::from_secs(25), rx.recv()).await {
         Ok(Some((step, reply))) => {
             s.pending.lock().await.insert(step.id(), reply);
+            Json(step).into_response()
+        }
+        _ => idle().into_response(),
+    }
+}
+
+/// The slice 2 queues. Steps are `serde_json::Value`, because the
+/// §10 witness's vocabulary belongs to `stage6.rs` and `peer6.js`
+/// rather than to the Stage 5 step enum.
+async fn next_step6(State(s): State<PageState>, Query(q): Query<TabQuery>) -> Response {
+    let idle = || Json(serde_json::json!({ "kind": "idle", "id": 0, "millis": 50 }));
+    let Some(queue) = s.steps6.get(&q.tab) else {
+        return idle().into_response();
+    };
+    let mut rx = queue.lock().await;
+    match tokio::time::timeout(Duration::from_secs(25), rx.recv()).await {
+        Ok(Some((step, reply))) => {
+            let id = step
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            s.pending.lock().await.insert(id, reply);
             Json(step).into_response()
         }
         _ => idle().into_response(),
@@ -1865,12 +1903,22 @@ async fn run(
         step5_tx.insert((*tab).to_string(), tx);
         step5_rx.insert((*tab).to_string(), Arc::new(Mutex::new(rx)));
     }
+    // The slice 2 tabs are a third script on a third route: their
+    // page is `peer6.js` and its steps are not Stage 5 steps.
+    let mut step6_tx: HashMap<String, Step6Sender> = HashMap::new();
+    let mut step6_rx: HashMap<String, Step6Queue> = HashMap::new();
+    for tab in stage6::PEER_TABS {
+        let (tx, rx) = mpsc::channel(4);
+        step6_tx.insert(tab.to_string(), tx);
+        step6_rx.insert(tab.to_string(), Arc::new(Mutex::new(rx)));
+    }
     let page_state = PageState {
         dist,
         page: root.join("page"),
         browser_dist: bundle.dist.clone(),
         steps: Arc::new(Mutex::new(step_rx)),
         steps5: Arc::new(step5_rx),
+        steps6: Arc::new(step6_rx),
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
     let (page_addr, _page_task) = serve_page(page_state)
@@ -3666,6 +3714,7 @@ async fn run(
             page_origin: origin.clone(),
             stun: stun.clone(),
             tabs: step5_tx,
+            peer_tabs: step6_tx,
             anchor_rtc_addr: anchor_rtc_addr.to_string(),
         };
         stage6::run(cx6, ledger).await?;

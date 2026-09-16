@@ -542,6 +542,74 @@ export class BrowserNode {
     return parseCounters(this.inner.counters_json());
   }
 
+  /**
+   * The RTC transport's `RtcStats`, in the **same field names** the
+   * native `RtcStats` uses — plan §10's telemetry surface on the
+   * leaf.
+   *
+   * Values are exact decimal strings, for the reason
+   * {@link BrowserNode.counters} gives. `notApplicable` is not a
+   * counter: it maps each native field a leaf has no meaning for to
+   * the reason it has none, because a field frozen at `0` reads as
+   * an observation ("no ingress overflow", "no STUN requests
+   * answered") and a browser leaf is not entitled to those claims.
+   * Native makes the same choice in the other direction — it
+   * carries no `udpBlocked`/`udp_blocked` field at all — so
+   * `udp_blocked` is the one term here with no native counterpart.
+   *
+   * `ice_pending` is absent on both sides on purpose: it is
+   * `ice_attempted - (direct + relayed + failed + udp_blocked)`,
+   * the attempts still in flight, and the §10 identity is exact
+   * only where that residual is zero. Derive it; do not expect it.
+   */
+  rtcStats(): RtcStatsReading {
+    return parseRtcStats(this.inner.rtc_stats_json());
+  }
+
+  /**
+   * Arm the network-change re-attempt trigger: `online` events and
+   * an ICE `disconnected` → `failed` transition drive **one**
+   * bounded re-attempt per network change, per peer.
+   *
+   * Opt-in, and that is a decision rather than an omission.
+   * Re-dialling is policy and policy is the application's: a page
+   * may be holding a pair on the routed path deliberately, may be
+   * tearing down, may be on a metered link. §9 step 6 makes the
+   * routed session a supported disposition rather than a degraded
+   * one, so "this pair is relayed" is not a fault the library may
+   * assume it should fix.
+   *
+   * Idempotent — a second call installs no second listener. Only
+   * pairs this node took direct **as the offerer** are
+   * re-attempted: `connectPeer`'s side owns the repair, and both
+   * ends re-offering one network change would be two attempts per
+   * pair plus a supersession race.
+   *
+   * Once armed, {@link BrowserNode.retryReport} is how a page
+   * observes it.
+   */
+  enableNetworkRetry(): void {
+    try {
+      this.inner.arm_network_retry();
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * What the re-attempt owner has seen and done.
+   *
+   * `started` is the assertion that matters: one network change, one
+   * re-attempt, however many observations of it the browser
+   * delivered. `triggers` is how many arrived and `coalesced` is
+   * the difference the owner absorbed — reported rather than
+   * hidden, because "the trigger never fired" and "it fired and was
+   * absorbed" are different facts and only one of them is a defect.
+   */
+  retryReport(): RetryReport {
+    return parseRetryReport(this.inner.retry_report());
+  }
+
   /** Publish this node's capabilities as a signed fold announcement. */
   async announce(capabilities: readonly string[]): Promise<void> {
     try {
@@ -722,6 +790,105 @@ export function parseAttemptStatus(json: string): PeerAttemptStatus {
     answered: raw.answered === true,
     direct: raw.direct === true,
     remainingMs: String(raw.remainingMs ?? '0'),
+  };
+}
+
+/**
+ * One `rtc_stats_json()` reading — plan §10's `RtcStats` on the leaf.
+ *
+ * `counters` are exact decimal strings under the NATIVE field names;
+ * `notApplicable` maps each native field a leaf has no meaning for
+ * to the reason it has none. Kept apart in the type because they are
+ * different kinds of thing: one is measurement, the other is the
+ * refusal to pretend to measure.
+ */
+export interface RtcStatsReading {
+  readonly counters: Record<string, string>;
+  readonly notApplicable: Record<string, string>;
+}
+
+/** What {@link BrowserNode.retryReport} reports. */
+export interface RetryReport {
+  /** Whether {@link BrowserNode.enableNetworkRetry} has been called. */
+  readonly armed: boolean;
+  /** Triggers filed by the `online` listener. */
+  readonly online: string;
+  /** Triggers filed by the ICE `disconnected` → `failed` watcher. */
+  readonly iceFailed: string;
+  /** Every trigger seen, whatever the owner decided. */
+  readonly triggers: string;
+  /** Re-attempts STARTED. One per network change, per peer. */
+  readonly started: string;
+  /** Triggers absorbed into an episode that already had its attempt. */
+  readonly coalesced: string;
+  /** Triggers for a peer with nothing to repair. */
+  readonly notEligible: string;
+  /** Episodes open right now. */
+  readonly openEpisodes: number;
+  /** Pairs this node took direct as the offerer, i.e. the eligible set. */
+  readonly owned: number;
+  /**
+   * The last re-attempt's disposition, in
+   * {@link PeerConnectOutcome}'s vocabulary, or `null` before the
+   * first one. `offerRefused` is the one name not in that union: it
+   * is a repair that could not even re-offer, which `connectPeer`
+   * surfaces as a thrown error rather than an outcome.
+   */
+  readonly last: string | null;
+}
+
+/**
+ * Parse an `rtc_stats_json()` payload.
+ *
+ * `not_applicable` is lifted out rather than left among the
+ * counters: a consumer iterating the reading must not find a field
+ * whose value is a sentence where every other value is a number.
+ *
+ * Exported for the unit tests, which drive it with fixed payloads.
+ */
+export function parseRtcStats(json: string): RtcStatsReading {
+  const parsed: unknown = JSON.parse(json);
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new TypeError(`rtc_stats_json did not answer an object: ${json}`);
+  }
+  const counters: Record<string, string> = {};
+  const notApplicable: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key === 'not_applicable') {
+      if (value === null || typeof value !== 'object') continue;
+      for (const [field, reason] of Object.entries(value)) {
+        notApplicable[field] = String(reason);
+      }
+      continue;
+    }
+    counters[key] = typeof value === 'string' ? value : String(value);
+  }
+  return { counters, notApplicable };
+}
+
+/**
+ * Parse a `retry_report()` payload.
+ *
+ * Counts stay strings because they are `u64`, for the reason
+ * {@link parseCounters} gives. Exported for the unit tests.
+ */
+export function parseRetryReport(json: string): RetryReport {
+  const parsed: unknown = JSON.parse(json);
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new TypeError(`retry_report did not answer an object: ${json}`);
+  }
+  const raw = parsed as Record<string, unknown>;
+  return {
+    armed: raw.armed === true,
+    online: String(raw.online ?? '0'),
+    iceFailed: String(raw.iceFailed ?? '0'),
+    triggers: String(raw.triggers ?? '0'),
+    started: String(raw.started ?? '0'),
+    coalesced: String(raw.coalesced ?? '0'),
+    notEligible: String(raw.notEligible ?? '0'),
+    openEpisodes: Number(raw.openEpisodes ?? 0),
+    owned: Number(raw.owned ?? 0),
+    last: typeof raw.last === 'string' ? raw.last : null,
   };
 }
 

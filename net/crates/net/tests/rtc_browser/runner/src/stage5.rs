@@ -479,6 +479,92 @@ pub enum Step5 {
         id: u64,
         session: String,
     },
+    // ── Stage 6 slice 3: the network-change retry trigger, and
+    //    `rtcStats()` ──
+    /// `node.rtcStats()` — plan §10's `RtcStats` on the leaf, in the
+    /// NATIVE field names.
+    PeerRtcStats {
+        id: u64,
+        session: String,
+    },
+    /// `node.enableNetworkRetry()` — arm the network-change trigger.
+    ///
+    /// Opt-in, so this step is what makes the difference between a
+    /// leaf that repairs a pair after a network change and one that
+    /// does not. A row that forgot it would observe no re-attempt
+    /// and be right to.
+    PeerArmRetry {
+        id: u64,
+        session: String,
+    },
+    /// `node.retryReport()` — the re-attempt owner's ledger.
+    PeerRetryReport {
+        id: u64,
+        session: String,
+    },
+    /// Close the DataChannels this tab CREATED, above the first
+    /// `keep` of them, and report each channel's index, label and
+    /// `readyState` before and after.
+    ///
+    /// The interruption a retry row needs, and it is a real one: it
+    /// takes the pair's TRANSPORT away and leaves the session, which
+    /// is what a lost direct path is. Index 0 is the anchor's
+    /// channel — `connect()` creates it before any peer attempt
+    /// exists — so `keep: 1` leaves the anchor path alone, and the
+    /// reported rows are what makes "I closed the right one" an
+    /// assertion rather than a hope.
+    ///
+    /// Only the offerer's channels are visible: the page records
+    /// what `createDataChannel` produced, and the answerer receives
+    /// its channel through `ondatachannel`, which belongs to the
+    /// leaf and is deliberately not touched.
+    PeerChannels {
+        id: u64,
+        session: String,
+        close: bool,
+        /// How many LEADING channels to leave alone. `1` is the
+        /// anchor's.
+        keep: u32,
+    },
+    /// Ride out one network change and report what the re-attempt
+    /// owner did about it.
+    ///
+    /// **In flight across the offline window, necessarily.** The
+    /// page's step queue is HTTP, and `setOffline` fails the
+    /// context's HTTP — so a page cannot be handed a step while its
+    /// network is down, and cannot post a result either. This step
+    /// is therefore spawned before the runner goes offline: it waits
+    /// for the `offline` event, waits for `online`, and only then
+    /// answers.
+    ///
+    /// It also dispatches a SECOND `online` event for the same
+    /// network change, because that is the defect the row exists to
+    /// catch: a browser is under no obligation to fire each
+    /// observation once, and two triggers must still produce one
+    /// re-attempt.
+    PeerNetworkChange {
+        id: u64,
+        session: String,
+        peer_hex: String,
+        /// The page's own patience, in ms. The leaf owns the real
+        /// deadline; this only bounds the wait for the events.
+        wait_ms: u64,
+    },
+    /// `node.signal(peer_hex, …)` with one spelling of a node id,
+    /// reporting the refusal verbatim.
+    ///
+    /// Not a drive step: an assertion that the page-facing surfaces
+    /// agree about what a node id IS. The direct surface read
+    /// `parse_u64` (DECIMAL first), so it refused `node_id_hex()`'s
+    /// own output, and the leader-proxied twin read bare hex of any
+    /// length — two surfaces, two answers, and the proxied one could
+    /// not work at all because the leader re-encodes canonical
+    /// 16-hex on the way to the surface that wanted decimal.
+    PeerSignalSpelling {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
     Close {
         id: u64,
         session: String,
@@ -517,6 +603,12 @@ impl Step5 {
             | Self::PeerHandshakeTyped { id, .. }
             | Self::PeerArity { id, .. }
             | Self::PeerCounters { id, .. }
+            | Self::PeerRtcStats { id, .. }
+            | Self::PeerArmRetry { id, .. }
+            | Self::PeerRetryReport { id, .. }
+            | Self::PeerChannels { id, .. }
+            | Self::PeerNetworkChange { id, .. }
+            | Self::PeerSignalSpelling { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => id,
         }
@@ -550,6 +642,12 @@ impl Step5 {
             | Self::PeerHandshakeTyped { id, .. }
             | Self::PeerArity { id, .. }
             | Self::PeerCounters { id, .. }
+            | Self::PeerRtcStats { id, .. }
+            | Self::PeerArmRetry { id, .. }
+            | Self::PeerRetryReport { id, .. }
+            | Self::PeerChannels { id, .. }
+            | Self::PeerNetworkChange { id, .. }
+            | Self::PeerSignalSpelling { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => *id,
         }

@@ -195,6 +195,14 @@ struct PeerDialog {
     settled: bool,
 }
 
+/// One filed re-attempt trigger: where it came from, and which peer
+/// it names.
+///
+/// `None` is an `online` event — the network came back, which
+/// belongs to every pair this leaf owns a repair for rather than to
+/// one. `Some(peer)` is that peer's ICE giving up.
+type RetryTrigger = (crate::retry::TriggerSource, Option<NodeId>);
+
 /// The shared interior. One per node; the transport's inbound
 /// closure holds a `Weak` to it, so a closed node's callbacks cannot
 /// resurrect it.
@@ -281,6 +289,45 @@ struct Inner {
     dispatching: bool,
     listeners: Vec<js_sys::Function>,
     closed: bool,
+    // ───────── the network-change re-attempt owner (slice 3) ─────────
+    /// The one owner of the network-change re-attempt.
+    ///
+    /// Both trigger sources reach it and nothing else decides: see
+    /// [`crate::retry::RetryPolicy`].
+    retry: crate::retry::RetryPolicy,
+    /// Whether the window listeners are installed.
+    ///
+    /// Opt-in, and the page's call — see
+    /// [`LeafNode::arm_network_retry`]. Idempotent: a second arming
+    /// is a no-op, not a second listener, because two listeners for
+    /// one `online` event are two triggers for one network change
+    /// and the whole row is about that not becoming two attempts.
+    retry_armed: bool,
+    /// The `online`/`offline` listeners, kept alive for the node's
+    /// lifetime. Dropping a closure would detach the callback.
+    retry_listeners: Vec<Closure<dyn FnMut(JsValue)>>,
+    /// Triggers filed and not yet decided.
+    ///
+    /// **The single funnel.** The `online` listener runs inside a JS
+    /// callback and the ICE watcher inside another
+    /// ([`crate::rtc::RtcLeafTransport::take_ice_failures`]), so
+    /// neither may re-enter the `RefCell` the pump may hold. They
+    /// file here; the ticker drains and [`Inner::retry`] decides.
+    /// A `None` peer is an `online` event, which belongs to every
+    /// peer this leaf owns a re-attempt for rather than to one.
+    retry_triggers: Rc<RefCell<VecDeque<RetryTrigger>>>,
+    /// Peers this leaf took a DIRECT session with **as the
+    /// offerer**, and therefore owns the re-attempt for.
+    ///
+    /// The answerer must not re-offer: §9 step 4 gives the offerer
+    /// the initiating role, and two leaves re-offering each other
+    /// on one network change is two attempts per pair plus a
+    /// supersession race. So the side that offered owns the repair
+    /// and the other side answers it, exactly as it answered the
+    /// first one.
+    direct_offerer: std::collections::HashSet<NodeId>,
+    /// The last re-attempt's disposition, for `retryReport()`.
+    retry_last: Option<&'static str>,
 }
 
 impl Inner {
@@ -452,7 +499,62 @@ impl Inner {
     /// a pair that now has its own channel.
     fn direct_installed(&mut self, peer: NodeId) {
         self.node.clear_peer_relay(peer);
+        // The re-attempt owner's eligibility set, recorded here
+        // because this is the one place a direct session is known to
+        // be installed AND the role that installed it is still
+        // readable. The offerer owns the repair (see
+        // [`Inner::direct_offerer`]); the answerer records nothing
+        // and re-offers nothing.
+        if self.peers.get(&peer).map(|d| d.role) == Some(PeerRole::Offerer) {
+            self.direct_offerer.insert(peer);
+        }
         self.settle(peer, IceTerm::Direct);
+    }
+
+    /// Is `peer`'s direct path — one this leaf offered — not
+    /// carrying traffic?
+    ///
+    /// The only reading that makes a re-attempt meaningful, and the
+    /// `interrupted` argument [`crate::retry::RetryPolicy::note`]
+    /// takes. Two facts, both required: this leaf took the pair
+    /// direct as the offerer, and the direct path is not usable
+    /// right now.
+    ///
+    /// **Three conditions, not two.** The first version read only
+    /// the session — a session exists and no relay entry stands for
+    /// it, i.e. `peer_candidate`'s `direct` inverted — and that is
+    /// wrong in the exact case a repair is for: a DataChannel that
+    /// closed leaves the session installed and unrelayed, so the
+    /// pair reads DIRECT while no byte can leave. That is the
+    /// "silent half-working fallback" §10 excludes, and a trigger
+    /// that consulted it would have decided there was nothing to
+    /// repair. So the transport is part of the reading: `is_open`
+    /// is what says the direct path can carry anything.
+    ///
+    /// A pair whose channel is open, whose session is installed and
+    /// which holds no relay entry is healthy and is not
+    /// re-attempted, however many network changes arrive.
+    fn direct_interrupted(&self, peer: NodeId) -> bool {
+        if !self.direct_offerer.contains(&peer) {
+            return false;
+        }
+        !(self.node.has_session(peer)
+            && self.node.peer_relay(peer).is_none()
+            && self.transport.is_open(peer))
+    }
+
+    /// Drain the transport's ICE `disconnected` → `failed`
+    /// observations into the trigger queue.
+    ///
+    /// One of the two sources; the other is the `online` listener.
+    /// Both file into `retry_triggers` and neither decides anything,
+    /// which is what makes the owner single.
+    fn harvest_ice_failures(&mut self) {
+        for peer in self.transport.take_ice_failures() {
+            self.retry_triggers
+                .borrow_mut()
+                .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+        }
     }
 
     /// Deliver, then run the node's time-driven work: retransmit
@@ -715,6 +817,16 @@ impl LeafNode {
             dispatching: false,
             listeners: Vec::new(),
             closed: false,
+            // One window for the episode and for the re-attempt it
+            // starts: the same number a peer attempt's own ICE
+            // deadline is, because "until this attempt is over" is
+            // what an episode lasts.
+            retry: crate::retry::RetryPolicy::new(PEER_ICE_DEADLINE_MS),
+            retry_armed: false,
+            retry_listeners: Vec::new(),
+            retry_triggers: Rc::new(RefCell::new(VecDeque::new())),
+            direct_offerer: std::collections::HashSet::new(),
+            retry_last: None,
         }));
 
         // The inbound sink queues **and delivers**. A `Weak` so the
@@ -893,6 +1005,121 @@ impl LeafNode {
         self.inner.borrow().node.counters().to_json()
     }
 
+    /// `RtcStats` on the leaf — plan §10's telemetry surface, in the
+    /// field names the NATIVE `RtcStats` uses.
+    ///
+    /// Page-facing as `node.rtcStats()` through
+    /// `@net-mesh/browser`. `u64`s are decimal strings, the rule
+    /// [`Self::counters_json`] follows.
+    ///
+    /// Two halves, one reading: the transport's own ledger
+    /// (admission, writes, the buffered-amount high water) and the
+    /// ICE attempt ledger the conformance matrix asserts on. Plus
+    /// `not_applicable`, which names the 24 native fields a leaf has
+    /// no meaning for **and says why** — see
+    /// [`crate::counters::LeafCounters::rtc_stats_json`] for the
+    /// reason that is a list of reasons rather than a wall of
+    /// zeros.
+    pub fn rtc_stats_json(&self) -> String {
+        let guard = self.inner.borrow();
+        let link = guard.transport.link_snapshot();
+        guard.node.counters().rtc_stats_json(&link)
+    }
+
+    /// Arm the network-change re-attempt trigger.
+    ///
+    /// Installs the window's `online` listener; the ICE
+    /// `disconnected` → `failed` watcher is already on every peer
+    /// connection this transport owns. From here, either
+    /// observation files a trigger and
+    /// [`crate::retry::RetryPolicy`] decides — once per network
+    /// change, per peer.
+    ///
+    /// # Why a page has to ask
+    ///
+    /// Re-dialling is policy, and policy is the application's. A
+    /// library that re-offered on its own would take that decision
+    /// away from a page that has a reason not to: one that is
+    /// deliberately holding a pair on the routed path, one tearing
+    /// down, one whose user is on a metered link. §9 step 6 makes
+    /// the routed session a supported disposition rather than a
+    /// degraded one, so "the pair is relayed" is not a fault this
+    /// leaf may assume it should fix.
+    ///
+    /// **Idempotent.** A second call adds no second listener,
+    /// because two listeners for one `online` event are two triggers
+    /// for one network change — and while the owner would coalesce
+    /// them, a page that armed twice should not be relying on that.
+    ///
+    /// Only pairs this leaf took direct **as the offerer** are
+    /// re-attempted: §9 step 4 gives the offerer the initiating
+    /// role, and both sides re-offering one network change is two
+    /// attempts per pair plus a supersession race.
+    pub fn arm_network_retry(&self) -> Result<(), JsError> {
+        let mut guard = self.inner.borrow_mut();
+        guard.admit().map_err(js)?;
+        if guard.retry_armed {
+            return Ok(());
+        }
+        let window = web_sys::window()
+            .ok_or_else(|| JsError::new("no window: the network-change trigger needs one"))?;
+        let triggers = Rc::clone(&guard.retry_triggers);
+        // Filed, never acted on here. This runs inside a JS event
+        // callback and the owner lives behind the `RefCell` the pump
+        // may hold; the ticker drains.
+        let online = Closure::wrap(Box::new(move |_event: JsValue| {
+            triggers
+                .borrow_mut()
+                .push_back((crate::retry::TriggerSource::Online, None));
+        }) as Box<dyn FnMut(JsValue)>);
+        window
+            .add_event_listener_with_callback("online", online.as_ref().unchecked_ref())
+            .map_err(|e| JsError::new(&format!("online listener: {e:?}")))?;
+        guard.retry_listeners.push(online);
+        guard.retry_armed = true;
+        Ok(())
+    }
+
+    /// The re-attempt owner's ledger, as JSON.
+    ///
+    /// `{"armed":<bool>,"online":"<n>","iceFailed":"<n>",
+    /// "triggers":"<n>","started":"<n>","coalesced":"<n>",
+    /// "notEligible":"<n>","openEpisodes":<n>,"owned":<n>,
+    /// "last":"<disposition>"|null}`.
+    ///
+    /// `started` is the number the witness asserts: one network
+    /// change, one re-attempt, however many observations of it
+    /// arrived. `triggers` is how many arrived, and `coalesced` is
+    /// the difference the owner absorbed — reported rather than
+    /// hidden, because "the trigger never fired" and "it fired and
+    /// was absorbed" are different facts and only one of them is a
+    /// defect.
+    ///
+    /// `owned` is how many pairs this leaf took direct as the
+    /// offerer, i.e. the set a network change is evaluated against.
+    pub fn retry_report(&self) -> String {
+        let guard = self.inner.borrow();
+        let ledger = guard.retry.ledger();
+        let now = clock::now();
+        let last = guard
+            .retry_last
+            .map_or_else(|| "null".to_string(), json_string);
+        format!(
+            "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"triggers\":\"{}\",\
+             \"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
+             \"openEpisodes\":{},\"owned\":{},\"last\":{last}}}",
+            guard.retry_armed,
+            ledger.online,
+            ledger.ice_failed,
+            ledger.triggers(),
+            ledger.started,
+            ledger.coalesced,
+            ledger.not_eligible,
+            guard.retry.open_episodes(now),
+            guard.direct_offerer.len(),
+        )
+    }
+
     /// Call `service` on the anchor.
     ///
     /// Resolves to the reply body, or rejects with the typed
@@ -956,22 +1183,54 @@ impl LeafNode {
     /// Open an application stream.
     ///
     /// `opts`: `{ reliability: "reliable" | "fireAndForget",
-    /// reliable?: boolean, label?, streamId?, channelHash? }`.
+    /// reliable?: boolean, label?, streamId?, channelHash?, peer? }`.
     /// `streamId` (a decimal or `0x`-hex **string**, because a `u64`
     /// never crosses as a JS number) and `channelHash` (a **number**
     /// in `0..=65535`) are used verbatim when present, so a stream
     /// can match a publish contract a native handler dispatches on.
     ///
+    /// `peer` is **16 hex digits** — the spelling `node_id_hex()`
+    /// hands out and the four §9 peer methods take — and names the
+    /// node the stream addresses; absent, it is the anchor, which is
+    /// what every caller before this option got and still gets. It
+    /// is the page-facing half of §9: `connectPeer` installs a
+    /// direct leaf ↔ leaf session and this is what puts application
+    /// bytes on it. Nothing below it changes —
+    /// `crate::node::LeafNode::open_stream` has always taken a peer
+    /// and `route_outbound` has always decided routed vs direct, so
+    /// a stream to a peer whose session is still ROUTED rides the
+    /// anchor and needs no second call to start riding the
+    /// DataChannel.
+    ///
+    /// **But the HANDLE does not survive the upgrade.** §9 step 4
+    /// installs a *replacement* session, so the peer's incarnation
+    /// changes, and a `StreamHandle` is fenced to the incarnation it
+    /// was opened on
+    /// ([`crate::node::LeafNode::check_handle`] — the alias the
+    /// native R12 fix closed): a handle opened while the pair was
+    /// routed refuses with "stale stream handle … reopen the
+    /// stream" once the direct session lands. The addressing is
+    /// unchanged — same peer, same `streamId` if one was pinned —
+    /// so reopening is one call and the far end sees the same
+    /// stream; what is not true is that the old handle keeps
+    /// working. A page driving a peer across the upgrade should
+    /// reopen on that refusal.
+    ///
+    /// A peer with no session at all refuses typed from `send`,
+    /// unchanged.
+    ///
     /// Both are read by `stream_options`, which
     /// [`crate::leader_session::MeshSession::open_stream`] also
     /// calls: the direct and the proxied surface cannot read the
-    /// same option object two ways.
+    /// same option object two ways. That surface **refuses** `peer`
+    /// rather than dropping it — see
+    /// [`StreamOptions::require_anchor_addressed`].
     pub fn open_stream(&self, opts: JsValue) -> Result<LeafStream, JsError> {
         let options = stream_options(&opts)?;
 
         let mut guard = self.inner.borrow_mut();
         guard.admit().map_err(js)?;
-        let peer = guard.anchor;
+        let peer = options.peer.unwrap_or(guard.anchor);
         let handle = guard
             .node
             .open_stream(
@@ -1011,9 +1270,11 @@ impl LeafNode {
     /// the stream.
     ///
     /// Shape: `{"reliability":"reliable","label":"app",
-    /// "streamId":"0000000000000009","channelHash":7}`, with
-    /// `streamId` `null` when the caller did not pin one (the node
-    /// allocates) and `channelHash` `null` when absent.
+    /// "streamId":"0000000000000009","channelHash":7,
+    /// "peer":"00366d403ce19dac"}`, with `streamId` `null` when the
+    /// caller did not pin one (the node allocates), `channelHash`
+    /// `null` when absent, and `peer` `null` when the stream
+    /// addresses the anchor.
     pub fn effective_stream_options(opts: JsValue) -> Result<String, JsError> {
         Ok(stream_options(&opts)?.to_json())
     }
@@ -1069,7 +1330,17 @@ impl LeafNode {
         kind: String,
         payload: Uint8Array,
     ) -> Result<(), JsError> {
-        let peer = parse_u64(&peer_hex)?;
+        // **One spelling, and it is the one this boundary hands
+        // out.** This read `parse_u64`, which is DECIMAL for a bare
+        // string — so `node_id_hex()`'s own output was refused here
+        // while the four §9 methods accept it, and a page that got
+        // an id from one surface could not use it on the other. The
+        // leader-proxied twin
+        // ([`crate::leader_session::MeshSession::signal`]) read bare
+        // hex of any length, so `"9"` and `"deadbeef"` named nodes
+        // there that nothing else would accept. All three now parse
+        // the same 16 hex digits (PeerLoop's audit, 2026-09-16).
+        let peer = parse_peer_id(&peer_hex)?;
         let kind = match kind.as_str() {
             "offer" => SignalKind::Offer,
             "answer" => SignalKind::Answer,
@@ -1124,8 +1395,36 @@ impl LeafNode {
     ///    attempt to charge.
     /// 3. **The offer goes out** as a signed `Offer` envelope inside
     ///    that session, and `ice_attempted` moves.
+    ///
+    /// The deadline the attempt runs under is
+    /// [`PEER_ICE_DEADLINE_MS`] from now. The re-attempt owner calls
+    /// [`Self::offer_peer`] directly with the episode's deadline
+    /// instead, which is how a repair and the window that absorbs
+    /// its duplicate triggers end up being one absolute instant
+    /// rather than two that nearly agree.
     pub async fn peer_offer(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
+        let dialog = self
+            .offer_peer(peer, crate::clock::Deadline::in_ms(PEER_ICE_DEADLINE_MS))
+            .await?;
+        Ok(format!("{dialog:016x}"))
+    }
+
+    /// [`Self::peer_offer`]'s whole body, with the attempt's
+    /// absolute deadline as a parameter.
+    ///
+    /// Not page-facing: a page names a peer and gets the one
+    /// deadline the leaf publishes. The parameter exists so the
+    /// network-change re-attempt owner can drive **this** function —
+    /// the production offer path, with its supersession, its
+    /// counting and its ordering — under the deadline its episode
+    /// already committed to, rather than a second offer path that
+    /// agreed with this one on the day it was written.
+    async fn offer_peer(
+        &self,
+        peer: NodeId,
+        deadline: crate::clock::Deadline,
+    ) -> Result<DialogId, JsError> {
         let (anchor, noise, psk, ice_servers) = {
             let guard = self.inner.borrow();
             guard.admit().map_err(js)?;
@@ -1175,7 +1474,7 @@ impl LeafNode {
                     role: PeerRole::Offerer,
                     inbox: VecDeque::new(),
                     local: VecDeque::new(),
-                    deadline: crate::clock::Deadline::in_ms(PEER_ICE_DEADLINE_MS),
+                    deadline,
                     settled: false,
                 },
             );
@@ -1211,7 +1510,7 @@ impl LeafNode {
             });
             return Err(js(e));
         }
-        Ok(format!("{dialog:016x}"))
+        Ok(dialog)
     }
 
     /// Answer the offer `peer` sent — the other half of §9 step 3.
@@ -1341,6 +1640,22 @@ impl LeafNode {
     /// opening is what matters.
     pub async fn peer_candidate(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
+        let r = self.service_peer(peer).await?;
+        Ok(format!(
+            "{{\"dialog\":\"{:016x}\",\"state\":\"{}\",\"sent\":{},\
+             \"applied\":{},\"answered\":{},\"direct\":{},\
+             \"remainingMs\":\"{}\"}}",
+            r.dialog, r.state, r.sent, r.applied, r.answered, r.direct, r.remaining_ms
+        ))
+    }
+
+    /// [`Self::peer_candidate`]'s whole body, before the JSON.
+    ///
+    /// Split out for the reason [`Self::offer_peer`] is: the
+    /// re-attempt owner drives the attempt through the SAME service
+    /// step a page's drive loop calls, and a private reading is a
+    /// struct rather than a string it would have to re-parse.
+    async fn service_peer(&self, peer: NodeId) -> Result<AttemptReading, JsError> {
         let (dialog, role, outgoing, incoming, transport) = with_node(&self.inner, |guard| {
             guard.admit()?;
             guard.harvest_candidates();
@@ -1436,11 +1751,15 @@ impl LeafNode {
             let guard = self.inner.borrow();
             guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
         };
-        Ok(format!(
-            "{{\"dialog\":\"{dialog:016x}\",\"state\":\"{state}\",\"sent\":{sent},\
-             \"applied\":{applied},\"answered\":{answered},\"direct\":{direct},\
-             \"remainingMs\":\"{remaining}\"}}"
-        ))
+        Ok(AttemptReading {
+            dialog,
+            state,
+            sent,
+            applied,
+            answered,
+            direct,
+            remaining_ms: remaining,
+        })
     }
 
     /// Run the Noise handshake with `peer` over the direct
@@ -1465,6 +1784,13 @@ impl LeafNode {
     /// Stage 3/4a fence, unchanged and unreached from here.
     pub async fn peer_handshake(&self, peer_hex: String) -> Result<(), JsError> {
         let peer = parse_peer_id(&peer_hex)?;
+        self.run_handshake(peer).await
+    }
+
+    /// [`Self::peer_handshake`]'s whole body. Split out so the
+    /// re-attempt owner runs the production step and not a copy of
+    /// it.
+    async fn run_handshake(&self, peer: NodeId) -> Result<(), JsError> {
         let msg1 = with_node(&self.inner, |guard| {
             guard.admit()?;
             let dialog = guard
@@ -1631,6 +1957,98 @@ impl LeafNode {
             guard.collect(events);
             failed
         })
+    }
+}
+
+/// One service of a live attempt, as [`LeafNode::service_peer`]
+/// reads it.
+///
+/// `state` is about ICE and `direct` is about the SESSION. Two
+/// different facts, and a reader that conflates them would call a
+/// pair direct because a channel opened.
+struct AttemptReading {
+    dialog: DialogId,
+    state: &'static str,
+    sent: usize,
+    applied: usize,
+    answered: bool,
+    direct: bool,
+    remaining_ms: u64,
+}
+
+/// The network-change re-attempt owner's execution half.
+impl LeafNode {
+    /// Run ONE re-attempt for `peer`, bounded by `deadline`.
+    ///
+    /// **Every step here is the production step**, not a copy of
+    /// one: [`Self::offer_peer`] is `peer_offer`'s body (so the
+    /// re-attempt supersedes the stale dialog, counts
+    /// `ice_attempted` once, and puts the routed session back before
+    /// it replaces the channel), [`Self::service_peer`] is
+    /// `peer_candidate`'s, and [`Self::run_handshake`] is
+    /// `peer_handshake`'s. What this function adds is the loop
+    /// between them and nothing else.
+    ///
+    /// **Retire before install**, Stage 4a's rule: the retirement is
+    /// `offer_peer`'s own `supersede`, which counts the dialog it
+    /// replaces rather than dropping it, and it happens before the
+    /// new dialog is registered — so the §10 partition holds across
+    /// a repair.
+    ///
+    /// **One absolute deadline**: `deadline` is the episode's, it is
+    /// what the new dialog is given, and it is therefore what the
+    /// channel wait, the settle and the Noise wait all read. There
+    /// is no second clock here.
+    async fn re_attempt(&self, peer: NodeId, deadline: crate::clock::Deadline) {
+        let outcome = self.re_attempt_once(peer, deadline).await;
+        with_node(&self.inner, |guard| {
+            guard.retry_last = Some(outcome);
+        });
+    }
+
+    /// The re-attempt, reporting where it ended.
+    ///
+    /// The dispositions are the typed outcome union's names, because
+    /// a repair ends the same four ways an attempt does and a fifth
+    /// vocabulary would be a second taxonomy for one fact.
+    async fn re_attempt_once(
+        &self,
+        peer: NodeId,
+        deadline: crate::clock::Deadline,
+    ) -> &'static str {
+        if self.offer_peer(peer, deadline).await.is_err() {
+            // The routed session would not come up, the peer is no
+            // longer discoverable, or the offer could not be signed
+            // and sent. `offer_peer` counted a term for whatever it
+            // allocated.
+            return "offerRefused";
+        }
+        loop {
+            let reading = match self.service_peer(peer).await {
+                Ok(reading) => reading,
+                // The peer rejected, or the attempt is gone —
+                // superseded by a page that started its own while
+                // this ran, which is the page's to own and not
+                // this owner's to fight over.
+                Err(_) => return "superseded",
+            };
+            match reading.state {
+                "open" => break,
+                "iceTimeout" => return "iceTimeout",
+                "udpBlocked" => return "udpBlocked",
+                _ => {}
+            }
+            if reading.remaining_ms == 0 {
+                // The episode's own deadline, read through the
+                // dialog it created. Not a second bound.
+                return "iceTimeout";
+            }
+            gloo_timer_sleep(TICK_MS).await.ok();
+        }
+        if self.run_handshake(peer).await.is_err() {
+            return "handshakeFailed";
+        }
+        "direct"
     }
 }
 
@@ -2258,8 +2676,68 @@ fn start_ticker(inner: Weak<RefCell<Inner>>) {
             // After the borrow, so a listener that sends or closes
             // from here is doing so on an unborrowed node.
             dispatch_events(&inner);
+            // And the re-attempt owner, for the same reason: it
+            // spawns, and what it spawns takes the node.
+            drive_retries(&inner);
         }
     });
+}
+
+/// Drain the trigger queue, decide once per peer, and start at most
+/// one re-attempt each.
+///
+/// **This is the single owner.** Both sources file into
+/// `retry_triggers` — the window's `online` listener and the
+/// transport's ICE `disconnected` → `failed` watcher — and neither
+/// acts; this drains, asks [`crate::retry::RetryPolicy`], and
+/// spawns. Two callbacks that each started a re-attempt would be
+/// two owners of one retry, and both firing for one network change
+/// is the defect this row exists to catch.
+///
+/// Called from the ticker rather than from the callbacks so the
+/// decision is never taken while the node is borrowed. The cost is
+/// up to one tick of latency on a repair that is already waiting on
+/// ICE.
+fn drive_retries(inner: &Rc<RefCell<Inner>>) {
+    let starts = {
+        let Ok(mut guard) = inner.try_borrow_mut() else {
+            return;
+        };
+        if guard.closed {
+            return;
+        }
+        guard.harvest_ice_failures();
+        let triggers: Vec<RetryTrigger> = guard.retry_triggers.borrow_mut().drain(..).collect();
+        let now = clock::now();
+        let mut starts: Vec<(NodeId, crate::clock::Deadline)> = Vec::new();
+        for (source, peer) in triggers {
+            // An `online` event belongs to every peer this leaf owns
+            // a re-attempt for, not to one: the network came back,
+            // and which pairs that repairs is a question about the
+            // pairs. A peer-scoped ICE failure belongs to its peer.
+            let peers: Vec<NodeId> = match peer {
+                Some(peer) => vec![peer],
+                None => guard.direct_offerer.iter().copied().collect(),
+            };
+            for peer in peers {
+                let interrupted = guard.direct_interrupted(peer);
+                if let crate::retry::RetryDecision::Start(deadline) =
+                    guard.retry.note(peer, source, now, interrupted)
+                {
+                    starts.push((peer, deadline));
+                }
+            }
+        }
+        starts
+    };
+    for (peer, deadline) in starts {
+        let node = LeafNode {
+            inner: Rc::clone(inner),
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            node.re_attempt(peer, deadline).await;
+        });
+    }
 }
 
 /// The identity `connect` runs under.
@@ -2396,6 +2874,23 @@ pub(crate) struct StreamOptions {
     /// The id the caller pinned, or `None` to let the node allocate.
     pub(crate) stream_id: Option<u64>,
     pub(crate) channel_hash: Option<u16>,
+    /// The peer this stream addresses, or `None` for the anchor.
+    ///
+    /// The node's own `open_stream` has always been peer-addressed
+    /// (`crate::node::LeafNode::open_stream` takes a `NodeId` and
+    /// `route_outbound` decides routed vs direct); this boundary
+    /// pinned it to the anchor, so a page could establish a direct
+    /// leaf ↔ leaf session under §9 and then had nothing that could
+    /// send a byte over it. The only leaf → peer traffic a page
+    /// could cause was signalling, which the anchor's per-pair
+    /// application-data counter excludes — so §10's first two parts
+    /// were unreachable from a page as well.
+    ///
+    /// 16 hex digits, read through [`parse_peer_id`]: the same
+    /// spelling `node_id_hex()` hands out and the four peer methods
+    /// take. A decimal id is refused rather than accepted as a
+    /// second spelling.
+    pub(crate) peer: Option<u64>,
 }
 
 impl StreamOptions {
@@ -2413,15 +2908,50 @@ impl StreamOptions {
         let channel_hash = self
             .channel_hash
             .map_or_else(|| "null".to_string(), |hash| hash.to_string());
+        // `peer` is spelled the way the boundary HANDS OUT node ids —
+        // 16 lowercase hex digits — and is `null` for the anchor.
+        // Reported rather than left implicit because this reader is
+        // the only way a page can confirm the leaf read its peer id
+        // at all, which is exactly what `effective_ice_servers` was
+        // added for after Stage 5 dropped every `RTCIceServer`
+        // silently.
+        let peer = self
+            .peer
+            .map_or_else(|| "null".to_string(), |peer| format!("\"{peer:016x}\""));
         format!(
             "{{\"reliability\":\"{reliability}\",\"label\":{},\"streamId\":{stream_id},\
-             \"channelHash\":{channel_hash}}}",
+             \"channelHash\":{channel_hash},\"peer\":{peer}}}",
             json_string(&self.label)
         )
     }
+
+    /// Refuse a `peer` option on a surface that cannot honour it.
+    ///
+    /// [`stream_options`] is shared with the leader-proxied surface
+    /// ([`crate::leader_session::MeshSession::open_stream`]) —
+    /// deliberately, so the direct and the proxied path cannot read
+    /// one options object two ways. But a follower's stream is
+    /// opened by the LEADER tab's node, and `LeaderRequest::
+    /// StreamOpen` carries no peer, so a `peer` that crossed there
+    /// would be dropped and the stream would quietly address the
+    /// leader's anchor instead. "The positions stopped arriving" is
+    /// indistinguishable from a slow peer, so the proxied surface
+    /// refuses the option by name instead of honouring it
+    /// approximately.
+    pub(crate) fn require_anchor_addressed(&self, surface: &str) -> Result<(), JsError> {
+        match self.peer {
+            None => Ok(()),
+            Some(peer) => Err(JsError::new(&format!(
+                "{surface} cannot address a peer: the stream would be opened by the leader \
+                 tab's node, which this request carries no peer to. Call `openStream({{ peer: \
+                 \"{peer:016x}\" }})` on the leader's own node."
+            ))),
+        }
+    }
 }
 
-/// Read `{ reliability?, reliable?, label?, streamId?, channelHash? }`.
+/// Read `{ reliability?, reliable?, label?, streamId?, channelHash?,
+/// peer? }`.
 pub(crate) fn stream_options(opts: &JsValue) -> Result<StreamOptions, JsError> {
     let reliability = match typed_string(opts, "reliability", "\"reliable\" or \"fireAndForget\"")?
     {
@@ -2440,6 +2970,10 @@ pub(crate) fn stream_options(opts: &JsValue) -> Result<StreamOptions, JsError> {
             None => None,
         },
         channel_hash: optional_u16(opts, "channelHash")?,
+        peer: match typed_string(opts, "peer", "16 hex digits")? {
+            Some(raw) => Some(parse_peer_id(&raw)?),
+            None => None,
+        },
     })
 }
 
@@ -2553,7 +3087,7 @@ fn json_string(raw: &str) -> String {
 /// second spelling — one contract, and `0009` meaning two different
 /// nodes depending on which method read it is exactly the class of
 /// defect the `u64`-as-string rule exists to prevent.
-fn parse_peer_id(raw: &str) -> Result<u64, JsError> {
+pub(crate) fn parse_peer_id(raw: &str) -> Result<u64, JsError> {
     let trimmed = raw.trim();
     let hex = trimmed
         .strip_prefix("0x")

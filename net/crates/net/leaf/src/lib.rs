@@ -65,6 +65,10 @@ pub mod leader_session;
 #[cfg(feature = "mock-control-plane")]
 pub mod mock_control_plane;
 pub mod node;
+/// The network-change re-attempt owner's policy: one owner, one
+/// absolute deadline, one re-attempt per network change. Native, so
+/// the rule is assertable without a browser.
+pub mod retry;
 pub mod rpc;
 pub mod rpc_wire;
 /// The browser transport. `wasm32`-only: it is the one module that

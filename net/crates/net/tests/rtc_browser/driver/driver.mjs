@@ -420,6 +420,98 @@ async function opLifecycle(req) {
   return { state: req.state };
 }
 
+// `BrowserContext.setOffline` — the network change plan §10's retry
+// row is driven by.
+//
+// **Per CONTEXT, and the context that owns this page.** Stage 6's two
+// tabs live in genuinely isolated contexts, so `live.context` is the
+// wrong one for either of them: taking the launch context offline
+// would change nothing a Stage 6 page can observe and the witness
+// would pass while having disconnected nobody. The page name is
+// therefore the argument, and the context is looked up from it —
+// the same lookup `opLifecycle` does, for the same reason.
+//
+// The context's OTHER pages go offline with it, which is exactly
+// right: a browsing context is the unit a network change happens to.
+// It is also why the caller must name the side it means — "the
+// network changed" is ambiguous about whose network.
+//
+// What this does and does not do, stated because the witness depends
+// on it: it flips `navigator.onLine` and fires `offline`/`online` in
+// every page of the context, and it fails the context's HTTP. It is
+// NOT a link-layer break — Chromium's emulation sits on the URL
+// loader, so an established ICE path over loopback keeps working.
+// The row that needs a dead direct path has to cause one; this
+// provides the network CHANGE, which is what the trigger is about.
+//
+// **Two mechanisms, and the second is the one that matters.**
+// `BrowserContext.setOffline` fails the context's HTTP but does NOT
+// move the renderer's network state on Chromium: measured, first
+// run — `0 offline event(s)`, `navigator.onLine` unchanged, and so
+// nothing a page listens for ever fired. DevTools' own Offline
+// checkbox is `Network.emulateNetworkConditions`, which DOES notify
+// the renderer, so that is sent per page as well. Both are applied:
+// the first is what stops the page's HTTP, the second is what makes
+// `navigator.onLine` and the `offline`/`online` events true.
+//
+// The reply carries `online`, read back out of the page, so a
+// witness asserts on what the renderer BELIEVES rather than on the
+// fact that a request was accepted.
+
+/// Page name → the CDP session holding its network emulation.
+///
+/// Held because CDP emulation is scoped to its session: detaching
+/// reverts it, so a session opened and closed around one
+/// `emulateNetworkConditions` produces an offline window that lasts
+/// microseconds and still fires the full event pair.
+/** @type {Map<string, any>} */
+const cdpNetwork = new Map();
+
+async function opOffline(req) {
+  const page = pages.get(req.page);
+  if (!page) throw new Error(`no page named ${req.page}`);
+  const offline = req.offline === true;
+  const owner = pageContexts.get(req.page) || live.context;
+  await owner.setOffline(offline);
+  if (live.engine === 'chromium') {
+    // **The session is HELD for the whole window.** CDP emulation
+    // is scoped to the session that set it, so detaching reverts
+    // it: the first version opened a session, sent `offline: true`
+    // and detached in a `finally`, which fired `offline` and then
+    // immediately `online` again — a window microseconds long that
+    // read as a completed network change. The page saw the event
+    // pair and `navigator.onLine` read TRUE a moment later, which
+    // is how a reverted emulation looks exactly like a working one.
+    let session = cdpNetwork.get(req.page);
+    if (!session) {
+      session = await owner.newCDPSession(page);
+      await session.send('Network.enable');
+      cdpNetwork.set(req.page, session);
+    }
+    await session.send('Network.emulateNetworkConditions', {
+      offline,
+      latency: 0,
+      downloadThroughput: -1,
+      uploadThroughput: -1,
+    });
+  }
+  // Read BEFORE any detach, for the same reason.
+  let online = null;
+  try {
+    online = await page.evaluate('navigator.onLine');
+  } catch {
+    // A page whose HTTP is down can still be evaluated in, but a
+    // navigation in flight can refuse: the reading is evidence, not
+    // the operation.
+  }
+  if (!offline) {
+    const session = cdpNetwork.get(req.page);
+    cdpNetwork.delete(req.page);
+    if (session) await session.detach().catch(() => {});
+  }
+  return { offline, online };
+}
+
 async function opShutdown() {
   const it = live;
   const named = [...contexts.values()];
@@ -547,6 +639,7 @@ const OPS = {
   close_page: opClosePage,
   eval: opEval,
   lifecycle: opLifecycle,
+  offline: opOffline,
   tls_probe: opTlsProbe,
   shutdown: opShutdown,
   ping: async () => ({ pong: true }),

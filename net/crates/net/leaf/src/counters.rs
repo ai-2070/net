@@ -369,7 +369,334 @@ impl LeafCounters {
         out.push_str("}}");
         out
     }
+
+    /// The RTC transport's own ledger, in the field names the NATIVE
+    /// `RtcStats` uses — plan §10's `RtcStats` exposed on the leaf.
+    ///
+    /// `u64`s are decimal **strings**, the same rule
+    /// [`Self::to_json`] follows and for the same reason.
+    ///
+    /// # One spelling, across anchors and browsers
+    ///
+    /// Every emitted name exists natively and means the same thing.
+    /// There is deliberately no leaf-specific spelling for a fact
+    /// both sides record: an operator reading
+    /// `ice_direct / ice_attempted` over a mesh of anchors and
+    /// browsers is reading ONE metric, and two spellings would make
+    /// it two.
+    ///
+    /// # `not_applicable`, and why it is not a wall of zeros
+    ///
+    /// 24 native fields have no leaf meaning, and each says so with
+    /// its reason instead of reporting `0`. A zero is an
+    /// OBSERVATION — "no ingress overflow", "no STUN requests
+    /// answered" — and a leaf that has no such mechanism is not
+    /// entitled to the claim. Native `RtcStats` makes exactly this
+    /// choice in the other direction: it carries no `udp_blocked`
+    /// field because a node signalling over UDP cannot have UDP
+    /// blocked, "rather than a field frozen at zero, which would
+    /// read as 'no UDP blocking observed'".
+    ///
+    /// `udp_blocked` is therefore the one emitted term with no
+    /// native counterpart, and it is emitted here because the leaf
+    /// is the side that can actually establish it
+    /// ([`crate::error::UdpBlockedEvidence`]).
+    ///
+    /// # `ice_pending` is derived, on both sides
+    ///
+    /// Not a field here and not a field natively:
+    /// `ice_attempted - (direct + relayed + failed + udp_blocked)`
+    /// is the residual, i.e. the attempts still in flight, and the
+    /// §10 identity is exact only where it is zero. The arithmetic
+    /// is the same on both surfaces, so it is done by the reader
+    /// rather than emitted twice.
+    pub fn rtc_stats_json(&self, link: &RtcLinkSnapshot) -> String {
+        let mut out = String::from("{");
+        for (name, value) in [
+            ("accepted", link.accepted),
+            ("written", link.written),
+            ("write_false", link.write_false),
+            ("retained", link.retained),
+            ("discarded_at_close", link.discarded_at_close),
+            ("max_buffered", link.max_buffered),
+            ("admission_refused_slots", link.admission_refused_slots),
+            ("admission_refused_bytes", link.admission_refused_bytes),
+            (
+                "admission_refused_advisory",
+                link.admission_refused_advisory,
+            ),
+            (
+                "admission_refused_unknown_peer",
+                link.admission_refused_unknown_peer,
+            ),
+            ("ingress_delivered", link.ingress_delivered),
+            ("ice_attempted", self.ice_attempted.get()),
+            ("ice_direct", self.ice_direct.get()),
+            ("ice_relayed", self.ice_relayed.get()),
+            ("ice_failed", self.ice_failed.get()),
+            ("udp_blocked", self.udp_blocked.get()),
+        ] {
+            if out.len() > 1 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"{name}\":\"{value}\""));
+        }
+        out.push_str(",\"not_applicable\":{");
+        for (i, (name, reason)) in RTC_STATS_NOT_APPLICABLE.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\"{name}\":{}",
+                serde_json::Value::String((*reason).to_string())
+            ));
+        }
+        out.push_str("}}");
+        out
+    }
+
+    /// The names [`Self::rtc_stats_json`] emits, in emission order.
+    ///
+    /// Exported so the correspondence test can compare the emitted
+    /// set against [`NATIVE_RTC_STATS_FIELDS`] without parsing the
+    /// JSON it is asserting about.
+    pub const RTC_STATS_EMITTED: [&'static str; 16] = [
+        "accepted",
+        "written",
+        "write_false",
+        "retained",
+        "discarded_at_close",
+        "max_buffered",
+        "admission_refused_slots",
+        "admission_refused_bytes",
+        "admission_refused_advisory",
+        "admission_refused_unknown_peer",
+        "ingress_delivered",
+        "ice_attempted",
+        "ice_direct",
+        "ice_relayed",
+        "ice_failed",
+        "udp_blocked",
+    ];
 }
+
+/// One reading of the browser's RTC link, in the field names the
+/// NATIVE `RtcStats` uses.
+///
+/// Plain `u64`s and no `wasm-bindgen`, so the rendering above is
+/// testable on the host. [`crate::rtc::RtcLinkCounters`] is the live
+/// side; this is the snapshot it hands over.
+///
+/// Every field here exists natively under the same spelling
+/// (`net/src/adapter/net/rtc/stats.rs`) and means the same thing.
+/// That is the point of the type: a leaf-specific spelling for a
+/// fact both sides record would make one deployment metric two, and
+/// the operator reading `ice_direct / ice_attempted` across a mesh
+/// of anchors and browsers is reading one number.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RtcLinkSnapshot {
+    /// Packets admitted into the peer's retained queue. Once
+    /// counted the transport owns the packet (§2).
+    pub accepted: u64,
+    /// Packets `RTCDataChannel.send` took.
+    pub written: u64,
+    /// `send` throwing after a passing precheck. NOT a loss: the
+    /// packet stays at the head of the queue and
+    /// `bufferedamountlow` retries it.
+    pub write_false: u64,
+    /// Packets retained right now — a gauge, not a counter.
+    pub retained: u64,
+    /// Packets still retained when a channel closed. The only place
+    /// an admitted packet is lost, and it is counted.
+    pub discarded_at_close: u64,
+    /// The largest `bufferedAmount` observed.
+    pub max_buffered: u64,
+    /// Admission refusals because the reserved packet slots were
+    /// exhausted — half of the hard bound.
+    pub admission_refused_slots: u64,
+    /// Admission refusals because the reserved byte budget was
+    /// exhausted — the other half.
+    pub admission_refused_bytes: u64,
+    /// Admission refusals because the live `bufferedAmount` reading
+    /// was at or over the advisory threshold.
+    pub admission_refused_advisory: u64,
+    /// Sends for a peer this transport cannot address: no link, or
+    /// a link whose channel is not open.
+    pub admission_refused_unknown_peer: u64,
+    /// DataChannel messages handed to the node.
+    pub ingress_delivered: u64,
+}
+
+/// Every field the native `RtcStats` carries, verbatim.
+///
+/// The inventory a reader diffs against
+/// `net/src/adapter/net/rtc/stats.rs`, and the reason
+/// [`LeafCounters::rtc_stats_json`] cannot quietly grow a spelling
+/// of its own or quietly forget one: the emitted names plus
+/// [`RTC_STATS_NOT_APPLICABLE`] are asserted to be exactly this
+/// list, with nothing in both.
+pub const NATIVE_RTC_STATS_FIELDS: [&str; 39] = [
+    "accepted",
+    "admission_refused_slots",
+    "admission_refused_bytes",
+    "admission_refused_advisory",
+    "admission_refused_unknown_peer",
+    "write_false",
+    "written",
+    "discarded_at_close",
+    "drain_refused",
+    "ingress_delivered",
+    "ingress_dropped",
+    "validate_rejected",
+    "udp_conn_reset",
+    "max_buffered",
+    "retained",
+    "admission_refused_forward",
+    "admission_refused_transit",
+    "admission_refused_route",
+    "admission_refused_subscribe",
+    "admission_refused_announce",
+    "admission_refused_deliver",
+    "admission_promoted",
+    "close_notify_deferred",
+    "close_notify_redelivered",
+    "admission_reservation_retired",
+    "admission_promotion_orphaned",
+    "admission_rejected_outcome",
+    "admission_reclaimed",
+    "signal_over_budget",
+    "signal_malformed",
+    "signal_engine_full",
+    "signal_forwarded",
+    "signal_delivered",
+    "signal_unknown_dialog",
+    "stun_binding_requests",
+    "ice_attempted",
+    "ice_direct",
+    "ice_relayed",
+    "ice_failed",
+];
+
+/// Native `RtcStats` fields a leaf has no meaning for, each with the
+/// reason it has none.
+///
+/// **Said rather than zeroed.** A field frozen at `0` reads as an
+/// observation — "no ingress overflow", "no STUN requests answered",
+/// "no admission refusals" — and a leaf is not entitled to any of
+/// those claims. Native `RtcStats` makes the same choice in the
+/// other direction and says so: it carries no `udp_blocked` field,
+/// "rather than a field frozen at zero, which would read as 'no UDP
+/// blocking observed', a claim this surface is not entitled to
+/// make". This is that rule applied to the leaf's 24.
+pub const RTC_STATS_NOT_APPLICABLE: [(&str, &str); 24] = [
+    (
+        "ingress_dropped",
+        "the leaf's inbound queue is an unbounded VecDeque the pump drains on the same turn, \
+         so there is no bounded input to overflow",
+    ),
+    (
+        "drain_refused",
+        "there is no scheduler drain: a refused write leaves the packet at the head of the \
+         retained queue and `bufferedamountlow` retries it",
+    ),
+    (
+        "validate_rejected",
+        "the leaf's inbound refusals are named one by one in `counters().drops`, by \
+         DropReason, rather than collapsed into a single term",
+    ),
+    (
+        "udp_conn_reset",
+        "a browser holds no UDP socket, so there is no ICMP port-unreachable reading to \
+         swallow",
+    ),
+    (
+        "admission_refused_forward",
+        "§12 admission is the ANCHOR's: a leaf relays for nobody",
+    ),
+    (
+        "admission_refused_transit",
+        "§12 admission is the ANCHOR's: a leaf carries no routed envelope in transit",
+    ),
+    (
+        "admission_refused_route",
+        "§12 admission is the ANCHOR's: a leaf installs no routes for other nodes",
+    ),
+    (
+        "admission_refused_subscribe",
+        "§12 admission is the ANCHOR's: a leaf serves no subscriptions",
+    ),
+    (
+        "admission_refused_announce",
+        "§12 admission is the ANCHOR's: a leaf floods no announcements",
+    ),
+    (
+        "admission_refused_deliver",
+        "§12 admission is the ANCHOR's: a leaf answers no third party's nRPC",
+    ),
+    (
+        "admission_promoted",
+        "a leaf enrolls WITH an anchor; it promotes nobody",
+    ),
+    (
+        "close_notify_deferred",
+        "the mesh's close-notification channel is native; a leaf's close is synchronous in \
+         `PeerLink::drop` and cannot be deferred",
+    ),
+    (
+        "close_notify_redelivered",
+        "nothing is deferred, so nothing is redelivered",
+    ),
+    (
+        "admission_reservation_retired",
+        "enrollment reservations are the anchor's accounting, not the enrollee's",
+    ),
+    (
+        "admission_promotion_orphaned",
+        "enrollment reservations are the anchor's accounting, not the enrollee's",
+    ),
+    (
+        "admission_rejected_outcome",
+        "a leaf READS its own JoinOutcome; it adjudicates nobody else's",
+    ),
+    (
+        "admission_reclaimed",
+        "provisional sessions are reclaimed by the anchor that admitted them",
+    ),
+    (
+        "signal_over_budget",
+        "the per-sender `0x0D02` dialog/frame budget is the forwarding anchor's gate",
+    ),
+    (
+        "signal_malformed",
+        "a leaf decodes only envelopes addressed to itself, and an undecodable one is \
+         counted as a drop by reason",
+    ),
+    (
+        "signal_engine_full",
+        "there is no bounded signalling engine queue: a verified envelope is filed on its \
+         dialog synchronously",
+    ),
+    (
+        "signal_forwarded",
+        "blind `0x0D02` forwarding is the anchor's, and it is what makes §10's flat \
+         application-data counter observable",
+    ),
+    (
+        "signal_delivered",
+        "a leaf's delivered envelopes are the verified ones filed on a dialog; the term \
+         natively counts frames a NODE handed to its own signalling handler on behalf of \
+         pairs it relays for",
+    ),
+    (
+        "signal_unknown_dialog",
+        "an envelope for a dialog this leaf is not driving is dropped by \
+         `Inner::file_signal` and counted as a drop by reason",
+    ),
+    (
+        "stun_binding_requests",
+        "a leaf serves no STUN: it is a client of the address its anchor published",
+    ),
+];
 
 #[inline]
 fn bump(cell: &Cell<u64>) {
@@ -410,5 +737,129 @@ mod tests {
             assert!(json.contains(reason.as_str()), "{reason:?} missing: {json}");
         }
         assert!(json.contains("\"not_addressed_to_us\":\"1\""), "{json}");
+    }
+
+    /// Every native `RtcStats` field is accounted for exactly once:
+    /// emitted with a leaf meaning, or declared inapplicable with
+    /// the reason it has none. Nothing in both, nothing in neither.
+    ///
+    /// This is the assertion that keeps "the same field names as
+    /// native" true as either side grows a counter. A leaf-only
+    /// spelling would show up as an emitted name that is not in the
+    /// native inventory; a native field nobody decided about would
+    /// show up as missing from both sets - and the second is the
+    /// dangerous one, because the alternative to deciding is a
+    /// plausible zero.
+    #[test]
+    fn every_native_rtc_stats_field_is_emitted_or_declared_inapplicable() {
+        let mut accounted: Vec<&str> = LeafCounters::RTC_STATS_EMITTED
+            .iter()
+            .copied()
+            // `udp_blocked` is the one emitted term with NO native
+            // counterpart, on purpose: native says it has no such
+            // field because a node signalling over UDP cannot have
+            // UDP blocked, and the leaf is the side whose
+            // `UdpBlockedEvidence` can establish it.
+            .filter(|name| *name != "udp_blocked")
+            .chain(RTC_STATS_NOT_APPLICABLE.iter().map(|(name, _)| *name))
+            .collect();
+        let overlap: Vec<&str> = LeafCounters::RTC_STATS_EMITTED
+            .iter()
+            .copied()
+            .filter(|name| {
+                RTC_STATS_NOT_APPLICABLE
+                    .iter()
+                    .any(|(other, _)| other == name)
+            })
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "these are emitted AND declared inapplicable: {overlap:?}"
+        );
+
+        let mut native: Vec<&str> = NATIVE_RTC_STATS_FIELDS.to_vec();
+        accounted.sort_unstable();
+        native.sort_unstable();
+        assert_eq!(
+            accounted, native,
+            "the leaf's RtcStats surface has drifted from the native field inventory in \
+             net/src/adapter/net/rtc/stats.rs"
+        );
+    }
+
+    /// The inapplicable fields carry a REASON, not a zero.
+    #[test]
+    fn an_inapplicable_field_says_why_instead_of_reporting_zero() {
+        let json = LeafCounters::new().rtc_stats_json(&RtcLinkSnapshot::default());
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let na = parsed
+            .get("not_applicable")
+            .and_then(serde_json::Value::as_object)
+            .expect("not_applicable is an object");
+        assert_eq!(na.len(), RTC_STATS_NOT_APPLICABLE.len());
+        for (name, _) in RTC_STATS_NOT_APPLICABLE {
+            let reason = na
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name} carries no reason: {json}"));
+            assert!(reason.len() > 20, "{name}'s reason is not one: {reason:?}");
+            // The whole point: the field is absent from the reading
+            // itself, so no consumer can read it as an observation.
+            assert!(
+                parsed.get(name).is_none(),
+                "{name} is declared inapplicable AND reported: {json}"
+            );
+        }
+    }
+
+    /// The reading reports the transport's and the ICE ledger's real
+    /// values, as decimal strings.
+    #[test]
+    fn the_rtc_reading_reports_both_halves_as_decimal_strings() {
+        let c = LeafCounters::new();
+        c.ice_attempted();
+        c.ice_attempted();
+        c.ice_direct();
+        c.udp_blocked();
+        let link = RtcLinkSnapshot {
+            accepted: 7,
+            written: 6,
+            write_false: 1,
+            retained: 1,
+            discarded_at_close: 0,
+            // Past 2^53: a `JSON.parse` of a bare number would round
+            // it, which is why every value here is a string.
+            max_buffered: 9_007_199_254_740_993,
+            admission_refused_slots: 2,
+            admission_refused_bytes: 3,
+            admission_refused_advisory: 4,
+            admission_refused_unknown_peer: 5,
+            ingress_delivered: 11,
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&c.rtc_stats_json(&link)).expect("valid JSON");
+        for (name, want) in [
+            ("accepted", "7"),
+            ("written", "6"),
+            ("write_false", "1"),
+            ("retained", "1"),
+            ("max_buffered", "9007199254740993"),
+            ("admission_refused_slots", "2"),
+            ("admission_refused_bytes", "3"),
+            ("admission_refused_advisory", "4"),
+            ("admission_refused_unknown_peer", "5"),
+            ("ingress_delivered", "11"),
+            ("ice_attempted", "2"),
+            ("ice_direct", "1"),
+            ("ice_relayed", "0"),
+            ("ice_failed", "0"),
+            ("udp_blocked", "1"),
+        ] {
+            assert_eq!(
+                parsed.get(name).and_then(serde_json::Value::as_str),
+                Some(want),
+                "{name}"
+            );
+        }
     }
 }

@@ -289,6 +289,27 @@ describe('BrowserNode', () => {
     expect(inner.streams[0]?.options).toEqual(options);
   });
 
+  it('keeps rtcStats measurements and the fields it refuses to measure apart', async () => {
+    // The reading carries two kinds of thing under one JSON object:
+    // counters, and the native fields a leaf has NO meaning for —
+    // each with the reason it has none rather than a `0`, because a
+    // zero reads as an observation ("no STUN requests answered") that
+    // a browser leaf is not entitled to make. A consumer iterating
+    // the counters must not find a sentence among the numbers.
+    const node = await connected(new FakeNode());
+    const stats = node.rtcStats();
+    expect(stats.counters.ice_attempted).toBe('2');
+    // Past 2^53: a bare JSON number would have rounded, so every
+    // value crosses as a decimal string.
+    expect(stats.counters.max_buffered).toBe('9007199254740993');
+    expect(stats.counters.not_applicable).toBeUndefined();
+    expect(stats.notApplicable.stun_binding_requests).toBe('a leaf serves no STUN');
+    // `udp_blocked` is the one term with no native counterpart, and
+    // it IS measured here: the leaf is the side whose evidence can
+    // establish it.
+    expect(stats.counters.udp_blocked).toBe('0');
+  });
+
   it('surfaces leaf events on the typed surface', async () => {
     const inner = new FakeNode();
     const node = await connected(inner);

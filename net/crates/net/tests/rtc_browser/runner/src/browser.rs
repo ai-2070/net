@@ -406,6 +406,35 @@ impl Driver {
             .map(|_| ())
     }
 
+    /// Take the browsing context that owns `name` offline, or back
+    /// online — `BrowserContext.setOffline`.
+    ///
+    /// **The page names the SIDE.** `setOffline` is per context, and
+    /// Stage 6's two tabs live in genuinely isolated contexts, so
+    /// there is no such thing as taking "the browser" offline here:
+    /// a witness has to say whose network changed, and taking the
+    /// wrong context offline would disconnect nobody the row cares
+    /// about while still reading as a network change.
+    ///
+    /// What it delivers, exactly: `navigator.onLine` flips and
+    /// `offline`/`online` fire in every page of that context, and
+    /// the context's HTTP fails. It is NOT a link-layer break —
+    /// Chromium emulates this on the URL loader, so an established
+    /// ICE path (on this host, over loopback) keeps working. A row
+    /// that needs a dead direct path must cause one; this is the
+    /// network CHANGE, which is what the retry trigger is about.
+    ///
+    /// Answers what the page's `navigator.onLine` reads afterwards,
+    /// so a witness asserts on what the renderer BELIEVES rather
+    /// than on the request having been accepted. `None` when the
+    /// reading could not be taken.
+    pub async fn set_offline(&self, name: &str, offline: bool) -> Result<Option<bool>, String> {
+        let reply = self
+            .request("offline", json!({ "page": name, "offline": offline }))
+            .await?;
+        Ok(reply.get("online").and_then(Value::as_bool))
+    }
+
     pub async fn shutdown_browser(&self) -> Result<(), String> {
         self.request("shutdown", json!({})).await.map(|_| ())
     }

@@ -224,12 +224,18 @@ await probe('real_wasm_reads_stream_options_the_way_the_package_declares_them', 
         channelHash: 7,
       }),
     ),
-    { reliability: 'fireAndForget', label: 'frames', streamId: '0000000000000009', channelHash: 7 },
+    {
+      reliability: 'fireAndForget',
+      label: 'frames',
+      streamId: '0000000000000009',
+      channelHash: 7,
+      peer: null,
+    },
     'the declared options',
   );
   eq(
     JSON.parse(LeafNode.effective_stream_options({ reliability: 'reliable' })),
-    { reliability: 'reliable', label: 'app', streamId: null, channelHash: null },
+    { reliability: 'reliable', label: 'app', streamId: null, channelHash: null, peer: null },
     'the defaults',
   );
   eq(
@@ -240,9 +246,68 @@ await probe('real_wasm_reads_stream_options_the_way_the_package_declares_them', 
         channelHash: 65535,
       }),
     ),
-    { reliability: 'reliable', label: 'app', streamId: 'ffffffffffffffff', channelHash: 65535 },
+    {
+      reliability: 'reliable',
+      label: 'app',
+      streamId: 'ffffffffffffffff',
+      channelHash: 65535,
+      peer: null,
+    },
     'the boundary values',
   );
+});
+
+// A stream can address a PEER, and the id it addresses is readable.
+//
+// §9 installs a direct leaf ↔ leaf session and the boundary used to
+// pin every stream to the anchor, so a page had nothing that could
+// send a byte over it — and §10's routed and direct delivery legs
+// were unreachable from a page for the same reason. `peer` is read
+// through the SAME parser the four peer methods use, which is why a
+// decimal id is refused here rather than silently naming node 9.
+await probe('real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands_out', () => {
+  eq(
+    JSON.parse(
+      LeafNode.effective_stream_options({
+        reliability: 'fireAndForget',
+        label: 'positions',
+        peer: '00366d403ce19dac',
+      }),
+    ),
+    {
+      reliability: 'fireAndForget',
+      label: 'positions',
+      streamId: null,
+      channelHash: null,
+      peer: '00366d403ce19dac',
+    },
+    'the peer the stream addresses',
+  );
+  // `0x`-prefixed is the second spelling `parse_peer_id` accepts, and
+  // it is still SIXTEEN digits — the prefix is tolerated, a shorter
+  // id is not.
+  eq(
+    JSON.parse(
+      LeafNode.effective_stream_options({ reliability: 'reliable', peer: '0x00366d403ce19dac' }),
+    ),
+    {
+      reliability: 'reliable',
+      label: 'app',
+      streamId: null,
+      channelHash: null,
+      peer: '00366d403ce19dac',
+    },
+    'the 0x prefix, normalised to the spelling node_id_hex() emits',
+  );
+  // The defect this spelling rule exists to prevent: `node_id_hex()`
+  // emits `00366d403ce19dac`, a page passes exactly that back, and a
+  // DECIMAL reading would refuse it — or worse, read `0009` as node 9
+  // under one reader and node 0x9 under another. So there is exactly
+  // one spelling and every other shape is refused by name.
+  refusal(() => LeafNode.effective_stream_options({ peer: '3652178' }), 'a decimal peer id');
+  refusal(() => LeafNode.effective_stream_options({ peer: '0x9' }), 'a short hex peer id');
+  refusal(() => LeafNode.effective_stream_options({ peer: 9 }), 'a numeric peer id');
+  refusal(() => LeafNode.effective_stream_options({ peer: 'nine' }), 'a non-hex peer id');
 });
 
 await probe('real_wasm_refuses_a_channel_hash_it_would_otherwise_silence', () => {

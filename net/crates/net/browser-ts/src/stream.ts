@@ -29,6 +29,36 @@ export interface OpenStreamOptions {
    * why it is not a string.
    */
   channelHash?: number;
+  /**
+   * The node this stream addresses — **16 hex digits**, the spelling
+   * {@link BrowserNode.nodeId} hands out and
+   * {@link BrowserNode.connectPeer} takes. Absent, it is the anchor,
+   * which is what every caller got before this option existed.
+   *
+   * This is the page-facing half of §9: `connectPeer` installs a
+   * direct leaf ↔ leaf session and this is what puts application
+   * bytes on it. The addressing is the leaf's, not a second path —
+   * a stream to a peer whose session is still ROUTED rides the
+   * anchor, and needs no second call to start riding the
+   * DataChannel.
+   *
+   * **The handle does not survive the direct upgrade, though.** §9
+   * step 4 installs a *replacement* session, and a stream handle is
+   * fenced to the incarnation it was opened on — so `send` on a
+   * stream opened while the pair was routed rejects with
+   * {@link SessionError} ("stale stream handle … reopen the
+   * stream") once the direct session lands. Reopening is one call
+   * with the same `peer` and the same `streamId`; a page driving a
+   * peer across the upgrade should reopen on that rejection rather
+   * than assume continuity.
+   *
+   * A peer with no session at all rejects typed from `send`.
+   *
+   * Not accepted by {@link MeshSession.openStream}: a follower's
+   * stream is opened by the leader tab's node, so the option is
+   * refused by name there rather than dropped.
+   */
+  peer?: string;
 }
 
 /**

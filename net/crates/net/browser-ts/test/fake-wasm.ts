@@ -98,6 +98,9 @@ export interface FakeNodeBehaviour {
   peerOfferError?: unknown;
   peerAcceptOfferError?: unknown;
   peerHandshakeError?: unknown;
+  rtcStatsJson?: string;
+  retryReportJson?: string;
+  armNetworkRetryError?: unknown;
 }
 
 export class FakeNode implements LeafWasmNode {
@@ -225,6 +228,37 @@ export class FakeNode implements LeafWasmNode {
 
   counters_json(): string {
     return this.behaviour.countersJson ?? '{"packets_sent":"18446744073709551615","dropped_oversize":"2"}';
+  }
+
+  /** How many times the page armed the network-change trigger. */
+  armings = 0;
+
+  rtc_stats_json(): string {
+    return (
+      this.behaviour.rtcStatsJson ??
+      '{"accepted":"3","written":"3","write_false":"0","retained":"0",\
+"discarded_at_close":"0","max_buffered":"9007199254740993",\
+"admission_refused_slots":"0","admission_refused_bytes":"0",\
+"admission_refused_advisory":"1","admission_refused_unknown_peer":"0",\
+"ingress_delivered":"7","ice_attempted":"2","ice_direct":"1",\
+"ice_relayed":"0","ice_failed":"0","udp_blocked":"0",\
+"not_applicable":{"stun_binding_requests":"a leaf serves no STUN"}}'
+    );
+  }
+
+  arm_network_retry(): void {
+    if (this.behaviour.armNetworkRetryError !== undefined) {
+      throw this.behaviour.armNetworkRetryError;
+    }
+    this.armings += 1;
+  }
+
+  retry_report(): string {
+    return (
+      this.behaviour.retryReportJson ??
+      `{"armed":${this.armings > 0},"online":"0","iceFailed":"0","triggers":"0",\
+"started":"0","coalesced":"0","notEligible":"0","openEpisodes":0,"owned":0,"last":null}`
+    );
   }
 
   close(): void {

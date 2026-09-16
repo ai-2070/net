@@ -21,6 +21,8 @@ export {
   parseAttemptStatus,
   parseCounters,
   parseDescriptors,
+  parseRetryReport,
+  parseRtcStats,
   refineIceFailure,
 } from './node.js';
 export type {
@@ -29,6 +31,8 @@ export type {
   NodeDescriptor,
   PeerAttemptStatus,
   PeerConnectOutcome,
+  RetryReport,
+  RtcStatsReading,
 } from './node.js';
 
 export { LeafStream } from './stream.js';

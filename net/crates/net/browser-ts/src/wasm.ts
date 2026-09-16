@@ -67,6 +67,16 @@ export interface LeafWasmStreamOptions {
    * saturating cast.
    */
   channelHash?: number;
+  /**
+   * The node the stream addresses: **16 hex digits**, the spelling
+   * `node_id_hex()` hands out and the four §9 peer methods take.
+   * Absent, the stream addresses the anchor — the behaviour every
+   * caller had before this option existed.
+   *
+   * A decimal id is refused rather than accepted as a second
+   * spelling, exactly as `connectPeer` refuses one.
+   */
+  peer?: string;
 }
 
 /**
@@ -199,6 +209,20 @@ export interface LeafWasmNode {
   peer_handshake(peer_hex: string): Promise<void>;
   /** Every counter as JSON; `u64`s are decimal strings. */
   counters_json(): string;
+  /**
+   * The RTC transport's `RtcStats` as JSON, in the NATIVE field
+   * names, plus a `not_applicable` object mapping each native field
+   * a leaf has no meaning for to the reason it has none.
+   */
+  rtc_stats_json(): string;
+  /**
+   * Install the `online` listener for the network-change re-attempt
+   * trigger. Idempotent; the ICE `disconnected` → `failed` watcher
+   * is already on every peer connection.
+   */
+  arm_network_retry(): void;
+  /** The re-attempt owner's ledger as JSON. */
+  retry_report(): string;
   /** One JSON-string event per call. Registered once per node. */
   on_event(callback: (eventJson: string) => void): void;
   close(): void;
@@ -238,11 +262,16 @@ export interface LeafWasmModule {
     /**
      * What an `open_stream()` with these options would ask the node
      * for, as JSON: `{"reliability":"reliable","label":"app",
-     * "streamId":"0000000000000009","channelHash":7}`, `streamId`
-     * `null` when unpinned, `channelHash` `null` when absent.
+     * "streamId":"0000000000000009","channelHash":7,
+     * "peer":"00366d403ce19dac"}`, `streamId` `null` when unpinned,
+     * `channelHash` `null` when absent, `peer` `null` when the
+     * stream addresses the anchor.
      *
      * The same reader `MeshSession.open_stream` uses, so one
-     * assertion covers the direct and the leader-proxied surface.
+     * assertion covers the direct and the leader-proxied surface —
+     * which is also why `peer` appears here: the proxied surface
+     * refuses that option by name, and this is where a page can see
+     * what the leaf made of it.
      *
      * Optional for the same reason as the reader above.
      */

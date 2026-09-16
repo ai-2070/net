@@ -38,7 +38,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
@@ -49,11 +49,145 @@ use wasm_bindgen::JsCast;
 use web_sys::{
     MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
     RtcDataChannelState, RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit,
-    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcIceConnectionState, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
+    RtcSessionDescriptionInit,
 };
 
 use crate::control_plane::{IceCandidate, NodeId, Sdp};
+use crate::counters::RtcLinkSnapshot;
 use crate::error::{LeafError, Result, RtcError};
+use crate::retry::{IceLinkState, IceWatch};
+
+/// The live half of [`RtcLinkSnapshot`]: the transport's own ledger,
+/// in the field names the NATIVE `RtcStats` uses.
+///
+/// `Cell`, not atomics, for the reason [`crate::counters`] gives:
+/// this crate runs on the browser main thread and an atomic would
+/// buy nothing on a per-packet path.
+///
+/// Every term here is one the native driver also records, under the
+/// same name. The ones a leaf has no mechanism for are NOT fields —
+/// [`crate::counters::RTC_STATS_NOT_APPLICABLE`] names them and says
+/// why, because a counter frozen at zero reads as an observation.
+#[derive(Debug, Default)]
+pub struct RtcLinkCounters {
+    accepted: Cell<u64>,
+    written: Cell<u64>,
+    write_false: Cell<u64>,
+    discarded_at_close: Cell<u64>,
+    max_buffered: Cell<u64>,
+    admission_refused_slots: Cell<u64>,
+    admission_refused_bytes: Cell<u64>,
+    admission_refused_advisory: Cell<u64>,
+    admission_refused_unknown_peer: Cell<u64>,
+    ingress_delivered: Cell<u64>,
+}
+
+impl RtcLinkCounters {
+    /// One packet admitted into a peer's retained queue. Past this
+    /// line the transport owns it (§2).
+    #[inline]
+    fn note_accepted(&self) {
+        bump(&self.accepted);
+    }
+
+    /// One packet `RTCDataChannel.send` took.
+    #[inline]
+    fn note_written(&self) {
+        bump(&self.written);
+    }
+
+    /// `send` threw after a passing precheck.
+    ///
+    /// Native spells this `write_false` because str0m's
+    /// `Channel::write` returns `Ok(false)`; the browser throws
+    /// instead. Same fact, same name: **not a loss** — the packet is
+    /// still at the head of the queue and `bufferedamountlow`
+    /// retries it.
+    #[inline]
+    fn note_write_false(&self) {
+        bump(&self.write_false);
+    }
+
+    /// `n` packets were still retained when a channel closed. The
+    /// one place an admitted packet is lost, and it is counted.
+    #[inline]
+    fn note_discarded_at_close_n(&self, n: u64) {
+        self.discarded_at_close
+            .set(self.discarded_at_close.get().saturating_add(n));
+    }
+
+    /// Record an observed `bufferedAmount`.
+    ///
+    /// Exact here, where native's is a snapshot stale by up to one
+    /// drain: `RTCDataChannel.bufferedAmount` is a live property.
+    #[inline]
+    fn observe_buffered(&self, amount: u32) {
+        self.max_buffered
+            .set(self.max_buffered.get().max(u64::from(amount)));
+    }
+
+    /// Admission refused: the reserved packet slots are exhausted.
+    #[inline]
+    fn note_refused_slots(&self) {
+        bump(&self.admission_refused_slots);
+    }
+
+    /// Admission refused: the reserved byte budget is exhausted.
+    #[inline]
+    fn note_refused_bytes(&self) {
+        bump(&self.admission_refused_bytes);
+    }
+
+    /// Admission refused: the live `bufferedAmount` is at or over
+    /// the advisory threshold.
+    #[inline]
+    fn note_refused_advisory(&self) {
+        bump(&self.admission_refused_advisory);
+    }
+
+    /// Admission refused for a peer this transport cannot address.
+    ///
+    /// Native's term is "a peer the driver does not hold — a closed
+    /// session, or a handle whose generation is spent", and both
+    /// leaf cases are that peer: no link at all, or a link whose
+    /// channel is not open. They are distinguished in the typed
+    /// error the caller receives; the counter is one, as it is
+    /// natively.
+    #[inline]
+    fn note_refused_unknown_peer(&self) {
+        bump(&self.admission_refused_unknown_peer);
+    }
+
+    /// One DataChannel message handed to the node.
+    #[inline]
+    fn note_ingress_delivered(&self) {
+        bump(&self.ingress_delivered);
+    }
+
+    /// One coherent reading, with `retained` — a gauge, not a
+    /// counter — supplied by the caller that can see the queues.
+    fn snapshot(&self, retained: u64) -> RtcLinkSnapshot {
+        RtcLinkSnapshot {
+            accepted: self.accepted.get(),
+            written: self.written.get(),
+            write_false: self.write_false.get(),
+            retained,
+            discarded_at_close: self.discarded_at_close.get(),
+            max_buffered: self.max_buffered.get(),
+            admission_refused_slots: self.admission_refused_slots.get(),
+            admission_refused_bytes: self.admission_refused_bytes.get(),
+            admission_refused_advisory: self.admission_refused_advisory.get(),
+            admission_refused_unknown_peer: self.admission_refused_unknown_peer.get(),
+            ingress_delivered: self.ingress_delivered.get(),
+        }
+    }
+}
+
+#[inline]
+fn bump(cell: &Cell<u64>) {
+    cell.set(cell.get().saturating_add(1));
+}
 
 /// The advisory SCTP buffered-amount threshold, in bytes.
 ///
@@ -145,6 +279,20 @@ pub struct RtcLeafTransport {
     /// to the control plane.
     local_candidates: Rc<RefCell<VecDeque<(NodeId, IceCandidate)>>>,
     next_slot: Rc<core::cell::Cell<u32>>,
+    /// The transport's own `RtcStats`, in the native field names.
+    stats: Rc<RtcLinkCounters>,
+    /// Peers whose ICE walked `disconnected` → `failed`, filed for
+    /// the caller to drain.
+    ///
+    /// A queue rather than a call into the node, for the reason
+    /// `local_candidates` is one: this is written from inside a JS
+    /// event callback, which must not re-enter a `RefCell` the pump
+    /// may already hold. [`crate::wasm`] drains it on the tick and
+    /// files each entry as a trigger, so the ICE source and the
+    /// `online` source reach ONE owner
+    /// ([`crate::retry::RetryPolicy`]) rather than deciding for
+    /// themselves.
+    ice_failures: Rc<RefCell<VecDeque<NodeId>>>,
 }
 
 impl RtcLeafTransport {
@@ -155,7 +303,55 @@ impl RtcLeafTransport {
             inbound,
             local_candidates: Rc::new(RefCell::new(VecDeque::new())),
             next_slot: Rc::new(core::cell::Cell::new(0)),
+            stats: Rc::new(RtcLinkCounters::default()),
+            ice_failures: Rc::new(RefCell::new(VecDeque::new())),
         }
+    }
+
+    /// The transport's ledger, in the native `RtcStats` field names.
+    ///
+    /// `retained` is a GAUGE and is counted here rather than
+    /// tracked: it is exactly what is in the queues right now, so
+    /// reading it from them cannot drift from them. Native carries
+    /// the same term for the same reason — the retry slot is finite
+    /// storage outside the queue reservation, so
+    /// `accepted == written + discarded_at_close` is not the
+    /// conservation law and this is the missing term.
+    pub fn link_snapshot(&self) -> RtcLinkSnapshot {
+        let retained = self
+            .peers
+            .borrow()
+            .values()
+            .map(|link| link.retained.len() as u64)
+            .sum();
+        self.stats.snapshot(retained)
+    }
+
+    /// Take the peers whose ICE walked `disconnected` → `failed`
+    /// since the last call.
+    pub fn take_ice_failures(&self) -> Vec<NodeId> {
+        self.ice_failures.borrow_mut().drain(..).collect()
+    }
+
+    /// `peer`'s live `iceConnectionState`, as the engine spells it.
+    ///
+    /// Read off the `RTCPeerConnection` rather than remembered, so a
+    /// report says what the browser believes and not what this
+    /// module last heard.
+    pub fn ice_connection_state(&self, peer: NodeId) -> Option<&'static str> {
+        self.peers
+            .borrow()
+            .get(&peer)
+            .map(|link| match link.connection.ice_connection_state() {
+                RtcIceConnectionState::New => "new",
+                RtcIceConnectionState::Checking => "checking",
+                RtcIceConnectionState::Connected => "connected",
+                RtcIceConnectionState::Completed => "completed",
+                RtcIceConnectionState::Disconnected => "disconnected",
+                RtcIceConnectionState::Failed => "failed",
+                RtcIceConnectionState::Closed => "closed",
+                _ => "unknown",
+            })
     }
 
     /// The slot a new peer's `PeerAddr::Rtc` handle takes.
@@ -185,9 +381,20 @@ impl RtcLeafTransport {
         channel.set_binary_type(RtcDataChannelType::Arraybuffer);
         channel.set_buffered_amount_low_threshold(BUFFERED_AMOUNT_LOW);
 
-        let message = message_handler(Rc::clone(&self.inbound), peer, &channel);
+        let message = message_handler(
+            Rc::clone(&self.inbound),
+            Rc::clone(&self.stats),
+            peer,
+            &channel,
+        );
         let ice = self.install_ice_handler(peer, &connection);
-        let low = low_water_handler(Rc::downgrade(&self.peers), peer, &channel);
+        let ice_state = self.install_ice_state_handler(peer, &connection);
+        let low = low_water_handler(
+            Rc::downgrade(&self.peers),
+            Rc::clone(&self.stats),
+            peer,
+            &channel,
+        );
 
         self.peers.borrow_mut().insert(
             peer,
@@ -197,7 +404,7 @@ impl RtcLeafTransport {
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
-                _closures: vec![low],
+                _closures: vec![low, ice_state],
                 _message: Some(message),
                 _ice: Some(ice),
                 _data_channel: None,
@@ -244,6 +451,7 @@ impl RtcLeafTransport {
     ) -> Result<Sdp> {
         let connection = new_connection(ice_servers)?;
         let ice = self.install_ice_handler(peer, &connection);
+        let ice_state = self.install_ice_state_handler(peer, &connection);
 
         // **`Weak`.** The handler lives in the `PeerLink` this map
         // holds, so a strong clone here would be a cycle — map →
@@ -252,6 +460,7 @@ impl RtcLeafTransport {
         // dropped without closing a single connection.
         let peers = Rc::downgrade(&self.peers);
         let inbound = Rc::clone(&self.inbound);
+        let stats = Rc::clone(&self.stats);
         let on_data_channel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
@@ -259,11 +468,11 @@ impl RtcLeafTransport {
             let Some(peers) = peers.upgrade() else {
                 return;
             };
-            let message = message_handler(Rc::clone(&inbound), peer, &channel);
+            let message = message_handler(Rc::clone(&inbound), Rc::clone(&stats), peer, &channel);
             // The low-water handler is what retries a retained
             // packet; an accepted channel without it would retain
             // for ever after the first refusal.
-            let low = low_water_handler(Rc::downgrade(&peers), peer, &channel);
+            let low = low_water_handler(Rc::downgrade(&peers), Rc::clone(&stats), peer, &channel);
             let mut links = peers.borrow_mut();
             if let Some(link) = links.get_mut(&peer) {
                 // The first channel the peer opens is the Net one:
@@ -288,7 +497,7 @@ impl RtcLeafTransport {
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
-                _closures: Vec::new(),
+                _closures: vec![ice_state],
                 _message: None,
                 _ice: Some(ice),
                 _data_channel: Some(on_data_channel),
@@ -376,25 +585,39 @@ impl RtcLeafTransport {
     /// retried, never dropped while the channel lives.
     pub fn send(&self, peer: NodeId, packet: Bytes) -> Result<()> {
         let mut peers = self.peers.borrow_mut();
-        let link = peers
-            .get_mut(&peer)
-            .ok_or_else(|| LeafError::Session(format!("no transport for {peer:#x}")))?;
+        let link = peers.get_mut(&peer).ok_or_else(|| {
+            self.stats.note_refused_unknown_peer();
+            LeafError::Session(format!("no transport for {peer:#x}"))
+        })?;
         let channel = link
             .channel
             .as_ref()
-            .ok_or_else(|| LeafError::Rtc(RtcError::ChannelClosed("no channel".into())))?
+            .ok_or_else(|| {
+                self.stats.note_refused_unknown_peer();
+                LeafError::Rtc(RtcError::ChannelClosed("no channel".into()))
+            })?
             .clone();
         if channel.ready_state() != RtcDataChannelState::Open {
+            self.stats.note_refused_unknown_peer();
             return Err(LeafError::Rtc(RtcError::ChannelClosed(format!(
                 "channel for {peer:#x} is {:?}",
                 channel.ready_state()
             ))));
         }
 
-        // Hard bound first: it is the one that actually bounds.
-        if link.retained.len() >= SEND_QUEUE_PACKETS
-            || link.retained_bytes + packet.len() > SEND_QUEUE_BYTES
-        {
+        // Hard bound first: it is the one that actually bounds. The
+        // two halves are counted apart, as they are natively, so a
+        // witness expecting "no refusals" can say which bound fired.
+        if link.retained.len() >= SEND_QUEUE_PACKETS {
+            self.stats.note_refused_slots();
+            return Err(LeafError::Wire(format!(
+                "send queue for {peer:#x} is full ({} packets, {} bytes retained)",
+                link.retained.len(),
+                link.retained_bytes
+            )));
+        }
+        if link.retained_bytes + packet.len() > SEND_QUEUE_BYTES {
+            self.stats.note_refused_bytes();
             return Err(LeafError::Wire(format!(
                 "send queue for {peer:#x} is full ({} packets, {} bytes retained)",
                 link.retained.len(),
@@ -402,17 +625,20 @@ impl RtcLeafTransport {
             )));
         }
         // Advisory: may refuse earlier, never defines the bound.
-        if channel.buffered_amount() >= BUFFERED_AMOUNT_ADVISORY {
+        let buffered = channel.buffered_amount();
+        self.stats.observe_buffered(buffered);
+        if buffered >= BUFFERED_AMOUNT_ADVISORY {
+            self.stats.note_refused_advisory();
             return Err(LeafError::Wire(format!(
-                "SCTP buffered amount for {peer:#x} is {} bytes, at or over the \
-                 {BUFFERED_AMOUNT_ADVISORY}-byte advisory",
-                channel.buffered_amount()
+                "SCTP buffered amount for {peer:#x} is {buffered} bytes, at or over the \
+                 {BUFFERED_AMOUNT_ADVISORY}-byte advisory"
             )));
         }
 
+        self.stats.note_accepted();
         link.retained_bytes += packet.len();
         link.retained.push_back(packet);
-        flush_link(link, &channel);
+        flush_link(link, &channel, &self.stats);
         Ok(())
     }
 
@@ -423,6 +649,8 @@ impl RtcLeafTransport {
             return 0;
         };
         link.discarded_at_close += link.retained.len() as u64;
+        self.stats
+            .note_discarded_at_close_n(link.retained.len() as u64);
         // Taking the link out of the map is the close: `PeerLink`'s
         // `Drop` shuts the channel and the connection.
         link.discarded_at_close
@@ -478,6 +706,53 @@ impl RtcLeafTransport {
         connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
         closure
     }
+
+    /// Watch `peer`'s ICE for the one transition that is a network
+    /// change: `disconnected` → `failed`.
+    ///
+    /// The decision is [`IceWatch`]'s, not this closure's — it is a
+    /// rule about transitions rather than states, and it is
+    /// asserted on the host ([`crate::retry`]) rather than hoped for
+    /// in a browser. All this does is map the engine's enum onto the
+    /// one the rule reads and file the peer when the rule fires.
+    ///
+    /// **Filed, not acted on.** This runs inside a JS event
+    /// callback, and the owner it feeds lives behind the same
+    /// `RefCell` the pump may already hold. So it queues, and
+    /// [`crate::wasm`] drains on the tick — which is also what makes
+    /// the `online` source and this one ONE owner rather than two
+    /// callbacks that each decide.
+    fn install_ice_state_handler(
+        &self,
+        peer: NodeId,
+        connection: &RtcPeerConnection,
+    ) -> Closure<dyn FnMut(JsValue)> {
+        let failures = Rc::downgrade(&self.ice_failures);
+        let watched = connection.clone();
+        let mut watch = IceWatch::default();
+        let closure = Closure::wrap(Box::new(move |_event: JsValue| {
+            let state = match watched.ice_connection_state() {
+                RtcIceConnectionState::New => IceLinkState::New,
+                RtcIceConnectionState::Checking => IceLinkState::Checking,
+                RtcIceConnectionState::Connected => IceLinkState::Connected,
+                RtcIceConnectionState::Completed => IceLinkState::Completed,
+                RtcIceConnectionState::Disconnected => IceLinkState::Disconnected,
+                RtcIceConnectionState::Failed => IceLinkState::Failed,
+                // `closed`, and anything a future engine adds: not a
+                // loss. A state this build does not know is not
+                // evidence of one.
+                _ => IceLinkState::Closed,
+            };
+            if !watch.observe(state) {
+                return;
+            }
+            if let Some(failures) = failures.upgrade() {
+                failures.borrow_mut().push_back(peer);
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+        connection.set_oniceconnectionstatechange(Some(closure.as_ref().unchecked_ref()));
+        closure
+    }
 }
 
 /// Write as much of the retained queue as the channel will take.
@@ -485,19 +760,28 @@ impl RtcLeafTransport {
 /// `send` throwing is not a lost packet: the packet stays at the head
 /// of the queue and the next `bufferedamountlow` retries it. That is
 /// the retain-and-retry policy S0b's 19 476 lost packets bought.
-fn flush_link(link: &mut PeerLink, channel: &RtcDataChannel) {
+fn flush_link(link: &mut PeerLink, channel: &RtcDataChannel, stats: &RtcLinkCounters) {
     while let Some(front) = link.retained.front() {
-        if channel.buffered_amount() >= BUFFERED_AMOUNT_ADVISORY {
+        let buffered = channel.buffered_amount();
+        stats.observe_buffered(buffered);
+        if buffered >= BUFFERED_AMOUNT_ADVISORY {
             return;
         }
         // `send_with_u8_array` copies into the SCTP buffer, so the
         // borrow ends with the call.
         match channel.send_with_u8_array(front) {
             Ok(()) => {
+                stats.note_written();
                 let sent = link.retained.pop_front().map_or(0, |p| p.len());
                 link.retained_bytes = link.retained_bytes.saturating_sub(sent);
             }
-            Err(_) => return,
+            Err(_) => {
+                // Native spells this `write_false`. NOT a loss: the
+                // packet is still at the head of the queue and
+                // `bufferedamountlow` retries it.
+                stats.note_write_false();
+                return;
+            }
         }
     }
 }
@@ -566,6 +850,7 @@ pub fn new_connection(ice_servers: &[IceServer]) -> Result<RtcPeerConnection> {
 /// The inbound handler for one peer's channel.
 fn message_handler(
     inbound: InboundSink,
+    stats: Rc<RtcLinkCounters>,
     peer: NodeId,
     channel: &RtcDataChannel,
 ) -> Closure<dyn FnMut(MessageEvent)> {
@@ -579,6 +864,7 @@ fn message_handler(
             // A text frame on the Net channel is not ours.
             return;
         };
+        stats.note_ingress_delivered();
         inbound(peer, Bytes::from(bytes));
     }) as Box<dyn FnMut(MessageEvent)>);
     channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
@@ -589,6 +875,7 @@ fn message_handler(
 /// the §2 send rules.
 fn low_water_handler(
     peers: Weak<RefCell<HashMap<NodeId, PeerLink>>>,
+    stats: Rc<RtcLinkCounters>,
     peer: NodeId,
     channel: &RtcDataChannel,
 ) -> Closure<dyn FnMut(JsValue)> {
@@ -603,7 +890,7 @@ fn low_water_handler(
         let mut peers = peers.borrow_mut();
         if let Some(link) = peers.get_mut(&peer) {
             if let Some(channel) = link.channel.clone() {
-                flush_link(link, &channel);
+                flush_link(link, &channel, &stats);
             }
         }
     }) as Box<dyn FnMut(JsValue)>);

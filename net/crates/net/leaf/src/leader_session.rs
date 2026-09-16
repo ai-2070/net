@@ -744,6 +744,11 @@ impl Lifecycle {
     /// spelling of it.
     pub async fn open_stream(&self, opts: &JsValue) -> Result<ProxyStream, JsError> {
         let options = crate::wasm::stream_options(opts)?;
+        // A follower's stream is opened by the LEADER tab's node and
+        // `LeaderRequest::StreamOpen` carries no peer, so a `peer`
+        // here would be silently dropped and the stream would
+        // address the leader's anchor. Refused by name instead.
+        options.require_anchor_addressed("a leader-proxied openStream")?;
         let reliable = options.reliability.is_reliable();
         // Read before the request, not after: a request that crosses a
         // handoff must produce a handle stamped with the generation it
@@ -2132,8 +2137,17 @@ impl MeshSession {
         kind: String,
         payload: Uint8Array,
     ) -> Result<(), JsError> {
-        let peer = u64::from_str_radix(peer_hex.trim_start_matches("0x"), 16)
-            .map_err(|_| JsError::new("peer_hex must be hex"))?;
+        // **One spelling, and the same reader as every other
+        // page-facing surface.** This read bare hex of ANY length —
+        // `"9"`, `"0x9"`, `"deadbeef"` all parsed — so a page on
+        // `openSession()` could sign an envelope to a node id
+        // spelling `connect()` refuses, i.e. the two surfaces
+        // disagreed about what a node id IS. That is exactly the
+        // drift the §9 refusal exists to prevent (PeerLoop's audit,
+        // 2026-09-16). It also could not work: the leader re-encodes
+        // canonical 16-hex on the way to
+        // [`crate::wasm::LeafNode::signal`], which read DECIMAL.
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
         self.lifecycle
             .request(LeaderRequest::Signal {
                 peer,
