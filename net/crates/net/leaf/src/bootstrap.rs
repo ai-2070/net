@@ -209,9 +209,19 @@ pub struct AnchorInfo {
     /// Its live Noise static public key — for **comparison** with
     /// the credential's pinned key, never as a source of it.
     pub noise_pubkey: [u8; 32],
-    /// Its public RTC/STUN socket, when the operator configured one.
-    /// The STUN probe's only legitimate target.
+    /// Its public RTC socket, when the operator configured one.
+    /// The diagnostic STUN probe's only legitimate target — and
+    /// **not** an `iceServers` entry for a connection with this
+    /// anchor, which is what [`Self::stun_addr`] is for.
     pub rtc_addr: Option<String>,
+    /// The **separately announced** STUN endpoint, when the anchor
+    /// announced one: a second, distinct UDP endpoint that answers
+    /// STUN for connections pairing with this anchor.
+    ///
+    /// Absent on an anchor that predates the field or configures
+    /// nothing, which parses as `None` and leaves the leaf
+    /// configuring no ICE servers at all.
+    pub stun_addr: Option<String>,
 }
 
 impl AnchorInfo {
@@ -237,6 +247,10 @@ impl AnchorInfo {
             noise_pubkey,
             rtc_addr: document
                 .get("rtc_addr")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            stun_addr: document
+                .get("stun_addr")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
         })
@@ -345,6 +359,121 @@ pub fn classify_ice_failure(
         },
         // Nothing to probe means nothing is established.
         None => RtcError::IceTimeout,
+    }
+}
+
+/// The IANA STUN port, which a `stun:` URL with no port means.
+pub const DEFAULT_STUN_PORT: u16 = 3478;
+
+/// The `iceServers` URL a leaf defaults to for a connection with an
+/// anchor that announced `announced` as its STUN endpoint.
+///
+/// `None` when nothing was announced — an anchor that predates the
+/// field, or one that configures no second socket. The leaf then
+/// configures **no** ICE servers at all, which is byte-for-byte the
+/// pre-Stage-6 behaviour.
+///
+/// It never guesses: not a port adjacent to `rtc_addr`, and never
+/// `rtc_addr` itself, which is the ICE peer rather than a STUN
+/// server for the connection it is a party to.
+pub fn default_stun_url(announced: Option<&str>) -> Option<String> {
+    let announced = announced?.trim();
+    if announced.is_empty() {
+        return None;
+    }
+    if stun_endpoint(announced).is_some() {
+        return Some(announced.to_string());
+    }
+    Some(format!("stun:{announced}"))
+}
+
+/// Refuse an `iceServers` configuration that aims a STUN URL at the
+/// peer of the connection being established.
+///
+/// `urls` is every URL of every caller-supplied entry, in the order
+/// the caller gave them; `peer_rtc_addr` is the RTC endpoint of the
+/// peer **this** connection pairs with. The comparison is
+/// deliberately connection-specific: an anchor may legitimately
+/// serve STUN to a browser ↔ browser connection it is not a party
+/// to, so a global blocklist would refuse a working configuration.
+///
+/// Returns [`LeafError::IceServerConflictsWithPeer`] on the first
+/// conflicting entry, and it is the caller's job to return it
+/// **before any ICE work** — the whole value of the check is that it
+/// replaces an ICE deadline with a sentence.
+///
+/// **Detection is endpoint equality only**, after default-port
+/// normalisation (`stun:h` and `stun:h:3478` are the same endpoint,
+/// `stun:[::1]:9` and `[::1]:9` are the same endpoint). A URL naming
+/// a DNS alias of the peer is **not** detected: the leaf resolves no
+/// names, and the announced STUN endpoint is what makes detection
+/// unnecessary for the configuration Net supplies.
+pub fn check_ice_servers_against_peer<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    peer_rtc_addr: Option<&str>,
+) -> Result<()> {
+    // No published peer endpoint is nothing to compare against —
+    // a browser peer has no RTC address at all.
+    let Some(peer_rtc_addr) = peer_rtc_addr else {
+        return Ok(());
+    };
+    let peer = normalized_endpoint(peer_rtc_addr);
+    for url in urls {
+        let Some(endpoint) = stun_endpoint(url) else {
+            // A `turn:`/`turns:` relay is a different role and a
+            // different contract; this check is about STUN.
+            continue;
+        };
+        if normalized_endpoint(endpoint) == peer {
+            return Err(LeafError::IceServerConflictsWithPeer {
+                entry: url.to_string(),
+                peer_rtc_addr: peer_rtc_addr.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `host:port` of a `stun:`/`stuns:` URL, or `None` when the URL
+/// is not one.
+fn stun_endpoint(url: &str) -> Option<&str> {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("stun") && !scheme.eq_ignore_ascii_case("stuns") {
+        return None;
+    }
+    // RFC 7064 gives a `stun:` URI no query component, but an engine
+    // that tolerates one must not be able to smuggle the peer past
+    // this comparison.
+    Some(rest.split('?').next().unwrap_or(rest))
+}
+
+/// `host:port` with the IANA STUN port supplied when the endpoint
+/// carries none, and an unbracketed IPv6 literal bracketed, so two
+/// spellings of one endpoint compare equal.
+fn normalized_endpoint(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.starts_with('[') {
+        return match raw.split_once(']') {
+            Some((host, tail)) if tail.len() > 1 && tail.starts_with(':') => {
+                format!("{host}]{tail}")
+            }
+            Some((host, _)) => format!("{host}]:{DEFAULT_STUN_PORT}"),
+            // Unterminated: not an endpoint, and comparing it
+            // verbatim is the one disposition that cannot invent a
+            // match.
+            None => raw.to_string(),
+        };
+    }
+    // A bare IPv6 literal has more than one colon and no brackets,
+    // and carries no port — an unbracketed one cannot be told from
+    // the address.
+    if raw.matches(':').count() > 1 {
+        return format!("[{raw}]:{DEFAULT_STUN_PORT}");
+    }
+    match raw.split_once(':') {
+        Some((_, port)) if !port.is_empty() => raw.to_string(),
+        _ => format!("{raw}:{DEFAULT_STUN_PORT}"),
     }
 }
 
@@ -528,21 +657,32 @@ mod tests {
 
     #[test]
     fn anchor_info_parses_both_node_id_spellings() {
-        let body = r#"{"node_id":"0xaabb","noise_pubkey":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","rtc_addr":"198.51.100.7:4433","trust_domain":"x"}"#;
+        let body = r#"{"node_id":"0xaabb","noise_pubkey":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","rtc_addr":"198.51.100.7:4433","stun_addr":"198.51.100.7:3479","trust_domain":"x"}"#;
         let info = AnchorInfo::from_json(body).expect("parses");
         assert_eq!(info.node_id, 0xAABB);
         assert_eq!(info.noise_pubkey, [0xA1u8; 32]);
         assert_eq!(info.rtc_addr.as_deref(), Some("198.51.100.7:4433"));
+        // Two distinct announced endpoints, read as two fields: the
+        // STUN endpoint is never derived from `rtc_addr`.
+        assert_eq!(info.stun_addr.as_deref(), Some("198.51.100.7:3479"));
 
         assert_eq!(parse_node_id("42"), Some(42));
         assert_eq!(parse_node_id("0X2A"), Some(42));
         assert_eq!(parse_node_id("nope"), None);
 
         let no_addr = r#"{"node_id":"1","noise_pubkey":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"}"#;
-        assert_eq!(
-            AnchorInfo::from_json(no_addr).expect("parses").rtc_addr,
-            None
-        );
+        let bare = AnchorInfo::from_json(no_addr).expect("parses");
+        assert_eq!(bare.rtc_addr, None);
+        // An anchor that predates the field, which must parse — not
+        // fail, and not default to `rtc_addr`.
+        assert_eq!(bare.stun_addr, None);
+
+        // Announced RTC endpoint, no announced STUN endpoint: the
+        // one field is absent on its own.
+        let rtc_only = r#"{"node_id":"1","noise_pubkey":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","rtc_addr":"198.51.100.7:4433"}"#;
+        let rtc_only = AnchorInfo::from_json(rtc_only).expect("parses");
+        assert_eq!(rtc_only.rtc_addr.as_deref(), Some("198.51.100.7:4433"));
+        assert_eq!(rtc_only.stun_addr, None);
     }
 
     /// The MITM refusal: the live key must be the pinned key.
@@ -555,6 +695,7 @@ mod tests {
             node_id: 1,
             noise_pubkey: [0xA1u8; 32],
             rtc_addr: None,
+            stun_addr: None,
         };
         matching
             .check_pinned_key(&credential)
@@ -564,6 +705,7 @@ mod tests {
             node_id: 1,
             noise_pubkey: [0xBEu8; 32],
             rtc_addr: None,
+            stun_addr: None,
         };
         let err = impostor
             .check_pinned_key(&credential)
@@ -626,5 +768,133 @@ mod tests {
         };
         assert_eq!(evidence.probed, "198.51.100.7:4433");
         assert!(evidence.bootstrap_ok && evidence.stun_probe_failed);
+    }
+
+    /// The Stage 6 default: the announced endpoint, and nothing
+    /// when nothing was announced.
+    #[test]
+    fn the_default_ice_server_is_the_announced_stun_endpoint_or_nothing() {
+        assert_eq!(
+            default_stun_url(Some("198.51.100.7:3479")).as_deref(),
+            Some("stun:198.51.100.7:3479")
+        );
+        // IPv6 arrives already bracketed, the way `SocketAddr`
+        // renders it, and must stay that way inside the URL.
+        assert_eq!(
+            default_stun_url(Some("[2001:db8::1]:3479")).as_deref(),
+            Some("stun:[2001:db8::1]:3479")
+        );
+        // An anchor that announced a URL rather than an endpoint is
+        // taken at its word, not double-prefixed.
+        assert_eq!(
+            default_stun_url(Some("stun:anchor.example:3479")).as_deref(),
+            Some("stun:anchor.example:3479")
+        );
+
+        // Nothing announced, nothing configured: the pre-Stage-6
+        // behaviour, which is an empty `iceServers`. The leaf never
+        // substitutes `rtc_addr` here — that substitution is the
+        // defect Stage 6 exists to remove.
+        assert_eq!(default_stun_url(None), None);
+        assert_eq!(default_stun_url(Some("")), None);
+        assert_eq!(default_stun_url(Some("   ")), None);
+    }
+
+    /// The safeguard: the peer's own RTC endpoint configured as this
+    /// connection's STUN server is refused, by name.
+    #[test]
+    fn a_stun_entry_naming_this_connections_peer_is_refused_with_both_endpoints_named() {
+        let peer = Some("198.51.100.7:4433");
+        let err = check_ice_servers_against_peer(["stun:198.51.100.7:4433"], peer)
+            .expect_err("the peer's own RTC endpoint must be refused");
+        assert_eq!(
+            err,
+            LeafError::IceServerConflictsWithPeer {
+                entry: "stun:198.51.100.7:4433".into(),
+                peer_rtc_addr: "198.51.100.7:4433".into(),
+            }
+        );
+        let text = format!("{err}");
+        // Descriptive, per the acceptance boundary: the conflicting
+        // entry, the peer it collides with, and the way out. Pinned
+        // whole, not by substring, because `@net-mesh/browser`
+        // reconstructs this variant by parsing exactly this sentence
+        // — `IceServerConflictError` carries a byte-identical copy,
+        // and a reworded prefix here would silently demote the error
+        // to `unknown` in the browser.
+        assert_eq!(
+            text,
+            "ice configuration: the iceServers entry stun:198.51.100.7:4433 names this \
+             connection's peer RTC endpoint 198.51.100.7:4433; a peer cannot be its own STUN \
+             server. Omit iceServers to use the STUN endpoint the anchor announces (the \
+             stun_addr field of GET /rtc/anchor), or name a STUN server that is not this peer"
+        );
+
+        // The conflicting entry is found wherever it sits, and the
+        // error names *it*, not the first entry.
+        let err = check_ice_servers_against_peer(
+            ["stun:stun.example:3478", "stun:198.51.100.7:4433"],
+            peer,
+        )
+        .expect_err("a later entry conflicts just as much");
+        assert!(format!("{err}").contains("stun:198.51.100.7:4433"), "{err}");
+
+        // Default-port spellings of one endpoint compare equal in
+        // both directions.
+        assert!(check_ice_servers_against_peer(["stun:anchor.example"], Some("anchor.example:3478"))
+            .is_err());
+        assert!(check_ice_servers_against_peer(
+            ["stun:anchor.example:3478"],
+            Some("anchor.example")
+        )
+        .is_err());
+        // An unbracketed IPv6 peer and a bracketed URL are one
+        // endpoint.
+        assert!(check_ice_servers_against_peer(
+            ["stun:[2001:db8::1]:3478"],
+            Some("2001:db8::1")
+        )
+        .is_err());
+        // A tolerated query component cannot smuggle the peer past
+        // the comparison.
+        assert!(check_ice_servers_against_peer(
+            ["stun:198.51.100.7:4433?transport=udp"],
+            peer
+        )
+        .is_err());
+    }
+
+    /// What must NOT be refused — the check is connection-specific
+    /// and STUN-specific, and equality is all it claims.
+    #[test]
+    fn a_separate_endpoint_a_relay_or_an_unknown_peer_is_not_a_conflict() {
+        let peer = Some("198.51.100.7:4433");
+        // The whole point of Stage 6: the separately announced
+        // endpoint on the same host, a different port.
+        check_ice_servers_against_peer(["stun:198.51.100.7:3479"], peer)
+            .expect("the announced STUN endpoint is the working configuration");
+        // A third-party STUN server.
+        check_ice_servers_against_peer(["stun:stun.example:3478"], peer).expect("unrelated");
+        // A TURN relay is a different role; this check is about
+        // STUN, and refusing a relay would refuse a configuration
+        // that works.
+        check_ice_servers_against_peer(["turn:198.51.100.7:4433"], peer).expect("a relay");
+        check_ice_servers_against_peer(["turns:198.51.100.7:4433"], peer).expect("a relay");
+        // A browser peer publishes no RTC endpoint, so there is
+        // nothing this connection could collide with — including the
+        // anchor's own endpoint, which an anchor may legitimately
+        // serve to a browser ↔ browser connection it is not a party
+        // to.
+        check_ice_servers_against_peer(["stun:198.51.100.7:4433"], None)
+            .expect("no peer endpoint is no conflict");
+        // No entries at all.
+        check_ice_servers_against_peer(core::iter::empty(), peer).expect("nothing configured");
+
+        // The documented boundary, asserted so it stays documented:
+        // a DNS alias of the peer is NOT detected. The leaf resolves
+        // no names, and this test records that as a known limit
+        // rather than a promise.
+        check_ice_servers_against_peer(["stun:alias.example:4433"], peer)
+            .expect("an unresolved alias is outside what equality can see");
     }
 }

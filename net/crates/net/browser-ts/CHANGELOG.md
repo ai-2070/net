@@ -121,3 +121,35 @@ the README on why it is a sibling package rather than a sub-path.
   would actually use, so the ABI can be asserted against the built
   package without an anchor. `tests/abi_real_package.mjs` does exactly
   that against `dist/` and the `pkg/` beside it.
+
+- **`ConnectOptions.iceServers` now has a working default, and one
+  refusal.** Omitted, the leaf gathers against the STUN endpoint the
+  anchor announces separately — `stun_addr` on `GET /rtc/anchor`, a
+  second UDP endpoint distinct from `rtc_addr` — so the advertised
+  configuration works without a page choosing a STUN service. An
+  anchor that announces none leaves the connection with no ICE
+  servers, which is what it had before. An explicit `iceServers: []`
+  is still a caller choosing none, and is honoured: the default turns
+  on the key's absence, not on emptiness.
+
+  Supplied entries are honoured verbatim except one, which is now
+  `IceServerConflictError` (`kind: 'ice-server-conflict'`) raised
+  **before any ICE work**: an entry whose STUN endpoint is this
+  connection's own peer RTC endpoint. An anchor's `rtc_addr` is that
+  connection's ICE peer, not a STUN server for it, so the connection
+  gathers no server-reflexive candidate and times out. It is refused
+  rather than silently stripped — stripping turns an explicit
+  NAT-traversal configuration into a host-candidate-only attempt
+  while appearing to have accepted it. The error carries `entry` and
+  `peerRtcAddr`. Detection is endpoint equality only (after
+  default-port normalisation); a DNS alias that resolves to the peer
+  is not detected, and the announced endpoint is what makes detection
+  unnecessary for the configuration Net supplies.
+
+- **`stunUrl` is now `diagnosticStunUrl`.** Same behaviour, honest
+  name: it builds the throwaway UDP probe's target out of `rtc_addr`
+  and is for `probeStunBinding` only. The old name implied that
+  turning `rtc_addr` into a `stun:` URL made it suitable for that
+  anchor's own connection — the configuration the leaf now refuses,
+  and the one both of this repo's harnesses had adopted. There is no
+  alias: update the call site.

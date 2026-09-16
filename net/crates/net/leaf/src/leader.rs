@@ -2015,6 +2015,20 @@ fn encode_error(error: &LeafError) -> Value {
             map.insert("needed".into(), Value::from(*needed as u64));
             map.insert("remaining".into(), Value::from(*remaining as u64));
         }
+        LeafError::IceServerConflictsWithPeer {
+            entry,
+            peer_rtc_addr,
+        } => {
+            map.insert(
+                "kind".into(),
+                Value::from("ice_server_conflicts_with_peer"),
+            );
+            map.insert("entry".into(), Value::from(entry.clone()));
+            map.insert(
+                "peer_rtc_addr".into(),
+                Value::from(peer_rtc_addr.clone()),
+            );
+        }
         LeafError::NotLeader { presented, current } => {
             map.insert("kind".into(), Value::from("not_leader"));
             map.insert("presented".into(), Value::from(presented.to_string()));
@@ -2158,6 +2172,10 @@ fn decode_error(value: &Value) -> Result<LeafError> {
             stream_id: u64_field(value, "stream_id")?,
             needed: u64_field(value, "needed")? as usize,
             remaining: u64_field(value, "remaining")? as usize,
+        },
+        "ice_server_conflicts_with_peer" => LeafError::IceServerConflictsWithPeer {
+            entry: detail("entry")?,
+            peer_rtc_addr: detail("peer_rtc_addr")?,
         },
         other => {
             return Err(LeafError::ControlPlane(format!(

@@ -769,13 +769,26 @@ impl LeafNode {
     /// `bootstrapUrl` overrides the credential's when present;
     /// everything else Layer 0 needs — the pinned anchor key, the
     /// PSK, the listener URL — comes from the credential itself.
+    ///
+    /// `iceServers` is optional and **defaults to the anchor's
+    /// separately announced STUN endpoint** (the `stun_addr` field
+    /// of `GET /rtc/anchor`), so the advertised configuration works
+    /// without the page choosing a STUN service. An anchor that
+    /// announced none leaves the connection with no ICE servers.
+    ///
+    /// A supplied `iceServers` is honoured verbatim, with one
+    /// refusal: an entry naming this connection's peer RTC endpoint
+    /// as its STUN server is
+    /// [`LeafError::IceServerConflictsWithPeer`], returned before
+    /// any ICE work. Detection is endpoint equality only; see
+    /// [`crate::bootstrap::check_ice_servers_against_peer`].
     pub async fn connect(opts: JsValue) -> Result<LeafNode, JsError> {
         let credential_str = require_string(&opts, "credentialB64")?;
         let credential = Credential::decode(&credential_str).map_err(js)?;
         credential.validate_at(clock::now_unix_secs()).map_err(js)?;
         let bootstrap_url = optional_string(&opts, "bootstrapUrl")
             .unwrap_or_else(|| credential.bootstrap_url.clone());
-        let ice_servers = parse_ice_servers(&opts)?;
+        let caller_ice_servers = parse_ice_servers(&opts)?;
         let identity = identity_from(&opts)?;
         let node_id = identity.node_id();
 
@@ -790,6 +803,48 @@ impl LeafNode {
             .map_err(js)?;
         let anchor = control.anchor_node();
         let anchor_rtc_addr = control.anchor_rtc_addr();
+
+        // Stage 6, the safeguard. A caller-supplied STUN entry that
+        // names this connection's own ICE peer gathers no
+        // server-reflexive candidate, so configuring it buys an ICE
+        // deadline instead of a reason. Refused **here**: after the
+        // announcement that names the peer, and before the offer
+        // that would start ICE. Never silently stripped — stripping
+        // would turn an explicit NAT-traversal configuration into a
+        // host-candidate-only attempt while appearing to have
+        // accepted the caller's settings.
+        //
+        // Connection-specific by construction: the comparison is
+        // against *this* connection's peer, so an anchor remains a
+        // legitimate STUN server for a browser ↔ browser connection
+        // it is not a party to.
+        let ice_servers = match caller_ice_servers {
+            Some(servers) => {
+                crate::bootstrap::check_ice_servers_against_peer(
+                    servers
+                        .iter()
+                        .flat_map(|server| server.urls.iter().map(String::as_str)),
+                    anchor_rtc_addr.as_deref(),
+                )
+                .map_err(js)?;
+                servers
+            }
+            // The working configuration Net supplies, so an
+            // integrator does not have to discover which external
+            // STUN service avoids its own anchor: the anchor's
+            // separately announced endpoint. An anchor that
+            // announced none leaves this empty, which is exactly
+            // the pre-Stage-6 behaviour.
+            None => crate::bootstrap::default_stun_url(control.anchor_stun_addr().as_deref())
+                .map(|url| {
+                    vec![IceServer {
+                        urls: vec![url],
+                        username: None,
+                        credential: None,
+                    }]
+                })
+                .unwrap_or_default(),
+        };
 
         let seed = u64::from_le_bytes(
             random32().map_err(js)?[..8]
@@ -1261,8 +1316,17 @@ impl LeafNode {
     /// Shape: `[{"urls":["stun:host:3478"],"username":"u",
     /// "credential":"c"}]`, `username`/`credential` present only
     /// when the entry carried them.
+    ///
+    /// It reports what the **caller** configured, so an options
+    /// object with no `iceServers` reads `[]` here even though
+    /// [`Self::connect`] will substitute the anchor's announced
+    /// STUN endpoint: the substitute is not knowable without an
+    /// anchor to ask, and inventing one would make this method lie
+    /// about the only thing it can see.
     pub fn effective_ice_servers(opts: JsValue) -> Result<String, JsError> {
-        Ok(ice_servers_json(&parse_ice_servers(&opts)?))
+        Ok(ice_servers_json(
+            &parse_ice_servers(&opts)?.unwrap_or_default(),
+        ))
     }
 
     /// What an `open_stream(opts)` with this options object would
@@ -3035,16 +3099,24 @@ pub(crate) fn stream_options(opts: &JsValue) -> Result<StreamOptions, JsError> {
 /// `RTCIceServer`, whose `urls` is a string or an array of them and
 /// which carries `username`/`credential` for TURN.
 ///
+/// `None` means the caller supplied **no** `iceServers` key at all,
+/// which is what lets [`LeafNode::connect`] substitute the anchor's
+/// announced STUN endpoint. `Some(vec![])` is an explicit empty
+/// array — a caller saying "no ICE servers" — and is honoured as
+/// given. The distinction is the whole of the Stage 6 default:
+/// collapsing the two would either ignore an explicit choice or
+/// deny a silent one.
+///
 /// Stage 5 read this with `as_string` on each element, so every
 /// object a page passed — the only shape `RTCIceServer` has —
 /// evaluated to nothing and the page's ICE configuration was
 /// silently absent from the offer. A bare URL string is refused
 /// rather than quietly accepted as a second spelling: one contract.
-fn parse_ice_servers(opts: &JsValue) -> Result<Vec<IceServer>, JsError> {
+fn parse_ice_servers(opts: &JsValue) -> Result<Option<Vec<IceServer>>, JsError> {
     let value = js_sys::Reflect::get(opts, &JsValue::from_str("iceServers"))
         .map_err(|_| JsError::new("iceServers could not be read"))?;
     if value.is_undefined() || value.is_null() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let array = value
         .dyn_into::<js_sys::Array>()
@@ -3053,7 +3125,8 @@ fn parse_ice_servers(opts: &JsValue) -> Result<Vec<IceServer>, JsError> {
         .iter()
         .enumerate()
         .map(|(index, entry)| parse_ice_server(&entry, index))
-        .collect()
+        .collect::<Result<Vec<IceServer>, JsError>>()
+        .map(Some)
 }
 
 fn parse_ice_server(entry: &JsValue, index: usize) -> Result<IceServer, JsError> {

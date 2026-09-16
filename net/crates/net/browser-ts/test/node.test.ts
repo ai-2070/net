@@ -8,7 +8,12 @@
 import { describe, expect, it } from 'vitest';
 
 import { connect, type BrowserNode } from '../src/node.js';
-import { fromWasmError, isUdpBlocked, type LeafError } from '../src/errors.js';
+import {
+  fromWasmError,
+  IceServerConflictError,
+  isUdpBlocked,
+  type LeafError,
+} from '../src/errors.js';
 import type { LeafWasmConnectOptions } from '../src/wasm.js';
 import { fakeModule, failingModule, FakeNode } from './fake-wasm.js';
 
@@ -143,6 +148,59 @@ describe('connect', () => {
       new Error('rtc: ICE did not connect inside the deadline (this does not establish that UDP is blocked)'),
     );
     await expect(connect({ ...BASE, wasm: module })).rejects.toMatchObject({ kind: 'ice-timeout' });
+  });
+
+  // The leaf's default `iceServers` is the anchor's separately
+  // announced STUN endpoint, and it turns on the ABSENCE of the key.
+  // An `iceServers: []` synthesised by this wrapper would read as a
+  // caller who chose no ICE servers and suppress the default —
+  // silently, and only visible as a connection that gathers host
+  // candidates only.
+  it('omits iceServers entirely when the page supplied none, so the leaf can default it', async () => {
+    const requests: LeafWasmConnectOptions[] = [];
+    await connect({ ...BASE, wasm: fakeModule(new FakeNode(), requests) });
+    expect(requests).toHaveLength(1);
+    expect('iceServers' in requests[0]!).toBe(false);
+  });
+
+  it('carries an explicit empty iceServers, because choosing none is not the same as saying nothing', async () => {
+    const requests: LeafWasmConnectOptions[] = [];
+    await connect({ ...BASE, wasm: fakeModule(new FakeNode(), requests), iceServers: [] });
+    expect(requests[0]!.iceServers).toEqual([]);
+  });
+
+  it('carries supplied iceServers verbatim', async () => {
+    const requests: LeafWasmConnectOptions[] = [];
+    const iceServers = [{ urls: 'stun:stun.example:3478' }];
+    await connect({ ...BASE, wasm: fakeModule(new FakeNode(), requests), iceServers });
+    expect(requests[0]!.iceServers).toEqual(iceServers);
+  });
+
+  // The typed refusal, re-typed across the boundary rather than
+  // flattened to `unknown`: a page that catches this has a setting to
+  // change, and the error names both endpoints.
+  it('re-types an iceServers entry that names the connection peer', async () => {
+    const module = failingModule(
+      new Error(
+        "ice configuration: the iceServers entry stun:203.0.113.9:4433 names this connection's " +
+          'peer RTC endpoint 203.0.113.9:4433; a peer cannot be its own STUN server. Omit ' +
+          'iceServers to use the STUN endpoint the anchor announces (the stun_addr field of GET ' +
+          '/rtc/anchor), or name a STUN server that is not this peer',
+      ),
+    );
+    const error = await connect({
+      ...BASE,
+      wasm: module,
+      anchorRtcAddr: '203.0.113.9:4433',
+      iceServers: [{ urls: 'stun:203.0.113.9:4433' }],
+    }).then(
+      () => null,
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(IceServerConflictError);
+    expect((error as IceServerConflictError).kind).toBe('ice-server-conflict');
+    expect((error as IceServerConflictError).entry).toBe('stun:203.0.113.9:4433');
+    expect((error as IceServerConflictError).peerRtcAddr).toBe('203.0.113.9:4433');
   });
 });
 

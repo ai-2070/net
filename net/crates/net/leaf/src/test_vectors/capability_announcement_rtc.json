@@ -1,5 +1,5 @@
 {
-  "description": "CapabilityAnnouncement WITH the three Stage 4a browser-leaf fields set (noise_pubkey, rtc_bootstrap, rtc_addr). Each is optional and omitted when None \u2014 the sibling fixture capability_announcement.json is the same announcement WITHOUT them, and its bytes are unchanged by Stage 4a. Declaration order puts the three after owner_cert, and SignedPayloadCanonical emits them in that order, so these bytes are also the signed transcript.",
+  "description": "CapabilityAnnouncement WITH the optional RTC browser-leaf fields set — the three Stage 4a ones (noise_pubkey, rtc_bootstrap, rtc_addr) plus Stage 6's separately announced STUN endpoint (rtc_stun_addr). Each is optional and omitted when None \u2014 the sibling fixture capability_announcement.json is the same announcement WITHOUT them, and its bytes are unchanged by Stage 4a and by Stage 6. Declaration order puts them after owner_cert with rtc_stun_addr immediately after rtc_addr, and SignedPayloadCanonical emits them in that order, so these bytes are also the signed transcript. rtc_stun_addr is a host:port STRING (a DNS name is legal) and is deliberately a DIFFERENT endpoint from rtc_addr: a leaf's iceServers points at it, while rtc_addr stays the ICE endpoint and the diagnostic STUN probe target.",
   "json": {
     "node_id": 11651590505119483656,
     "entity_id": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -45,7 +45,8 @@
       17
     ],
     "rtc_bootstrap": "https://anchor.example/rtc",
-    "rtc_addr": "198.51.100.7:4433"
+    "rtc_addr": "198.51.100.7:4433",
+    "rtc_stun_addr": "198.51.100.7:3478"
   },
-  "bytes_utf8": "{\"node_id\":11651590505119483656,\"entity_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"version\":7,\"timestamp_ns\":1700000000000000000,\"ttl_secs\":300,\"capabilities\":{\"tags\":[],\"metadata\":{}},\"noise_pubkey\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"rtc_bootstrap\":\"https://anchor.example/rtc\",\"rtc_addr\":\"198.51.100.7:4433\"}"
+  "bytes_utf8": "{\"node_id\":11651590505119483656,\"entity_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"version\":7,\"timestamp_ns\":1700000000000000000,\"ttl_secs\":300,\"capabilities\":{\"tags\":[],\"metadata\":{}},\"noise_pubkey\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"rtc_bootstrap\":\"https://anchor.example/rtc\",\"rtc_addr\":\"198.51.100.7:4433\",\"rtc_stun_addr\":\"198.51.100.7:3478\"}"
 }

@@ -37,7 +37,8 @@ pub const STREAM_WINDOW: &str = include_str!("test_vectors/stream_window.json");
 pub const CAPABILITY_ANNOUNCEMENT: &str = include_str!("test_vectors/capability_announcement.json");
 
 /// `capability_announcement_rtc.json` — the announcement with the
-/// three Stage 4a browser-leaf fields.
+/// optional RTC browser-leaf fields: the three Stage 4a ones plus
+/// Stage 6's separately announced `rtc_stun_addr`.
 pub const CAPABILITY_ANNOUNCEMENT_RTC: &str =
     include_str!("test_vectors/capability_announcement_rtc.json");
 

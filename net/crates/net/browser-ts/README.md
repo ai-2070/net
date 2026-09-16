@@ -158,6 +158,7 @@ crossed the boundary; `.kind` is a flat, stable discriminant:
 | `leader-lost` | `RpcError` | `RpcError::LeaderLost` |
 | `rpc-indeterminate` | `RpcError` | `RpcError::Indeterminate` |
 | `rpc-malformed` | `RpcError` | `RpcError::Malformed` |
+| `ice-server-conflict` | `IceServerConflictError` | `LeafError::IceServerConflictsWithPeer` |
 | `unknown` | `UnknownLeafError` | *nothing* — see below |
 
 An unrecognised message becomes `UnknownLeafError` rather than being
@@ -303,6 +304,16 @@ timeout correctly stays `ice-timeout`; `connect({ failureTyping: {
 probeOnIceTimeout: false } })` switches probing off with the same
 consequence.
 
+**The probe's subject is `rtc_addr`, and only `rtc_addr`.**
+`diagnosticStunUrl(rtcAddr)` builds that target; the name says what it
+is for. It is **not** a source of `ConnectOptions.iceServers`: for a
+connection with that anchor, `rtc_addr` is the ICE peer, and a peer
+cannot be its own STUN server. The endpoint an anchor connection
+gathers against is the separate one the anchor announces as
+`stun_addr` on `GET /rtc/anchor`, which `connect()` uses by default.
+Configuring the peer anyway rejects with `IceServerConflictError`
+before any ICE work, naming both endpoints.
+
 **The one assumption this rests on**, named rather than buried: the
 anchor's published `rtc_addr` must answer an unauthenticated STUN
 binding request (with a success *or* an error response). If a future
@@ -379,7 +390,11 @@ Two consequences a page can see:
   `ConnectOptions.iceServers` is a real `RTCIceServer[]` — `urls` a
   string or an array, `username`/`credential` carried through for
   TURN. Each is refused with a typed error rather than silently
-  dropped.
+  dropped. `ConnectOptions.iceServers` is also **optional with a
+  working default**: omitted, the leaf gathers against the `stun_addr`
+  the anchor announces, and an entry naming this connection's peer
+  rejects with `IceServerConflictError` before ICE rather than being
+  silently stripped.
 
 None of that is taken on trust. `tests/abi_real_package.mjs` loads the
 **built** `dist/` and the wasm-bindgen `pkg/` beside it and asserts the

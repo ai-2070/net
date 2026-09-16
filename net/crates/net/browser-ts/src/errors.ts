@@ -33,6 +33,7 @@ export type LeafErrorKind =
   | 'leader-lost'
   | 'rpc-indeterminate'
   | 'rpc-malformed'
+  | 'ice-server-conflict'
   | 'unknown';
 
 /**
@@ -131,6 +132,48 @@ export class IdentityError extends LeafError {
   constructor(readonly detail: string) {
     super(`identity: ${detail}`);
     this.name = 'IdentityError';
+  }
+}
+
+/**
+ * A supplied `iceServers` entry named **this connection's own peer**
+ * as its STUN server.
+ *
+ * The mirror of Rust's `LeafError::IceServerConflictsWithPeer`. An
+ * anchor's `rtc_addr` is the ICE peer of a connection with that
+ * anchor, not a STUN server for it: the connection gathers no
+ * server-reflexive candidate and times out. The leaf refuses this
+ * **before any ICE work**, and refuses rather than silently
+ * stripping the entry — stripping would turn an explicit
+ * NAT-traversal configuration into a host-candidate-only attempt
+ * while appearing to have accepted it.
+ *
+ * The fix is to omit `iceServers` and let `connect()` use the
+ * endpoint the anchor announces as `stun_addr` on
+ * `GET /rtc/anchor`, or to name a STUN server that is not this
+ * peer. {@link diagnosticStunUrl} exists for the throwaway UDP
+ * probe and is not a source of `iceServers`.
+ *
+ * **Detection is endpoint equality only**, after default-port
+ * normalisation. A URL naming a DNS alias that resolves to the peer
+ * is not detected: the leaf resolves no names. The announced
+ * endpoint is what makes detection unnecessary for the configuration
+ * Net supplies.
+ */
+export class IceServerConflictError extends LeafError {
+  readonly kind = 'ice-server-conflict' as const;
+
+  constructor(
+    readonly entry: string,
+    readonly peerRtcAddr: string,
+  ) {
+    super(
+      `ice configuration: the iceServers entry ${entry} names this connection's peer RTC ` +
+        `endpoint ${peerRtcAddr}; a peer cannot be its own STUN server. Omit iceServers to ` +
+        'use the STUN endpoint the anchor announces (the stun_addr field of GET /rtc/anchor), ' +
+        'or name a STUN server that is not this peer',
+    );
+    this.name = 'IceServerConflictError';
   }
 }
 
@@ -316,6 +359,17 @@ export function parseLeafError(message: string): LeafError | null {
 
   const identity = after(message, 'identity: ');
   if (identity !== null) return new IdentityError(identity);
+
+  // Re-typed, not flattened to `unknown`: a page that catches this
+  // has a configuration to fix, and `kind` is what tells it apart
+  // from a transient ICE failure it might retry.
+  const iceConflict = after(message, 'ice configuration: ');
+  if (iceConflict !== null) {
+    const parsed = /^the iceServers entry (.+?) names this connection's peer RTC endpoint (.+?); a peer cannot be its own STUN server\./.exec(
+      iceConflict,
+    );
+    if (parsed) return new IceServerConflictError(parsed[1] ?? '', parsed[2] ?? '');
+  }
 
   const notLeader = /^not the leader: this tab holds generation (\d+)(?:, the leader holds (\d+))?$/.exec(
     message,

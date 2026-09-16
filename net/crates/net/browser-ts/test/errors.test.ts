@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ControlPlaneError,
   fromWasmError,
+  IceServerConflictError,
   IdentityError,
   isUdpBlocked,
   LeafError,
@@ -97,6 +98,15 @@ const VARIANTS: Array<{ error: LeafError; kind: LeafErrorKind; display: string }
     kind: 'rpc-malformed',
     display: 'rpc: the reply did not decode: unexpected end of input',
   },
+  {
+    error: new IceServerConflictError('stun:203.0.113.9:4433', '203.0.113.9:4433'),
+    kind: 'ice-server-conflict',
+    display:
+      "ice configuration: the iceServers entry stun:203.0.113.9:4433 names this connection's " +
+      'peer RTC endpoint 203.0.113.9:4433; a peer cannot be its own STUN server. Omit ' +
+      'iceServers to use the STUN endpoint the anchor announces (the stun_addr field of GET ' +
+      '/rtc/anchor), or name a STUN server that is not this peer',
+  },
 ];
 
 describe('the Rust Display round-trip', () => {
@@ -138,6 +148,31 @@ describe('fromWasmError', () => {
     }
   });
 
+  it('recovers both endpoints from an iceServers conflict, so a page can name what to change', () => {
+    const conflict = fromWasmError(
+      new Error(
+        "ice configuration: the iceServers entry stun:[2001:db8::1]:4433 names this connection's " +
+          'peer RTC endpoint [2001:db8::1]:4433; a peer cannot be its own STUN server. Omit ' +
+          'iceServers to use the STUN endpoint the anchor announces (the stun_addr field of GET ' +
+          '/rtc/anchor), or name a STUN server that is not this peer',
+      ),
+    );
+    expect(conflict).toBeInstanceOf(IceServerConflictError);
+    expect(conflict.kind).toBe('ice-server-conflict');
+    if (conflict instanceof IceServerConflictError) {
+      expect(conflict.entry).toBe('stun:[2001:db8::1]:4433');
+      expect(conflict.peerRtcAddr).toBe('[2001:db8::1]:4433');
+    }
+  });
+
+  it('does not invent a conflict from an unknown ice configuration Display', () => {
+    // A refusal this taxonomy has not been taught is `unknown`, not
+    // the nearest neighbour: mistyping a configuration error as a
+    // conflict would send a page to change the wrong setting.
+    const mapped = fromWasmError(new Error('ice configuration: something later added'));
+    expect(mapped.kind).toBe('unknown');
+  });
+
   it('accepts a bare string and an object with a message, as the boundary may throw either', () => {
     expect(fromWasmError('session: gone').kind).toBe('session');
     expect(fromWasmError({ message: 'identity: no key' }).kind).toBe('identity');
@@ -172,7 +207,7 @@ describe('enrollment failures', () => {
   // The sentences below are representative, NOT pinned: the detail text
   // after the prefix is the leaf's human-facing prose and must stay free
   // to be reworded. So these assert the kind and that the detail crosses
-  // verbatim, never the wording itself. (The 15 `Display` strings of the
+  // verbatim, never the wording itself. (The 16 `Display` strings of the
   // error *enums* are a different matter and are pinned above — those are
   // the contract.)
   it.each([

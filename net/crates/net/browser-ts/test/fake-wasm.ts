@@ -280,11 +280,24 @@ export class FakeNode implements LeafWasmNode {
 // That ABI is asserted against the real built `pkg/` by
 // `tests/abi_real_package.mjs`, and nowhere else.
 
-/** A module object satisfying `LeafWasmModule`, with no wasm behind it. */
-export function fakeModule(node: FakeNode | (() => FakeNode | Promise<FakeNode>)): LeafWasmModule {
+/**
+ * A module object satisfying `LeafWasmModule`, with no wasm behind it.
+ *
+ * `requests`, when supplied, collects every options object `connect`
+ * was handed. The leaf's `iceServers` default turns on the **absence**
+ * of that key — an absent `iceServers` takes the anchor's announced
+ * STUN endpoint, an explicit `[]` is honoured as a caller saying "no
+ * ICE servers" — so a test that cares about it has to see what
+ * actually crossed the boundary, not what the page passed in.
+ */
+export function fakeModule(
+  node: FakeNode | (() => FakeNode | Promise<FakeNode>),
+  requests?: LeafWasmConnectOptions[],
+): LeafWasmModule {
   return {
     LeafNode: {
-      async connect(_options: LeafWasmConnectOptions): Promise<LeafWasmNode> {
+      async connect(options: LeafWasmConnectOptions): Promise<LeafWasmNode> {
+        requests?.push(options);
         return typeof node === 'function' ? await node() : node;
       },
     },

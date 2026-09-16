@@ -72,6 +72,36 @@ pub enum LeafError {
         /// Descriptor slots the stream had.
         remaining: usize,
     },
+    /// A caller-supplied `iceServers` entry points a STUN URL at
+    /// **this connection's own peer**.
+    ///
+    /// Stage 6: an anchor's RTC endpoint is an ICE agent, not a STUN
+    /// server for the connection it is a party to, and configuring
+    /// it as one produces a connection that gathers no
+    /// server-reflexive candidate and then simply times out. The
+    /// refusal is returned **before any ICE work** — before the
+    /// offer exists — because "promptly and descriptively" is the
+    /// only useful disposition for a configuration that cannot
+    /// work.
+    ///
+    /// It is a refusal and **not** a silent strip: stripping would
+    /// turn an explicit NAT-traversal configuration into a
+    /// host-candidate-only attempt while appearing to have accepted
+    /// the caller's settings.
+    ///
+    /// **Detection is endpoint equality only**, after default-port
+    /// normalisation. A STUN URL naming a DNS alias that happens to
+    /// resolve to the peer's address is **not** detected: the leaf
+    /// does not resolve names, and promising exhaustive detection it
+    /// cannot provide would be worse than naming the boundary. The
+    /// announced STUN endpoint exists so the working configuration
+    /// needs no detection at all.
+    IceServerConflictsWithPeer {
+        /// The `iceServers` URL the caller supplied, verbatim.
+        entry: String,
+        /// This connection's peer RTC endpoint, as announced.
+        peer_rtc_addr: String,
+    },
 }
 
 /// Why an RTC attempt did not produce a DataChannel.
@@ -216,6 +246,17 @@ impl fmt::Display for LeafError {
                 "reliable window full: stream {stream_id:#x} needs {needed} retransmit \
                  descriptor(s) and has room for {remaining}; the peer has not \
                  acknowledged enough packets yet"
+            ),
+            Self::IceServerConflictsWithPeer {
+                entry,
+                peer_rtc_addr,
+            } => write!(
+                f,
+                "ice configuration: the iceServers entry {entry} names this connection's \
+                 peer RTC endpoint {peer_rtc_addr}; a peer cannot be its own STUN server. \
+                 Omit iceServers to use the STUN endpoint the anchor announces (the \
+                 stun_addr field of GET /rtc/anchor), or name a STUN server that is not \
+                 this peer"
             ),
         }
     }

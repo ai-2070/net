@@ -114,7 +114,7 @@ export async function probeStunBinding(
   rtcAddr: string,
   options: StunProbeOptions = {},
 ): Promise<StunProbeOutcome> {
-  const url = stunUrl(rtcAddr);
+  const url = diagnosticStunUrl(rtcAddr);
   if (url === null) return { type: 'notRun', reason: `not an address: ${rtcAddr}` };
 
   const factory = options.peerConnectionFactory ?? defaultPeerConnectionFactory();
@@ -246,12 +246,24 @@ export async function probeBootstrapReachable(
 }
 
 /**
- * `host:port` (or `[v6]:port`, or a bare host) to a `stun:` URL, or
- * `null` when it is not an address at all. A missing port means the
- * IANA STUN port, which is what an anchor publishing a bare host
- * would mean.
+ * `host:port` (or `[v6]:port`, or a bare host) to a `stun:` URL for
+ * the **throwaway diagnostic probe**, or `null` when it is not an
+ * address at all. A missing port means the IANA STUN port, which is
+ * what an anchor publishing a bare host would mean.
+ *
+ * This is for {@link probeStunBinding} and nothing else. It must
+ * **NOT** be used to build the anchor connection's `iceServers`:
+ * `rtc_addr` is that connection's ICE peer, and a peer cannot be its
+ * own STUN server — configuring it that way gathers no reflexive
+ * candidate and buys an ICE deadline instead of a connection. The
+ * leaf refuses it outright ({@link IceServerConflictError}).
+ *
+ * The endpoint an anchor connection should gather against is the one
+ * the anchor announces separately, as `stun_addr` on
+ * `GET /rtc/anchor`; `connect()` uses it by default, so a page needs
+ * no URL-building at all.
  */
-export function stunUrl(rtcAddr: string): string | null {
+export function diagnosticStunUrl(rtcAddr: string): string | null {
   const trimmed = rtcAddr.trim();
   if (trimmed.length === 0) return null;
   if (trimmed.startsWith('stun:') || trimmed.startsWith('stuns:')) return trimmed;

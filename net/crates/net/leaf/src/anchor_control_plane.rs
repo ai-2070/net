@@ -91,6 +91,9 @@ struct State {
     anchor_node: NodeId,
     /// The anchor's published RTC socket, when it has one.
     anchor_rtc_addr: Option<String>,
+    /// The anchor's **separately announced** STUN endpoint, when it
+    /// announced one. A different socket from `anchor_rtc_addr`.
+    anchor_stun_addr: Option<String>,
     /// The dialog `POST /rtc/offer` allocated, once it has.
     dialog: Cell<Option<DialogId>>,
     /// The trickle socket for that dialog.
@@ -160,6 +163,7 @@ impl AnchorControlPlane {
                 self_node,
                 anchor_node: info.node_id,
                 anchor_rtc_addr: info.rtc_addr.clone(),
+                anchor_stun_addr: info.stun_addr.clone(),
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
                 pending_flush: Rc::new(RefCell::new(Vec::new())),
@@ -179,12 +183,31 @@ impl AnchorControlPlane {
     ///
     /// Not a trait method and deliberately not one: it is not an
     /// address the leaf dials — a browser cannot dial a socket — it
-    /// is the STUN probe's only legitimate target and the `rtc_addr`
-    /// the `connected` event reports. The trait carries no addresses
-    /// at all, so this stays on the implementation that minted it.
+    /// is the **diagnostic** STUN probe's only legitimate target and
+    /// the `rtc_addr` the `connected` event reports. The trait
+    /// carries no addresses at all, so this stays on the
+    /// implementation that minted it.
+    ///
+    /// It is also this connection's ICE peer, which is why
+    /// [`crate::bootstrap::check_ice_servers_against_peer`] compares
+    /// a caller's `iceServers` against it.
     #[inline]
     pub fn anchor_rtc_addr(&self) -> Option<String> {
         self.state.anchor_rtc_addr.clone()
+    }
+
+    /// The anchor's separately announced STUN endpoint, when it
+    /// announced one.
+    ///
+    /// The sibling of [`Self::anchor_rtc_addr`] and deliberately a
+    /// second value rather than a derivation of it: this is the
+    /// endpoint a connection with this anchor gathers against, and
+    /// `rtc_addr` is the peer it gathers *for*. `None` means the
+    /// anchor announced nothing, and the leaf then configures no
+    /// ICE servers at all.
+    #[inline]
+    pub fn anchor_stun_addr(&self) -> Option<String> {
+        self.state.anchor_stun_addr.clone()
     }
 
     /// Open `GET /rtc/trickle`, presenting the attempt token as the

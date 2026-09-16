@@ -9,14 +9,20 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { isUdpBlocked, RtcError, udpBlockedEvidence } from '../src/errors.js';
+import {
+  IceServerConflictError,
+  isUdpBlocked,
+  parseLeafError,
+  RtcError,
+  udpBlockedEvidence,
+} from '../src/errors.js';
 import { refineIceFailure } from '../src/node.js';
 import {
   classifyRtcFailure,
+  diagnosticStunUrl,
   probeBootstrapReachable,
   probeStunBinding,
   reflexiveAddress,
-  stunUrl,
   type StunProbeOutcome,
 } from '../src/udp-probe.js';
 
@@ -80,7 +86,7 @@ describe('udpBlockedEvidence', () => {
   });
 });
 
-describe('stunUrl', () => {
+describe('diagnosticStunUrl', () => {
   it.each([
     ['203.0.113.9:4433', 'stun:203.0.113.9:4433'],
     ['anchor.example', 'stun:anchor.example:3478'],
@@ -89,13 +95,28 @@ describe('stunUrl', () => {
     ['2001:db8::1', 'stun:[2001:db8::1]:3478'],
     ['stun:already.example:3478', 'stun:already.example:3478'],
   ])('maps %s to %s', (addr, expected) => {
-    expect(stunUrl(addr)).toBe(expected);
+    expect(diagnosticStunUrl(addr)).toBe(expected);
   });
 
   it('rejects what is not an address, so the probe is never aimed at nothing', () => {
-    expect(stunUrl('')).toBeNull();
-    expect(stunUrl('   ')).toBeNull();
-    expect(stunUrl('http://anchor.example/rtc')).toBeNull();
+    expect(diagnosticStunUrl('')).toBeNull();
+    expect(diagnosticStunUrl('   ')).toBeNull();
+    expect(diagnosticStunUrl('http://anchor.example/rtc')).toBeNull();
+  });
+
+  // The rename is the contract: what this helper produces is the
+  // diagnostic probe's target, which is the anchor's ICE peer — so
+  // handing it to the leaf as `iceServers` is exactly the
+  // configuration the leaf now refuses. The old name implied the two
+  // uses were interchangeable, and both of this repo's harnesses
+  // took it up on that.
+  it('produces the peer endpoint the leaf refuses as an iceServers entry', () => {
+    const anchorRtcAddr = '203.0.113.9:4433';
+    const url = diagnosticStunUrl(anchorRtcAddr);
+    expect(url).toBe(`stun:${anchorRtcAddr}`);
+    const refused = parseLeafError(new IceServerConflictError(url ?? '', anchorRtcAddr).message);
+    expect(refused).toBeInstanceOf(IceServerConflictError);
+    expect((refused as IceServerConflictError).entry).toBe(url);
   });
 });
 
@@ -167,6 +188,23 @@ describe('probeStunBinding', () => {
       peerConnectionFactory: fakePeerConnection(() => {}),
     });
     expect(outcome).toEqual({ type: 'unanswered', detail: 'no answer inside the probe deadline' });
+  });
+
+  // Stage 6 added a SECOND announced STUN endpoint, and the
+  // classification contract is that this probe did not move: the
+  // `udp-blocked` claim is about `rtc_addr`, so the probe must be
+  // aimed at `rtc_addr` and at nothing else. Asserted on the
+  // configuration the factory is handed, because an aim is not
+  // observable from the outcome.
+  it('aims exactly one ICE server at rtc_addr, which is what udp-blocked is a claim about', async () => {
+    const connections: FakePeerConnection[] = [];
+    await probeStunBinding(PROBED, {
+      timeoutMs: 5,
+      peerConnectionFactory: fakePeerConnection(() => {}, connections),
+    });
+    expect(connections).toHaveLength(1);
+    expect(connections[0]?.config.iceServers).toEqual([{ urls: `stun:${PROBED}` }]);
+    expect(connections[0]?.config.iceCandidatePoolSize).toBe(0);
   });
 
   it('closes the probe connection whatever the outcome', async () => {

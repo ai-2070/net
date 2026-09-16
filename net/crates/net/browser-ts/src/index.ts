@@ -64,6 +64,7 @@ export type {
 
 export {
   ControlPlaneError,
+  IceServerConflictError,
   IdentityError,
   isUdpBlocked,
   LeafError,
@@ -89,10 +90,10 @@ export type {
 export {
   classifyRtcError,
   classifyRtcFailure,
+  diagnosticStunUrl,
   probeBootstrapReachable,
   probeStunBinding,
   reflexiveAddress,
-  stunUrl,
 } from './udp-probe.js';
 export type {
   BootstrapProbeOptions,

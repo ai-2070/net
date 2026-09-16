@@ -189,7 +189,31 @@ export interface ConnectOptions extends WasmSource {
    * stored under.
    */
   origin?: string;
-  /** Extra ICE servers, when the page wants them. */
+  /**
+   * The ICE servers this node's connections gather against.
+   *
+   * Optional, and **defaulted for you**: omitted, the leaf uses the
+   * STUN endpoint the anchor announces as `stun_addr` on
+   * `GET /rtc/anchor`, so the advertised configuration works without
+   * a page choosing a STUN service. An anchor that announces none
+   * leaves the connection with no ICE servers, which is host
+   * candidates only.
+   *
+   * **Absence, not emptiness, triggers the default.** An explicit
+   * `iceServers: []` is a caller saying *none*, and is honoured as
+   * given; only an omitted option takes the announced endpoint. A
+   * default that also fired on `[]` would override an intent rather
+   * than supply a missing one, and the only symptom would be a
+   * connection that gathered more than the page asked for.
+   *
+   * Supplied, it is honoured verbatim — with one refusal. An entry
+   * naming this connection's peer RTC endpoint as its STUN server is
+   * rejected with {@link IceServerConflictError} before any ICE
+   * work, because a peer cannot be its own STUN server. In
+   * particular, do not build an entry out of
+   * {@link diagnosticStunUrl}(anchorRtcAddr): that helper is for the
+   * throwaway UDP probe.
+   */
   iceServers?: readonly RTCIceServer[];
   /**
    * Custodial identity: the Ed25519 entity secret as 32 bytes of hex.
