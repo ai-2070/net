@@ -129,11 +129,12 @@ average.
 
 ## 6. Findings
 
-Nine defects found by **building on** this surface rather than
-reviewing it. Five are in the product or its witnesses; four are in
-instruments and toolchains that reported success without doing the
-job asked of them. Three surfaced only on CI, which is the argument
-for gating the demo rather than shipping it as a sample.
+Eleven defects found by **building on** this surface rather than
+reviewing it. Six are in the product or its witnesses; five are in
+instruments, harnesses and toolchains that reported success without
+doing the job asked of them. Five surfaced only on CI, which is the
+argument for gating the demo and the matrix rather than shipping them
+as samples.
 
 ### 6.1 Cross-talk: two peer streams under one label share an id
 
@@ -310,6 +311,49 @@ and the state dirs are root-owned so `upload-artifact` failed with
 `EACCES` — the artifact step ran and produced nothing. A conformance
 matrix that fails without naming a cause is the one failure mode it
 must not have.
+
+### 6.10 The rows were dying in the witness, after the thing they witness
+
+With the browsers finally launching, all seven rows still failed —
+and the cause was not ICE. `run_scenario.sh`'s gateway flow witness
+reads `/proc/net/nf_conntrack`, which does not exist on the GitHub
+runner kernel, under `set -euo pipefail`: `cat` exits 1, the pipeline
+fails, and the script dies **mid-write, after the runner had already
+written a good verdict**.
+
+Proved from a file size before any further CI cycle: every browser
+state dir's `nat_flow.json` is exactly **36 bytes** —
+`{"a":{"udp_flows":0,"udp_replied":0}` — truncated between the `a`
+value and the `,"b":` that follows it; no browser dir contains the
+gateway snapshot written later in the script while every native dir
+does; and stdout stops after the pid marker with empty stderr. The
+working `conntrack -L` → proc → "(no view)" ladder was already in the
+same file, ten lines below.
+
+Second, separate cause in the same run: Firefox refuses to run as
+root when `$XDG_RUNTIME_DIR` is owned by another user, and Playwright
+rethrows that as the generic *"Target page, context or browser has
+been closed"*.
+
+### 6.11 A log line that asserts more than its code checked
+
+Chasing the remaining rows, the anchor appeared to contradict the
+page: *"the attempt's channel is already open, so there is nothing
+left to apply it to"* while the page reported ICE never connected.
+There is no contradiction. The line fires whenever
+`dispatch_bootstrap_candidate` returns `Err` and the attempt is live,
+and that `Err` covers **any** non-`CandidateApplied` outcome — the
+message states a conclusion the code never tested.
+
+Same class as §6.5: a string that argues its own conclusion. It cost
+a cycle of chasing a contradiction that did not exist. Not fixed
+here; the wording is leaf surface.
+
+A related blind spot, worth naming because the log looked complete:
+the bootstrap listener lives in `net_sdk`, which the harness's
+`RUST_LOG` filter did not include, so the anchor's entire dialog view
+— offer accepted, trickle socket authorized, every typed refusal —
+was simply absent.
 
 ---
 

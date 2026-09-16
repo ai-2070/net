@@ -26233,17 +26233,28 @@ impl MeshNode {
             },
         )?;
         match self
-            .dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate, mid)
+            .dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate.clone(), mid)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) => {
                 if self.bootstrap_attempt_is_live(claimed_node_id, dialog, budget_key) {
+                    // This arm knows two things: the engine did not
+                    // apply the candidate, and the attempt is still
+                    // live. It does NOT know the channel is open —
+                    // `dispatch_bootstrap_candidate` returns `Err` for
+                    // every non-`CandidateApplied` outcome, an
+                    // unparseable mDNS `.local` address among them.
+                    // The old wording asserted openness and cost a
+                    // debugging cycle chasing a contradiction that did
+                    // not exist; the candidate and the reason are what
+                    // a reader needs.
                     tracing::debug!(
                         peer = format!("{claimed_node_id:#x}"),
                         dialog,
-                        "a late bootstrap candidate: the attempt's channel is already \
-                         open, so there is nothing left to apply it to"
+                        candidate = %candidate,
+                        reason = %e,
+                        "bootstrap candidate not applied while the attempt is live; dropped"
                     );
                     return Ok(());
                 }
