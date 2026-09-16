@@ -112,7 +112,11 @@ function chromiumArgs(spkiPin) {
     // by their bare module name. These four are where the discard
     // accounting lives — 'Received STUN binding request with bad
     // ufrag/pwd', 'unrecognized transaction', 'Rejecting … integrity'.
-    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2',
+    // `network` and `basic_port_allocator` are the enumerator: they
+    // log 'Ignoring network' with the REASON a candidate interface was
+    // rejected, which is the one thing the wildcard fallback does not
+    // explain by itself.
+    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2,network=3,basic_port_allocator=2,stun_port=2',
     // mDNS obfuscation stays ON. Turning it off was a one-cycle
     // experiment and it EXONERATED mDNS: with a real host address
     // Chromium failed identically (`sent=192 gotResponse=0`), so the
@@ -184,8 +188,20 @@ async function opLaunch(req) {
         // dbus and histograms: the log is evidence, and evidence
         // nobody can find is not evidence.
         for (const line of text.split('\n')) {
-          if (/connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc/.test(line)) {
+          if (
+            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc/.test(
+              line,
+            )
+          ) {
             log(`[chromium-ice] ${line.trim()}`);
+          }
+          // PER LINE, not per chunk: the first version tested the whole
+          // stderr chunk, so it reported real=0 wildcard=0 on a run
+          // whose log was full of `Net[…Wildcard…]` — a counter that
+          // measured its own buffering rather than the browser.
+          if (/Net\[/.test(line)) {
+            if (/Wildcard/.test(line)) wildcardPorts += 1;
+            else realNetworkPorts += 1;
           }
         }
         // THE PRECONDITION, pinned so it cannot regress silently.
@@ -199,13 +215,6 @@ async function opLaunch(req) {
         // A real network (`Net[eth0:…:Ethernet:id=1]`, cost 10/50) is
         // what makes the Chromium rows able to work at all, so it is
         // reported either way rather than hoped for.
-        if (/Net\[/.test(text)) {
-          if (/Wildcard/.test(text)) {
-            wildcardPorts += 1;
-          } else {
-            realNetworkPorts += 1;
-          }
-        }
       });
       child.on('error', reject);
       child.on('exit', (code) =>
