@@ -131,7 +131,16 @@ function chromiumArgs(spkiPin) {
       // the wire showing 197 responses AND 7 peer requests arriving
       // while Chromium answers none, this is the next boundary below
       // ICE - and the only one left between the kernel and libwebrtc.
-      'socket_udp=3,p2p_socket=3,',
+      'socket_udp=3,p2p_socket=3,' +
+      // The gap that is left. The receive path is: network service
+      // `P2PSocketUdp::OnRecv` -> mojo -> renderer
+      // `P2PSocketClientImpl::OnDataReceived` ->
+      // `IpcPacketSocket::OnDataReceived` -> `SignalReadPacket` ->
+      // `UDPPort::OnReadPacket`. Everything up to and including the
+      // network service's own socket is verified: it owns the exact
+      // port the packets arrive on and logs no discard. These are the
+      // renderer-side links nobody has asked.
+      'socket_client_impl=3,ipc_socket_factory=3,ipc_network_manager=3,p2p_socket_dispatcher=3,filtering_network_manager=3,'
     // mDNS obfuscation stays ON. Turning it off was a one-cycle
     // experiment and it EXONERATED mDNS: with a real host address
     // Chromium failed identically (`sent=192 gotResponse=0`), so the
@@ -209,7 +218,7 @@ async function opLaunch(req) {
         // nobody can find is not evidence.
         for (const line of text.split('\n')) {
           if (
-            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc|socket_udp\.cc|p2p_socket\.cc/.test(
+            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc|socket_udp\.cc|p2p_socket\.cc|socket_client_impl\.cc|ipc_socket_factory\.cc|ipc_network_manager\.cc|p2p_socket_dispatcher\.cc/.test(
               line,
             )
           ) {
