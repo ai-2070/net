@@ -412,7 +412,7 @@ impl Inner {
     /// a relayed one. A *direct* message 1 may replace, because it
     /// arrived on a DataChannel this leaf negotiated with that peer
     /// inside an attempt it is driving; that is §9 step 4 and it
-    /// goes through [`crate::node::LeafNode::install_session`]'s
+    /// goes through `LeafNode::install_session`'s
     /// unchanged replacement fence.
     fn on_handshake(&mut self, from: NodeId, packet: &[u8], relayed: bool) {
         if self.node.is_handshaking(from) {
@@ -493,7 +493,7 @@ impl Inner {
     ///
     /// §9 step 4 from the addressing side. The session replacement
     /// already happened inside
-    /// [`crate::node::LeafNode::install_session`] — the Stage 3/4a
+    /// `LeafNode::install_session` — the Stage 3/4a
     /// fence, untouched — and this is the part that has to follow
     /// it: a relay entry left behind would keep wrapping packets for
     /// a pair that now has its own channel.
@@ -1206,7 +1206,7 @@ impl LeafNode {
     /// installs a *replacement* session, so the peer's incarnation
     /// changes, and a `StreamHandle` is fenced to the incarnation it
     /// was opened on
-    /// ([`crate::node::LeafNode::check_handle`] — the alias the
+    /// (`LeafNode::check_handle` — the alias the
     /// native R12 fix closed): a handle opened while the pair was
     /// routed refuses with "stale stream handle … reopen the
     /// stream" once the direct session lands. The addressing is
@@ -1224,7 +1224,7 @@ impl LeafNode {
     /// calls: the direct and the proxied surface cannot read the
     /// same option object two ways. That surface **refuses** `peer`
     /// rather than dropping it — see
-    /// [`StreamOptions::require_anchor_addressed`].
+    /// `StreamOptions::require_anchor_addressed`.
     pub fn open_stream(&self, opts: JsValue) -> Result<LeafStream, JsError> {
         let options = stream_options(&opts)?;
 
@@ -1398,7 +1398,7 @@ impl LeafNode {
     ///
     /// The deadline the attempt runs under is
     /// [`PEER_ICE_DEADLINE_MS`] from now. The re-attempt owner calls
-    /// [`Self::offer_peer`] directly with the episode's deadline
+    /// `offer_peer` directly with the episode's deadline
     /// instead, which is how a repair and the window that absorbs
     /// its duplicate triggers end up being one absolute instant
     /// rather than two that nearly agree.
@@ -1651,7 +1651,7 @@ impl LeafNode {
 
     /// [`Self::peer_candidate`]'s whole body, before the JSON.
     ///
-    /// Split out for the reason [`Self::offer_peer`] is: the
+    /// Split out for the reason `offer_peer` is: the
     /// re-attempt owner drives the attempt through the SAME service
     /// step a page's drive loop calls, and a private reading is a
     /// struct rather than a string it would have to re-parse.
@@ -1775,12 +1775,12 @@ impl LeafNode {
     /// The offerer's role, per §9 step 4: the leaf that created the
     /// offer is the NKpsk0 initiator. The answerer never calls this
     /// — its half runs from the inbound packet, in
-    /// [`Inner::on_handshake`].
+    /// `Inner::on_handshake`.
     ///
     /// On success the direct session is installed on this side and
     /// the relay entry for `peer` is gone, so the pair's traffic
     /// leaves on its own channel. The session replacement itself is
-    /// the node's — [`crate::node::LeafNode::install_session`], the
+    /// the node's — `LeafNode::install_session`, the
     /// Stage 3/4a fence, unchanged and unreached from here.
     pub async fn peer_handshake(&self, peer_hex: String) -> Result<(), JsError> {
         let peer = parse_peer_id(&peer_hex)?;
@@ -1981,7 +1981,7 @@ impl LeafNode {
     /// Run ONE re-attempt for `peer`, bounded by `deadline`.
     ///
     /// **Every step here is the production step**, not a copy of
-    /// one: [`Self::offer_peer`] is `peer_offer`'s body (so the
+    /// one: `offer_peer` is `peer_offer`'s body (so the
     /// re-attempt supersedes the stale dialog, counts
     /// `ice_attempted` once, and puts the routed session back before
     /// it replaces the channel), [`Self::service_peer`] is

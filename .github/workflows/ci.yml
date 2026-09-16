@@ -4745,7 +4745,8 @@ jobs:
             --test rtc_signalling \
             --test rtc_admission \
             --test rtc_anchor_registry \
-            --test rtc_proxy_boundary
+            --test rtc_proxy_boundary \
+            --test natsim_browser
           st=$?
           cp target/nextest/default/junit.xml "$RUNNER_TEMP/rtc-junit.xml"
           exit "$st"
@@ -4789,6 +4790,7 @@ jobs:
             --floor rtc_admission=26 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
+            --floor natsim_browser=22 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller

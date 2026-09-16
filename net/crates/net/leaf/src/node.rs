@@ -583,7 +583,7 @@ impl LeafNode {
     ///
     /// The addressing half of §9 step 4. Called once a direct
     /// DataChannel to `peer` is carrying its session; the session
-    /// replacement itself is [`Self::install_session`]'s, and this
+    /// replacement itself is `install_session`'s, and this
     /// does not touch it.
     pub fn clear_peer_relay(&mut self, peer: NodeId) -> bool {
         self.relays.remove(&peer).is_some()

@@ -16,7 +16,7 @@
 //! decision rule, not a browser behaviour: it is about what the leaf
 //! does with the second trigger, whichever source produced it. Rules
 //! are worth asserting exhaustively, and a rule that lives in
-//! [`crate::rtc`] or [`crate::wasm`] cannot be — both are
+//! `rtc` or `wasm` cannot be — both are
 //! `#![cfg(target_arch = "wasm32")]`, so the only test that could
 //! reach it would need a real browser, a real network change and a
 //! real ICE agent, and would then assert one path through the rule
@@ -161,7 +161,7 @@ impl RetryPolicy {
     /// `interrupted` is the caller's reading of the only thing that
     /// makes a re-attempt meaningful: this leaf took a direct session
     /// with `peer` as the offerer, and does not have one now. It is
-    /// the caller's because only [`crate::wasm`] can see a session;
+    /// the caller's because only `wasm` can see a session;
     /// it is a parameter rather than a closure so this rule stays
     /// assertable.
     ///
@@ -226,7 +226,7 @@ impl RetryPolicy {
 /// spells them.
 ///
 /// A plain enum rather than `web_sys::RtcIceConnectionState` so
-/// [`IceWatch`] is assertable on the host; [`crate::rtc`] maps the
+/// [`IceWatch`] is assertable on the host; `rtc` maps the
 /// engine's value onto it at the one place it reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IceLinkState {

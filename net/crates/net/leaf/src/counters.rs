@@ -484,7 +484,7 @@ impl LeafCounters {
 /// NATIVE `RtcStats` uses.
 ///
 /// Plain `u64`s and no `wasm-bindgen`, so the rendering above is
-/// testable on the host. [`crate::rtc::RtcLinkCounters`] is the live
+/// testable on the host. `RtcLinkCounters` is the live
 /// side; this is the snapshot it hands over.
 ///
 /// Every field here exists natively under the same spelling
