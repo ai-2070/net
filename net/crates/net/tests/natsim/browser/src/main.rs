@@ -196,11 +196,25 @@ struct Matrix {
     anchor_ip: Ipv4Addr,
     /// The address of the run's STUN responder, which MUST NOT be the
     /// anchor's own RTC socket. See `run_row` — the whole of §6.12.
+    /// Accepted and deliberately UNUSED since §6.12.2.
+    ///
+    /// The matrix used to run a separate STUN host here. The product
+    /// now announces its own second endpoint and the leaf defaults to
+    /// it, so nothing in a row needs this address — but the flag stays
+    /// so an operator's existing invocation does not break, and its
+    /// being unused is stated rather than left for someone to
+    /// rediscover.
+    #[allow(dead_code)]
     stun_ip: Ipv4Addr,
     netns_a: String,
     netns_b: String,
     mesh_port: u16,
     rtc_port: u16,
+    /// The anchor's SECOND UDP port: STUN only, announced as
+    /// `rtc_stun_addr`, never an ICE peer. Distinct from `rtc_port`
+    /// because libwebrtc eats datagrams from a configured STUN
+    /// server before pairing (§6.12).
+    stun_port: u16,
     bootstrap_port: u16,
     control_port: u16,
     page_port: u16,
@@ -293,6 +307,7 @@ fn parse_args() -> Result<Mode, String> {
         netns_b: need("netns-b")?,
         mesh_port: port("mesh-port", 7000)?,
         rtc_port: port("rtc-port", 7100)?,
+        stun_port: port("stun-port", 7101)?,
         bootstrap_port: port("bootstrap-port", 8443)?,
         control_port: port("control-port", 8081)?,
         page_port: port("page-port", 8080)?,
@@ -316,7 +331,6 @@ enum Step {
         anchor_rtc_addr: String,
         entity_secret_hex: String,
         noise_secret_hex: String,
-        stun: String,
     },
     Announce {
         id: u64,
@@ -905,6 +919,25 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     cfg.rtc = Some(RtcConfig {
         serve_bootstrap: true,
         serve_stun: true,
+        // **Stage 6 §6.12.2: the anchor's OWN second STUN socket.**
+        //
+        // Kyra's acceptance item 2 is that both engines connect with
+        // the PRODUCT-ADVERTISED configuration and no harness search
+        // for whichever one works. So the STUN endpoint this matrix
+        // uses is the one the product announces — a second UDP port
+        // on the anchor itself, distinct from `rtc_addr`, which the
+        // leaf reads out of `GET /rtc/anchor` and puts in its own
+        // default `iceServers`. The page configures nothing.
+        //
+        // A different PORT on the same host is enough, and is what
+        // the rule requires: libwebrtc keys its gathering-path
+        // shortcut on the source address AND port of a configured
+        // STUN server, so an endpoint that is not the peer's ICE
+        // socket is not eaten. The previous shape — a whole separate
+        // STUN node on another host — proved the mechanism but was
+        // exactly the harness search this acceptance item forbids.
+        stun_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
+        stun_public_addr: Some(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.stun_port)),
         // The anchor is NOT behind a NAT here: it lives on the
         // simulated internet, and its bind address is the address the
         // browsers reach. `public_addr` is still set explicitly so the
@@ -935,11 +968,11 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         .serve_rpc(ENROLL_SERVICE, Arc::new(Enrollment))
         .map_err(|e| format!("serve {ENROLL_SERVICE}: {e}"))?;
 
-    // --- 1b. the STUN responder, deliberately NOT the anchor -------
+    // --- 1b. the announced STUN endpoint: the anchor's OWN -------
     //
-    // **S6_REPORT.md §6.12, closed.** libwebrtc eats every datagram
-    // that arrives on an ICE port from an address the port was
-    // configured with as a STUN server
+    // **S6_REPORT.md §6.12, closed; §6.12.2, the product fix.**
+    // libwebrtc eats every datagram that arrives on an ICE port from
+    // an address the port was configured with as a STUN server
     // (`webrtc/p2p/base/stun_port.cc`, `UDPPort::OnReadPacket`,
     // verbatim):
     //
@@ -953,44 +986,25 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     //
     // The page's only `iceServers` entry used to be
     // `stun:<the anchor's own rtc_addr>`, and the anchor's ICE host
-    // candidate IS that address and port — the product serves STUN on
-    // the RTC socket, by design. So every connectivity-check RESPONSE
-    // the anchor sent, and every Binding REQUEST it sent, was consumed
-    // by the gathering path and never reached the candidate pair: the
-    // `return` is before `GetConnection`. That is exactly what §6.12
-    // measured and could not explain — 197 valid, integrity-correct,
-    // transaction-matched responses landing in Chromium's own
-    // namespace, none credited, no request answered, and silence in
-    // BOTH directions. Firefox's nICEr reads its sockets directly and
-    // has no such rule, which is the whole engine asymmetry.
+    // candidate IS that address and port. So every connectivity-check
+    // RESPONSE the anchor sent, and every Binding REQUEST it sent, was
+    // consumed by the gathering path and never reached the candidate
+    // pair: the `return` is before `GetConnection`. Firefox's nICEr
+    // reads its sockets directly and has no such rule, which is the
+    // whole engine asymmetry.
     //
-    // So the run's STUN server is a DIFFERENT HOST from the ICE peer,
-    // which is also what a real deployment has. `serve_stun` stays on
-    // the anchor as well: the leaf's own `UdpBlocked` evidence probes
-    // the anchor's published `rtc_addr` and must keep being answered.
-    let stun_bind = SocketAddr::new(IpAddr::V4(m.stun_ip), m.rtc_port);
-    let mut stun_cfg =
-        MeshNodeConfig::new(SocketAddr::new(IpAddr::V4(m.stun_ip), m.mesh_port), PSK);
-    stun_cfg.rtc = Some(RtcConfig {
-        // STUN and nothing else: no bootstrap listener, no services,
-        // no peers. It answers RFC 5389 binding requests and is never
-        // an ICE peer of anything.
-        serve_bootstrap: false,
-        serve_stun: true,
-        public_addr: Some(stun_bind),
-        ..RtcConfig::new().with_bind_addr(stun_bind)
-    });
-    let stun_node = Arc::new(
-        MeshNode::new(EntityKeypair::generate(), stun_cfg)
-            .await
-            .map_err(|e| format!("stun responder MeshNode::new: {e}"))?,
-    );
-    stun_node.start_arc();
-    println!(
-        "[runner] stun responder node {:016x} rtc {stun_bind} — NOT the anchor's ICE \
-         endpoint {rtc_bind} (S6_REPORT.md §6.12)",
-        stun_node.node_id()
-    );
+    // A previous shape of this harness ran a whole separate STUN node
+    // on another host. It proved the mechanism, but it was a HARNESS
+    // SEARCH for a configuration that works — the thing Kyra's
+    // acceptance item 2 forbids. The product now announces its own
+    // second endpoint (`stun_addr` / `stun_public_addr` above), the
+    // leaf reads it from `GET /rtc/anchor` and defaults its own
+    // `iceServers` to it, and this matrix configures NOTHING. What
+    // the rows exercise is what an integrator gets.
+    //
+    // `serve_stun` stays on for the anchor's primary socket too: the
+    // leaf's `UdpBlocked` evidence probes the published `rtc_addr`
+    // and must keep being answered.
 
     // --- 2. TLS + the bootstrap listener ---------------------------
     let ca = issue_certificate(&work, m.anchor_ip)?;
@@ -1314,16 +1328,11 @@ async fn drive_sequence(
     page_origin: &str,
 ) -> Result<(), String> {
     let anchor_rtc_addr = format!("{}:{}", m.anchor_ip, m.rtc_port);
-    // NOT `m.anchor_ip`: a STUN server that is also the ICE peer has
-    // its every packet eaten by libwebrtc's gathering path. §6.12, and
-    // `run_row` carries the mechanism verbatim.
-    let stun = format!("stun:{}:{}", m.stun_ip, m.rtc_port);
     let connect_step = |tab: &'static str| {
         let credential = credential.to_owned();
         let bootstrap_url = bootstrap_url.to_owned();
         let origin = page_origin.to_owned();
         let anchor_rtc_addr = anchor_rtc_addr.clone();
-        let stun = stun.clone();
         let scenario = m.scenario.clone();
         move |id: u64| Step::Connect {
             id,
@@ -1333,7 +1342,6 @@ async fn drive_sequence(
             anchor_rtc_addr,
             entity_secret_hex: secret_hex(&scenario, tab, "entity"),
             noise_secret_hex: secret_hex(&scenario, tab, "noise"),
-            stun,
         }
     };
 

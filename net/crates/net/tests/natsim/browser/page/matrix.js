@@ -164,7 +164,13 @@ async function execute(step) {
       // observable: a server-reflexive candidate IS the gateway's
       // mapping. Without it the two browsers would have nothing but
       // host candidates on two different private subnets.
-      if (step.stun) opts.iceServers = [{ urls: step.stun }];
+      // NOTHING is configured here on purpose. Stage 6 §6.12.2: the
+      // leaf defaults its own `iceServers` to the STUN endpoint the
+      // anchor ANNOUNCES, read from `GET /rtc/anchor`. A page that
+      // named one here would be the harness picking a configuration
+      // that works instead of exercising the product's — Kyra's
+      // acceptance item 2 — and naming the anchor's `rtc_addr` is now
+      // a typed refusal before ICE rather than a 60-second timeout.
       try {
         node = await connect(opts);
       } catch (e) {

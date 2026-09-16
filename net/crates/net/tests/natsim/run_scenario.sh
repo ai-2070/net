@@ -284,14 +284,19 @@ if [[ "$MODE" == browser ]]; then
   # AND their browsers run entirely inside nsim_a / nsim_b while their
   # stdio pipes stay attached here.
   #
-  # `--stun-ip` is 10.99.0.11 — `X`, the aux public address `setup.sh`
-  # always adds to the wan bridge, and free here because no helper
-  # runs. It MUST NOT be the anchor's address: libwebrtc drops every
-  # datagram arriving on an ICE port from an address that port was
-  # given as a STUN server (`UDPPort::OnReadPacket` returns before
-  # `GetConnection`), so an anchor that is also the page's STUN server
-  # can never form a candidate pair with Chromium. That was the whole
-  # of S6_REPORT.md §6.12.
+  # `--stun-ip` is VESTIGIAL as of §6.12.2 and the runner ignores it.
+  # The matrix used to run a separate STUN host at 10.99.0.11 because
+  # libwebrtc drops every datagram arriving on an ICE port from an
+  # address that port was given as a STUN server
+  # (`UDPPort::OnReadPacket` returns before `GetConnection`), so an
+  # anchor that is also the page's STUN server can never form a
+  # candidate pair with Chromium — the whole of S6_REPORT.md §6.12.
+  #
+  # That separate host was a HARNESS search for a configuration that
+  # works. The product now announces its own second STUN endpoint and
+  # the leaf defaults to it, so these rows exercise what an integrator
+  # actually gets. The flag stays only so an existing invocation does
+  # not break.
   capture nsim_a browser_a
   capture nsim_b browser_b
   capture nsim_wan anchor_wan
@@ -327,7 +332,6 @@ else
     # (classify.rs Finding B3), so a port-preserving cone NAT
     # (`masquerade persistent` keeps the source port) reflects back
     # `10.99.0.3:7002`, whose port matches the bind port, and the node
-    # misclassifies as Open instead of Cone. A concrete bind IP forces
     # the full `reflex.ip() == bind.ip()` comparison, which the NAT'd
     # public IP fails → Cone, as the scenario expects. (Symmetric dodges
     # this because `fully-random` scrambles the port.)
