@@ -116,7 +116,14 @@ function chromiumArgs(spkiPin) {
     // log 'Ignoring network' with the REASON a candidate interface was
     // rejected, which is the one thing the wildcard fallback does not
     // explain by itself.
-    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2,network=3,basic_port_allocator=2,stun_port=2',
+    // The last cycle answered the enumerator question: there is NOT ONE
+    // 'Ignoring network' line, and the allocator logs 'Allocate ports
+    // on any any' — WebRTC was handed ZERO networks rather than
+    // networks it rejected. In Chromium the list does not come from
+    // WebRTC at all: the NETWORK SERVICE enumerates and sends it over
+    // IPC, so these are its modules.
+    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2,network=3,basic_port_allocator=2,stun_port=2,' +
+      'address_tracker_linux=3,network_change_notifier=3,network_change_notifier_linux=3,network_interfaces_linux=3,p2p_socket_manager=3,network_manager=3,ip_address=2',
     // mDNS obfuscation stays ON. Turning it off was a one-cycle
     // experiment and it EXONERATED mDNS: with a real host address
     // Chromium failed identically (`sent=192 gotResponse=0`), so the
@@ -189,7 +196,7 @@ async function opLaunch(req) {
         // nobody can find is not evidence.
         for (const line of text.split('\n')) {
           if (
-            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc/.test(
+            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc/.test(
               line,
             )
           ) {
