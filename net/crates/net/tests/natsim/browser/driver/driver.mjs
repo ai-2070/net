@@ -87,6 +87,16 @@ function chromiumArgs(spkiPin) {
     // anyway. Every direct pair in this matrix is reached through the
     // anchor's STUN (server-reflexive) or peer-reflexively, which is
     // exactly what the NAT flavors are being tested against.
+    // Chromium's OWN account of every connectivity check. The wire
+    // capture, the anchor's str0m log and the page's `getStats` are
+    // now all consistent and still contradictory: 197 transaction-
+    // matched, integrity-valid, correctly-mapped responses arrive in
+    // this browser's namespace, on the socket its own stats name, and
+    // the ICE agent reports `gotResponse=0` and nominates nothing.
+    // No observer outside the engine can say why a response was
+    // discarded; this is the one that can, and it costs a log file.
+    '--enable-logging=stderr',
+    '--vmodule=*/p2p/base/*=2,*stun*=2,*port*=2,*connection*=2',
   ];
 }
 
@@ -109,6 +119,18 @@ async function opLaunch(req) {
       chromiumSandbox: false,
       args: chromiumArgs(req.spkiPin),
     });
+    // Playwright keeps the browser process's stderr to itself unless
+    // it is drained; `--enable-logging=stderr` writes there and
+    // nowhere else, so without this the flags above would be a
+    // silently-dropped instrument.
+    const proc = browser.process();
+    if (proc && proc.stderr) {
+      proc.stderr.on('data', (chunk) => {
+        for (const line of String(chunk).split('\n')) {
+          if (line.trim()) log(`[chromium] ${line}`);
+        }
+      });
+    }
     const context = await browser.newContext();
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
