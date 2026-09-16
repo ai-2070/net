@@ -5121,8 +5121,8 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 249 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 249 — \
+          if [ "$total" -lt 266 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 266 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -5365,6 +5365,7 @@ jobs:
             real_wasm_reads_stream_options_the_way_the_package_declares_them
             real_wasm_refuses_a_channel_hash_it_would_otherwise_silence
             real_wasm_keeps_u64_stream_ids_off_the_number_path
+            real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands_out
             real_package_exports_every_symbol_the_browser_harness_imports
           "
           # The roster is checked against the probe file before the
@@ -5381,7 +5382,7 @@ jobs:
           if grep -q '"pass": false' /tmp/abi-real.log; then
             echo "::error::an ABI probe failed against the built package"; exit 1
           fi
-          echo "R11 ABI probes: 10/10 against the real package"
+          echo "R11 ABI probes: 12/12 against the real package"
 
       # Kyra's JS probes, landed verbatim beside her leaf ones.
       - name: Browser-package review probes
@@ -5613,6 +5614,12 @@ jobs:
           stage6_a_second_offer_supersedes_the_live_attempt
           stage6_the_ice_attempt_ledger_partitions_on_both_leaves
           stage6_a_handshake_the_peer_cannot_answer_is_typed_handshake_failed
+          stage6_routed_peer_app_data_moves_the_anchors_per_pair_counter
+          stage6_direct_peer_app_data_leaves_that_counter_flat_while_the_anchor_is_live
+          stage6_forcing_the_direct_channel_down_moves_the_counter_again
+          stage6_a_network_change_drives_exactly_one_re_attempt
+          stage6_rtc_stats_uses_the_native_field_names_and_names_what_it_cannot_measure
+          stage6_one_node_id_spelling_across_both_signalling_surfaces
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
@@ -5641,14 +5648,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 35)"
+            echo "[$engine] $passes passed, $fails failed (floor 41)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 35 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 35 — \
+            if [ "$passes" -lt 41 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 41 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
@@ -5658,7 +5665,7 @@ jobs:
                 exit 1
               fi
             done
-            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 9 Stage 6"
+            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6"
           done
 
       # WebKit's verdicts are surfaced, never gated.
@@ -5700,6 +5707,150 @@ jobs:
             ${{ runner.temp }}/rtcb.log
             ${{ runner.temp }}/rtcb-firefox.log
             ${{ runner.temp }}/rtcb-webkit.log
+          if-no-files-found: warn
+
+  browser-demo:
+    # Stage 6's runnable artefact: two real browser tabs whose pages
+    # find each other, go direct, and exchange 60 Hz positions over
+    # the PUBLIC `@net-mesh/browser` surface — no harness hooks, no
+    # private methods. It gates because a demo that has rotted is
+    # worse than no demo: it is a promise the README keeps making.
+    #
+    # `--check` is the same binary the by-hand `run.ps1`/`run.sh`
+    # path runs, headless, asserting four rows and exiting non-zero
+    # on any of them. Its own job for the same reason the matrix is:
+    # it pays for a browser download and a wasm32 toolchain.
+    #
+    # CHROMIUM ONLY, deliberately and on the record. The demo's
+    # driver needs Chromium's throttling-defeat flags and SwiftShader
+    # for WebGL, and neither has a Firefox equivalent here. Engine
+    # coverage is the browser matrix's job; a one-engine demo is not
+    # a matrix and is not described as one.
+    name: Browser demo (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm32 to every toolchain that builds for it
+        run: |
+          set -o pipefail
+          rustup target add --toolchain stable wasm32-unknown-unknown
+          for dir in net/crates/net net/crates/net/leaf; do
+            ( cd "$dir"
+              rustup target add wasm32-unknown-unknown
+              rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+                echo "::error::wasm32-unknown-unknown is missing for the toolchain $dir selects"
+                exit 1
+              } ) || exit 1
+          done
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: browser-demo
+          workspaces: |
+            net/crates/net/examples/browser-demo/host -> target
+            net/crates/net/leaf -> target
+
+      - name: Install Chromium from Playwright's cache
+        run: npx --yes playwright@1.56.0 install --with-deps chromium
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      # Exactly what the browser matrix builds, plus the demo's own
+      # deps: the page loads the real bundle, so a stale artefact
+      # would make the demo prove something about a build nobody
+      # ships.
+      - name: Build the leaf bundle, @net-mesh/browser and the demo
+        run: |
+          set -euo pipefail
+          cd net/crates/net/leaf
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+          cd ../browser-ts
+          npm install --no-audit --no-fund
+          npm run build
+          cd ../examples/browser-demo
+          npm install --no-audit --no-fund
+          cargo build --release --manifest-path host/Cargo.toml
+
+      - name: Demo — Chromium, headless
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          net/crates/net/examples/browser-demo/host/target/release/net-browser-demo \
+            --check --seconds 6 2>&1 | tee "$RUNNER_TEMP/demo.log"
+          exit "${PIPESTATUS[0]}"
+
+      # Same discipline as the browser matrix: the roster is checked
+      # against the source before any log is read, the parser proves
+      # it can find a KNOWN line before a count is believed, and the
+      # binary's own `NOT REACHED` line means an early exit cannot
+      # read as a smaller green count.
+      - name: Demo witness inventory
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          REQUIRED="
+          demo_the_pair_counter_moves_while_the_anchor_carries_the_pair
+          demo_the_pair_counter_is_flat_while_the_pair_is_direct
+          demo_positions_sustain_60_hz_over_the_direct_path
+          demo_announcements_keep_arriving_while_the_counter_is_flat
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "browser demo" --mode literal \
+            --source net/crates/net/examples/browser-demo/host/src/main.rs \
+            $REQUIRED
+          log="$RUNNER_TEMP/demo.log"
+          probe=$(grep -c '^DEMO PASS demo_the_pair_counter_is_flat_while_the_pair_is_direct ' "$log" || true)
+          if [ "$probe" -eq 0 ]; then
+            echo "::error::demo verdict parser found no known PASS line — the output \
+          format changed; fix the parser before trusting any floor"
+            tail -40 "$log"
+            exit 1
+          fi
+          if grep -q '^\[demo\] NOT REACHED' "$log"; then
+            grep '^\[demo\] NOT REACHED' "$log"
+            echo "::error::the demo exited before every row ran"
+            exit 1
+          fi
+          passes=$(grep -c '^DEMO PASS ' "$log" || true)
+          fails=$(grep -c '^DEMO FAIL ' "$log" || true)
+          echo "demo: $passes passed, $fails failed (floor 4)"
+          if [ "$fails" -ne 0 ]; then
+            grep '^DEMO FAIL ' "$log"
+            echo "::error::a demo witness failed"
+            exit 1
+          fi
+          if [ "$passes" -lt 4 ]; then
+            echo "::error::emitted $passes demo witnesses, floor is 4 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+          for required in $REQUIRED; do
+            if ! grep -q "^DEMO PASS $required " "$log"; then
+              echo "::error::required demo witness missing or failed: $required"
+              exit 1
+            fi
+          done
+
+      - name: Upload the demo log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-demo-log
+          path: ${{ runner.temp }}/demo.log
           if-no-files-found: warn
 
   acme-cold-start:
