@@ -245,6 +245,7 @@ struct Report {
     avg_send_hz: f64,
     run_ms: f64,
     worst_send_gap_ms: f64,
+    gate_wait_ms: f64,
     announce_tick: u64,
     announce_ok: u64,
     announce_failed: u64,
@@ -343,6 +344,51 @@ impl Shared {
         )
     }
 
+    /// The admission gate, read on the anchor.
+    fn gate(&self) -> Gate {
+        let stats = self.anchor.rtc_stats();
+        let ids = self.pair_ids();
+        let (provisional_a, provisional_b) = match ids {
+            Some((a, b)) => (
+                self.anchor.peer_is_provisional(a),
+                self.anchor.peer_is_provisional(b),
+            ),
+            None => (true, true),
+        };
+        // MUTUAL discovery, and why it is the load-bearing half.
+        //
+        // `query` reads this leaf's own store of signature-verified
+        // announcements, so A discovering B proves A holds B's
+        // announcement — and says NOTHING about whether B holds A's.
+        // A leaf answers a RELAYED handshake only from a node whose
+        // signed announcement it has verified (that is slice 1's
+        // keys-from-discovery-only enforcement at the session seam),
+        // so an offer sent before the peer has verified the offerer
+        // is refused, and the offerer sees exactly "discoverable but
+        // not reachable through the anchor". The offerer cannot
+        // observe the peer's store; the host can, because both pages
+        // report the peer they found. So the gate is: both admitted,
+        // and each has found the other.
+        let reports = self.reports.lock();
+        let discovered_a = reports[0].peer_id.is_some();
+        let discovered_b = reports[1].peer_id.is_some();
+        drop(reports);
+        Gate {
+            ready: ids.is_some()
+                && !provisional_a
+                && !provisional_b
+                && discovered_a
+                && discovered_b,
+            have_ids: ids.is_some(),
+            discovered_a,
+            discovered_b,
+            provisional_a,
+            provisional_b,
+            provisional_count: self.anchor.provisional_count(),
+            admission_refused_transit: stats.admission_refused_transit(),
+        }
+    }
+
     /// Sample the pair counter and update how long it has been flat.
     fn sample(&self) -> PairView {
         let stats = self.anchor.rtc_stats();
@@ -394,8 +440,16 @@ impl Shared {
     /// rather than scanned from zero.
     fn resolved_tick(&self, tab: usize, node_id: u64) -> Option<u64> {
         let reported = self.report(tab).announce_tick;
-        let lowest = reported.saturating_sub(6);
-        for k in (lowest..=reported).rev() {
+        // Scanned from the page's own tick down to ZERO, not over a
+        // narrow window around it. A six-wide window was enough to
+        // fail: the anchor throttles how often it ingests one peer's
+        // announcement, so the tag it holds can lag the page's latest
+        // by more than that — and the row then read `None` and went
+        // red while announcements were demonstrably still arriving.
+        // The probe is a local fold lookup and the tick count is
+        // small, so scanning the whole range costs nothing and
+        // removes a tuned constant from the assertion.
+        for k in (0..=reported).rev() {
             let tag = format!("demo.tick.{}.{k}", if tab == 0 { "a" } else { "b" });
             let req = CapabilityRequirement::from_filter(CapabilityFilter::new().require_tag(&tag));
             if self.anchor.find_best_node(&req) == Some(node_id) {
@@ -417,6 +471,40 @@ struct PairView {
     ingress_delivered: u64,
     tick_a: Option<u64>,
     tick_b: Option<u64>,
+}
+
+/// Whether the ANCHOR considers both leaves admitted — the gate a
+/// page waits on before it offers.
+///
+/// `connect()` awaits its enrollment reply, so a page believes it is
+/// enrolled the moment `connect` returns. The anchor promotes the
+/// session on its own side, and until it has, that peer is
+/// PROVISIONAL and §12's admission rule refuses its application
+/// transit through the anchor. A provisional leaf still floods
+/// announcements, so it is DISCOVERABLE while it is not REACHABLE:
+/// exactly the state the leaf reports as "did not complete the
+/// relayed Noise handshake … it is discoverable but not reachable
+/// through the anchor".
+///
+/// So "connected" and "discovered" are not the precondition for
+/// offering; "admitted on the anchor, both sides" is. The page polls
+/// this, and the answer is read ON THE ANCHOR rather than inferred
+/// on the page.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Gate {
+    ready: bool,
+    have_ids: bool,
+    /// Whether each page has found the other through its own
+    /// verified-announcement store.
+    discovered_a: bool,
+    discovered_b: bool,
+    provisional_a: bool,
+    provisional_b: bool,
+    provisional_count: usize,
+    /// The §12 refusal that this race produces: transit refused for a
+    /// provisional session. Non-zero means a leaf offered too early.
+    admission_refused_transit: u64,
 }
 
 fn parse_hex_id(hex: &str) -> Option<u64> {
@@ -453,6 +541,7 @@ fn serve_page(listener: tokio::net::TcpListener, state: AppState) {
         .route("/demo.js", get(demo_js))
         .route("/config", get(config))
         .route("/pair", get(pair))
+        .route("/gate", get(gate))
         .route("/report", post(report))
         .route("/log", post(page_log))
         .route("/browser/{*path}", get(browser_asset))
@@ -560,6 +649,11 @@ async fn config(State(s): State<AppState>, Query(q): Query<TabQuery>) -> Json<Va
         "reportMs": 250,
         "announceMs": 500,
         "discoveryMs": 30_000,
+        // How long a page waits for the anchor to admit BOTH
+        // leaves before it offers. Generous: it bounds a wait for
+        // something the anchor is doing, and a page that gave up
+        // here would offer into a refusal.
+        "admissionMs": 30_000,
         // How long a page waits for a session with the peer to exist
         // at all, and the short burst of ROUTED application data it
         // then sends so the anchor's counter has moved before the
@@ -572,6 +666,10 @@ async fn config(State(s): State<AppState>, Query(q): Query<TabQuery>) -> Json<Va
 
 async fn pair(State(s): State<AppState>) -> Json<PairView> {
     Json(s.sample())
+}
+
+async fn gate(State(s): State<AppState>) -> Json<Gate> {
+    Json(s.gate())
 }
 
 async fn report(State(s): State<AppState>, Json(body): Json<Report>) -> StatusCode {
@@ -1203,7 +1301,9 @@ async fn check(
              the pair — the routed Noise handshake plus {}+{} routed position frames on the \
              peer-addressed fire-and-forget stream. The baseline was read before either leaf \
              announced, so it must be 0 and was {}. `0x0D02` signalling is EXCLUDED from this \
-             counter and moved on its own, {} → {}",
+             counter and moved on its own, {} → {}. Neither leaf offered until the ANCHOR \
+             reported both admitted, which took {:.0}/{:.0} ms; {} admission transit refusal(s) \
+             recorded, which is what offering into a provisional peer produces",
             t0.ab,
             t0.ba,
             t1.ab,
@@ -1212,7 +1312,10 @@ async fn check(
             b1.sent,
             t0.ab + t0.ba,
             t0.signal_forwarded,
-            t1.signal_forwarded
+            t1.signal_forwarded,
+            a1.gate_wait_ms,
+            b1.gate_wait_ms,
+            state.gate().admission_refused_transit
         ),
     );
 

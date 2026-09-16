@@ -58,6 +58,8 @@ const state = {
   runMs: 0,
   /** Worst gap between two consecutive sends, ms. */
   worstSendGapMs: 0,
+  /** How long the anchor took to admit BOTH leaves, ms. */
+  gateWaitMs: 0,
   announceTick: 0,
   announceOk: 0,
   announceFailed: 0,
@@ -300,6 +302,24 @@ async function main() {
   state.peerId = peerHex;
   log(`discovered peer ${peerHex}`);
 
+  // BOTH leaves must be ADMITTED on the anchor before either offers.
+  //
+  // Discovery is not reachability. A provisional leaf still floods
+  // announcements, so each tab can discover the other while the
+  // anchor is still refusing its application transit under §12's
+  // admission rule — and the relayed Noise handshake that carries
+  // the offer is exactly that transit. `connect()` awaits its own
+  // enrollment reply, so this page believes it is enrolled; what it
+  // cannot see is whether the ANCHOR has promoted the other tab's
+  // session yet. That is what `/gate` answers, read on the anchor.
+  //
+  // This closes a window rather than widening one: `acceptPeer`'s
+  // 5 s offer wait and the leaf's 5 s relayed-handshake deadline are
+  // library surface and are not touched.
+  state.phase = 'waiting for admission';
+  state.gateWaitMs = await waitForAdmission();
+  log(`both leaves admitted on the anchor after ${state.gateWaitMs.toFixed(0)} ms`);
+
   // The attempt is started but NOT awaited: the routed phase only
   // exists between the offer and the direct install, so a page that
   // wants to put application bytes on the anchor's forwarding path
@@ -362,6 +382,35 @@ async function discoverPeer() {
     await sleep(200);
   }
   throw new Error(`no peer announced ${cfg.peerTag} within ${cfg.discoveryMs} ms`);
+}
+
+/**
+ * Wait until the ANCHOR reports both leaves admitted, and return how
+ * long that took.
+ *
+ * The wait is on the anchor's own `peer_is_provisional`, not on this
+ * page's belief about itself — a page cannot see the other tab's
+ * admission state, and the offer needs BOTH. Returns the measured
+ * wait so the demo reports the size of the window it closed instead
+ * of assuming it was zero.
+ */
+async function waitForAdmission() {
+  const started = performance.now();
+  const deadline = started + cfg.admissionMs;
+  for (;;) {
+    const gate = await (await fetch('/gate')).json();
+    if (gate.ready) return performance.now() - started;
+    if (performance.now() >= deadline) {
+      throw new Error(
+        `the pair was not ready to offer after ${cfg.admissionMs} ms ` +
+          `(provisional a=${gate.provisionalA}, b=${gate.provisionalB}; ` +
+          `discovered a=${gate.discoveredA}, b=${gate.discoveredB}; ` +
+          `provisional=${gate.provisionalCount}, ` +
+          `transit refused=${gate.admissionRefusedTransit})`,
+      );
+    }
+    await sleep(100);
+  }
 }
 
 /**
