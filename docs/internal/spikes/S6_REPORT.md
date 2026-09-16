@@ -410,6 +410,28 @@ So: **valid, symmetric, integrity-correct, transaction-matched
 responses arrive in Chromium's own namespace and its ICE agent does
 not accept them.**
 
+**The one measurement still missing, and two failed attempts at it.**
+Only the engine can say why it discarded a response that satisfies
+every external check. Both tries failed, and neither is left in the
+tree: `browser.process()` does not exist on Playwright's `Browser`,
+so draining its stderr took the launch down with it (`launch failed:
+browser.process is not a function` — the fifth instrument in this
+stage to do something other than what it was asked, and the first to
+kill its own subject); and `--enable-logging --log-file=<path>
+--vmodule=…` then produced no file at all under headless Chromium.
+Untried: `launchPersistentContext` with an explicit `--user-data-dir`,
+or a `chrome://webrtc-internals` dump from a headed run.
+
+Also ruled out, on the capture already in hand, before spending a
+cycle on it: the **unexpected-source discard** (`stun_request.cc`
+drops a response whose source differs from the request's
+destination). Matched **per transaction id**, all 197 satisfy
+`response.src == request.dst` and `response.dst == request.src`. And
+the **role/aggressive-nomination** reading: the anchor logs `Accept
+offer`, so it is *controlled*; Chromium's checks all carry
+`ICE-CONTROLLING` + `USE-CANDIDATE` and str0m answered every one and
+logged `Nominated pair` / `got nomination`.
+
 Killed by evidence, in order, and none of them should be reopened:
 
 - *The gateway or NAT setup* — packets cross both ways; conntrack

@@ -70,7 +70,7 @@ function seedFirefoxProfile(profileDir, caPemPath) {
   return `certutil -d sql:${profileDir}`;
 }
 
-function chromiumArgs(spkiPin, logPath) {
+function chromiumArgs(spkiPin) {
   return [
     // The netns rows run as root (netns + nft need it), and Chromium
     // refuses its sandbox as root. This is a throwaway browser in a
@@ -87,22 +87,17 @@ function chromiumArgs(spkiPin, logPath) {
     // anyway. Every direct pair in this matrix is reached through the
     // anchor's STUN (server-reflexive) or peer-reflexively, which is
     // exactly what the NAT flavors are being tested against.
-    // Chromium's OWN account of every connectivity check. The wire
-    // capture, the anchor's str0m log and the page's `getStats` are
-    // now all consistent and still contradictory: 197 transaction-
-    // matched, integrity-valid, correctly-mapped responses arrive in
-    // this browser's namespace, on the socket its own stats name, and
-    // the ICE agent reports `gotResponse=0` and nominates nothing.
-    // No observer outside the engine can say why a response was
-    // discarded; this is the one that can, and it costs a log file.
-    // To a FILE, not stderr: Playwright's `Browser` exposes no
-    // process handle (`browser.process` is not a function — the first
-    // version of this instrument failed to instrument), and Chromium
-    // writes `--enable-logging` output to stderr only when it has a
-    // console. `--log-file` is the one path that survives both.
-    '--enable-logging',
-    `--log-file=${logPath}`,
-    '--vmodule=*/p2p/base/*=2,*stun*=2,*port*=2,*connection*=2',
+    // NOTE for whoever closes the Chromium gap (S6_REPORT.md §6.12):
+    // the engine's own per-check account is the one measurement left,
+    // and TWO ways of getting it failed here. `browser.process()` does
+    // not exist on Playwright's `Browser`, so draining its stderr
+    // took the launch down with it; `--enable-logging
+    // --log-file=<path> --vmodule=…` then produced no file at all
+    // under headless Chromium. Removed rather than left in place: a
+    // flag that reports nothing while appearing to work is the exact
+    // failure this stage documented five times. `launchPersistentContext`
+    // with `--user-data-dir`, or a `chrome://webrtc-internals` dump
+    // from a headed run, are the untried paths.
   ];
 }
 
@@ -120,14 +115,11 @@ async function opLaunch(req) {
     });
     live = { engine: req.engine, context, browser: null, persistent: true };
   } else {
-    const iceLog = path.join(req.profileDir, 'chromium-ice.log');
-    fs.mkdirSync(req.profileDir, { recursive: true });
     const browser = await engine.launch({
       headless: true,
       chromiumSandbox: false,
-      args: chromiumArgs(req.spkiPin, iceLog),
+      args: chromiumArgs(req.spkiPin),
     });
-    log(`chromium ice log: ${iceLog}`);
     const context = await browser.newContext();
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
