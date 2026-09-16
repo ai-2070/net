@@ -2560,6 +2560,54 @@ questions remain open as stated in §12.1/§12.2/§13.
   application-data forwarding counter on the anchor flat once direct, while
   signalling and announcements continue.
 
+**Stage 6 delivered (2026-09-16): main CI green at `f225f309d`;
+natsim green at `cfd7aa44d` / `0674b43c6` (13/13: six native, seven
+browser rows incl. the Firefox control) after a two-session diagnosis
+of the six Chromium rows.** `S6_REPORT.md`; the diagnosis trail is
+§6.12 and `spikes/S6_CHROMIUM_NAT_NOTE.md`. All twelve exit criteria
+met with named witnesses: two isolated contexts reach a direct
+session; keys from the signed announcement; the four wasm methods
+drive one attempt; undiscovered peer refused; unanswered offer stays
+relayed and typed; a second offer supersedes; the ICE ledger partitions
+on both leaves; direct app data leaves the anchor's counter **flat**
+while signalling/announcements continue; forcing the channel down moves
+it again; one network change → exactly one re-attempt; `rtcStats()`
+with native names and "cannot measure" named; a runnable two-tab demo
+(four CI rows). Fifteen browser witnesses (floor 41 with 4b/5), each
+with a raw inverse receipt; the §10 three-part witness bit-identical
+across two serialized runs; 60 Hz sustained through the public API.
+Six findings by building on the surface, five product (the Stage 5
+stream-id cross-talk under one label — **owner decision, three fixes
+offered**; the proxied signal that could not work; a trickle frame
+discarded while its socket was CONNECTING; answer/candidate ordering;
+`sdpMLineIndex`) and six harness/instrument.
+
+**The Chromium NAT rows — resolved, with a design consequence.**
+Fifteen hypotheses died with evidence across two sessions (the
+reviewer's own included: nomination role, credentials, source address,
+pair attribution, adapter enumeration — the last falsified by the
+renderer log at HEAD before implementation, correctly). The cause is
+one rule in libwebrtc's `UDPPort::OnReadPacket`: any datagram arriving
+from an address configured as an `iceServers` STUN server is consumed
+by the gathering path and **returns before `GetConnection`** — in both
+directions. The harness handed Chromium `stun:<anchor rtc_addr>`, and
+the anchor's ICE candidate *is* that socket, so every connectivity
+response and every anchor request was eaten; Firefox's nICEr has no
+such rule. Confirmed by a 2×2 that had been running unread in the 4b
+mDNS sweep (`anchor-stun` → no pair; `no-stun` → pair in 22 ms, both
+interfaces). Harness fix: the run's STUN responder is a separate host
+(`10.99.0.11`); `serve_stun` stays on the anchor; the row runner now
+refuses a Chromium tab that allocated no port on an enumerated network.
+**Owner decision surfaced:** the plan defines `rtc_addr` as the
+anchor's "public RTC/STUN socket" — one socket by design (§7 registry),
+4b/R8 proved it serves as a STUN target, and Stage 6's `UdpBlocked`
+probe uses it as one. A Chromium leaf configured with that address as
+an ICE server can never pair with that anchor. Resolutions (not
+chosen): STUN on a second announced socket; the leaf strips/refuses an
+`iceServers` entry equal to the anchor it pairs with, typed; or
+documentation only. The `UdpBlocked` probe (unsolicited request from a
+throwaway socket, not the ICE port) is unaffected by any of them.
+
 ## Stage 7 — Surface completion and deferred items (**DEFERRED**)
 
 - Node / Python / Go anchor-role parity for `RtcConfig` + `RtcStats`.
