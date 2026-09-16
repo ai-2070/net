@@ -123,7 +123,15 @@ function chromiumArgs(spkiPin) {
     // WebRTC at all: the NETWORK SERVICE enumerates and sends it over
     // IPC, so these are its modules.
     '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2,network=3,basic_port_allocator=2,stun_port=2,' +
-      'address_tracker_linux=3,network_change_notifier=3,network_change_notifier_linux=3,network_interfaces_linux=3,p2p_socket_manager=3,network_manager=3,ip_address=2',
+      'address_tracker_linux=3,network_change_notifier=3,network_change_notifier_linux=3,network_interfaces_linux=3,p2p_socket_manager=3,network_manager=3,ip_address=2,' +
+      // `socket_udp` is the network service's OWN reader, and it has a
+      // filter: a P2P UDP socket drops datagrams from addresses the
+      // renderer has not made known to it, logging 'Received packet
+      // from unknown address'. With a real network now enumerated and
+      // the wire showing 197 responses AND 7 peer requests arriving
+      // while Chromium answers none, this is the next boundary below
+      // ICE - and the only one left between the kernel and libwebrtc.
+      'socket_udp=3,p2p_socket=3,',
     // mDNS obfuscation stays ON. Turning it off was a one-cycle
     // experiment and it EXONERATED mDNS: with a real host address
     // Chromium failed identically (`sent=192 gotResponse=0`), so the
@@ -201,7 +209,7 @@ async function opLaunch(req) {
         // nobody can find is not evidence.
         for (const line of text.split('\n')) {
           if (
-            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc/.test(
+            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc|socket_udp\.cc|p2p_socket\.cc/.test(
               line,
             )
           ) {
