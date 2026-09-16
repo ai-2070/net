@@ -172,6 +172,7 @@
 
 mod browser;
 mod stage5;
+mod stage6;
 mod udp_block;
 
 use std::collections::HashMap;
@@ -1855,10 +1856,14 @@ async fn run(
     let bundle = Bundle::locate(root);
     let mut step5_tx: HashMap<String, Step5Sender> = HashMap::new();
     let mut step5_rx: HashMap<String, Step5Queue> = HashMap::new();
-    for tab in stage5::TABS {
+    // Stage 6's two tabs have their own queues: they live in
+    // separate browsing contexts and must not consume the Stage 5
+    // tabs' steps, and two pages long-polling one queue would
+    // resolve each other's.
+    for tab in stage5::TABS.iter().chain(stage6::TABS.iter()) {
         let (tx, rx) = mpsc::channel(4);
-        step5_tx.insert(tab.to_string(), tx);
-        step5_rx.insert(tab.to_string(), Arc::new(Mutex::new(rx)));
+        step5_tx.insert((*tab).to_string(), tx);
+        step5_rx.insert((*tab).to_string(), Arc::new(Mutex::new(rx)));
     }
     let page_state = PageState {
         dist,
@@ -3622,7 +3627,7 @@ async fn run(
             page_origin: origin.clone(),
             stun: stun.clone(),
             bundle,
-            tabs: step5_tx,
+            tabs: step5_tx.clone(),
             launch: launch.clone(),
         };
         stage5::run(cx, ledger).await?;
@@ -3633,6 +3638,39 @@ async fn run(
              will therefore fail, which is the point."
         );
         for name in stage5::WITNESSES {
+            println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
+        }
+    }
+
+    // ================================================================
+    // Stage 6 slice 1 — browser ↔ browser direct, from a page
+    //
+    // Two ISOLATED browsing contexts on the same browser and the same
+    // anchor. Runs after Stage 5 deliberately: it opens two more
+    // contexts and leaves the launch context's pages alone, so every
+    // Stage 5 witness has already been recorded on exactly the
+    // topology it passes on today.
+    //
+    // Gated on the same `--no-stage5` flag, because it needs the same
+    // bundle: excluding one half and running the other would report a
+    // Stage 6 result against an untested leaf.
+    // ================================================================
+    if stage5 {
+        let cx6 = stage6::Cx6 {
+            driver: &driver,
+            engine,
+            anchor: &anchor,
+            credential: anchor_cred.clone(),
+            bootstrap_url: anchor_base.clone(),
+            origin: origin.clone(),
+            page_origin: origin.clone(),
+            stun: stun.clone(),
+            tabs: step5_tx,
+            anchor_rtc_addr: anchor_rtc_addr.to_string(),
+        };
+        stage6::run(cx6, ledger).await?;
+    } else {
+        for name in stage6::WITNESSES {
             println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
         }
     }

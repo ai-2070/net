@@ -33,6 +33,7 @@ use crate::rpc_wire::{self, RpcRequestPayload};
 use crate::session::{event_frame_bytes, rtc_addr, PendingHandshake, SessionTable};
 use crate::signal::{self, SeenSignals};
 use crate::stream::{stream_id_from_label, Reliability, RxStream, StreamRecord};
+use net_wire::route_codec::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use net_wire::stream_window::{
     StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
     SUBPROTOCOL_STREAM_WINDOW,
@@ -240,6 +241,62 @@ pub struct Outbound {
     pub packet: Bytes,
 }
 
+/// The TTL a relayed packet leaves with.
+///
+/// Eight, mirroring the native routed `0x0D02` send. See
+/// [`LeafNode::route_outbound`].
+const RELAY_TTL: u8 = 8;
+
+/// What the transport delivered, once its routing envelope — if it
+/// had one — has been stripped and its sender resolved.
+///
+/// Produced by [`LeafNode::classify_datagram`], which documents what
+/// `from` is derived from and, for a relayed packet, what it is not
+/// authority for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbound {
+    /// A Noise handshake packet. The driver runs
+    /// [`LeafNode::complete_handshake`] or
+    /// [`LeafNode::accept_handshake`] according to
+    /// [`LeafNode::is_handshaking`].
+    Handshake {
+        /// Who it is from.
+        from: NodeId,
+        /// The packet, routing envelope removed.
+        packet: Bytes,
+        /// Whether it arrived through a relay. The answer decides
+        /// which transport message 2 goes back on, and it is the
+        /// only thing that distinguishes a relayed session being
+        /// established from a direct one **replacing** it (§9 step
+        /// 4).
+        relayed: bool,
+    },
+    /// Anything else: hand `packet` to
+    /// [`LeafNode::on_datagram`] with `from` as the peer.
+    Session {
+        /// Who it is from.
+        from: NodeId,
+        /// The packet, routing envelope removed.
+        packet: Bytes,
+        /// Whether it arrived through a relay.
+        relayed: bool,
+    },
+    /// Refused; a counter moved. The driver does nothing.
+    Refused,
+}
+
+/// A Net handshake packet: `0x4E45` magic and the HANDSHAKE flag.
+///
+/// The one place this is decided. The wasm driver and the
+/// classifier above both read it, and two spellings of "is this a
+/// handshake" is how a driver ends up feeding message 1 to the
+/// session path.
+pub fn is_handshake_packet(bytes: &[u8]) -> bool {
+    bytes.len() >= net_wire::protocol::HEADER_SIZE
+        && u16::from_le_bytes([bytes[0], bytes[1]]) == net_wire::protocol::MAGIC
+        && net_wire::protocol::PacketFlags::from_bits(bytes[3]).is_handshake()
+}
+
 /// An open application stream's parameters.
 ///
 /// **The handle carries the incarnation it was opened on**, and
@@ -320,6 +377,16 @@ pub struct LeafNode {
     /// The peer's published RTC socket, per peer, for the
     /// `UdpBlocked` evidence and the `connected` event.
     peer_rtc_addr: HashMap<NodeId, String>,
+    /// `peer` → the peer that **relays** for it: every packet for
+    /// `peer` leaves wrapped in a routing envelope and addressed to
+    /// the relay's transport instead (plan §9 step 3).
+    ///
+    /// Empty for a leaf that talks only to its anchor, which is why
+    /// [`Self::take_outbound`] costs nothing until something is in
+    /// here. A direct DataChannel for `peer` is what removes the
+    /// entry ([`Self::clear_peer_relay`]) — §9 step 4's replacement,
+    /// from the addressing side.
+    relays: HashMap<NodeId, NodeId>,
     /// Subscribe nonces, so an Ack can be correlated.
     next_nonce: u64,
     /// The delegation chain the anchor issued at enrollment. `None`
@@ -433,6 +500,7 @@ impl LeafNode {
             events: Vec::new(),
             announcement_version: 1,
             peer_rtc_addr: HashMap::new(),
+            relays: HashMap::new(),
             next_nonce: 1,
             reply_subscriptions: std::collections::HashSet::new(),
             rpc_reply_carriers: std::collections::HashSet::new(),
@@ -482,6 +550,226 @@ impl LeafNode {
             }
             None => {
                 self.peer_rtc_addr.remove(&peer);
+            }
+        }
+    }
+
+    // ──────────────── the relayed path (plan §9 step 3) ─────────────
+
+    /// Send everything for `peer` through `relay`, wrapped in a
+    /// routing envelope.
+    ///
+    /// This is plan §9 step 2–3 from the leaf's side: before ICE has
+    /// solved anything, A reaches B by handing packets to a peer that
+    /// forwards them **blind**. The relay learns `(src, dest, ttl)`
+    /// and the inner packet's cleartext subprotocol id — the metadata
+    /// it already sees for every packet it carries today — and can
+    /// drop or delay, which is a liveness failure, not an
+    /// authenticity one. It cannot read the payload: the inner packet
+    /// is sealed to the A↔B session, and a `0x0D02` envelope riding
+    /// inside it is additionally signed by the sender's entity key.
+    ///
+    /// Nothing about the session changes. The relay is an
+    /// **addressing** fact, which is why it lives in its own map and
+    /// not in the session table: `SessionTable` is keyed on identity
+    /// exactly so that §9 step 4 can replace a relayed session with a
+    /// direct one as a table update rather than a route install.
+    pub fn set_peer_relay(&mut self, peer: NodeId, relay: NodeId) {
+        self.relays.insert(peer, relay);
+    }
+
+    /// Stop relaying for `peer`: its packets go out on its own
+    /// transport again. `true` if a relay was set.
+    ///
+    /// The addressing half of §9 step 4. Called once a direct
+    /// DataChannel to `peer` is carrying its session; the session
+    /// replacement itself is [`Self::install_session`]'s, and this
+    /// does not touch it.
+    pub fn clear_peer_relay(&mut self, peer: NodeId) -> bool {
+        self.relays.remove(&peer).is_some()
+    }
+
+    /// The relay set for `peer`, if any.
+    pub fn peer_relay(&self, peer: NodeId) -> Option<NodeId> {
+        self.relays.get(&peer).copied()
+    }
+
+    /// Address one packet for the wire: which transport carries it,
+    /// and what bytes go on it.
+    ///
+    /// With no relay for `peer` this is the identity function, which
+    /// is the Stage 5 path unchanged. With one, the packet is wrapped
+    /// in a `RoutingHeader` naming `peer` as the destination and this
+    /// leaf's 32-bit projection as the source, and handed to the
+    /// relay's transport.
+    ///
+    /// The TTL is 8, which is what the native side stamps on a routed
+    /// `0x0D02` frame (`adapter/net/mesh.rs`'s `send_rtc_signal`:
+    /// `RoutingHeader::new(peer_node_id, self.node_id as u32, 8)`).
+    /// Mirrored rather than re-chosen — a leaf relaying with a
+    /// different hop count than the mesh's own signalling would be a
+    /// second policy for one number.
+    pub fn route_outbound(&self, peer: NodeId, packet: Bytes) -> Outbound {
+        let Some(relay) = self.peer_relay(peer) else {
+            return Outbound { peer, packet };
+        };
+        // The 32-bit projection is the wire format, not a narrowing
+        // this code chose: `RoutingHeader::src_id` is a `u32` and
+        // `session::routing_id` already binds the same projection
+        // into the handshake prologue.
+        #[allow(clippy::cast_possible_truncation)]
+        let header = RoutingHeader::new(peer, self.identity.node_id() as u32, RELAY_TTL);
+        let mut wire = Vec::with_capacity(ROUTING_HEADER_SIZE + packet.len());
+        wire.extend_from_slice(&header.to_bytes());
+        wire.extend_from_slice(&packet);
+        Outbound {
+            peer: relay,
+            packet: Bytes::from(wire),
+        }
+    }
+
+    /// Whether an **initiator** handshake with `peer` is in flight.
+    ///
+    /// The driver's discriminator for an inbound handshake packet:
+    /// `true` means it is message 2 for a handshake this leaf started
+    /// and [`Self::complete_handshake`] owns it; `false` means it is
+    /// somebody's message 1 and only [`Self::accept_handshake`] can.
+    /// Guessing from "do I have a session" cannot tell them apart
+    /// once a session exists, which is exactly the §9 step 4 case.
+    pub fn is_handshaking(&self, peer: NodeId) -> bool {
+        self.handshakes.contains_key(&peer)
+    }
+
+    /// Send one signed envelope to `peer` as a `0x0D02` frame on the
+    /// session with `peer`.
+    ///
+    /// Plan §9 step 3, verbatim: the signalling rides the A↔B session
+    /// and the relay forwards it blind. The stream id is the
+    /// subprotocol id and the frame is fire-and-forget, which is the
+    /// framing the native `send_rtc_signal` uses for the same message
+    /// (`PacketFlags::NONE`, `stream_id = SUBPROTOCOL_RTC_SIGNAL as
+    /// u64`) — so an anchor that counts per-pair *application* data
+    /// excludes these by subprotocol id, and signalling can never be
+    /// mistaken for payload in the §10 witness.
+    ///
+    /// Requires a session with `peer`; a peer with no session is
+    /// [`crate::control_plane::ControlPlane::signal`]'s job, and that
+    /// carrier is the serverless one.
+    pub fn send_signal_frame(&mut self, peer: NodeId, envelope: &SignalEnvelope) -> Result<()> {
+        let payload = signal::encode(envelope)?;
+        self.send_subprotocol(
+            peer,
+            u64::from(signal::SUBPROTOCOL_RTC_SIGNAL),
+            signal::SUBPROTOCOL_RTC_SIGNAL,
+            0,
+            &payload,
+            false,
+        )
+    }
+
+    /// Classify one datagram the transport delivered: who it is from,
+    /// and whether it is a handshake.
+    ///
+    /// # Why the driver needs this
+    ///
+    /// A **relayed** packet arrives on the RELAY's DataChannel, so
+    /// the transport-level peer is the relay and not the sender.
+    /// [`Self::on_datagram`] is unchanged and still resolves an
+    /// ordinary datagram's session by the peer the transport named;
+    /// this function is what turns a relayed datagram into the
+    /// `(sender, inner packet)` pair `on_datagram` already knows how
+    /// to take. A datagram with no routing envelope comes back with
+    /// its bytes and its peer untouched.
+    ///
+    /// # What `src_id` is, and what it is NOT
+    ///
+    /// The only hint about who sent a relayed packet is
+    /// `RoutingHeader::src_id`: the low 32 bits of a node id, written
+    /// by the sender and rewritable by any hop.
+    ///
+    /// It is used for exactly one thing — choosing **which key to
+    /// try**. It is authority for nothing. A [`Inbound::Session`]
+    /// packet still has to open under that session's AEAD, and an
+    /// [`Inbound::Handshake`] still has to complete NKpsk0 against
+    /// this leaf's own static key with the trust domain's PSK and the
+    /// claimed id bound into the prologue. So a forged `src_id` can
+    /// only make this leaf try the wrong key — which fails and is
+    /// counted — and can never make a frame speak for a peer.
+    ///
+    /// Resolution is through the **announcement store**, so the
+    /// sender must be a node whose signed announcement this leaf
+    /// verified: §5 Layer 1's "key discovery precedes signalling",
+    /// applied to the session seam as well as to the envelope. An
+    /// unresolvable source is refused and counted, and a projection
+    /// shared by two fresh announcements is refused rather than
+    /// guessed.
+    pub fn classify_datagram(&self, transport_peer: NodeId, bytes: Bytes) -> Inbound {
+        if bytes.len() < 2 {
+            self.counters.drop_for(DropReason::Unparsable);
+            return Inbound::Refused;
+        }
+        if u16::from_le_bytes([bytes[0], bytes[1]]) != ROUTING_MAGIC {
+            // Not relayed: the Stage 5 path, byte for byte.
+            return Self::classified(transport_peer, bytes, false);
+        }
+        let Some(header) = RoutingHeader::from_bytes(&bytes) else {
+            self.counters.drop_for(DropReason::Unparsable);
+            return Inbound::Refused;
+        };
+        if header.dest_id != self.identity.node_id() {
+            // The role: a leaf never forwards.
+            self.counters.drop_for(DropReason::NotAddressedToUs);
+            return Inbound::Refused;
+        }
+        if header.is_expired() {
+            self.counters.drop_for(DropReason::RoutingExpired);
+            return Inbound::Refused;
+        }
+        if bytes.len() <= ROUTING_HEADER_SIZE {
+            self.counters.drop_for(DropReason::Unparsable);
+            return Inbound::Refused;
+        }
+        let Some(from) = self.resolve_relayed_source(header.src_id) else {
+            // Nothing this leaf has verified an announcement for, or
+            // two that share the projection. Either way there is no
+            // key to try, which is the same disposition an ordinary
+            // datagram from an unknown peer gets.
+            self.counters.drop_for(DropReason::NoSession);
+            return Inbound::Refused;
+        };
+        Self::classified(from, bytes.slice(ROUTING_HEADER_SIZE..), true)
+    }
+
+    /// The full node id a relayed packet's 32-bit source names.
+    ///
+    /// A live session's peer first — a pair already talking resolves
+    /// without consulting discovery at all, and its own AEAD is what
+    /// confirms the guess — then a verified announcement. Ambiguity
+    /// in either direction is `None`.
+    fn resolve_relayed_source(&self, src_id: u32) -> Option<NodeId> {
+        let mut found = None;
+        #[allow(clippy::cast_possible_truncation)]
+        for peer in self.sessions.peers().filter(|p| *p as u32 == src_id) {
+            if found.replace(peer).is_some() {
+                return None;
+            }
+        }
+        found.or_else(|| self.announcements.resolve_routing_id(src_id))
+    }
+
+    /// Split a packet with a known sender into handshake or session.
+    fn classified(from: NodeId, packet: Bytes, relayed: bool) -> Inbound {
+        if is_handshake_packet(&packet) {
+            Inbound::Handshake {
+                from,
+                packet,
+                relayed,
+            }
+        } else {
+            Inbound::Session {
+                from,
+                packet,
+                relayed,
             }
         }
     }
@@ -618,6 +906,10 @@ impl LeafNode {
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
         self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
+        // Addressing dies with the session it addressed. A relay
+        // entry left behind would wrap the next attempt's packets
+        // for a session that no longer exists.
+        self.relays.remove(&peer);
         self.events.push(LeafEvent::Disconnected {
             peer_node: peer,
             reason: reason.into(),
@@ -744,9 +1036,24 @@ impl LeafNode {
         }
     }
 
-    /// Take everything queued for the transport.
+    /// Take everything queued for the transport, addressed.
+    ///
+    /// Addressing is applied here and nowhere else: every packet the
+    /// node enqueues names the peer it is *for*, and a peer reached
+    /// through a relay needs a routing envelope and the relay's
+    /// transport instead (see [`Self::route_outbound`]). One place,
+    /// so a send path added later cannot forget. A leaf with no
+    /// relays — every leaf that talks only to its anchor — takes the
+    /// original path, allocation for allocation.
     pub fn take_outbound(&mut self) -> Vec<Outbound> {
-        self.outbound.drain(..).collect()
+        if self.relays.is_empty() {
+            return self.outbound.drain(..).collect();
+        }
+        let queued: Vec<Outbound> = self.outbound.drain(..).collect();
+        queued
+            .into_iter()
+            .map(|out| self.route_outbound(out.peer, out.packet))
+            .collect()
     }
 
     /// Take everything queued for the application.
@@ -2585,6 +2892,253 @@ mod tests {
             node.drain_events().is_empty(),
             "a forwarded packet produces no application event"
         );
+    }
+
+    // ──────── the relayed leaf ↔ leaf path (plan §9 steps 2–3) ──────
+
+    /// The peer that forwards for a pair with no channel of their
+    /// own. Not a party to either session, which is the point.
+    const RELAY: NodeId = 0x9999_8888_7777_6666;
+
+    /// Two leaves that have **discovered** each other and nothing
+    /// more: each holds the other's verified announcement, neither
+    /// holds a session, and neither has been told anything by a
+    /// carrier.
+    fn discovered() -> (LeafNode, LeafNode) {
+        let mut a = LeafNode::new(identity(0x71), 11);
+        let mut b = LeafNode::new(identity(0x72), 12);
+        let from_a = a
+            .build_announcement(&["chat".to_string()])
+            .expect("a signs its own announcement");
+        let from_b = b
+            .build_announcement(&["chat".to_string()])
+            .expect("b signs its own announcement");
+        assert!(b.ingest_announcement(&from_a), "b verifies a's");
+        assert!(a.ingest_announcement(&from_b), "a verifies b's");
+        a.drain_events();
+        b.drain_events();
+        (a, b)
+    }
+
+    /// Move everything `from` queued for `peer` to `to`, exactly as a
+    /// blind relay would: the bytes are forwarded verbatim, and the
+    /// relay is told nothing and asked nothing.
+    ///
+    /// Returns how many packets crossed.
+    fn forward(from: &mut LeafNode, to: &mut LeafNode) -> usize {
+        let out = from.take_outbound();
+        let n = out.len();
+        for packet in out {
+            assert_eq!(
+                packet.peer, RELAY,
+                "a relayed packet leaves addressed to the relay, not to its destination"
+            );
+            match to.classify_datagram(RELAY, packet.packet) {
+                Inbound::Session {
+                    from: src,
+                    packet,
+                    relayed,
+                } => {
+                    assert!(relayed, "it arrived through the relay");
+                    to.on_datagram(src, packet, clock::now());
+                }
+                other => panic!("expected a session packet, got {other:?}"),
+            }
+        }
+        n
+    }
+
+    /// §9 step 2: the routed A↔B session, over a relay that never
+    /// sees inside it.
+    ///
+    /// Everything the pair needs comes from discovery: B's Noise
+    /// static from its signed announcement, and A's full node id
+    /// resolved from B's copy of A's announcement — the routing
+    /// header carries only a 32-bit projection, so this is the step
+    /// that would be impossible if either side had skipped Layer 1.
+    #[test]
+    fn a_relayed_handshake_installs_a_session_on_both_sides_from_discovery_alone() {
+        let (mut a, mut b) = discovered();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        // From discovery, and from nowhere else: this is the datum
+        // first contact genuinely requires, and it is read out of the
+        // announcement A verified itself.
+        let b_noise = a
+            .announcement_for(bid)
+            .expect("a discovered b")
+            .noise_pubkey
+            .expect("a leaf's announcement carries its noise_pubkey");
+
+        a.set_peer_relay(bid, RELAY);
+        let msg1 = a.begin_handshake(bid, &PSK, &b_noise, 0).expect("msg1");
+        let out = a.route_outbound(bid, msg1);
+        assert_eq!(out.peer, RELAY);
+
+        // A leaf that is merely carrying this refuses it: not
+        // addressed to us, not forwarded, counted.
+        let carrier = LeafNode::new(identity(0x73), 13);
+        assert_eq!(
+            carrier.classify_datagram(aid, out.packet.clone()),
+            Inbound::Refused,
+            "the relay is not the destination, and a leaf never forwards"
+        );
+        assert_eq!(carrier.counters().drops(DropReason::NotAddressedToUs), 1);
+
+        let msg2 = match b.classify_datagram(RELAY, out.packet) {
+            Inbound::Handshake {
+                from,
+                packet,
+                relayed,
+            } => {
+                assert_eq!(
+                    from, aid,
+                    "the sender is resolved from the announcement b verified, \
+                     never from the carrier"
+                );
+                assert!(relayed);
+                b.set_peer_relay(from, RELAY);
+                b.accept_handshake(from, &PSK, &packet, 0)
+                    .expect("the responder half completes on message 1")
+            }
+            other => panic!("expected message 1, got {other:?}"),
+        };
+
+        let back = b.route_outbound(aid, msg2);
+        assert_eq!(back.peer, RELAY);
+        match a.classify_datagram(RELAY, back.packet) {
+            Inbound::Handshake {
+                from,
+                packet,
+                relayed,
+            } => {
+                assert_eq!(from, bid);
+                assert!(relayed);
+                a.complete_handshake(from, &packet)
+                    .expect("the initiator installs from message 2");
+            }
+            other => panic!("expected message 2, got {other:?}"),
+        }
+
+        assert!(a.has_session(bid) && b.has_session(aid));
+        assert_eq!(a.peer_relay(bid), Some(RELAY));
+        assert_eq!(b.peer_relay(aid), Some(RELAY));
+    }
+
+    /// §9 step 3: the signed `0x0D02` envelope rides that session,
+    /// and the receiver verifies it on its own.
+    #[test]
+    fn a_signed_offer_rides_the_relayed_session_and_the_receiver_verifies_it() {
+        let (mut a, mut b) = relayed_pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+
+        let envelope = a.sign_signal(
+            bid,
+            0x5109,
+            SignalKind::Offer,
+            b"v=0\r\no=- 1 1 IN".to_vec(),
+        );
+        a.send_signal_frame(bid, &envelope)
+            .expect("the offer goes out on the relayed session");
+        assert_eq!(forward(&mut a, &mut b), 1);
+
+        assert_eq!(
+            b.drain_events(),
+            vec![LeafEvent::Signal(envelope)],
+            "the envelope arrives verified: signature against a's announcement, \
+             inside its window, unreplayed"
+        );
+        assert_eq!(b.counters().drops(DropReason::SignalRejected), 0);
+        assert_eq!(a.node_id(), aid);
+    }
+
+    /// Application data takes the same relayed path — which is what
+    /// §10 part 1 measures on the anchor, and what part 2 then
+    /// expects to go flat.
+    #[test]
+    fn application_data_rides_the_relayed_session_and_stops_when_the_pair_goes_direct() {
+        let (mut a, mut b) = relayed_pair();
+        let bid = b.node_id();
+
+        let handle = a
+            .open_stream(bid, "positions", Reliability::FireAndForget, None, None)
+            .expect("stream");
+        a.stream_send(handle, b"frame one").expect("send");
+        assert_eq!(forward(&mut a, &mut b), 1, "it went through the relay");
+
+        // §9 step 4's addressing half: the pair now has its own
+        // channel, so nothing more is wrapped.
+        assert!(a.clear_peer_relay(bid));
+        a.stream_send(handle, b"frame two").expect("send");
+        let out = a.take_outbound();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].peer, bid,
+            "a direct packet is addressed to the peer, with no routing envelope"
+        );
+        assert_eq!(
+            u16::from_le_bytes([out[0].packet[0], out[0].packet[1]]),
+            net_wire::protocol::MAGIC,
+            "and it carries the Net magic, not the routing magic"
+        );
+    }
+
+    /// A relayed source this leaf cannot resolve is refused, not
+    /// guessed at.
+    ///
+    /// The fail-closed half of "keys from discovery only": with no
+    /// verified announcement for the projection a packet claims,
+    /// there is no key to try and no identity to key a session
+    /// under, so the frame is dropped and counted.
+    #[test]
+    fn a_relayed_packet_from_an_undiscovered_source_is_refused() {
+        let (mut a, _b) = discovered();
+        let stranger = LeafNode::new(identity(0x7E), 14);
+        let aid = a.node_id();
+
+        let header = RoutingHeader::new(aid, stranger.node_id() as u32, RELAY_TTL);
+        let mut wire = header.to_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; net_wire::protocol::HEADER_SIZE]);
+        assert_eq!(
+            a.classify_datagram(RELAY, Bytes::from(wire)),
+            Inbound::Refused
+        );
+        assert_eq!(a.counters().drops(DropReason::NoSession), 1);
+        assert!(
+            a.drain_events().is_empty(),
+            "an unresolvable relayed packet produces no application event"
+        );
+    }
+
+    /// Two leaves with a live relayed session, the state §9 step 3
+    /// starts from.
+    fn relayed_pair() -> (LeafNode, LeafNode) {
+        let (mut a, mut b) = discovered();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        let b_noise = a
+            .announcement_for(bid)
+            .expect("discovered")
+            .noise_pubkey
+            .expect("noise key");
+        a.set_peer_relay(bid, RELAY);
+        b.set_peer_relay(aid, RELAY);
+        let msg1 = a.begin_handshake(bid, &PSK, &b_noise, 0).expect("msg1");
+        let wrapped = a.route_outbound(bid, msg1);
+        let msg2 = match b.classify_datagram(RELAY, wrapped.packet) {
+            Inbound::Handshake { from, packet, .. } => b
+                .accept_handshake(from, &PSK, &packet, 0)
+                .expect("responder"),
+            other => panic!("{other:?}"),
+        };
+        let wrapped = b.route_outbound(aid, msg2);
+        match a.classify_datagram(RELAY, wrapped.packet) {
+            Inbound::Handshake { from, packet, .. } => {
+                a.complete_handshake(from, &packet).expect("initiator");
+            }
+            other => panic!("{other:?}"),
+        }
+        a.drain_events();
+        b.drain_events();
+        (a, b)
     }
 
     #[test]

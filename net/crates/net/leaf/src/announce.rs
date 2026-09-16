@@ -489,6 +489,50 @@ impl AnnouncementStore {
         self.by_node.get(&node)
     }
 
+    /// The full node id whose low 32 bits are `routing_id`, from a
+    /// still-fresh announcement.
+    ///
+    /// **Why this exists.** `RoutingHeader::src_id` is a `u32` — the
+    /// low 32 bits of a node id — so a relayed packet names its
+    /// sender only by that projection, and the native side handles it
+    /// the same way (`adapter/net/mesh.rs`'s `handle_routed_handshake`
+    /// binds its prologue to `routing_header.src_id as u64` for
+    /// exactly this reason). A leaf's NKpsk0 message 1 carries an
+    /// empty payload, so the projection is all a relayed handshake
+    /// arrives with, and the session table is keyed on the FULL id.
+    ///
+    /// Resolving it here rather than anywhere else is deliberate:
+    /// the answer can only be a node whose **signed announcement**
+    /// this leaf verified, which is §5 Layer 1's rule ("key discovery
+    /// precedes signalling") applied to the session seam as well as
+    /// to the envelope. An expired announcement resolves to nothing,
+    /// so the same expiry that removes a peer from discovery removes
+    /// it from here.
+    ///
+    /// **Ambiguity is refused, not guessed.** A 32-bit projection is
+    /// not unique; two fresh announcements sharing one is `None`,
+    /// because choosing between them would be this function
+    /// inventing a sender.
+    pub fn resolve_routing_id(&self, routing_id: u32) -> Option<u64> {
+        self.resolve_routing_id_at(routing_id, crate::clock::now_unix_secs())
+    }
+
+    /// [`Self::resolve_routing_id`] against an explicit wall-clock
+    /// second, so the expiry boundary is testable natively.
+    pub fn resolve_routing_id_at(&self, routing_id: u32, now_unix_secs: u64) -> Option<u64> {
+        let mut found = None;
+        for node in self.by_node.values().filter_map(|a| {
+            a.is_fresh(now_unix_secs)
+                .then_some(a.node_id)
+                .filter(|id| *id as u32 == routing_id)
+        }) {
+            if found.replace(node).is_some() {
+                return None;
+            }
+        }
+        found
+    }
+
     /// How many announcements are held.
     pub fn len(&self) -> usize {
         self.by_node.len()
@@ -561,6 +605,81 @@ mod tests {
             "§7: a leaf omits reflex_addr — got {text}"
         );
         assert!(!text.contains("hop_count"), "a leaf originates at hop 0");
+    }
+
+    /// A record with a chosen node id, fresh at `now`.
+    ///
+    /// Hand-built rather than signed: the only field under test is
+    /// `node_id`, and two node ids that collide in their low 32 bits
+    /// cannot be reached by choosing entity secrets — the id is a
+    /// hash of the key.
+    fn record(node_id: u64, now_unix_secs: u64) -> VerifiedAnnouncement {
+        VerifiedAnnouncement {
+            node_id,
+            entity_id: format!("{node_id:016x}"),
+            capabilities: vec!["leaf".to_string()],
+            noise_pubkey: Some([0x33; 32]),
+            rtc_addr: None,
+            rtc_bootstrap: None,
+            version: 1,
+            timestamp_ns: now_unix_secs * 1_000_000_000,
+            ttl_secs: DEFAULT_TTL_SECS,
+        }
+    }
+
+    /// The 32-bit projection a routing header carries resolves to the
+    /// full node id, and expiry takes that authority away with
+    /// discovery.
+    #[test]
+    fn a_routing_id_resolves_to_the_announced_node_and_expires_with_it() {
+        const NOW: u64 = 1_700_000_000;
+        let mut store = AnnouncementStore::new();
+        store.ingest(record(0xAAAA_BBBB_1234_5678, NOW));
+        store.ingest(record(0xCCCC_DDDD_9999_0000, NOW));
+
+        assert_eq!(
+            store.resolve_routing_id_at(0x1234_5678, NOW),
+            Some(0xAAAA_BBBB_1234_5678)
+        );
+        assert_eq!(
+            store.resolve_routing_id_at(0x9999_0000, NOW),
+            Some(0xCCCC_DDDD_9999_0000)
+        );
+        assert_eq!(
+            store.resolve_routing_id_at(0xDEAD_BEEF, NOW),
+            None,
+            "a projection nobody announced resolves to nobody"
+        );
+        assert_eq!(
+            store.resolve_routing_id_at(0x1234_5678, NOW + u64::from(DEFAULT_TTL_SECS) + 1),
+            None,
+            "the expiry that removes a peer from discovery removes it from here"
+        );
+    }
+
+    /// **Fail closed on a collision.** Two fresh announcements
+    /// sharing a 32-bit projection resolve to neither: a leaf that
+    /// picked one would be inventing the sender of a relayed packet,
+    /// and the whole point of resolving through discovery is that
+    /// nothing else gets to decide who sent something.
+    #[test]
+    fn two_announcements_sharing_a_routing_id_resolve_to_neither() {
+        const NOW: u64 = 1_700_000_000;
+        let mut store = AnnouncementStore::new();
+        store.ingest(record(0x1111_1111_4444_4444, NOW));
+        store.ingest(record(0x2222_2222_4444_4444, NOW));
+
+        assert_eq!(store.len(), 2, "both are held: they are different nodes");
+        assert_eq!(
+            store.resolve_routing_id_at(0x4444_4444, NOW),
+            None,
+            "ambiguity is refused, not guessed"
+        );
+        // And the ambiguity is confined to the projection: each is
+        // still reachable by its full id, so a collision costs those
+        // two peers the relayed path and nothing else.
+        assert!(store.get_at(0x1111_1111_4444_4444, NOW).is_some());
+        assert!(store.get_at(0x2222_2222_4444_4444, NOW).is_some());
     }
 
     /// One flipped byte anywhere in the signed transcript must fail.

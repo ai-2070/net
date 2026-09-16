@@ -242,6 +242,32 @@ function typedFailure(e) {
 }
 
 // ---------------------------------------------------------------------
+// the generated wasm node
+// ---------------------------------------------------------------------
+//
+// Reaches through the `BrowserNode` wrapper to the GENERATED wasm node
+// the same way `arm_reentry` already does — `.inner` — deliberately
+// the ONE way in, so there is no second answer to "where is the raw
+// node" to keep in step.
+//
+// The raw node is needed because the four `#[wasm_bindgen]` peer
+// methods (`peer_offer`, `peer_accept_offer`, `peer_candidate`,
+// `peer_handshake`) are the surface under test. The wrapper's
+// `connectPeer`/`acceptPeer` are a SECOND, separate surface that
+// drives them; a witness has to be able to exercise either one on its
+// own, otherwise a wrapper that papers over a broken raw method is
+// indistinguishable from a correct one.
+//
+// Keyed on `peer_offer` rather than on `inner` merely existing, so a
+// build whose peer methods did not land fails by name here instead of
+// throwing `undefined is not a function` from inside an arm.
+function wasmNodeOf(node) {
+  return node && node.inner && typeof node.inner.peer_offer === 'function' ? node.inner : null;
+}
+
+const NO_WASM_NODE = 'the generated wasm node with the peer methods is not reachable';
+
+// ---------------------------------------------------------------------
 // steps
 // ---------------------------------------------------------------------
 
@@ -870,6 +896,238 @@ async function execute(step) {
       const state = reentry.get(step.session);
       if (!state) return { ok: false, error: 'nothing armed on ' + step.session };
       return { ok: true, info: JSON.stringify(state) };
+    }
+
+    // The offerer's whole drive loop, in one step.
+    //
+    // A THROW and an OUTCOME are different things and the harness must
+    // be able to tell them apart — that distinction is the point of
+    // the union. Every `type` (`direct`, `iceTimeout`, `udpBlocked`,
+    // `noAnnouncement`, `handshakeFailed`, `superseded`) is a
+    // DISPOSITION the leaf reached and reported, so it comes back
+    // `ok: true` with the disposition in `stats.outcome`; a throw is
+    // the leaf reaching no disposition at all and goes back typed. A
+    // step that folded `iceTimeout` into an error would make "ICE
+    // gave up, correctly narrowed" look like "the call blew up".
+    case 'peer_connect': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const r = await node.connectPeer(step.peer_hex);
+        return {
+          ok: true,
+          stats: {
+            outcome: r.type,
+            dialog: r.dialog ?? '',
+            peer: r.peer ?? '',
+            detail: r.detail ?? '',
+            live_dialog: r.liveDialog ?? '',
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // The answerer's half of the same dialog. Reported in exactly the
+    // shape `peer_connect` uses, because a witness asserts on both
+    // ends of one session and an asymmetric report would hide which
+    // side disagreed.
+    case 'peer_accept': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const r = await node.acceptPeer(step.peer_hex);
+        return {
+          ok: true,
+          stats: {
+            outcome: r.type,
+            dialog: r.dialog ?? '',
+            peer: r.peer ?? '',
+            detail: r.detail ?? '',
+            live_dialog: r.liveDialog ?? '',
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // One service of a LIVE attempt, without driving it to a
+    // conclusion. This is how a witness observes the middle of a
+    // dialog — candidates sent and applied while still `gathering` —
+    // which `peer_connect` can only report after the fact.
+    // `remaining_ms` is a decimal STRING because it is a u64.
+    case 'peer_attempt': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const s = await node.peerAttempt(step.peer_hex);
+        return {
+          ok: true,
+          stats: {
+            dialog: s.dialog,
+            state: s.state,
+            sent: s.sent,
+            applied: s.applied,
+            answered: s.answered,
+            direct: s.direct,
+            remaining_ms: s.remainingMs,
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // The raw `#[wasm_bindgen]` methods from here down. They exist as
+    // steps of their own so a witness can stop between them — open a
+    // dialog and never answer it, answer twice, hand shake before a
+    // candidate landed — which the wrapper's drive loop, by being a
+    // loop, cannot express.
+    case 'peer_offer': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const wasm = wasmNodeOf(node);
+      if (!wasm) return { ok: false, error: NO_WASM_NODE };
+      try {
+        const dialog = await wasm.peer_offer(step.peer_hex);
+        return { ok: true, stats: { dialog, counters: node.counters() } };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    case 'peer_accept_offer': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const wasm = wasmNodeOf(node);
+      if (!wasm) return { ok: false, error: NO_WASM_NODE };
+      try {
+        const dialog = await wasm.peer_accept_offer(step.peer_hex);
+        return { ok: true, stats: { dialog, counters: node.counters() } };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // The raw method answers with a JSON string. Both the PARSED
+    // fields and the verbatim text come back: if the leaf's encoding
+    // ever drifts from the field names the runner reads, the parsed
+    // half goes quietly undefined and only `raw` shows why.
+    case 'peer_candidate': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const wasm = wasmNodeOf(node);
+      if (!wasm) return { ok: false, error: NO_WASM_NODE };
+      try {
+        const json = await wasm.peer_candidate(step.peer_hex);
+        const s = JSON.parse(json);
+        return {
+          ok: true,
+          stats: {
+            raw: json,
+            dialog: s.dialog,
+            state: s.state,
+            sent: s.sent,
+            applied: s.applied,
+            answered: s.answered,
+            direct: s.direct,
+            remaining_ms: s.remainingMs,
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // Nothing but the counters to report — the handshake's whole
+    // observable effect is in them, and a witness that called this out
+    // of order reads its refusal off `typedFailure` instead.
+    case 'peer_handshake': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const wasm = wasmNodeOf(node);
+      if (!wasm) return { ok: false, error: NO_WASM_NODE };
+      try {
+        await wasm.peer_handshake(step.peer_hex);
+        return { ok: true, stats: { counters: node.counters() } };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // The same last step through the WRAPPER, so the disposition is
+    // the one a page reads. `peer_handshake` above answers with a
+    // throw; `handshakePeer` answers with the union member
+    // `connectPeer` would have returned, which is the only place
+    // `handshakeFailed` is observable as a disposition rather than
+    // as an exception.
+    case 'peer_handshake_typed': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      try {
+        const r = await node.handshakePeer(step.peer_hex, step.dialog);
+        return {
+          ok: true,
+          stats: {
+            outcome: r.type,
+            dialog: r.dialog ?? '',
+            peer: r.peer ?? '',
+            detail: r.detail ?? '',
+            live_dialog: r.liveDialog ?? '',
+            counters: node.counters(),
+          },
+        };
+      } catch (e) {
+        return typedFailure(e);
+      }
+    }
+
+    // Not a drive step: an ASSERTION about the shape of the boundary.
+    //
+    // `peer_handshake` taking a peer id and NOTHING else is the
+    // security property of this whole slice. A page that can supply a
+    // Noise key can supply ANY key, so the key must never be a
+    // parameter — the leaf holds it and the page only names who to
+    // talk to. `Function.prototype.length` is the only way to observe
+    // from the page that no such parameter exists: one added later
+    // would be ignored by every call site here and so invisible to
+    // every other witness.
+    case 'peer_arity': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const wasm = wasmNodeOf(node);
+      if (!wasm) return { ok: false, error: NO_WASM_NODE };
+      return {
+        ok: true,
+        stats: {
+          peer_offer: wasm.peer_offer.length,
+          peer_accept_offer: wasm.peer_accept_offer.length,
+          peer_candidate: wasm.peer_candidate.length,
+          peer_handshake: wasm.peer_handshake.length,
+          all_functions: [
+            wasm.peer_offer,
+            wasm.peer_accept_offer,
+            wasm.peer_candidate,
+            wasm.peer_handshake,
+          ].every((f) => typeof f === 'function'),
+        },
+      };
+    }
+
+    // The attempt ledger, with no attempt required. `peer_attempt`
+    // refuses a peer it has no live attempt with — correctly — and a
+    // ledger read must not depend on an attempt being live at the
+    // moment it is taken.
+    case 'peer_counters': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      return { ok: true, stats: { counters: node.counters() } };
     }
 
     case 'close': {

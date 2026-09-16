@@ -45,6 +45,43 @@ let live = null;
 /** @type {Map<string, any>} */
 const pages = new Map();
 
+// ISOLATED BROWSING CONTEXTS, BY NAME
+// -----------------------------------
+//
+// `live.context` above is the LAUNCH context and stays the default:
+// an `open` with no `context` field lands there, exactly as every
+// Stage 4b / Stage 5 witness expects.
+//
+// A *named* context is a second browsing context, and that is a
+// stronger claim than a second tab. Two tabs in one context share
+// one storage partition and ONE Web Locks namespace, so two leaves
+// in them share their persisted identity and contend for the same
+// lock — which is precisely what the "two tabs, one identity"
+// witnesses measure. A browser↔browser session instead needs two
+// leaves that are genuinely independent: separate storage (separate
+// identity) and separate Web Locks (separate leader election). Only
+// a separate context gives that.
+//
+// Firefox cannot use `browser.newContext()` here. It is launched
+// through `launchPersistentContext`, so `context.browser()` may be
+// null (the `browser ? browser.version() : 'unknown'` guard in
+// `opLaunch` exists for that), and there is no Browser to ask for a
+// second context. So on a persistent engine a named context is a
+// SECOND persistent context on its own profile directory — which is
+// also the strongest isolation available, a whole separate profile.
+// That profile must be seeded with the same harness CA the first
+// one was, or TLS to the anchor fails inside it.
+/** @type {Map<string, {context: any, persistent: boolean, profileDir?: string}>} */
+const contexts = new Map();
+// What a later named context needs to be created the same way the
+// launch context was: the resolved engine type, the executable, the
+// flags/prefs `opLaunch` computed, the profile dir and the CA to
+// seed a further profile with. Set beside `live`, cleared with it.
+/** @type {{engine: string, type: any, executablePath: string|undefined, args: string[]|null, firefoxUserPrefs: object|null, profileDir: string, caPemPath: string|undefined, caNickname: string|undefined}|null} */
+let launchSpec = null;
+/** Which context each open page belongs to. @type {Map<string, any>} */
+const pageContexts = new Map();
+
 function log(line) {
   process.stderr.write(line + '\n');
 }
@@ -162,9 +199,14 @@ async function opLaunch(req) {
   let browser = null;
   let context = null;
   let persistent = false;
+  // Captured out of the engine branches so a named context can be
+  // created with the SAME flags / prefs this launch used.
+  let ctxArgs = null;
+  let ctxPrefs = null;
 
   if (engine === 'chromium') {
     const args = chromiumArgs(req.spkiPin);
+    ctxArgs = args;
     // Chromium's `WebRtcHideLocalIpsWithMdns` is ON by default and
     // that default is what the mDNS witness measures. The flag is
     // only ever passed to turn it OFF, deliberately.
@@ -214,6 +256,7 @@ async function opLaunch(req) {
         'media.peerconnection.ice.proxy_only=true with network.proxy.type=0: ICE may only ' +
         'go through a proxy and none is configured';
     }
+    ctxPrefs = prefs;
     context = await type.launchPersistentContext(profileDir, {
       headless: true,
       executablePath: req.executablePath || undefined,
@@ -239,6 +282,16 @@ async function opLaunch(req) {
   }
 
   live = { engine, browser, context, persistent };
+  launchSpec = {
+    engine,
+    type,
+    executablePath: req.executablePath || undefined,
+    args: ctxArgs,
+    firefoxUserPrefs: ctxPrefs,
+    profileDir,
+    caPemPath: req.caPemPath,
+    caNickname: req.caNickname,
+  };
   return {
     version: browser ? browser.version() : 'unknown',
     trust,
@@ -249,6 +302,50 @@ async function opLaunch(req) {
 // ---------------------------------------------------------------------
 // pages
 // ---------------------------------------------------------------------
+
+// Resolve a browsing context by name, creating it on first use.
+// `null` / absent / empty is the launch context — today's path,
+// untouched.
+async function contextFor(name) {
+  if (!name) return live.context;
+  const existing = contexts.get(name);
+  if (existing) return existing.context;
+  if (!launchSpec) throw new Error('no launch spec recorded; cannot create a context');
+
+  if (live.persistent) {
+    // Firefox. A second persistent context on its own profile,
+    // seeded with the same CA through the same code path — a
+    // differently-trusted profile would fail TLS to the anchor and
+    // take the Firefox leg down in CI.
+    const dir = `${launchSpec.profileDir}-${name}`;
+    fs.rmSync(dir, { recursive: true, force: true });
+    const seeded = seedFirefoxProfile(dir, launchSpec.caPemPath, launchSpec.caNickname);
+    const context = await launchSpec.type.launchPersistentContext(dir, {
+      headless: true,
+      executablePath: launchSpec.executablePath,
+      firefoxUserPrefs: launchSpec.firefoxUserPrefs || undefined,
+    });
+    contexts.set(name, { context, persistent: true, profileDir: dir });
+    log(`context ${name}: second persistent profile ${dir} — trust: ${seeded.how}`);
+    return context;
+  }
+
+  if (!live.browser) {
+    // Named, not silent. Falling back to the launch context here
+    // would hand back a page that SHARES storage and Web Locks
+    // while the witness reports two isolated contexts — the exact
+    // false claim this registry exists to make impossible.
+    throw new Error(
+      `no_browser_for_context: engine ${live.engine} is not persistent yet exposes no ` +
+        `Browser, so the isolated context ${name} cannot be created; refusing to fall ` +
+        'back to the launch context, which would report isolation the page did not get',
+    );
+  }
+  const context = await live.browser.newContext();
+  contexts.set(name, { context, persistent: false });
+  log(`context ${name}: new isolated browser context`);
+  return context;
+}
 
 async function opOpen(req) {
   if (!live) throw new Error('no browser is live');
@@ -261,7 +358,10 @@ async function opOpen(req) {
   // half's `close_page` took the window down before Stage 5 could
   // open its tab. So the blank page is now left alone as the window
   // anchor and every `open` gets a genuinely new tab.
-  const page = await live.context.newPage();
+  const named =
+    typeof req.context === 'string' && req.context.length > 0 ? req.context : null;
+  const ctx = await contextFor(named);
+  const page = await ctx.newPage();
   // The pages POST their own narrative to `/harness/log`, so
   // forwarding `console.log` too would double every line. Only what
   // the page did NOT choose to report is forwarded: warnings,
@@ -274,6 +374,7 @@ async function opOpen(req) {
   page.on('pageerror', (e) => log(`[${req.page}] pageerror: ${e.message}`));
   page.on('crash', () => log(`[${req.page}] CRASHED`));
   pages.set(req.page, page);
+  pageContexts.set(req.page, ctx);
   await page.goto(req.url, { waitUntil: 'domcontentloaded', timeout: req.timeoutMs || 30000 });
   return { url: page.url() };
 }
@@ -282,6 +383,7 @@ async function opClosePage(req) {
   const page = pages.get(req.page);
   if (!page) throw new Error(`no page named ${req.page}`);
   pages.delete(req.page);
+  pageContexts.delete(req.page);
   await page.close({ runBeforeUnload: false });
   return {};
 }
@@ -305,7 +407,10 @@ async function opLifecycle(req) {
       `Page.setWebLifecycleState is CDP-only; ${live.engine} cannot freeze a tab`,
     );
   }
-  const session = await live.context.newCDPSession(page);
+  // The CDP session must be opened on the context that OWNS the
+  // page, which for a named context is not `live.context`.
+  const owner = pageContexts.get(req.page) || live.context;
+  const session = await owner.newCDPSession(page);
   try {
     await session.send('Page.enable');
     await session.send('Page.setWebLifecycleState', { state: req.state });
@@ -317,8 +422,21 @@ async function opLifecycle(req) {
 
 async function opShutdown() {
   const it = live;
+  const named = [...contexts.values()];
   live = null;
+  launchSpec = null;
+  contexts.clear();
   pages.clear();
+  pageContexts.clear();
+  // Named contexts first, then the launch one. Each close is
+  // independent: one already-gone context must not strand the rest.
+  for (const c of named) {
+    try {
+      await c.context.close();
+    } catch (e) {
+      log('shutdown context: ' + (e.message || String(e)));
+    }
+  }
   if (!it) return {};
   try {
     if (it.persistent) await it.context.close();

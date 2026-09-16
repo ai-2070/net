@@ -18,11 +18,18 @@ export {
   connect,
   BrowserNode,
   buildConnectRequest,
+  parseAttemptStatus,
   parseCounters,
   parseDescriptors,
   refineIceFailure,
 } from './node.js';
-export type { ConnectOptions, FailureTypingOptions, NodeDescriptor } from './node.js';
+export type {
+  ConnectOptions,
+  FailureTypingOptions,
+  NodeDescriptor,
+  PeerAttemptStatus,
+  PeerConnectOutcome,
+} from './node.js';
 
 export { LeafStream } from './stream.js';
 export type { OpenStreamOptions } from './stream.js';

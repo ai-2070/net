@@ -353,10 +353,36 @@ impl Driver {
         })
     }
 
+    /// Open `name` at `url` in the launch context.
     pub async fn open_page(&self, name: &str, url: &str) -> Result<(), String> {
-        self.request("open", json!({ "page": name, "url": url }))
-            .await
-            .map(|_| ())
+        self.open_page_in(name, url, None).await
+    }
+
+    /// Open `name` at `url` in an ISOLATED browsing context named
+    /// `context`, created on first use; `None` is the launch context.
+    ///
+    /// A named context is not a second tab. Tabs in one context share
+    /// one storage partition and one Web Locks namespace, so two
+    /// leaves in them share a persisted identity and contend for the
+    /// same leader lock — the thing the "two tabs, one identity"
+    /// witnesses measure. A named context has its own storage and its
+    /// own locks, which is what makes two leaf identities and two
+    /// leader elections genuinely independent, as a browser↔browser
+    /// session requires.
+    pub async fn open_page_in(
+        &self,
+        name: &str,
+        url: &str,
+        context: Option<&str>,
+    ) -> Result<(), String> {
+        // `None` renders as `null`, which the driver reads as the
+        // launch context — byte-for-byte the pre-existing path.
+        self.request(
+            "open",
+            json!({ "page": name, "url": url, "context": context }),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn close_page(&self, name: &str) -> Result<(), String> {

@@ -64,6 +64,112 @@ export interface FailureTypingOptions {
   readonly bootstrap?: BootstrapProbeOptions;
 }
 
+/**
+ * Where one browser ↔ browser attempt ended (plan §9).
+ *
+ * A **typed result**, not a rejection: every member below is a
+ * disposition a drive loop acts on rather than an exception. `direct`
+ * is the only success; the rest are the four the stage brief names,
+ * plus `udpBlocked`, which is `iceTimeout` with the evidence that
+ * narrows it actually established (`UdpBlockedEvidence` — never
+ * claimed without it).
+ *
+ * `dialog` is the attempt's id, 16 lowercase hex digits, the same
+ * value both sides number the exchange with.
+ */
+export type PeerConnectOutcome =
+  /** A direct session is installed and the pair is off the relay. */
+  | { readonly type: 'direct'; readonly peer: string; readonly dialog: string }
+  /**
+   * ICE did not connect inside the attempt's deadline. The routed
+   * session was never replaced (§9 step 6), which is a relayed
+   * session and not a failure.
+   */
+  | { readonly type: 'iceTimeout'; readonly peer: string; readonly dialog: string }
+  /**
+   * As `iceTimeout`, and the STUN probe against the address the
+   * anchor published also went unanswered — so this browser's UDP is
+   * blocked, with the two observations that establish it.
+   */
+  | { readonly type: 'udpBlocked'; readonly peer: string; readonly dialog: string }
+  /**
+   * This node holds no verified announcement for the peer, so there
+   * is no key to handshake against. Discover it by capability query
+   * first: a peer's Noise key comes from its signed announcement and
+   * never from a caller.
+   */
+  | { readonly type: 'noAnnouncement'; readonly peer: string; readonly detail: string }
+  /** The DataChannel opened and the Noise handshake did not install. */
+  | {
+      readonly type: 'handshakeFailed';
+      readonly peer: string;
+      readonly dialog: string;
+      readonly detail: string;
+    }
+  /**
+   * A newer attempt with the same peer replaced this one. `liveDialog`
+   * is the attempt that now holds the peer, or `null` when the
+   * attempt simply ended.
+   */
+  | {
+      readonly type: 'superseded';
+      readonly peer: string;
+      readonly dialog: string;
+      readonly liveDialog: string | null;
+    };
+
+/** One `peer_candidate` reading, as the leaf reports it. */
+export interface PeerAttemptStatus {
+  /** The attempt CURRENTLY live for the peer. */
+  readonly dialog: string;
+  /** Where ICE stands. */
+  readonly state: 'gathering' | 'open' | 'iceTimeout' | 'udpBlocked';
+  /** Signed `Candidate` envelopes sent by this call. */
+  readonly sent: number;
+  /** Remote candidates the browser accepted on this call. */
+  readonly applied: number;
+  /** Whether the peer's answer was applied on this call. */
+  readonly answered: boolean;
+  /**
+   * Whether a direct session is installed and the relay is gone — a
+   * different fact from `state === 'open'`, which is only the
+   * DataChannel.
+   */
+  readonly direct: boolean;
+  /** Milliseconds left on the attempt's ICE deadline, exact decimal. */
+  readonly remainingMs: string;
+}
+
+/**
+ * The exact prefix the leaf's "peer not discovered" refusal carries
+ * (`wasm.rs`'s `NO_ANNOUNCEMENT_PREFIX`).
+ *
+ * Pinned, like {@link parseLeafError}'s other `Display` strings: the
+ * wasm boundary carries messages, so a message is a contract. The
+ * browser ↔ browser witnesses drive this outcome end to end, so a
+ * drift is a red test rather than a misclassified failure.
+ */
+const NO_ANNOUNCEMENT_PREFIX = 'no verified announcement for';
+
+/** `wasm.rs`'s `NO_LIVE_ATTEMPT_PREFIX`. */
+const NO_LIVE_ATTEMPT_PREFIX = 'no live attempt with';
+
+/** How long the drive loop waits between `peer_candidate` calls. */
+const PEER_TICK_MS = 50;
+
+/**
+ * How long {@link BrowserNode.acceptPeer} waits for the offer
+ * envelope to arrive before it treats "no offer" as the answer.
+ *
+ * Two anchor hops and one pump, so this is generous rather than
+ * tuned. It bounds the wait for a message IN FLIGHT and nothing
+ * else — no other refusal is retried under it.
+ */
+const PEER_OFFER_WAIT_MS = 5_000;
+
+/** `wasm.rs`'s refusal when no verified offer is waiting yet. */
+const NO_OFFER_PREFIX = 'no verified offer from';
+
 /** {@link connect}'s argument. */
 export interface ConnectOptions extends WasmSource {
   /** The bootstrap credential, base64. */
@@ -252,6 +358,183 @@ export class BrowserNode {
   }
 
   /**
+   * Connect **directly** to another browser node — plan §9, from a
+   * page.
+   *
+   * The whole sequence, driven here so a page does not have to:
+   * bring up the relayed session through the anchor if there is not
+   * one, offer, trickle candidates both ways as signed envelopes,
+   * and run the Noise handshake over the DataChannel that results.
+   * The direct session then **replaces** the relayed one rather than
+   * joining it (§9 step 4), through the node's own session-table
+   * fence.
+   *
+   * `nodeIdHex` is the peer's mesh id, 16 lowercase hex digits — the
+   * `nodeId` a {@link BrowserNode.query} descriptor carries, or
+   * {@link BrowserNode.nodeIdHex} on the other tab.
+   *
+   * **Nothing else is passed, and nothing else can be.** No SDP, no
+   * candidate, no key: the peer's Noise static comes from its
+   * signature-verified announcement and the pre-shared key from the
+   * credential this node connected with. A page that could supply a
+   * key could supply any key.
+   *
+   * Returns a {@link PeerConnectOutcome}. It **rejects** only for
+   * something that is not a disposition of the attempt — a closed
+   * node, a peer that answered `Reject`, a malformed peer id.
+   */
+  async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    const peer = nodeIdHex;
+    let dialog: string;
+    try {
+      dialog = await this.inner.peer_offer(peer);
+    } catch (thrown) {
+      const error = fromWasmError(thrown);
+      if (error.message.includes(NO_ANNOUNCEMENT_PREFIX)) {
+        return { type: 'noAnnouncement', peer, detail: error.message };
+      }
+      throw error;
+    }
+
+    const gathered = await this.driveAttempt(peer, dialog, (status) => status.state === 'open');
+    if (gathered.type !== 'direct') return gathered;
+    return this.handshakePeer(peer, dialog);
+  }
+
+  /**
+   * Run the offerer's Noise handshake on an attempt whose
+   * DataChannel is already open, and type the result the way
+   * {@link BrowserNode.connectPeer} types it.
+   *
+   * `connectPeer` is the drive loop plus exactly this call, so there
+   * is one classifier and not two. It is public because the four
+   * `#[wasm_bindgen]` methods are a page surface in their own right:
+   * a page that drove `peer_offer`, `peer_accept_offer` and
+   * `peer_candidate` itself — because it wanted to observe or
+   * intervene between them — would otherwise have to re-derive the
+   * typing of the last step, and a second classifier is a second
+   * set of bugs.
+   *
+   * `dialog` is the id `peer_offer` returned. It is carried rather
+   * than re-read so that a handshake whose attempt was replaced
+   * underneath it reports `superseded` naming the dialog the caller
+   * still believed it held.
+   */
+  async handshakePeer(nodeIdHex: string, dialog: string): Promise<PeerConnectOutcome> {
+    const peer = nodeIdHex;
+    try {
+      await this.inner.peer_handshake(peer);
+    } catch (thrown) {
+      const error = fromWasmError(thrown);
+      if (error.message.includes(NO_LIVE_ATTEMPT_PREFIX)) {
+        return { type: 'superseded', peer, dialog, liveDialog: null };
+      }
+      return { type: 'handshakeFailed', peer, dialog, detail: error.message };
+    }
+    return { type: 'direct', peer, dialog };
+  }
+
+  /**
+   * Accept the offer `nodeIdHex` sent, and drive the attempt to a
+   * direct session — {@link BrowserNode.connectPeer}'s counterpart.
+   *
+   * Call it when a `signal` event arrives from that peer: the offer
+   * it answers is the **verified envelope** the leaf already holds,
+   * so the page neither sees nor supplies the SDP.
+   *
+   * The answerer does not run the handshake — §9 step 4 puts Noise
+   * in the offerer's role, so this waits for the direct session to
+   * install from the inbound message instead. Same
+   * {@link PeerConnectOutcome}, same meanings.
+   */
+  async acceptPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    const peer = nodeIdHex;
+    // **The offer may still be in flight.** It crosses
+    // A → anchor → B as a signed `0x0D02` frame on the relayed
+    // session, and this leaf files it when it next pumps, so a page
+    // that reacts to "the peer is here" a moment before the envelope
+    // lands would otherwise be told there is no offer — which is
+    // true, and not an answer. So the accept is retried until the
+    // envelope arrives or {@link PEER_OFFER_WAIT_MS} elapses; a
+    // message in flight is not a refusal. Every OTHER refusal —
+    // an undiscovered peer, a closed node — is returned or thrown at
+    // once, because retrying those would only hide them.
+    let dialog: string | null = null;
+    const until = Date.now() + PEER_OFFER_WAIT_MS;
+    for (;;) {
+      try {
+        dialog = await this.inner.peer_accept_offer(peer);
+        break;
+      } catch (thrown) {
+        const error = fromWasmError(thrown);
+        if (error.message.includes(NO_ANNOUNCEMENT_PREFIX)) {
+          return { type: 'noAnnouncement', peer, detail: error.message };
+        }
+        if (!error.message.includes(NO_OFFER_PREFIX) || Date.now() >= until) {
+          throw error;
+        }
+        const tick = Promise.withResolvers<void>();
+        setTimeout(tick.resolve, PEER_TICK_MS);
+        await tick.promise;
+      }
+    }
+    return this.driveAttempt(peer, dialog, (status) => status.direct);
+  }
+
+  /**
+   * Read one `peer_candidate` status for a live attempt.
+   *
+   * Exposed because it is the only way to observe an attempt without
+   * driving it to a conclusion — which is what a witness asserting
+   * the shape of the exchange needs, and what a page showing
+   * connection progress wants.
+   */
+  async peerAttempt(nodeIdHex: string): Promise<PeerAttemptStatus> {
+    try {
+      return parseAttemptStatus(await this.inner.peer_candidate(nodeIdHex));
+    } catch (error) {
+      throw fromWasmError(error);
+    }
+  }
+
+  /**
+   * Pump one attempt until `done`, its deadline, or a newer attempt
+   * replaces it.
+   *
+   * `{ type: 'direct' }` here means only "`done` answered true" — the
+   * caller decides what remains. Both drive loops share it so the
+   * offerer and the answerer cannot disagree about what supersession
+   * or a deadline looks like.
+   */
+  private async driveAttempt(
+    peer: string,
+    dialog: string,
+    done: (status: PeerAttemptStatus) => boolean,
+  ): Promise<PeerConnectOutcome> {
+    for (;;) {
+      let status: PeerAttemptStatus;
+      try {
+        status = parseAttemptStatus(await this.inner.peer_candidate(peer));
+      } catch (thrown) {
+        const error = fromWasmError(thrown);
+        if (error.message.includes(NO_LIVE_ATTEMPT_PREFIX)) {
+          return { type: 'superseded', peer, dialog, liveDialog: null };
+        }
+        throw error;
+      }
+      if (status.dialog !== dialog) {
+        return { type: 'superseded', peer, dialog, liveDialog: status.dialog };
+      }
+      if (done(status)) return { type: 'direct', peer, dialog };
+      if (status.state === 'iceTimeout') return { type: 'iceTimeout', peer, dialog };
+      if (status.state === 'udpBlocked') return { type: 'udpBlocked', peer, dialog };
+      const tick = Promise.withResolvers<void>();
+      setTimeout(tick.resolve, PEER_TICK_MS);
+      await tick.promise;
+    }
+  }
+
+  /**
    * Every leaf counter, including each drop reason. Values are exact
    * decimal strings because they are `u64` on the Rust side.
    */
@@ -402,6 +685,44 @@ export function parseCounters(json: string): Record<string, string> {
     out[key] = typeof value === 'string' ? value : String(value);
   }
   return out;
+}
+
+/**
+ * Parse one `peer_candidate` reading.
+ *
+ * `remainingMs` stays a string for the reason every other `u64` on
+ * this boundary does, and `state` is validated rather than cast: an
+ * unrecognised state would otherwise fall through both the
+ * `iceTimeout` and the `open` arm of a drive loop and spin until the
+ * leaf's own deadline, which is the slowest possible way to report a
+ * boundary that changed shape.
+ *
+ * Exported for the unit tests, which drive it with fixed payloads.
+ */
+export function parseAttemptStatus(json: string): PeerAttemptStatus {
+  const parsed: unknown = JSON.parse(json);
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new TypeError(`peer_candidate did not answer an object: ${json}`);
+  }
+  const raw = parsed as Record<string, unknown>;
+  const state = raw.state;
+  if (
+    state !== 'gathering' &&
+    state !== 'open' &&
+    state !== 'iceTimeout' &&
+    state !== 'udpBlocked'
+  ) {
+    throw new TypeError(`peer_candidate answered an unknown state: ${String(state)}`);
+  }
+  return {
+    dialog: String(raw.dialog ?? ''),
+    state,
+    sent: Number(raw.sent ?? 0),
+    applied: Number(raw.applied ?? 0),
+    answered: raw.answered === true,
+    direct: raw.direct === true,
+    remainingMs: String(raw.remainingMs ?? '0'),
+  };
 }
 
 /** What {@link refineIceFailure} is allowed to know. */

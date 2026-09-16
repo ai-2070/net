@@ -25,6 +25,7 @@
 //! CI floor exists precisely to make that impossible.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -389,6 +390,95 @@ pub enum Step5 {
         id: u64,
         session: String,
     },
+    // ── Stage 6, §9: browser ↔ browser from a page ──
+    //
+    // Two families, deliberately both: `PeerConnect`/`PeerAccept`
+    // drive `@net-mesh/browser`'s page-facing loop, and
+    // `PeerOffer`/`PeerAcceptOffer`/`PeerCandidate`/`PeerHandshake`
+    // drive the four `#[wasm_bindgen]` methods one at a time. The
+    // fine-grained family is what lets a witness put a failure
+    // BETWEEN two steps — which is the only way some of the typed
+    // failures are reachable at all.
+    /// `node.connectPeer(peer)` — the offerer's whole loop.
+    PeerConnect {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// `node.acceptPeer(peer)` — the answerer's whole loop.
+    PeerAccept {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// `node.peerAttempt(peer)` — one service of a live attempt,
+    /// without driving it to a conclusion.
+    PeerAttempt {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// The raw `peer_offer`.
+    PeerOffer {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// The raw `peer_accept_offer`.
+    PeerAcceptOffer {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// The raw `peer_candidate`.
+    PeerCandidate {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// The raw `peer_handshake`.
+    PeerHandshake {
+        id: u64,
+        session: String,
+        peer_hex: String,
+    },
+    /// `node.handshakePeer(peer, dialog)` — `connectPeer`'s last
+    /// step, with `connectPeer`'s typing, on an attempt the runner
+    /// drove through the raw methods itself.
+    ///
+    /// The only way a witness can reach the `handshakeFailed`
+    /// disposition without racing: `connectPeer` decides to hand
+    /// shake the moment its own poll reads `open`, so a peer that
+    /// has to be gone by then cannot be taken away in time. Driving
+    /// the four methods to an open channel, closing the peer, and
+    /// then asking for the handshake puts the failure where the
+    /// runner chooses rather than where the scheduler lands.
+    PeerHandshakeTyped {
+        id: u64,
+        session: String,
+        peer_hex: String,
+        dialog: String,
+    },
+    /// The declared parameter count of each of the four methods.
+    ///
+    /// An assertion, not a step: `peer_handshake` taking a peer id
+    /// and NOTHING else is the security property of the slice, and
+    /// an arity read off the live boundary is the only way to observe
+    /// from outside that there is no parameter a key could arrive
+    /// through.
+    PeerArity {
+        id: u64,
+        session: String,
+    },
+    /// Every leaf counter, with no attempt required.
+    ///
+    /// Separate from `PeerAttempt` because that one refuses a peer it
+    /// has no live attempt with — correctly — and a ledger read must
+    /// not depend on an attempt being live at the moment it is taken.
+    PeerCounters {
+        id: u64,
+        session: String,
+    },
     Close {
         id: u64,
         session: String,
@@ -417,6 +507,16 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::PeerConnect { id, .. }
+            | Self::PeerAccept { id, .. }
+            | Self::PeerAttempt { id, .. }
+            | Self::PeerOffer { id, .. }
+            | Self::PeerAcceptOffer { id, .. }
+            | Self::PeerCandidate { id, .. }
+            | Self::PeerHandshake { id, .. }
+            | Self::PeerHandshakeTyped { id, .. }
+            | Self::PeerArity { id, .. }
+            | Self::PeerCounters { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => id,
         }
@@ -440,6 +540,16 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::PeerConnect { id, .. }
+            | Self::PeerAccept { id, .. }
+            | Self::PeerAttempt { id, .. }
+            | Self::PeerOffer { id, .. }
+            | Self::PeerAcceptOffer { id, .. }
+            | Self::PeerCandidate { id, .. }
+            | Self::PeerHandshake { id, .. }
+            | Self::PeerHandshakeTyped { id, .. }
+            | Self::PeerArity { id, .. }
+            | Self::PeerCounters { id, .. }
             | Self::Close { id, .. }
             | Self::Done { id } => *id,
         }
@@ -538,27 +648,77 @@ fn sender_ledger(anchor: &MeshNode, node_id: u64, stream_id: u64) -> String {
     )
 }
 
-struct Script5 {
+pub struct Script5 {
     tabs: HashMap<String, Step5Sender>,
     next_id: u64,
 }
 
 impl Script5 {
-    async fn run(&mut self, tab: &str, mut step: Step5) -> StepResult {
+    /// A script over `tabs`, numbering its steps from `id_base`.
+    ///
+    /// The base matters: every script in this runner posts its
+    /// results to one `/harness/result` keyed by step id, so two
+    /// scripts sharing a range would resolve each other's steps.
+    pub fn new(tabs: HashMap<String, Step5Sender>, id_base: u64) -> Self {
+        Self {
+            tabs,
+            next_id: id_base,
+        }
+    }
+
+    pub async fn run(&mut self, tab: &str, step: Step5) -> StepResult {
+        self.spawn(tab, step).await
+    }
+
+    /// Put a step **in flight now** and hand back a future that
+    /// resolves to its result.
+    ///
+    /// What makes two tabs drivable at once. A browser ↔ browser
+    /// attempt needs it: the answerer's loop blocks until an offer
+    /// arrives, so an offerer that could only be started after the
+    /// answerer's step had RETURNED would spend its whole ICE
+    /// deadline before the answerer was asked anything.
+    ///
+    /// **The dispatch is spawned onto the runtime, not merely
+    /// described.** A Rust future does nothing until something polls
+    /// it, so returning the `async move` block alone left the step
+    /// unsent until the caller awaited it — which for the Stage 6
+    /// page-facing witness meant awaiting it *after* the offerer's
+    /// `connectPeer` had returned. The answerer's `acceptPeer` then
+    /// entered 10 042 ms after the offerer, one full
+    /// `PEER_ICE_DEADLINE_MS` late, and both halves reported
+    /// `iceTimeout` while the identical sequence driven one call at
+    /// a time by the runner was green. A method named `spawn` that
+    /// only builds a future is a lie the type system does not catch,
+    /// so it spawns.
+    pub fn spawn(
+        &mut self,
+        tab: &str,
+        mut step: Step5,
+    ) -> impl Future<Output = StepResult> + 'static {
         let id = self.next_id;
         self.next_id += 1;
         *step.id_mut() = id;
-        let Some(tx) = self.tabs.get(tab) else {
-            return fail(format!("no Stage 5 tab named {tab}"));
-        };
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if tx.send((step, reply_tx)).await.is_err() {
-            return fail("the Stage 5 page server is gone");
-        }
-        match tokio::time::timeout(Duration::from_secs(180), reply_rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => fail("the Stage 5 step was dropped"),
-            Err(_) => fail("the Stage 5 page did not answer this step in 180 s"),
+        let tab = tab.to_string();
+        let tx = self.tabs.get(&tab).cloned();
+        let dispatch = tokio::spawn(async move {
+            let Some(tx) = tx else {
+                return fail(format!("no page tab named {tab}"));
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send((step, reply_tx)).await.is_err() {
+                return fail("the page server is gone");
+            }
+            match tokio::time::timeout(Duration::from_secs(180), reply_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => fail("the step was dropped"),
+                Err(_) => fail("the page did not answer this step in 180 s"),
+            }
+        });
+        async move {
+            dispatch
+                .await
+                .unwrap_or_else(|e| fail(format!("the step dispatch task failed: {e}")))
         }
     }
 }
@@ -837,10 +997,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         )
         .map_err(|e| format!("serve {PARK_SERVICE}: {e}"))?;
 
-    let mut script = Script5 {
-        tabs: cx.tabs.clone(),
-        next_id: STEP5_ID_BASE,
-    };
+    let mut script = Script5::new(cx.tabs.clone(), STEP5_ID_BASE);
 
     // Tab `a` carries every single-tab witness.
     let url_a = format!("{}/leaf5.html?tab=a", cx.page_origin);

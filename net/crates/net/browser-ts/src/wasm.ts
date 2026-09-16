@@ -162,6 +162,41 @@ export interface LeafWasmNode {
    * control plane — no session with `peer` needed.
    */
   signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void>;
+  /**
+   * Offer a direct browser ↔ browser connection to `peer` (plan §9
+   * steps 2–3). Resolves to the dialog id, 16 lowercase hex digits.
+   *
+   * Takes a peer id. The SDP is created, signed and sent inside the
+   * leaf; the relayed session it rides comes up first if it is not
+   * already there.
+   */
+  peer_offer(peer_hex: string): Promise<string>;
+  /**
+   * Answer the offer `peer` sent, from the **verified envelope** that
+   * arrived — not from anything the caller supplies. Resolves to the
+   * dialog id the offerer minted.
+   */
+  peer_accept_offer(peer_hex: string): Promise<string>;
+  /**
+   * Service `peer`'s attempt once: apply its answer, trickle local
+   * candidates as signed envelopes, apply the ones it sent, and
+   * evaluate the ICE deadline.
+   *
+   * Resolves to JSON: `{"dialog","state","sent","applied","answered",
+   * "remainingMs"}` where `state` is `gathering | open | iceTimeout |
+   * udpBlocked`. `dialog` is the attempt CURRENTLY live for the peer,
+   * so a caller whose dialog id no longer matches was superseded.
+   */
+  peer_candidate(peer_hex: string): Promise<string>;
+  /**
+   * Run the Noise handshake with `peer` over the direct DataChannel
+   * (§9 step 4), in the offerer's role.
+   *
+   * **A peer id and nothing else.** A page that could supply a Noise
+   * key could supply any key, so the peer's static key comes from its
+   * signature-verified announcement and the PSK from the credential.
+   */
+  peer_handshake(peer_hex: string): Promise<void>;
   /** Every counter as JSON; `u64`s are decimal strings. */
   counters_json(): string;
   /** One JSON-string event per call. Registered once per node. */
