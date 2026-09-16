@@ -28,7 +28,7 @@
 // database inside its own launch profile. Verification stays on.
 
 import { chromium, firefox } from 'playwright-core';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -71,7 +71,7 @@ function seedFirefoxProfile(profileDir, caPemPath) {
   return `certutil -d sql:${profileDir}`;
 }
 
-function chromiumArgs(spkiPin, logPath) {
+function chromiumArgs(spkiPin) {
   return [
     // The netns rows run as root (netns + nft need it), and Chromium
     // refuses its sandbox as root. This is a throwaway browser in a
@@ -92,11 +92,10 @@ function chromiumArgs(spkiPin, logPath) {
     // and the reason is worth keeping: these rows launch Playwright's
     // headless-SHELL build, which ignores `--vmodule`, and
     // `--enable-logging=stderr` goes to a pipe Playwright swallows.
-    // The combination that works is the FULL chromium build (channel
-    // `chromium`) plus `--enable-logging` (no `=stderr`) and an
-    // absolute `--log-file` under the profile, read after close.
-    '--enable-logging',
-    `--log-file=${logPath}`,
+    // `=stderr`, and WE own the process now, so nothing swallows it.
+    // `--log-file` was the wrong target: child processes inherit
+    // stderr, not the parent's log file, and ICE runs in a child.
+    '--enable-logging=stderr',
     // `--v=1`, not `--v=0` with a `--vmodule` list. The previous
     // combination produced only `services/network/p2p/socket_udp.cc`
     // lines — the BROWSER-process socket layer — because libwebrtc's
@@ -134,42 +133,72 @@ async function opLaunch(req) {
     });
     live = { engine: req.engine, context, browser: null, persistent: true };
   } else {
-    const iceLog = path.join(req.profileDir, 'chrome_debug.log');
+    // SPAWNED BY US, then attached over CDP.
+    //
+    // `--log-file` does not reach the renderer: Chromium's child
+    // processes inherit stderr, not the parent's log file, and ICE
+    // runs in the renderer. Thirteen thousand lines of
+    // `chrome_debug.log` from one run were all the BROWSER process,
+    // with nothing from `connection`, `stun_request` or
+    // `p2p_transport_channel` even after the `--vmodule` names were
+    // corrected. Playwright's own `launch()` swallows that stderr, so
+    // the only way to read it is to own the process: spawn the
+    // executable, keep its stderr, and attach with
+    // `connectOverCDP`.
+    //
+    // The browser still runs in THIS namespace, which is the whole
+    // point of a driver per namespace — this replaces how the process
+    // is started, not where.
     fs.mkdirSync(req.profileDir, { recursive: true });
-    // HEADED when a display exists, headless otherwise.
-    //
-    // The Chromium NAT rows are the reason. Every anchor-side
-    // boundary passes for them — the check is claimed by the right
-    // live session, str0m accepts it, a response is generated, the
-    // send succeeds, and a capture inside the browser's own namespace
-    // shows it arrive, transaction-matched and integrity-valid — and
-    // the engine still credits no response. The first failed boundary
-    // is inside the browser, and headless Chromium's network service
-    // emitted only `socket_udp.cc` lines under `--vmodule`: the
-    // `p2p/base` code that records WHY a response was discarded never
-    // logged. A headed browser runs the full renderer path with the
-    // same log file, and `chrome://webrtc-internals` exists to be
-    // read.
-    //
-    // Headless stays the default so nothing changes for a host with
-    // no X server; CI provides one.
-    const headed = !!process.env.DISPLAY;
-    const browser = await engine.launch({
-      // The FULL build, not the headless shell: the shell ignores
-      // `--vmodule`, which is the whole point of launching it here.
-      channel: 'chromium',
-      headless: !headed,
-      chromiumSandbox: false,
-      args: chromiumArgs(req.spkiPin, iceLog),
+    const headed = __omp_shell("!process.env.DISPLAY;")
+    const exe = chromium.executablePath();
+    const args = [
+      ...chromiumArgs(req.spkiPin),
+      '--remote-debugging-port=0',
+      `--user-data-dir=${path.join(req.profileDir, 'cdp-profile')}`,
+      ...(headed ? [] : ['--headless=new']),
+      'about:blank',
+    ];
+    const child = spawn(exe, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let wsEndpoint = null;
+    const ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('no DevTools endpoint within 60s')),
+        60_000,
+      );
+      let buffered = '';
+      child.stderr.on('data', (chunk) => {
+        const text = String(chunk);
+        if (!wsEndpoint) {
+          buffered += text;
+          const m = buffered.match(/DevTools listening on (ws:\/\/\S+)/);
+          if (m) {
+            wsEndpoint = m[1];
+            clearTimeout(timer);
+            resolve(wsEndpoint);
+          }
+        }
+        // Only the ICE accounting, not thirteen thousand lines of
+        // dbus and histograms: the log is evidence, and evidence
+        // nobody can find is not evidence.
+        for (const line of text.split('\n')) {
+          if (/connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc/.test(line)) {
+            log(`[chromium-ice] ${line.trim()}`);
+          }
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', (code) =>
+        reject(new Error(`chromium exited with ${code} before DevTools`)),
+      );
     });
-    log(`chromium ${headed ? 'HEADED' : 'headless'}, ice log: ${iceLog}`);
-    const context = await browser.newContext();
+    await ready;
+    log(`chromium ${headed ? 'HEADED' : 'headless'} pid ${child.pid}, cdp ${wsEndpoint}`);
+    const browser = await chromium.connectOverCDP(wsEndpoint);
+    const context = browser.contexts()[0] || (await browser.newContext());
     // Opened NOW, not at shutdown. `chrome://webrtc-internals` only
     // records peer connections that exist while it is open, and the
-    // leaf closes its connection the moment `connect` gives up — so
-    // the first version of this dump caught the event list and an
-    // EMPTY candidate grid, which is the one part worth having. The
-    // tab lives for the row and is read before the browser closes.
+    // leaf closes its connection the moment `connect` gives up.
     try {
       internals = await context.newPage();
       await internals.goto('chrome://webrtc-internals', {
@@ -180,7 +209,7 @@ async function opLaunch(req) {
       internals = null;
       log(`webrtc-internals open: ${e && e.message}`);
     }
-    live = { engine: req.engine, context, browser, persistent: false };
+    live = { engine: req.engine, context, browser, persistent: false, child };
     trust = 'spki-pin';
   }
   return { engine: req.engine, trust };
@@ -227,6 +256,9 @@ async function opShutdown() {
   try {
     if (live && live.persistent) await live.context.close();
     else if (live && live.browser) await live.browser.close();
+    // `connectOverCDP` detaches rather than terminating, so the
+    // process we spawned is ours to end.
+    if (live && live.child && live.child.exitCode === null) live.child.kill('SIGTERM');
   } catch (e) {
     log(`shutdown: ${e && e.message}`);
   }
