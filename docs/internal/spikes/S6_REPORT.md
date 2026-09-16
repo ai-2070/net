@@ -85,6 +85,31 @@ the **path**, not about a new session.
 carries a nonce the receiver names and echoes. This is not ceremony:
 it is what caught §7.1, which a counting assertion would have passed.
 
+### 3.1 The same property, behind two real NATs
+
+The §10 witness runs on loopback. The natsim matrix runs it behind
+simulated NATs in Linux network namespaces, and the cone-ar × cone-ar
+row is **green on Firefox**:
+
+```
+[runner] a discovered ["9684434118755589433"] for natsim.matrix.peer
+[runner] connectPeer settled as "direct" in 269 ms; acceptPeer as "direct"
+[runner] anchor ice attempted=2 direct=2 relayed=0 failed=0 pending=0
+[runner] row browser_cone_cone_firefox landed direct, as expected
+nat_flow.json: {"a":{"udp_flows":1,"udp_replied":1},"b":{"udp_flows":1,"udp_replied":1}}
+```
+
+Two headless browsers, in separate namespaces, behind two separate
+address-restricted NATs, punched a direct DataChannel — and the
+**gateways' own conntrack** is the witness for it. That last line
+matters more than the endpoints' agreement: a `[UNREPLIED]`-free UDP
+flow on both gateways is the NAT saying packets crossed between the
+two public addresses in both directions, and neither endpoint was
+asked. It is the one party to the session with no stake in the
+answer.
+
+The six Chromium rows do not pass; §6.12 is the evidenced gap.
+
 ---
 
 ## 4. One network change, one re-attempt
@@ -354,6 +379,79 @@ the bootstrap listener lives in `net_sdk`, which the harness's
 `RUST_LOG` filter did not include, so the anchor's entire dialog view
 — offer accepted, trickle socket authorized, every typed refusal —
 was simply absent.
+
+### 6.12 The Chromium NAT rows: an open gap, with every boundary but one measured
+
+**Not closed.** Six of the seven natsim browser rows — every Chromium
+one — fail at the browser↔anchor bootstrap. The Firefox control on
+the same anchor, same topology and same run passes end to end. What
+follows is what is *established*, because four plausible explanations
+died here and each cost a cycle.
+
+From a `tcpdump` inside tab b's own network namespace, on the exact
+socket its own `getStats` names (`host/udp :47252 -> 10.99.0.10:7100`,
+reporting `sent=192 gotResponse=0 recvd=0`):
+
+| Measurement | Value |
+|---|---|
+| Binding Requests out | 197 |
+| Binding Responses in, from `10.99.0.10:7100` | **197** |
+| Response transaction IDs matching an outstanding request | **197 / 197** |
+| `MESSAGE-INTEGRITY` valid against str0m's answer password | **193 / 193** |
+| `FINGERPRINT` CRC correct | **193 / 193**, zero bad |
+| Non-STUN packets (i.e. DTLS ever starting) | **0** |
+
+The remaining four responses are the bare gathering responses, as
+designed. The Firefox control's same capture: 6 requests, 4
+responses, and **71 non-STUN packets** — it validates a pair almost
+immediately and proceeds to DTLS.
+
+So: **valid, symmetric, integrity-correct, transaction-matched
+responses arrive in Chromium's own namespace and its ICE agent does
+not accept them.**
+
+Killed by evidence, in order, and none of them should be reopened:
+
+- *The gateway or NAT setup* — packets cross both ways; conntrack
+  shows the flow; the srflx is gathered on every row and engine.
+- *str0m rejecting Chromium's candidate attributes* — proven offline
+  against str0m 0.23.1: the srflx line parses with `generation 0 …
+  network-cost 999`; only the mDNS `.local` address fails.
+- *The anchor being deaf* — it creates a peer-reflexive candidate
+  FROM Chromium's check, nominates, and reports `Completed`.
+- *The egress being refused* — with the discarded `send_to` result
+  now logged: zero failures, and zero ICE checks unclaimed by a
+  session.
+- *`addIceCandidate` refusing anything* — with the swallowed error now
+  surfaced: `candidateErrors: []` on every failing row.
+- *Answer/candidate ordering* — fixed anyway on its own merits, and
+  not the cause here.
+
+The next step is a byte-level diff of the responses str0m sends to
+each engine, not another CI cycle. The `.pcap` files are in the run's
+`natsim-state` artifact, three per row.
+
+**What this gap does NOT cast doubt on**: the browser matrix (41
+witnesses, both engines, green), the demo (4 rows, green), and the
+Firefox NAT row — which is the stage's headline and is described in
+§3.1.
+
+### 6.13 Two more log lines that asserted more than their code knew
+
+`no such dialog on this anchor` renders `SignalOutcome::Ignored`,
+which collapses a missing dialog AND any driver error into one
+string. The registration-race reading it invited is therefore a
+hypothesis, not a finding, and is recorded as such. Separately,
+`add_remote_candidate` returns `()`: "our wrapper reported success"
+cannot distinguish acceptance from the ICE agent's silent rejection,
+so a claim that a candidate was *applied* was never established by
+any run — only that the code called an API.
+
+Both were caught by the reviewer, after both the implementer and the
+harness lane had reasoned from them. The lane's own summary is the
+one worth keeping: *"the same defect class I flagged on the original
+line, and I walked into it one layer down — a string that names one
+cause for an outcome that has several."*
 
 ---
 
