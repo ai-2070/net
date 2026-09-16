@@ -841,8 +841,11 @@ mod tests {
 
         // Default-port spellings of one endpoint compare equal in
         // both directions.
-        assert!(check_ice_servers_against_peer(["stun:anchor.example"], Some("anchor.example:3478"))
-            .is_err());
+        assert!(check_ice_servers_against_peer(
+            ["stun:anchor.example"],
+            Some("anchor.example:3478")
+        )
+        .is_err());
         assert!(check_ice_servers_against_peer(
             ["stun:anchor.example:3478"],
             Some("anchor.example")
@@ -850,18 +853,15 @@ mod tests {
         .is_err());
         // An unbracketed IPv6 peer and a bracketed URL are one
         // endpoint.
-        assert!(check_ice_servers_against_peer(
-            ["stun:[2001:db8::1]:3478"],
-            Some("2001:db8::1")
-        )
-        .is_err());
+        assert!(
+            check_ice_servers_against_peer(["stun:[2001:db8::1]:3478"], Some("2001:db8::1"))
+                .is_err()
+        );
         // A tolerated query component cannot smuggle the peer past
         // the comparison.
-        assert!(check_ice_servers_against_peer(
-            ["stun:198.51.100.7:4433?transport=udp"],
-            peer
-        )
-        .is_err());
+        assert!(
+            check_ice_servers_against_peer(["stun:198.51.100.7:4433?transport=udp"], peer).is_err()
+        );
     }
 
     /// What must NOT be refused — the check is connection-specific

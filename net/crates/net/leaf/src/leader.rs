@@ -2019,15 +2019,9 @@ fn encode_error(error: &LeafError) -> Value {
             entry,
             peer_rtc_addr,
         } => {
-            map.insert(
-                "kind".into(),
-                Value::from("ice_server_conflicts_with_peer"),
-            );
+            map.insert("kind".into(), Value::from("ice_server_conflicts_with_peer"));
             map.insert("entry".into(), Value::from(entry.clone()));
-            map.insert(
-                "peer_rtc_addr".into(),
-                Value::from(peer_rtc_addr.clone()),
-            );
+            map.insert("peer_rtc_addr".into(), Value::from(peer_rtc_addr.clone()));
         }
         LeafError::NotLeader { presented, current } => {
             map.insert("kind".into(), Value::from("not_leader"));
