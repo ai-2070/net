@@ -290,14 +290,22 @@ jobs:
           echo "=== did anything, and its own output was never shown."
           tail -n 80 /tmp/diag_wan_wan.log || true
 
-      # The engine's ICE accounting, into the JOB log.
+      # The engine's enumeration and ICE accounting, into the JOB log.
       #
-      # It reaches `runner.log` inside a state dir, and the last run
+      # It reaches `runner.log` inside a state dir, and one run
       # uploaded NO artifact at all: the browser profile the driver now
       # owns contains unix sockets, which `upload-artifact` refuses. So
-      # the one measurement this cycle exists for was unreadable for a
+      # the one measurement a cycle existed for was unreadable for a
       # reason that had nothing to do with it. Printed here as well,
       # where nothing can swallow it.
+      #
+      # `grep -m`, NOT `grep | head`: this step runs under `bash -e`
+      # with `pipefail`, so `head` closing the pipe made `grep` die of
+      # SIGPIPE and took the STEP with it — run 35138824048 printed
+      # row one's lines, `grep: write error: Broken pipe`, and then
+      # `exit code 2`, with the other five rows' logs never opened.
+      # Two sessions read that partial output as if it were the whole
+      # matrix. `-m` is grep's own limit and closes no pipe.
       - name: Chromium's ICE accounting
         if: ${{ failure() }}
         run: |
@@ -308,7 +316,7 @@ jobs:
             if grep -aq 'chromium-ice' "$log"; then
               found=1
               echo "=== $log"
-              grep -a 'chromium-ice' "$log" | head -200
+              grep -a -m 120 'chromium-ice' "$log"
             fi
           done
           [ "$found" = 1 ] || echo "no [chromium-ice] lines in any runner.log"
