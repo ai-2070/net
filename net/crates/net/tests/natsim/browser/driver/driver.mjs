@@ -70,7 +70,7 @@ function seedFirefoxProfile(profileDir, caPemPath) {
   return `certutil -d sql:${profileDir}`;
 }
 
-function chromiumArgs(spkiPin) {
+function chromiumArgs(spkiPin, logPath) {
   return [
     // The netns rows run as root (netns + nft need it), and Chromium
     // refuses its sandbox as root. This is a throwaway browser in a
@@ -95,7 +95,13 @@ function chromiumArgs(spkiPin) {
     // the ICE agent reports `gotResponse=0` and nominates nothing.
     // No observer outside the engine can say why a response was
     // discarded; this is the one that can, and it costs a log file.
-    '--enable-logging=stderr',
+    // To a FILE, not stderr: Playwright's `Browser` exposes no
+    // process handle (`browser.process` is not a function — the first
+    // version of this instrument failed to instrument), and Chromium
+    // writes `--enable-logging` output to stderr only when it has a
+    // console. `--log-file` is the one path that survives both.
+    '--enable-logging',
+    `--log-file=${logPath}`,
     '--vmodule=*/p2p/base/*=2,*stun*=2,*port*=2,*connection*=2',
   ];
 }
@@ -114,23 +120,14 @@ async function opLaunch(req) {
     });
     live = { engine: req.engine, context, browser: null, persistent: true };
   } else {
+    const iceLog = path.join(req.profileDir, 'chromium-ice.log');
+    fs.mkdirSync(req.profileDir, { recursive: true });
     const browser = await engine.launch({
       headless: true,
       chromiumSandbox: false,
-      args: chromiumArgs(req.spkiPin),
+      args: chromiumArgs(req.spkiPin, iceLog),
     });
-    // Playwright keeps the browser process's stderr to itself unless
-    // it is drained; `--enable-logging=stderr` writes there and
-    // nowhere else, so without this the flags above would be a
-    // silently-dropped instrument.
-    const proc = browser.process();
-    if (proc && proc.stderr) {
-      proc.stderr.on('data', (chunk) => {
-        for (const line of String(chunk).split('\n')) {
-          if (line.trim()) log(`[chromium] ${line}`);
-        }
-      });
-    }
+    log(`chromium ice log: ${iceLog}`);
     const context = await browser.newContext();
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
