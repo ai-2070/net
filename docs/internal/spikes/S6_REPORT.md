@@ -515,11 +515,12 @@ dropped too. **Firefox is unaffected** (nICEr has no such rule, and
 its `anchor-stun` legs form pairs — §6.12's 2×2); WebKit is untested
 here and should not be assumed either way.
 
-The plan makes that configuration the obvious one. §5 defines
-`rtc_addr` as the anchor's **"public RTC/STUN socket, UDP-only"** —
-one socket for both roles, and §6 rules out a demux, deliberately and
-for good reasons. Stage 4b's R8 repair then *proved* the announced
-address is a live STUN target
+The plan makes that configuration the obvious one. §5 (line 841)
+defines `rtc_addr` as the anchor's **"public RTC/STUN socket,
+UDP-only"** — one socket for both roles — the §7 announcement-field
+registry carries the same field, and §6 rules out a demux,
+deliberately and for good reasons. Stage 4b's R8 repair then *proved*
+the announced address is a live STUN target
 (`natsim_natted_anchor_publishes_a_reachable_rtc_addr`:
 `stun_probe_ok` / `stun_probe_target` / `stun_probe_mapped`, against
 `RtcStats::stun_binding_requests`), and `@net-mesh/browser` ships
