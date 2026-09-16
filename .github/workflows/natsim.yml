@@ -285,8 +285,10 @@ jobs:
             [ -f "$log" ] || continue
             grep -a 'PRECONDITION networks' "$log" | tail -2 || true
           done
-          echo "=== the bisect's own ICE lines"
-          grep -a 'chromium-ice' /tmp/diag_wan_wan.log | head -40 || true
+          echo "=== the bisect's own log, tail. The first run printed an EMPTY"
+          echo "=== verdict and no ICE lines — it failed before the browsers"
+          echo "=== did anything, and its own output was never shown."
+          tail -n 80 /tmp/diag_wan_wan.log || true
 
       # The engine's ICE accounting, into the JOB log.
       #
