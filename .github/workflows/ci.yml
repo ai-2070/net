@@ -4746,7 +4746,8 @@ jobs:
             --test rtc_admission \
             --test rtc_anchor_registry \
             --test rtc_proxy_boundary \
-            --test natsim_browser
+            --test natsim_browser \
+            --test rtc_stun_endpoint
           st=$?
           cp target/nextest/default/junit.xml "$RUNNER_TEMP/rtc-junit.xml"
           exit "$st"
@@ -4791,6 +4792,7 @@ jobs:
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
             --floor natsim_browser=22 \
+            --floor rtc_stun_endpoint=7 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
@@ -4800,6 +4802,10 @@ jobs:
           rtc_anchor_registry:an_announced_anchor_is_listed_with_its_addresses_and_a_plain_peer_is_not
           rtc_proxy_boundary:an_rtc_peers_routed_envelope_never_reaches_the_proxy
           rtc_proxy_boundary:a_proxy_socket_cannot_become_the_authenticated_adjacency_a_relay_needs
+          rtc_stun_endpoint:the_two_announced_endpoints_are_different_sockets
+          rtc_stun_endpoint:announcing_one_endpoint_for_both_roles_is_refused
+          rtc_stun_endpoint:binding_one_socket_for_both_roles_is_refused
+          rtc_stun_endpoint:the_rtc_socket_still_answers_its_own_probe
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
