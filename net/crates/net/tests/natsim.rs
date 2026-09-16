@@ -228,12 +228,7 @@ fn scenario(name: &str) -> ScenarioRun {
     // through sudo would silently undo the display CI starts — and a
     // headless run is exactly what could not answer the question
     // these rows are stuck on.
-    for key in [
-        "PLAYWRIGHT_BROWSERS_PATH",
-        "NATSIM_BROWSER_BIN",
-        "DISPLAY",
-        "NATSIM_NO_MDNS_OBFUSCATION",
-    ] {
+    for key in ["PLAYWRIGHT_BROWSERS_PATH", "NATSIM_BROWSER_BIN", "DISPLAY"] {
         if let Ok(value) = std::env::var(key) {
             cmd.arg(format!("{key}={value}"));
         }

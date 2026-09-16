@@ -105,27 +105,18 @@ function chromiumArgs(spkiPin, logPath) {
     // `--v=0` none of it is emitted. The discard accounting for a
     // STUN response lives exactly there.
     '--v=1',
-    // Kept narrow on top of `--v=1` so the ICE files are at the
-    // highest level while the rest of the browser stays at 1.
-    '--vmodule=*p2p*=3,*stun*=3,*connection*=3,*port*=3',
-    // EXPERIMENT, and labelled as one (S6_REPORT.md §6.12). The
-    // multicast route did NOT fix `MDNS bind failed,
-    // address_family=2, error=-4` — it recurs identically — so the
-    // mDNS reading is unproven rather than confirmed. This isolates
-    // causality instead of arguing about it: with obfuscation off,
-    // Chromium's host candidate is a real address it owns outright.
-    //
-    // If the rows go green, mDNS was causal and the real fix is a
-    // working mDNS path (or accepting srflx-only on such networks).
-    // If they stay red, mDNS is EXONERATED and the cause is
-    // elsewhere. Either way it is one cycle for a fact.
-    //
-    // Not a shipped behaviour change: production cannot turn this
-    // off, which is why it lives here behind an env switch and
-    // defaults to leaving obfuscation ON.
-    ...(process.env.NATSIM_NO_MDNS_OBFUSCATION
-      ? ['--disable-features=WebRtcHideLocalIpsWithMdns']
-      : []),
+    // MODULE names, not paths. `*/p2p/*` and `*p2p*` matched only
+    // `services/network/p2p/socket_udp.cc`, which is the
+    // browser-process socket layer; libwebrtc's own files are matched
+    // by their bare module name. These four are where the discard
+    // accounting lives — 'Received STUN binding request with bad
+    // ufrag/pwd', 'unrecognized transaction', 'Rejecting … integrity'.
+    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2',
+    // mDNS obfuscation stays ON. Turning it off was a one-cycle
+    // experiment and it EXONERATED mDNS: with a real host address
+    // Chromium failed identically (`sent=192 gotResponse=0`), so the
+    // switch is gone rather than left behind as a knob nobody should
+    // reach for.
   ];
 }
 
