@@ -95,6 +95,16 @@ struct State {
     dialog: Cell<Option<DialogId>>,
     /// The trickle socket for that dialog.
     trickle: RefCell<Option<WebSocket>>,
+    /// Frames minted before that socket finished opening.
+    ///
+    /// `WebSocket.send` THROWS while the socket is `CONNECTING`, and
+    /// the frame is then gone: the browser does not queue it and the
+    /// caller has no way to know a candidate it gathered was never
+    /// sent. On loopback the window is small enough to miss; behind a
+    /// NAT the frames lost in it are the server-reflexive candidates,
+    /// and ICE then fails with nothing naming the cause. Frames wait
+    /// here and `onopen` flushes them in order.
+    pending_flush: Rc<RefCell<Vec<String>>>,
     /// What arrived on it, waiting for `drain_events`.
     events: Rc<RefCell<VecDeque<ControlEvent>>>,
     /// The socket's handlers, kept alive for the socket's lifetime.
@@ -152,6 +162,7 @@ impl AnchorControlPlane {
                 anchor_rtc_addr: info.rtc_addr.clone(),
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
+                pending_flush: Rc::new(RefCell::new(Vec::new())),
                 events: Rc::new(RefCell::new(VecDeque::new())),
                 handlers: RefCell::new(Vec::new()),
             }),
@@ -220,6 +231,24 @@ impl AnchorControlPlane {
         }) as Box<dyn FnMut(CloseEvent)>);
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
+        // The flush. Everything minted while the socket was
+        // CONNECTING goes out here, in order, before anything else
+        // this leaf sends — a candidate delivered late is still a
+        // candidate, but a candidate dropped is an ICE failure with
+        // no cause in any log.
+        let pending = Rc::clone(&state.pending_flush);
+        let sock = socket.clone();
+        let on_open = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+            for frame in pending.borrow_mut().drain(..) {
+                // Nothing to do about a failure here that the close
+                // handler does not already report: the socket is open,
+                // so a refusal is the listener's, not a race.
+                let _ = sock.send_with_str(&frame);
+            }
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        state.handlers.borrow_mut().push(on_open.into_js_value());
+
         state.handlers.borrow_mut().push(on_message.into_js_value());
         state.handlers.borrow_mut().push(on_close.into_js_value());
         *state.trickle.borrow_mut() = Some(socket);
@@ -237,8 +266,15 @@ impl AnchorControlPlane {
         let socket = socket
             .as_ref()
             .ok_or_else(|| refused("the bootstrap dialog has no trickle socket"))?;
+        let text = frame.to_string();
+        // CONNECTING is not a failure, it is a race with the socket's
+        // own handshake. Buffer; `onopen` flushes in order.
+        if socket.ready_state() == WebSocket::CONNECTING {
+            self.state.pending_flush.borrow_mut().push(text);
+            return Ok(());
+        }
         socket
-            .send_with_str(&frame.to_string())
+            .send_with_str(&text)
             .map_err(|e| refused(&format!("the trickle socket refused a frame: {e:?}")))
     }
 }

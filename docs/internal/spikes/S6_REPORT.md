@@ -129,10 +129,11 @@ average.
 
 ## 6. Findings
 
-Six defects found by **building on** this surface rather than
-reviewing it. Four are in the product or its witnesses; two are in
-instruments that reported success without affecting the system under
-test.
+Nine defects found by **building on** this surface rather than
+reviewing it. Five are in the product or its witnesses; four are in
+instruments and toolchains that reported success without doing the
+job asked of them. Three surfaced only on CI, which is the argument
+for gating the demo rather than shipping it as a sample.
 
 ### 6.1 Cross-talk: two peer streams under one label share an id
 
@@ -247,6 +248,68 @@ announces only after its own POST resolves.
 
 *An ordering argument held with confidence, falsified by the run that
 was supposed to be a formality.*
+
+
+### 6.7 "Discovered" is one-directional; the handshake requires both
+
+The demo's four rows never ran on CI: the page offered as soon as it
+had discovered the peer, and the relayed handshake died with
+*"discoverable but not reachable through the anchor"*.
+
+The message was exactly right and everyone read it as vague.
+`node.query` reads **this** leaf's store of signature-verified
+announcements, so A discovering B proves A holds B's announcement and
+says nothing about the reverse — and a leaf answers a relayed
+handshake only from a node whose announcement it has verified, which
+is slice 1's keys-from-discovery-only property working correctly. A
+one-directional precondition on a mutual requirement.
+
+Ruled out first, with evidence rather than argument: admission is not
+the cause (`admission_refused_transit` stayed 0, admission completed
+in 1–3 ms across every failing run), and neither is §6.8 (the browser
+matrix hits it 26 times in the same CI run and goes 41/41).
+
+Reproduced deterministically 2/2 — not under CPU load, but by
+starting both pages simultaneously, which closed a startup skew the
+demo had been relying on without knowing it. 5/5 after the fix. The
+gate is now mutual discovery plus anchor-side admission, read on the
+host, which already had both pages' ids and was not using them. No
+library deadline was touched.
+
+### 6.8 A control frame sent before its socket is open is discarded
+
+`anchor_control_plane.rs:230 send_frame` calls `send_with_str`
+without checking `ready_state` and without a queue, so a frame
+emitted between `open_trickle` returning and the socket opening
+throws `InvalidStateError: Still in CONNECTING state` and is **lost**
+— not deferred. The comment above it reasons about the socket opening
+before the answer is installed; opening is asynchronous, so that is a
+race, not an ordering.
+
+Observed on every CI page load, tolerated by every row. Not fixed:
+Stage 5 surface, and nothing this stage asserts depends on it. The
+honest fix is to buffer until `onopen` and flush.
+
+### 6.9 An installer that reported success and installed the wrong thing
+
+All seven natsim browser rows died in 1.1 s with no output. The
+cause, once the evidence was reachable: `browserType.launch:
+Executable doesn't exist at …/chromium_headless_shell-1194`. The
+driver depends on `playwright-core` only, which ships no CLI, so a
+bare `npx playwright install` fetched the **latest** `playwright`
+(1.63.0) and installed **its** browser builds (v1243) while
+`playwright-core@1.56.0` looks for v1194. The step exited 0.
+
+The CLI version is now read from the driver's own `package.json`, so
+the two numbers cannot drift apart silently.
+
+Two evidence gaps were fixed to get there, and both are worth more
+than the bug: the rows exited with **empty stderr and no cause**
+(the scenario waited on a verdict file that would never be written),
+and the state dirs are root-owned so `upload-artifact` failed with
+`EACCES` — the artifact step ran and produced nothing. A conformance
+matrix that fails without naming a cause is the one failure mode it
+must not have.
 
 ---
 
