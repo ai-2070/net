@@ -42,6 +42,7 @@ let page = null;
 let internals = null;
 let wildcardPorts = 0;
 let realNetworkPorts = 0;
+const networkNames = new Set();
 
 function log(line) {
   process.stderr.write(line + '\n');
@@ -90,57 +91,47 @@ function chromiumArgs(spkiPin) {
     // anyway. Every direct pair in this matrix is reached through the
     // anchor's STUN (server-reflexive) or peer-reflexively, which is
     // exactly what the NAT flavors are being tested against.
-    // The engine's own per-check account. Two earlier attempts failed
-    // and the reason is worth keeping: these rows launch Playwright's
-    // headless-SHELL build, which ignores `--vmodule`, and
-    // `--enable-logging=stderr` goes to a pipe Playwright swallows.
-    // `=stderr`, and WE own the process now, so nothing swallows it.
-    // `--log-file` was the wrong target: child processes inherit
-    // stderr, not the parent's log file, and ICE runs in a child.
+    // The engine's own account, into stderr WE own. Two earlier
+    // attempts failed and the reason is worth keeping: these rows used
+    // to launch Playwright's headless-SHELL build, which ignores
+    // `--vmodule`, and Playwright's own `launch()` swallows the
+    // stderr; `--log-file` was the wrong target too, because child
+    // processes inherit stderr, not the parent's log file, and ICE
+    // runs in a child.
     '--enable-logging=stderr',
-    // `--v=1`, not `--v=0` with a `--vmodule` list. The previous
-    // combination produced only `services/network/p2p/socket_udp.cc`
-    // lines — the BROWSER-process socket layer — because libwebrtc's
-    // own `RTC_LOG` in the RENDERER maps onto Chrome's verbose
-    // logging rather than onto per-file `--vmodule` overrides, and at
-    // `--v=0` none of it is emitted. The discard accounting for a
-    // STUN response lives exactly there.
+    // `--v=1` and three modules, down from eighteen.
+    //
+    // Every line the [chromium-ice] print keeps is either `INFO`
+    // (libwebrtc's own `RTC_LOG`, emitted as soon as logging is on:
+    // `basic_port_allocator.cc`'s `Net[…]`, `Count of networks`,
+    // `Allocate ports on`, `port.cc`'s network cost, the gathered
+    // candidates) or `VERBOSE1` (`filtering_network_manager.cc`'s
+    // permission status, `ipc_network_manager.cc`'s network list,
+    // `socket_udp.cc`'s local address) — read off the severity tokens
+    // of run 35138824048's log. What the removed fifteen modules added
+    // was hundreds of `connection.cc` ping lines per second, which is
+    // what pushed the job-log print past its own limit.
     '--v=1',
-    // MODULE names, not paths. `*/p2p/*` and `*p2p*` matched only
-    // `services/network/p2p/socket_udp.cc`, which is the
-    // browser-process socket layer; libwebrtc's own files are matched
-    // by their bare module name. These four are where the discard
-    // accounting lives — 'Received STUN binding request with bad
-    // ufrag/pwd', 'unrecognized transaction', 'Rejecting … integrity'.
-    // `network` and `basic_port_allocator` are the enumerator: they
-    // log 'Ignoring network' with the REASON a candidate interface was
-    // rejected, which is the one thing the wildcard fallback does not
-    // explain by itself.
-    // The last cycle answered the enumerator question: there is NOT ONE
-    // 'Ignoring network' line, and the allocator logs 'Allocate ports
-    // on any any' — WebRTC was handed ZERO networks rather than
-    // networks it rejected. In Chromium the list does not come from
-    // WebRTC at all: the NETWORK SERVICE enumerates and sends it over
-    // IPC, so these are its modules.
-    '--vmodule=connection=2,port=2,stun_request=2,p2p_transport_channel=2,network=3,basic_port_allocator=2,stun_port=2,' +
-      'address_tracker_linux=3,network_change_notifier=3,network_change_notifier_linux=3,network_interfaces_linux=3,p2p_socket_manager=3,network_manager=3,ip_address=2,' +
-      // `socket_udp` is the network service's OWN reader, and it has a
-      // filter: a P2P UDP socket drops datagrams from addresses the
-      // renderer has not made known to it, logging 'Received packet
-      // from unknown address'. With a real network now enumerated and
-      // the wire showing 197 responses AND 7 peer requests arriving
-      // while Chromium answers none, this is the next boundary below
-      // ICE - and the only one left between the kernel and libwebrtc.
-      'socket_udp=3,p2p_socket=3,' +
-      // The gap that is left. The receive path is: network service
-      // `P2PSocketUdp::OnRecv` -> mojo -> renderer
-      // `P2PSocketClientImpl::OnDataReceived` ->
-      // `IpcPacketSocket::OnDataReceived` -> `SignalReadPacket` ->
-      // `UDPPort::OnReadPacket`. Everything up to and including the
-      // network service's own socket is verified: it owns the exact
-      // port the packets arrive on and logs no discard. These are the
-      // renderer-side links nobody has asked.
-      'socket_client_impl=3,ipc_socket_factory=3,ipc_network_manager=3,p2p_socket_dispatcher=3,filtering_network_manager=3,'
+    // Three entries, each named for what it feeds:
+    //
+    // `basic_port_allocator` and `port` are the PRECONDITION's own
+    // source — the `Net[…]` descriptors this driver counts and
+    // `run_row` refuses a Chromium row without. They are INFO lines
+    // and `--v=1` alone should carry them; they stay named because a
+    // precondition that silently loses its own input would fail a
+    // working row, which is worse than a wide flag.
+    //
+    // `peer_connection_dependency_factory` is a RECORD rather than a
+    // diagnosis: it logs `WebRTC routing preferences: policy: …
+    // multiple_routes: …` at VLOG(3) — the renderer's own statement of
+    // the EFFECTIVE `WebRtcIPHandling` value, at the point where it
+    // decides whether to enumerate interfaces at all. `chrome://policy`
+    // would only show a *configured* enterprise policy, and renders it
+    // inside a shadow root; this is the value that actually governs,
+    // from the line that reads it. (The neighbouring `Active
+    // WebRtcIPHandlingPolicy` line is a `DVLOG`, compiled out of a
+    // release build, which is why the level is 3 and not 1.)
+    '--vmodule=basic_port_allocator=2,port=2,peer_connection_dependency_factory=3',
     // mDNS obfuscation stays ON. Turning it off was a one-cycle
     // experiment and it EXONERATED mDNS: with a real host address
     // Chromium failed identically (`sent=192 gotResponse=0`), so the
@@ -213,12 +204,12 @@ async function opLaunch(req) {
             resolve(wsEndpoint);
           }
         }
-        // Only the ICE accounting, not thirteen thousand lines of
-        // dbus and histograms: the log is evidence, and evidence
-        // nobody can find is not evidence.
+        // Only the enumeration and ICE accounting, not thirteen
+        // thousand lines of dbus and histograms: the log is evidence,
+        // and evidence nobody can find is not evidence.
         for (const line of text.split('\n')) {
           if (
-            /connection\.cc|stun_request\.cc|port\.cc|p2p_transport_channel\.cc|stun\.cc|network\.cc|basic_port_allocator\.cc|address_tracker_linux\.cc|network_change_notifier|network_interfaces|p2p_socket_manager\.cc|network_manager\.cc|socket_udp\.cc|p2p_socket\.cc|socket_client_impl\.cc|ipc_socket_factory\.cc|ipc_network_manager\.cc|p2p_socket_dispatcher\.cc/.test(
+            /basic_port_allocator\.cc|port\.cc|p2p_transport_channel\.cc|filtering_network_manager\.cc|ipc_network_manager\.cc|peer_connection_dependency_factory\.cc|socket_udp\.cc/.test(
               line,
             )
           ) {
@@ -231,19 +222,21 @@ async function opLaunch(req) {
           if (/Net\[/.test(line)) {
             if (/Wildcard/.test(line)) wildcardPorts += 1;
             else realNetworkPorts += 1;
+            // The descriptor itself, deduplicated, so the row's
+            // precondition failure can name the interface the engine
+            // did or did not enumerate instead of only counting.
+            const m = /Net\[([^\]]*)\]/.exec(line);
+            if (m) networkNames.add(m[1]);
           }
         }
         // THE PRECONDITION, pinned so it cannot regress silently.
         //
-        // A Port on `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999
-        // means `BasicNetworkManager` enumerated ZERO networks and
-        // fell back to wildcard ports — and a wildcard port drops
-        // every inbound packet before STUN parsing, which is exactly
-        // how §6.12 presented: valid, correctly credentialed packets
-        // on the wire, no request answered and no response credited.
-        // A real network (`Net[eth0:…:Ethernet:id=1]`, cost 10/50) is
-        // what makes the Chromium rows able to work at all, so it is
-        // reported either way rather than hoped for.
+        // Ports on `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999 mean
+        // ZERO enumerated interfaces and a wildcard bind, which drops
+        // every inbound datagram before STUN parsing. A real network
+        // (`Net[eth0:192.168.10x.x/24:Ethernet:id=1]`) is what makes a
+        // Chromium row able to work at all, and `run_row` REFUSES a
+        // Chromium tab that reports none.
       });
       child.on('error', reject);
       child.on('exit', (code) =>
@@ -312,25 +305,34 @@ async function opOpen(req) {
   return { url: page.url() };
 }
 
-// `chrome://webrtc-internals`, read before the browser closes.
-//
-// It is the engine's own record of every peer connection in this
-// process: the ICE event log, the candidate pairs and their state
-// transitions, and the getStats history — the account of the failing
-// check that no external observer could supply. Chromium only, opened
-// in its own tab so the row's page is untouched, and best-effort: a
-// dump that fails must not fail a row.
+// What the port allocator enumerated, as a value the runner can
+// assert on rather than a line a human has to find.
+function networksSnapshot() {
+  return { real: realNetworkPorts, wildcard: wildcardPorts, nets: [...networkNames] };
+}
+
 function reportNetworkEnumeration(at) {
-  // Named plainly, both ways: the fix is a topology fact and a run
-  // that silently lost it would otherwise look like a new mystery.
+  // Named plainly, both ways: the enumerated interface is a
+  // precondition of every Chromium row, and a run that silently lost
+  // it would otherwise look like a new mystery.
+  const nets = networkNames.size === 0 ? '(none)' : [...networkNames].join(' ');
   log(
-    `[chromium-ice] PRECONDITION networks at ${at}: real=${realNetworkPorts} wildcard=${wildcardPorts}` +
+    `[chromium-ice] PRECONDITION networks at ${at}: real=${realNetworkPorts} ` +
+      `wildcard=${wildcardPorts} nets=${nets}` +
       (realNetworkPorts === 0
         ? ' — ZERO enumerated networks, every inbound packet is dropped before STUN (S6_REPORT.md §6.12)'
         : ''),
   );
 }
 
+// `chrome://webrtc-internals`, read before the browser closes.
+//
+// It is the engine's own record of every peer connection in this
+// process: the ICE event log, the candidate pairs and their state
+// transitions, and the getStats history — the account of a failing
+// check that no external observer could supply. Chromium only, opened
+// in its own tab so the row's page is untouched, and best-effort: a
+// dump that fails must not fail a row.
 async function dumpWebrtcInternals() {
   if (!internals) return;
   try {
@@ -361,7 +363,10 @@ async function opShutdown() {
   live = null;
   page = null;
   internals = null;
-  return {};
+  // The counters travel in the reply: `run_row` refuses a Chromium
+  // row that enumerated no interface, and it can only do that if the
+  // number reaches it.
+  return { networks: networksSnapshot() };
 }
 
 const OPS = { launch: opLaunch, open: opOpen, shutdown: opShutdown };
@@ -420,5 +425,51 @@ const addrs = Object.entries(os.networkInterfaces())
   )
   .join(' ');
 log(`netns ${process.env.NATSIM_NETNS || '(unnamed)'} addrs ${addrs} home ${process.env.HOME}`);
+
+// The default-local-address probe, from inside the namespace.
+//
+// libwebrtc (and Chromium's network service, which is what actually
+// enumerates here) learns a "default local address" by connect()ing a
+// throwaway UDP socket at a public IP; a namespace where that route
+// does not resolve enumerates nothing. `setup.sh` already gives every
+// browser namespace `default via <gateway>`, so it resolves — and the
+// point of printing it is that the precondition is then a FACT in the
+// log rather than an inference from the topology script. Reachability
+// is irrelevant: nothing answers 8.8.8.8 in this lab and nothing has
+// to.
+try {
+  const route = execFileSync('ip', ['route', 'get', '8.8.8.8'], { encoding: 'utf8' });
+  log(`ip route get 8.8.8.8 -> ${route.trim().replace(/\s+/g, ' ')}`);
+} catch (e) {
+  log(`ip route get 8.8.8.8 FAILED: ${(e && e.message) || e}`);
+}
+
+// Is a `WebRtcIPHandling` policy being inherited from disk?
+//
+// The suspicion was that the headed CDP launch picks up a policy file
+// that turns interface enumeration off. Recorded once, from the only
+// places Chromium reads managed policy on Linux; the EFFECTIVE value
+// is reported by the renderer itself (`peer_connection_dependency_
+// factory.cc`: `WebRTC routing preferences: policy: …`) in the
+// [chromium-ice] lines.
+const policyDirs = [
+  '/etc/chromium/policies/managed',
+  '/etc/chromium/policies/recommended',
+  '/etc/opt/chrome/policies/managed',
+  '/etc/opt/chrome/policies/recommended',
+];
+log(
+  `chromium managed-policy files: ${
+    policyDirs
+      .flatMap((dir) => {
+        try {
+          return fs.readdirSync(dir).map((f) => `${dir}/${f}`);
+        } catch {
+          return [];
+        }
+      })
+      .join(' ') || '(none)'
+  }`,
+);
 
 reply({ id: 0, ok: true, hello: 'natsim browser driver', engines: Object.keys(ENGINES) });

@@ -274,7 +274,8 @@ capture() { # capture <netns> <name>
 
 if [[ "$MODE" == browser ]]; then
   # The browser rows launch NO mesh helpers. Every native piece — the
-  # anchor `MeshNode` with its RTC socket and STUN responder, the real
+  # anchor `MeshNode` with its RTC socket, the standalone STUN
+  # responder on the lab's second public address, the real
   # `serve_bootstrap` HTTPS listener, the page origin, the credential,
   # and one Playwright driver per NAT'd namespace — is in this one
   # binary, running inside nsim_wan on 10.99.0.10. It reaches the
@@ -282,6 +283,15 @@ if [[ "$MODE" == browser ]]; then
   # (setns needs root, which this script already has), so the drivers
   # AND their browsers run entirely inside nsim_a / nsim_b while their
   # stdio pipes stay attached here.
+  #
+  # `--stun-ip` is 10.99.0.11 — `X`, the aux public address `setup.sh`
+  # always adds to the wan bridge, and free here because no helper
+  # runs. It MUST NOT be the anchor's address: libwebrtc drops every
+  # datagram arriving on an ICE port from an address that port was
+  # given as a STUN server (`UDPPort::OnReadPacket` returns before
+  # `GetConnection`), so an anchor that is also the page's STUN server
+  # can never form a candidate pair with Chromium. That was the whole
+  # of S6_REPORT.md §6.12.
   capture nsim_a browser_a
   capture nsim_b browser_b
   capture nsim_wan anchor_wan
@@ -293,6 +303,7 @@ if [[ "$MODE" == browser ]]; then
       --expect "$EXPECT" \
       --engine-a "$ENGINE_A" --engine-b "$ENGINE_B" \
       --anchor-ip 10.99.0.10 \
+      --stun-ip 10.99.0.11 \
       --netns-a "${NETNS_A:-nsim_a}" --netns-b "${NETNS_B:-nsim_b}" \
       >"$STATE/runner.log" 2>&1 &
   PIDS+=("$!")

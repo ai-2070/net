@@ -194,6 +194,9 @@ struct Matrix {
     engine_a: String,
     engine_b: String,
     anchor_ip: Ipv4Addr,
+    /// The address of the run's STUN responder, which MUST NOT be the
+    /// anchor's own RTC socket. See `run_row` — the whole of §6.12.
+    stun_ip: Ipv4Addr,
     netns_a: String,
     netns_b: String,
     mesh_port: u16,
@@ -224,7 +227,8 @@ enum Mode {
 fn usage() -> String {
     "usage:\n  natsim-browser-matrix --scenario <name> --state <dir> --nat-a <mode> \
      --nat-b <mode> --expect <direct|relayed> --engine-a <engine> --engine-b <engine> \
-     --anchor-ip <ip> --netns-a <ns> --netns-b <ns>\n  natsim-browser-matrix page-server \
+     --anchor-ip <ip> [--stun-ip <ip>] --netns-a <ns> --netns-b <ns>\n  \
+     natsim-browser-matrix page-server \
      --bind <addr> --page <dir> --browser-dist <dir> [--ready <file>]"
         .to_owned()
 }
@@ -275,6 +279,16 @@ fn parse_args() -> Result<Mode, String> {
         anchor_ip: need("anchor-ip")?
             .parse()
             .map_err(|e| format!("--anchor-ip: {e}"))?,
+        // Defaulted, and passed explicitly by `run_scenario.sh`
+        // because the lab's second public address is a fact of the
+        // topology that file owns. 10.99.0.11 is `X`, the aux public
+        // address `setup.sh` always adds to the wan bridge; the
+        // browser rows launch no mesh helper, so nothing else binds
+        // it.
+        stun_ip: flags
+            .get("stun-ip")
+            .map_or(Ok(Ipv4Addr::new(10, 99, 0, 11)), |v| v.parse())
+            .map_err(|e| format!("--stun-ip: {e}"))?,
         netns_a: need("netns-a")?,
         netns_b: need("netns-b")?,
         mesh_port: port("mesh-port", 7000)?,
@@ -921,6 +935,63 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         .serve_rpc(ENROLL_SERVICE, Arc::new(Enrollment))
         .map_err(|e| format!("serve {ENROLL_SERVICE}: {e}"))?;
 
+    // --- 1b. the STUN responder, deliberately NOT the anchor -------
+    //
+    // **S6_REPORT.md §6.12, closed.** libwebrtc eats every datagram
+    // that arrives on an ICE port from an address the port was
+    // configured with as a STUN server
+    // (`webrtc/p2p/base/stun_port.cc`, `UDPPort::OnReadPacket`,
+    // verbatim):
+    //
+    //     // Look for a response from the STUN server.
+    //     if (server_addresses_.find(packet.source_address()) !=
+    //         server_addresses_.end()) {
+    //       request_manager_.CheckResponse(packet.payload());
+    //       return;
+    //     }
+    //     if (Connection* conn = GetConnection(packet.source_address()))
+    //
+    // The page's only `iceServers` entry used to be
+    // `stun:<the anchor's own rtc_addr>`, and the anchor's ICE host
+    // candidate IS that address and port — the product serves STUN on
+    // the RTC socket, by design. So every connectivity-check RESPONSE
+    // the anchor sent, and every Binding REQUEST it sent, was consumed
+    // by the gathering path and never reached the candidate pair: the
+    // `return` is before `GetConnection`. That is exactly what §6.12
+    // measured and could not explain — 197 valid, integrity-correct,
+    // transaction-matched responses landing in Chromium's own
+    // namespace, none credited, no request answered, and silence in
+    // BOTH directions. Firefox's nICEr reads its sockets directly and
+    // has no such rule, which is the whole engine asymmetry.
+    //
+    // So the run's STUN server is a DIFFERENT HOST from the ICE peer,
+    // which is also what a real deployment has. `serve_stun` stays on
+    // the anchor as well: the leaf's own `UdpBlocked` evidence probes
+    // the anchor's published `rtc_addr` and must keep being answered.
+    let stun_bind = SocketAddr::new(IpAddr::V4(m.stun_ip), m.rtc_port);
+    let mut stun_cfg =
+        MeshNodeConfig::new(SocketAddr::new(IpAddr::V4(m.stun_ip), m.mesh_port), PSK);
+    stun_cfg.rtc = Some(RtcConfig {
+        // STUN and nothing else: no bootstrap listener, no services,
+        // no peers. It answers RFC 5389 binding requests and is never
+        // an ICE peer of anything.
+        serve_bootstrap: false,
+        serve_stun: true,
+        public_addr: Some(stun_bind),
+        ..RtcConfig::new().with_bind_addr(stun_bind)
+    });
+    let stun_node = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), stun_cfg)
+            .await
+            .map_err(|e| format!("stun responder MeshNode::new: {e}"))?,
+    );
+    stun_node.start_arc();
+    println!(
+        "[runner] stun responder node {:016x} rtc {stun_bind} — NOT the anchor's ICE \
+         endpoint {rtc_bind} (S6_REPORT.md §6.12)",
+        stun_node.node_id()
+    );
+
     // --- 2. TLS + the bootstrap listener ---------------------------
     let ca = issue_certificate(&work, m.anchor_ip)?;
     let page_origin = format!("http://localhost:{}", m.page_port);
@@ -1164,8 +1235,36 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     for tab in [&tab_a, &tab_b] {
         let _ = tab.run(|id| Step::Done { id }).await;
     }
-    driver_a.shutdown().await;
-    driver_b.shutdown().await;
+    let networks_a = driver_a.shutdown().await;
+    let networks_b = driver_b.shutdown().await;
+    // THE CHROMIUM-BEHIND-NAT PRECONDITION, pinned (§6.12).
+    //
+    // A Chromium row whose ports were allocated on
+    // `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999 enumerated ZERO
+    // interfaces, and a wildcard port drops every inbound datagram
+    // before STUN parsing. The inverse fact is a port on a real named
+    // network — `Net[eth0:192.168.10x.x/24:Ethernet:id=1]` — and it is
+    // REQUIRED of every Chromium tab here rather than hoped for, so a
+    // row that loses interface enumeration fails naming it instead of
+    // failing sixty seconds later as an indistinguishable ICE timeout.
+    for (tab, engine, nets) in [
+        ("a", m.engine_a.as_str(), &networks_a),
+        ("b", m.engine_b.as_str(), &networks_b),
+    ] {
+        // Firefox's nICEr has no enumerator stage and logs no
+        // `Net[…]` at all; requiring one of it would assert nothing.
+        if engine != "chromium" {
+            continue;
+        }
+        if nets.real == 0 {
+            verdict.errors.push(format!(
+                "tab {tab}: {engine} allocated no port on an enumerated network \
+                 (real={} wildcard={} nets={:?}) — interface enumeration is OFF, so every \
+                 inbound datagram is dropped before STUN parsing (S6_REPORT.md §6.12)",
+                nets.real, nets.wildcard, nets.nets
+            ));
+        }
+    }
     for mut child in page_children {
         let _ = child.kill().await;
     }
@@ -1215,7 +1314,10 @@ async fn drive_sequence(
     page_origin: &str,
 ) -> Result<(), String> {
     let anchor_rtc_addr = format!("{}:{}", m.anchor_ip, m.rtc_port);
-    let stun = format!("stun:{}:{}", m.anchor_ip, m.rtc_port);
+    // NOT `m.anchor_ip`: a STUN server that is also the ICE peer has
+    // its every packet eaten by libwebrtc's gathering path. §6.12, and
+    // `run_row` carries the mechanism verbatim.
+    let stun = format!("stun:{}:{}", m.stun_ip, m.rtc_port);
     let connect_step = |tab: &'static str| {
         let credential = credential.to_owned();
         let bootstrap_url = bootstrap_url.to_owned();

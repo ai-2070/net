@@ -31,6 +31,24 @@ pub struct Driver {
     next_id: u64,
 }
 
+/// What the engine's own port allocator did about interface
+/// enumeration, as the driver counted it over the browser's whole
+/// lifetime.
+///
+/// The §6.12 signature is `real == 0 && wildcard > 0`: zero
+/// enumerated interfaces, ports bound to the `any` address, and every
+/// inbound datagram dropped before STUN parsing. `run_row` refuses a
+/// Chromium row that reports it.
+#[derive(Debug, Default, Clone)]
+pub struct Networks {
+    /// Ports allocated on a real, named network (`Net[eth0:…]`).
+    pub real: u64,
+    /// Ports allocated on the wildcard `any` network.
+    pub wildcard: u64,
+    /// The network descriptors seen, verbatim and deduplicated.
+    pub nets: Vec<String>,
+}
+
 impl Driver {
     /// Launch the driver INSIDE `netns`.
     ///
@@ -183,9 +201,31 @@ impl Driver {
             .map(|_| ())
     }
 
-    pub async fn shutdown(mut self) {
-        let _ = self.request("shutdown", serde_json::json!({})).await;
+    /// Stop the engine, and report what it enumerated.
+    ///
+    /// The counters come back in the `shutdown` reply rather than
+    /// being parsed out of the log by a second reader: the driver is
+    /// already counting them line by line, and a number the runner
+    /// can assert on is worth more than one a human can find.
+    pub async fn shutdown(mut self) -> Networks {
+        let reply = self.request("shutdown", serde_json::json!({})).await;
         drop(self.stdin);
         let _ = tokio::time::timeout(Duration::from_secs(20), self.child.wait()).await;
+        let Ok(reply) = reply else {
+            return Networks::default();
+        };
+        let networks = &reply["networks"];
+        Networks {
+            real: networks["real"].as_u64().unwrap_or(0),
+            wildcard: networks["wildcard"].as_u64().unwrap_or(0),
+            nets: networks["nets"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|n| n.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
