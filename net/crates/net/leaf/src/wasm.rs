@@ -1635,17 +1635,33 @@ impl LeafNode {
     /// one disposition this call cannot report for itself, because
     /// the attempt it would report about is gone.
     ///
-    /// A candidate the browser rejects (a stale pair, a duplicate)
-    /// is not an error and is not counted in `applied`; the channel
-    /// opening is what matters.
+    /// A candidate the browser rejects is not fatal to the attempt —
+    /// the channel opening is what matters — but it is no longer
+    /// SILENT. The engine's own error text rides back as
+    /// `candidateError` (first one only, JSON-escaped) and is warned
+    /// to the console. It was previously swallowed entirely: the
+    /// success count rose or it did not, and nothing anywhere said
+    /// why, which is the difference between "ICE is working on it"
+    /// and "ICE has nothing to work with".
     pub async fn peer_candidate(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
         let r = self.service_peer(peer).await?;
+        let candidate_error = match &r.candidate_error {
+            Some(text) => format!(",\"candidateError\":{}", json_string(text)),
+            None => String::new(),
+        };
         Ok(format!(
             "{{\"dialog\":\"{:016x}\",\"state\":\"{}\",\"sent\":{},\
              \"applied\":{},\"answered\":{},\"direct\":{},\
-             \"remainingMs\":\"{}\"}}",
-            r.dialog, r.state, r.sent, r.applied, r.answered, r.direct, r.remaining_ms
+             \"remainingMs\":\"{}\"{}}}",
+            r.dialog,
+            r.state,
+            r.sent,
+            r.applied,
+            r.answered,
+            r.direct,
+            r.remaining_ms,
+            candidate_error
         ))
     }
 
@@ -1689,9 +1705,32 @@ impl LeafNode {
             sent += 1;
         }
 
+        // **Answers before candidates, whatever the arrival order.**
+        //
+        // The answerer's `onicecandidate` fires during
+        // `setLocalDescription` — before its answer has even been
+        // returned to the page, let alone signalled — so its first
+        // candidates routinely reach the offerer AHEAD of the answer.
+        // Applied in arrival order, the offerer then calls
+        // `addIceCandidate` with no remote description: Chromium
+        // throws `InvalidStateError` and the candidate is gone,
+        // while Firefox queues it internally and applies it after
+        // `setRemoteDescription`. That difference alone is a
+        // "Firefox connects, Chromium never does" discriminator, and
+        // it presents exactly as this one did — the offerer gathers
+        // fine, sends checks forever, and never learns a remote
+        // candidate for anything to answer on.
+        //
+        // The inbox is the Stage 5 dialog's, so this is a REORDER of
+        // what is already held, not new state: take the answer first,
+        // then the candidates, in their own arrival order.
         let mut applied = 0usize;
         let mut answered = false;
-        for (kind, payload) in incoming {
+        let mut candidate_error: Option<String> = None;
+        let (answers, rest): (Vec<_>, Vec<_>) = incoming
+            .into_iter()
+            .partition(|(kind, _)| matches!(kind, SignalKind::Answer));
+        for (kind, payload) in answers.into_iter().chain(rest) {
             match kind {
                 SignalKind::Answer if role == PeerRole::Offerer => {
                     let sdp = String::from_utf8(payload)
@@ -1703,12 +1742,23 @@ impl LeafNode {
                     let Some(candidate) = parse_candidate(&payload) else {
                         continue;
                     };
-                    if transport
-                        .add_remote_candidate(peer, &candidate)
-                        .await
-                        .is_ok()
-                    {
-                        applied += 1;
+                    // The engine's refusal was swallowed here: the
+                    // count of successes rose or it did not, and no
+                    // log, counter or verdict field said why. A
+                    // candidate the engine refuses is the difference
+                    // between "ICE is working on it" and "ICE has
+                    // nothing to work with", so it is reported.
+                    match transport.add_remote_candidate(peer, &candidate).await {
+                        Ok(()) => applied += 1,
+                        Err(e) => {
+                            let text = e.to_string();
+                            web_sys::console::warn_1(
+                                &format!("net-mesh-leaf: peer candidate refused: {text}").into(),
+                            );
+                            if candidate_error.is_none() {
+                                candidate_error = Some(text);
+                            }
+                        }
                     }
                 }
                 SignalKind::Reject => {
@@ -1759,6 +1809,7 @@ impl LeafNode {
             answered,
             direct,
             remaining_ms: remaining,
+            candidate_error,
         })
     }
 
@@ -1974,6 +2025,9 @@ struct AttemptReading {
     answered: bool,
     direct: bool,
     remaining_ms: u64,
+    /// The engine's own text for the first candidate it refused, if
+    /// any. `None` when every trickled candidate was accepted.
+    candidate_error: Option<String>,
 }
 
 /// The network-change re-attempt owner's execution half.

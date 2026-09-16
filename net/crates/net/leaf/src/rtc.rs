@@ -554,6 +554,16 @@ impl RtcLeafTransport {
             .ok_or_else(|| LeafError::Session(format!("no attempt for {peer:#x}")))?;
         let init = RtcIceCandidateInit::new(&candidate.candidate);
         init.set_sdp_mid(Some(&candidate.mid));
+        // BOTH, not either. `addIceCandidate` resolves a candidate
+        // against the remote description by `sdpMid` OR
+        // `sdpMLineIndex`, and engines differ on which they will
+        // accept alone: Chromium refuses a candidate it cannot place
+        // when the mid on the wire is not one the description
+        // declares, where Firefox is lenient. This transport
+        // negotiates exactly one m-line — a single DataChannel
+        // bundle — so index 0 is not a guess, it is the only line
+        // there is.
+        init.set_sdp_m_line_index(Some(0));
         let candidate = RtcIceCandidate::new(&init).map_err(|e| unsupported("candidate", &e))?;
         wasm_bindgen_futures::JsFuture::from(
             connection.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate)),
