@@ -160,11 +160,22 @@ jobs:
       - name: Build the natsim browser runner
         run: cargo build --release --manifest-path net/crates/net/tests/natsim/browser/Cargo.toml
 
+      # The CLI version MUST equal the driver's `playwright-core`
+      # version. The driver depends on `playwright-core` only, which
+      # ships no CLI, so a bare `npx playwright install` silently
+      # fetches the LATEST `playwright` and downloads ITS browser
+      # builds: 1.63.0 installed chromium v1243 while
+      # `playwright-core@1.56.0` looks for v1194, and every browser row
+      # died with `Executable doesn't exist at
+      # …/chromium_headless_shell-1194`. Pin it, as ci.yml's browser
+      # jobs already do, and keep the two numbers equal.
       - name: Install the browser driver + engines
         working-directory: net/crates/net/tests/natsim/browser/driver
         run: |
           npm install --no-audit --no-fund
-          npx playwright install --with-deps chromium firefox
+          pinned=$(node -p "require('./package.json').dependencies['playwright-core']")
+          echo "driver pins playwright-core $pinned"
+          npx --yes "playwright@$pinned" install --with-deps chromium firefox
 
       - name: Build helper + test binaries
         working-directory: net/crates/net
