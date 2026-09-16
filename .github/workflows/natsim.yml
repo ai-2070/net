@@ -208,6 +208,20 @@ jobs:
               echo "::error::the NAT conformance row $w did not run and pass"; exit 1; }
           done
 
+      # The scenarios leave their state dirs under /tmp: every helper
+      # log, the browser runner's log, the conntrack snapshots and the
+      # verdicts. A red row whose evidence is only readable by adding a
+      # print and pushing again costs a full CI cycle per question.
+      - name: Upload the scenario state dirs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: natsim-state
+          path: |
+            /tmp/natsim.*/**
+            /tmp/natsim.log
+          if-no-files-found: warn
+
       - name: Teardown (paranoia)
         if: always()
         run: sudo net/crates/net/tests/natsim/teardown.sh

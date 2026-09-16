@@ -274,9 +274,24 @@ else
 fi
 
 # Wait for the verdict from whichever side drives this scenario.
+#
+# For the browser rows there is exactly ONE process to wait on, and it
+# can die before it ever writes a verdict — a missing engine, a driver
+# that cannot start inside the namespace, a panic in the runner. When
+# that happened the script exited with the runner's status and no
+# output at all: the row failed naming nothing, which is the one thing
+# a conformance matrix must never do. Check liveness while waiting and
+# print what it said.
 OUTCOME="$STATE/${OUTCOME_NODE}_outcome.json"
 for _ in $(seq 1 240); do
   [[ -s "$OUTCOME" ]] && break
+  if [[ "$MODE" == browser ]] && ! kill -0 "${PIDS[0]}" 2>/dev/null; then
+    wait "${PIDS[0]}" 2>/dev/null; rc=$?
+    echo "natsim: the browser runner exited with status $rc before writing a \
+verdict; its log follows:" >&2
+    tail -n 60 "$STATE/runner.log" >&2 || true
+    exit 1
+  fi
   sleep 0.5
 done
 if [[ ! -s "$OUTCOME" ]]; then
