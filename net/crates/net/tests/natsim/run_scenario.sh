@@ -341,7 +341,19 @@ fi
 # is installed by the workflow for exactly this reason.
 #
 # Both renderings carry `[UNREPLIED]` on an unanswered flow and both
-# spell the tuple `(src|dst)=<ip>`, so one awk program reads either.
+# spell the tuple `(src|dst)=<ip>`, so one awk program reads either —
+# but they do NOT agree on where the protocol word sits.
+# `/proc/net/nf_conntrack` leads with `ipv4     2 udp      17 …`, so
+# `udp` has whitespace on both sides; `conntrack -L` leads with `udp`
+# itself, at the start of the line. A matcher written for the proc
+# format therefore matched NOTHING once the ladder above started
+# preferring `conntrack -L`, and run 35056816488's Firefox row —
+# `connectPeer settled as "direct" in 269 ms`, `acceptPeer as
+# "direct"`, `ice_attempted=2 ice_direct=2` on both leaves and the
+# anchor, `errors: []` — was failed by its own witness reporting
+# `a: 0/0, b: 0/0` while the artifact dump three sections below listed
+# the A<->B flow on BOTH gateways. Allow either position.
+#
 # `(src|dst)=<peer>` with a non-digit boundary so 10.99.0.3 never
 # matches 10.99.0.30.
 if [[ "$MODE" == browser ]]; then
@@ -353,7 +365,7 @@ if [[ "$MODE" == browser ]]; then
         || true)"
     fi
     printf '%s' "$raw" | awk -v peer="$peer" '
-        $0 ~ /[[:space:]]udp[[:space:]]/ {
+        $0 ~ /(^|[[:space:]])udp[[:space:]]/ {
           if ($0 !~ ("(src|dst)=" peer "([^0-9]|$)")) next
           flows++
           if ($0 !~ /\[UNREPLIED\]/) replied++
