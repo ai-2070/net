@@ -481,16 +481,6 @@ instead of timing out sixty seconds later, indistinguishably from a
 real ICE failure. Defect 2 is pinned by the rows themselves: with the
 anchor as STUN server again, no Chromium row can reach `direct`.
 
-**Named for the product, not fixed here (out of stage scope).** A page
-that does the obvious thing — `iceServers: [{ urls: 'stun:' +
-anchorRtcAddr }]`, which is what both harnesses did and what
-`stunUrl(rtcAddr)` in `@net-mesh/browser` exists to build — cannot
-form a direct pair **with that anchor** on any Chromium-family engine.
-The probe paths (`bootstrap.rs`, `udp-probe.ts`) are unaffected: they
-build a `RTCPeerConnection` with no ICE peer at all. What needs a
-decision is guidance, or an anchor that answers STUN on a second
-socket.
-
 **Dead, and not to be reopened**: the four readings §6.12 already
 killed (gateway/NAT setup, str0m's candidate parsing, a deaf anchor, a
 refused egress, `addIceCandidate`, answer/candidate ordering), plus
@@ -504,6 +494,81 @@ routes stay as **harmless, not causal**, recorded as such in
 **What this gap never cast doubt on**: the browser matrix (41
 witnesses, both engines, green), the demo (4 rows, green), and the
 Firefox NAT row described in §3.1.
+
+**Named for the owner, not fixed here (out of stage scope).** The
+harness collision is a harness bug. The *configuration* that produced
+it is one the plan invites, so §6.12.1 states it as a plan-level
+consequence and stops short of choosing a resolution.
+
+#### 6.12.1 Plan-level consequence: `rtc_addr` is one socket serving two roles
+
+**(a) The rule and its scope.** `UDPPort::OnReadPacket` consumes and
+`return`s any datagram whose source address is in `server_addresses_`
+— the port's configured STUN servers — before it reaches
+`GetConnection`. So on a **Chromium-family engine (any libwebrtc
+build: Chrome, Edge, Electron, Playwright's Chromium)** a leaf handed
+`stun:<anchor rtc_addr>` as an `RTCIceServer` **can never form a
+candidate pair with that anchor**: its own checks go out, the anchor
+answers, and every answer is eaten by the gathering path. It is
+per-source-address, not per-direction, so the anchor's own checks are
+dropped too. **Firefox is unaffected** (nICEr has no such rule, and
+its `anchor-stun` legs form pairs — §6.12's 2×2); WebKit is untested
+here and should not be assumed either way.
+
+The plan makes that configuration the obvious one. §5 defines
+`rtc_addr` as the anchor's **"public RTC/STUN socket, UDP-only"** —
+one socket for both roles, and §6 rules out a demux, deliberately and
+for good reasons. Stage 4b's R8 repair then *proved* the announced
+address is a live STUN target
+(`natsim_natted_anchor_publishes_a_reachable_rtc_addr`:
+`stun_probe_ok` / `stun_probe_target` / `stun_probe_mapped`, against
+`RtcStats::stun_binding_requests`), and `@net-mesh/browser` ships
+`stunUrl(rtcAddr)` to turn it into exactly that URL. The leaf does not
+force it — `iceServers` is caller-supplied and the leaf passes it
+through verbatim (`wasm.rs: parse_ice_servers`) — but nothing warns
+against it, and both of this repo's own harnesses did it.
+
+**(b) Three ways to resolve it. Not chosen here; owner's call.**
+
+1. **A second socket.** The anchor answers STUN on its own socket/port
+   and announces that separately from `rtc_addr`, so a leaf's STUN
+   server is never its peer's ICE address. Costs a wire field and a
+   second bound port per anchor; §6's no-demux ruling is untouched
+   (two sockets, not one demuxed).
+2. **The leaf refuses or strips it.** At `connect`, compare each
+   `iceServers` entry against the anchor this leaf will pair with and
+   drop it (or refuse the option) with a typed warning. Keeps one
+   socket and one announcement; puts engine-specific knowledge in the
+   leaf, and needs a rule for the peer-to-peer case where the same
+   address is a legitimate STUN server for a pair that does not
+   include it.
+3. **Documentation only.** "Never configure an anchor's `rtc_addr` as
+   an `iceServer` for a Chromium leaf." Zero code; relies on every
+   integrator reading it, and the failure it prevents is a silent
+   60-second ICE timeout with no diagnostic — which is what cost this
+   stage five cycles.
+
+**The `UdpBlocked` probe is unaffected by all three.** It sends one
+unsolicited RFC 5389 binding request to `rtc_addr` from a **throwaway
+`RTCPeerConnection` with no remote description and no ICE peer**
+(`leaf/src/bootstrap.rs`, `browser-ts/src/udp-probe.ts`), so the
+eaten-by-the-gathering-path branch is precisely where its answer is
+*supposed* to land. Option 1 leaves it pointed at `rtc_addr`, which
+still answers; option 2 touches `connect`'s `iceServers`, not the
+probe; option 3 is prose. Any resolution that removed the anchor's
+`serve_stun` — none of the three do — would break it, and with it the
+only evidence that distinguishes `UdpBlocked` from `IceTimeout`.
+
+**(c) Which witnesses would have to change.**
+
+| Resolution | Stage 4b | Stage 5 | Stage 6 |
+|---|---|---|---|
+| 1. second STUN socket | `natsim_natted_anchor_publishes_a_reachable_rtc_addr` keeps probing `rtc_addr` unchanged; a **new** witness is owed for the announced STUN address (reachable, mapped, and *not equal* to `rtc_addr`) | `stage5_udp_blocked_surfaces_a_typed_failure` unchanged — but `udp_block.rs` installs its firewall rule scoped to `rtc_addr`, and would need the second port blocked too, or the probe passes while ICE is dead | natsim's `--stun-ip` becomes the product's announced address instead of a harness choice; the loopback `[mdns]` sweep's `anchor-stun` legs become "announced-stun" legs and should then form pairs on Chromium, so `working_stun` can go |
+| 2. leaf refuses/strips | unchanged | unchanged | a new leaf witness: the stripped entry is reported (typed warning, not silence) and `effective_ice_servers` shows it gone — that method exists because Stage 5 dropped `RTCIceServer`s silently once already |
+| 3. documentation only | unchanged | unchanged | unchanged; the `[mdns]` sweep's `working_stun` fallback must then be made loud (it currently hides this exact defect) and the natsim `--stun-ip` comment becomes the normative reference |
+
+No witness is weakened under any of the three, and none of them
+changes a NAT flavour, a deadline or a counter identity.
 
 ### 6.13 Two more log lines that asserted more than their code knew
 
