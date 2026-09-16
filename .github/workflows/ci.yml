@@ -4780,7 +4780,7 @@ jobs:
             --junit "$RUNNER_TEMP/rtc-junit.xml" --multi \
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
-            --floor rtc_repairs=43 \
+            --floor rtc_repairs=49 \
             --floor rtc_ice_telemetry=6 \
             --floor rtc_routed_restore=5 \
             --floor rtc_install_race=8 \
@@ -4816,6 +4816,11 @@ jobs:
           rtc_repairs:retention_conserves_every_admitted_packet_and_then_delivers_it
           rtc_repairs:node_shutdown_releases_the_rtc_socket
           rtc_repairs:a_wrong_generation_handle_cannot_touch_the_live_session
+          rtc_repairs:a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event
+          rtc_repairs:a_native_sender_fragments_for_a_peer_that_advertises_reassembly
+          rtc_repairs:a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once
+          rtc_repairs:a_group_over_the_ceiling_is_refused_at_the_first_piece_on_both_sides
+          rtc_repairs:a_peer_without_the_reassembly_tag_still_gets_event_too_large
           rtc_repairs:thirty_two_lifetimes_do_not_grow_the_slot_table
           rtc_repairs:a_dead_handle_cannot_be_installed_and_a_close_evicts_the_peer
           rtc_repairs:a_busy_incumbent_survives_an_rtc_upgrade_attempt

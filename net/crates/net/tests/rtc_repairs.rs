@@ -4542,3 +4542,613 @@ async fn one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it() {
          half-open peer record behind"
     );
 }
+
+// ---------------------------------------------------------------
+// Stage 5, fifth round, ruling 4 — multi-fragment interoperability
+// in BOTH directions. `S5_R5_BRIEF.md` §4.
+// ---------------------------------------------------------------
+
+/// A payload whose every byte is derived from `nonce`, so an
+/// assertion that the receiver got *these* bytes cannot be satisfied
+/// by a payload some other run, some other group or some retained
+/// buffer produced.
+///
+/// The first sixteen bytes are the tag and the nonce verbatim, which
+/// is what makes a partial arrival attributable: a lone head still
+/// names the message it was a piece of.
+fn nonce_payload(tag: &[u8; 8], nonce: u64, len: usize) -> Bytes {
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    let mut state = nonce | 1;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state & 0xFF) as u8);
+    }
+    out.truncate(len);
+    Bytes::from(out)
+}
+
+/// The offset `event` occupies inside `payload`, if it is one of the
+/// pieces a fragmenting sender would have cut it into.
+///
+/// Both fragmenting producers — the browser leaf's `split_payload`
+/// and the native sender — cut at `MAX_EVENT_SIZE`, so the candidate
+/// offsets are exactly the multiples of it. Checking those rather
+/// than every window keeps the measurement O(pieces) and, more
+/// importantly, makes "one whole payload" and "N partial pieces"
+/// answers to the SAME question instead of two different ones.
+fn piece_offset(payload: &[u8], event: &[u8]) -> Option<usize> {
+    let step = net_wire::protocol::MAX_EVENT_SIZE;
+    (0..payload.len().div_ceil(step))
+        .map(|i| i * step)
+        .find(|&off| {
+            payload.len() - off >= event.len() && &payload[off..off + event.len()] == event
+        })
+}
+
+/// Drain every shard and return, in arrival order, the events that
+/// are `payload` or a piece of it.
+///
+/// Returns as soon as the WHOLE payload arrives; otherwise it spends
+/// the window, so a partial delivery is measured rather than waited
+/// out. That is the discriminator the reassembly witnesses need: a
+/// working receive half produces `[payload]`, and the inverse (no
+/// reassembly) produces the N pieces, from one measurement.
+async fn collect_payload_events(
+    node: &Arc<MeshNode>,
+    payload: &[u8],
+    within: Duration,
+) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        for shard in 0..4u16 {
+            let result = node.poll_shard(shard, None, 512).await.expect("poll_shard");
+            for event in result.events {
+                let raw = event.raw.to_vec();
+                if piece_offset(payload, &raw).is_some() {
+                    seen.push(raw);
+                }
+            }
+        }
+        if seen.iter().any(|e| e.len() == payload.len()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    seen
+}
+
+/// Emit `payload` from `from` to `to_node` exactly as a browser leaf
+/// would, and return how many packets that took.
+///
+/// This is the leaf's `openStream` + `send` shape, not an
+/// approximation of it: `leaf/src/frame.rs::split_payload` cuts at
+/// `MAX_EVENT_SIZE`, stamps `FRAG_FRAGMENTED` on every piece and
+/// `FRAG_LAST` on the final one, and `leaf/src/session.rs::
+/// build_packets` allocates the pieces' sequences inside ONE call in
+/// offset order — which is why they are contiguous and ascending,
+/// and why the receiver may hold a group to that.
+async fn leaf_send_fragmented(
+    from: &Arc<MeshNode>,
+    to_node: u64,
+    stream_id: u64,
+    fragment_id: u16,
+    payload: &[u8],
+) -> usize {
+    use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST, MAX_EVENT_SIZE};
+
+    let mut offset = 0usize;
+    let mut packets = 0usize;
+    while offset < payload.len() {
+        let end = (offset + MAX_EVENT_SIZE).min(payload.len());
+        let last = end == payload.len();
+        let piece = leaf_fragment(
+            from,
+            to_node,
+            stream_id,
+            (
+                fragment_id,
+                u16::try_from(offset).expect("the leaf's ceiling keeps offsets in u16"),
+                FRAG_FRAGMENTED | if last { FRAG_LAST } else { 0 },
+            ),
+            0,
+            &payload[offset..end],
+        );
+        from.send_built_packet_for_test(to_node, &piece)
+            .await
+            .expect("the piece leaves the leaf");
+        packets += 1;
+        offset = end;
+    }
+    packets
+}
+
+/// **(a)** leaf → native: a 40 000-byte reliable stream payload
+/// arrives as ONE event, byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event() {
+    const STREAM: u64 = 0x07A0;
+    const GROUP: u16 = 101;
+    const SIZE: usize = 40_000;
+
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+    let payload = nonce_payload(b"S5R4-A--", 0x5A5A_0001_u64, SIZE);
+
+    let packets = leaf_send_fragmented(&b, a_id, STREAM, GROUP, &payload).await;
+    assert_eq!(
+        packets, 5,
+        "40 000 bytes is five leaf fragments; a single packet would mean the \
+         premise (a payload no packet can carry) was never arranged"
+    );
+
+    let delivered = collect_payload_events(&a, &payload, Duration::from_secs(10)).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "a fragmented leaf payload is ONE message: the receiver saw {} events \
+         of sizes {:?}",
+        delivered.len(),
+        delivered.iter().map(|e| e.len()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        delivered[0].len(),
+        SIZE,
+        "and it is the whole payload, not its head"
+    );
+    assert!(
+        delivered[0] == payload,
+        "and byte-identical to what the leaf sent"
+    );
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "a completed group keeps nothing"
+    );
+    assert_eq!(
+        a.rtc_reassembly().abandoned_total(),
+        0,
+        "and nothing was abandoned on the way"
+    );
+}
+
+/// A reliable stream config, spelled once for the ruling-4
+/// witnesses: fragmentation is a reliable-semantics claim.
+fn reliable_config() -> StreamConfig {
+    let mut cfg = StreamConfig::new();
+    cfg.reliability = Reliability::Reliable;
+    cfg
+}
+
+/// Make `receiver` advertise fragment reassembly through the real
+/// announcement path, and wait until `sender`'s capability fold
+/// actually carries the tag.
+///
+/// Both halves matter. The gate reads the SENDER's fold, so
+/// announcing without observing arrival would make every witness
+/// below a race with the announcement it depends on; and asserting
+/// the arrival is how we know a later refusal is the gate's verdict
+/// rather than a capability that never propagated.
+async fn advertise_reassembly(receiver: &Arc<MeshNode>, sender: &Arc<MeshNode>) {
+    use net::adapter::net::behavior::capability::{CapabilitySet, FRAGMENT_REASSEMBLY_TAG};
+    use net::adapter::net::behavior::fold::capability::capability_tags_for;
+
+    receiver
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce_capabilities");
+    let node_id = receiver.node_id();
+    assert!(
+        wait_for(
+            || capability_tags_for(sender.capability_fold(), node_id)
+                .iter()
+                .any(|t| t == FRAGMENT_REASSEMBLY_TAG),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the receiver's reassembly capability never reached the sender's fold, \
+         so nothing below would be measuring the gate: {:?}",
+        capability_tags_for(sender.capability_fold(), node_id)
+    );
+}
+
+/// This stream's next TX sequence on `from`'s session to `to_node` —
+/// how many sequences the send actually consumed, which is how a
+/// witness tells "fragmented into N packets" from "sent as one" and
+/// "refused before the wire" from "refused after a piece went out".
+fn tx_seq_of(from: &Arc<MeshNode>, to_node: u64, stream_id: u64) -> u64 {
+    from.peer_session_for_test(to_node)
+        .expect("a session to the peer")
+        .get_or_create_stream(stream_id)
+        .current_tx_seq()
+}
+
+/// **(b)** native → a peer that advertises reassembly: a 40 000-byte
+/// reliable `send_on_stream` arrives as ONE event, byte-identical.
+///
+/// The mirror of (a), and the half ruling 4 actually had to build.
+/// `A` here is playing the role the browser leaf plays on the wire —
+/// an RTC peer whose receive path reassembles and that says so — and
+/// the assertion that this really fragmented is the sequence count:
+/// five packets, five sequences, one event delivered.
+///
+/// Inverse (reassembly disabled): stub
+/// `MeshNode::reassemble_rtc_fragments` to `Some(events)` — the five
+/// pieces are delivered as five partial events.
+/// Inverse (gate removed): see (e).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_sender_fragments_for_a_peer_that_advertises_reassembly() {
+    const STREAM: u64 = 0x07A1;
+    const SIZE: usize = 40_000;
+
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+    advertise_reassembly(&a, &b).await;
+
+    let stream = b
+        .open_stream(a_id, STREAM, reliable_config())
+        .expect("open_stream");
+    let before = tx_seq_of(&b, a_id, STREAM);
+    let payload = nonce_payload(b"S5R4-B--", 0x5A5A_0002_u64, SIZE);
+    b.send_on_stream(&stream, std::slice::from_ref(&payload))
+        .await
+        .expect("an over-cap event is carried, not refused, for this peer");
+
+    assert_eq!(
+        tx_seq_of(&b, a_id, STREAM) - before,
+        5,
+        "40 000 bytes must leave as FIVE pieces on five consecutive \
+         sequences; one sequence would mean an over-cap packet no receiver \
+         accepts, and a different count would break the receiver's \
+         contiguity rule"
+    );
+
+    let delivered = collect_payload_events(&a, &payload, Duration::from_secs(10)).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the group is ONE message at the peer: it saw {} events of sizes {:?}",
+        delivered.len(),
+        delivered.iter().map(|e| e.len()).collect::<Vec<_>>()
+    );
+    assert_eq!(delivered[0].len(), SIZE, "whole, not the head");
+    assert!(
+        delivered[0] == payload,
+        "and byte-identical to what the sender passed to send_on_stream"
+    );
+    assert_eq!(
+        a.rtc_reassembly().held_bytes(session_id),
+        0,
+        "a completed group keeps nothing"
+    );
+    assert_eq!(a.rtc_reassembly().abandoned_total(), 0, "and lost nothing");
+}
+
+/// **(c)** a lost MIDDLE fragment of a reliable group is recovered by
+/// the existing reliability machinery, and the payload arrives ONCE.
+///
+/// The loss is injected ABOVE SCTP, at the receiver's ingress, so
+/// SCTP has already delivered the chunk and cannot recover it
+/// whatever the channel was negotiated as: if the payload arrives, a
+/// Net retransmit carried it. And the retransmit has to RESTAMP the
+/// fragment header — a rebuilt piece with `frag_flags == 0` is a
+/// whole event to the receiver, which would hand its application a
+/// partial payload and leave the group short forever.
+///
+/// **"Middle" is measured, not assumed.** The injector drops the
+/// third inbound Net packet, and the receiver's held-byte count then
+/// names which piece is missing, because a reliable stream parks
+/// arrivals past a sequence hole:
+///
+/// * `2 × MAX_EVENT_SIZE` held ⇒ pieces 1 and 2 are in the group and
+///   the third is the hole — an interior piece, which is the case
+///   this witness is about;
+/// * `0` held would mean the HEAD was lost (every later piece
+///   parked behind it);
+/// * `4 × MAX_EVENT_SIZE` held would mean the TAIL was lost.
+///
+/// The raw-egress injector cannot make this claim at all and the
+/// first attempt at this witness proved it: one 8 KiB Net packet
+/// rides ~7 DTLS datagrams, so arming it at 3 counted 43 qualifying
+/// datagrams and lost a chunk of the FIRST piece. Hence
+/// `set_ingress_drop_at`, which drops one whole packet.
+///
+/// Inverse: delete the `if let Some(f) = d.fragment` restamp from
+/// either rebuild site — the recovered piece arrives unfragmented,
+/// the group never completes, and the payload never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() {
+    use net_wire::protocol::MAX_EVENT_SIZE;
+
+    const STREAM: u64 = 0x07A2;
+    const SIZE: usize = 40_000;
+
+    let (a, b, _id_a) = quiet_pair().await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    // B reassembles and says so; A is the fragmenting sender.
+    advertise_reassembly(&b, &a).await;
+    let session_id = b.peer_session_id(a_id).expect("an installed session");
+    let hooks_b = b.rtc_driver().expect("driver").hooks();
+    let before_retransmit = a
+        .control_plane_stats()
+        .retransmit_packets_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let stream = a
+        .open_stream(b_id, STREAM, reliable_config())
+        .expect("open_stream");
+    let payload = nonce_payload(b"S5R4-C--", 0x5A5A_0003_u64, SIZE);
+
+    // Quiesce first, exactly as the below-SCTP witness above does:
+    // an armed hook that eats a leftover acknowledgement fires and
+    // hits nothing that matters. The heartbeat is parked at 600 s,
+    // so once the announcement traffic flushes, B's next inbound
+    // packets are this group's pieces.
+    settle_egress().await;
+    hooks_b.set_ingress_drop_at(3);
+    a.send_on_stream(&stream, std::slice::from_ref(&payload))
+        .await
+        .expect("the group is admitted");
+
+    // The interior hole, observed while it exists. It persists at
+    // least until the receiver's 25 ms gap tick plus a round trip,
+    // which is what makes it observable rather than hoped for.
+    assert!(
+        wait_for(
+            || b.rtc_reassembly().held_bytes(session_id) == 2 * MAX_EVENT_SIZE as u64,
+            Duration::from_secs(10)
+        )
+        .await,
+        "the group must be holding its first two pieces with the THIRD \
+         missing — held {} bytes, and 0 would mean the head was lost while \
+         {} would mean the tail was",
+        b.rtc_reassembly().held_bytes(session_id),
+        4 * MAX_EVENT_SIZE as u64
+    );
+    let counted = hooks_b.ingress_counted();
+    assert!(
+        counted >= 3,
+        "the injector counted {counted} inbound packets: the armed drop was \
+         never reached, so nothing below measures recovery"
+    );
+
+    let delivered = collect_payload_events(&b, &payload, Duration::from_secs(60)).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the payload must arrive exactly once — not twice from the \
+         retransmission, not partially from the surviving pieces: {:?}",
+        delivered.iter().map(|e| e.len()).collect::<Vec<_>>()
+    );
+    assert!(
+        delivered[0] == payload,
+        "and byte-identical: a recovered group is the original bytes or it is \
+         nothing. Got {} bytes of {SIZE} — an 8 104-byte delivery here is the \
+         recovered piece arriving UNFRAGMENTED and handed over as a whole \
+         event",
+        delivered[0].len()
+    );
+    let retransmits = a
+        .control_plane_stats()
+        .retransmit_packets_sent
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - before_retransmit;
+    assert!(
+        retransmits >= 1,
+        "and `reliability.rs` is what carried it: {retransmits} retransmitted \
+         packets against {counted} counted inbound packets and one armed \
+         drop. Zero would mean the piece was never actually lost"
+    );
+
+    // ONCE, measured rather than assumed: keep draining after the
+    // payload landed. A retransmitted piece arriving after its group
+    // completed is a refusal, not a second delivery.
+    let after = collect_payload_events(&b, &payload, Duration::from_secs(2)).await;
+    assert!(
+        after.is_empty(),
+        "a second delivery of the same group: {:?}",
+        after.iter().map(|e| e.len()).collect::<Vec<_>>()
+    );
+}
+
+/// **(d)** a group over the fragmentation ceiling is refused typed at
+/// the FIRST piece, on both sides.
+///
+/// Sender: `send_on_stream` refuses `MAX_FRAGMENTED_EVENT_SIZE + 1`
+/// with the ceiling as the named limit and consumes NO sequence —
+/// there is no first piece, so there is nothing partial to clean up.
+/// The companion at-ceiling payload is sent in the same run, so the
+/// refusal is a boundary and not a blanket one.
+///
+/// Receiver: a piece whose own `offset + len` crosses the ceiling is
+/// refused before the session's reassembly state is touched at all —
+/// no group opened, nothing buffered, nothing delivered, and no
+/// abandonment, because nothing was ever admitted to lose.
+///
+/// Inverse (ceiling check removed): drop the
+/// `e.len() > protocol::MAX_FRAGMENTED_EVENT_SIZE` arm in
+/// `send_on_stream` — the over-ceiling event is accepted and emitted
+/// as nine pieces; drop `end > MAX_REASSEMBLED_BYTES` in
+/// `RtcReassembly::accept` — the over-ceiling piece opens a group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_over_the_ceiling_is_refused_at_the_first_piece_on_both_sides() {
+    use net::adapter::net::rtc::{FragmentOutcome, FragmentPiece, FragmentProvenance};
+    use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST, MAX_FRAGMENTED_EVENT_SIZE};
+
+    const STREAM: u64 = 0x07A3;
+    const OVER: u64 = 0x07A4;
+    const GROUP: u16 = 103;
+
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let (a_id, b_id) = (a.node_id(), b.node_id());
+    let session_id = a.peer_session_id(b_id).expect("an installed session");
+    advertise_reassembly(&a, &b).await;
+
+    // ---- sender: the boundary, both sides of it ----------------
+    let stream = b
+        .open_stream(a_id, STREAM, reliable_config())
+        .expect("open_stream");
+    let at_ceiling = nonce_payload(b"S5R4-D1-", 0x5A5A_0004_u64, MAX_FRAGMENTED_EVENT_SIZE);
+    b.send_on_stream(&stream, std::slice::from_ref(&at_ceiling))
+        .await
+        .expect(
+            "the ceiling itself is carried: the refusal below is a bound, \
+                 not a blanket",
+        );
+    let ceiling_delivered = collect_payload_events(&a, &at_ceiling, Duration::from_secs(20)).await;
+    assert_eq!(
+        ceiling_delivered.len(),
+        1,
+        "and it arrives as one event of {} bytes: {:?}",
+        MAX_FRAGMENTED_EVENT_SIZE,
+        ceiling_delivered
+            .iter()
+            .map(|e| e.len())
+            .collect::<Vec<_>>()
+    );
+    assert!(ceiling_delivered[0] == at_ceiling);
+
+    let before = tx_seq_of(&b, a_id, STREAM);
+    let over = nonce_payload(b"S5R4-D2-", 0x5A5A_0005_u64, MAX_FRAGMENTED_EVENT_SIZE + 1);
+    let refused = b.send_on_stream(&stream, std::slice::from_ref(&over)).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StreamError::EventTooLarge { size, limit })
+                if size == MAX_FRAGMENTED_EVENT_SIZE + 1
+                    && limit == MAX_FRAGMENTED_EVENT_SIZE
+        ),
+        "one byte past the ceiling is a TYPED refusal naming the ceiling, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        tx_seq_of(&b, a_id, STREAM),
+        before,
+        "and it consumed no sequence: refused at the first piece means before \
+         the first piece exists, so no prefix of the group is on the wire"
+    );
+
+    // ---- receiver: a piece that crosses the ceiling ------------
+    //
+    // No conformant producer emits this — both cut at
+    // MAX_EVENT_SIZE and refuse above the ceiling — so it is built
+    // by hand, which is exactly the hostile case the bound exists
+    // for. It is this group's FIRST piece.
+    let held_before = a.rtc_reassembly().held_bytes(session_id);
+    let abandoned_before = a.rtc_reassembly().abandoned_total();
+    let bad = leaf_fragment(
+        &b,
+        a_id,
+        OVER,
+        (GROUP, 60_000, FRAG_FRAGMENTED | FRAG_LAST),
+        0,
+        &vec![0xD1u8; 5_000],
+    );
+    b.send_built_packet_for_test(a_id, &bad)
+        .await
+        .expect("the over-ceiling piece leaves B");
+
+    assert_eq!(
+        a.rtc_reassembly().accept(
+            FragmentPiece {
+                session_id,
+                fragment_id: GROUP,
+                offset: 60_000,
+                flags: FRAG_FRAGMENTED | FRAG_LAST,
+                sequence: 0,
+                provenance: FragmentProvenance {
+                    stream_id: OVER,
+                    origin_hash: b_id,
+                    channel_hash: 0,
+                    subprotocol_id: 0,
+                    reliable: true,
+                },
+                data: Bytes::from(vec![0xD1u8; 5_000]),
+            },
+            std::time::Instant::now(),
+        ),
+        Err(FragmentOutcome::Malformed),
+        "a piece claiming bytes past the ceiling is typed-refused"
+    );
+    assert!(
+        wait_for(
+            || a.rtc_reassembly().held_bytes(session_id) == held_before,
+            Duration::from_secs(2)
+        )
+        .await,
+        "and it opened NO group: held {} bytes, was {held_before}",
+        a.rtc_reassembly().held_bytes(session_id)
+    );
+    assert_eq!(
+        a.rtc_reassembly().abandoned_total(),
+        abandoned_before,
+        "and nothing was abandoned — the refusal is before admission, so \
+         there were no acknowledged bytes to lose"
+    );
+}
+
+/// **(e)** native → a native peer that has NOT advertised
+/// reassembly still gets the typed `EventTooLarge` refusal at
+/// 8 104 B. The hard invariant: ruling 4 changed nothing for a peer
+/// that cannot reassemble.
+///
+/// Inverse (capability gate removed): make
+/// `peer_reassembles_fragments` return `true` — this peer is handed
+/// two partial events instead of a refusal, which is the silent
+/// corruption the gate exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_without_the_reassembly_tag_still_gets_event_too_large() {
+    use net::adapter::net::behavior::capability::FRAGMENT_REASSEMBLY_TAG;
+    use net::adapter::net::behavior::fold::capability::capability_tags_for;
+    use net_wire::protocol::MAX_EVENT_SIZE;
+
+    const STREAM: u64 = 0x07A5;
+    const SIZE: usize = 9_000;
+
+    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
+    let a_id = a.node_id();
+    // The premise, asserted rather than assumed: neither node has
+    // announced, so A carries no reassembly claim in B's fold.
+    assert!(
+        !capability_tags_for(b.capability_fold(), a_id)
+            .iter()
+            .any(|t| t == FRAGMENT_REASSEMBLY_TAG),
+        "this witness is about a peer that has NOT advertised; it has: {:?}",
+        capability_tags_for(b.capability_fold(), a_id)
+    );
+
+    let stream = b
+        .open_stream(a_id, STREAM, reliable_config())
+        .expect("open_stream");
+    let before = tx_seq_of(&b, a_id, STREAM);
+    let payload = nonce_payload(b"S5R4-E--", 0x5A5A_0006_u64, SIZE);
+    let refused = b
+        .send_on_stream(&stream, std::slice::from_ref(&payload))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(StreamError::EventTooLarge { size, limit })
+                if size == SIZE && limit == MAX_EVENT_SIZE
+        ),
+        "a peer that does not say it reassembles keeps the 8 104-byte refusal, \
+         naming MAX_EVENT_SIZE and not the fragmentation ceiling, got {refused:?}"
+    );
+    assert_eq!(
+        tx_seq_of(&b, a_id, STREAM),
+        before,
+        "and nothing reached the wire"
+    );
+    let delivered = collect_payload_events(&a, &payload, Duration::from_millis(800)).await;
+    assert!(
+        delivered.is_empty(),
+        "no partial events at the peer — that is the whole invariant: {:?}",
+        delivered.iter().map(|e| e.len()).collect::<Vec<_>>()
+    );
+}

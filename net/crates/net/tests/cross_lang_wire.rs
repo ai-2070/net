@@ -404,6 +404,19 @@ fn the_leaf_generated_announcement_round_trips_through_the_production_codec() {
             "a leaf's announcement must carry the {required:?} tag, got {tags:?}"
         );
     }
+    // The negotiation tag, checked against the CORE's constant rather
+    // than a repeated literal: this is the string a native sender
+    // matches on before it fragments a stream payload above
+    // `MAX_EVENT_SIZE`, so a leaf spelling it differently from the
+    // core does not produce a refusal — it produces a silent fallback
+    // to the 8 104-byte cap that nothing else here would notice.
+    assert!(
+        tags.iter()
+            .any(|t| t == net::adapter::net::behavior::capability::FRAGMENT_REASSEMBLY_TAG),
+        "the pinned leaf announcement must carry the core's \
+         FRAGMENT_REASSEMBLY_TAG ({:?}), got {tags:?}",
+        net::adapter::net::behavior::capability::FRAGMENT_REASSEMBLY_TAG
+    );
     assert!(
         decoded.reflex_addr.is_none(),
         "§7: a leaf omits reflex_addr — it has no observer-visible socket"

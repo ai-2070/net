@@ -167,6 +167,23 @@ pub struct RtcTestHooks {
     ingress_drop_one_in: std::sync::atomic::AtomicU64,
     /// Counter for the loss injector.
     ingress_seen: std::sync::atomic::AtomicU64,
+    /// Drop the Nth inbound DataChannel message, counting from the
+    /// moment it is armed (0 = disabled).
+    ///
+    /// Deterministic where [`Self::ingress_drop_one_in`] is
+    /// periodic, and per-PACKET where
+    /// [`Self::raw_egress_drop_at`] is per-datagram. That last
+    /// difference is the one that matters for a fragment group: one
+    /// 8 KiB Net packet is carried by ~7 DTLS datagrams, so the raw
+    /// egress injector cannot name a PACKET at all — arming it at 3
+    /// loses a chunk of the first piece, not the third piece. This
+    /// drops a whole `Event::ChannelData`, which is exactly one Net
+    /// packet, so "the third piece" is a thing a witness can say.
+    ingress_drop_at: std::sync::atomic::AtomicU64,
+    /// Inbound messages seen since [`Self::ingress_drop_at`] was
+    /// armed, so a receipt can state that the drop happened rather
+    /// than that it was requested.
+    ingress_seen_since_arm: std::sync::atomic::AtomicU64,
     /// Drop the Nth RAW outbound datagram carrying DTLS
     /// application data — i.e. below SCTP (0 = disabled).
     ///
@@ -227,6 +244,25 @@ impl RtcTestHooks {
         self.ingress_drop_one_in.store(n, Ordering::Release);
     }
 
+    /// Arm the deterministic ABOVE-SCTP injector: drop the `nth`
+    /// inbound DataChannel message, counting from this call. `0`
+    /// disables and resets the counter.
+    ///
+    /// One message is one Net packet, which is what makes this the
+    /// instrument for "lose exactly the third piece of this
+    /// fragment group". A drop here is terminal for SCTP — it has
+    /// already delivered — so whatever arrives afterwards was
+    /// recovered by `reliability.rs` and nothing else.
+    pub fn set_ingress_drop_at(&self, nth: u64) {
+        self.ingress_seen_since_arm.store(0, Ordering::Release);
+        self.ingress_drop_at.store(nth, Ordering::Release);
+    }
+
+    /// Inbound messages counted since [`Self::set_ingress_drop_at`].
+    pub fn ingress_counted(&self) -> u64 {
+        self.ingress_seen_since_arm.load(Ordering::Acquire)
+    }
+
     /// Arm the PRE-SCTP injector: drop the `nth` outbound datagram
     /// that carries DTLS application data, counting from this call.
     /// `0` disables and resets the counter.
@@ -277,12 +313,21 @@ impl RtcTestHooks {
     }
 
     fn drop_this_ingress(&self) -> bool {
-        let n = self.ingress_drop_one_in.load(Ordering::Acquire);
-        if n == 0 {
-            return false;
+        // The two injectors keep independent counters, so arming
+        // one does not perturb the other's schedule, and an
+        // unarmed injector counts nothing.
+        let mut drop = false;
+        let nth = self.ingress_drop_at.load(Ordering::Acquire);
+        if nth != 0 {
+            let seen = self.ingress_seen_since_arm.fetch_add(1, Ordering::Relaxed) + 1;
+            drop = seen == nth;
         }
-        let seen = self.ingress_seen.fetch_add(1, Ordering::Relaxed) + 1;
-        seen.is_multiple_of(n)
+        let n = self.ingress_drop_one_in.load(Ordering::Acquire);
+        if n != 0 {
+            let seen = self.ingress_seen.fetch_add(1, Ordering::Relaxed) + 1;
+            drop = drop || seen.is_multiple_of(n);
+        }
+        drop
     }
 
     /// Whether this raw outbound datagram is the armed one.

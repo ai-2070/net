@@ -125,9 +125,13 @@ fn the_leaf_announcement_encoder_reproduces_the_pinned_bytes() {
         verified.capabilities,
         vec![
             "leaf".to_string(),
+            "net.stream.fragment_reassembly@1".to_string(),
             "stage5.browser".to_string(),
             "transport:rtc".to_string()
-        ]
+        ],
+        "the pinned bytes carry the fragment-reassembly negotiation tag \
+         as well as the two role tags; a native sender reads it to decide \
+         whether a payload above its per-event cap may be fragmented"
     );
     assert_eq!(
         verified.noise_pubkey.as_ref(),

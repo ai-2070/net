@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwapOption;
 use std::sync::Arc;
@@ -478,6 +478,51 @@ fn peer_supports_ack_ranges(
         .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
     cache.insert(node_id, (supports, Instant::now()));
     supports
+}
+
+/// Capability gate for outbound stream fragmentation
+/// (`S5_R5_BRIEF.md` §4): may this node split one over-cap stream
+/// event into a fragment group for `node_id` at `addr`?
+///
+/// **Two factors, and neither is redundant.**
+///
+/// * The peer must advertise
+///   [`FRAGMENT_REASSEMBLY_TAG`](super::behavior::capability::FRAGMENT_REASSEMBLY_TAG).
+///   A peer that does not reassemble would be handed N partial
+///   events as if each were a message, which is why the refusal at
+///   [`protocol::MAX_EVENT_SIZE`] stays exactly where it was for it.
+/// * The resolved address must be RTC. The native receive arm —
+///   `MeshNode::reassemble_rtc_fragments` — is confined to
+///   `PeerAddr::Rtc` sources on purpose (widening it would put a map
+///   lookup on the datagram hot path for a case that cannot occur
+///   there), so the tag alone is not enough: the same peer reached
+///   over UDP does **not** reassemble, whatever it advertises. The
+///   sender owns that distinction because the sender is the one
+///   choosing the transport.
+///
+/// No cache, unlike [`peer_supports_ack_ranges`]: that gate is asked
+/// at up to 1 kHz per session by the grant drainer, this one at most
+/// once per over-cap event — a send that is already about to put at
+/// least 8 KiB on the wire. One fold read there is free, and it
+/// removes a cache-invalidation surface rather than adding one.
+fn peer_reassembles_fragments(
+    capability_fold: &super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+    node_id: u64,
+    addr: &PeerAddr,
+) -> bool {
+    #[cfg(feature = "webrtc")]
+    let over_rtc = matches!(addr, PeerAddr::Rtc(_));
+    #[cfg(not(feature = "webrtc"))]
+    let over_rtc = {
+        let _ = addr;
+        false
+    };
+    if !over_rtc {
+        return false;
+    }
+    super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
+        .iter()
+        .any(|t| t == super::behavior::capability::FRAGMENT_REASSEMBLY_TAG)
 }
 
 /// Drop `ack_ranges_peer_cache` entries not refreshed within
@@ -12275,6 +12320,18 @@ pub struct MeshNode {
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Monotonic allocator for the `fragment_id` this node stamps on
+    /// the groups its stream sender emits (`S5_R5_BRIEF.md` §4).
+    ///
+    /// A group id only has to be unique among the groups one session
+    /// holds open at once, and a receiver bounds that at
+    /// `MAX_GROUPS_PER_SESSION`; one mesh-wide counter is therefore
+    /// strictly finer-grained than per-session ids would be, without
+    /// a per-session map to retire. Wraps past `u16::MAX` and never
+    /// yields 0 — the same discipline as the leaf's
+    /// `next_fragment_id`, so a group id is never the "unfragmented"
+    /// default an unstamped header carries.
+    fragment_id_counter: AtomicU32,
     /// Per PERF_AUDIT §4.1: generation-keyed snapshot of synthesized
     /// `Arc<CapabilitySet>` per node, shared with `DispatchCtx` so
     /// the per-packet greedy admission path (and other hot callers)
@@ -14082,6 +14139,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            fragment_id_counter: AtomicU32::new(1),
             #[cfg(feature = "dataforts")]
             capability_set_cache,
             reservation_fold,
@@ -29000,6 +29058,16 @@ impl MeshNode {
                     // allocation + full-packet memcpy per
                     // retransmit. Loss-path only, but the burst
                     // fires exactly when the link is stressed.
+                    // A rebuild is a second build, and the fragment
+                    // stamp is one-shot: restamp it from the
+                    // descriptor or the recovered piece arrives with
+                    // `frag_flags == 0` and is delivered as a whole
+                    // event — a partial payload handed to the peer's
+                    // application, which is precisely the failure
+                    // reassembly exists to prevent.
+                    if let Some(f) = d.fragment {
+                        builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                    }
                     let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                     packets.push(p);
                 }
@@ -30811,6 +30879,12 @@ impl MeshNode {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
                     for d in due {
+                        // Same one-shot restamp as the NACK path:
+                        // a rebuilt piece without its fragment
+                        // header is a partial payload at the peer.
+                        if let Some(f) = d.fragment {
+                            builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                        }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                         if sink.send(&packet, addr).await.is_ok() {
                             control_stats
@@ -41515,6 +41589,23 @@ impl MeshNode {
                 caps
             };
 
+            // Stage 5 ruling 4: advertise that this node's stream
+            // receive path reassembles leaf fragment groups, so a
+            // peer may send an over-cap stream event to us instead
+            // of refusing it typed.
+            //
+            // NOT config-gated, and that is deliberate: the RTC
+            // ingress reassembles unconditionally (there is no knob
+            // that turns `reassemble_rtc_fragments` off), so a flag
+            // here would let an operator withdraw a claim that is
+            // still true and cost peers a capability this node does
+            // in fact have. The `webrtc` cfg IS the condition —
+            // without it there is no RTC ingress and nothing
+            // reassembles.
+            #[cfg(feature = "webrtc")]
+            let caps =
+                caps.add_tag(super::behavior::capability::FRAGMENT_REASSEMBLY_TAG.to_string());
+
             // Stage 4a §11 tags. `transport:rtc` is how a peer
             // learns it can take a DataChannel with us — the
             // classifier reads it and returns `PairAction::Ice`
@@ -44584,44 +44675,91 @@ impl MeshNode {
     /// against (R12) — the handle is inert for good, and the stream id
     /// it names may be live on the successor with a different config.
     ///
-    /// Returns [`StreamError::EventTooLarge`] when any single event in
-    /// `events` exceeds [`protocol::MAX_EVENT_SIZE`], and returns it
-    /// **before the peer is even resolved** — nothing is enqueued and
-    /// no packet of the call reaches the wire.
+    /// Returns [`StreamError::EventTooLarge`] when a single event in
+    /// `events` is one this stream cannot carry to *this* peer.
+    /// Nothing is enqueued and no packet of the call reaches the
+    /// wire, and the `limit` it names is the bound that applied:
     ///
-    /// This is the *only* honest disposition, and it is deliberately
-    /// not fragmentation. The batching loop below splits a batch
-    /// across packets, but it cannot split one event, and no native
-    /// send path stamps `frag_flags`: the only producer in the tree
-    /// that fragments is the browser leaf's `frame` module. Pre-repair
-    /// this path built an over-cap packet anyway, whose `payload_len`
-    /// no receiver accepts — every native receive path reads into a
-    /// `MAX_PACKET_SIZE` buffer and `NetHeader::validate` refuses an
-    /// over-cap length — so the call returned `Ok` and the bytes were
-    /// never delivered anywhere. Fragmenting here instead would be
-    /// worse: a native peer has no reassembly arm (only the RTC
-    /// ingress and the browser leaf do), so its application would be
-    /// handed N partial events as if each were a message. A refusal
-    /// that names the limit is discoverable; `Ok` plus silence is not.
+    /// * [`protocol::MAX_EVENT_SIZE`] (8 104) for a peer that does
+    ///   not reassemble fragments — which is every UDP peer and
+    ///   every RTC peer that has not advertised
+    ///   [`FRAGMENT_REASSEMBLY_TAG`](super::behavior::capability::FRAGMENT_REASSEMBLY_TAG).
+    ///   Unchanged, including for a peer that is not connected at
+    ///   all: the gate below cannot resolve, so the refusal is the
+    ///   same one this path has always returned.
+    /// * [`protocol::MAX_FRAGMENTED_EVENT_SIZE`] (64 832) for a peer
+    ///   that does — the fragmentation ceiling, refused before the
+    ///   FIRST piece exists rather than after some of the group is
+    ///   already on the wire.
+    ///
+    /// **Why the refusal survives at all** (Stage 5 ruling 4
+    /// qualified it; it did not delete it). The batching loop below
+    /// splits a batch across packets; splitting one EVENT is
+    /// fragmentation, and fragmenting toward a peer with no
+    /// reassembly arm hands its application N partial events as if
+    /// each were a message. That reasoning is intact — it is now the
+    /// justification for the gate instead of for a blanket refusal.
+    /// Pre-repair this path built an over-cap packet anyway, whose
+    /// `payload_len` no receiver accepts — every native receive path
+    /// reads into a `MAX_PACKET_SIZE` buffer and
+    /// `NetHeader::validate` refuses an over-cap length — so the
+    /// call returned `Ok` and the bytes were never delivered
+    /// anywhere. A refusal that names the limit is discoverable;
+    /// `Ok` plus silence is not.
+    ///
+    /// **The group's sequences are contiguous within one call.** A
+    /// fragment group's pieces take consecutive sequences in offset
+    /// order, because that is the rule the receiver holds a group to
+    /// (`rtc/fragment.rs`, NR6). Two concurrent `send_on_stream`
+    /// calls on one stream already interleave their packets — this
+    /// function guarantees ordering *within* a call and never across
+    /// calls — so a caller that does that while one call fragments
+    /// gets its group refused typed at the receiver and reported as
+    /// an abandoned group, rather than mixed into a payload. Loud,
+    /// attributable, and the same scope of guarantee batching
+    /// already had.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
         events: &[Bytes],
     ) -> Result<(), StreamError> {
-        // Refused before any state is touched, so the answer is the
-        // same whether or not the peer is connected: this is a
-        // property of the caller's bytes, not of the session. Checked
-        // over the WHOLE slice up front — the batching loop flushes
-        // as it goes, so validating inline would put the events
-        // before the offending one on the wire and then report a
-        // failure, which is exactly the partial delivery the typed
-        // refusal exists to prevent.
-        if let Some(event) = events.iter().find(|e| e.len() > protocol::MAX_EVENT_SIZE) {
-            return Err(StreamError::EventTooLarge {
-                size: event.len(),
-                limit: protocol::MAX_EVENT_SIZE,
-            });
-        }
+        // Checked over the WHOLE slice up front — the batching loop
+        // flushes as it goes, so validating inline would put the
+        // events before the offending one on the wire and then
+        // report a failure, which is exactly the partial delivery
+        // the typed refusal exists to prevent.
+        let fragmenting = match events.iter().find(|e| e.len() > protocol::MAX_EVENT_SIZE) {
+            None => false,
+            Some(oversize) => {
+                // The gate needs the RESOLVED address, so it reads
+                // the peer map — but it touches no send state and
+                // clones no session, so an unresolvable peer simply
+                // cannot reassemble and gets the refusal this path
+                // has always returned.
+                let node_id = stream.peer_node_id();
+                let reassembles = self.peers.get(&node_id).is_some_and(|peer| {
+                    peer_reassembles_fragments(&self.capability_fold, node_id, &peer.addr())
+                });
+                if !reassembles {
+                    return Err(StreamError::EventTooLarge {
+                        size: oversize.len(),
+                        limit: protocol::MAX_EVENT_SIZE,
+                    });
+                }
+                // The ceiling, refused at the first piece: there is
+                // no first piece yet, so nothing partial can exist.
+                if let Some(over_ceiling) = events
+                    .iter()
+                    .find(|e| e.len() > protocol::MAX_FRAGMENTED_EVENT_SIZE)
+                {
+                    return Err(StreamError::EventTooLarge {
+                        size: over_ceiling.len(),
+                        limit: protocol::MAX_FRAGMENTED_EVENT_SIZE,
+                    });
+                }
+                true
+            }
+        };
 
         let peer = self
             .peers
@@ -44713,6 +44851,43 @@ impl MeshNode {
         let mut committed_any = false;
 
         for event in events {
+            // An over-cap event is its own message and its own
+            // group: it never shares a packet with a neighbour, so
+            // whatever is pending flushes first and ordering within
+            // the call is preserved.
+            if fragmenting && event.len() > protocol::MAX_EVENT_SIZE {
+                if !current_batch.is_empty() {
+                    self.flush_stream_batch(
+                        &session,
+                        &mut builder,
+                        stream,
+                        stream_id,
+                        peer_addr,
+                        scheduled,
+                        flags,
+                        &current_batch,
+                        current_size,
+                        None,
+                        &mut committed_any,
+                    )
+                    .await?;
+                    current_batch.clear();
+                    current_size = 0;
+                }
+                self.flush_stream_fragment_group(
+                    &session,
+                    &mut builder,
+                    stream,
+                    stream_id,
+                    peer_addr,
+                    scheduled,
+                    flags,
+                    event,
+                    &mut committed_any,
+                )
+                .await?;
+                continue;
+            }
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
                 self.flush_stream_batch(
@@ -44725,6 +44900,7 @@ impl MeshNode {
                     flags,
                     &current_batch,
                     current_size,
+                    None,
                     &mut committed_any,
                 )
                 .await?;
@@ -44746,6 +44922,7 @@ impl MeshNode {
                 flags,
                 &current_batch,
                 current_size,
+                None,
                 &mut committed_any,
             )
             .await?;
@@ -44797,6 +44974,13 @@ impl MeshNode {
         flags: PacketFlags,
         batch: &[Bytes],
         batch_size: usize,
+        // `fragment` is the stamp this packet carries when it is one
+        // piece of a group: stamped one-shot on the build below and
+        // kept on the retransmit descriptor so a rebuild restamps
+        // it. A rebuilt piece with `frag_flags == 0` would reach the
+        // peer as a whole event and be handed to its application as
+        // a partial payload.
+        fragment: Option<net_wire::reliability::FragmentStamp>,
         committed_any: &mut bool,
     ) -> Result<(), StreamError> {
         // Charge the **wire size** (Net header + AEAD tag + payload)
@@ -44841,6 +45025,11 @@ impl MeshNode {
                 TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 TxAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
             };
+            // The stamp is one-shot: `build` consumes it, so it is
+            // set inside the retry loop and re-set on every attempt.
+            if let Some(f) = fragment {
+                builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+            }
             let packet = builder.build(stream_id, seq, batch, flags);
             match self
                 .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
@@ -44855,6 +45044,7 @@ impl MeshNode {
                         seq,
                         batch,
                         flags,
+                        fragment,
                     );
                     *committed_any = true;
                     return Ok(());
@@ -44911,6 +45101,7 @@ impl MeshNode {
         seq: u64,
         events: &[Bytes],
         flags: PacketFlags,
+        fragment: Option<net_wire::reliability::FragmentStamp>,
     ) {
         if !flags.contains(PacketFlags::RELIABLE) {
             return;
@@ -44920,10 +45111,115 @@ impl MeshNode {
             stream_id,
             events: events.to_vec(),
             flags,
+            fragment,
         });
         if let Some(state) = session.try_stream(stream_id) {
             if state.epoch() == epoch {
                 state.with_reliability(|r| r.on_send(descriptor));
+            }
+        }
+    }
+
+    /// Emit one over-cap stream event as a fragment group
+    /// (`S5_R5_BRIEF.md` §4). **The new seam this round adds.**
+    ///
+    /// It is a new function rather than a call into
+    /// `rtc/fragment.rs` because that module is the RECEIVER: it
+    /// owns group provenance, the abandonment ledger, the session
+    /// byte budget and the TTL, and has no notion of credit,
+    /// sequences, backpressure or a socket. The two halves share
+    /// what must not drift — the flag bits, the per-piece cap and
+    /// the ceiling, all from `net_wire::protocol` — and nothing
+    /// else. Writing this as a second reassembler would have been
+    /// the defect the brief forbids; writing it as a sender is the
+    /// missing half.
+    ///
+    /// The emission is the leaf's, piece for piece
+    /// (`leaf/src/frame.rs::split_payload` +
+    /// `leaf/src/session.rs::build_packets`): cut at
+    /// [`protocol::MAX_EVENT_SIZE`], `FRAG_FRAGMENTED` on every
+    /// piece and `FRAG_LAST` on the last, one `fragment_id` for the
+    /// group, and consecutive sequences allocated in offset order —
+    /// which is the sequence-ownership rule the receiver holds a
+    /// group to (round 4's mode boundary: the head's sequence is the
+    /// group's, the tail's are consumed by reassembly). Each piece
+    /// is admitted, delivered and registered for retransmit by
+    /// [`Self::flush_stream_batch`], so credit, the #19 atomicity
+    /// rule and the reliable window are the ones already in force —
+    /// no second admission path.
+    ///
+    /// A fire-and-forget group is lossy by construction: its pieces
+    /// register no descriptor, so a lost piece leaves the group
+    /// incomplete, the receiver reaps it on its TTL, and the stream
+    /// survives (`dispose_abandoned_groups`' reliable guard, R3-4).
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_stream_fragment_group(
+        &self,
+        session: &Arc<NetSession>,
+        builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
+        stream: &Stream,
+        stream_id: u64,
+        peer_addr: PeerAddr,
+        scheduled: bool,
+        flags: PacketFlags,
+        event: &Bytes,
+        committed_any: &mut bool,
+    ) -> Result<(), StreamError> {
+        use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
+
+        debug_assert!(
+            event.len() > protocol::MAX_EVENT_SIZE
+                && event.len() <= protocol::MAX_FRAGMENTED_EVENT_SIZE,
+            "send_on_stream decided the size disposition before any piece \
+             existed; reaching here outside the fragmentable band means that \
+             decision was bypassed"
+        );
+        let fragment_id = self.next_fragment_id();
+        let mut offset = 0usize;
+        while offset < event.len() {
+            let end = (offset + protocol::MAX_EVENT_SIZE).min(event.len());
+            let last = end == event.len();
+            let piece = event.slice(offset..end);
+            let stamp = net_wire::reliability::FragmentStamp {
+                fragment_id,
+                // The ceiling and `MAX_FRAGMENTS_PER_GROUP` are
+                // asserted at compile time to keep every start
+                // offset inside the header's u16, and the band
+                // assertion above keeps this event inside them.
+                fragment_offset: offset as u16,
+                frag_flags: FRAG_FRAGMENTED | if last { FRAG_LAST } else { 0 },
+            };
+            self.flush_stream_batch(
+                session,
+                builder,
+                stream,
+                stream_id,
+                peer_addr,
+                scheduled,
+                flags,
+                std::slice::from_ref(&piece),
+                EventFrame::LEN_SIZE + piece.len(),
+                Some(stamp),
+                committed_any,
+            )
+            .await?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    /// The next `fragment_id` this node's sender stamps.
+    ///
+    /// Never 0, because 0 is what an unstamped header carries and a
+    /// group must not share an id with "no group". Wraps at
+    /// `u16::MAX` back to 1 — the same discipline as the leaf's
+    /// `next_fragment_id`.
+    fn next_fragment_id(&self) -> u16 {
+        loop {
+            let raw = self.fragment_id_counter.fetch_add(1, Ordering::Relaxed);
+            let id = (raw % (u16::MAX as u32 + 1)) as u16;
+            if id != 0 {
+                return id;
             }
         }
     }

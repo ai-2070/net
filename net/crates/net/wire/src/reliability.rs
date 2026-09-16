@@ -78,6 +78,28 @@ impl StreamMode {
     }
 }
 
+/// The header's fragment fields, as stamped on the original send.
+///
+/// `fragment_id`, `fragment_offset` and `frag_flags` are one-shot on
+/// [`PacketBuilder::set_fragment`](crate::pool::PacketBuilder::set_fragment):
+/// they are consumed by the build that carries them. A rebuild is a
+/// second build, so a descriptor that does not carry them rebuilds
+/// the piece with `frag_flags == 0` — a packet the receiver treats
+/// as a whole event and hands its application as a partial payload.
+/// That is why this rides the descriptor rather than a side table
+/// keyed by `(stream_id, seq)`: the stamp's lifetime IS the
+/// descriptor's, and a second lifetime to keep in step with it is
+/// the leak shape the leaf's own stamp table had to be repaired for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FragmentStamp {
+    /// Group id within the session.
+    pub fragment_id: u16,
+    /// Byte offset of this piece inside the whole event.
+    pub fragment_offset: u16,
+    /// Raw `frag_flags` — see `protocol::FRAG_FRAGMENTED`.
+    pub frag_flags: u8,
+}
+
 /// Pre-encryption inputs needed to rebuild a packet for
 /// retransmission.
 ///
@@ -101,6 +123,10 @@ pub struct RetransmitDescriptor {
     pub events: Vec<Bytes>,
     /// Packet flags as stamped on the original send.
     pub flags: PacketFlags,
+    /// The fragment stamp to restamp on a rebuild, or `None` for an
+    /// unfragmented packet (which is every packet no fragmenting
+    /// producer built).
+    pub fragment: Option<FragmentStamp>,
 }
 
 /// Trait for reliability mode implementations.
@@ -1573,6 +1599,7 @@ mod tests {
             stream_id: 0,
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         })
     }
 
@@ -2646,18 +2673,21 @@ mod tests {
             stream_id: 7,
             events: events_a.clone(),
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 1,
             stream_id: 7,
             events: events_b.clone(),
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 2,
             stream_id: 7,
             events: events_c.clone(),
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         }));
 
         // NACK seq=1.
@@ -2718,6 +2748,7 @@ mod tests {
             stream_id: 7,
             events: vec![Bytes::from_static(b"event-A")],
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         });
         let original_ptr = Arc::as_ptr(&original);
         mode.on_send(Arc::clone(&original));

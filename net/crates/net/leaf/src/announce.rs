@@ -72,6 +72,18 @@ pub const TAG_LEAF: &str = "leaf";
 /// The transport tag §7 requires on a leaf's announcement.
 pub const TAG_TRANSPORT_RTC: &str = "transport:rtc";
 
+/// The transport-negotiation tag that tells a native sender this leaf
+/// reassembles fragment groups, so a stream payload above the native
+/// per-event cap may be cut into pieces instead of refused
+/// (`§14.4`, owner ruling 2026-09-16). It mirrors the core's
+/// `FRAGMENT_REASSEMBLY_TAG` and must keep the same string.
+///
+/// Announced unconditionally, and that is not a shortcut: `frame::
+/// Reassembler` is always on the leaf's receive path, so this is
+/// never a claim the leaf could fail to honour. A conditional tag
+/// would be a capability that depends on state a peer cannot see.
+pub const TAG_FRAGMENT_REASSEMBLY: &str = "net.stream.fragment_reassembly@1";
+
 /// Default announcement TTL, in seconds. The same 300 the core's
 /// fixtures pin.
 pub const DEFAULT_TTL_SECS: u32 = 300;
@@ -229,6 +241,7 @@ pub fn build_announcement(
     let mut tags: Vec<String> = capabilities.to_vec();
     tags.push(TAG_LEAF.to_string());
     tags.push(TAG_TRANSPORT_RTC.to_string());
+    tags.push(TAG_FRAGMENT_REASSEMBLY.to_string());
     tags.sort_unstable();
     tags.dedup();
 
@@ -627,10 +640,14 @@ mod tests {
             verified.capabilities,
             vec![
                 "leaf".to_string(),
+                "net.stream.fragment_reassembly@1".to_string(),
                 "stage5.browser".to_string(),
                 "transport:rtc".to_string()
             ],
-            "tags must be sorted, and the two role tags are not optional"
+            "tags must be sorted, and neither the two role tags nor the \
+             fragment-reassembly negotiation tag is optional: a native \
+             sender reads the last one to decide whether a payload above \
+             its per-event cap may be fragmented instead of refused"
         );
         assert_eq!(
             verified.noise_pubkey.as_ref(),

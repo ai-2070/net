@@ -2,7 +2,8 @@
 //!
 //! # Why the native side has to do this
 //!
-//! A browser leaf cannot put more than [`MAX_PAYLOAD_SIZE`] bytes in
+//! A browser leaf cannot put more than
+//! [`MAX_PAYLOAD_SIZE`](net_wire::protocol::MAX_PAYLOAD_SIZE) bytes in
 //! one Net packet — `NetHeader::validate` refuses it on arrival — so
 //! it fragments, stamping `fragment_id`, `fragment_offset` and
 //! `frag_flags` on each piece. Those three fields have always been
@@ -18,6 +19,19 @@
 //! accepts request bodies up to `MAX_ENROLL_BODY_BYTES`, which
 //! exceeds one packet before nRPC framing is added, so the very
 //! first thing a leaf says to an anchor can need this.
+//!
+//! # This module is the RECEIVER, and only the receiver
+//!
+//! Since Stage 5's fourth ruling there are two fragmenting
+//! producers, not one: the leaf, and `MeshNode::
+//! flush_stream_fragment_group` for a peer that advertises
+//! `FRAGMENT_REASSEMBLY_TAG`. Neither lives here. What the two ends
+//! share is exactly the vocabulary that must not drift —
+//! [`FRAG_FRAGMENTED`], [`FRAG_LAST`], the per-piece cap and
+//! [`MAX_REASSEMBLED_BYTES`], all defined once in
+//! `net_wire::protocol` — and nothing else: a sender owns credit,
+//! sequences and backpressure, and this module owns provenance, the
+//! abandonment ledger, the session byte budget and the TTL.
 //!
 //! # What is bounded, and by what
 //!
@@ -98,7 +112,9 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use net_wire::protocol::{NetHeader, FRAG_FRAGMENTED, FRAG_LAST, MAX_PAYLOAD_SIZE};
+use net_wire::protocol::{
+    NetHeader, FRAG_FRAGMENTED, FRAG_LAST, MAX_FRAGMENTED_EVENT_SIZE, MAX_FRAGMENTS_PER_GROUP,
+};
 
 use super::MAX_PROVISIONAL_STREAM_BYTES;
 
@@ -110,13 +126,20 @@ use super::MAX_PROVISIONAL_STREAM_BYTES;
 /// unbounded state.
 pub const MAX_GROUPS_PER_SESSION: usize = 8;
 
-/// Pieces one group may hold. The leaf refuses to emit more, so a
-/// group claiming more is malformed.
-pub const MAX_PIECES_PER_GROUP: usize = 8;
+/// Pieces one group may hold. Both fragmenting producers — the leaf
+/// and the native stream sender — refuse to emit more, so a group
+/// claiming more is malformed.
+pub const MAX_PIECES_PER_GROUP: usize = MAX_FRAGMENTS_PER_GROUP;
 
-/// Largest payload a group may reassemble to: eight full packets'
-/// worth, which is the leaf's `MAX_FRAGMENTED_PAYLOAD`.
-pub const MAX_REASSEMBLED_BYTES: usize = MAX_PAYLOAD_SIZE * MAX_PIECES_PER_GROUP;
+/// Largest payload a group may reassemble to.
+///
+/// The wire crate's [`MAX_FRAGMENTED_EVENT_SIZE`] — eight events of
+/// `MAX_EVENT_SIZE` — which is what a conformant producer can
+/// actually emit. This used to be derived here as
+/// `MAX_PAYLOAD_SIZE * 8`, 32 bytes ABOVE that: a ceiling no
+/// producer could reach, so the receiver and the two senders were
+/// carrying two different numbers for one bound.
+pub const MAX_REASSEMBLED_BYTES: usize = MAX_FRAGMENTED_EVENT_SIZE;
 
 /// How long an incomplete group may sit before it is reaped, and how
 /// long a retirement marker or an abandonment fence is kept.
@@ -1176,6 +1199,8 @@ impl RtcReassembly {
 
 #[cfg(test)]
 mod tests {
+    use net_wire::protocol::MAX_PAYLOAD_SIZE;
+
     use super::*;
 
     const SESSION: u64 = 0xABCD;

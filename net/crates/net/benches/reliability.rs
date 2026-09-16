@@ -22,6 +22,7 @@ fn descriptor(seq: u64) -> Arc<RetransmitDescriptor> {
         stream_id: 0,
         events: vec![Bytes::from_static(b"payload")],
         flags: PacketFlags::RELIABLE,
+        fragment: None,
     })
 }
 

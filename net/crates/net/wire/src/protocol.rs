@@ -41,17 +41,43 @@ pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
 /// This is the size a producer is actually bounded by, and it is
 /// stated here — beside the cap it derives from — because both ends
 /// of every transport need the same number. A batch of events is
-/// split across packets by the batching layer, but **one event is
-/// never split by any native send path**: nothing on the native side
-/// fragments an outbound stream event, and the only receivers that
-/// reassemble fragments at all are the browser leaf
-/// (`net-mesh-leaf`'s `frame` module) and the native RTC ingress.
-/// Every other receive path reads into a [`MAX_PACKET_SIZE`] buffer
-/// and `NetHeader::validate` refuses an over-cap `payload_len`, so an
-/// event above this bound cannot arrive anywhere — which is why
-/// `MeshNode::send_on_stream` refuses it at the sender instead of
-/// returning `Ok` for bytes that will never be delivered.
+/// split across packets by the batching layer, and **one event is
+/// split only by a fragmenting producer toward a peer that
+/// reassembles**: the browser leaf (`net-mesh-leaf`'s `frame`
+/// module) always, and the native stream sender for a peer that
+/// advertises the reassembly capability. Every other receive path
+/// reads into a [`MAX_PACKET_SIZE`] buffer and `NetHeader::validate`
+/// refuses an over-cap `payload_len`, so an event above this bound
+/// cannot arrive at a peer that does not reassemble — which is why
+/// `MeshNode::send_on_stream` refuses it at the sender for such a
+/// peer instead of returning `Ok` for bytes that will never be
+/// delivered.
 pub const MAX_EVENT_SIZE: usize = MAX_PAYLOAD_SIZE - EventFrame::LEN_SIZE;
+
+/// Pieces one fragment group may carry.
+///
+/// `fragment_offset` is a `u16` **byte** offset, so the last piece
+/// of a group can start no later than byte 65 535. Eight pieces of
+/// [`MAX_EVENT_SIZE`] is the most whose start offsets are all
+/// representable, and the compile-time assertion below pins that
+/// rather than leaving it as an implicit truncation.
+pub const MAX_FRAGMENTS_PER_GROUP: usize = 8;
+
+/// The largest event a fragmenting producer may emit and a
+/// reassembling receiver may rebuild.
+///
+/// One definition for both roles, for the same reason
+/// [`MAX_EVENT_SIZE`] is one definition: the leaf fragments up to
+/// exactly this bound and refuses above it, the native sender does
+/// the same, and the native RTC ingress refuses a group that claims
+/// more. Two derivations of this number could drift apart and turn
+/// a refusal on one side into a truncation on the other.
+pub const MAX_FRAGMENTED_EVENT_SIZE: usize = MAX_EVENT_SIZE * MAX_FRAGMENTS_PER_GROUP;
+
+// The offsets a conformant producer emits must fit the wire field.
+// A property of the two constants above, not of any input, so it is
+// checked at compile time rather than asserted at runtime.
+const _: () = assert!(MAX_EVENT_SIZE * (MAX_FRAGMENTS_PER_GROUP - 1) <= u16::MAX as usize);
 
 /// `frag_flags` bit 0: this packet carries a piece of a payload
 /// that did not fit one packet.

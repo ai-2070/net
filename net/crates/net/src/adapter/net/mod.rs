@@ -1581,6 +1581,10 @@ impl Adapter for NetAdapter {
                         stream_id,
                         events: current_batch.clone(),
                         flags,
+                        // The `on_batch` adapter path never
+                        // fragments: it splits a BATCH across
+                        // packets and never one event.
+                        fragment: None,
                     });
                     let stream = session.get_or_create_stream(stream_id);
                     stream.with_reliability(|r| r.on_send(descriptor));
@@ -1622,6 +1626,7 @@ impl Adapter for NetAdapter {
                     stream_id,
                     events: current_batch.clone(),
                     flags,
+                    fragment: None,
                 });
                 let stream = session.get_or_create_stream(stream_id);
                 stream.with_reliability(|r| r.on_send(descriptor));

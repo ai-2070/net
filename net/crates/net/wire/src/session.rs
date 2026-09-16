@@ -4961,6 +4961,7 @@ mod tests {
                 stream_id: 11,
                 events: vec![Bytes::from_static(b"x")],
                 flags: crate::protocol::PacketFlags::RELIABLE,
+                fragment: None,
             });
             state.with_reliability(|r| r.on_send(descriptor));
         }

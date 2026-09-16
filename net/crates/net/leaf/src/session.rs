@@ -649,6 +649,17 @@ impl LeafSession {
             stream_id,
             events: events.to_vec(),
             flags,
+            // `None` deliberately: the leaf does not carry its
+            // fragment stamp on the descriptor. `self.stamps` is an
+            // admission RESERVATION — `build_packets` refuses a whole
+            // message with `ReliableWindowFull` against
+            // `MAX_RETRANSMIT_STAMPS` before consuming a sequence
+            // (F3b), the cap is non-evicting since L5, and `rebuild`
+            // skips a descriptor whose reservation is gone. Folding
+            // the stamp onto the descriptor would leave that
+            // reservation with nothing to count. The field is the
+            // NATIVE sender's carrier, where no such table exists.
+            fragment: None,
         });
         let Some(stream) = self.session.try_stream(stream_id) else {
             return;
@@ -1214,6 +1225,7 @@ mod tests {
             stream_id: base,
             events: vec![Bytes::from_static(b"x")],
             flags: PacketFlags::RELIABLE,
+            fragment: None,
         });
         assert_eq!(
             leaf.rebuild(&[owned]).len(),

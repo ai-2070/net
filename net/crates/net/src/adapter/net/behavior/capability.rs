@@ -651,6 +651,36 @@ pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
 /// budgets.
 pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
 
+/// Reserved tag advertising that this node **reassembles leaf
+/// fragment groups** on its stream receive path, so a sender may
+/// split one stream event across several packets toward it
+/// (`S5_R5_BRIEF.md` §4).
+///
+/// A plain legacy tag, like [`RELAY_CAPABLE_TAG`], set via
+/// [`CapabilitySet::with_fragment_reassembly`]. Versioned in the
+/// `net.<subsystem>.<feature>@<n>` shape the transport-negotiation
+/// tags use, because it negotiates a wire behaviour rather than
+/// labelling a role.
+///
+/// **What it is not.** It confers no authority and obligates
+/// nothing: a receiver already reassembles whether or not it says
+/// so, and the tag exists for the SENDER's benefit. Without it a
+/// sender refuses an over-cap event typed
+/// (`StreamError::EventTooLarge` at
+/// [`MAX_EVENT_SIZE`](net_wire::protocol::MAX_EVENT_SIZE)), because
+/// fragmenting toward a peer that does not reassemble hands its
+/// application N partial events as if each were a message — a
+/// silent corruption where the refusal is discoverable.
+///
+/// **The tag only reaches a peer once this node actually broadcasts
+/// a capability announcement** — same caveat as
+/// `ACK_RANGES_CAPABILITY_TAG`: a node that never calls
+/// `MeshNode::announce_capabilities` (and is not on the
+/// `start_arc` reannounce loop) does not advertise it, and its
+/// peers keep refusing over-cap events toward it. That is the safe
+/// direction to fail in.
+pub const FRAGMENT_REASSEMBLY_TAG: &str = "net.stream.fragment_reassembly@1";
+
 /// Resolved scope of a capability announcement, derived from the
 /// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
 /// Pure derivation — never stored, recomputed on each query via
@@ -1202,6 +1232,18 @@ impl CapabilitySet {
     /// legacy tag; idempotent.
     pub fn with_relay_capable(self) -> Self {
         self.add_tag(RELAY_CAPABLE_TAG)
+    }
+
+    /// Advertise that this node reassembles leaf fragment groups on
+    /// its stream receive path, so peers may fragment an over-cap
+    /// stream event toward it instead of refusing it.
+    ///
+    /// Emits [`FRAGMENT_REASSEMBLY_TAG`]; idempotent. Only claim it
+    /// if the receive path really does reassemble — the native side
+    /// adds it automatically when built with the `webrtc` feature,
+    /// because that is exactly when its RTC ingress reassembles.
+    pub fn with_fragment_reassembly(self) -> Self {
+        self.add_tag(FRAGMENT_REASSEMBLY_TAG)
     }
 
     /// Add a typed `BlobCapability` projection. Emits the matching

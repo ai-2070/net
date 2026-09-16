@@ -1760,17 +1760,24 @@ and CHANGELOG as a behaviour change, in the words a consumer would
 search for, together with which of the two paths moved.
 
 **4. Is above-one-event fragmentation a Stage 5 contract, or an
-explicit bound?** Today: the leaf fragments up to a 64 832-byte
-ceiling and refuses typed above it; the native sender refuses typed
-above `MAX_EVENT_SIZE` (8 104) because no plain native receiver
-reassembles. The large-message witness proves near-ceiling delivery
-and a typed refusal — it does **not** prove successful multi-fragment
-interoperability in both directions, and the report should stop
-being read as though it did. Either that leg is supplied (native-side
-reassembly for the stream path, which is real work and a real
-decision) or the bound is written down as the accepted contract. We
-recommend writing down the bound for this stage and scoping
-reassembly separately; we have not decided it.
+explicit bound? RULED — supply the interoperability leg. Implemented
+in §14.4.** The recommendation in this item was the opposite: write
+the bound down and scope reassembly separately. The owner ruled for
+the work, and the work is done — the native stream receive path
+reassembles leaf fragment groups (which, as §14.4 records, already
+worked and is now pinned), and the native sender fragments for a peer
+advertising `net.stream.fragment_reassembly@1`.
+
+**The overstatement this item names is now retired at its source.**
+The large-message witness proved near-ceiling delivery and a typed
+refusal, and the report should have stopped being read as though it
+proved multi-fragment interoperability. It no longer needs the
+caveat: leg 3b of that witness has changed sides and now requires a
+32 KiB native → leaf payload to ARRIVE as one byte-identical event,
+counting arrivals so that a group delivered as five pieces fails. Both
+directions are witnessed, and the bound that remains — 64 832 B, one
+number now shared by both ends instead of two that differed by 32
+bytes — is a refusal, not a silence.
 
 
 ## 14. Fifth round — the four owner rulings
@@ -1917,6 +1924,31 @@ wasm32-unknown-unknown` clean. The `cross_lang_wire` fixtures that
 carry an announcement with a TTL still decode on both sides: **13
 passed, unchanged** — the ruling changes when a record is *believed*,
 not how it is *encoded*, and that distinction is why no fixture moved.
+
+### 14.2 Ruling 2 — the N4 policy, confirmed
+
+**Ruled:** owner-confirmed 2026-09-16; the version bump and release
+note are deferred to the release process.
+
+**No code.** `#[non_exhaustive]` on `StreamError` and `StreamStats`
+plus `StreamStats::empty()` were already shipped and
+reviewer-endorsed; the ruling changes their STATUS, not their
+content. The only change is §12.2's heading and status line and
+§13.7 item 2. A cosmetic code edit to make the ruling look
+implemented would have been worse than nothing.
+
+**What is deliberately not done.** Marking an existing public type
+non-exhaustive is itself a breaking change and must be versioned as
+one. The release owner handles the bump and the note when the branch
+ships.
+
+**The attribution correction stands unchanged.** §12.2 and §13.5
+record that an earlier draft attributed this decision to an owner who
+had not made it, that the policy was the implementer's choice, and
+that the reviewer endorsed it afterwards. That history is not rewritten
+now that the owner has agreed — the correction's point was that a
+judgement call must not be laundered into an instruction, and a
+later confirmation does not make the earlier attribution true.
 
 ### 14.3 Ruling 3 — a direct node's close ends its iterators
 
@@ -2079,3 +2111,168 @@ against a 250 ms timer that *fails the test* is the assertion. It
 costs no wall clock when green — the race resolves on an
 already-settled promise and the timer is cleared in `finally` (suite
 duration 353 ms green vs 596 ms with the inverse applied).
+
+### 14.4 Ruling 4 — native reassembly, and gated native fragmentation
+
+**Ruled:** supply native reassembly now. The bound-as-contract option
+is rejected. **This is core work inside a Stage 5 round by owner
+decision** — see the framing note at the head of §14.
+
+#### What was already true, established before anything was built
+
+The brief's witness (a) — leaf → native, 40 000 B, one event,
+byte-identical — was written FIRST and run against unmodified code.
+**It passed** (`a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event
+... ok`, 0.29 s).
+
+The receive leg already worked. `reassemble_rtc_fragments` (rounds
+3–4) is wired into event-plane dispatch for every RTC source, and a
+native stream receive IS that path. Reporting that honestly matters
+more than appearing to have built it: the ruling asked for a leg that
+was, for the receive direction, already standing, and the witness that
+proves it is now pinned so it cannot quietly stop being true.
+
+All genuinely new work is therefore the **send** half, plus one
+ceiling correction.
+
+#### The send half
+
+`send_on_stream` now decides a size disposition before any piece
+exists: at or under `MAX_EVENT_SIZE`, unchanged; above it, fragment
+for a peer that reassembles, refuse typed for one that does not.
+
+The gate is **two-factor and neither factor is optional**
+(`peer_reassembles_fragments`):
+
+1. the peer advertises `FRAGMENT_REASSEMBLY_TAG` in its folded
+   capability set, and
+2. the resolved peer address is `PeerAddr::Rtc`.
+
+Factor 2 is not belt-and-braces. `reassemble_rtc_fragments` returns
+early for any non-RTC source by deliberate design, so fragmenting
+toward a UDP peer that advertised the tag would hand its application N
+partial events. Reassembly is not widened to UDP in this round, so the
+sender must not pretend otherwise.
+
+The tag is `net.stream.fragment_reassembly@1`, a plain signed tag
+beside `RELAY_CAPABLE_TAG` — not a new canonical field, as the brief
+required. It confers no authority and obligates nothing: a receiver
+reassembles whether or not it says so, and the tag exists for the
+**sender's** benefit.
+
+The browser leaf advertises it unconditionally, and that is a
+deliberate choice rather than a shortcut: `frame::Reassembler` is
+always on the leaf's receive path, so the tag can never be a claim the
+leaf fails to honour. A conditional tag would be a capability
+depending on state the peer cannot see.
+
+#### The ceiling correction — a real divergence, found by building
+
+The native reassembler's ceiling was `MAX_PAYLOAD_SIZE * 8 = 64 864`;
+the leaf's producer ceiling is `MAX_EVENT_SIZE * 8 = 64 832`. **The
+two ends were carrying two different numbers**, 32 bytes apart, and
+the larger one was the receiver's — so the receiver would have
+accepted a group no conformant producer can emit. `wire/src/protocol.rs`
+now defines `MAX_FRAGMENTS_PER_GROUP` and `MAX_FRAGMENTED_EVENT_SIZE`
+once, with a compile-time assertion that the last piece's start offset
+fits the header's `u16`, and the RTC reassembler reads it. This is the
+brief's "a constant genuinely requires it" exemption, and it is the
+kind of defect that only surfaces when someone writes the other side.
+
+#### One reassembler, and where the leaf deliberately differs
+
+No second reassembler was written. New seams, named as the brief
+requires: `MeshNode::flush_stream_fragment_group`,
+`MeshNode::next_fragment_id`, `peer_reassembles_fragments`, and the
+fixtures-only `RtcTestHooks::set_ingress_drop_at` / `ingress_counted`.
+
+`RetransmitDescriptor` gained `fragment: Option<FragmentStamp>` so a
+retransmitted piece restamps its fragment header — witness (c) is what
+forced it; without it the receipt reads `Got 8104 bytes of 40000`.
+`PacketBuilder::set_fragment` remains the single stamping seam, with
+exactly three call sites in core (the fragmenting send and the two
+retransmit rebuilds).
+
+**The leaf sets `fragment: None` and keeps its own stamp table**, and
+the reason is worth recording because the tidy-looking alternative
+would have deleted two shipped repairs. The leaf's `stamps` table is
+not a duplicate stamp carrier, it is an **admission reservation**:
+`build_packets` refuses a whole message with `ReliableWindowFull`
+against `MAX_RETRANSMIT_STAMPS` before consuming a sequence (F3b), the
+cap is non-evicting since L5 repaired an eviction that stole another
+stream's ownership, and `rebuild` skips a descriptor whose reservation
+is gone. Folding the stamp onto the descriptor leaves that reservation
+with nothing to count, and `a_full_stamp_table_refuses_a_new_stream_rather_than_evicting_an_owned_one`
+along with the F3b and L5 receipts would stop meaning anything. The
+native path has no equivalent table — its admission is byte credit plus
+the reliability window — so the field is the native carrier and the
+leaf's table stays the leaf's gate. One fact per mechanism; they are
+different facts.
+
+#### `MAX_EVENT_SIZE` did not change meaning
+
+It is still the largest single event one packet carries, so **no
+Go/Node/Python typed error or parity test moves**. What becomes newly
+reachable is a second *value* in `EventTooLarge.limit` — 64 832, the
+fragmentation ceiling — and only for a peer that advertises the tag. A
+binding parity test that sends over-cap to a peer without the tag still
+observes limit 8 104, unchanged.
+
+#### The five witnesses, and what each is for
+
+In `tests/rtc_repairs.rs`, **44 → 49** (the brief said 43; 44 was the
+measured count at this head, and the discrepancy is reported rather
+than silently absorbed). All five are pinned by name in `ci.yml` with
+the floor raised 43 → 49.
+
+| witness | what it proves |
+|---|---|
+| `a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event` | (a) leaf → native, 40 000 B, one byte-identical event. Passed before the change; pinned so it stays true |
+| `a_native_sender_fragments_for_a_peer_that_advertises_reassembly` | (b) the **sender** emits a conformant group: cut at `MAX_EVENT_SIZE`, contiguous sequences in offset order, reassembled byte-identically |
+| `a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once` | (c) a lost middle piece is recovered by the existing reliability machinery and the payload arrives ONCE — the witness that forced the descriptor's stamp |
+| `a_group_over_the_ceiling_is_refused_at_the_first_piece_on_both_sides` | (d) typed refusal at the FIRST piece, never a partial |
+| `a_peer_without_the_reassembly_tag_still_gets_event_too_large` | (e) native ↔ native unchanged: no tag ⇒ typed `EventTooLarge` at 8 104 |
+
+Six raw inverse receipts accompany them (reassembly disabled, the gate
+removed, the ceiling check removed, and three narrower ones).
+
+#### Two claims this round does NOT make
+
+**(b) is not proof that a real browser leaf accepts those bytes.**
+There is no browser leaf inside `tests/rtc_repairs.rs`; (b)'s "leaf" is
+an RTC peer advertising the tag. It proves the sender emits a
+conformant group. The only witness anywhere that a **real** leaf
+reassembles what the native sender cut is the browser matrix's leg 3b,
+described below. Both are needed; neither is the other.
+
+**(e) is not proved twice.** Leg 3b used to assert the typed refusal
+native → leaf. After this ruling it asserts delivery, so it has changed
+sides, not become a second copy of (e). The "no tag ⇒ `EventTooLarge`
+at 8 104" invariant is now witnessed in exactly ONE place, (e), and
+that is stated here rather than left for a reviewer to discover by
+counting.
+
+#### The browser witness changed sides
+
+`stage5_large_messages_cross_the_public_api_in_both_directions` leg 3b
+sends 32 KiB native → leaf. It required `StreamError::EventTooLarge`;
+it now requires the payload to ARRIVE as one byte-identical event, and
+its gate counts arrivals: **a group that was never reassembled arrives
+as five pieces, not as nothing**, and every weaker check — "the bytes
+arrived", "a matching mark arrived" — would call that a pass.
+
+The round-4 comment said fragmentation "was rejected on the merits …
+fragmenting here would hand a native peer's application N partial
+events". That reasoning was never wrong, and it is preserved rather
+than deleted: it was an argument against fragmenting **blindly**, and
+it is now the gate's justification. The comment, the constant's
+rustdoc, `send_on_stream`'s own doc, and the verdict string all say so
+in those terms, because a comment that contradicts the code it sits
+above is worse than no comment.
+
+The leaf's pinned announcement fixture moved with the new tag — both
+copies and the core-side pin, in the same commit. The core-side check
+now compares against the core's own `FRAGMENT_REASSEMBLY_TAG` constant
+instead of a repeated literal: a leaf spelling the tag differently from
+the core would not produce a refusal, it would produce a silent
+fallback to the 8 104-byte cap that nothing else would notice.

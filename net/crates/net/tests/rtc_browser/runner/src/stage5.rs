@@ -162,10 +162,23 @@ const ABI_OVER_LIMIT_SIZE: usize = 96 * 1024;
 /// classifier below follows.
 const ABI_LEAF_MAX_FRAGMENTS: usize = 8;
 const ABI_LEAF_FRAG_CEILING: usize = MAX_EVENT_SIZE * ABI_LEAF_MAX_FRAGMENTS;
-/// Native → leaf on a stream, over `MAX_EVENT_SIZE`. Nothing on the
-/// native side fragments a stream event, so this is the size at which
-/// the sender must REFUSE, typed, naming the limit — the leg that
-/// used to return `Ok` and deliver nothing.
+/// Native → leaf on a stream, over `MAX_EVENT_SIZE` and under the
+/// leaf's fragmentation ceiling.
+///
+/// **This constant changed sides in round 5 (owner ruling
+/// 2026-09-16, `S5_REPORT.md` §14.4).** It used to be the size at
+/// which the native sender must REFUSE, typed, because nothing
+/// native fragmented a stream event. The native sender now fragments
+/// for a peer that advertises `net.stream.fragment_reassembly@1`, and
+/// the browser leaf advertises it unconditionally, so this is the
+/// size at which the payload must ARRIVE — one event, byte-identical,
+/// reassembled by the leaf's own `frame::Reassembler`.
+///
+/// The refusal did not disappear; it moved to the peers that still
+/// cannot reassemble, where it is witnessed natively by
+/// `a_peer_without_the_reassembly_tag_still_gets_event_too_large`.
+/// This leg is the only witness anywhere that a REAL browser leaf
+/// accepts a group the native sender cut.
 const ABI_STREAM_LARGE_SIZE: usize = 32 * 1024;
 
 /// Payloads the leader-PROXIED stream witness pushes native → leaf.
@@ -2237,23 +2250,39 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // ceiling, so "both directions" covers the stream API and
         // not only nRPC.
         //
-        // Leg 3b, now GATED as well: the same send at 32 KiB, over
-        // the per-event cap. This leg was RECORDED for one round
-        // because §9.2 stated the leaf → native direction only and
-        // gating a contract nobody had written would have been
-        // asserting an assumption. The measurement came back
-        // `Ok` + nothing delivered, and that is now repaired: the
-        // native sender refuses an event above `MAX_EVENT_SIZE`
-        // with a typed `StreamError::EventTooLarge` that NAMES the
-        // limit, before any packet of the call reaches the wire.
-        // Fragmentation was the alternative and was rejected on the
-        // merits: `send_on_stream` is transport-agnostic, only the
-        // browser leaf and the native RTC ingress reassemble, and
-        // every other receive path reads into a `MAX_PACKET_SIZE`
-        // buffer — so fragmenting here would hand a native peer's
-        // application N partial events, trading a silent drop for a
-        // silent corruption. The contract now reads the same in both
-        // directions (§9.2), so this leg gates.
+        // Leg 3b, GATED, and it now asserts the OPPOSITE outcome to
+        // the round it was written in. History, because the reason
+        // matters more than the current line:
+        //
+        // The leg was first RECORDED because §9.2 stated the
+        // leaf → native direction only, and gating a contract nobody
+        // had written would have been asserting an assumption. The
+        // measurement came back `Ok` + nothing delivered — a silent
+        // drop — and round 4 repaired that into a typed
+        // `StreamError::EventTooLarge` naming the limit before any
+        // packet reached the wire. Fragmentation was considered then
+        // and rejected, with this reason: `send_on_stream` is
+        // transport-agnostic, only the browser leaf and the native
+        // RTC ingress reassemble, so fragmenting unconditionally
+        // would hand a native peer's application N partial events —
+        // trading a silent drop for a silent corruption.
+        //
+        // **That reason was never wrong, and it is why this leg's
+        // outcome is now the other one** (owner ruling 2026-09-16,
+        // §14.4). It was an argument against fragmenting BLINDLY, not
+        // against fragmenting. The native sender now fragments only
+        // for a peer that advertises `net.stream.fragment_reassembly@1`
+        // in its signed announcement, and the browser leaf advertises
+        // it unconditionally because `frame::Reassembler` is always on
+        // its receive path. So at 32 KiB this send SUCCEEDS and the
+        // payload arrives as one byte-identical event.
+        //
+        // For a peer that does not advertise the tag the refusal is
+        // unchanged at `MAX_EVENT_SIZE`, which is the case the old
+        // reason describes and which is witnessed natively by
+        // `a_peer_without_the_reassembly_tag_still_gets_event_too_large`
+        // — the ONLY witness for it, now that this leg has changed
+        // sides.
         //
         // BOTH legs ride a stream of their OWN
         // (`ABI_LARGE_STREAM_ID`), opened here, used by nothing
@@ -2295,9 +2324,12 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let want_stream_large = Mark::of(&stream_large);
         let mut ceiling_send_error: Option<String> = None;
         let mut stream_large_error: Option<String> = None;
-        // The TYPED refusal, not its Display form: a stringly-typed
-        // check would pass on any error at all, including the
-        // transport faults this leg must not accept.
+        // A refusal here is now a FAILURE, so the typed form is still
+        // captured rather than collapsed to a string: if the gate
+        // regresses, the verdict should be able to say whether the
+        // sender refused with `EventTooLarge` (the tag was not seen)
+        // or died some other way (a transport fault), and those want
+        // different repairs.
         let mut stream_large_refusal: Option<(usize, usize)> = None;
         if let Ok(stream) = &large_native {
             let at_ceiling = Bytes::from(stream_ceiling.clone());
@@ -2323,19 +2355,20 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             ceiling_send_error = Some("the anchor never opened the large-message stream".into());
             stream_large_error = ceiling_send_error.clone();
         }
-        // Exactly ONE payload is expected on this stream, so the wait
-        // ends as soon as it arrives — a condition, not a nap, and a
-        // ceiling that still FAILS if it never comes. The settle
-        // below is what catches a regression that put the over-cap
-        // payload on the wire after all: a second read once the link
-        // has gone quiet.
+        // TWO payloads are expected on this stream now — the ceiling
+        // one and the fragmented 32 KiB one — so the wait ends as
+        // soon as both arrive: a condition, not a nap, and one that
+        // still FAILS if the second never comes. The settle below
+        // then catches the regression this leg most needs to see: a
+        // fragment group delivered as PIECES, which shows up as a
+        // third arrival once the link has gone quiet.
         let ceiling_wait = script
             .run(
                 "a",
                 Step5::StreamInbox {
                     id: 0,
                     handle: "large".into(),
-                    expect: 1,
+                    expect: 2,
                     timeout_ms: 30_000,
                 },
             )
@@ -2347,7 +2380,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 Step5::StreamInbox {
                     id: 0,
                     handle: "large".into(),
-                    expect: 1,
+                    expect: 2,
                     timeout_ms: 5_000,
                 },
             )
@@ -2358,54 +2391,69 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         let large_waited = stat_u64(&ceiling_wait, "waited_ms");
         let large_terminal = stat_str(&large_inbox, "iterator_ended");
         let large_sender = sender_ledger(cx.anchor, node_id, ABI_LARGE_STREAM_ID);
-        // GATED: the ceiling payload must be the FIRST — and, with
-        // this stream carrying nothing else, the only — payload to
+        // GATED: the ceiling payload must be the FIRST payload to
         // arrive, byte-exact, on both consumers.
         let large_open_ok = large_open.ok;
         let stream_down = large_open_ok
             && ceiling_send_error.is_none()
             && extra.first() == Some(&want_stream_ceiling)
             && extra_iter.first() == Some(&want_stream_ceiling);
-        // GATED: the over-cap send is refused TYPED, the error names
-        // BOTH the offending size and the limit, and nothing beyond
-        // the ceiling payload ever arrives on either consumer. An
-        // `Ok` with nothing delivered, a truncation, and a late
-        // delivery each fail here.
-        let over_cap_refused = stream_large_refusal
-            == Some((ABI_STREAM_LARGE_SIZE, MAX_EVENT_SIZE))
-            && extra.len() == 1
-            && extra_iter.len() == 1;
-        // Each branch says what was actually OBSERVED. The old
-        // wording claimed "something else also arrived" for every
-        // failure that still had the typed refusal, so the round
-        // where NOTHING arrived — the ceiling payload included —
-        // was reported as a surplus when it was a shortfall, and
-        // read as a defect in the refusal rather than in delivery.
+        // GATED, and this is the leg that changed sides in round 5:
+        // the 32 KiB send must SUCCEED and arrive as exactly ONE
+        // byte-identical event on both consumers.
+        //
+        // `extra.len() == 2` is doing the load-bearing work here, and
+        // it is not a count for its own sake: the failure this leg
+        // exists to catch is reassembly that never happened, which
+        // delivers the payload as five pieces rather than not at all.
+        // Five pieces would satisfy "the bytes arrived somewhere" and
+        // even "a mark matching the tail arrived"; only the count
+        // refuses it. Byte-exactness on BOTH consumers then refuses a
+        // group reassembled in the wrong order, which would arrive as
+        // one event of the right length and the wrong content.
+        let over_cap_delivered = stream_large_error.is_none()
+            && extra.get(1) == Some(&want_stream_large)
+            && extra_iter.get(1) == Some(&want_stream_large)
+            && extra.len() == 2
+            && extra_iter.len() == 2;
+        // Each branch says what was actually OBSERVED, and after the
+        // side change the interesting failures are new ones: a
+        // refusal (the tag was not read), and a delivery that arrived
+        // in PIECES (the leaf never reassembled). Both would have
+        // been invisible to the old wording, which had no vocabulary
+        // for anything but a refusal.
         let arrived = extra.len().max(extra_iter.len());
-        let over_cap_outcome = if over_cap_refused {
-            "REFUSED at the native sender, typed, naming the limit, and nothing arrived".to_string()
-        } else if stream_large_refusal.is_some() && arrived == 0 {
-            "REFUSED typed, but the CEILING payload never arrived either — nothing at all \
-             was delivered on this stream, so the failure is in delivery, not in the \
-             refusal"
-                .to_string()
-        } else if stream_large_refusal.is_some() && extra.iter().any(|m| *m == want_stream_large) {
-            "REFUSED typed at the sender, yet the over-cap payload ARRIVED — two senders \
-             disagree about the cap"
-                .to_string()
-        } else if stream_large_refusal.is_some() {
+        let over_cap_outcome = if over_cap_delivered {
             format!(
-                "REFUSED typed, but {arrived} payload(s) arrived where exactly one (the \
-                 ceiling) was due"
+                "DELIVERED as ONE byte-identical {ABI_STREAM_LARGE_SIZE} B event on both \
+                 consumers — the native sender fragmented and the leaf reassembled"
+            )
+        } else if stream_large_refusal == Some((ABI_STREAM_LARGE_SIZE, MAX_EVENT_SIZE)) {
+            "REFUSED with EventTooLarge at MAX_EVENT_SIZE — the sender did not see this \
+             leaf's reassembly tag, so the capability gate, the announcement or the fold \
+             is broken, NOT the fragmenter"
+                .to_string()
+        } else if let Some((size, limit)) = stream_large_refusal {
+            format!(
+                "REFUSED with EventTooLarge naming size={size} limit={limit} — a refusal \
+                 this leg does not expect at all, and not the per-event cap either"
             )
         } else if stream_large_error.is_some() {
-            "refused with the WRONG error — not EventTooLarge".to_string()
-        } else if extra.iter().any(|m| *m == want_stream_large) {
-            "ACCEPTED and delivered byte-exact — the sender no longer refuses".to_string()
-        } else if arrived > 1 {
-            "ACCEPTED and something OTHER than the payload arrived — a truncation".to_string()
+            format!("refused with the WRONG error — not EventTooLarge: {stream_large_error:?}")
+        } else if arrived > 2 {
+            format!(
+                "ACCEPTED, but {arrived} payloads arrived where 2 were due — the group was \
+                 delivered as PIECES, which is reassembly that did not happen rather than \
+                 a transport fault"
+            )
+        } else if arrived == 2 {
+            "ACCEPTED and two payloads arrived, but not byte-identical to what was sent — \
+             a group reassembled in the wrong order, or a truncation"
+                .to_string()
         } else {
-            "ACCEPTED with Ok and NOTHING arrived — the silent drop is back".to_string()
+            "ACCEPTED with Ok and the over-cap payload NEVER arrived — the silent drop is \
+             back, now behind the fragmenter"
+                .to_string()
         };
 
         ledger.record(
@@ -2415,16 +2463,20 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 && reply_down
                 && refused_typed
                 && stream_down
-                && over_cap_refused,
+                && over_cap_delivered,
             format!(
                 "LARGE MESSAGES THROUGH THE PUBLIC API, BOTH DIRECTIONS — measured against \
-                 the interoperability §9.2 claims, in BOTH directions. (§9.2: no NATIVE \
-                 node reassembles leaf fragments, so leaf → native above MAX_EVENT_SIZE = \
-                 {MAX_EVENT_SIZE} B is not put back together, and above 64 832 B the leaf \
+                 the interoperability contract as RULED in round 5 (§14.4, owner \
+                 2026-09-16), which is no longer §9.2's. (The contract: a native node \
+                 REASSEMBLES leaf fragment groups, so leaf → native above MAX_EVENT_SIZE = \
+                 {MAX_EVENT_SIZE} B is put back together, and above 64 832 B the leaf \
                  attempts nothing and returns a typed `LeafError::Wire` naming streams; \
-                 native → leaf, the native sender refuses above the same \
-                 {MAX_EVENT_SIZE} B with a typed `StreamError::EventTooLarge` naming the \
-                 limit. Never a truncation, never a drop, in either direction.) \
+                 native → leaf, the native sender FRAGMENTS above the same \
+                 {MAX_EVENT_SIZE} B for a peer advertising \
+                 `net.stream.fragment_reassembly@1`, which this leaf does. The typed \
+                 `StreamError::EventTooLarge` survives for peers WITHOUT that tag and is \
+                 witnessed natively, not here. Never a truncation, never a drop, never a \
+                 partial, in either direction.) \
                  LEG 1, AT THE CEILING: one `call('{ECHO_SERVICE}', <{ABI_CEILING_SIZE} B>)` \
                  through the package's public API (ok={}{}); the page built \
                  {got_request:?} and the ANCHOR's real handler recorded a body matching \
@@ -2438,8 +2490,10 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  ZERO times afterwards={handler_untouched} (refused_typed={refused_typed}). \
                  The classifier is EXACT, not `some error`: kind must be `\"wire\"` — the \
                  leaf's `LeafError::Wire` from `frame::split_payload`, not the native \
-                 sender's `EventTooLarge`, which measures `MAX_EVENT_SIZE` and is leg 3b's \
-                 subject — the text must name the {ABI_LEAF_FRAG_CEILING}-byte \
+                 sender's `EventTooLarge`; leg 3b no longer produces that refusal at all \
+                 since the sender fragments for this leaf, and it is precisely because \
+                 these are two DIFFERENT limits that this leg still has one to hit — \
+                 the text must name the {ABI_LEAF_FRAG_CEILING}-byte \
                  fragmentation ceiling ({ABI_LEAF_MAX_FRAGMENTS} fragments of \
                  {MAX_EVENT_SIZE}) and the stream it points at, and the byte count it \
                  names must be at least the {ABI_OVER_LIMIT_SIZE} B we sent. It used to \
@@ -2466,29 +2520,34 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  received {want_stream_ceiling:?} byte-exact as the first payload on this \
                  stream={stream_down}; that wait is a CONDITION with a 30 s ceiling, not a \
                  sleep, and it took {large_waited} ms. \
-                 LEG 3b, NOW GATED — the contract, not a measurement: the same send at \
-                 {ABI_STREAM_LARGE_SIZE} B, over MAX_EVENT_SIZE = {MAX_EVENT_SIZE} B. This \
-                 leg was RECORDED for one round, because §9.2 stated the LEAF → NATIVE \
-                 direction only and the NATIVE → LEAF answer was unwritten; the \
-                 measurement came back `Ok` plus NOTHING delivered — a silent drop on a \
-                 reliable path — and it is repaired. The anchor's `send_with_retry` must \
-                 now fail with the TYPED variant, checked as a variant and not as a \
-                 string, carrying the offending size AND the limit: observed \
-                 {stream_large_refusal:?}, required \
-                 Some(({ABI_STREAM_LARGE_SIZE}, {MAX_EVENT_SIZE})); Display was \
-                 {stream_large_error:?}. AND the payload must never appear: after a 2 s \
-                 settle on a quiet link, everything that arrived on this stream is \
-                 {extra:?} (iterator: {extra_iter:?}) — exactly ONE payload, the ceiling \
-                 one, with {want_stream_large:?} absent. Outcome: {over_cap_outcome} \
-                 (over_cap_refused={over_cap_refused}). An `Ok` with nothing delivered, a \
-                 truncation, a late delivery, or an untyped/misnamed error each FAIL. \
+                 LEG 3b, GATED, AND IT CHANGED SIDES IN ROUND 5: the same send at \
+                 {ABI_STREAM_LARGE_SIZE} B, over MAX_EVENT_SIZE = {MAX_EVENT_SIZE} B. Its \
+                 history in one line, because the outcome inverted and a reader deserves \
+                 to know why: RECORDED for one round (§9.2 stated leaf → native only, and \
+                 the measurement came back `Ok` plus NOTHING delivered — a silent drop on \
+                 a reliable path), then GATED on a typed refusal in round 4, and now \
+                 gated on DELIVERY, because the owner ruled the native sender fragments \
+                 for a peer that advertises reassembly. The anchor's `send_with_retry` \
+                 must SUCCEED (observed error: {stream_large_error:?}; any \
+                 EventTooLarge here means the tag was not read: {stream_large_refusal:?}), \
+                 and after a 2 s settle on a quiet link everything that arrived on this \
+                 stream is {extra:?} (iterator: {extra_iter:?}) — required: EXACTLY TWO \
+                 payloads, the ceiling one first and {want_stream_large:?} second, \
+                 byte-identical on both consumers. The count is the assertion that \
+                 matters: a group that was never reassembled arrives as FIVE pieces, not \
+                 as nothing, and every weaker check would call that a pass. Outcome: \
+                 {over_cap_outcome} (over_cap_delivered={over_cap_delivered}). A refusal, \
+                 a piecewise delivery, a truncation, a wrong-order reassembly, or an `Ok` \
+                 with nothing delivered each FAIL. \
                  WHERE A MISSING PAYLOAD WENT: the LEAF's counters at judgement were \
                  {large_counters} (iterator_ended={large_terminal}), and the ANCHOR's \
                  ledger for this stream was {large_sender}. \
-                 Fragmenting instead was rejected on the merits: `send_on_stream` is \
-                 transport-agnostic and only the browser leaf and the native RTC ingress \
-                 reassemble, so fragmenting there would hand a native peer's application N \
-                 partial events — a silent corruption in place of a silent drop. \
+                 The round-4 reason for refusing — fragmenting blindly would hand a \
+                 native peer's application N partial events — was never wrong and is now \
+                 the GATE's justification: the sender fragments only for a peer that \
+                 advertises `net.stream.fragment_reassembly@1`, and a peer without it \
+                 still gets the typed refusal at {MAX_EVENT_SIZE} B, witnessed in \
+                 `rtc_repairs` rather than here. \
                  ANCHOR STATE: {}",
                 sized.ok,
                 sized
