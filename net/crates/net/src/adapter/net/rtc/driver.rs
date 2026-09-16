@@ -53,6 +53,17 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Maximum datagram the RTC socket reads.
 const RECV_BUF: usize = 2048;
 
+/// Longest the **STUN-only** socket parks in `recv_from` before
+/// re-checking the shutdown flag.
+///
+/// Two orders of magnitude slacker than [`MAX_POLL_INTERVAL`]
+/// because it paces nothing: that socket has no queues to pump and
+/// no session timers to fire, so this only bounds how long a
+/// signal-only [`RtcDriverHandle::shutdown`] leaves the port bound.
+/// A joining shutdown waits for the task's own exit, which is at
+/// most one interval away.
+const STUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// **Bounded service policy** (R6): the most `Channel::write`s one
 /// peer may take in one outer turn of the driver loop.
 ///
@@ -378,6 +389,10 @@ pub struct RtcDriverHandle {
     /// a second caller that found `None` used to return while the
     /// driver was still running. Every caller now waits on this.
     done: tokio::sync::watch::Sender<bool>,
+    /// The STUN-only endpoint, when `RtcConfig::stun_addr`
+    /// configured one: the address to announce and the task
+    /// answering on it.
+    stun: Option<StunEndpoint>,
     #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<RtcTestHooks>,
 }
@@ -406,6 +421,24 @@ impl RtcDriverHandle {
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The address the **STUN-only** socket is bound to, when
+    /// [`RtcConfig::stun_addr`] configured one.
+    ///
+    /// Resolved post-bind, so a `:0` bind reports a real port and
+    /// the announcement never has to guess an adjacent one. `None`
+    /// when no second socket was configured, which is what "off
+    /// unless configured" means at the emission point.
+    ///
+    /// Always a different socket from [`Self::local_addr`], which is
+    /// the point: a leaf pointing `iceServers` at its peer's RTC
+    /// endpoint has libwebrtc eat that peer's connectivity checks.
+    /// The operator's `stun_public_addr` override is applied by the
+    /// announcer; this is the bind's own truth.
+    #[inline]
+    pub fn stun_local_addr(&self) -> Option<SocketAddr> {
+        self.stun.as_ref().map(|stun| stun.local_addr)
     }
 
     /// Send a signalling instruction to the driver.
@@ -522,6 +555,9 @@ impl RtcDriverHandle {
         if let Some(handle) = self.task.lock().take() {
             handle.abort();
         }
+        if let Some(stun) = &self.stun {
+            stun.abort();
+        }
     }
 
     /// Stop the driver and wait until the task is **gone**, so the
@@ -536,6 +572,18 @@ impl RtcDriverHandle {
     /// detaching the task.
     pub async fn shutdown_and_join(&self) {
         self.shutdown.store(true, Ordering::Release);
+        self.join_driver().await;
+        // The STUN-only socket is a second binding under the same
+        // R3-B obligation: a shut-down anchor must not keep
+        // answering, and a successor must be able to rebind an
+        // explicit STUN port.
+        if let Some(stun) = &self.stun {
+            stun.join().await;
+        }
+    }
+
+    /// The driver-task half of [`Self::shutdown_and_join`].
+    async fn join_driver(&self) {
         let handle = self.task.lock().take();
         let Some(handle) = handle else {
             // Someone else owns the join. Wait for the task's own
@@ -608,6 +656,69 @@ impl Drop for JoinSlot {
     }
 }
 
+/// The STUN-only endpoint: the address its socket bound, and the
+/// task that answers binding requests on it.
+///
+/// Its own task rather than a second arm of the driver loop. That
+/// loop's read is also its pacing — one bounded `recv_from` between
+/// signalling, pumping, timers and reaping — so folding a second
+/// socket into it would change *when* the RTC socket is read. The
+/// diagnostic `UdpBlocked` probe targets that socket, and its
+/// behaviour has to stay byte-identical.
+#[derive(Debug, Clone)]
+struct StunEndpoint {
+    /// Post-bind, so a `:0` configuration yields a real port.
+    local_addr: SocketAddr,
+    task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Release **completion**, published by the task's own guard —
+    /// the same reason `RtcDriverHandle::done` exists: ownership of
+    /// the join is not completion of it, so a caller that finds the
+    /// handle taken waits on this instead of returning while the
+    /// port is still bound.
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl StunEndpoint {
+    /// Signal-free abort, for a destructor.
+    fn abort(&self) {
+        if let Some(task) = self.task.lock().take() {
+            task.abort();
+        }
+    }
+
+    /// Wait until the socket is released, bounded the way the
+    /// driver's own join is.
+    async fn join(&self) {
+        let mut slot = JoinSlot {
+            home: Arc::clone(&self.task),
+            handle: self.task.lock().take(),
+        };
+        let Some(handle) = slot.handle.as_mut() else {
+            // Another caller owns the join; wait for the task's own
+            // completion rather than for that caller's return.
+            let mut rx = self.done.subscribe();
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            return;
+        };
+        if tokio::time::timeout(Duration::from_secs(2), &mut *handle)
+            .await
+            .is_err()
+        {
+            tracing::debug!("rtc stun socket did not exit in time; aborting");
+            handle.abort();
+            // `abort()` requests cancellation, it does not perform
+            // it: without this join the port can still be bound.
+            let _ = handle.await;
+        }
+        let _ = slot.handle.take();
+        let _ = self.done.send(true);
+    }
+}
+
 /// One driver-owned session.
 struct Session {
     rtc: Rtc,
@@ -648,6 +759,19 @@ impl RtcDriver {
     /// The socket is the node's second: §6 rules out demultiplexing
     /// RTC traffic on the Net socket, so there is no discriminator to
     /// get wrong and no way for RTC traffic to reach the Net ingress.
+    ///
+    /// A **third, STUN-only** socket is bound when
+    /// [`RtcConfig::stun_addr`] names one, so this anchor can
+    /// announce a STUN endpoint that is not its own ICE address. It
+    /// is additional: the RTC socket's behaviour, including the
+    /// `serve_stun` responder the diagnostic `UdpBlocked` probe
+    /// targets, is unchanged.
+    ///
+    /// Refuses **before binding anything** when the configuration
+    /// puts one UDP endpoint in both roles
+    /// ([`RtcConfig::stun_endpoint_conflict`]): an anchor must not
+    /// come up announcing a pairing that cannot work, because the
+    /// peer's only symptom is an ICE timeout with no diagnostic.
     pub async fn spawn(
         config: RtcConfig,
         net_bind_addr: SocketAddr,
@@ -660,6 +784,12 @@ impl RtcDriver {
         // noticed.
         closed: mpsc::Sender<RtcPeerId>,
     ) -> std::io::Result<RtcDriverHandle> {
+        if let Some(conflict) = config.stun_endpoint_conflict() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                conflict,
+            ));
+        }
         let socket = UdpSocket::bind(config.resolved_bind_addr(net_bind_addr)).await?;
         let local_addr = socket.local_addr()?;
         let advertised = config.public_addr.unwrap_or(local_addr);
@@ -669,6 +799,32 @@ impl RtcDriver {
         let shutdown = Arc::new(AtomicBool::new(false));
         #[cfg(any(test, feature = "fixtures"))]
         let hooks = Arc::new(RtcTestHooks::default());
+
+        // A configured STUN bind that cannot be taken is fatal
+        // here: the alternative is an anchor that announces an
+        // endpoint it is not listening on.
+        let stun = match config.stun_addr {
+            Some(bind) => {
+                let stun_socket = UdpSocket::bind(bind).await?;
+                let bound = stun_socket.local_addr()?;
+                let (stun_done, _stun_done_rx) = tokio::sync::watch::channel(false);
+                let stun_task = tokio::spawn(stun_only_loop(
+                    stun_socket,
+                    Arc::clone(&shutdown),
+                    stun_done.clone(),
+                ));
+                Some(StunEndpoint {
+                    // The bind's own truth. `stun_public_addr` is
+                    // the announcer's override, applied where the
+                    // announcement is built — one resolution rule,
+                    // in one place.
+                    local_addr: bound,
+                    task: Arc::new(parking_lot::Mutex::new(Some(stun_task))),
+                    done: stun_done,
+                })
+            }
+            None => None,
+        };
 
         let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(driver_loop(
@@ -694,6 +850,7 @@ impl RtcDriver {
             shutdown: Arc::clone(&shutdown),
             task: Arc::new(parking_lot::Mutex::new(Some(task))),
             done: done_tx,
+            stun,
             #[cfg(any(test, feature = "fixtures"))]
             hooks,
         })
@@ -938,6 +1095,74 @@ async fn driver_loop(
     // Teardown is `SessionTable::drop`, below — one implementation
     // for the cooperative exit and the aborted one.
     drop(table);
+}
+
+/// The STUN-only socket's loop: answer uncredentialed binding
+/// requests, and carry nothing else.
+///
+/// No session ever reads or writes this socket — it is not passed to
+/// any `Rtc`, never appears as a host candidate, and never receives
+/// a session's outbound packet. That is the whole point of it: a
+/// leaf can point `iceServers` here without libwebrtc's
+/// `UDPPort::OnReadPacket` consuming the anchor's connectivity
+/// checks as STUN-server responses.
+///
+/// A **credentialed** binding request (an ICE connectivity check) is
+/// ignored: no session on this socket could have negotiated those
+/// credentials, and an unauthenticated response is something the
+/// asking ICE agent must discard anyway.
+async fn stun_only_loop(
+    socket: UdpSocket,
+    shutdown: Arc<AtomicBool>,
+    done: tokio::sync::watch::Sender<bool>,
+) {
+    // Same shape as `SessionTable` (H1): release the port and
+    // publish completion from a guard, so an aborted task does it
+    // too.
+    let guard = StunSocket {
+        socket: Some(socket),
+        done,
+    };
+    let Some(socket) = guard.socket.as_ref() else {
+        return;
+    };
+    let mut buf = vec![0u8; RECV_BUF];
+
+    while !shutdown.load(Ordering::Acquire) {
+        match tokio::time::timeout(STUN_POLL_INTERVAL, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, source))) => {
+                let datagram = &buf[..n];
+                if stun::is_binding_request(datagram) && !stun::has_username(datagram) {
+                    answer_binding_request(socket, datagram, source).await;
+                }
+            }
+            // Rule 6: an ICMP port-unreachable about a client that
+            // went away says nothing about this socket's health, and
+            // on Windows it fails the *next* `recv_from`.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "rtc stun socket read error");
+            }
+            Err(_) => {} // read timeout: re-check the shutdown flag
+        }
+    }
+
+    drop(guard);
+}
+
+/// Releases the STUN-only socket and publishes completion, whether
+/// [`stun_only_loop`] exits cooperatively or is aborted.
+struct StunSocket {
+    socket: Option<UdpSocket>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for StunSocket {
+    fn drop(&mut self) {
+        drop(self.socket.take());
+        let _ = self.done.send(true);
+    }
 }
 
 /// The driver's session table plus the teardown its `Drop` owns
@@ -1247,6 +1472,25 @@ fn reap(
     }
 }
 
+/// The bare STUN responder: answer one binding request, reporting
+/// the sender's own address back to it. Returns whether a response
+/// went out.
+///
+/// One implementation, shared by the RTC socket's dispatch and the
+/// STUN-only socket, so the two cannot drift. Counting is the
+/// caller's: `RtcStats::stun_binding_requests` is specifically "a
+/// peer aimed at our published `rtc_addr`" (R8), which the
+/// STUN-only socket's traffic is not.
+async fn answer_binding_request(socket: &UdpSocket, datagram: &[u8], source: SocketAddr) -> bool {
+    // `None` when the datagram is not a binding request, so no
+    // caller can accidentally answer arbitrary traffic.
+    let Some(response) = stun::binding_response(datagram, source) else {
+        return false;
+    };
+    let _ = socket.send_to(&response, source).await;
+    true
+}
+
 /// Route one datagram: STUN first (it is not str0m's), then the
 /// session that claims it.
 #[expect(
@@ -1272,11 +1516,11 @@ async fn receive(
     // negotiated those credentials; it goes to `Rtc::accepts` first,
     // and reaches the bare responder only if no session claims it.
     if config.serve_stun && stun::is_binding_request(datagram) && !stun::has_username(datagram) {
-        if let Some(response) = stun::binding_response(datagram, source) {
-            let _ = socket.send_to(&response, source).await;
+        if answer_binding_request(socket, datagram, source).await {
             // R8: a peer aiming at our published `rtc_addr` is
             // observable here, and nowhere else — an ICE check
-            // carries `USERNAME` and never reaches this arm.
+            // carries `USERNAME` and never reaches this arm, and the
+            // STUN-only socket is a different published endpoint.
             stats.note_stun_binding_request();
         }
         return;
@@ -1345,8 +1589,7 @@ async fn receive(
                     "an ICE connectivity check no session claimed"
                 );
             }
-            if let Some(response) = stun::binding_response(datagram, source) {
-                let _ = socket.send_to(&response, source).await;
+            if answer_binding_request(socket, datagram, source).await {
                 stats.note_stun_binding_request();
             }
         }

@@ -73,6 +73,35 @@ pub struct RtcConfig {
     pub ingress_queue_packets: usize,
     /// Answer RFC 5389 binding requests on the RTC socket.
     pub serve_stun: bool,
+    /// Bind address for a **second UDP socket that answers STUN and
+    /// nothing else** — the endpoint this anchor announces as
+    /// `rtc_stun_addr`, distinct from `rtc_addr`.
+    ///
+    /// It is FOR keeping a leaf's STUN server off its peer's ICE
+    /// address. libwebrtc's `UDPPort::OnReadPacket` consumes any
+    /// datagram arriving from a configured STUN server address as a
+    /// STUN-server response *before* `GetConnection` gets to look
+    /// for a candidate pair — in both directions — so an
+    /// `iceServers` entry pointing at the peer's RTC endpoint eats
+    /// that peer's connectivity checks and the pair never nominates.
+    /// A separate port makes the two roles separate tuples, which is
+    /// what the peer's ICE agent discriminates on.
+    ///
+    /// `None` ⇒ no second socket is bound and nothing is announced:
+    /// emission and binding are off unless configured. Orthogonal to
+    /// [`RtcConfig::serve_stun`], which keeps its meaning for the RTC
+    /// socket (the diagnostic `UdpBlocked` probe target); this socket
+    /// is additional, never a replacement.
+    pub stun_addr: Option<SocketAddr>,
+    /// The **externally reachable** endpoint to announce for that
+    /// socket, when the bind is not reachable as-is (NAT, container)
+    /// — `stun_addr`'s counterpart to
+    /// [`RtcConfig::public_addr`].
+    ///
+    /// Unset with a bind configured, the announcement carries the
+    /// driver's resolved bound address, so `:0` works and the value
+    /// is the actual endpoint rather than an adjacent-port guess.
+    pub stun_public_addr: Option<SocketAddr>,
     /// Serve the browser bootstrap listener. Stage 3 carried the
     /// flag and nothing read it; Stage 4b's listener does.
     pub serve_bootstrap: bool,
@@ -108,6 +137,8 @@ impl Default for RtcConfig {
             buffered_amount_advisory: DEFAULT_BUFFERED_AMOUNT_ADVISORY,
             ingress_queue_packets: DEFAULT_INGRESS_QUEUE_PACKETS,
             serve_stun: false,
+            stun_addr: None,
+            stun_public_addr: None,
             serve_bootstrap: false,
             bootstrap_url: None,
             max_provisional: DEFAULT_MAX_PROVISIONAL,
@@ -138,6 +169,34 @@ impl RtcConfig {
         self
     }
 
+    /// Bind a second UDP socket that answers STUN only, at `addr`.
+    ///
+    /// This is the endpoint announced as `rtc_stun_addr` and the one
+    /// a leaf's default `iceServers` points at; it must not be the
+    /// RTC socket, or a peer's ICE checks are consumed as
+    /// STUN-server responses before any candidate pair is
+    /// considered. Port 0 is fine: the driver announces what it
+    /// actually bound.
+    ///
+    /// Off unless called: `Default` leaves it `None`, and then no
+    /// second socket is bound and nothing is announced.
+    #[must_use]
+    #[inline]
+    pub fn with_stun_addr(mut self, addr: SocketAddr) -> Self {
+        self.stun_addr = Some(addr);
+        self
+    }
+
+    /// Announce `addr` for that socket instead of the address it
+    /// bound — the NAT/container case, as
+    /// [`RtcConfig::public_addr`] is for `rtc_addr`.
+    #[must_use]
+    #[inline]
+    pub fn with_stun_public_addr(mut self, addr: SocketAddr) -> Self {
+        self.stun_public_addr = Some(addr);
+        self
+    }
+
     /// Serve the bootstrap listener at this externally reachable
     /// base URL (Stage 4b). Turns `serve_bootstrap` on: a URL to
     /// advertise and no listener would be worse than neither.
@@ -155,6 +214,57 @@ impl RtcConfig {
     pub fn resolved_bind_addr(&self, net_bind_addr: SocketAddr) -> SocketAddr {
         self.bind_addr
             .unwrap_or_else(|| SocketAddr::new(net_bind_addr.ip(), 0))
+    }
+
+    /// The configuration §6.12.1 describes, detected before anything
+    /// is bound: **one endpoint in both roles**.
+    ///
+    /// `Some(explanation)` when this anchor would announce, or bind,
+    /// a single UDP endpoint as both its RTC address and its STUN
+    /// address. A peer cannot be its own STUN server: libwebrtc's
+    /// `UDPPort::OnReadPacket` consumes any datagram arriving from a
+    /// configured STUN server as a STUN-server response before it
+    /// looks for a candidate pair, so the two roles on one endpoint
+    /// eat the peer's connectivity checks and ICE never nominates.
+    ///
+    /// Detected equality only, and only between values this config
+    /// holds. It cannot see a `stun_public_addr` that a gateway maps
+    /// onto `public_addr`, nor a DNS name that resolves to either —
+    /// those are the boundary the leaf's connect-time check and the
+    /// documentation own.
+    pub fn stun_endpoint_conflict(&self) -> Option<String> {
+        // The announced pair first: it is the one a peer acts on, and
+        // the one that produces a silent 60-second ICE timeout
+        // instead of a diagnostic.
+        if let (Some(stun), Some(rtc)) = (self.stun_public_addr, self.public_addr) {
+            if stun == rtc {
+                return Some(format!(
+                    "rtc: stun_public_addr ({stun}) is the announced RTC endpoint public_addr \
+                     ({rtc}); they must be distinct UDP endpoints, because a peer cannot be its \
+                     own STUN server — libwebrtc consumes datagrams from a configured STUN \
+                     server before pairing, so the peer's ICE checks would be eaten"
+                ));
+            }
+        }
+        // The same mistake one level down. Caught here so it reads as
+        // the configuration error it is, rather than as the
+        // `AddrInUse` the second bind would produce.
+        //
+        // Port 0 is exempt: it names no endpoint, it asks the OS for
+        // one. Two `ip:0` binds compare equal and are nonetheless
+        // two different sockets — refusing them would refuse the
+        // ordinary test and container configuration.
+        if let (Some(stun), Some(rtc)) = (self.stun_addr, self.bind_addr) {
+            if stun == rtc && rtc.port() != 0 {
+                return Some(format!(
+                    "rtc: stun_addr ({stun}) is the RTC bind_addr ({rtc}); they must be distinct \
+                     UDP endpoints, because a peer cannot be its own STUN server — libwebrtc \
+                     consumes datagrams from a configured STUN server before pairing, so the \
+                     peer's ICE checks would be eaten"
+                ));
+            }
+        }
+        None
     }
 }
 
