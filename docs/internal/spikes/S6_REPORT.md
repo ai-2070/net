@@ -108,7 +108,8 @@ two public addresses in both directions, and neither endpoint was
 asked. It is the one party to the session with no stake in the
 answer.
 
-The six Chromium rows do not pass; §6.12 is the evidenced gap.
+The six Chromium rows pass too, on the same three witnesses — see
+§6.12, which is now closed.
 
 ---
 
@@ -380,83 +381,129 @@ the bootstrap listener lives in `net_sdk`, which the harness's
 — offer accepted, trickle socket authorized, every typed refusal —
 was simply absent.
 
-### 6.12 The Chromium NAT rows: an open gap, with every boundary but one measured
+### 6.12 The Chromium NAT rows: closed — the page's STUN server was the anchor it had to pair with
 
-**Not closed.** Six of the seven natsim browser rows — every Chromium
-one — fail at the browser↔anchor bootstrap. The Firefox control on
-the same anchor, same topology and same run passes end to end. What
-follows is what is *established*, because four plausible explanations
-died here and each cost a cycle.
+**Closed.** All six Chromium rows and the Firefox control pass in
+natsim run
+[35142933036](https://github.com/ai-2070/net/actions/runs/35142933036)
+(13/13 scenarios: six native, six Chromium, one Firefox control).
 
-From a `tcpdump` inside tab b's own network namespace, on the exact
-socket its own `getStats` names (`host/udp :47252 -> 10.99.0.10:7100`,
-reporting `sent=192 gotResponse=0 recvd=0`):
+There were **two** defects, in series, and the second was invisible
+until the first was fixed. Both were in the harness or its
+environment; neither was in the product.
 
-| Measurement | Value |
+**Defect 1 — interface enumeration was off.** Chromium gates
+local-interface enumeration on media permission. With it denied,
+`FilteringNetworkManager` withholds the network list the browser
+process has already delivered, the allocator logs `Allocate ports on
+any any`, every port binds the `any` address at cost 999, and inbound
+datagrams are matched against a network list that is empty — so they
+are dropped before any STUN parsing. Granting camera+microphone for
+the page's own origin (what a real user does before a call) fixed it:
+run 35138824048 logs `received permission status: granted`,
+`Count of networks: 1`, `Net[eth0:192.168.102.x/24:Ethernet:id=1]`,
+`Allocate ports on eth0`, and a gathered srflx. The rows still failed.
+
+**Defect 2 — the harness named the anchor as the page's STUN
+server.** One rule in libwebrtc
+(`webrtc/p2p/base/stun_port.cc`, `UDPPort::OnReadPacket`, verbatim):
+
+```c++
+  // Look for a response from the STUN server.
+  if (server_addresses_.find(packet.source_address()) !=
+      server_addresses_.end()) {
+    request_manager_.CheckResponse(packet.payload());
+    return;
+  }
+  if (Connection* conn = GetConnection(packet.source_address())) {
+```
+
+The `return` precedes `GetConnection`. **Every** datagram arriving on
+an ICE port from an address that port was configured with as a STUN
+server is handed to the gathering path and consumed there — responses
+and requests alike, in both directions.
+
+`drive_sequence` gave the page exactly one `iceServers` entry,
+`stun:10.99.0.10:7100`, and the anchor's ICE host candidate **is**
+10.99.0.10:7100: the product answers STUN on the RTC socket, by
+design. So the anchor was both the STUN server and the ICE peer, and
+every packet between them was eaten before ICE saw it.
+
+That is the whole of the symptom table above, which no STUN-level
+reading had explained:
+
+| Measured | Explained by |
 |---|---|
-| Binding Requests out | 197 |
-| Binding Responses in, from `10.99.0.10:7100` | **197** |
-| Response transaction IDs matching an outstanding request | **197 / 197** |
-| `MESSAGE-INTEGRITY` valid against str0m's answer password | **193 / 193** |
-| `FINGERPRINT` CRC correct | **193 / 193**, zero bad |
-| Non-STUN packets (i.e. DTLS ever starting) | **0** |
+| 197 valid, integrity-correct, transaction-matched responses arrive and **none** is credited | consumed by `request_manager_.CheckResponse` and `return`ed |
+| the anchor's 7 Binding **Requests** go unanswered | same branch; a request is not a response, so it is simply dropped |
+| **zero** receive-side `connection.cc` lines while the pcap shows the packets landing | the `Connection` is never reached |
+| silence in **both** directions — the one symptom nothing else fitted | the rule is per-source-address, not per-direction |
+| Firefox passes on the same topology, same anchor, same run | nICEr reads its sockets directly and has no such rule |
 
-The remaining four responses are the bare gathering responses, as
-designed. The Firefox control's same capture: 6 requests, 4
-responses, and **71 non-STUN packets** — it validates a pair almost
-immediately and proceeds to DTLS.
+**The controlled experiment was already running in CI and had never
+been read as one.** The loopback harness's `[mdns]` sweep
+(`rtc_browser/runner/src/main.rs`) varies exactly one thing — whether
+the page's `iceServers` names the anchor's own socket — across two
+interfaces, with the STUN variant deliberately first on one and second
+on the other so position is excluded. ci.yml run 35137453461,
+Chromium:
 
-So: **valid, symmetric, integrity-correct, transaction-matched
-responses arrive in Chromium's own namespace and its ICE agent does
-not accept them.**
+```
+[mdns] loopback/anchor-stun:  NO PAIR — timeout: datachannel open
+[mdns] loopback/no-stun:      PAIR FORMED in 22 ms   (same anchor socket 127.0.0.1:36622)
+[mdns] interface/no-stun:     PAIR FORMED in 20 ms
+[mdns] interface/anchor-stun: NO PAIR — timeout: datachannel open
+```
 
-**The one measurement still missing, and two failed attempts at it.**
-Only the engine can say why it discarded a response that satisfies
-every external check. Both tries failed, and neither is left in the
-tree: `browser.process()` does not exist on Playwright's `Browser`,
-so draining its stderr took the launch down with it (`launch failed:
-browser.process is not a function` — the fifth instrument in this
-stage to do something other than what it was asked, and the first to
-kill its own subject); and `--enable-logging --log-file=<path>
---vmodule=…` then produced no file at all under headless Chromium.
-Untried: `launchPersistentContext` with an explicit `--user-data-dir`,
-or a `chrome://webrtc-internals` dump from a headed run.
+Firefox forms a pair in **both** `anchor-stun` positions. And that
+sweep's `working_stun` fallback — take the first configuration that
+forms a pair — is why §6.12's founding premise held: the loopback
+matrix had silently dropped the STUN server, so "Chromium works
+against this same anchor on loopback and fails behind the NAT" was
+true for a reason that had nothing to do with the NAT. A harness that
+searches for a working configuration will hide the defect it searched
+around; that is a finding in its own right.
 
-Also ruled out, on the capture already in hand, before spending a
-cycle on it: the **unexpected-source discard** (`stun_request.cc`
-drops a response whose source differs from the request's
-destination). Matched **per transaction id**, all 197 satisfy
-`response.src == request.dst` and `response.dst == request.src`. And
-the **role/aggressive-nomination** reading: the anchor logs `Accept
-offer`, so it is *controlled*; Chromium's checks all carry
-`ICE-CONTROLLING` + `USE-CANDIDATE` and str0m answered every one and
-logged `Nominated pair` / `got nomination`.
+**The fix.** The run's STUN responder is a separate host from the ICE
+peer — 10.99.0.11, the aux public address `setup.sh` always adds to
+the wan bridge (`run_scenario.sh --stun-ip`). That is also what a real
+deployment has. `serve_stun` stays on the anchor as well: the leaf's
+own `UdpBlocked` evidence probes the anchor's published `rtc_addr` and
+must keep being answered. No product code, no deadline widened, no
+assertion weakened, no NAT flavour touched.
 
-Killed by evidence, in order, and none of them should be reopened:
+**Pinned, so neither defect can return quietly.** The driver counts
+every `Net[…]` descriptor the allocator prints and returns the counts
+in its `shutdown` reply; `run_row` **refuses** a Chromium tab that
+allocated no port on an enumerated network, naming the interfaces it
+did see. A row that loses interface enumeration now fails saying so
+instead of timing out sixty seconds later, indistinguishably from a
+real ICE failure. Defect 2 is pinned by the rows themselves: with the
+anchor as STUN server again, no Chromium row can reach `direct`.
 
-- *The gateway or NAT setup* — packets cross both ways; conntrack
-  shows the flow; the srflx is gathered on every row and engine.
-- *str0m rejecting Chromium's candidate attributes* — proven offline
-  against str0m 0.23.1: the srflx line parses with `generation 0 …
-  network-cost 999`; only the mDNS `.local` address fails.
-- *The anchor being deaf* — it creates a peer-reflexive candidate
-  FROM Chromium's check, nominates, and reports `Completed`.
-- *The egress being refused* — with the discarded `send_to` result
-  now logged: zero failures, and zero ICE checks unclaimed by a
-  session.
-- *`addIceCandidate` refusing anything* — with the swallowed error now
-  surfaced: `candidateErrors: []` on every failing row.
-- *Answer/candidate ordering* — fixed anyway on its own merits, and
-  not the cause here.
+**Named for the product, not fixed here (out of stage scope).** A page
+that does the obvious thing — `iceServers: [{ urls: 'stun:' +
+anchorRtcAddr }]`, which is what both harnesses did and what
+`stunUrl(rtcAddr)` in `@net-mesh/browser` exists to build — cannot
+form a direct pair **with that anchor** on any Chromium-family engine.
+The probe paths (`bootstrap.rs`, `udp-probe.ts`) are unaffected: they
+build a `RTCPeerConnection` with no ICE peer at all. What needs a
+decision is guidance, or an anchor that answers STUN on a second
+socket.
 
-The next step is a byte-level diff of the responses str0m sends to
-each engine, not another CI cycle. The `.pcap` files are in the run's
-`natsim-state` artifact, three per row.
+**Dead, and not to be reopened**: the four readings §6.12 already
+killed (gateway/NAT setup, str0m's candidate parsing, a deaf anchor, a
+refused egress, `addIceCandidate`, answer/candidate ordering), plus
+two more this closure retires — mDNS obfuscation (falsified twice:
+disabling it changed nothing) and the default-local-address route
+(real mechanism, wrong namespace, and enumeration was already working
+when the rows still failed). The multicast route and both default
+routes stay as **harmless, not causal**, recorded as such in
+`setup.sh`.
 
-**What this gap does NOT cast doubt on**: the browser matrix (41
+**What this gap never cast doubt on**: the browser matrix (41
 witnesses, both engines, green), the demo (4 rows, green), and the
-Firefox NAT row — which is the stage's headline and is described in
-§3.1.
+Firefox NAT row described in §3.1.
 
 ### 6.13 Two more log lines that asserted more than their code knew
 
@@ -538,13 +585,21 @@ names.
 | Browser demo (Chromium) | 4 | `browser-demo/host/src/main.rs` |
 | Leaf native | 266 | run count |
 | R11 ABI probes | 12 | `abi_real_package.mjs` |
-| natsim topology rows | 6 | `natsim.yml` |
+| natsim scenarios (6 native + 6 Chromium + Firefox control) | 13 | `natsim.yml`, each row pinned by name |
+| Chromium interface enumeration, per NAT'd tab | ≥1 port on `Net[eth0:…]` | `run_row`, from the driver's own count |
 
 Each roster is validated against its **source** before any log is
 read, each parser proves it can find a known verdict line before a
 count is believed, and the demo binary prints `[demo] NOT REACHED:
 <names>` if it exits before a row ran — so an early exit cannot
 present itself as a smaller green count.
+
+The enumeration floor is the one gate that is not a count of
+witnesses. It is a **precondition**: a Chromium tab that allocated
+every port on `Net[any:0.0.0.x/0:Wildcard:id=0]` has enumerated no
+interface and drops every inbound datagram before STUN parsing, so
+any verdict a row reached would be about that and nothing else.
+§6.12 spent five cycles reading such rows as ICE failures.
 
 ---
 

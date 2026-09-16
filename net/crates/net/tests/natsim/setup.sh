@@ -164,48 +164,47 @@ one_side() {
 
   # A multicast route, so the browser's mDNS responder can BIND.
   #
-  # This is the experiment behind S6_REPORT.md §6.12. Chromium
-  # obfuscates its host candidate behind an mDNS `.local` name it
-  # publishes and owns. With only a default unicast route, the
-  # renderer logs `MDNS bind failed, address_family=2, error=-4` and
-  # then `Received an external response for an owned record` once a
-  # second — the conflict signal that makes it disown the name that
-  # IS its host candidate's identity. Its srflx is pruned in favour
-  # of that host base (RFC 8445 §6.1.2.4), so it ends up checking
-  # from a candidate whose identity it has rescinded. Firefox does
-  # not use mDNS obfuscation, which is the engine asymmetry.
+  # **Harmless, not causal.** This was the first §6.12 experiment.
+  # Chromium obfuscates its host candidate behind an mDNS `.local`
+  # name it publishes and owns, and with only a default unicast route
+  # the renderer logged `MDNS bind failed, address_family=2,
+  # error=-4` and then `Received an external response for an owned
+  # record` once a second. A route for 224.0.0.0/4 out of the private
+  # interface is what a real LAN has and this simulated one did not,
+  # so it stays — it removes a real error from the log and is a
+  # topology fact, not a protocol change: no candidate is relabelled,
+  # no deadline widened, and the NAT flavours are untouched.
   #
-  # A route for 224.0.0.0/4 out of the private interface is what a
-  # real LAN has and this simulated one did not. It is a topology
-  # fact, not a protocol change: no candidate is relabelled, no
-  # deadline widened, and the NAT flavours are untouched.
+  # It did NOT fix the Chromium rows, and the mDNS reading it came
+  # from was falsified twice over: with obfuscation disabled entirely
+  # Chromium failed identically, and the actual cause turned out to be
+  # the harness naming the anchor's own ICE socket as the page's STUN
+  # server (`run_scenario.sh --stun-ip`, S6_REPORT.md §6.12).
   ip -n "$NS" route add 224.0.0.0/4 dev eth0
   ip -n "$NS" link set eth0 multicast on
 
-  # The gateway needs a default route of its OWN, and the browser rows
-  # are why.
+  # A default route on the GATEWAY itself.
   #
-  # libwebrtc's `BasicNetworkManager` decides which interfaces are
-  # usable by asking for a "default local address": it connect()s a
-  # throwaway UDP socket at a public address (8.8.8.8, and the v6
-  # equivalent). In a namespace whose only route leads to a gateway
-  # that cannot itself route beyond the lab, that probe fails,
-  # `GetDefaultLocalAddress` returns nothing, and the enumerator
-  # classifies eth0 as unusable — so it enumerates ZERO networks and
-  # falls back to wildcard `any address` ports at cost 999.
+  # **Harmless, not causal.** Chromium's network service learns a
+  # "default local address" by connect()ing a throwaway UDP socket at
+  # a public IP (8.8.8.8), and a namespace where that route does not
+  # resolve enumerates no interface at all — ports bind the `any`
+  # address and every inbound datagram is dropped before STUN
+  # parsing. That mechanism is real, and it is why this route and the
+  # joiner's own `default via $LAN.1` above are both worth having:
+  # nothing answers 8.8.8.8 in this lab and nothing needs to, the
+  # probe only has to resolve a route rather than get ENETUNREACH.
   #
-  # On a wildcard port, inbound packets are matched against the
-  # networks the port knows, and with none known EVERY inbound packet
-  # is dropped BEFORE any STUN parsing. That is the whole of §6.12:
-  # Chromium answered no Binding Requests and credited no responses
-  # while every packet on the wire was valid, correctly credentialed
-  # and correctly addressed. Firefox is unaffected because nICEr reads
-  # its sockets directly, with no enumeration gate.
-  #
-  # A default route on the gateway gives that probe a usable next hop.
-  # No traffic leaves the lab — nothing answers 8.8.8.8 here and
-  # nothing needs to; the probe only has to resolve a route rather
-  # than get ENETUNREACH.
+  # But it was never what ailed §6.12. The enumeration failure that
+  # looked like this one had a different cause — Chromium gates
+  # interface enumeration on MEDIA PERMISSION
+  # (`FilteringNetworkManager`: `received permission status: denied`),
+  # which `driver.mjs` now grants; run 35138824048 then logged
+  # `Allocate ports on eth0`, `Count of networks: 1` and
+  # `Net[eth0:192.168.102.x/24:Ethernet:id=1]` while the rows still
+  # failed. `driver.mjs` prints `ip route get 8.8.8.8` from inside
+  # each namespace so this precondition is a fact in the log rather
+  # than an inference from this script.
   ip -n "$GW" route add default via 10.99.0.1
 
   ip netns exec "$GW" sysctl -qw net.ipv4.ip_forward=1
