@@ -236,6 +236,7 @@ if [[ "$MODE" == browser ]]; then
       --netns-a nsim_a --netns-b nsim_b \
       >"$STATE/runner.log" 2>&1 &
   PIDS+=("$!")
+  echo "natsim: browser runner pid ${PIDS[0]} state $STATE"
 else
   # Publics: X accepts R first (R dials it), then the joiners.
   launch nsim_wan x  public --name x --bind 10.99.0.11:7000 --state "$STATE" --joiners r,a,b

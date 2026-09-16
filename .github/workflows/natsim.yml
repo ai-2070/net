@@ -211,7 +211,17 @@ jobs:
       # The scenarios leave their state dirs under /tmp: every helper
       # log, the browser runner's log, the conntrack snapshots and the
       # verdicts. A red row whose evidence is only readable by adding a
-      # print and pushing again costs a full CI cycle per question.
+      # print and pushing again costs a full CI cycle per question —
+      # which this red has already cost twice.
+      #
+      # They are written by helpers running under `sudo`, so they are
+      # root-owned and `actions/upload-artifact` fails on them with
+      # `EACCES: permission denied, scandir`. Widen the read bits first;
+      # the upload step cannot do it itself.
+      - name: Make the scenario state dirs readable
+        if: ${{ failure() }}
+        run: sudo chmod -R a+rX /tmp/natsim.* 2>/dev/null || true
+
       - name: Upload the scenario state dirs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
