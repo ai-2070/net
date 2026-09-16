@@ -117,15 +117,33 @@ async function opLaunch(req) {
   } else {
     const iceLog = path.join(req.profileDir, 'chrome_debug.log');
     fs.mkdirSync(req.profileDir, { recursive: true });
+    // HEADED when a display exists, headless otherwise.
+    //
+    // The Chromium NAT rows are the reason. Every anchor-side
+    // boundary passes for them — the check is claimed by the right
+    // live session, str0m accepts it, a response is generated, the
+    // send succeeds, and a capture inside the browser's own namespace
+    // shows it arrive, transaction-matched and integrity-valid — and
+    // the engine still credits no response. The first failed boundary
+    // is inside the browser, and headless Chromium's network service
+    // emitted only `socket_udp.cc` lines under `--vmodule`: the
+    // `p2p/base` code that records WHY a response was discarded never
+    // logged. A headed browser runs the full renderer path with the
+    // same log file, and `chrome://webrtc-internals` exists to be
+    // read.
+    //
+    // Headless stays the default so nothing changes for a host with
+    // no X server; CI provides one.
+    const headed = !!process.env.DISPLAY;
     const browser = await engine.launch({
       // The FULL build, not the headless shell: the shell ignores
       // `--vmodule`, which is the whole point of launching it here.
       channel: 'chromium',
-      headless: true,
+      headless: !headed,
       chromiumSandbox: false,
       args: chromiumArgs(req.spkiPin, iceLog),
     });
-    log(`chromium ice log: ${iceLog}`);
+    log(`chromium ${headed ? 'HEADED' : 'headless'}, ice log: ${iceLog}`);
     const context = await browser.newContext();
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
@@ -146,7 +164,44 @@ async function opOpen(req) {
   return { url: page.url() };
 }
 
+// `chrome://webrtc-internals`, read before the browser closes.
+//
+// It is the engine's own record of every peer connection in this
+// process: the ICE event log, the candidate pairs and their state
+// transitions, and the getStats history — the account of the failing
+// check that no external observer could supply. Chromium only, opened
+// in its own tab so the row's page is untouched, and best-effort: a
+// dump that fails must not fail a row.
+async function dumpWebrtcInternals() {
+  if (!live || live.engine === 'firefox' || !live.context) return;
+  let tab;
+  try {
+    tab = await live.context.newPage();
+    await tab.goto('chrome://webrtc-internals', {
+      waitUntil: 'domcontentloaded',
+      timeout: 15_000,
+    });
+    // The page renders asynchronously from the browser's own event
+    // stream; give it a beat to populate rather than racing it.
+    await tab.waitForTimeout(1_500);
+    const text = await tab.evaluate(() => document.body.innerText || '');
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) log(`[webrtc-internals] ${trimmed}`);
+    }
+  } catch (e) {
+    log(`webrtc-internals: ${e && e.message}`);
+  } finally {
+    try {
+      if (tab) await tab.close();
+    } catch {
+      /* closing a dump tab is not a row failure */
+    }
+  }
+}
+
 async function opShutdown() {
+  await dumpWebrtcInternals();
   try {
     if (live && live.persistent) await live.context.close();
     else if (live && live.browser) await live.browser.close();

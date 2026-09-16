@@ -64,7 +64,29 @@ jobs:
           # into the Firefox control row's profile NSS database. The
           # driver REFUSES the run if it cannot seed it, so without this
           # the control row fails loudly rather than running untrusted.
-          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump
+          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump xvfb
+
+      # A display for the HEADED Chromium rows. The Chromium NAT rows
+      # fail inside the engine — every anchor-side boundary passes and
+      # the response arrives in the browser's own namespace — and
+      # headless Chromium's network service never logged the `p2p/base`
+      # discard reason. Headed runs the full renderer path and makes
+      # `chrome://webrtc-internals` readable. Firefox rows stay
+      # headless and are unaffected.
+      - name: Start Xvfb
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          # Assert it, rather than exporting a DISPLAY that points at
+          # nothing: the driver falls back to headless when DISPLAY is
+          # unset, so a silently dead Xvfb would quietly undo this
+          # whole step.
+          test -e /tmp/.X11-unix/X99 || { echo "::error::Xvfb :99 never came up"; cat /tmp/xvfb.log; exit 1; }
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
       # FIRST, deliberately: this is the drift guard. It parses
       # `run_scenario.sh`'s own `browser_*` case arms and fails if they

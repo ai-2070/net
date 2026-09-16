@@ -214,15 +214,21 @@ fn scenario(name: &str) -> ScenarioRun {
     let mut cmd = Command::new("sudo");
     cmd.arg("env")
         .arg(format!("NATSIM_NODE_BIN={}", bin.display()));
-    // The browser rows need two more values on the far side of sudo,
-    // and both are environment-only by design.
+    // The browser rows need three more values on the far side of sudo,
+    // and all three are environment-only by design.
     //
     // `PLAYWRIGHT_BROWSERS_PATH` is the load-bearing one: the drivers
     // run as ROOT inside the namespaces, so Playwright would look for
     // browsers under root's `$HOME` and find the ones CI installed for
     // the build user nowhere. Forwarded only when set, so a machine
     // using the default location is unaffected.
-    for key in ["PLAYWRIGHT_BROWSERS_PATH", "NATSIM_BROWSER_BIN"] {
+    //
+    // `DISPLAY` is what makes the Chromium rows HEADED: the driver
+    // launches headless when it is absent, so failing to forward it
+    // through sudo would silently undo the display CI starts — and a
+    // headless run is exactly what could not answer the question
+    // these rows are stuck on.
+    for key in ["PLAYWRIGHT_BROWSERS_PATH", "NATSIM_BROWSER_BIN", "DISPLAY"] {
         if let Ok(value) = std::env::var(key) {
             cmd.arg(format!("{key}={value}"));
         }
