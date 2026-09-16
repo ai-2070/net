@@ -115,9 +115,33 @@
           return pairs;
         };
 
+        // EVERY candidate the engine holds, not only the ones that
+        // reached a pair. libwebrtc credits a response to the pair
+        // whose LOCAL candidate the request left from, so a check sent
+        // from a host candidate whose response carries the SRFLX
+        // mapped address is only credited if the srflx->remote pair
+        // exists — and that pair exists only if the engine actually
+        // holds the remote candidate. `pairs` cannot answer "does it
+        // hold the anchor's candidate at all"; this can.
+        const summarizeCandidates = (stats) => {
+          const out = [];
+          stats.forEach((s) => {
+            if (s.type !== 'local-candidate' && s.type !== 'remote-candidate') return;
+            out.push(
+              `${s.type} ${s.candidateType || '?'}/${s.protocol || '?'} ` +
+                `${s.address || s.ip || '<none>'}:${s.port} prio=${s.priority || 0}` +
+                `${s.relatedAddress ? ` raddr=${s.relatedAddress}:${s.relatedPort}` : ''}`,
+            );
+          });
+          return out;
+        };
+
         const sample = async (pc, state) => {
           try {
-            const pairs = summarizePairs(await pc.getStats());
+            const stats = await pc.getStats();
+            const pairs = summarizePairs(stats);
+            const cands = summarizeCandidates(stats);
+            if (cands.length) state.lastCandidates = cands;
             if (pairs.length) {
               state.lastPairs = pairs;
               state.lastPairsAtMs = Math.round(performance.now() - t0);
@@ -191,9 +215,25 @@
           addIceCandidate(...args) {
             const state = seen.get(this);
             const d = describe(args[0]);
-            if (state) state.remote.push(d);
-            note(`pc${state ? state.index : '?'} applied-remote ${d}`);
-            return super.addIceCandidate(...args);
+            note(`pc${state ? state.index : '?'} applying-remote ${d}`);
+            // The OUTCOME, not the attempt. This recorded `applied-remote`
+            // and pushed to `state.remote` before awaiting anything, so a
+            // rejected candidate read exactly like an accepted one — the
+            // same swallowed-error shape the leaf's peer leg had, one
+            // layer up and in the bootstrap path, where it mattered.
+            return super.addIceCandidate(...args).then(
+              (v) => {
+                if (state) state.remote.push(d);
+                note(`pc${state ? state.index : '?'} applied-remote ${d}`);
+                return v;
+              },
+              (e) => {
+                const text = (e && e.message) || String(e);
+                if (state) state.candidateErrors.push(`${d}: ${text}`);
+                note(`pc${state ? state.index : '?'} REFUSED-remote ${d}: ${text}`);
+                throw e;
+              },
+            );
           }
 
           setRemoteDescription(...args) {
@@ -236,6 +276,7 @@
                 // anchor never sending any.
                 pairs: state.lastPairs || [],
                 pairsAtMs: state.lastPairsAtMs === undefined ? null : state.lastPairsAtMs,
+                candidates: state.lastCandidates || [],
               };
               // Only the bootstrap connection's SDP: it is the pair
               // that fails, and two more copies would bury it.

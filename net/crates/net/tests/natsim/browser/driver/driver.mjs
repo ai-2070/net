@@ -70,7 +70,7 @@ function seedFirefoxProfile(profileDir, caPemPath) {
   return `certutil -d sql:${profileDir}`;
 }
 
-function chromiumArgs(spkiPin) {
+function chromiumArgs(spkiPin, logPath) {
   return [
     // The netns rows run as root (netns + nft need it), and Chromium
     // refuses its sandbox as root. This is a throwaway browser in a
@@ -87,17 +87,17 @@ function chromiumArgs(spkiPin) {
     // anyway. Every direct pair in this matrix is reached through the
     // anchor's STUN (server-reflexive) or peer-reflexively, which is
     // exactly what the NAT flavors are being tested against.
-    // NOTE for whoever closes the Chromium gap (S6_REPORT.md §6.12):
-    // the engine's own per-check account is the one measurement left,
-    // and TWO ways of getting it failed here. `browser.process()` does
-    // not exist on Playwright's `Browser`, so draining its stderr
-    // took the launch down with it; `--enable-logging
-    // --log-file=<path> --vmodule=…` then produced no file at all
-    // under headless Chromium. Removed rather than left in place: a
-    // flag that reports nothing while appearing to work is the exact
-    // failure this stage documented five times. `launchPersistentContext`
-    // with `--user-data-dir`, or a `chrome://webrtc-internals` dump
-    // from a headed run, are the untried paths.
+    // The engine's own per-check account. Two earlier attempts failed
+    // and the reason is worth keeping: these rows launch Playwright's
+    // headless-SHELL build, which ignores `--vmodule`, and
+    // `--enable-logging=stderr` goes to a pipe Playwright swallows.
+    // The combination that works is the FULL chromium build (channel
+    // `chromium`) plus `--enable-logging` (no `=stderr`) and an
+    // absolute `--log-file` under the profile, read after close.
+    '--enable-logging',
+    `--log-file=${logPath}`,
+    '--v=0',
+    '--vmodule=*/p2p/*=2,*stun*=2,*connection*=2',
   ];
 }
 
@@ -115,11 +115,17 @@ async function opLaunch(req) {
     });
     live = { engine: req.engine, context, browser: null, persistent: true };
   } else {
+    const iceLog = path.join(req.profileDir, 'chrome_debug.log');
+    fs.mkdirSync(req.profileDir, { recursive: true });
     const browser = await engine.launch({
+      // The FULL build, not the headless shell: the shell ignores
+      // `--vmodule`, which is the whole point of launching it here.
+      channel: 'chromium',
       headless: true,
       chromiumSandbox: false,
-      args: chromiumArgs(req.spkiPin),
+      args: chromiumArgs(req.spkiPin, iceLog),
     });
+    log(`chromium ice log: ${iceLog}`);
     const context = await browser.newContext();
     live = { engine: req.engine, context, browser, persistent: false };
     trust = 'spki-pin';
