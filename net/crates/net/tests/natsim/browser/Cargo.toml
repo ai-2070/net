@@ -34,4 +34,8 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto
 sha2 = "0.10"
 base64 = "0.22"
 tracing = "0.1"
+# The anchor's enrollment RPC provider. `connect()` enrols, and an
+# anchor that serves nothing leaves that call unanswered.
+async-trait = "0.1"
+bytes = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }

@@ -81,6 +81,56 @@
           }
         };
 
+        const side = (s) =>
+          s ? `${s.candidateType}/${s.protocol} ${s.address}:${s.port}` : '(unknown)';
+
+        // Sampled WHILE THE CONNECTION IS ALIVE, not at report time.
+        // The leaf closes the RTCPeerConnection the moment `connect`
+        // gives up, and `getStats` on a closed connection returns
+        // nothing — so the first instrumented run reported
+        // `pairs: []` on exactly the rows whose candidate pairs were
+        // the question. The last live sample is kept instead, with
+        // the instant it was taken.
+        const summarizePairs = (stats) => {
+          const by = new Map();
+          let selected = null;
+          stats.forEach((s) => {
+            by.set(s.id, s);
+            if (s.type === 'transport' && s.selectedCandidatePairId) {
+              selected = s.selectedCandidatePairId;
+            }
+          });
+          const pairs = [];
+          stats.forEach((s) => {
+            if (s.type !== 'candidate-pair') return;
+            pairs.push(
+              `${s.state}${s.id === selected || s.selected ? ' SELECTED' : ''}` +
+                ` nominated=${!!s.nominated} sent=${s.requestsSent || 0}` +
+                ` gotResponse=${s.responsesReceived || 0} recvd=${s.requestsReceived || 0}` +
+                ` answered=${s.responsesSent || 0}` +
+                ` bytes=${s.bytesSent || 0}/${s.bytesReceived || 0} ` +
+                `${side(by.get(s.localCandidateId))} -> ${side(by.get(s.remoteCandidateId))}`,
+            );
+          });
+          return pairs;
+        };
+
+        const sample = async (pc, state) => {
+          try {
+            const pairs = summarizePairs(await pc.getStats());
+            if (pairs.length) {
+              state.lastPairs = pairs;
+              state.lastPairsAtMs = Math.round(performance.now() - t0);
+            }
+            const local = pc.localDescription;
+            const remote = pc.remoteDescription;
+            if (local && local.sdp) state.localSdp = local.sdp;
+            if (remote && remote.sdp) state.remoteSdp = remote.sdp;
+          } catch (e) {
+            // A closed connection. The last live sample stands.
+          }
+        };
+
         class Observed extends Native {
           constructor(config) {
             super(config);
@@ -96,6 +146,13 @@
             pcs.push({ pc: this, state });
             const i = state.index;
             note(`pc${i} new iceServers=${JSON.stringify((config && config.iceServers) || [])}`);
+            const timer = setInterval(() => {
+              if (this.connectionState === 'closed' || this.signalingState === 'closed') {
+                clearInterval(timer);
+                return;
+              }
+              void sample(this, state);
+            }, 250);
             this.addEventListener('icecandidate', (e) => {
               const d = describe(e.candidate);
               state.local.push(d);
@@ -159,6 +216,10 @@
           report: async () => {
             const out = { peerConnections: [], events: events.slice(-200) };
             for (const { pc, state } of pcs) {
+              // A last-gasp live sample: if the connection is still
+              // up, this is the freshest truth; if it is closed, the
+              // interval sampler's last one stands.
+              await sample(pc, state);
               const entry = {
                 index: state.index,
                 ice: pc.iceConnectionState,
@@ -170,25 +231,17 @@
                 remoteSdpCandidates: state.remoteSdpCandidates,
                 candidateErrors: state.candidateErrors,
                 channels: state.channels,
-                pairs: [],
+                // `sent` with `gotResponse=0` is the anchor not
+                // answering this side's checks; `recvd=0` is the
+                // anchor never sending any.
+                pairs: state.lastPairs || [],
+                pairsAtMs: state.lastPairsAtMs === undefined ? null : state.lastPairsAtMs,
               };
-              try {
-                const stats = await pc.getStats();
-                const by = new Map();
-                stats.forEach((s) => by.set(s.id, s));
-                const side = (s) =>
-                  s ? `${s.candidateType}/${s.protocol} ${s.address}:${s.port}` : '(unknown)';
-                stats.forEach((s) => {
-                  if (s.type !== 'candidate-pair') return;
-                  entry.pairs.push(
-                    `${s.state} nominated=${!!s.nominated} sent=${s.requestsSent || 0}` +
-                      ` gotResponse=${s.responsesReceived || 0} recvd=${s.requestsReceived || 0}` +
-                      ` answered=${s.responsesSent || 0} ` +
-                      `${side(by.get(s.localCandidateId))} -> ${side(by.get(s.remoteCandidateId))}`,
-                  );
-                });
-              } catch (e) {
-                entry.pairs.push(`getStats failed: ${(e && e.message) || e}`);
+              // Only the bootstrap connection's SDP: it is the pair
+              // that fails, and two more copies would bury it.
+              if (state.index === 0) {
+                entry.offerSdp = state.localSdp || '';
+                entry.answerSdp = state.remoteSdp || '';
               }
               out.peerConnections.push(entry);
             }

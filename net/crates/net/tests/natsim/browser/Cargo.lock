@@ -1579,8 +1579,10 @@ dependencies = [
 name = "natsim-browser-matrix"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "net-mesh",
  "net-mesh-sdk",
  "rcgen",

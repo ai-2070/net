@@ -102,7 +102,11 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use net::adapter::net::rtc::RtcConfig;
+use bytes::Bytes;
+use net::adapter::net::cortex::{
+    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+};
+use net::adapter::net::rtc::{RtcConfig, ENROLL_SERVICE};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
 use net_sdk::bootstrap_credential::{BrowserBootstrapCredential, Psk};
 use net_sdk::enrollment::InviteToken;
@@ -121,6 +125,45 @@ const PSK: [u8; 32] = [0x6Au8; 32];
 /// announcement, which is the only place `connectPeer` can get them —
 /// it takes a peer id and nothing else.
 const CAPABILITY: &str = "natsim.matrix.peer";
+
+/// The one service this anchor has to serve.
+///
+/// `connect()` ENROLS, and an anchor that serves nothing leaves that
+/// call unanswered until the leaf's own 30 s deadline, which comes
+/// out of `connect` as `rpc: the call's deadline elapsed` and reads
+/// like a broken transport. It is not optional for a conformance row
+/// either: §12 gate 4 refuses a capability announcement from a
+/// PROVISIONAL session, so an unenrolled leaf could never announce
+/// and the two tabs could never discover each other — every row would
+/// die two steps later with a cause that no longer names itself.
+///
+/// Observed, not deduced: run 35053041109's Firefox row got its
+/// DataChannel open and the anchor counted `direct=2`, then both tabs
+/// failed with exactly that RPC deadline thirty seconds later.
+struct Enrollment;
+
+#[async_trait::async_trait]
+impl RpcHandler for Enrollment {
+    async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: admitted_outcome(),
+        })
+    }
+}
+
+/// `JoinOutcome`'s pinned wire form (`sdk/src/enrollment.rs`: `NMO1`,
+/// then `0` Admitted / `1` Rejected, then a length-prefixed
+/// delegation chain). The core's promotion gate parses exactly this.
+fn admitted_outcome() -> Bytes {
+    let mut buf = Vec::from(*b"NMO1");
+    buf.push(0);
+    let chain = b"natsim-matrix-delegation-chain";
+    buf.extend_from_slice(&(chain.len() as u32).to_le_bytes());
+    buf.extend_from_slice(chain);
+    Bytes::from(buf)
+}
 
 const CA_COMMON_NAME: &str = "net-mesh natsim harness CA";
 
@@ -871,6 +914,12 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         "[runner] anchor node {:016x} rtc {rtc_bind}",
         anchor.node_id()
     );
+    // Held for the row's lifetime: dropping the guard unregisters the
+    // service, and a leaf that reconnects would find nothing serving
+    // its enrolment call again.
+    let _enrollment = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(Enrollment))
+        .map_err(|e| format!("serve {ENROLL_SERVICE}: {e}"))?;
 
     // --- 2. TLS + the bootstrap listener ---------------------------
     let ca = issue_certificate(&work, m.anchor_ip)?;
