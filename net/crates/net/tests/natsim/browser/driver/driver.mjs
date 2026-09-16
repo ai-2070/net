@@ -97,8 +97,17 @@ function chromiumArgs(spkiPin, logPath) {
     // absolute `--log-file` under the profile, read after close.
     '--enable-logging',
     `--log-file=${logPath}`,
-    '--v=0',
-    '--vmodule=*/p2p/*=2,*stun*=2,*connection*=2',
+    // `--v=1`, not `--v=0` with a `--vmodule` list. The previous
+    // combination produced only `services/network/p2p/socket_udp.cc`
+    // lines — the BROWSER-process socket layer — because libwebrtc's
+    // own `RTC_LOG` in the RENDERER maps onto Chrome's verbose
+    // logging rather than onto per-file `--vmodule` overrides, and at
+    // `--v=0` none of it is emitted. The discard accounting for a
+    // STUN response lives exactly there.
+    '--v=1',
+    // Kept narrow on top of `--v=1` so the ICE files are at the
+    // highest level while the rest of the browser stays at 1.
+    '--vmodule=*p2p*=3,*stun*=3,*connection*=3,*port*=3',
   ];
 }
 
