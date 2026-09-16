@@ -571,6 +571,103 @@ only evidence that distinguishes `UdpBlocked` from `IceTimeout`.
 No witness is weakened under any of the three, and none of them
 changes a NAT flavour, a deadline or a counter identity.
 
+#### 6.12.2 The resolution, built: a separately announced STUN endpoint
+
+Kyra ruled **option 1** plus fail-fast rejection of a known
+collision, and rejected documentation-only, in
+[`spikes/S6_STUN_ENDPOINT_BRIEF.md`](../../../spikes/S6_STUN_ENDPOINT_BRIEF.md):
+*"The receive-dispatch behaviour belongs to libwebrtc, but our
+product contract invites the incompatible configuration. Changing the
+harness closes the experiment; it does not fix that contract."*
+
+**What shipped.** `rtc_addr` is unchanged and keeps both of its
+roles. A new announcement field `rtc_stun_addr` carries a distinct
+endpoint, signed in `SignedPayloadCanonical` immediately after
+`rtc_addr` (field count 15 → 16), emitted only when configured. The
+anchor binds a second UDP socket that answers STUN and nothing else.
+The leaf reads the announced endpoint from `GET /rtc/anchor` and uses
+it as its own default `iceServers`, so an integrator does not have to
+discover which STUN service avoids its own anchor.
+
+| Kyra's acceptance boundary | Evidence |
+|---|---|
+| 1. Announced STUN reachable **and distinct** from `rtc_addr`, NAT case included | `the_two_announced_endpoints_are_different_sockets` + `the_stun_only_socket_answers_a_binding_request`; distinctness is structural, not observed — two independent binds, and a NAT cannot map two internal tuples to one external tuple for a protocol whose reverse translation keys on the external port. natsim asserts the public tuples after the gateway. |
+| 2. **Chromium and Firefox** connect on the **product-advertised** configuration, no harness search | the matrix's separate STUN host is DELETED; the anchor announces its own endpoint and `matrix.js` configures no `iceServers` at all |
+| 3. The conflicting configuration fails **promptly and descriptively** | `LeafError::IceServerConflictsWithPeer`, returned after `attach` and **before** `create_offer` |
+| 4. `UdpBlocked` still targets `rtc_addr`, classification unchanged | proven, not assumed: both call sites still read `anchor_rtc_addr()`, the new accessor appears only inside `connect`'s default, and a browser-ts test fails if a second entry reaches the probe's configuration |
+| 5. NAT matrix passes with **no** topology change, longer deadline, or candidate-type criterion | no NAT flavour, deadline, floor or disposition changed; `--stun-ip` is vestigial rather than repurposed |
+
+The typed refusal, verbatim — pinned by `assert_eq!` on **both**
+sides, because `@net-mesh/browser` reconstructs the variant by
+parsing this prefix and a reworded message would silently demote it
+to `unknown` with nothing red:
+
+```
+ice configuration: the iceServers entry stun:198.51.100.7:4433 names
+this connection's peer RTC endpoint 198.51.100.7:4433; a peer cannot
+be its own STUN server. Omit iceServers to use the STUN endpoint the
+anchor announces (the stun_addr field of GET /rtc/anchor), or name a
+STUN server that is not this peer
+```
+
+**Decisions worth keeping.**
+
+- **Absence, not emptiness.** An explicit `iceServers: []` is a
+  caller saying *none* and is honoured; only an omitted option takes
+  the default. A default that also fired on `[]` would override an
+  intent rather than supply a missing one.
+- **`effective_ice_servers({})` still reports `[]`.** The leaf uses
+  the announced endpoint without pretending the caller configured it.
+- **Detection is equality-only**, and DNS aliases are documented out
+  of scope rather than implied to work.
+- **A second fail-fast, unasked and then commissioned.** Two
+  correctly distinct sockets announced under one endpoint reproduces
+  §6.12.1 exactly, and neither the driver nor the leaf could see it.
+  `RtcDriver::spawn` now refuses before binding when the announced
+  endpoints collide, or when the two binds do. The bind arm exempts
+  port 0 — two `ip:0` binds compare equal and are nonetheless two
+  sockets — and that exemption was found by a negative witness going
+  red on the ordinary `127.0.0.1:0` configuration, not by reasoning.
+  The best receipt in the slice: inverting the bind comparison yields
+  `AddrInUse`, which is *literally the confusing failure the check
+  replaces*.
+- **`stunUrl` → `diagnosticStunUrl`**, clean cutover, no alias. The
+  implication that it also builds an anchor connection's `iceServers`
+  is what cost this stage five cycles. §6.12.1 keeps the old name
+  because it describes the pre-fix state.
+
+**Two qualifications Kyra required, stated rather than buried.**
+
+1. **The harness's camera/microphone grant is not permission to make
+   media access a prerequisite for a data-only Net application.** It
+   is a harness fact about Chromium's interface-enumeration gate.
+   Verified: there is no `getUserMedia`, `getDisplayMedia` or
+   `MediaStream` anywhere on the leaf or `browser-ts` path — every
+   connection and the probe are `RTCPeerConnection` + `DataChannel`.
+   The product must work without it, and does.
+2. **Reachability is the second socket's weak point, not
+   distinctness.** `stun_only_loop` only ever replies, so it cannot
+   bootstrap its own NAT mapping: the announced endpoint is reachable
+   only via a static or forwarded mapping, exactly like `rtc_addr`.
+   natsim's anchor is not NAT'd so this does not arise there; an
+   operator running a NAT'd anchor must forward both ports.
+
+**A named gap found on the way, not fixed here.** The leaf vendors
+byte copies of the cross-language fixtures, because `include_str!`
+cannot cross a package boundary and the wasm runner must replay them
+inside Chromium. The copies are load-bearing; their *guard* is not
+well placed. Editing a fixture in the core workspace goes green where
+the editor is working and reddens only a separately-invoked
+`cargo test -p net-mesh-leaf` — which is exactly what happened during
+this slice. The repo already solves it correctly for
+`aead_vector.json`, where the core asserts the mirror byte-equal so
+the red lands at the edit. Fix shape: one test in
+`tests/cross_lang_wire.rs` comparing against
+`net_leaf::test_vectors::ALL`. This is the second guard in this stage
+that existed but sat on the far side of the boundary it guards — the
+first was natsim's table-vs-script cross-check, which only fires in a
+job that has to get that far.
+
 ### 6.13 Two more log lines that asserted more than their code knew
 
 `no such dialog on this anchor` renders `SignalOutcome::Ignored`,
