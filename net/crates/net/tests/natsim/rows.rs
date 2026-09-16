@@ -625,8 +625,10 @@ impl RowVerdict {
                 row.scenario, row.expect, row.why
             ));
         }
-        self.a.check_exact("side a (leaf)", row.leaf_expectation())?;
-        self.b.check_exact("side b (leaf)", row.leaf_expectation())?;
+        self.a
+            .check_exact("side a (leaf)", row.leaf_expectation())?;
+        self.b
+            .check_exact("side b (leaf)", row.leaf_expectation())?;
         self.anchor
             .check_exact("anchor (native)", row.anchor_expectation())?;
         Ok(())
@@ -784,9 +786,11 @@ pub fn parse_script_arms(script: &str) -> Result<Vec<ScriptArm>, String> {
         });
     }
     if out.is_empty() {
-        return Err("no browser_* case arms found in run_scenario.sh — either the matrix is \
+        return Err(
+            "no browser_* case arms found in run_scenario.sh — either the matrix is \
                     gone or the arms no longer have the shape this parser reads"
-            .to_owned());
+                .to_owned(),
+        );
     }
     Ok(out)
 }
