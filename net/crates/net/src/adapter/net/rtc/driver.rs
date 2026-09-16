@@ -1113,7 +1113,22 @@ async fn drain_session(
                 if hooks.drop_this_raw_egress(&t.contents) {
                     continue;
                 }
-                let _ = socket.send_to(&t.contents, t.destination).await;
+                // The send result is NOT discarded. A datagram the
+                // kernel refuses — no route, EPERM from a firewall,
+                // an address the socket's namespace cannot reach —
+                // is indistinguishable at the peer from a packet
+                // that was never generated, and str0m will happily
+                // go on nominating a pair whose every transmit
+                // failed. That is the one boundary between "the
+                // engine answered" and "the answer left the host".
+                if let Err(e) = socket.send_to(&t.contents, t.destination).await {
+                    tracing::debug!(
+                        destination = %t.destination,
+                        bytes = t.contents.len(),
+                        error = %e,
+                        "an RTC datagram could not be sent"
+                    );
+                }
             }
             Ok(Output::Event(event)) => match event {
                 Event::ChannelOpen(cid, _label) => {
