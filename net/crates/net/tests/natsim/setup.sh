@@ -15,17 +15,35 @@
 #         |                |
 #      nsim_a .2        nsim_b .2           (joiners behind NAT)
 #
-# NAT flavor per side (--nat-a / --nat-b):
+# NAT flavor per side (--nat-a / --nat-b). The three pre-existing
+# modes are for a side running a native helper on a KNOWN port; the
+# two `cone-*` modes are for a side whose UDP port is ephemeral (a
+# browser), and they are the axis the Stage 6 conformance matrix
+# separates — endpoint-independent mapping either way, filtering by
+# address or by full tuple:
 #   cone      — static 1:1 `snat to <pub>:<port>` for the joiner's own
 #               port, giving genuinely endpoint-independent mapping
 #               (the same public port for every destination) →
-#               classifies Cone; filtering stays conntrack-based
-#               (address-restricted), the realistic punch-needing case.
-#               Plus an INPUT drop for unsolicited inbound on that port,
-#               which is both what a restricted NAT does and what keeps
-#               a simultaneous punch from poisoning the port mapping.
-#               See `one_side` for why `masquerade persistent` alone is
-#               NOT a cone NAT.
+#               classifies Cone. Filtering is conntrack's full-tuple
+#               reply match plus an INPUT drop for unsolicited inbound
+#               on that port, which is both what a restricted NAT does
+#               and what keeps a simultaneous punch from poisoning the
+#               port mapping. That filtering is PORT-restricted, not
+#               address-restricted: an earlier comment here and the
+#               README both said address-restricted, and both were
+#               wrong (see `cone-ar` below for the real thing).
+#               See `one_side` for why `masquerade persistent` alone
+#               is NOT a cone NAT.
+#   cone-pr   — port-restricted, EPHEMERAL port: plain `masquerade`
+#               (port-preserving, so still endpoint-independent) plus
+#               the same `ct state new` input drop. Same filtering
+#               class as `cone`, for a side whose port nobody can pin.
+#   cone-ar   — address-restricted, EPHEMERAL port: `cone-pr` plus a
+#               dynamic set of the addresses this side has itself
+#               written UDP to, and a DNAT admitting inbound from any
+#               source PORT at such an address. Still nothing
+#               unsolicited: the mapping opens only after the local
+#               outbound.
 #   symmetric — `masquerade fully-random`: a fresh public port per
 #               connection tuple → classifies Symmetric.
 #   none      — the joiner is expected to run publicly in nsim_wan
@@ -67,8 +85,12 @@ done
 # unrecognized used to fall through to the cone masquerade).
 for mode in "$NAT_A" "$NAT_B"; do
   case "$mode" in
-    cone|symmetric|none) ;;
-    *) echo "invalid NAT mode: '$mode' (want cone|symmetric|none)" >&2; exit 2 ;;
+    cone|cone-ar|cone-pr|symmetric|none) ;;
+    *)
+      echo "invalid NAT mode: '$mode'" \
+        "(want cone|cone-ar|cone-pr|symmetric|none)" >&2
+      exit 2
+      ;;
   esac
 done
 # --public-b replaces side B's NAT'd joiner with a public address on
@@ -150,6 +172,84 @@ table ip nat {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "gw$L-wan" masquerade fully-random
+  }
+}
+EOF
+    return 0
+  fi
+
+  # ------------------------------------------------------------------
+  # The two EPHEMERAL-PORT cone modes, for a side whose UDP source
+  # port cannot be known in advance — i.e. a browser. Both are
+  # endpoint-independent in MAPPING (one public port for every
+  # destination) and differ only in FILTERING, which is the axis the
+  # Stage 6 conformance matrix separates:
+  #
+  #   cone-pr  port-restricted: conntrack's full-tuple reply match is
+  #            the only way in. A peer that writes from a source port
+  #            other than the one this side sent to is dropped.
+  #   cone-ar  address-restricted: any source PORT from an address
+  #            this side has itself written to is let in.
+  #
+  # That difference is the whole reason the matrix has both a
+  # `cone` row and a `port-restricted` row. It decides two rows:
+  # ar × symmetric solves (the symmetric peer's check arrives from an
+  # unpredictable port at an address-restricted filter, is admitted,
+  # and ICE learns it peer-reflexively) while pr × symmetric cannot
+  # (same packet, full-tuple filter, dropped — and the reverse check
+  # dies at the symmetric gateway). The pre-existing `cone` mode below
+  # is port-restricted despite its name; see the README.
+  #
+  # MAPPING, and why there is no `snat to $PUB:$PORT` here. The pinned
+  # mode below can only pin a port it knows; a browser's ICE socket
+  # picks its own. Plain `masquerade` (NOT `fully-random`) preserves
+  # the source port when the tuple is free, which makes the mapping
+  # endpoint-independent — and the tuple IS free here, because exactly
+  # one host lives behind this gateway, so nothing of its own can
+  # collide with it, and the `ct state new` input drop below keeps a
+  # stranger's inbound from claiming the tuple before the local
+  # outbound leaves (the same poisoning the pinned mode's drop
+  # prevents, for the same reason). A future row that puts TWO nodes
+  # behind one gateway invalidates that argument and must pin instead.
+  #
+  # FILTERING, `cone-ar`. The permitted-address set is learned from
+  # this side's OWN outbound: the forward-hook rule records every
+  # destination address the joiner writes a UDP datagram to, and the
+  # prerouting DNAT admits inbound only from an address in that set.
+  # So the peer becomes reachable strictly AFTER this side has written
+  # to it — which is what address-restricted means, and is why this is
+  # not the full-cone static DNAT the pinned mode's comment rejects: a
+  # stranger is still refused, and nothing is reachable unsolicited.
+  # Everything lives in ONE table because an nftables set is
+  # table-scoped and the nat rule has to reference it.
+  if [[ "$MODE" == "cone-ar" || "$MODE" == "cone-pr" ]]; then
+    local AR_LEARN="" AR_DNAT=""
+    if [[ "$MODE" == "cone-ar" ]]; then
+      AR_LEARN="iifname \"gw$L-lan\" meta l4proto udp update @punched { ip daddr }"
+      AR_DNAT="iifname \"gw$L-wan\" ip saddr @punched meta l4proto udp ct state new dnat to $LAN.2"
+    fi
+    ip netns exec "$GW" nft -f - <<EOF
+table ip natsim {
+  set punched {
+    type ipv4_addr
+    flags dynamic,timeout
+    timeout 5m
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "gw$L-wan" masquerade
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    $AR_DNAT
+  }
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "gw$L-wan" meta l4proto udp ct state new drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    $AR_LEARN
   }
 }
 EOF

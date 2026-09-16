@@ -211,9 +211,23 @@ fn scenario(name: &str) -> ScenarioRun {
     // SAME profile's binary as this test run instead of its
     // debug-path default.
     let bin = natsim_node_bin();
-    let out = Command::new("sudo")
-        .arg("env")
-        .arg(format!("NATSIM_NODE_BIN={}", bin.display()))
+    let mut cmd = Command::new("sudo");
+    cmd.arg("env")
+        .arg(format!("NATSIM_NODE_BIN={}", bin.display()));
+    // The browser rows need two more values on the far side of sudo,
+    // and both are environment-only by design.
+    //
+    // `PLAYWRIGHT_BROWSERS_PATH` is the load-bearing one: the drivers
+    // run as ROOT inside the namespaces, so Playwright would look for
+    // browsers under root's `$HOME` and find the ones CI installed for
+    // the build user nowhere. Forwarded only when set, so a machine
+    // using the default location is unaffected.
+    for key in ["PLAYWRIGHT_BROWSERS_PATH", "NATSIM_BROWSER_BIN"] {
+        if let Ok(value) = std::env::var(key) {
+            cmd.arg(format!("{key}={value}"));
+        }
+    }
+    let out = cmd
         .arg(script)
         .arg(name)
         .output()
@@ -440,6 +454,138 @@ fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
         0,
         "the direct path under test is the DataChannel, not a punch: {v:#}",
     );
+}
+
+// =========================================================================
+// Stage 6 — the browser NAT conformance matrix
+// (BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md Stage 6, §3, §9, §10)
+//
+// Two headless browsers behind two simulated NATs plus one anchor,
+// six rows over the cone / port-restricted / symmetric axis, and a
+// Firefox control. The table, the expected disposition per row, the
+// counter arithmetic and the derivation of all of it live in
+// `natsim/rows.rs` — ONE table, shared with the runner and with
+// `tests/natsim_browser.rs`, which cross-checks it against
+// `run_scenario.sh`'s own case arms on every platform.
+//
+// Each row asserts three independent witnesses:
+//
+//   1. the typed `PeerConnectOutcome.type` on BOTH halves of the
+//      dialog (`connectPeer` on the offerer, `acceptPeer` on the
+//      answerer) — and that they agree, because one pair has one
+//      disposition;
+//   2. the §10 ICE ledgers on both leaves and on the anchor, with the
+//      identity `direct + relayed + failed + udp_blocked ==
+//      attempted`, `pending == 0` and a non-zero denominator, every
+//      term at its exact expected value;
+//   3. the two gateways' own conntrack tables, which are nobody's
+//      report but the NAT's: a two-way UDP flow between the public
+//      addresses on a direct row, and none on a relayed row.
+// =========================================================================
+
+#[path = "natsim/rows.rs"]
+mod rows;
+
+/// Run one matrix row and assert everything it promises.
+///
+/// Every failure path panics with the whole verdict attached, and
+/// `ScenarioRun`'s `Drop` then dumps the runner log, both page
+/// consoles and both gateways' NAT snapshots — because the next
+/// occurrence has to be diagnosable from the CI log without a re-run,
+/// and a row that failed at the NAT level and a row that failed at
+/// the leaf level look identical in a bare assertion message.
+fn browser_row(row: &rows::Row) {
+    let run = scenario(row.scenario);
+    let verdict = rows::RowVerdict::from_json(&run.outcome)
+        .unwrap_or_else(|e| panic!("row {}: unreadable verdict: {e}\n{run:#}", row.scenario));
+    if let Err(e) = verdict.check(row) {
+        panic!("row {}: {e}\n{run:#}", row.scenario);
+    }
+
+    // The independent half. Read from the gateways, not from either
+    // endpoint: a leaf reporting `direct` and an anchor reporting a
+    // flat forwarding counter are both statements by a party to the
+    // session.
+    let path = run.state.join("nat_flow.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "row {}: no gateway flow witness at {}: {e}\n{run:#}",
+            row.scenario,
+            path.display()
+        )
+    });
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("row {}: nat_flow.json: {e}", row.scenario));
+    let flows = rows::NatFlows::from_json(&json)
+        .unwrap_or_else(|e| panic!("row {}: nat_flow.json: {e}\n{json:#}", row.scenario));
+    if let Err(e) = flows.check(row) {
+        panic!("row {}: {e}\n{run:#}", row.scenario);
+    }
+}
+
+/// Address-restricted cone on both sides: each gateway admits the
+/// peer's check once its own outbound has opened the mapping.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct() {
+    browser_row(&rows::ROWS[0]);
+}
+
+/// Address-restricted × port-restricted: both mappings are
+/// endpoint-independent, so each side's check lands on the exact
+/// tuple the other sent to.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_portrestricted_is_direct() {
+    browser_row(&rows::ROWS[1]);
+}
+
+/// Port-restricted on both sides — the simultaneous-open case. Each
+/// check matches the conntrack reply tuple the other side's own check
+/// created; nothing peer-reflexive is needed.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_portrestricted_portrestricted_is_direct() {
+    browser_row(&rows::ROWS[2]);
+}
+
+/// Address-restricted × symmetric: the row that justifies having both
+/// cone flavors. The symmetric side's check arrives from a port
+/// nobody could predict, the address-restricted filter admits it
+/// anyway, and ICE learns the pair peer-reflexively.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_symmetric_is_direct() {
+    browser_row(&rows::ROWS[3]);
+}
+
+/// Port-restricted × symmetric: **relayed, and that is the correct
+/// outcome.** The same check a `cone-ar` gateway admits is dropped by
+/// a full-tuple filter, and the reverse check dies at the symmetric
+/// gateway, so ICE cannot solve this pair at all. The routed session
+/// through the anchor is kept and typed `iceTimeout` — not
+/// `udpBlocked`, which this row refuses, because the leaf's own
+/// anchor dialog is a UDP DataChannel that landed direct.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_portrestricted_symmetric_is_relayed() {
+    browser_row(&rows::ROWS[4]);
+}
+
+/// Symmetric × symmetric: relayed, the plan's named fallback row.
+/// Neither side can predict the other's mapping.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_symmetric_symmetric_is_relayed() {
+    browser_row(&rows::ROWS[5]);
+}
+
+/// The control: row 1 again with Firefox on both sides, so a direct
+/// result is not a Chromium artifact. Same NAT pair, one variable.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct_on_firefox() {
+    browser_row(&rows::CONTROL);
 }
 
 // =========================================================================

@@ -1,0 +1,6 @@
+# Build artifacts of this nested crate. CI builds them; the repo never
+# carries them.
+target/
+# The Playwright driver's single dependency, installed on first use.
+driver/node_modules/
+driver/package-lock.json

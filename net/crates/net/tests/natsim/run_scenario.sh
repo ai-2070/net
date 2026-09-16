@@ -19,6 +19,14 @@
 #                              upgrades the relayed session onto a
 #                              DataChannel reached at A's MAPPED
 #                              `rtc_addr` (needs a `webrtc` helper)
+#   browser_*                  the Stage 6 NAT conformance matrix: two
+#                              headless browsers behind simulated NATs
+#                              plus one anchor, six rows plus a Firefox
+#                              control. No mesh helper runs; the anchor,
+#                              the page and both browser drivers are the
+#                              `tests/natsim/browser` runner. See
+#                              `tests/natsim/rows.rs` for the table and
+#                              the expected disposition per row
 #
 # Requires root (netns + nft). The helper binary must already be
 # built: NATSIM_NODE_BIN or target/debug/examples/natsim_node.
@@ -38,10 +46,16 @@ mkdir -p "$STATE"
 # script's last stdout line points at.
 chmod 700 "$STATE"
 
-[[ -x "$BIN" ]] || {
-  echo "natsim: helper not built: $BIN (cargo build --example natsim_node --features net,nat-traversal)" >&2
-  exit 2
-}
+# The mesh helper. The Stage 6 `browser_*` rows run NO mesh helper at
+# all — their nodes are browser leaves and their anchor is the browser
+# runner — so requiring it there would refuse a scenario that does not
+# use it.
+if [[ "$SCENARIO" != browser_* ]]; then
+  [[ -x "$BIN" ]] || {
+    echo "natsim: helper not built: $BIN (cargo build --example natsim_node --features net,nat-traversal)" >&2
+    exit 2
+  }
+fi
 
 # Per-scenario knobs. `OUTCOME_NODE` names the side that writes the
 # verdict: `a` for every punch/upgrade scenario (A is the initiator),
@@ -55,6 +69,14 @@ A_EXTRA=() PUBLIC_B_EXTRA=(--auto-upgrade)
 # is the only reason the anchor can advertise it.
 RTC_PORT_A=7101
 RTC_PORT_B=7102
+# Stage 6 browser rows: the disposition the row asserts and the engine
+# each side runs. `EXPECT` is passed to the runner so the verdict
+# records what the topology was provisioned FOR, which is what makes a
+# mis-wired row detectable (`tests/natsim/rows.rs`).
+EXPECT="" ENGINE_A=chromium ENGINE_B=chromium
+# The Stage 6 browser runner: anchor + HTTPS bootstrap listener + page
+# origin + both Playwright drivers, one binary, inside nsim_wan.
+BROWSER_BIN="${NATSIM_BROWSER_BIN:-$HERE/browser/target/release/natsim-browser-matrix}"
 case "$SCENARIO" in
   cone_cone_punch)          NAT_A=cone;      NAT_B=cone ;;
   symmetric_cone_punch)     NAT_A=symmetric; NAT_B=cone ;;
@@ -75,6 +97,25 @@ case "$SCENARIO" in
     # DataChannel, and a UDP punch racing it would decide the verdict.
     PUBLIC_B_EXTRA=(--target a --mode rtc --rtc-bind "10.99.0.12:$RTC_PORT_B")
     ;;
+  # --- Stage 6 browser NAT conformance matrix -----------------------
+  # Two headless browsers behind simulated NATs, one anchor. Every arm
+  # is ONE line in a fixed shape because `tests/natsim/rows.rs` parses
+  # it: the Rust table and these arms are cross-checked by
+  # `tests/natsim_browser.rs`, which runs on every platform, so the
+  # provisioned topology and the asserted disposition cannot drift.
+  #
+  # `cone-ar` (address-restricted) and `cone-pr` (port-restricted) are
+  # both endpoint-independent in mapping and differ only in filtering
+  # — see setup.sh. That difference is why ar x symmetric solves and
+  # pr x symmetric cannot.
+  browser_cone_cone) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_cone_portrestricted) NAT_A=cone-ar NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_portrestricted_portrestricted) NAT_A=cone-pr NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_cone_symmetric) NAT_A=cone-ar NAT_B=symmetric MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_portrestricted_symmetric) NAT_A=cone-pr NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_symmetric_symmetric) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  # The control: row 1 again, the other engine on both sides.
+  browser_cone_cone_firefox) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=firefox ENGINE_B=firefox OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 
@@ -90,6 +131,28 @@ if [[ "$MODE" == rtc ]]; then
 (cargo build --example natsim_node --features net,nat-traversal,webrtc); got: ${CAPS:-<no output>}" >&2
        exit 2 ;;
   esac
+fi
+
+# Same discipline for the browser rows: refuse BEFORE provisioning
+# when the pieces a browser row cannot run without are missing. A row
+# that provisions namespaces and then discovers there is no runner
+# fails 120 s later as an empty verdict, naming nothing.
+if [[ "$MODE" == browser ]]; then
+  [[ -x "$BROWSER_BIN" ]] || {
+    echo "natsim: $SCENARIO needs the browser runner: $BROWSER_BIN" >&2
+    echo "  cargo build --release --manifest-path $HERE/browser/Cargo.toml" >&2
+    echo "  (or set NATSIM_BROWSER_BIN)" >&2
+    exit 2
+  }
+  command -v node >/dev/null || {
+    echo "natsim: $SCENARIO needs node on PATH (the Playwright driver)" >&2
+    exit 2
+  }
+  [[ -d "$HERE/browser/driver/node_modules" ]] || {
+    echo "natsim: $SCENARIO needs the driver's dependencies installed:" >&2
+    echo "  (cd $HERE/browser/driver && npm install && npx playwright install --with-deps chromium firefox)" >&2
+    exit 2
+  }
 fi
 
 PIDS=()
@@ -152,40 +215,63 @@ if [[ "$MODE" == upgrade ]]; then
   SEED_ARGS_B=(--seed-hex "$HIGH")
 fi
 
-# Publics: X accepts R first (R dials it), then the joiners.
-launch nsim_wan x  public --name x --bind 10.99.0.11:7000 --state "$STATE" --joiners r,a,b
-launch nsim_wan r  public --name r --bind 10.99.0.10:7000 --state "$STATE" --joiners a,b --connect-to x
-
-if [[ "$PUBLIC_B" == 1 ]]; then
-  # B runs publicly inside the wan namespace (no NAT).
-  launch nsim_wan b joiner --name b --bind 10.99.0.12:7002 --state "$STATE" \
-    --publics r,x "${PUBLIC_B_EXTRA[@]}" "${SEED_ARGS_B[@]}"
+if [[ "$MODE" == browser ]]; then
+  # The browser rows launch NO mesh helpers. Every native piece — the
+  # anchor `MeshNode` with its RTC socket and STUN responder, the real
+  # `serve_bootstrap` HTTPS listener, the page origin, the credential,
+  # and one Playwright driver per NAT'd namespace — is in this one
+  # binary, running inside nsim_wan on 10.99.0.10. It reaches the
+  # browsers with `ip netns exec`, which works from any namespace
+  # (setns needs root, which this script already has), so the drivers
+  # AND their browsers run entirely inside nsim_a / nsim_b while their
+  # stdio pipes stay attached here.
+  ip netns exec nsim_wan env RUST_LOG="$NATSIM_LOG" \
+    "$BROWSER_BIN" \
+      --scenario "$SCENARIO" \
+      --state "$STATE" \
+      --nat-a "$NAT_A" --nat-b "$NAT_B" \
+      --expect "$EXPECT" \
+      --engine-a "$ENGINE_A" --engine-b "$ENGINE_B" \
+      --anchor-ip 10.99.0.10 \
+      --netns-a nsim_a --netns-b nsim_b \
+      >"$STATE/runner.log" 2>&1 &
+  PIDS+=("$!")
 else
-  # Bind the concrete LAN IP (192.168.102.2), NOT 0.0.0.0. The
-  # classifier's Open check does port-only matching on a wildcard bind
-  # (classify.rs Finding B3), so a port-preserving cone NAT
-  # (`masquerade persistent` keeps the source port) reflects back
-  # `10.99.0.3:7002`, whose port matches the bind port, and the node
-  # misclassifies as Open instead of Cone. A concrete bind IP forces
-  # the full `reflex.ip() == bind.ip()` comparison, which the NAT'd
-  # public IP fails → Cone, as the scenario expects. (Symmetric dodges
-  # this because `fully-random` scrambles the port.)
-  launch nsim_b b joiner --name b --bind 192.168.102.2:7002 --state "$STATE" \
-    --publics r,x "${SEED_ARGS_B[@]}"
-fi
+  # Publics: X accepts R first (R dials it), then the joiners.
+  launch nsim_wan x  public --name x --bind 10.99.0.11:7000 --state "$STATE" --joiners r,a,b
+  launch nsim_wan r  public --name r --bind 10.99.0.10:7000 --state "$STATE" --joiners a,b --connect-to x
 
-# A's role: initiator for every punch/upgrade scenario, responder (the
-# anchor) for the RTC one, where the scenario already filled A_EXTRA.
-if [[ "$MODE" != rtc ]]; then
-  A_EXTRA=(--target b --mode "$MODE")
-  if [[ "$MODE" == upgrade ]]; then
-    A_EXTRA+=(--auto-upgrade)
+  if [[ "$PUBLIC_B" == 1 ]]; then
+    # B runs publicly inside the wan namespace (no NAT).
+    launch nsim_wan b joiner --name b --bind 10.99.0.12:7002 --state "$STATE" \
+      --publics r,x "${PUBLIC_B_EXTRA[@]}" "${SEED_ARGS_B[@]}"
+  else
+    # Bind the concrete LAN IP (192.168.102.2), NOT 0.0.0.0. The
+    # classifier's Open check does port-only matching on a wildcard bind
+    # (classify.rs Finding B3), so a port-preserving cone NAT
+    # (`masquerade persistent` keeps the source port) reflects back
+    # `10.99.0.3:7002`, whose port matches the bind port, and the node
+    # misclassifies as Open instead of Cone. A concrete bind IP forces
+    # the full `reflex.ip() == bind.ip()` comparison, which the NAT'd
+    # public IP fails → Cone, as the scenario expects. (Symmetric dodges
+    # this because `fully-random` scrambles the port.)
+    launch nsim_b b joiner --name b --bind 192.168.102.2:7002 --state "$STATE" \
+      --publics r,x "${SEED_ARGS_B[@]}"
   fi
+
+  # A's role: initiator for every punch/upgrade scenario, responder (the
+  # anchor) for the RTC one, where the scenario already filled A_EXTRA.
+  if [[ "$MODE" != rtc ]]; then
+    A_EXTRA=(--target b --mode "$MODE")
+    if [[ "$MODE" == upgrade ]]; then
+      A_EXTRA+=(--auto-upgrade)
+    fi
+  fi
+  # Concrete LAN IP (192.168.101.2), not 0.0.0.0 — see the B side above
+  # for why a wildcard bind misclassifies a port-preserving cone NAT.
+  launch nsim_a a joiner --name a --bind 192.168.101.2:7001 --state "$STATE" \
+    --publics r,x "${A_EXTRA[@]}" "${SEED_ARGS_A[@]}"
 fi
-# Concrete LAN IP (192.168.101.2), not 0.0.0.0 — see the B side above
-# for why a wildcard bind misclassifies a port-preserving cone NAT.
-launch nsim_a a joiner --name a --bind 192.168.101.2:7001 --state "$STATE" \
-  --publics r,x "${A_EXTRA[@]}" "${SEED_ARGS_A[@]}"
 
 # Wait for the verdict from whichever side drives this scenario.
 OUTCOME="$STATE/${OUTCOME_NODE}_outcome.json"
@@ -197,6 +283,50 @@ if [[ ! -s "$OUTCOME" ]]; then
   echo "natsim: scenario $SCENARIO timed out; helper logs:" >&2
   tail -n 40 "$STATE"/*.log >&2 || true
   exit 1
+fi
+
+# The browser rows' INDEPENDENT disposition witness, written from the
+# gateways' own conntrack tables before teardown.
+#
+# Neither endpoint is asked. A leaf reporting "direct" and an anchor
+# reporting a flat forwarding counter are both statements by a party
+# to the session; this one is the NAT's. And the discriminator is not
+# "is there a flow to the peer" — ICE sends checks on EVERY row,
+# including the two that cannot solve, so an outbound entry always
+# exists. It is whether that flow was ever REPLIED to: an entry
+# without `[UNREPLIED]` means packets crossed between the two public
+# addresses in both directions, which is what direct physically means
+# here, and its absence on both gateways is what relayed means.
+#
+# `/proc/net/nf_conntrack` rather than `conntrack -L`: it is
+# per-namespace, always present when conntrack is loaded, and needs no
+# extra package. `(src|dst)=<peer>` with a non-digit boundary so
+# 10.99.0.3 never matches 10.99.0.30.
+if [[ "$MODE" == browser ]]; then
+  flow_side() { # flow_side <gateway-ns> <peer public ip>
+    local ns="$1" peer="$2"
+    if [[ ! -e "/var/run/netns/$ns" ]]; then
+      printf '{"udp_flows":0,"udp_replied":0}'
+      return 0
+    fi
+    ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null |
+      awk -v peer="$peer" '
+        $0 ~ /[[:space:]]udp[[:space:]]/ {
+          if ($0 !~ ("(src|dst)=" peer "([^0-9]|$)")) next
+          flows++
+          if ($0 !~ /\[UNREPLIED\]/) replied++
+        }
+        END { printf "{\"udp_flows\":%d,\"udp_replied\":%d}", flows+0, replied+0 }
+      '
+  }
+  {
+    printf '{"a":'
+    flow_side nsim_gwa 10.99.0.3
+    printf ',"b":'
+    flow_side nsim_gwb 10.99.0.2
+    printf '}\n'
+  } >"$STATE/nat_flow.json"
+  echo "natsim: gateway flow witness: $(cat "$STATE/nat_flow.json")"
 fi
 
 # Snapshot each gateway's NAT state, BEFORE the EXIT trap tears the

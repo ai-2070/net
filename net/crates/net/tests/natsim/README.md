@@ -23,8 +23,21 @@ trivially arrives.
 - **cone** = static `snat to <public>:<port>` for the joiner's own port,
   plus an INPUT drop for unsolicited inbound on that port. That gives
   endpoint-independent mapping (one public port for all destinations)
-  with address-restricted filtering — the realistic punch-needing NAT.
+  with **port-restricted** filtering — the realistic punch-needing NAT.
   The classifier reads it as `Cone`.
+
+  > **This mode's filtering is port-restricted, and this document said
+  > "address-restricted" until Stage 6.** Both this bullet and
+  > `setup.sh`'s own comment made that claim; neither was true. The
+  > only way in is conntrack's FULL-TUPLE reply match, so a peer
+  > writing from any source port other than the one this side sent to
+  > is dropped — which is the definition of port-restricted. The
+  > mislabel mattered the moment a conformance matrix wanted a cone
+  > row AND a port-restricted row: spelled against this mode they
+  > would have been the same NAT class twice, proving one thing while
+  > claiming two. `cone-ar` below is the genuine
+  > address-restricted flavor. The rules of THIS mode are unchanged —
+  > every pre-existing scenario behaves exactly as before.
 
   > **`masquerade persistent` is not a cone NAT.** The earlier version of
   > this harness used it and claimed endpoint-independent mapping here.
@@ -47,6 +60,30 @@ trivially arrives.
 - **symmetric** = `masquerade fully-random`: fresh public port per
   connection tuple. The classifier reads it as `Symmetric` because R
   and X (two *distinct* public IPs) observe different mappings.
+- **cone-pr** / **cone-ar** = the same two filtering classes for a side
+  whose UDP source port cannot be known in advance, i.e. a **browser**.
+  No pinned port: plain `masquerade` (port-preserving, not
+  `fully-random`) keeps the mapping endpoint-independent, and the
+  `ct state new` input drop keeps a stranger's inbound from claiming
+  the tuple first. Exactly one host lives behind each gateway, so
+  nothing of its own can collide with its ephemeral port — a future
+  row with two nodes behind one gateway invalidates that and must pin
+  instead.
+  - **cone-pr** — port-restricted: conntrack's full-tuple reply match,
+    the same filtering class as `cone`.
+  - **cone-ar** — address-restricted: an nftables **dynamic set** of
+    every address this side has written UDP to (learned on the forward
+    hook from the joiner's own outbound) plus a prerouting DNAT that
+    admits inbound from any source PORT at such an address. Nothing is
+    reachable unsolicited — the mapping opens only after the local
+    outbound — so this is not the full-cone static DNAT the `cone`
+    bullet rejects.
+
+  The difference decides two matrix rows: `cone-ar × symmetric` solves
+  (the symmetric peer's check arrives from an unpredictable port, is
+  admitted, and ICE learns the pair peer-reflexively) while
+  `cone-pr × symmetric` cannot (same packet, full-tuple filter,
+  dropped — and the reverse check dies at the symmetric gateway).
 
 A cone gateway can also pin a **second** UDP port for the same
 joiner (`setup.sh --rtc-port-a <port>`), with the same `snat to
@@ -69,6 +106,9 @@ distinction is real, not forced by a test hook.
 | `run_scenario.sh <name>` | orchestrate one scenario: setup → launch helpers → collect verdict → teardown |
 | `../../examples/natsim_node.rs` | the helper node (roles: `keygen`, `capabilities`, `public`, `joiner`) |
 | `../natsim.rs` | `#[ignore]`d Rust tests wrapping the scripts; assert outcome + `traversal_stats` deltas |
+| `rows.rs` | the Stage 6 browser matrix as DATA: rows, dispositions, derivations, the counter checker, the verdict parser. Compiled by the row tests, the runner and `../natsim_browser.rs` — one table, three consumers |
+| `../natsim_browser.rs` | the matrix's platform-independent half: runs EVERYWHERE, cross-checks `rows.rs` against this script's `browser_*` case arms, and exercises the checker against every shape it must refuse |
+| `browser/` | the Stage 6 runner: anchor + bootstrap listener + page origin + both Playwright drivers, one binary, launched inside `nsim_wan` (`src/`), the page it serves (`page/`), and the per-namespace browser driver (`driver/`) |
 | `.github/workflows/natsim.yml` | CI job: traversal-touching PRs + nightly + manual |
 
 Helpers coordinate through a shared state directory (namespaces
@@ -87,6 +127,73 @@ public node), readiness markers, and the initiator's
 | `dropped_keepalives` | cone | cone (+ direct-UDP drop on both gateways) | attempt times out, falls back within deadline |
 | `relay_upgrade` | cone | — (B public) | relay-routed session migrates off the relay (`upgrades_succeeded ≥ 1`); the NAT'd joiner is forced to be the lower node id (C1 initiator) via `keygen` ordering |
 | `rtc_anchor_direct` | cone (+ RTC port 7101 pinned) | — (B public, the client) | the NAT'd **anchor** announces `rtc_addr = 10.99.0.2:7101` (its mapped address, not its `192.168.101.2:7101` bind), and the outside client's relay-signalled session ends up on a DataChannel (`transport: "rtc"`, `stats.rtc.ice_direct ≥ 1`). Needs a helper built with `webrtc`; the scenario refuses before provisioning if it isn't. Note B, not A, writes the verdict here — the client is the side that drives the upgrade |
+
+### The Stage 6 browser NAT conformance matrix
+
+Six rows plus a control, from
+`BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md` Stage 6: **two headless
+browsers behind two simulated NATs, one anchor**, no mesh helper
+anywhere. The anchor, the HTTPS bootstrap listener, the page origin
+and both Playwright drivers are one binary,
+`tests/natsim/browser/` (`natsim-browser-matrix`), launched inside
+`nsim_wan`; it puts each browser and its whole control stack inside
+the NAT'd namespace with `ip netns exec`.
+
+| scenario | NAT A | NAT B | expectation |
+|---|---|---|---|
+| `browser_cone_cone` | cone-ar | cone-ar | **direct** |
+| `browser_cone_portrestricted` | cone-ar | cone-pr | **direct** |
+| `browser_portrestricted_portrestricted` | cone-pr | cone-pr | **direct** (simultaneous open) |
+| `browser_cone_symmetric` | cone-ar | symmetric | **direct** (peer-reflexive through the address-restricted filter) |
+| `browser_portrestricted_symmetric` | cone-pr | symmetric | **relayed**, typed `iceTimeout` |
+| `browser_symmetric_symmetric` | symmetric | symmetric | **relayed**, typed `iceTimeout` |
+| `browser_cone_cone_firefox` | cone-ar | cone-ar | **direct** — row 1 on Firefox, both sides, as a control |
+
+**A relayed row is a PASS.** The routed session through the anchor is
+the documented disposition (plan §6), and the row asserts it is
+*typed* as such at the page surface rather than reported as a broken
+direct attempt. Two rows are relayed, not one: `cone-pr × symmetric`
+cannot solve either — the derivation is in `rows.rs`.
+
+The table, the expected disposition, the counter arithmetic and the
+derivations live in **`rows.rs`**, compiled by three consumers (the
+row tests, the runner, and `tests/natsim_browser.rs`) so there is one
+matrix and no drift. `tests/natsim_browser.rs` runs on **every**
+platform — it parses this script's own `browser_*` case arms and
+fails if they disagree with the Rust table, and it exercises the
+counter checker against every shape it must refuse.
+
+Each row asserts three independent witnesses:
+
+1. the typed `PeerConnectOutcome.type` on **both** halves of the
+   dialog (`connectPeer` on the offerer, `acceptPeer` on the
+   answerer), and that the two agree — one pair has one disposition;
+2. the §10 ICE ledgers on both leaves and on the anchor:
+   `direct + relayed + failed + udp_blocked == attempted`,
+   `pending == 0`, a **non-zero** denominator, and every term at its
+   exact expected value. An attempt is one signalling **dialog**, and
+   a leaf's dialog with its anchor is one — so every participant
+   expects `attempted == 2` (anchor bootstrap plus the peer dialog),
+   and a relayed row reads `direct == 1, relayed == 1` rather than
+   `direct == 0`. The anchor reads `attempted == 2, direct == 2` on
+   **every** row, which is what establishes that both anchors were
+   reachable — the scope the plan's "100 % of sessions established"
+   criterion is stated over;
+3. `<state>/nat_flow.json` — the two gateways' own conntrack tables.
+   Not "is there a flow to the peer": ICE sends checks on every row,
+   so the outbound entry always exists. What discriminates is whether
+   it was ever **replied** to.
+
+`udpBlocked` is refused as a disposition here, deliberately. It is
+`iceTimeout` narrowed by `UdpBlockedEvidence`, and on these rows UDP
+egress demonstrably works — every leaf's anchor dialog is a UDP
+DataChannel that landed direct. A row reporting it would be claiming a
+narrower cause than the evidence supports.
+
+What the rows do **not** measure: application data flow, and the
+anchor's per-pair forwarding counter. That is the §10 three-part
+witness, a different slice, and a row asserting both would diagnose
+neither.
 
 Deferred (documented, not yet wired): the parent-decision-11 IPv6
 pair — dual-stack both-open → direct, and a NAT64/464XLAT topology
@@ -119,6 +226,14 @@ cargo test --test natsim --features net,nat-traversal,webrtc -- --ignored --test
 # or a single scenario, directly:
 sudo tests/natsim/run_scenario.sh cone_cone_punch /tmp/natsim-state
 sudo tests/natsim/run_scenario.sh rtc_anchor_direct /tmp/natsim-rtc
+# the Stage 6 browser matrix (needs the runner, node, and Playwright
+# browsers; every row refuses BEFORE provisioning if a piece is
+# missing):
+cargo build --release --manifest-path tests/natsim/browser/Cargo.toml
+# `npm install`, not `npm ci`: the repo ignores package-lock.json, so
+# there is no committed lockfile (same as browser-ts and sdk-ts).
+(cd tests/natsim/browser/driver && npm install && npx playwright install --with-deps chromium firefox)
+sudo tests/natsim/run_scenario.sh browser_cone_symmetric /tmp/natsim-browser
 ```
 
 `webrtc` is only needed for `rtc_anchor_direct`; without it that

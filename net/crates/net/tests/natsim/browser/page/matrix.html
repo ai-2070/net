@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>natsim — NAT conformance matrix</title>
+  </head>
+  <body>
+    <!-- Served from `http://localhost:<port>` INSIDE the browser's own
+         network namespace, by a page-server child of the runner.
+
+         `http://localhost` is a secure context, which is what
+         `RTCPeerConnection`, `crypto.subtle` and wasm need — and it is
+         the only mechanism that works on both engines without a flag.
+         The alternatives were measured and rejected: serving the page
+         from the anchor's namespace over plain HTTP is not a secure
+         context, and Chromium's
+         `--unsafely-treat-insecure-origin-as-secure` has no Firefox
+         counterpart, so the control row could not have run. The
+         anchor's own endpoints stay on the real HTTPS listener, which
+         is the production shape anyway: page on one origin, anchor on
+         another. -->
+    <pre id="log"></pre>
+    <script type="module" src="/matrix.js"></script>
+  </body>
+</html>

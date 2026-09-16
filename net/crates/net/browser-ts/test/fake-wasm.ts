@@ -92,6 +92,12 @@ export interface FakeNodeBehaviour {
   publishError?: unknown;
   announceError?: unknown;
   streamSendError?: unknown;
+  /** One reading per `peer_candidate` call, replayed in order; the last repeats. */
+  peerCandidateJson?: string[];
+  peerOfferDialog?: string;
+  peerOfferError?: unknown;
+  peerAcceptOfferError?: unknown;
+  peerHandshakeError?: unknown;
 }
 
 export class FakeNode implements LeafWasmNode {
@@ -101,6 +107,10 @@ export class FakeNode implements LeafWasmNode {
   readonly calls: Array<{ service: string; payload: Uint8Array; timeoutMs?: number }> = [];
   readonly streams: FakeStream[] = [];
   readonly signals: Array<{ peerHex: string; dialog: number; kind: string; payload: Uint8Array }> = [];
+  readonly peerOffers: string[] = [];
+  readonly peerAccepts: string[] = [];
+  readonly peerCandidates: string[] = [];
+  readonly peerHandshakes: string[] = [];
   enrollments = 0;
   enrolled = false;
   closed = false;
@@ -162,6 +172,45 @@ export class FakeNode implements LeafWasmNode {
   async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
     if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
     this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
+  }
+
+  // ── §9, the four peer methods ──
+  //
+  // Faked at the Rust shape: `peer_offer` and `peer_accept_offer`
+  // resolve to a 16-hex dialog id, `peer_candidate` to the JSON
+  // `Inner::peer_candidate` formats, and `peer_handshake` to
+  // nothing. The real exchange is the browser matrix's; what the
+  // unit tests can reach here is the drive loop's own decisions —
+  // which reading is `direct`, which is a supersession, which is a
+  // deadline.
+  async peer_offer(peer_hex: string): Promise<string> {
+    if (this.behaviour.peerOfferError !== undefined) throw this.behaviour.peerOfferError;
+    this.peerOffers.push(peer_hex);
+    return this.behaviour.peerOfferDialog ?? '00000000000000d1';
+  }
+
+  async peer_accept_offer(peer_hex: string): Promise<string> {
+    if (this.behaviour.peerAcceptOfferError !== undefined) {
+      throw this.behaviour.peerAcceptOfferError;
+    }
+    this.peerAccepts.push(peer_hex);
+    return this.behaviour.peerOfferDialog ?? '00000000000000d1';
+  }
+
+  async peer_candidate(peer_hex: string): Promise<string> {
+    this.peerCandidates.push(peer_hex);
+    const readings = this.behaviour.peerCandidateJson ?? [];
+    const last = readings.at(-1);
+    if (last === undefined) {
+      return '{"dialog":"00000000000000d1","state":"open","sent":0,"applied":0,\
+"answered":true,"direct":true,"remainingMs":"9000"}';
+    }
+    return readings[Math.min(this.peerCandidates.length - 1, readings.length - 1)] ?? last;
+  }
+
+  async peer_handshake(peer_hex: string): Promise<void> {
+    if (this.behaviour.peerHandshakeError !== undefined) throw this.behaviour.peerHandshakeError;
+    this.peerHandshakes.push(peer_hex);
   }
 
   async enroll(): Promise<void> {
