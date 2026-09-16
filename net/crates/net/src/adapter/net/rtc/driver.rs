@@ -1264,6 +1264,20 @@ async fn receive(
         .map(|(slot, _)| *slot);
     let Some(slot) = target else {
         if config.serve_stun && stun::is_binding_request(datagram) {
+            // A binding request carrying USERNAME that NO session
+            // claims is the interesting case: it is an ICE check
+            // addressed to credentials this anchor does not
+            // recognise, and answering it as a gathering request
+            // tells the peer nothing it can use. Name it — a check
+            // that is silently unclaimed is indistinguishable, from
+            // the peer's side, from a dropped packet.
+            if stun::has_username(datagram) {
+                tracing::debug!(
+                    %source,
+                    sessions = sessions.len(),
+                    "an ICE connectivity check no session claimed"
+                );
+            }
             if let Some(response) = stun::binding_response(datagram, source) {
                 let _ = socket.send_to(&response, source).await;
                 stats.note_stun_binding_request();
@@ -1274,7 +1288,8 @@ async fn receive(
     let Some(session) = sessions.get_mut(&slot) else {
         return;
     };
-    if session.rtc.handle_input(input).is_err() {
+    if let Err(e) = session.rtc.handle_input(input) {
+        tracing::debug!(%source, slot, error = %e, "str0m refused a datagram; closing the session");
         session.closed = true;
     }
     drain_session(
