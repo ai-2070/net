@@ -108,6 +108,24 @@ function chromiumArgs(spkiPin, logPath) {
     // Kept narrow on top of `--v=1` so the ICE files are at the
     // highest level while the rest of the browser stays at 1.
     '--vmodule=*p2p*=3,*stun*=3,*connection*=3,*port*=3',
+    // EXPERIMENT, and labelled as one (S6_REPORT.md §6.12). The
+    // multicast route did NOT fix `MDNS bind failed,
+    // address_family=2, error=-4` — it recurs identically — so the
+    // mDNS reading is unproven rather than confirmed. This isolates
+    // causality instead of arguing about it: with obfuscation off,
+    // Chromium's host candidate is a real address it owns outright.
+    //
+    // If the rows go green, mDNS was causal and the real fix is a
+    // working mDNS path (or accepting srflx-only on such networks).
+    // If they stay red, mDNS is EXONERATED and the cause is
+    // elsewhere. Either way it is one cycle for a fact.
+    //
+    // Not a shipped behaviour change: production cannot turn this
+    // off, which is why it lives here behind an env switch and
+    // defaults to leaving obfuscation ON.
+    ...(process.env.NATSIM_NO_MDNS_OBFUSCATION
+      ? ['--disable-features=WebRtcHideLocalIpsWithMdns']
+      : []),
   ];
 }
 
