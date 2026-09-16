@@ -150,7 +150,7 @@ async function opLaunch(req) {
     // point of a driver per namespace — this replaces how the process
     // is started, not where.
     fs.mkdirSync(req.profileDir, { recursive: true });
-    const headed = __omp_shell("!process.env.DISPLAY;")
+    const headed = !!process.env.DISPLAY;
     const exe = chromium.executablePath();
     const args = [
       ...chromiumArgs(req.spkiPin),
