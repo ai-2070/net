@@ -129,7 +129,11 @@ const CA_COMMON_NAME: &str = "net-mesh natsim harness CA";
 fn step_label(step: &Step) -> String {
     serde_json::to_value(step)
         .ok()
-        .and_then(|v| v.get("kind").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .and_then(|v| {
+            v.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| "(unserializable step)".to_owned())
 }
 
@@ -205,9 +209,7 @@ fn parse_args() -> Result<Mode, String> {
     };
     if page_mode {
         return Ok(Mode::Page(PageServer {
-            bind: need("bind")?
-                .parse()
-                .map_err(|e| format!("--bind: {e}"))?,
+            bind: need("bind")?.parse().map_err(|e| format!("--bind: {e}"))?,
             page: PathBuf::from(need("page")?),
             browser_dist: PathBuf::from(need("browser-dist")?),
             ready_marker: flags.get("ready").map(PathBuf::from),
@@ -427,7 +429,8 @@ async fn next_step(State(s): State<Control>, Query(q): Query<TabQuery>) -> Respo
     match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
         Ok(Some((step, reply))) => {
             s.pending.lock().await.insert(step.id(), reply);
-            let body = serde_json::to_string(&step).unwrap_or_else(|e| format!("{{\"err\":\"{e}\"}}"));
+            let body =
+                serde_json::to_string(&step).unwrap_or_else(|e| format!("{{\"err\":\"{e}\"}}"));
             (
                 StatusCode::OK,
                 cors(&s.origin),
@@ -730,8 +733,7 @@ async fn main() {
             // nothing; a verdict with a populated `errors` array fails
             // the row in `tests/natsim.rs` naming the cause.
             let path = m.state.join("browser_outcome.json");
-            let body = serde_json::to_vec_pretty(&verdict.to_json(&m))
-                .expect("serialize verdict");
+            let body = serde_json::to_vec_pretty(&verdict.to_json(&m)).expect("serialize verdict");
             if let Err(e) = std::fs::write(&path, &body) {
                 eprintln!("natsim-browser-matrix: write {}: {e}", path.display());
                 std::process::exit(1);
@@ -799,10 +801,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
 
     // --- 1. the anchor ---------------------------------------------
     let rtc_bind = SocketAddr::new(IpAddr::V4(m.anchor_ip), m.rtc_port);
-    let mut cfg = MeshNodeConfig::new(
-        SocketAddr::new(IpAddr::V4(m.anchor_ip), m.mesh_port),
-        PSK,
-    );
+    let mut cfg = MeshNodeConfig::new(SocketAddr::new(IpAddr::V4(m.anchor_ip), m.mesh_port), PSK);
     cfg.rtc = Some(RtcConfig {
         serve_bootstrap: true,
         serve_stun: true,
@@ -825,7 +824,10 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             .map_err(|e| format!("anchor MeshNode::new: {e}"))?,
     );
     anchor.start_arc();
-    println!("[runner] anchor node {:016x} rtc {rtc_bind}", anchor.node_id());
+    println!(
+        "[runner] anchor node {:016x} rtc {rtc_bind}",
+        anchor.node_id()
+    );
 
     // --- 2. TLS + the bootstrap listener ---------------------------
     let ca = issue_certificate(&work, m.anchor_ip)?;
@@ -1028,10 +1030,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             verdict.a.node_id
         ));
     }
-    println!(
-        "[runner] a={} b={}",
-        verdict.a.node_id, verdict.b.node_id
-    );
+    println!("[runner] a={} b={}", verdict.a.node_id, verdict.b.node_id);
 
     for tab in [&tab_b, &tab_a] {
         tab.require(|id| Step::Announce {
@@ -1156,7 +1155,9 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         _ => None,
     };
     match landed {
-        Some(d) if d == row.expect => println!("[runner] row {} landed {d}, as expected", row.scenario),
+        Some(d) if d == row.expect => {
+            println!("[runner] row {} landed {d}, as expected", row.scenario)
+        }
         Some(d) => println!(
             "[runner] row {} landed {d}, expected {} — {}",
             row.scenario, row.expect, row.why

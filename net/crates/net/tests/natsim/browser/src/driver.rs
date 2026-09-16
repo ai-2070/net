@@ -88,7 +88,11 @@ impl Driver {
             .map_err(|e| format!("{}: unparseable driver line {line:?}: {e}", self.label))
     }
 
-    async fn request(&mut self, op: &str, mut req: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn request(
+        &mut self,
+        op: &str,
+        mut req: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         req["id"] = serde_json::json!(id);
