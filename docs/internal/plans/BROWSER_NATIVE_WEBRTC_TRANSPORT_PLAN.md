@@ -2608,6 +2608,46 @@ chosen): STUN on a second announced socket; the leaf strips/refuses an
 documentation only. The `UdpBlocked` probe (unsolicited request from a
 throwaway socket, not the ICE port) is unaffected by any of them.
 
+**Kyra's ruling on the `rtc_addr` consequence (2026-09-16): option 1 —
+a separately announced STUN endpoint — plus fail-fast rejection of a
+known collision; documentation-only rejected.** Her framing: "the
+receive-dispatch behaviour belongs to libwebrtc, but our product
+contract invites the incompatible configuration; changing the harness
+closes the experiment, it does not fix that contract." Brief
+`spikes/S6_STUN_ENDPOINT_BRIEF.md`. **Delivered by the bisect session
+in seven slices (`485d678ab`…`33cbf1be1`), green at `537c9c94f`: main
+CI 56/56, natsim 13/13 on the product-advertised configuration.**
+`S6_REPORT.md` §6.12.2. `rtc_addr` unchanged, both roles kept; a new
+announcement field `rtc_stun_addr` in `SignedPayloadCanonical`
+immediately after `rtc_addr` (field count 15 → 16, `skip_field` when
+absent, the cross-language golden vector carries the signed bytes and
+the no-RTC sibling is byte-unchanged); the anchor binds a second UDP
+socket that answers STUN and nothing else; the leaf reads `stun_addr`
+from `GET /rtc/anchor` and uses it as its default `iceServers` when the
+caller omits the option (an explicit `[]` is honoured as "none"); a
+STUN entry equal to *this* connection's peer RTC endpoint is
+`LeafError::IceServerConflictsWithPeer` before `create_offer`, message
+pinned on both sides; detection is equality-only with DNS aliases
+documented out of scope; `stunUrl` → `diagnosticStunUrl`, clean
+cutover. Unasked and commissioned: `RtcDriver::spawn` refuses before
+binding when the two announced endpoints or the two binds collide
+(port-0 exempt, found by a negative witness going red). The harness's
+separate STUN host is **deleted** — the matrix runs on what the anchor
+announces. Reviewer checked her five acceptance items: (1) two
+different sockets asserted, and the natsim row asserts the probe
+target as the NAT-mapped public tuple distinct from the ICE remote;
+(2) both engines on the advertised configuration, no harness search;
+(3) typed refusal before ICE; (4) `UdpBlocked` still reads
+`anchor_rtc_addr()`, `stun_addr` is a separate field with its own
+absent/present tests; (5) no topology, deadline, floor or label change.
+`--lib` 5788, leaf 269, export set 568/568, **no consumer-tree diff**.
+Two pre-existing timing witnesses met on the way, neither attributable
+to the amendment and neither widened: `rtc_stun_endpoint.rs` pinned
+(`12e8bad7d`); `sensing_consumer`'s idle-renewal witness now *awaits*
+the re-arm instead of sampling it (`537c9c94f`). Media-permission
+qualification carried: the harness's camera/mic grant is not a
+prerequisite for a data-only application.
+
 ## Stage 7 — Surface completion and deferred items (**DEFERRED**)
 
 - Node / Python / Go anchor-role parity for `RtcConfig` + `RtcStats`.
