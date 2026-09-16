@@ -253,6 +253,32 @@ async function opLaunch(req) {
 
 async function opOpen(req) {
   if (!live) throw new Error('open before launch');
+  // THE FIX for §6.12, and it is a permission, not a network.
+  //
+  // Chromium gates local-interface enumeration on media permission:
+  // `FilteringNetworkManager` logged `received permission status:
+  // denied` on every failing row, so the network list the browser
+  // process had ALREADY delivered was withheld from WebRTC, which
+  // then allocated `any any` wildcard ports — and a wildcard port
+  // drops every inbound packet before STUN parsing. That is why
+  // Chromium answered no Binding Request and credited no response
+  // while every packet on the wire was valid, correctly
+  // credentialed and correctly addressed, and why Firefox, which
+  // has no such gate, was fine throughout.
+  //
+  // Granting camera/microphone for the page's own origin is what a
+  // real user does before a call. It is a HARNESS grant: no product
+  // behaviour changes, no candidate is relabelled, no deadline
+  // widened. Chromium only; Firefox's rows are untouched.
+  if (live.engine !== 'firefox') {
+    try {
+      const origin = new URL(req.url).origin;
+      await live.context.grantPermissions(['camera', 'microphone'], { origin });
+      log(`granted camera+microphone for ${origin}`);
+    } catch (e) {
+      log(`grantPermissions: ${e && e.message}`);
+    }
+  }
   page = await live.context.newPage();
   page.on('console', (m) => log(`[page] ${m.type()}: ${m.text()}`));
   page.on('pageerror', (e) => log(`[page] ERROR ${e && e.message}`));
