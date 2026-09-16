@@ -162,6 +162,26 @@ one_side() {
   ip -n "$NS" link set eth0 up
   ip -n "$NS" route add default via "$LAN.1"
 
+  # A multicast route, so the browser's mDNS responder can BIND.
+  #
+  # This is the experiment behind S6_REPORT.md §6.12. Chromium
+  # obfuscates its host candidate behind an mDNS `.local` name it
+  # publishes and owns. With only a default unicast route, the
+  # renderer logs `MDNS bind failed, address_family=2, error=-4` and
+  # then `Received an external response for an owned record` once a
+  # second — the conflict signal that makes it disown the name that
+  # IS its host candidate's identity. Its srflx is pruned in favour
+  # of that host base (RFC 8445 §6.1.2.4), so it ends up checking
+  # from a candidate whose identity it has rescinded. Firefox does
+  # not use mDNS obfuscation, which is the engine asymmetry.
+  #
+  # A route for 224.0.0.0/4 out of the private interface is what a
+  # real LAN has and this simulated one did not. It is a topology
+  # fact, not a protocol change: no candidate is relabelled, no
+  # deadline widened, and the NAT flavours are untouched.
+  ip -n "$NS" route add 224.0.0.0/4 dev eth0
+  ip -n "$NS" link set eth0 multicast on
+
   ip netns exec "$GW" sysctl -qw net.ipv4.ip_forward=1
 
   if [[ "$MODE" == "symmetric" ]]; then
