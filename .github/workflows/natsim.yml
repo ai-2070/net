@@ -251,6 +251,29 @@ jobs:
       # root-owned and `actions/upload-artifact` fails on them with
       # `EACCES: permission denied, scandir`. Widen the read bits first;
       # the upload step cannot do it itself.
+      # The engine's ICE accounting, into the JOB log.
+      #
+      # It reaches `runner.log` inside a state dir, and the last run
+      # uploaded NO artifact at all: the browser profile the driver now
+      # owns contains unix sockets, which `upload-artifact` refuses. So
+      # the one measurement this cycle exists for was unreadable for a
+      # reason that had nothing to do with it. Printed here as well,
+      # where nothing can swallow it.
+      - name: Chromium's ICE accounting
+        if: ${{ failure() }}
+        run: |
+          set -uo pipefail
+          found=0
+          for log in /tmp/natsim.*/runner.log; do
+            [ -f "$log" ] || continue
+            if grep -aq 'chromium-ice' "$log"; then
+              found=1
+              echo "=== $log"
+              grep -a 'chromium-ice' "$log" | head -200
+            fi
+          done
+          [ "$found" = 1 ] || echo "no [chromium-ice] lines in any runner.log"
+
       - name: Make the scenario state dirs readable
         if: ${{ failure() }}
         run: sudo chmod -R a+rX /tmp/natsim.* 2>/dev/null || true
@@ -263,6 +286,7 @@ jobs:
           path: |
             /tmp/natsim.*/**
             /tmp/natsim.log
+            !/tmp/natsim.*/browser/profile-*/cdp-profile/**
           if-no-files-found: warn
 
       - name: Teardown (paranoia)
