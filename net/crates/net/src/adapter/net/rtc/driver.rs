@@ -1121,13 +1121,45 @@ async fn drain_session(
                 // go on nominating a pair whose every transmit
                 // failed. That is the one boundary between "the
                 // engine answered" and "the answer left the host".
-                if let Err(e) = socket.send_to(&t.contents, t.destination).await {
-                    tracing::debug!(
+                // Boundaries 5 and 6, per transaction: a STUN reply
+                // the engine generated, and whether it actually left
+                // the host. The transaction id ties it back to the
+                // request logged on ingress, so one check can be
+                // followed across every boundary without a browser
+                // counter in the argument. Non-STUN egress (DTLS,
+                // SCTP) is not traced: it only exists once ICE has
+                // already succeeded.
+                let reply_tid = (t.contents.len() >= 12
+                    && t.contents[4..8] == [0x21, 0x12, 0xa4, 0x42])
+                .then(|| {
+                    (
+                        u16::from_be_bytes([t.contents[0], t.contents[1]]),
+                        u32::from_be_bytes([
+                            t.contents[8],
+                            t.contents[9],
+                            t.contents[10],
+                            t.contents[11],
+                        ]),
+                    )
+                });
+                match socket.send_to(&t.contents, t.destination).await {
+                    Err(e) => tracing::debug!(
                         destination = %t.destination,
                         bytes = t.contents.len(),
                         error = %e,
                         "an RTC datagram could not be sent"
-                    );
+                    ),
+                    Ok(sent) => {
+                        if let Some((kind, tid)) = reply_tid {
+                            tracing::debug!(
+                                destination = %t.destination,
+                                stun_type = format!("{kind:04x}"),
+                                tid = format!("{tid:08x}"),
+                                bytes = sent,
+                                "a STUN message left the socket"
+                            );
+                        }
+                    }
                 }
             }
             Ok(Output::Event(event)) => match event {
@@ -1273,6 +1305,26 @@ async fn receive(
     // negotiated them. Only a request **no session claims** is an
     // unsolicited gathering request, and only that one is answered by
     // the bare responder.
+    // R4-A trace, per TRANSACTION. Kyra's boundary list for the
+    // Chromium NAT rows: request received → parsed → accepted by the
+    // correct live session → authenticated response generated → sent.
+    // Each boundary below records its own outcome, keyed by the
+    // transaction's first four bytes, so one check can be followed
+    // end to end without a browser counter in the argument and
+    // without a credential in the log. The id prefix is opaque: it
+    // identifies, it does not authenticate.
+    let credentialed_check = stun::is_binding_request(datagram) && stun::has_username(datagram);
+    let tid = if credentialed_check && datagram.len() >= 12 {
+        Some(u32::from_be_bytes([
+            datagram[8],
+            datagram[9],
+            datagram[10],
+            datagram[11],
+        ]))
+    } else {
+        None
+    };
+
     let target = sessions
         .iter()
         .find(|(_, s)| s.rtc.accepts(&input))
@@ -1303,10 +1355,27 @@ async fn receive(
     let Some(session) = sessions.get_mut(&slot) else {
         return;
     };
+    // Boundary 3: which live session claimed it. `accepts` matches the
+    // request's ICE credentials, so this names the session that owns
+    // them — the thing a "no such dialog" string could not.
+    if let Some(tid) = tid {
+        tracing::debug!(
+            %source,
+            slot,
+            tid = format!("{tid:08x}"),
+            "ICE check claimed by a live session"
+        );
+    }
+    // Boundary 4: the engine's verdict on the parsed datagram.
     if let Err(e) = session.rtc.handle_input(input) {
         tracing::debug!(%source, slot, error = %e, "str0m refused a datagram; closing the session");
         session.closed = true;
+    } else if let Some(tid) = tid {
+        tracing::debug!(slot, tid = format!("{tid:08x}"), "str0m accepted the check");
     }
+    // Boundary 5 and 6 are inside `drain_session`: it is what polls
+    // the response out of the engine and puts it on the socket, and
+    // it reports a refused send.
     drain_session(
         session,
         socket,
