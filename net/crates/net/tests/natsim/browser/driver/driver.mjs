@@ -168,7 +168,12 @@ async function opLaunch(req) {
     const args = [
       ...chromiumArgs(req.spkiPin),
       '--remote-debugging-port=0',
-      `--user-data-dir=${path.join(req.profileDir, 'cdp-profile')}`,
+      // OUTSIDE the uploaded tree. This profile contains unix
+      // sockets, and `upload-artifact` refuses a tree containing
+      // them — two runs uploaded NOTHING because of it, so the
+      // evidence a cycle existed for was unreadable for a reason
+      // unrelated to the measurement.
+      `--user-data-dir=${fs.mkdtempSync(path.join(os.tmpdir(), 'natsim-cdp-'))}`,
       ...(headed ? [] : ['--headless=new']),
       'about:blank',
     ];
@@ -298,11 +303,11 @@ async function opOpen(req) {
 // check that no external observer could supply. Chromium only, opened
 // in its own tab so the row's page is untouched, and best-effort: a
 // dump that fails must not fail a row.
-function reportNetworkEnumeration() {
+function reportNetworkEnumeration(at) {
   // Named plainly, both ways: the fix is a topology fact and a run
   // that silently lost it would otherwise look like a new mystery.
   log(
-    `[chromium-ice] PRECONDITION networks: real=${realNetworkPorts} wildcard=${wildcardPorts}` +
+    `[chromium-ice] PRECONDITION networks at ${at}: real=${realNetworkPorts} wildcard=${wildcardPorts}` +
       (realNetworkPorts === 0
         ? ' — ZERO enumerated networks, every inbound packet is dropped before STUN (S6_REPORT.md §6.12)'
         : ''),
@@ -325,7 +330,7 @@ async function dumpWebrtcInternals() {
 }
 
 async function opShutdown() {
-  reportNetworkEnumeration();
+  reportNetworkEnumeration('shutdown');
   await dumpWebrtcInternals();
   try {
     if (live && live.persistent) await live.context.close();
@@ -347,6 +352,12 @@ const OPS = { launch: opLaunch, open: opOpen, shutdown: opShutdown };
 // Requests are served strictly in order: the runner issues one at a
 // time, and an `open` that raced a `launch` would report a page on no
 // browser at all.
+// At EXIT as well as at shutdown: a driver whose row relaunched the
+// browser prints a shutdown line before the engine has logged
+// anything, and that zero says nothing about the run. The exit line
+// is the one that covers the whole process.
+process.on('exit', () => reportNetworkEnumeration('exit'));
+
 const rl = readline.createInterface({ input: process.stdin });
 let queue = Promise.resolve();
 
