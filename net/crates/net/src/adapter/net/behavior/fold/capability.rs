@@ -130,6 +130,13 @@ pub struct CapabilityMembership {
     /// `rtc_bootstrap`.
     #[serde(skip)]
     pub rtc_addr: Option<std::net::SocketAddr>,
+    /// Publisher's announced STUN endpoint (`rtc_stun_addr`,
+    /// Stage 6) — the endpoint a leaf's `iceServers` points at,
+    /// deliberately distinct from `rtc_addr`, which cannot serve
+    /// STUN for a connection it is itself the ICE peer of. Same
+    /// projection rules as `rtc_bootstrap`.
+    #[serde(skip)]
+    pub rtc_stun_addr: Option<String>,
     /// v0.4 capability-auth allow-list — peer `node_id`s
     /// authorized to invoke any of this publisher's `tags`. Empty
     /// = unrestricted (permissive default). Union semantics with
@@ -1066,6 +1073,7 @@ mod tests {
                 noise_pubkey: None,
                 rtc_bootstrap: None,
                 rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
@@ -1282,6 +1290,7 @@ mod tests {
             noise_pubkey: None,
             rtc_bootstrap: None,
             rtc_addr: None,
+            rtc_stun_addr: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -1374,6 +1383,7 @@ mod tests {
                     noise_pubkey: None,
                     rtc_bootstrap: None,
                     rtc_addr: None,
+                    rtc_stun_addr: None,
                     allowed_nodes: Vec::new(),
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
@@ -2049,6 +2059,7 @@ mod tests {
                 noise_pubkey: None,
                 rtc_bootstrap: None,
                 rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),

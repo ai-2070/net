@@ -10748,6 +10748,7 @@ mod roster_fallback_tests {
                 noise_pubkey: None,
                 rtc_bootstrap: None,
                 rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: vec![0xDEAD],
                 allowed_subnets: vec![],
                 allowed_groups: vec![],

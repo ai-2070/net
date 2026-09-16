@@ -237,6 +237,7 @@ fn seed_gang_capability(node: &Arc<MeshNode>, signer: &EntityKeypair, host_id: u
         noise_pubkey: None,
         rtc_bootstrap: None,
         rtc_addr: None,
+        rtc_stun_addr: None,
         allowed_nodes: Vec::new(),
         allowed_subnets: Vec::new(),
         allowed_groups: Vec::new(),

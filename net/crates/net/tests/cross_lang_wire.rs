@@ -235,10 +235,13 @@ fn capability_announcement_matches_the_fixture_bytes() {
     );
 }
 
-/// Stage 4a: the same announcement **with** the three browser-leaf
-/// fields. Pinned so a cross-language reader sees the exact key
-/// names, order and encodings — `noise_pubkey` as a 32-element byte
-/// array, `rtc_addr` as a `host:port` string.
+/// Stage 4a + Stage 6: the same announcement **with** the optional
+/// browser-leaf fields. Pinned so a cross-language reader sees the
+/// exact key names, order and encodings — `noise_pubkey` as a
+/// 32-element byte array, `rtc_addr` as a `host:port` string, and
+/// `rtc_stun_addr` as a `host:port` string naming a *different*
+/// endpoint from `rtc_addr` (that distinctness is the whole point
+/// of announcing it, so the fixture shows it).
 #[test]
 fn the_rtc_announcement_fixture_round_trips_and_keeps_field_order() {
     let f = fixture("capability_announcement_rtc.json");
@@ -255,6 +258,12 @@ fn the_rtc_announcement_fixture_round_trips_and_keeps_field_order() {
         decoded.rtc_addr,
         Some("198.51.100.7:4433".parse().expect("addr"))
     );
+    assert_eq!(decoded.rtc_stun_addr.as_deref(), Some("198.51.100.7:3478"));
+    assert_ne!(
+        decoded.rtc_stun_addr.as_deref(),
+        decoded.rtc_addr.map(|a| a.to_string()).as_deref(),
+        "the announced STUN endpoint must be a different endpoint from rtc_addr"
+    );
 
     let re_encoded = String::from_utf8(decoded.to_bytes()).expect("UTF-8 JSON");
     assert_eq!(
@@ -263,10 +272,10 @@ fn the_rtc_announcement_fixture_round_trips_and_keeps_field_order() {
     );
 }
 
-/// …and the same announcement with all three **absent** produces
+/// …and the same announcement with all of them **absent** produces
 /// exactly the pre-Stage-4 pinned bytes. This is the wire-compat
 /// claim: a node that does not configure RTC is invisible to Stage
-/// 4a, signature included.
+/// 4a and Stage 6, signature included.
 #[test]
 fn dropping_the_rtc_fields_reproduces_the_pre_stage4_announcement_bytes() {
     let with_rtc = fixture("capability_announcement_rtc.json");
@@ -280,14 +289,15 @@ fn dropping_the_rtc_fields_reproduces_the_pre_stage4_announcement_bytes() {
     ann.noise_pubkey = None;
     ann.rtc_bootstrap = None;
     ann.rtc_addr = None;
+    ann.rtc_stun_addr = None;
 
     let plain = fixture("capability_announcement.json");
     let expected = plain["bytes_utf8"].as_str().expect("bytes_utf8");
     assert_eq!(
         String::from_utf8(ann.to_bytes()).expect("UTF-8"),
         expected,
-        "with the three fields cleared the encoding must be byte-identical to \
-         the pre-Stage-4 fixture"
+        "with every optional RTC field cleared the encoding must be byte-identical \
+         to the pre-Stage-4 fixture"
     );
     // …and the signed transcript follows, because the canonical
     // signer emits exactly this document with `signature` and
@@ -304,6 +314,13 @@ fn dropping_the_rtc_fields_reproduces_the_pre_stage4_announcement_bytes() {
         with_field_back.verify().is_err(),
         "re-adding a Stage 4 field after signing must break verification — \
          proof the field is inside the transcript, not beside it"
+    );
+    let mut with_stun_back = signed.clone();
+    with_stun_back.rtc_stun_addr = Some("198.51.100.7:3478".to_string());
+    assert!(
+        with_stun_back.verify().is_err(),
+        "re-adding the announced STUN endpoint after signing must break \
+         verification — proof Stage 6's field is inside the transcript too"
     );
 }
 

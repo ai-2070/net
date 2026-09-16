@@ -2432,6 +2432,34 @@ pub struct CapabilityAnnouncement {
     /// Wire compat: as [`Self::noise_pubkey`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc_addr: Option<std::net::SocketAddr>,
+    /// The announcer's **separately announced STUN endpoint**
+    /// (`host:port`, UDP) — a *distinct* externally reachable
+    /// socket from [`Self::rtc_addr`], published for the
+    /// `iceServers` of connections that may pair with this
+    /// anchor (Stage 6, Kyra's option 1).
+    ///
+    /// Why a second endpoint at all: libwebrtc will not gather
+    /// server-reflexive candidates from a STUN server that is
+    /// also the ICE peer of the same `RTCPeerConnection`, so
+    /// converting `rtc_addr` into a STUN URL for that anchor's
+    /// own connection cannot work. `rtc_addr` keeps its roles
+    /// unchanged — ICE endpoint, and the target of the
+    /// throwaway diagnostic `UdpBlocked` probe; this field is
+    /// what a leaf puts in `iceServers`.
+    ///
+    /// A `host:port` string rather than a `SocketAddr` because
+    /// an anchor may legitimately announce a DNS name for the
+    /// STUN endpoint it serves; the leaf turns it into
+    /// `stun:<value>`.
+    ///
+    /// **Emission is off unless configured** (`RtcConfig`'s STUN
+    /// endpoint): a node that does not serve a second STUN
+    /// socket announces nothing here, and never an adjacent-port
+    /// guess derived from `rtc_addr`.
+    ///
+    /// Wire compat: as [`Self::noise_pubkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_stun_addr: Option<String>,
 }
 
 /// Cap on any single allow-list axis on a
@@ -2465,7 +2493,7 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
         // emulating `signature = None` and `hop_count = 0`). The
         // count is a hint; the JSON serializer ignores it and the
         // others tolerate over-counting plus `skip_field`.
-        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 15)?;
+        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 16)?;
         state.serialize_field("node_id", &a.node_id)?;
         state.serialize_field("entity_id", &a.entity_id)?;
         state.serialize_field("version", &a.version)?;
@@ -2520,6 +2548,17 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
             state.serialize_field("rtc_addr", &a.rtc_addr)?;
         } else {
             state.skip_field("rtc_addr")?;
+        }
+        // Stage 6's separately announced STUN endpoint, in
+        // declaration order immediately after `rtc_addr`. Same
+        // discipline: inside the signed transcript, so a relay
+        // cannot substitute the STUN endpoint a leaf will gather
+        // against; omitted when `None`, so a node that does not
+        // serve one produces the pre-Stage-6 signed bytes exactly.
+        if a.rtc_stun_addr.is_some() {
+            state.serialize_field("rtc_stun_addr", &a.rtc_stun_addr)?;
+        } else {
+            state.skip_field("rtc_stun_addr")?;
         }
         state.end()
     }
@@ -2620,6 +2659,7 @@ impl CapabilityAnnouncement {
             noise_pubkey: None,
             rtc_bootstrap: None,
             rtc_addr: None,
+            rtc_stun_addr: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -2676,6 +2716,18 @@ impl CapabilityAnnouncement {
     /// mesh only when `RtcConfig::public_addr` is configured.
     pub fn with_rtc_addr(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.rtc_addr = addr;
+        self
+    }
+
+    /// Attach the announcer's separately announced STUN endpoint
+    /// (Stage 6). Set by the mesh only when a STUN endpoint is
+    /// configured — never derived from [`Self::rtc_addr`], which
+    /// cannot serve the ICE peer's own connection.
+    ///
+    /// Included in the signed envelope: set it before
+    /// [`Self::sign`].
+    pub fn with_rtc_stun_addr(mut self, addr: Option<String>) -> Self {
+        self.rtc_stun_addr = addr;
         self
     }
 
@@ -3830,13 +3882,15 @@ mod tests {
             s
         );
     }
-    /// Stage 4a: each of the three new fields is **in the signed
-    /// transcript**. Tampering with one after signing must
+    /// Stage 4a + Stage 6: each announced RTC field is **in the
+    /// signed transcript**. Tampering with one after signing must
     /// invalidate the signature — otherwise a relay could swap the
     /// Noise key a peer will handshake against, which is the whole
-    /// security of §5 Layer 1.
+    /// security of §5 Layer 1, or swap the STUN endpoint a leaf
+    /// will gather its candidates against, which is the whole
+    /// point of announcing one (Stage 6).
     #[test]
-    fn tampering_with_any_stage4_field_invalidates_the_signature() {
+    fn tampering_with_any_announced_rtc_field_invalidates_the_signature() {
         use super::super::super::identity::EntityKeypair;
         let keypair = EntityKeypair::generate();
         let mut signed = CapabilityAnnouncement::new(
@@ -3847,7 +3901,8 @@ mod tests {
         )
         .with_noise_pubkey(Some([0x11; 32]))
         .with_rtc_bootstrap(Some("https://anchor.example/rtc".to_string()))
-        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")));
+        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")))
+        .with_rtc_stun_addr(Some("198.51.100.7:3478".to_string()));
         signed.sign(&keypair);
         signed.verify().expect("the freshly signed form verifies");
 
@@ -3872,6 +3927,24 @@ mod tests {
             "swapping the advertised RTC socket must break the signature"
         );
 
+        // Stage 6: the announced STUN endpoint. A relay that could
+        // substitute this would choose where every leaf pairing
+        // with this anchor gathers from.
+        let mut swapped_stun = signed.clone();
+        swapped_stun.rtc_stun_addr = Some("203.0.113.9:3478".to_string());
+        assert!(
+            swapped_stun.verify().is_err(),
+            "swapping the announced STUN endpoint must break the signature"
+        );
+
+        let mut dropped_stun = signed.clone();
+        dropped_stun.rtc_stun_addr = None;
+        assert!(
+            dropped_stun.verify().is_err(),
+            "dropping the announced STUN endpoint must break the signature — \
+             a stripped field would silently return a leaf to host-only gathering"
+        );
+
         // Removing a field is tampering too.
         let mut dropped = signed.clone();
         dropped.noise_pubkey = None;
@@ -3881,17 +3954,19 @@ mod tests {
         );
     }
 
-    /// …and with all three absent the signed bytes are **exactly**
-    /// the pre-Stage-4 ones: a node that does not configure RTC is
-    /// wire-invisible to this change, which is what lets the fields
-    /// land before the fleet is upgraded.
+    /// …and with every optional RTC field absent the signed bytes
+    /// are **exactly** the pre-Stage-4 ones: a node that does not
+    /// configure RTC is wire-invisible to this change, which is
+    /// what lets the fields land before the fleet is upgraded.
+    /// Stage 6's `rtc_stun_addr` joins that set — an anchor that
+    /// serves no second STUN socket announces nothing new.
     ///
     /// The byte-for-byte comparison against the pinned pre-Stage-4
     /// fixture lives in `tests/cross_lang_wire.rs`; this pins the
     /// key set, which is what a reordering or a stray emission
     /// would break first.
     #[test]
-    fn all_three_stage4_fields_absent_keeps_the_pre_stage4_signed_bytes() {
+    fn all_optional_rtc_fields_absent_keeps_the_pre_stage4_signed_bytes() {
         let ann = CapabilityAnnouncement::new(
             0xA1B2_C3D4_E5F6_0708,
             super::super::super::identity::EntityId::from_bytes([0x11; 32]),
@@ -3920,15 +3995,30 @@ mod tests {
             order, sorted,
             "the pre-Stage-4 keys must appear in declaration order: {payload}"
         );
+        // …and no optional RTC key is emitted at all: a stray
+        // emission is the other half of "wire-invisible", and the
+        // order check above cannot see it.
+        for key in [
+            "\"noise_pubkey\"",
+            "\"rtc_bootstrap\"",
+            "\"rtc_addr\"",
+            "\"rtc_stun_addr\"",
+        ] {
+            assert!(
+                !payload.contains(key),
+                "an unconfigured node must emit no {key}: {payload}"
+            );
+        }
     }
 
     /// The canonical signer and the derived `Serialize` must agree
     /// **with the new fields populated** — the failure mode the
     /// `SignedPayloadCanonical` doc warns about is a field added to
     /// the struct and forgotten here, which makes every signature
-    /// verify locally and fail everywhere else.
+    /// verify locally and fail everywhere else. Stage 6's
+    /// `rtc_stun_addr` is populated here for exactly that reason.
     #[test]
-    fn the_canonical_signer_matches_the_derived_form_with_stage4_fields_set() {
+    fn the_canonical_signer_matches_the_derived_form_with_rtc_fields_set() {
         let ann = CapabilityAnnouncement::new(
             9,
             super::super::super::identity::EntityId::from_bytes([0x5A; 32]),
@@ -3937,7 +4027,8 @@ mod tests {
         )
         .with_noise_pubkey(Some([0x77; 32]))
         .with_rtc_bootstrap(Some("https://anchor.example/rtc".to_string()))
-        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")));
+        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")))
+        .with_rtc_stun_addr(Some("198.51.100.7:3478".to_string()));
 
         let mut cloned = ann.clone();
         cloned.signature = None;
