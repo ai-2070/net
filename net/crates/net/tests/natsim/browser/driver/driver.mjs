@@ -31,6 +31,7 @@ import { chromium, firefox } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import readline from 'node:readline';
 
 const ENGINES = { chromium, firefox };
@@ -177,5 +178,18 @@ rl.on('close', async () => {
   await opShutdown();
   process.exit(0);
 });
+
+// The namespace this driver — and therefore its browser, and every
+// UDP socket ICE opens — is actually in, stated as a FACT observed
+// from inside it rather than as the name the runner passed. The whole
+// premise of the matrix is that tab a sits behind gateway a and tab b
+// behind gateway b; `192.168.101.x` vs `192.168.102.x` is what makes
+// that checkable when a row fails asymmetrically.
+const addrs = Object.entries(os.networkInterfaces())
+  .flatMap(([dev, list]) =>
+    (list || []).filter((a) => a.family === 'IPv4').map((a) => `${dev}=${a.address}`),
+  )
+  .join(' ');
+log(`netns ${process.env.NATSIM_NETNS || '(unnamed)'} addrs ${addrs} home ${process.env.HOME}`);
 
 reply({ id: 0, ok: true, hello: 'natsim browser driver', engines: Object.keys(ENGINES) });

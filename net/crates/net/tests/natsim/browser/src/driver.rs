@@ -40,10 +40,32 @@ impl Driver {
     /// keeps the stdio pipes created here, so the control channel
     /// crosses the namespace boundary while every socket the driver,
     /// Playwright and the browser open does not.
-    pub async fn spawn(netns: &str, driver_dir: &Path, label: &str) -> Result<Self, String> {
+    ///
+    /// `home` and `runtime` are a ROOT-owned pair, and Firefox needs
+    /// them. The rows run as root (netns + nft), and Firefox refuses
+    /// to start at all when it is root while `$XDG_RUNTIME_DIR`
+    /// belongs to somebody else — on the GitHub runner that is
+    /// `/run/user/1001`, owned by `runner`, inherited straight
+    /// through `sudo`. It exits 1 with
+    /// `Running Nightly as root in a regular user's session is not
+    /// supported.`, which Playwright surfaces as the far less
+    /// informative `Target page, context or browser has been closed`.
+    /// Chromium does not care, so this is set unconditionally rather
+    /// than per engine: one environment for both engines is one thing
+    /// to reason about.
+    pub async fn spawn(
+        netns: &str,
+        driver_dir: &Path,
+        label: &str,
+        home: &Path,
+        runtime: &Path,
+    ) -> Result<Self, String> {
         let mut child = Command::new("ip")
             .args(["netns", "exec", netns, "node", "driver.mjs"])
             .current_dir(driver_dir)
+            .env("HOME", home)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("NATSIM_NETNS", netns)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

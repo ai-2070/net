@@ -96,6 +96,22 @@ function typed(e) {
   };
 }
 
+/// The engine's own account of every `RTCPeerConnection` the leaf
+/// built, installed by the inline script in `matrix.html` before this
+/// module could run. It rides the result of every step that turns on
+/// ICE, in both directions: a row that fails needs it to name the
+/// cause, and a row that passes needs it to show the path was the one
+/// the NAT flavor predicts rather than an accident.
+async function iceReport() {
+  const api = window.__natsimIce;
+  if (!api) return { unavailable: 'the ICE observer did not install' };
+  try {
+    return await api.report();
+  } catch (e) {
+    return { error: (e && (e.message || String(e))) || 'unknown' };
+  }
+}
+
 async function execute(step) {
   switch (step.kind) {
     case 'connect': {
@@ -116,9 +132,9 @@ async function execute(step) {
       try {
         node = await connect(opts);
       } catch (e) {
-        return { ok: false, ...typed(e) };
+        return { ok: false, ...typed(e), rtc: await iceReport() };
       }
-      return { ok: true, node_id: node.nodeId, counters: counters() };
+      return { ok: true, node_id: node.nodeId, counters: counters(), rtc: await iceReport() };
     }
 
     case 'announce': {
@@ -210,9 +226,10 @@ async function execute(step) {
             'no `signal` event from the peer arrived, so acceptPeer never ran — the offer ' +
             'never reached this leaf, which is a routing or forwarding failure and not an ICE one',
           counters: counters(),
+          rtc: await iceReport(),
         };
       }
-      return { ok: true, ...out, counters: counters() };
+      return { ok: true, ...out, counters: counters(), rtc: await iceReport() };
     }
 
     case 'connect_peer': {
@@ -241,6 +258,7 @@ async function execute(step) {
       }
       out.elapsed_ms = performance.now() - started;
       out.counters = counters();
+      out.rtc = await iceReport();
       return out;
     }
 

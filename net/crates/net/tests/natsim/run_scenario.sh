@@ -177,6 +177,17 @@ SETUP_ARGS=(--nat-a "$NAT_A" --nat-b "$NAT_B" "${SETUP_EXTRA[@]}")
 # instrumented run did. Override with RUST_LOG=... to widen or quieten.
 NATSIM_LOG="${RUST_LOG:-net::adapter::net=trace,net=info}"
 
+# The browser rows need one filter the native helpers do not: the
+# bootstrap listener that the pages actually talk to lives in the
+# `net_sdk` crate, not in `net`, so `net::adapter::net=trace,net=info`
+# excluded it entirely and the anchor's whole view of a dialog —
+# `bootstrap offer accepted`, `trickle socket authorized by its attempt
+# token`, and every typed refusal of the upgrade — was silently absent
+# from `runner.log`. A browser reports a refused WebSocket handshake as
+# a bare 1006 with no reason, so those lines are the ONLY place the
+# reason exists.
+NATSIM_BROWSER_LOG="${RUST_LOG:-net::adapter::net=trace,net_sdk=debug,net=info}"
+
 launch() { # launch <netns> <logname> <args...>
   local ns="$1" log="$2"; shift 2
   # `ip netns exec` keeps the environment, but be explicit — this runs
@@ -225,7 +236,7 @@ if [[ "$MODE" == browser ]]; then
   # (setns needs root, which this script already has), so the drivers
   # AND their browsers run entirely inside nsim_a / nsim_b while their
   # stdio pipes stay attached here.
-  ip netns exec nsim_wan env RUST_LOG="$NATSIM_LOG" \
+  ip netns exec nsim_wan env RUST_LOG="$NATSIM_BROWSER_LOG" \
     "$BROWSER_BIN" \
       --scenario "$SCENARIO" \
       --state "$STATE" \
@@ -314,19 +325,34 @@ fi
 # addresses in both directions, which is what direct physically means
 # here, and its absence on both gateways is what relayed means.
 #
-# `/proc/net/nf_conntrack` rather than `conntrack -L`: it is
-# per-namespace, always present when conntrack is loaded, and needs no
-# extra package. `(src|dst)=<peer>` with a non-digit boundary so
-# 10.99.0.3 never matches 10.99.0.30.
+# The conntrack view is read through the SAME ladder as the per-gateway
+# snapshot below — `conntrack -L` first, `/proc/net/nf_conntrack` as the
+# fallback — and a namespace that can produce neither yields zeros
+# rather than killing the script.
+#
+# `/proc/net/nf_conntrack` alone was wrong: the GitHub runner kernel is
+# built WITHOUT `CONFIG_NF_CONNTRACK_PROCFS`, so `cat` exited 1, the
+# pipeline failed under `set -o pipefail`, and `set -e` killed
+# run_scenario.sh in the middle of writing this file. Every browser row
+# therefore exited 1 after a perfectly good verdict had already been
+# written — leaving a truncated `{"a":{"udp_flows":0,"udp_replied":0}`
+# and no `NATSIM_OUTCOME_PATH=` line at all, which is what
+# `tests/natsim.rs` reported as a bare non-zero status. `conntrack -L`
+# is installed by the workflow for exactly this reason.
+#
+# Both renderings carry `[UNREPLIED]` on an unanswered flow and both
+# spell the tuple `(src|dst)=<ip>`, so one awk program reads either.
+# `(src|dst)=<peer>` with a non-digit boundary so 10.99.0.3 never
+# matches 10.99.0.30.
 if [[ "$MODE" == browser ]]; then
   flow_side() { # flow_side <gateway-ns> <peer public ip>
-    local ns="$1" peer="$2"
-    if [[ ! -e "/var/run/netns/$ns" ]]; then
-      printf '{"udp_flows":0,"udp_replied":0}'
-      return 0
+    local ns="$1" peer="$2" raw=""
+    if [[ -e "/var/run/netns/$ns" ]]; then
+      raw="$(ip netns exec "$ns" conntrack -L 2>/dev/null \
+        || ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null \
+        || true)"
     fi
-    ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null |
-      awk -v peer="$peer" '
+    printf '%s' "$raw" | awk -v peer="$peer" '
         $0 ~ /[[:space:]]udp[[:space:]]/ {
           if ($0 !~ ("(src|dst)=" peer "([^0-9]|$)")) next
           flows++

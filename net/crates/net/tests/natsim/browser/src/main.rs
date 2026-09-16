@@ -332,12 +332,31 @@ struct StepResult {
     peers: Option<serde_json::Value>,
     #[serde(default)]
     elapsed_ms: Option<f64>,
+    /// The page's own view of every `RTCPeerConnection` the leaf
+    /// built: the state each one reached, the candidates it gathered
+    /// and was given, and `getStats`' candidate pairs at the moment
+    /// the step settled. The anchor's counters and the page's typed
+    /// outcome are both statements ABOUT ICE; this is the engine's.
+    #[serde(default)]
+    rtc: Option<serde_json::Value>,
 }
 
 impl StepResult {
     fn detail(&self) -> String {
         self.detail.clone().unwrap_or_default()
     }
+}
+
+/// One tab's refusal, in the shape the verdict's `errors` carries.
+fn step_failure(tab: &str, r: &StepResult) -> Option<String> {
+    if r.ok {
+        return None;
+    }
+    Some(format!(
+        "tab {tab}: {} {}",
+        r.kind.clone().unwrap_or_else(|| "failed".to_owned()),
+        r.detail()
+    ))
 }
 
 type Queue = Arc<Mutex<mpsc::Receiver<(Step, oneshot::Sender<StepResult>)>>>;
@@ -382,6 +401,17 @@ impl Tab {
                 )
             })?
             .map_err(|_| format!("tab {} step {id} dropped", self.name))?;
+        // Printed the moment it arrives, not folded into the verdict:
+        // a row that dies two steps later still needs the engine's
+        // own account of the step that actually went wrong, and
+        // `runner.log` is the only file that survives every path.
+        if let Some(rtc) = &result.rtc {
+            println!(
+                "[runner] tab {} step {id} ({label}) ice: {}",
+                self.name,
+                serde_json::to_string(rtc).unwrap_or_else(|e| format!("(unserializable: {e})"))
+            );
+        }
         Ok(result)
     }
 
@@ -389,13 +419,8 @@ impl Tab {
     /// does not.
     async fn require(&self, make: impl FnOnce(u64) -> Step) -> Result<StepResult, String> {
         let r = self.run(make).await?;
-        if !r.ok {
-            return Err(format!(
-                "tab {}: {} {}",
-                self.name,
-                r.kind.clone().unwrap_or_else(|| "failed".to_owned()),
-                r.detail()
-            ));
+        if let Some(e) = step_failure(self.name, &r) {
+            return Err(e);
         }
         Ok(r)
     }
@@ -789,6 +814,24 @@ fn secret_hex(scenario: &str, tab: &str, purpose: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Create a directory only this (root) user may enter.
+///
+/// The browsers' `HOME` and `XDG_RUNTIME_DIR`. `0700` is not
+/// decoration: Firefox reads the ownership of `$XDG_RUNTIME_DIR` and
+/// refuses to run as root when it belongs to somebody else, and a
+/// world-writable runtime dir under `/tmp` would be a handle on the
+/// browser's profile for any local user.
+fn private_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod 700 {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     let row = row_for(m)?;
     println!(
@@ -961,8 +1004,34 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         println!("[runner] page server up in {netns}");
     }
 
-    let mut driver_a = Driver::spawn(&m.netns_a, &driver_dir, "driver-a").await?;
-    let mut driver_b = Driver::spawn(&m.netns_b, &driver_dir, "driver-b").await?;
+    // A root-owned HOME and XDG_RUNTIME_DIR for the browsers, inside
+    // the run's own state dir (`mktemp`'d 700 and root-owned by
+    // `run_scenario.sh`). Firefox refuses to start as root while
+    // `$XDG_RUNTIME_DIR` belongs to another user, and under `sudo` on
+    // the GitHub runner it inherits `/run/user/1001`, owned by
+    // `runner` — which is how the control row died with Playwright's
+    // `Target page, context or browser has been closed`.
+    let browser_home = work.join("home");
+    let browser_runtime = work.join("xdg-runtime");
+    for dir in [&browser_home, &browser_runtime] {
+        private_dir(dir)?;
+    }
+    let mut driver_a = Driver::spawn(
+        &m.netns_a,
+        &driver_dir,
+        "driver-a",
+        &browser_home,
+        &browser_runtime,
+    )
+    .await?;
+    let mut driver_b = Driver::spawn(
+        &m.netns_b,
+        &driver_dir,
+        "driver-b",
+        &browser_home,
+        &browser_runtime,
+    )
+    .await?;
     verdict.engine_trust_a = driver_a
         .launch(
             &m.engine_a,
@@ -990,13 +1059,118 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     driver_a.open(&page_url("a")).await?;
     driver_b.open(&page_url("b")).await?;
 
-    // --- 5. the §9 sequence ----------------------------------------
+    // --- 5–7. the §9 sequence --------------------------------------
+    //
+    // Split out of the provisioning above for one reason: §8 and the
+    // shutdown below now run on the FAILING path too. The first red
+    // run returned at the first bad step, so every failing row's
+    // verdict carried `"anchor": {"counters": null}` — and the one
+    // question those rows raised ("the page says ICE never connected;
+    // what does the anchor say about the same dialog?") was the one
+    // question the evidence could not answer.
+    let outcome = drive_sequence(
+        m,
+        verdict,
+        &tab_a,
+        &tab_b,
+        &credential,
+        &bootstrap_url,
+        &page_origin,
+    )
+    .await;
+
+    // --- 8. the anchor's own ledger --------------------------------
+    //
+    // Read on EVERY path. On a failing row this is the anchor's own
+    // answer to whatever the page claimed: a page reporting an ICE
+    // timeout against an anchor whose `direct` term advanced is a
+    // contradiction that names the layer to look at, and a page
+    // reporting one against `attempted=1 pending=1` says the dialog
+    // was opened and never completed on EITHER side.
+    match anchor.rtc_ice_stats() {
+        Some(ice) => {
+            verdict.anchor = serde_json::json!({
+                "ice_attempted": ice.attempted.to_string(),
+                "ice_direct": ice.direct.to_string(),
+                "ice_relayed": ice.relayed.to_string(),
+                "ice_failed": ice.failed.to_string(),
+                // Native has no such term and should not: a node that
+                // signals over UDP cannot have UDP blocked. Reported
+                // as a constant so the four-term partition is well
+                // formed on both sides.
+                "udp_blocked": "0",
+            });
+            println!(
+                "[runner] anchor ice attempted={} direct={} relayed={} failed={} pending={}",
+                ice.attempted,
+                ice.direct,
+                ice.relayed,
+                ice.failed,
+                ice.pending()
+            );
+        }
+        None => println!("[runner] the anchor has no RTC driver — `webrtc` feature?"),
+    }
+
+    for tab in [&tab_a, &tab_b] {
+        let _ = tab.run(|id| Step::Done { id }).await;
+    }
+    driver_a.shutdown().await;
+    driver_b.shutdown().await;
+    for mut child in page_children {
+        let _ = child.kill().await;
+    }
+
+    // Only now: the sequence's own verdict, with the anchor's ledger
+    // already in the outcome file beside it.
+    outcome?;
+
+    // The runner does NOT decide the row — `tests/natsim.rs` does,
+    // against the table. But a runner that noticed the disposition is
+    // wrong and said nothing would make the scenario log useless, so
+    // the observation is printed here and asserted there.
+    let landed = match verdict.page_type.as_str() {
+        t if t == Disposition::Direct.page_type() => Some(Disposition::Direct),
+        t if t == Disposition::Relayed.page_type() => Some(Disposition::Relayed),
+        _ => None,
+    };
+    match landed {
+        Some(d) if d == row.expect => {
+            println!("[runner] row {} landed {d}, as expected", row.scenario)
+        }
+        Some(d) => println!(
+            "[runner] row {} landed {d}, expected {} — {}",
+            row.scenario, row.expect, row.why
+        ),
+        None => println!(
+            "[runner] row {} reached no disposition: {:?}",
+            row.scenario, verdict.page_type
+        ),
+    }
+    Ok(())
+}
+
+/// The §9 sequence: connect both leaves, announce, discover, run the
+/// dialog under test, and settle the counters.
+///
+/// Everything this touches already exists; nothing here provisions.
+/// That split is what lets `run_row` read the anchor's own ledger and
+/// shut the browsers down on the failing path as well as the good one.
+async fn drive_sequence(
+    m: &Matrix,
+    verdict: &mut Verdict,
+    tab_a: &Tab,
+    tab_b: &Tab,
+    credential: &str,
+    bootstrap_url: &str,
+    page_origin: &str,
+) -> Result<(), String> {
     let anchor_rtc_addr = format!("{}:{}", m.anchor_ip, m.rtc_port);
     let stun = format!("stun:{}:{}", m.anchor_ip, m.rtc_port);
     let connect_step = |tab: &'static str| {
-        let credential = credential.clone();
-        let bootstrap_url = bootstrap_url.clone();
-        let origin = page_origin.clone();
+        let credential = credential.to_owned();
+        let bootstrap_url = bootstrap_url.to_owned();
+        let origin = page_origin.to_owned();
         let anchor_rtc_addr = anchor_rtc_addr.clone();
         let stun = stun.clone();
         let scenario = m.scenario.clone();
@@ -1014,8 +1188,21 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
 
     // B first: its signed announcement has to exist before A can
     // learn B's keys from it, which is the only way A gets them.
-    let b_connected = tab_b.require(connect_step("b")).await?;
-    let a_connected = tab_a.require(connect_step("a")).await?;
+    //
+    // BOTH sides are driven before either failure is reported. B
+    // failing used to end the row on the spot, and "was tab a ever
+    // driven at all?" was then unanswerable from the log — the two
+    // tabs sit behind two different gateways, so whether the symptom
+    // is one-sided is the first thing a NAT row has to say.
+    let b_connected = tab_b.run(connect_step("b")).await?;
+    let a_connected = tab_a.run(connect_step("a")).await?;
+    let refused: Vec<String> = [("b", &b_connected), ("a", &a_connected)]
+        .into_iter()
+        .filter_map(|(tab, r)| step_failure(tab, r))
+        .collect();
+    if !refused.is_empty() {
+        return Err(refused.join("; "));
+    }
     verdict.b.node_id = b_connected
         .node_id
         .clone()
@@ -1032,7 +1219,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     }
     println!("[runner] a={} b={}", verdict.a.node_id, verdict.b.node_id);
 
-    for tab in [&tab_b, &tab_a] {
+    for tab in [tab_b, tab_a] {
         tab.require(|id| Step::Announce {
             id,
             capabilities: vec![CAPABILITY.to_owned()],
@@ -1110,63 +1297,8 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     // the numbers that were actually there. `samples` and `settle_ms`
     // ride the verdict so "it settled immediately" and "it never
     // settled" are distinguishable afterwards.
-    verdict.a = settle(&tab_a, verdict.a.node_id.clone(), m.settle).await?;
-    verdict.b = settle(&tab_b, verdict.b.node_id.clone(), m.settle).await?;
-
-    // --- 8. the anchor's own ledger --------------------------------
-    let ice = anchor
-        .rtc_ice_stats()
-        .ok_or("the anchor has no RTC driver — `webrtc` feature?")?;
-    verdict.anchor = serde_json::json!({
-        "ice_attempted": ice.attempted.to_string(),
-        "ice_direct": ice.direct.to_string(),
-        "ice_relayed": ice.relayed.to_string(),
-        "ice_failed": ice.failed.to_string(),
-        // Native has no such term and should not: a node that signals
-        // over UDP cannot have UDP blocked. Reported as a constant so
-        // the four-term partition is well formed on both sides.
-        "udp_blocked": "0",
-    });
-    println!(
-        "[runner] anchor ice attempted={} direct={} relayed={} failed={} pending={}",
-        ice.attempted,
-        ice.direct,
-        ice.relayed,
-        ice.failed,
-        ice.pending()
-    );
-
-    for tab in [&tab_a, &tab_b] {
-        let _ = tab.run(|id| Step::Done { id }).await;
-    }
-    driver_a.shutdown().await;
-    driver_b.shutdown().await;
-    for mut child in page_children {
-        let _ = child.kill().await;
-    }
-
-    // The runner does NOT decide the row — `tests/natsim.rs` does,
-    // against the table. But a runner that noticed the disposition is
-    // wrong and said nothing would make the scenario log useless, so
-    // the observation is printed here and asserted there.
-    let landed = match verdict.page_type.as_str() {
-        t if t == Disposition::Direct.page_type() => Some(Disposition::Direct),
-        t if t == Disposition::Relayed.page_type() => Some(Disposition::Relayed),
-        _ => None,
-    };
-    match landed {
-        Some(d) if d == row.expect => {
-            println!("[runner] row {} landed {d}, as expected", row.scenario)
-        }
-        Some(d) => println!(
-            "[runner] row {} landed {d}, expected {} — {}",
-            row.scenario, row.expect, row.why
-        ),
-        None => println!(
-            "[runner] row {} reached no disposition: {:?}",
-            row.scenario, verdict.page_type
-        ),
-    }
+    verdict.a = settle(tab_a, verdict.a.node_id.clone(), m.settle).await?;
+    verdict.b = settle(tab_b, verdict.b.node_id.clone(), m.settle).await?;
     Ok(())
 }
 
