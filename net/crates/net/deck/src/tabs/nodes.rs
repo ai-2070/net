@@ -244,8 +244,10 @@ pub(crate) fn render_nodes_view(
             Constraint::Length(5),  // SAT
             Constraint::Length(8),  // DAEMONS
             Constraint::Length(10), // MAINT
-            Constraint::Length(21), // ANCHOR (rtc_addr / bootstrap host)
-            Constraint::Min(24),    // ICE (direct/attempts + pending)
+            // ANCHOR (rtc_addr / bootstrap host, plus the
+            // separately announced STUN endpoint when there is one)
+            Constraint::Length(anchor_column_width(anchors, area)),
+            Constraint::Min(24), // ICE (direct/attempts + pending)
         ],
     )
     .header(header)
@@ -276,6 +278,40 @@ fn anchor_span(anchors: &crate::app::AnchorRollup, peer_id: u64) -> Span<'static
         Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
         None => Span::styled("—".to_string(), theme::chrome()),
     }
+}
+
+/// The ANCHOR column's width for this frame.
+///
+/// 21 is the width the widest cell needed when `rtc_addr` was the
+/// only endpoint a row could carry, and it stays 21 whenever that
+/// is still true — a mesh where no anchor announced a separate
+/// STUN endpoint (every mesh, until an operator opts in) is laid
+/// out exactly as it was before Stage 6, to the character.
+///
+/// When an anchor does announce one, the column takes the width
+/// its widest cell needs instead of truncating it: a clipped
+/// `203.0.113.7:71` is not a narrower fact, it is a wrong one.
+/// Bounded so the ICE column keeps its `Min(24)` floor — growing
+/// one operator-facing column by squeezing another's numbers off
+/// the screen would be a worse trade than a truncated address.
+pub(crate) fn anchor_column_width(anchors: &crate::app::AnchorRollup, area: Rect) -> u16 {
+    /// What `rtc_addr`-or-bootstrap-host alone needed: the width
+    /// this column had before Stage 6, and its floor now.
+    const BASE: u16 = 21;
+    /// The ten fixed columns either side of ANCHOR.
+    const FIXED_ELSEWHERE: u16 = 2 + 22 + 11 + 7 + 5 + 5 + 5 + 5 + 8 + 10;
+    /// `column_spacing(2)` between the twelve columns.
+    const SPACING: u16 = 2 * 11;
+    /// ICE's own `Min`, which this column must not eat into.
+    const ICE_FLOOR: u16 = 24;
+    /// The surrounding block's left and right borders.
+    const BORDERS: u16 = 2;
+
+    let headroom = area
+        .width
+        .saturating_sub(BORDERS + FIXED_ELSEWHERE + SPACING + ICE_FLOOR);
+    let widest = u16::try_from(anchors.widest_cell()).unwrap_or(u16::MAX);
+    widest.clamp(BASE, headroom.max(BASE))
 }
 
 /// The ICE cell for one node row — plan §10's

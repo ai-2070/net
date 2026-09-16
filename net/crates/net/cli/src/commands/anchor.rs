@@ -47,7 +47,9 @@ pub enum AnchorCommand {
     #[command(subcommand)]
     Credential(CredentialCommand),
     /// List the RTC anchors this node has heard announce
-    /// themselves, with their `rtc_addr` / `rtc_bootstrap`.
+    /// themselves, with their `rtc_addr` / `rtc_bootstrap`, plus
+    /// `rtc_stun_addr` for an anchor that announced a separate
+    /// STUN endpoint.
     ///
     /// Requires the `rtc-bootstrap` build: it reads the listing
     /// from a live daemon's anchor directory, and an anchor row a
@@ -260,6 +262,15 @@ struct InspectReport {
 struct AnchorRow {
     node: String,
     rtc_addr: Option<String>,
+    /// The anchor's **separately announced STUN endpoint** (Stage
+    /// 6), when it configured one. Omitted from the JSON otherwise:
+    /// the overwhelming majority of anchors announce none, and a row
+    /// for one of those must read exactly as it did before this
+    /// field existed. The siblings keep emitting `null` — they
+    /// predate the convention, and changing their rendering is a
+    /// consumer-visible decision this slice does not make.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_stun_addr: Option<String>,
     rtc_bootstrap: Option<String>,
     noise_pubkey: Option<String>,
 }
@@ -427,6 +438,7 @@ async fn run_ls(
             .map(|row| AnchorRow {
                 node: row.node,
                 rtc_addr: row.rtc_addr,
+                rtc_stun_addr: row.rtc_stun_addr,
                 rtc_bootstrap: row.rtc_bootstrap,
                 noise_pubkey: row.noise_pubkey,
             })
@@ -740,6 +752,28 @@ pub struct ServeArgs {
     #[arg(long = "rtc-bind", value_name = "ADDR")]
     pub rtc_bind: Option<String>,
 
+    /// Bind address of a SECOND UDP socket that answers STUN only,
+    /// published as `rtc_stun_addr` on the announcement. Off by
+    /// default: an anchor that passes neither this nor
+    /// `--rtc-stun-public-addr` opens no second socket and
+    /// announces no STUN endpoint.
+    ///
+    /// It exists because `--rtc-public-addr` is this anchor's ICE
+    /// endpoint: a browser pairing WITH this anchor cannot gather
+    /// against it, so the endpoint it gathers against has to be a
+    /// distinct one. Use `:0` to let the OS pick — the announced
+    /// value is the port the socket actually bound, never a guess.
+    #[arg(long = "rtc-stun-bind", value_name = "ADDR")]
+    pub rtc_stun_bind: Option<String>,
+
+    /// Public address of that STUN socket, published as
+    /// `rtc_stun_addr`. Required behind NAT, and it must be a
+    /// **distinct externally reachable endpoint** from
+    /// `--rtc-public-addr` — two ports on this host is fine, a
+    /// gateway mapping that lands both on one public tuple is not.
+    #[arg(long = "rtc-stun-public-addr", value_name = "ADDR")]
+    pub rtc_stun_public_addr: Option<String>,
+
     /// Operator-supplied certificate chain (PEM). With `--tls-key`.
     #[arg(long = "tls-cert", value_name = "PATH", requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
@@ -797,8 +831,71 @@ struct ServeReport {
     listening_on: String,
     bootstrap_url: String,
     rtc_addr: Option<String>,
+    /// The announced STUN endpoint (Stage 6) — the PUBLIC value the
+    /// operator configured, echoed the way `rtc_addr` echoes
+    /// `--rtc-public-addr`.
+    ///
+    /// **Deliberately asymmetric with its sibling**: this key is
+    /// absent when no STUN endpoint was configured, while
+    /// `rtc_addr` above still renders `null`. `rtc_addr` predates
+    /// the omit-when-absent convention and a consumer parsing this
+    /// report is entitled to the shape it already has, so changing
+    /// it is a separate, consumer-visible decision — not a side
+    /// effect of adding a field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_stun_addr: Option<String>,
     trust_domain: String,
     noise_pubkey: String,
+}
+
+/// The RTC driver configuration `serve` runs with, from the
+/// operator's flags.
+///
+/// Its own function so the flag → config mapping is a thing a test
+/// can read without binding a socket or starting a mesh: every
+/// address here is operator input, and the failure mode worth
+/// guarding is a flag that parses fine and lands on nothing.
+///
+/// Two pairs, and they are not interchangeable:
+///
+/// * `--rtc-bind` / `--rtc-public-addr` → the ICE/RTC socket. It
+///   keeps `serve_stun = true`, which is what answers the
+///   diagnostic `UdpBlocked` probe aimed at `rtc_addr`.
+/// * `--rtc-stun-bind` / `--rtc-stun-public-addr` → the SECOND,
+///   STUN-only socket announced as `rtc_stun_addr` (Stage 6),
+///   additional to the first and never a replacement for it.
+///   Neither flag given: no second socket, nothing announced.
+#[cfg(feature = "rtc-bootstrap")]
+fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcConfig, CliError> {
+    let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
+    rtc.serve_stun = true;
+    if let Some(bind) = args.rtc_bind.as_ref() {
+        rtc.bind_addr = Some(
+            bind.parse()
+                .map_err(|e| invalid_args(format!("--rtc-bind: {e}")))?,
+        );
+    }
+    if let Some(public) = args.rtc_public_addr.as_ref() {
+        rtc.public_addr = Some(
+            public
+                .parse()
+                .map_err(|e| invalid_args(format!("--rtc-public-addr: {e}")))?,
+        );
+    }
+    if let Some(bind) = args.rtc_stun_bind.as_ref() {
+        rtc.stun_addr = Some(
+            bind.parse()
+                .map_err(|e| invalid_args(format!("--rtc-stun-bind: {e}")))?,
+        );
+    }
+    if let Some(public) = args.rtc_stun_public_addr.as_ref() {
+        rtc.stun_public_addr = Some(
+            public
+                .parse()
+                .map_err(|e| invalid_args(format!("--rtc-stun-public-addr: {e}")))?,
+        );
+    }
+    Ok(rtc)
 }
 
 #[cfg(feature = "rtc-bootstrap")]
@@ -853,21 +950,7 @@ async fn run_serve(
         }
     };
 
-    let mut rtc = net::adapter::net::rtc::RtcConfig::new().with_bootstrap_url(args.url.clone());
-    rtc.serve_stun = true;
-    if let Some(bind) = args.rtc_bind.as_ref() {
-        rtc.bind_addr = Some(
-            bind.parse()
-                .map_err(|e| invalid_args(format!("--rtc-bind: {e}")))?,
-        );
-    }
-    if let Some(public) = args.rtc_public_addr.as_ref() {
-        rtc.public_addr = Some(
-            public
-                .parse()
-                .map_err(|e| invalid_args(format!("--rtc-public-addr: {e}")))?,
-        );
-    }
+    let rtc = rtc_config_from_args(&args)?;
 
     let mesh = Mesh::builder(&args.bind, &psk)
         .map_err(|e| generic(format!("mesh builder: {e}")))?
@@ -922,6 +1005,7 @@ async fn run_serve(
             listening_on: handle.local_addr().to_string(),
             bootstrap_url: args.url.clone(),
             rtc_addr: args.rtc_public_addr.clone(),
+            rtc_stun_addr: args.rtc_stun_public_addr.clone(),
             trust_domain: sdk_psk.trust_domain().to_string(),
             noise_pubkey: hex_string(mesh.node().public_key()),
         },
@@ -934,4 +1018,230 @@ async fn run_serve(
         .map_err(|e| generic(format!("waiting for ctrl-c: {e}")))?;
     handle.shutdown().await;
     Ok(())
+}
+
+/// Stage 6 — the operator surface of the separately announced STUN
+/// endpoint: the two flags that configure it, and the JSON that
+/// reports it.
+///
+/// Behind `rtc-bootstrap` because `ServeArgs` is: the verbs that
+/// announce and read the endpoint only exist in that build.
+/// Run: `cargo test -p net-cli --features rtc-bootstrap anchor`.
+#[cfg(all(test, feature = "rtc-bootstrap"))]
+mod tests {
+    use super::*;
+
+    /// `ServeArgs` parsed from argv, with only the four flags the
+    /// parser requires supplied. `extra` is the thing under test.
+    fn serve_args(extra: &[&str]) -> ServeArgs {
+        use clap::Parser;
+
+        /// `ServeArgs` is a flattened `Args`, so it needs a
+        /// `Parser` root to be parsed standalone.
+        #[derive(Parser)]
+        struct Root {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+
+        let mut argv = vec![
+            "net-mesh",
+            "--psk-file",
+            "psk.hex",
+            "--url",
+            "https://anchor.example.com",
+            "--credential-issuer",
+            "00",
+            "--allow-origin",
+            "https://app.example.com",
+        ];
+        argv.extend_from_slice(extra);
+        Root::parse_from(argv).serve
+    }
+
+    /// The two STUN flags land on the two `RtcConfig` fields that
+    /// open and announce the second socket — and an anchor that
+    /// passes neither configures nothing, which is what keeps the
+    /// endpoint off unless an operator asks for it.
+    ///
+    /// The `serve_stun` assertion is not incidental: the new socket
+    /// is ADDITIONAL. The RTC socket keeps answering the diagnostic
+    /// `UdpBlocked` probe aimed at `rtc_addr`, so a change that
+    /// moved STUN duty to the second socket would break the probe's
+    /// classification while every assertion about the new fields
+    /// still passed.
+    ///
+    /// Inverse receipt: drop either `if let` in
+    /// [`rtc_config_from_args`] and the matching `Some` assertion
+    /// fails — the flag parses, prints in `--help`, and reaches
+    /// nothing, which is the failure mode an operator cannot see.
+    #[test]
+    fn the_stun_flags_reach_the_rtc_config_and_are_absent_by_default() {
+        let configured = rtc_config_from_args(&serve_args(&[
+            "--rtc-stun-bind",
+            "0.0.0.0:3479",
+            "--rtc-stun-public-addr",
+            "203.0.113.7:3479",
+        ]))
+        .expect("both flags parse");
+        assert_eq!(
+            configured.stun_addr,
+            Some("0.0.0.0:3479".parse().expect("addr")),
+            "--rtc-stun-bind is the SECOND socket's bind"
+        );
+        assert_eq!(
+            configured.stun_public_addr,
+            Some("203.0.113.7:3479".parse().expect("addr")),
+            "--rtc-stun-public-addr is the endpoint that gets announced"
+        );
+
+        let bare = rtc_config_from_args(&serve_args(&[])).expect("no STUN flags parse");
+        assert_eq!(
+            bare.stun_addr, None,
+            "no flag, no second socket: an anchor that configures nothing announces \
+             nothing"
+        );
+        assert_eq!(bare.stun_public_addr, None);
+        assert!(
+            bare.serve_stun,
+            "the RTC socket still answers STUN — it is the diagnostic UdpBlocked \
+             probe's target, and the second socket is additional to it, never a \
+             replacement"
+        );
+
+        // The ICE pair is untouched by the STUN pair, and vice
+        // versa: four flags, four fields, no aliasing.
+        let both_pairs = rtc_config_from_args(&serve_args(&[
+            "--rtc-bind",
+            "0.0.0.0:7101",
+            "--rtc-public-addr",
+            "203.0.113.7:7101",
+            "--rtc-stun-bind",
+            "0.0.0.0:3479",
+        ]))
+        .expect("all four parse");
+        assert_eq!(
+            both_pairs.bind_addr,
+            Some("0.0.0.0:7101".parse().expect("addr"))
+        );
+        assert_eq!(
+            both_pairs.public_addr,
+            Some("203.0.113.7:7101".parse().expect("addr"))
+        );
+        assert_eq!(
+            both_pairs.stun_addr,
+            Some("0.0.0.0:3479".parse().expect("addr"))
+        );
+        assert_eq!(
+            both_pairs.stun_public_addr, None,
+            "a bind without a public address announces the socket's own resolved \
+             endpoint, decided in the driver — not here"
+        );
+    }
+
+    /// An unparseable address is refused by the flag that carried
+    /// it, named, with the invalid-args exit code — not silently
+    /// dropped into an anchor that then announces nothing.
+    #[test]
+    fn a_malformed_stun_address_names_the_flag_that_carried_it() {
+        for (flag, value) in [
+            ("--rtc-stun-bind", "not-an-address"),
+            ("--rtc-stun-public-addr", "203.0.113.7"),
+        ] {
+            let err = rtc_config_from_args(&serve_args(&[flag, value]))
+                .expect_err("a malformed address must be refused");
+            assert_eq!(err.kind(), crate::error::ExitCodeKind::InvalidArgs);
+            assert!(
+                err.to_string().contains(flag),
+                "the refusal must name the flag the operator typed: {err}"
+            );
+        }
+    }
+
+    /// The listing row omits the STUN endpoint entirely when the
+    /// anchor announced none: a row for one of the anchors that has
+    /// not opted in is byte-identical to the row this command
+    /// printed before Stage 6.
+    ///
+    /// Inverse receipt: remove the `skip_serializing_if` and the
+    /// first assertion fails with `"rtc_stun_addr": null` in the
+    /// row — a key every consumer of `anchor ls` would now have to
+    /// account for to describe an anchor that has nothing to do
+    /// with STUN.
+    #[test]
+    fn the_listing_row_omits_the_stun_endpoint_unless_the_anchor_announced_one() {
+        let row = AnchorRow {
+            node: "0x1".to_string(),
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+            noise_pubkey: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&row).expect("serialize"),
+            r#"{"node":"0x1","rtc_addr":"203.0.113.7:7101","rtc_bootstrap":"https://anchor.example.com","noise_pubkey":null}"#,
+            "the row an anchor without a STUN endpoint produces, key for key"
+        );
+
+        let announced = AnchorRow {
+            rtc_stun_addr: Some("203.0.113.7:3479".to_string()),
+            ..row
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&announced).expect("serialize"))
+                .expect("parse");
+        assert_eq!(
+            json["rtc_stun_addr"], "203.0.113.7:3479",
+            "and the announced endpoint travels under its own key, beside rtc_addr"
+        );
+        assert_eq!(
+            json["rtc_addr"], "203.0.113.7:7101",
+            "which is a different endpoint, and stays one"
+        );
+    }
+
+    /// `serve`'s report echoes the PUBLIC STUN address the operator
+    /// configured, and omits the key when there was none.
+    ///
+    /// **Deliberately asymmetric**, and pinned here so the
+    /// asymmetry is a decision rather than a drift: `rtc_addr`
+    /// still renders `null` when unset because it did before this
+    /// field existed and a consumer parsing this report is
+    /// entitled to the shape it has. The new key is absent
+    /// instead.
+    #[test]
+    fn the_serve_report_echoes_the_announced_stun_endpoint_and_omits_the_key_without_one() {
+        let base = ServeReport {
+            node: "0x1".to_string(),
+            listening_on: "0.0.0.0:8443".to_string(),
+            bootstrap_url: "https://anchor.example.com".to_string(),
+            rtc_addr: None,
+            rtc_stun_addr: None,
+            trust_domain: "td".to_string(),
+            noise_pubkey: "ab".to_string(),
+        };
+        let json = serde_json::to_string(&base).expect("serialize");
+        assert!(
+            !json.contains("rtc_stun_addr"),
+            "an anchor that configured no STUN endpoint reports no such key: {json}"
+        );
+        assert!(
+            json.contains(r#""rtc_addr":null"#),
+            "…while its sibling keeps the shape it already had, null and all: {json}"
+        );
+
+        let announced = ServeReport {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: Some("203.0.113.7:3479".to_string()),
+            ..base
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&announced).expect("serialize"))
+                .expect("parse");
+        assert_eq!(json["rtc_stun_addr"], "203.0.113.7:3479");
+        assert_eq!(
+            json["rtc_addr"], "203.0.113.7:7101",
+            "the two endpoints are reported separately because they ARE separate"
+        );
+    }
 }

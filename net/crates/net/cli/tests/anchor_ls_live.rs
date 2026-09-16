@@ -60,7 +60,117 @@ async fn anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer() {
     .await;
     let plain = node(None).await;
 
-    for peer in [&anchor, &plain] {
+    let _directory = join_start_and_announce(&daemon_mesh, &[&anchor, &plain]).await;
+    wait_for_anchor(&daemon, anchor.node_id()).await;
+
+    let rows = ls_rows(&daemon);
+    let anchor_hex = format!("{:#x}", anchor.node_id());
+    let listed = rows
+        .iter()
+        .find(|row| row["node"] == serde_json::Value::String(anchor_hex.clone()))
+        .unwrap_or_else(|| panic!("the announcing anchor is missing from {rows:?}"));
+    assert_eq!(listed["rtc_addr"], public.to_string());
+    assert_eq!(listed["rtc_bootstrap"], "https://anchor.example.com");
+    // Stage 6: this anchor configured no separate STUN endpoint —
+    // the state every anchor that has not opted in is in — so its
+    // row must carry no such key at all. A `null` here would make
+    // every consumer of `anchor ls` account for a field that has
+    // nothing to do with the anchor it is describing.
+    assert!(
+        listed.get("rtc_stun_addr").is_none(),
+        "an anchor that configured no STUN endpoint must produce a row with no such \
+         key: {listed:?}"
+    );
+
+    let plain_hex = format!("{:#x}", plain.node_id());
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["node"] == serde_json::Value::String(plain_hex.clone())),
+        "a peer that never claimed the anchor role must not be listed"
+    );
+}
+
+/// **Stage 6, end to end.** An anchor that configures a separate
+/// STUN endpoint announces it, and the exact endpoint reaches the
+/// operator's `anchor ls` JSON.
+///
+/// Live because no unit test can see this path: the value crosses
+/// the signed announcement, the daemon's ingest, the anchor
+/// directory's nRPC reply and the CLI's own row type, and a field
+/// dropped at any one of those four seams leaves every other
+/// assertion in the slice passing. `assert_eq!` on the string, not
+/// a presence check: a key that exists is satisfied by an empty or
+/// stale value, which is the failure this amendment exists to
+/// prevent.
+///
+/// Inverse receipt: drop `rtc_stun_addr` from the projection in
+/// `serve_anchor_directory` (`sdk/src/rtc_bootstrap.rs`) — the
+/// anchor still announces the endpoint and the daemon still
+/// ingests it, but the key vanishes from the CLI's JSON and this
+/// test fails on the missing row field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn anchor_ls_carries_the_separately_announced_stun_endpoint() {
+    let daemon_mesh = net_sdk::Mesh::builder("127.0.0.1:0", &PSK)
+        .expect("builder")
+        .build()
+        .await
+        .expect("daemon mesh");
+    let daemon = Arc::clone(daemon_mesh.node());
+
+    let rtc_public: std::net::SocketAddr = "203.0.113.9:7443".parse().expect("addr");
+    let stun_public: std::net::SocketAddr = "203.0.113.9:3479".parse().expect("addr");
+    // Two real sockets, both binds ephemeral — the natural
+    // spelling, and the one an operator types. `RtcConfig` exempts
+    // port 0 from its bind-distinctness check precisely because two
+    // `ip:0` binds compare equal and are nonetheless two different
+    // sockets. What must be distinct is what gets ANNOUNCED, and
+    // that is the pair of public endpoints above.
+    let anchor = node(Some(RtcConfig {
+        public_addr: Some(rtc_public),
+        ..RtcConfig::new()
+            .with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+            .with_stun_addr("127.0.0.1:0".parse().expect("addr"))
+            .with_stun_public_addr(stun_public)
+            .with_bootstrap_url("https://anchor.example.com")
+    }))
+    .await;
+
+    let _directory = join_start_and_announce(&daemon_mesh, &[&anchor]).await;
+    wait_for_anchor(&daemon, anchor.node_id()).await;
+
+    let rows = ls_rows(&daemon);
+    let anchor_hex = format!("{:#x}", anchor.node_id());
+    let listed = rows
+        .iter()
+        .find(|row| row["node"] == serde_json::Value::String(anchor_hex.clone()))
+        .unwrap_or_else(|| panic!("the announcing anchor is missing from {rows:?}"));
+    assert_eq!(
+        listed["rtc_stun_addr"],
+        stun_public.to_string(),
+        "the announced STUN endpoint must reach the operator exactly as announced, \
+         not merely be present: {listed:?}"
+    );
+    assert_eq!(
+        listed["rtc_addr"],
+        rtc_public.to_string(),
+        "…beside the RTC endpoint, which is a different address and stays one: \
+         {listed:?}"
+    );
+}
+
+/// Connect every peer to the daemon, start them all, serve the
+/// anchor directory and announce — the sequence the CLI's view
+/// depends on.
+///
+/// Returns the directory's `ServeHandle`, which the caller must
+/// keep alive: dropping it unregisters the service the CLI calls.
+async fn join_start_and_announce(
+    daemon_mesh: &net_sdk::Mesh,
+    peers: &[&Arc<MeshNode>],
+) -> net_sdk::mesh_rpc::ServeHandle {
+    let daemon = Arc::clone(daemon_mesh.node());
+    for peer in peers {
         let daemon_id = daemon.node_id();
         let peer_clone = Arc::clone(peer);
         let accept = tokio::spawn(async move { peer_clone.accept(daemon_id).await });
@@ -70,28 +180,35 @@ async fn anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer() {
             .expect("udp handshake");
         accept.await.expect("accept task").expect("accept");
     }
-    for n in [&daemon, &anchor, &plain] {
-        n.start_arc();
+    daemon.start_arc();
+    for peer in peers {
+        peer.start_arc();
     }
-    let _directory = serve_anchor_directory(&daemon_mesh).expect("serve the anchor directory");
-    for peer in [&anchor, &plain] {
+    let directory = serve_anchor_directory(daemon_mesh).expect("serve the anchor directory");
+    for peer in peers {
         peer.announce_capabilities(CapabilitySet::new())
             .await
             .expect("announce");
     }
+    directory
+}
 
-    // Wait for the daemon to have ingested the anchor's own signed
-    // announcement — the CLI reads what the daemon knows.
+/// Wait for the daemon to have ingested that anchor's own signed
+/// announcement — the CLI reads what the daemon knows.
+async fn wait_for_anchor(daemon: &Arc<MeshNode>, node_id: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline
         && !daemon
             .rtc_anchors()
             .iter()
-            .any(|row| row.node_id == anchor.node_id())
+            .any(|row| row.node_id == node_id)
     {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
 
+/// `anchor ls` as the operator runs it, against `daemon`, parsed.
+fn ls_rows(daemon: &Arc<MeshNode>) -> Vec<serde_json::Value> {
     let out = AssertCommand::cargo_bin("net-mesh")
         .expect("binary")
         .args([
@@ -116,29 +233,16 @@ async fn anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer() {
         "anchor ls failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "stdout was not JSON ({e}): {}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
-    let rows = rows.as_array().expect("an array of rows");
-    let anchor_hex = format!("{:#x}", anchor.node_id());
-    let listed = rows
-        .iter()
-        .find(|row| row["node"] == serde_json::Value::String(anchor_hex.clone()))
-        .unwrap_or_else(|| panic!("the announcing anchor is missing from {rows:?}"));
-    assert_eq!(listed["rtc_addr"], public.to_string());
-    assert_eq!(listed["rtc_bootstrap"], "https://anchor.example.com");
-
-    let plain_hex = format!("{:#x}", plain.node_id());
-    assert!(
-        !rows
-            .iter()
-            .any(|row| row["node"] == serde_json::Value::String(plain_hex.clone())),
-        "a peer that never claimed the anchor role must not be listed"
-    );
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .unwrap_or_else(|e| {
+            panic!(
+                "stdout was not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+        .as_array()
+        .expect("an array of rows")
+        .clone()
 }
 
 /// Without a daemon to attach to, the listing REFUSES rather than

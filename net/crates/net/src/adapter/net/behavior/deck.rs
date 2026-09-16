@@ -361,8 +361,16 @@ pub struct SubnetRollup {
 pub struct RtcAnchorRow {
     /// The anchor's node id.
     pub node_id: u64,
-    /// Its public RTC/STUN socket (`rtc_addr`), when announced.
+    /// Its public RTC socket (`rtc_addr`), when announced — what a
+    /// browser aims ICE at, and the diagnostic STUN probe's target.
     pub rtc_addr: Option<std::net::SocketAddr>,
+    /// Its **separately announced STUN endpoint**
+    /// (`rtc_stun_addr`, Stage 6), when it configured one: a second
+    /// UDP endpoint, distinct from [`Self::rtc_addr`], that a
+    /// connection pairing with this anchor gathers against. `None`
+    /// on every anchor that has not opted in, which is why the
+    /// surfaces that render it omit it rather than showing a blank.
+    pub rtc_stun_addr: Option<String>,
     /// Its bootstrap listener URL (`rtc_bootstrap`), when announced.
     pub rtc_bootstrap: Option<String>,
     /// Its Noise static public key, when announced (plan §5 Layer 1).

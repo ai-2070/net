@@ -26415,6 +26415,33 @@ impl MeshNode {
         self.config.rtc.as_ref().and_then(|rtc| rtc.public_addr)
     }
 
+    /// The **separately announced STUN endpoint**, when configured.
+    ///
+    /// Distinct from [`Self::rtc_public_addr`] on purpose, and this is
+    /// the whole point of Stage 6 §6.12.1: libwebrtc's
+    /// `UDPPort::OnReadPacket` consumes any datagram whose source is a
+    /// configured STUN server BEFORE `GetConnection`, in both
+    /// directions — so a leaf handed `stun:<anchor rtc_addr>` can
+    /// never form a candidate pair with that anchor. A second socket,
+    /// announced separately, is what lets a leaf's default
+    /// `iceServers` be useful instead of fatal.
+    ///
+    /// **Resolved, not merely configured.** `stun_public_addr` when
+    /// the operator set one; otherwise the address the second socket
+    /// actually bound, so a `:0` bind announces a real endpoint. The
+    /// same reason the bootstrap URL falls back to the driver's
+    /// `local_addr` below: an announcement names what exists, and
+    /// never an adjacent-port guess.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addr(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        if let Some(addr) = rtc.stun_public_addr {
+            return Some(addr);
+        }
+        rtc.stun_addr?;
+        self.rtc_driver.as_ref().and_then(|d| d.stun_local_addr())
+    }
+
     /// `rtc_stats()` without requiring a driver to exist.
     #[cfg(feature = "webrtc")]
     fn rtc_stats_opt(&self) -> Option<&Arc<super::rtc::RtcStats>> {
@@ -36674,6 +36701,11 @@ impl MeshNode {
         ann.with_noise_pubkey(Some(*self.public_key()))
             .with_rtc_bootstrap(bootstrap)
             .with_rtc_addr(rtc.public_addr)
+            // `Option<String>`, not a `SocketAddr`: an anchor may
+            // announce a name. `None` when nothing is configured, so
+            // the signed transcript of an anchor that does not serve
+            // a second STUN socket is byte-identical to today's.
+            .with_rtc_stun_addr(self.rtc_public_stun_addr().map(|a| a.to_string()))
     }
 
     /// §10 part 2: how many **application-data** packets this node
@@ -43155,6 +43187,7 @@ impl MeshNode {
                         node_id: *node_id,
                         rtc_addr: entry.payload.rtc_addr,
                         rtc_bootstrap: entry.payload.rtc_bootstrap.clone(),
+                        rtc_stun_addr: entry.payload.rtc_stun_addr.clone(),
                         noise_pubkey: entry.payload.noise_pubkey,
                     };
                     // Several announcements from one node: prefer the
@@ -48228,6 +48261,7 @@ mod fold_publisher_helpers_tests {
                 noise_pubkey: None,
                 rtc_bootstrap: None,
                 rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),

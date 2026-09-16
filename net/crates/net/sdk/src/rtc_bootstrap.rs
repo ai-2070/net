@@ -439,8 +439,15 @@ pub struct AnchorInfo {
     /// Its Noise static public key (hex) — for **comparison** with
     /// the credential's pinned key, never as a source of it.
     pub noise_pubkey: String,
-    /// The public RTC/STUN socket, when the operator configured one.
+    /// The public RTC socket, when the operator configured one.
+    /// The diagnostic STUN probe's only legitimate target.
     pub rtc_addr: Option<String>,
+    /// The **separately announced** STUN endpoint, when the operator
+    /// configured one: a second UDP socket, distinct from
+    /// [`Self::rtc_addr`], which a leaf's default `iceServers` points
+    /// at. `None` means nothing was announced, and a leaf then
+    /// configures no ICE servers at all.
+    pub stun_addr: Option<String>,
     /// The trust domain this anchor serves.
     pub trust_domain: String,
     /// §12 provisional capacity: bound and current occupancy.
@@ -1224,6 +1231,10 @@ async fn get_anchor(State(state): State<AppState>) -> Response {
         node_id: format!("{:#x}", state.node.node_id()),
         noise_pubkey: hex_of(state.node.public_key()),
         rtc_addr: state.node.rtc_public_addr().map(|a| a.to_string()),
+        // The resolved announced STUN endpoint, not the configured
+        // bind: one resolution rule, in the node, so this handler
+        // and the announcement emission point cannot disagree.
+        stun_addr: state.node.rtc_public_stun_addr().map(|a| a.to_string()),
         trust_domain: state.psk.trust_domain().to_string(),
         max_provisional: state.node.rtc_max_provisional(),
         provisional: state.node.provisional_count(),
@@ -1504,8 +1515,17 @@ pub const ANCHOR_DIRECTORY_SERVICE: &str = "net.mesh.anchors";
 pub struct AnchorDirectoryRow {
     /// The anchor's node id, hex.
     pub node: String,
-    /// Its announced public RTC/STUN socket.
+    /// Its announced public RTC socket — the endpoint a browser
+    /// aims ICE at, and the target of the diagnostic STUN probe.
     pub rtc_addr: Option<String>,
+    /// Its **separately announced STUN endpoint** (Stage 6), when
+    /// configured: a second UDP endpoint, distinct from
+    /// [`Self::rtc_addr`], that a connection pairing with this
+    /// anchor gathers against. Absent — and omitted from the JSON —
+    /// on an anchor that configured none, which is every anchor
+    /// that has not opted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_stun_addr: Option<String>,
     /// Its announced bootstrap listener URL.
     pub rtc_bootstrap: Option<String>,
     /// Its announced Noise static public key, hex.
@@ -1536,6 +1556,7 @@ pub fn serve_anchor_directory(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::Ser
                 .map(|row| AnchorDirectoryRow {
                     node: format!("{:#x}", row.node_id),
                     rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+                    rtc_stun_addr: row.rtc_stun_addr,
                     rtc_bootstrap: row.rtc_bootstrap,
                     noise_pubkey: row.noise_pubkey.as_ref().map(|k| hex_of(k)),
                 })

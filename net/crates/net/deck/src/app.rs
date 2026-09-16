@@ -35,12 +35,21 @@ pub struct LogsBackTarget {
     pub prior_paused: Option<Vec<net_sdk::deck::LogRecord>>,
 }
 
-/// The two addresses that make an RTC anchor usable, as the NODES
-/// table shows them (Stage 4b).
+/// The addresses that make an RTC anchor usable, as the NODES
+/// table shows them (Stage 4b; the STUN endpoint is Stage 6).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AnchorAddresses {
-    /// The announced public RTC/STUN socket.
+    /// The announced public RTC socket — what a browser aims ICE
+    /// at, and the diagnostic probe's target.
     pub rtc_addr: Option<String>,
+    /// The **separately announced STUN endpoint**
+    /// (`rtc_stun_addr`), when this anchor configured one. `None`
+    /// on every anchor that did not, which is why [`Self::cell`]
+    /// appends it only when it is there: an anchor without one has
+    /// to read exactly as it did before the field existed, and a
+    /// `—` next to a real RTC address would read as a broken
+    /// announcement rather than an unused option.
+    pub rtc_stun_addr: Option<String>,
     /// The announced bootstrap listener URL.
     pub rtc_bootstrap: Option<String>,
 }
@@ -51,20 +60,32 @@ impl AnchorAddresses {
     /// with neither address announced is still an anchor — and
     /// showing it as one is how an operator notices it is
     /// unreachable.
+    ///
+    /// An anchor that announced a separate STUN endpoint gets it
+    /// appended (`203.0.113.7:7101 stun 203.0.113.7:7102`); one
+    /// that did not renders exactly the string it rendered before
+    /// Stage 6.
     pub fn cell(&self) -> String {
-        if let Some(addr) = self.rtc_addr.as_deref() {
-            return addr.to_string();
-        }
-        if let Some(url) = self.rtc_bootstrap.as_deref() {
+        let base = if let Some(addr) = self.rtc_addr.as_deref() {
+            addr.to_string()
+        } else if let Some(url) = self.rtc_bootstrap.as_deref() {
             let host = url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
                 .split('/')
                 .next()
                 .unwrap_or(url);
-            return host.to_string();
+            host.to_string()
+        } else {
+            "anchor (no address)".to_string()
+        };
+        // Two endpoints are two facts, and the second one is the
+        // one a browser gathers against — labelled, because an
+        // unlabelled second socket beside the first is unreadable.
+        match self.rtc_stun_addr.as_deref() {
+            Some(stun) => format!("{base} stun {stun}"),
+            None => base,
         }
-        "anchor (no address)".to_string()
     }
 }
 
@@ -105,6 +126,22 @@ impl AnchorRollup {
     pub fn not_this_build(&self) -> bool {
         self.0.is_none()
     }
+
+    /// The width, in characters, of the widest cell this rollup
+    /// will paint — what the ANCHOR column has to be able to hold.
+    ///
+    /// Zero for a build that cannot read the fields and for a mesh
+    /// with no anchors: both paint strings narrower than the
+    /// column's own floor, so the layout is the caller's constant
+    /// either way. Goes through [`AnchorAddresses::cell`] rather
+    /// than measuring the fields, so the width can never disagree
+    /// with the text.
+    pub fn widest_cell(&self) -> usize {
+        self.0
+            .as_ref()
+            .and_then(|rows| rows.values().map(|a| a.cell().chars().count()).max())
+            .unwrap_or(0)
+    }
 }
 
 /// Read the anchor rollup off the deck client.
@@ -129,6 +166,7 @@ fn collect_rtc_anchors(
                     row.node_id,
                     AnchorAddresses {
                         rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+                        rtc_stun_addr: row.rtc_stun_addr,
                         rtc_bootstrap: row.rtc_bootstrap,
                     },
                 )
@@ -3819,19 +3857,17 @@ impl App {
 mod anchor_cell_tests {
     use super::{AnchorAddresses, AnchorRollup, IceRollup};
 
-    /// Draw the NODES tab into an offscreen terminal and return
-    /// every symbol it painted. Row-major, so a cell's text is
-    /// contiguous in the result.
-    fn nodes_tab_text(rollup: &AnchorRollup) -> String {
+    /// Draw the NODES tab into an offscreen terminal `width`
+    /// columns wide and return every symbol it painted. Row-major,
+    /// so a cell's text is contiguous in the result.
+    fn nodes_tab_text_at(width: u16, rollup: &AnchorRollup) -> String {
         use ratatui::{backend::TestBackend, Terminal};
 
         let mut snapshot = net_sdk::deck::MeshOsSnapshot::default();
         snapshot
             .peers
             .insert(0xA11CE, net_sdk::deck::PeerSnapshot::default());
-        // Wide enough that the ANCHOR column (the last, `Min(21)`)
-        // gets real width after the ten fixed columns.
-        let mut terminal = Terminal::new(TestBackend::new(150, 8)).expect("offscreen terminal");
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("offscreen terminal");
         terminal
             .draw(|frame| {
                 crate::tabs::nodes::render(
@@ -3857,6 +3893,13 @@ mod anchor_cell_tests {
             .collect()
     }
 
+    /// The same draw at 150 columns: wide enough that the ANCHOR
+    /// column gets real width after the ten fixed columns and
+    /// ICE's floor.
+    fn nodes_tab_text(rollup: &AnchorRollup) -> String {
+        nodes_tab_text_at(150, rollup)
+    }
+
     /// **R6.** The NODES tab paints the rollup's addresses in the
     /// ANCHOR column, and a build that cannot read the fields says
     /// so instead of painting the `—` that means "not an anchor".
@@ -3867,6 +3910,7 @@ mod anchor_cell_tests {
                 0xA11CE,
                 AnchorAddresses {
                     rtc_addr: Some("203.0.113.7:7101".to_string()),
+                    rtc_stun_addr: None,
                     rtc_bootstrap: Some("https://anchor.example.com".to_string()),
                 },
             )]
@@ -3904,12 +3948,14 @@ mod anchor_cell_tests {
     fn the_anchor_cell_prefers_the_rtc_socket_then_the_bootstrap_host() {
         let both = AnchorAddresses {
             rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: None,
             rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
         };
         assert_eq!(both.cell(), "203.0.113.7:7101");
 
         let url_only = AnchorAddresses {
             rtc_addr: None,
+            rtc_stun_addr: None,
             rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
         };
         assert_eq!(url_only.cell(), "anchor.example.com");
@@ -3919,6 +3965,151 @@ mod anchor_cell_tests {
         // unreachable, and a blank cell would read as "not an
         // anchor".
         assert_eq!(AnchorAddresses::default().cell(), "anchor (no address)");
+    }
+
+    /// **Stage 6.** An anchor that announced a separate STUN
+    /// endpoint shows both; an anchor that announced none renders
+    /// the string it rendered before the field existed.
+    ///
+    /// The second half is the one that matters: the field is off
+    /// unless an operator configures it, so nearly every row in
+    /// the field is the `None` case, and any placeholder there
+    /// (`—`, `stun: -`, a trailing separator) would be a column
+    /// full of noise announcing an option nobody took.
+    ///
+    /// Inverse receipt: make [`AnchorAddresses::cell`] append
+    /// unconditionally — `format!("{base} stun {}", …unwrap_or("—"))`
+    /// — and the `no_stun` assertion fails with
+    /// `"203.0.113.7:7101 stun —"`; make it never append and the
+    /// `announced` assertion fails with the bare RTC address, the
+    /// endpoint a browser actually gathers against having silently
+    /// not reached the operator.
+    #[test]
+    fn the_anchor_cell_appends_an_announced_stun_endpoint_and_adds_nothing_without_one() {
+        let announced = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: Some("203.0.113.7:7102".to_string()),
+            rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+        };
+        assert_eq!(
+            announced.cell(),
+            "203.0.113.7:7101 stun 203.0.113.7:7102",
+            "both endpoints, labelled — the RTC socket a browser aims ICE at and the \
+             distinct endpoint it gathers against"
+        );
+
+        let no_stun = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+        };
+        assert_eq!(
+            no_stun.cell(),
+            "203.0.113.7:7101",
+            "an anchor that configured no STUN endpoint renders exactly as it did \
+             before Stage 6 — no placeholder that reads like a value"
+        );
+        assert_eq!(
+            AnchorAddresses {
+                rtc_addr: None,
+                rtc_stun_addr: None,
+                rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+            }
+            .cell(),
+            "anchor.example.com",
+            "…and the bootstrap-host fallback is untouched too"
+        );
+    }
+
+    /// **Stage 6, on the operator's actual screen.** Both endpoints
+    /// are painted in full, and a mesh with no announced STUN
+    /// endpoint paints the ANCHOR column exactly as it did before
+    /// Stage 6 — same width, same text.
+    ///
+    /// Two widths on purpose. The column was `Length(21)`, sized to
+    /// `rtc_addr` alone, and two endpoints need 38: at 180 columns
+    /// there is room to the right of ICE's floor and the cell must
+    /// be painted whole, because a clipped `203.0.113.7:71` reads
+    /// as a broken announcement rather than a narrowed one. At 150
+    /// — the width the pre-existing tests draw at — a row with no
+    /// STUN endpoint must be indistinguishable from the old one,
+    /// which is the case nearly every anchor in the field is in.
+    ///
+    /// Inverse receipt: pin the column back to
+    /// `Constraint::Length(21)` in `tabs::nodes` and the first half
+    /// fails — the painted buffer holds `203.0.113.7:7101 stun`
+    /// and no endpoint — while the no-STUN half still passes,
+    /// which is exactly why the width is derived from the widest
+    /// cell instead of a constant. Drop the `widest_cell` clamp's
+    /// `BASE` floor and the second half fails instead: a 16-char
+    /// cell would shrink the column below its header.
+    #[test]
+    fn the_anchor_column_paints_both_endpoints_in_full_and_is_unchanged_without_one() {
+        let rollup = |stun: Option<&str>| {
+            AnchorRollup(Some(
+                [(
+                    0xA11CE,
+                    AnchorAddresses {
+                        rtc_addr: Some("203.0.113.7:7101".to_string()),
+                        rtc_stun_addr: stun.map(str::to_string),
+                        rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ))
+        };
+
+        let painted = nodes_tab_text_at(180, &rollup(Some("203.0.113.7:7102")));
+        assert!(
+            painted.contains("203.0.113.7:7101 stun 203.0.113.7:7102"),
+            "both endpoints must reach the screen whole — a clipped one is a wrong \
+             address, not a shorter one: {painted}"
+        );
+
+        // The case every anchor that has not opted in is in: at the
+        // width the pre-Stage-6 tests draw, the column is the same
+        // 21 characters holding the same text.
+        let painted_without = nodes_tab_text(&rollup(None));
+        assert!(
+            painted_without.contains("203.0.113.7:7101"),
+            "the RTC socket still paints: {painted_without}"
+        );
+        assert!(
+            !painted_without.contains("stun"),
+            "an anchor that announced no STUN endpoint must paint no trace of one: \
+             {painted_without}"
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 150, 8);
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&rollup(None), area),
+            21,
+            "no announced STUN endpoint anywhere in the mesh: the column keeps the \
+             exact width it had before Stage 6, so the whole table's layout is \
+             unchanged"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&AnchorRollup(None), area),
+            21,
+            "…and so does a build that cannot read the fields at all"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(
+                &rollup(Some("203.0.113.7:7102")),
+                ratatui::layout::Rect::new(0, 0, 180, 8)
+            ),
+            38,
+            "with an announced endpoint and room for it, the column is exactly as wide \
+             as the cell it has to hold"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&rollup(Some("203.0.113.7:7102")), area),
+            22,
+            "and at a width that cannot fit both, ICE keeps its floor: the column takes \
+             the headroom there is rather than pushing another column's numbers off the \
+             screen"
+        );
     }
 
     /// **R6 wiring witness.** The rollup the ANCHOR column renders
