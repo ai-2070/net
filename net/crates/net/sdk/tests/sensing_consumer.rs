@@ -2661,7 +2661,21 @@ async fn an_idle_watch_is_actually_renewed_and_stops_after_the_last_close() {
         "an idle watch must be RENEWED by the node, not merely armed \
          ({renewed_before} -> {renewed_after})"
     );
-    assert_eq!(armed(&consumer.node), 1);
+    // AWAITED, not sampled. `armed` is 1 between renewals and 0 for
+    // the instant a renewal is in flight, so reading it at a fixed
+    // point after a 5 s sleep asserts on whichever side of that gap
+    // the scheduler happened to land — a statement about runner load,
+    // not about renewal. The renewal itself is already proven by
+    // `renewed_after > renewed_before` directly above; what this line
+    // is for is that the watch returns to ARMED afterwards, and that
+    // is a state to wait for, exactly as the `until(... == 0)` below
+    // waits for the opposite transition.
+    until(
+        "an idle watch never returned to armed after its renewal",
+        SETTLE,
+        || armed(&consumer.node) == 1,
+    )
+    .await;
     let after_idle = observation.snapshot().expect("snapshot");
     assert!(
         after_idle.provider(provider_id).is_some(),
