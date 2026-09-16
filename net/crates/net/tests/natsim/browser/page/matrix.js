@@ -87,6 +87,32 @@ function toPeerHex(decimal) {
   return BigInt(decimal).toString(16).padStart(16, '0');
 }
 
+/// Whether a peer entry names `expectHex`, in EITHER encoding the
+/// leaf surface uses.
+///
+/// `connect` hands back `node.nodeId` as 16 lowercase hex digits and
+/// every peer-id ARGUMENT is hex, but a capability query's `nodeId`
+/// is the exact DECIMAL u64 — the same asymmetry `toPeerHex` already
+/// exists for on a `signal` event's `from`. Comparing the two
+/// verbatim is why run 35055657044's Firefox row reported that B
+/// "never appeared" in eighty queries whose very first answer was
+/// `nodeId: "9684434118755589433"` — which IS `0x866605854b199d39`,
+/// the peer it was looking for. Both readings are tried and neither
+/// is guessed at: a decimal that converts to the expected hex is the
+/// same node, and so is a string already equal to it.
+function namesPeer(entry, expectHex) {
+  const raw = typeof entry === 'string' ? entry : entry && (entry.nodeId || entry.node_id);
+  if (raw === null || raw === undefined) return false;
+  const s = String(raw);
+  if (s.toLowerCase() === expectHex.toLowerCase()) return true;
+  if (!/^[0-9]+$/.test(s)) return false;
+  try {
+    return toPeerHex(s) === expectHex.toLowerCase();
+  } catch (e) {
+    return false;
+  }
+}
+
 function safeJson(v) {
   try {
     return JSON.stringify(v);
@@ -209,7 +235,9 @@ async function execute(step) {
         const ids = seen.map((p) =>
           typeof p === 'string' ? p : p && (p.nodeId || p.node_id),
         );
-        if (ids.includes(step.expect_peer)) return { ok: true, peers: ids };
+        if (seen.some((p) => namesPeer(p, step.expect_peer))) {
+          return { ok: true, peers: ids };
+        }
         await new Promise((r) => setTimeout(r, 250));
       }
       // Everything the next reader needs without another cycle: what
