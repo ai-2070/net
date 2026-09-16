@@ -5604,6 +5604,15 @@ jobs:
           stage5_reliable_stream_recovers_injected_loss_and_reorder
           stage5_large_messages_cross_the_public_api_in_both_directions
           stage5_leader_proxied_stream_carries_native_bytes_both_ways
+          stage6_two_isolated_contexts_reach_a_direct_session
+          stage6_each_leaf_learns_the_others_keys_from_a_signed_announcement
+          stage6_the_four_wasm_methods_drive_one_attempt_end_to_end
+          stage6_peer_handshake_takes_a_peer_id_and_nothing_else
+          stage6_an_undiscovered_peer_is_refused_before_an_offer_exists
+          stage6_an_offer_nobody_answers_leaves_the_pair_relayed
+          stage6_a_second_offer_supersedes_the_live_attempt
+          stage6_the_ice_attempt_ledger_partitions_on_both_leaves
+          stage6_a_handshake_the_peer_cannot_answer_is_typed_handshake_failed
           "
           # The roster is checked against the harness source before the
           # logs are read: a witness name that the runner never emits
@@ -5613,6 +5622,7 @@ jobs:
             --label "browser matrix" --mode literal \
             --source net/crates/net/tests/rtc_browser/runner/src/main.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage5.rs \
+            --source net/crates/net/tests/rtc_browser/runner/src/stage6.rs \
             $REQUIRED
           for engine in chromium firefox; do
             case "$engine" in
@@ -5631,14 +5641,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 26)"
+            echo "[$engine] $passes passed, $fails failed (floor 35)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 26 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 26 — \
+            if [ "$passes" -lt 35 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 35 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
@@ -5648,7 +5658,7 @@ jobs:
                 exit 1
               fi
             done
-            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5"
+            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 9 Stage 6"
           done
 
       # WebKit's verdicts are surfaced, never gated.
