@@ -251,6 +251,43 @@ jobs:
       # root-owned and `actions/upload-artifact` fails on them with
       # `EACCES: permission denied, scandir`. Widen the read bits first;
       # the upload step cannot do it itself.
+
+      # THE BISECT (S6_REPORT.md §6.12), and the reason it exists:
+      # Chromium works against this same anchor on loopback in the
+      # browser-matrix job and fails here, and only two things differ —
+      # the NAT and the network namespace. Chromium's receive path has
+      # no logging at all (`socket_client_impl`, `ipc_socket_factory`:
+      # no VLOGs), so no further instrumentation can answer it.
+      #
+      # `diag_wan_wan` puts both browsers directly in nsim_wan on the
+      # lab segment: no NAT, no gateway, a real non-loopback
+      # interface. Connects -> the NAT is implicated. Fails -> the
+      # namespace is. Either answer costs one step and needs no
+      # Chromium internals.
+      #
+      # Diagnostic, never a gate: `|| true`, and it is not a pinned
+      # row — the Rust table and this file's `browser_*` arms stay in
+      # lockstep, which is why the arm is named `diag_*`.
+      - name: Bisect - Chromium in a namespace with no NAT
+        if: ${{ failure() }}
+        run: |
+          set -uo pipefail
+          sudo env \
+            "PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-}" \
+            "DISPLAY=${DISPLAY:-}" \
+            "NATSIM_NODE_BIN=$PWD/net/crates/net/target/debug/examples/natsim_node" \
+            net/crates/net/tests/natsim/run_scenario.sh diag_wan_wan \
+            > /tmp/diag_wan_wan.log 2>&1 || true
+          echo "=== verdict"
+          grep -aE 'landed|errors|page_type|ICE did not connect' /tmp/diag_wan_wan.log | head -20 || true
+          echo "=== networks and ports as the engine saw them"
+          for log in /tmp/natsim.*/runner.log; do
+            [ -f "$log" ] || continue
+            grep -a 'PRECONDITION networks' "$log" | tail -2 || true
+          done
+          echo "=== the bisect's own ICE lines"
+          grep -a 'chromium-ice' /tmp/diag_wan_wan.log | head -40 || true
+
       # The engine's ICE accounting, into the JOB log.
       #
       # It reaches `runner.log` inside a state dir, and the last run

@@ -114,6 +114,19 @@ case "$SCENARIO" in
   browser_cone_symmetric) NAT_A=cone-ar NAT_B=symmetric MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
   browser_portrestricted_symmetric) NAT_A=cone-pr NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
   browser_symmetric_symmetric) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  # DIAGNOSTIC, not a pinned row (S6_REPORT.md §6.12). Both browsers
+  # sit directly in nsim_wan on the lab segment: no NAT, no gateway,
+  # a real non-loopback interface. It bisects the one question logging
+  # cannot answer — Chromium works against this anchor on loopback in
+  # the browser matrix and fails here, and the two differences are the
+  # NAT and the namespace. If it connects, the NAT is implicated; if
+  # it fails, the namespace is, and neither answer needs Chromium
+  # internals.
+  # NOT named `browser_*`: `tests/natsim_browser.rs` cross-checks the
+  # Rust row table against this file's `browser_*` arms and an eighth
+  # arm would fail that guard - correctly, since this is a bisect and
+  # not a conformance row.
+  diag_wan_wan) NAT_A=none NAT_B=none MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser NETNS_A=nsim_wan NETNS_B=nsim_wan ;;
   # The control: row 1 again, the other engine on both sides.
   browser_cone_cone_firefox) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=firefox ENGINE_B=firefox OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
@@ -280,7 +293,7 @@ if [[ "$MODE" == browser ]]; then
       --expect "$EXPECT" \
       --engine-a "$ENGINE_A" --engine-b "$ENGINE_B" \
       --anchor-ip 10.99.0.10 \
-      --netns-a nsim_a --netns-b nsim_b \
+      --netns-a "${NETNS_A:-nsim_a}" --netns-b "${NETNS_B:-nsim_b}" \
       >"$STATE/runner.log" 2>&1 &
   PIDS+=("$!")
   # Its OWN variable: the captures are in `PIDS` too now, so index 0
