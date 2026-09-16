@@ -111,8 +111,25 @@ jobs:
           grep -q "^test result: ok. 22 passed" /tmp/natsim_rows.log || {
             echo "::error::expected 22 matrix-table witnesses"; exit 1; }
 
-      - name: Add wasm32 to the pinned toolchain
-        run: rustup target add wasm32-unknown-unknown
+      # The repo root resolves `stable`; `net/crates/net/**` resolves the
+      # PINNED toolchain from `rust-toolchain.toml`, and they are separate
+      # installations with separate target sets. Installing from the root
+      # and then building in `leaf/` is `E0463: can't find crate for
+      # 'core'` — which is exactly how this job first went red. Install
+      # from each directory that runs a wasm build, and assert it there.
+      - name: Add wasm32 to every toolchain that builds for it
+        run: |
+          set -o pipefail
+          rustup target add --toolchain stable wasm32-unknown-unknown
+          for dir in net/crates/net net/crates/net/leaf; do
+            ( cd "$dir"
+              rustup target add wasm32-unknown-unknown
+              echo "== $dir: $(rustup show active-toolchain)"
+              rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+                echo "::error::wasm32-unknown-unknown is missing for the toolchain $dir selects"
+                exit 1
+              } ) || exit 1
+          done
 
       # Pinned, like ci.yml's browser-package job: wasm-bindgen's CLI and
       # the crate must agree exactly or the bundle is unloadable.
