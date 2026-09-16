@@ -182,6 +182,32 @@ one_side() {
   ip -n "$NS" route add 224.0.0.0/4 dev eth0
   ip -n "$NS" link set eth0 multicast on
 
+  # The gateway needs a default route of its OWN, and the browser rows
+  # are why.
+  #
+  # libwebrtc's `BasicNetworkManager` decides which interfaces are
+  # usable by asking for a "default local address": it connect()s a
+  # throwaway UDP socket at a public address (8.8.8.8, and the v6
+  # equivalent). In a namespace whose only route leads to a gateway
+  # that cannot itself route beyond the lab, that probe fails,
+  # `GetDefaultLocalAddress` returns nothing, and the enumerator
+  # classifies eth0 as unusable — so it enumerates ZERO networks and
+  # falls back to wildcard `any address` ports at cost 999.
+  #
+  # On a wildcard port, inbound packets are matched against the
+  # networks the port knows, and with none known EVERY inbound packet
+  # is dropped BEFORE any STUN parsing. That is the whole of §6.12:
+  # Chromium answered no Binding Requests and credited no responses
+  # while every packet on the wire was valid, correctly credentialed
+  # and correctly addressed. Firefox is unaffected because nICEr reads
+  # its sockets directly, with no enumeration gate.
+  #
+  # A default route on the gateway gives that probe a usable next hop.
+  # No traffic leaves the lab — nothing answers 8.8.8.8 here and
+  # nothing needs to; the probe only has to resolve a route rather
+  # than get ENETUNREACH.
+  ip -n "$GW" route add default via 10.99.0.1
+
   ip netns exec "$GW" sysctl -qw net.ipv4.ip_forward=1
 
   if [[ "$MODE" == "symmetric" ]]; then

@@ -40,6 +40,8 @@ const NSS_NICKNAME = 'net-mesh-natsim-harness-ca';
 let live = null;
 let page = null;
 let internals = null;
+let wildcardPorts = 0;
+let realNetworkPorts = 0;
 
 function log(line) {
   process.stderr.write(line + '\n');
@@ -186,6 +188,24 @@ async function opLaunch(req) {
             log(`[chromium-ice] ${line.trim()}`);
           }
         }
+        // THE PRECONDITION, pinned so it cannot regress silently.
+        //
+        // A Port on `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999
+        // means `BasicNetworkManager` enumerated ZERO networks and
+        // fell back to wildcard ports — and a wildcard port drops
+        // every inbound packet before STUN parsing, which is exactly
+        // how §6.12 presented: valid, correctly credentialed packets
+        // on the wire, no request answered and no response credited.
+        // A real network (`Net[eth0:…:Ethernet:id=1]`, cost 10/50) is
+        // what makes the Chromium rows able to work at all, so it is
+        // reported either way rather than hoped for.
+        if (/Net\[/.test(text)) {
+          if (/Wildcard/.test(text)) {
+            wildcardPorts += 1;
+          } else {
+            realNetworkPorts += 1;
+          }
+        }
       });
       child.on('error', reject);
       child.on('exit', (code) =>
@@ -236,6 +256,17 @@ async function opOpen(req) {
 // check that no external observer could supply. Chromium only, opened
 // in its own tab so the row's page is untouched, and best-effort: a
 // dump that fails must not fail a row.
+function reportNetworkEnumeration() {
+  // Named plainly, both ways: the fix is a topology fact and a run
+  // that silently lost it would otherwise look like a new mystery.
+  log(
+    `[chromium-ice] PRECONDITION networks: real=${realNetworkPorts} wildcard=${wildcardPorts}` +
+      (realNetworkPorts === 0
+        ? ' — ZERO enumerated networks, every inbound packet is dropped before STUN (S6_REPORT.md §6.12)'
+        : ''),
+  );
+}
+
 async function dumpWebrtcInternals() {
   if (!internals) return;
   try {
@@ -252,6 +283,7 @@ async function dumpWebrtcInternals() {
 }
 
 async function opShutdown() {
+  reportNetworkEnumeration();
   await dumpWebrtcInternals();
   try {
     if (live && live.persistent) await live.context.close();
