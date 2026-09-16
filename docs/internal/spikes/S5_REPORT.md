@@ -1022,7 +1022,7 @@ Recommendation: option 1, on the grounds that two expiry rules for
 one announcement type is a defect regardless of which is better.
 Awaiting the owner.
 
-### 12.2 N4's residual source breaks — implementer's choice, reviewer-endorsed, pending owner confirmation
+### 12.2 N4's residual source breaks — owner-confirmed 2026-09-16; versioning deferred to release
 
 Round 2 restored the id-addressed API beside the fenced one, which
 closed the *behavioural* break. Two **source**-compatibility breaks
@@ -1049,8 +1049,13 @@ the CODE STANDS — but the attribution did not, and it is corrected
 here rather than quietly left to age. A decision must never be
 attributed to an owner who did not make it: it launders a judgement
 call into an instruction and removes exactly the scrutiny the call
-deserves. **Status: implementer's choice, reviewer-endorsed, pending
-owner confirmation.**
+deserves. **Status: owner-confirmed 2026-09-16; version bump and
+release note deferred to the release process.** The policy below was
+the implementer's choice and the reviewer endorsed it on its merits;
+the owner has now confirmed it as policy. Marking an existing public
+type `#[non_exhaustive]` is itself a breaking change — the release
+owner handles the version bump and the release note when the branch
+ships, and this round deliberately does not take that work.
 
 **The choice: accept the bounded source break now and establish
 extensibility properly**, rather than paying the same cost again at
@@ -1717,13 +1722,18 @@ expiry rules for one announcement type is a defect whichever is
 nicer. Cost: two leaf tests that pin the TTL-zero-within-its-second
 case move with it.
 
-**2. The N4 policy itself.** `#[non_exhaustive]` on `StreamError` and
-`StreamStats` plus `StreamStats::empty()` as the construction seam,
-shipped and reviewer-endorsed but not owner-confirmed (§13.0). Two
-things need the owner: confirmation of the policy, and how the
-version bump and release note are handled — marking an existing
-public type non-exhaustive is itself a breaking change and must be
-versioned as one. We deliberately did not take the release work.
+**2. The N4 policy itself. RULED — owner-confirmed 2026-09-16;
+version bump and release note deferred to the release process.**
+`#[non_exhaustive]` on `StreamError` and `StreamStats` plus
+`StreamStats::empty()` as the construction seam stand as policy. The
+code does not move: it was already shipped and reviewer-endorsed, and
+the confirmation changes its STATUS, not its content — so this ruling
+is recorded in §12.2 and here and produces no code change, which is
+the honest outcome rather than a cosmetic edit to look busy. Marking
+an existing public type non-exhaustive remains a breaking change and
+must be versioned as one; the release owner handles the bump and the
+note when the branch ships. We deliberately did not take the release
+work and still have not.
 
 **3. Direct `BrowserNode.close` and iterator lifetime.** Pre-existing
 and not introduced by this stage: a direct wrapper's stream iterators
