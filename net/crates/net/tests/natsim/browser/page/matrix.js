@@ -38,6 +38,16 @@ let node = null;
 /// `ice_attempted` and break the row's exact count.
 let armed = null;
 const answered = new Set();
+/// This side's own announcement ledger. A query that finds nothing is
+/// two different failures depending on whether the ANNOUNCER was
+/// still announcing, and the answering side's counts are the only
+/// place that distinction exists.
+const announces = { ok: 0, failed: 0, lastError: null, timer: null };
+/// How often this page re-announces once the `announce` step has run.
+/// One second is the same order the reference page uses; the row's
+/// discovery budget is twenty, so a lost announcement costs a second
+/// rather than the row.
+const ANNOUNCE_EVERY_MS = 1000;
 
 async function log(line) {
   logEl.textContent += line + '\n';
@@ -144,6 +154,31 @@ async function execute(step) {
       } catch (e) {
         return { ok: false, ...typed(e) };
       }
+      announces.ok += 1;
+      // KEEP announcing. A leaf's announcement is a periodic fact,
+      // not a one-shot registration, and `@net-mesh/browser`'s own
+      // reference page (`examples/browser-demo`) re-announces on a
+      // timer for exactly that reason. Announcing once and then
+      // querying for twenty seconds is what run 35054553211's
+      // Firefox row did: both tabs connected, enrolled and announced
+      // successfully, and A's query for B still never resolved. This
+      // is not a retry bolted onto a deadline — the deadline is
+      // unchanged; it is the page behaving like the leaf it is
+      // standing in for.
+      if (!announces.timer) {
+        const capabilities = step.capabilities;
+        announces.timer = setInterval(() => {
+          node.announce(capabilities).then(
+            () => {
+              announces.ok += 1;
+            },
+            (e) => {
+              announces.failed += 1;
+              announces.lastError = (e && (e.message || String(e))) || 'unknown';
+            },
+          );
+        }, ANNOUNCE_EVERY_MS);
+      }
       return { ok: true };
     }
 
@@ -161,7 +196,9 @@ async function execute(step) {
       const deadline = performance.now() + (step.timeout_ms || 20000);
       let seen = [];
       let last = null;
+      let attempts = 0;
       while (performance.now() < deadline) {
+        attempts += 1;
         try {
           const peers = await node.query(step.capability);
           seen = typeof peers === 'string' ? JSON.parse(peers) : peers || [];
@@ -175,11 +212,19 @@ async function execute(step) {
         if (ids.includes(step.expect_peer)) return { ok: true, peers: ids };
         await new Promise((r) => setTimeout(r, 250));
       }
+      // Everything the next reader needs without another cycle: what
+      // the query DID return, how many times it was asked, whether
+      // this side's own announcements are still landing, and the last
+      // typed error if any call rejected.
       return {
         ok: false,
         detail:
-          `peer ${step.expect_peer} never appeared in a capability query for ` +
-          `${step.capability}${last ? ' (last error: ' + last.detail + ')' : ''}`,
+          `peer ${step.expect_peer} never appeared in ${attempts} capability queries for ` +
+          `${step.capability} over ${step.timeout_ms || 20000} ms ` +
+          `(this side announced ok=${announces.ok} failed=${announces.failed}` +
+          `${announces.lastError ? ' lastAnnounceError=' + announces.lastError : ''}` +
+          `; last query returned ${safeJson(seen)})` +
+          `${last ? ' (last query error: ' + last.detail + ')' : ''}`,
         peers: seen,
       };
     }
