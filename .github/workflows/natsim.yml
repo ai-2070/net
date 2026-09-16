@@ -64,7 +64,7 @@ jobs:
           # into the Firefox control row's profile NSS database. The
           # driver REFUSES the run if it cannot seed it, so without this
           # the control row fails loudly rather than running untrusted.
-          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools
+          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump
 
       # FIRST, deliberately: this is the drift guard. It parses
       # `run_scenario.sh`'s own `browser_*` case arms and fails if they

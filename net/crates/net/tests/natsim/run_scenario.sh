@@ -235,6 +235,30 @@ if [[ "$MODE" == upgrade ]]; then
   SEED_ARGS_B=(--seed-hex "$HIGH")
 fi
 
+# The last boundary on the Chromium rows that no log can settle.
+#
+# Every account we have is now consistent and still contradictory:
+# str0m creates a peer-reflexive candidate FROM the browser's check,
+# nominates the pair, reports `Completed`, and `send_to` returns Ok —
+# while the browser reports `sent=192 gotResponse=0 recvd=0` and no
+# `addIceCandidate` error. Both can only be true if the answers do
+# not reach the browser's namespace, or reach it and are discarded
+# there. A packet counter inside each browser's own namespace is the
+# only thing that separates those two, and it is what turns the next
+# failure into a fact instead of another inference.
+#
+# `tcpdump -w` per namespace, UDP only, snaplen 200 (headers plus the
+# STUN attribute prefix, not payload), killed by the EXIT trap with
+# the rest. Absent tcpdump the row is unaffected — this is evidence,
+# never a gate.
+capture() { # capture <netns> <name>
+  local ns="$1" name="$2"
+  command -v tcpdump >/dev/null || return 0
+  ip netns exec "$ns" tcpdump -i any -n -s 200 -U -w "$STATE/$name.pcap" \
+    udp >"$STATE/$name.tcpdump.log" 2>&1 &
+  PIDS+=("$!")
+}
+
 if [[ "$MODE" == browser ]]; then
   # The browser rows launch NO mesh helpers. Every native piece — the
   # anchor `MeshNode` with its RTC socket and STUN responder, the real
@@ -245,6 +269,9 @@ if [[ "$MODE" == browser ]]; then
   # (setns needs root, which this script already has), so the drivers
   # AND their browsers run entirely inside nsim_a / nsim_b while their
   # stdio pipes stay attached here.
+  capture nsim_a browser_a
+  capture nsim_b browser_b
+  capture nsim_wan anchor_wan
   ip netns exec nsim_wan env RUST_LOG="$NATSIM_BROWSER_LOG" \
     "$BROWSER_BIN" \
       --scenario "$SCENARIO" \
@@ -256,7 +283,11 @@ if [[ "$MODE" == browser ]]; then
       --netns-a nsim_a --netns-b nsim_b \
       >"$STATE/runner.log" 2>&1 &
   PIDS+=("$!")
-  echo "natsim: browser runner pid ${PIDS[0]} state $STATE"
+  # Its OWN variable: the captures are in `PIDS` too now, so index 0
+  # is no longer the runner and a liveness check on it would watch a
+  # tcpdump instead.
+  RUNNER_PID="${PIDS[-1]}"
+  echo "natsim: browser runner pid $RUNNER_PID state $STATE"
 else
   # Publics: X accepts R first (R dials it), then the joiners.
   launch nsim_wan x  public --name x --bind 10.99.0.11:7000 --state "$STATE" --joiners r,a,b
@@ -306,8 +337,8 @@ fi
 OUTCOME="$STATE/${OUTCOME_NODE}_outcome.json"
 for _ in $(seq 1 240); do
   [[ -s "$OUTCOME" ]] && break
-  if [[ "$MODE" == browser ]] && ! kill -0 "${PIDS[0]}" 2>/dev/null; then
-    wait "${PIDS[0]}" 2>/dev/null; rc=$?
+  if [[ "$MODE" == browser ]] && ! kill -0 "$RUNNER_PID" 2>/dev/null; then
+    wait "$RUNNER_PID" 2>/dev/null; rc=$?
     echo "natsim: the browser runner exited with status $rc before writing a \
 verdict; its log follows:" >&2
     tail -n 60 "$STATE/runner.log" >&2 || true
