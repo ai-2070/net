@@ -74,6 +74,37 @@ the README on why it is a sibling package rather than a sub-path.
   `SIZE <artifact> raw=<n> gz=<n>` lines for CI, a comparison against
   the S0a baseline, and `--assert` / `--require-leaf` exit codes.
 
+### Changed
+
+- **Iterators returned by a direct `BrowserNode` now complete when
+  `close()` is called.** A consumer sitting in
+  `for await (const bytes of stream)` leaves the loop and one awaiting
+  `iterator.next()` resolves `{ value: undefined, done: true }`;
+  `onMessage` listeners are dropped. Previously `node.close()` closed
+  the wasm node and left every iterator it had handed out parked
+  forever, because the wasm side stops calling `on_message` and
+  nothing else could end the queue. Opening a stream on a node that
+  is already closed is now visibly a typed `SessionError`
+  (`kind: 'session'`,
+  `session: the node is closed: it no longer holds this origin's identity`)
+  rather than a handle that silently sends nothing.
+
+  This is a **behaviour change** for code that relied on an iterator
+  outliving its node, or on a `for await` loop parking until some
+  other mechanism tore it down: that loop now finishes. Nothing new
+  is thrown at the consumer — the terminal is the normal end of
+  iteration — so a loop that already handles "the stream ended" needs
+  no change, and one whose only exit was an `AbortController` can drop
+  it.
+
+  **`MeshSession` already behaved this way and is unchanged; it is the
+  direct path that moved.** The leader-proxied surface has always
+  ended its streams on a generation change or a leadership loss,
+  because Rust fences a stale handle by the generation it was opened
+  under and a consumer parked on a handle that will never emit again
+  has to be settled by something. `BrowserNode` was the outlier, and
+  the two surfaces now dispose of a stream identically.
+
 ### Notes for consumers
 
 - **64-bit ids are exact decimal strings**, never JS numbers.

@@ -340,6 +340,17 @@ impl Inner {
     /// barrier fired late, a page that kept its `LeafNode` — is
     /// refused here rather than allowed to put a packet on a
     /// DataChannel this origin's identity has already moved off.
+    ///
+    /// **The text below is read by a TypeScript probe.**
+    /// `browser-ts/tests/abi_real_package.mjs` extracts this
+    /// `LeafError::Session` string out of this function's source
+    /// and asserts the package re-types it as `SessionError`,
+    /// because `BrowserNode.openStream` relies on this fence
+    /// instead of adding a second one of its own — a closed node
+    /// refusing here is what makes `openStream` after `close()` a
+    /// typed refusal for a page. Reword or restructure it and that
+    /// probe says so; it must not be made to invent the sentence
+    /// itself.
     fn admit(&self) -> Result<(), LeafError> {
         if self.closed {
             return Err(LeafError::Session(

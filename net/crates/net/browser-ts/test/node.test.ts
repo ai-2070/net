@@ -12,10 +12,12 @@ import {
   fromWasmError,
   IceServerConflictError,
   isUdpBlocked,
+  SessionError,
   type LeafError,
 } from '../src/errors.js';
 import type { LeafWasmConnectOptions } from '../src/wasm.js';
 import { fakeModule, failingModule, FakeNode } from './fake-wasm.js';
+import { NODE_CLOSED_REFUSAL } from './leaf-abi.js';
 
 const BASE = {
   credentialB64: 'Y3JlZA==',
@@ -328,6 +330,70 @@ describe('BrowserNode', () => {
     await expect(stream.send(new Uint8Array([1]))).rejects.toMatchObject({ kind: 'session' });
   });
 
+  // Ruling 3 (§13.7): the direct surface disposes of a stream the way
+  // the leader-proxied one already did on a generation change. Before
+  // this, `node.close()` closed the wasm node and left every iterator
+  // it had handed out parked forever — the wasm side stops calling
+  // `on_message`, and nothing else can settle the queue.
+  it('ends an iterator parked in for-await when the node closes, so the consumer completes', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    const stream = node.openStream({ reliability: 'reliable' });
+
+    // Parked with nothing buffered, which is the hanging case: a
+    // payload already in `pending` would have settled it regardless.
+    const parked = stream[Symbol.asyncIterator]().next();
+    node.close();
+
+    // Raced, not awaited with a longer timeout: "never settles" is
+    // not observable by waiting, so the deadline is the assertion.
+    await expect(
+      withinDeadline(parked, 250, 'the iterator parked before node.close()'),
+    ).resolves.toEqual({ value: undefined, done: true });
+    expect(inner.streams[0]?.closed).toBe(true);
+  });
+
+  it("refuses a stream on a closed node with the leaf's typed session refusal", async () => {
+    const node = await connected(new FakeNode());
+    node.close();
+
+    let thrown: unknown;
+    try {
+      node.openStream({ reliability: 'reliable' });
+    } catch (error) {
+      thrown = error;
+    }
+    // A typed refusal, so a page can tell "this node is finished"
+    // from a transport failure it might retry — and the text is
+    // Rust's own, not a sentence this package invented.
+    expect(thrown).toBeInstanceOf(SessionError);
+    expect(thrown).toMatchObject({
+      kind: 'session',
+      // `.message` is verbatim the Rust `Display`, `.detail` the text
+      // behind the taxonomy prefix — both, so a refusal re-typed from
+      // the wrong branch cannot pass on the prefix alone.
+      message: NODE_CLOSED_REFUSAL,
+      detail: NODE_CLOSED_REFUSAL.slice('session: '.length),
+    });
+  });
+
+  it('retires every stream handle through a live node, and each one only once', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    node.openStream({ reliability: 'reliable' });
+    const closedByThePage = node.openStream({ reliability: 'fireAndForget' });
+    closedByThePage.close();
+
+    node.close();
+
+    // Both handles retired BEFORE the node: the leaf retires a stream
+    // handle through the node, so one closed afterwards is not retired
+    // at all. And exactly two entries — the node did not re-close the
+    // stream the page had already closed, which the leaf would refuse
+    // as a handle it no longer holds.
+    expect(inner.teardown).toEqual(['stream', 'stream', 'node']);
+  });
+
   it('delivers every stream option to the boundary, not just the ones it reads itself', async () => {
     // Far-end test, deliberately. Each of these crosses page ->
     // OpenStreamOptions -> wasm opts -> LeaderRequest::StreamOpen ->
@@ -417,6 +483,37 @@ function iceTimeout(): LeafError {
   return fromWasmError(
     new Error('rtc: ICE did not connect inside the deadline (this does not establish that UDP is blocked)'),
   );
+}
+
+/**
+ * Resolve `work`, or reject on `ms` naming what stayed pending.
+ *
+ * The inverse of the end-on-close terminal is a consumer that never
+ * settles, and no amount of waiting observes "never". So the witness
+ * races the parked iterator against a timer: with the terminal it
+ * settles in microtasks, and without it this rejection is what goes
+ * red — on the line that names the parked consumer, rather than as a
+ * suite-level timeout that only reports that the test was slow.
+ *
+ * A **real** timer, deliberately, and it is not a sleep: the green
+ * path races against an already-settled promise, so it pays nothing
+ * and the timer is cleared in `finally`. Fake timers would make the
+ * bound a clock this test advances itself — the assertion would then
+ * be "the consumer settled before I chose to fire the deadline",
+ * which is not the property under test. The wall clock is only ever
+ * reached when the behaviour is gone, which is exactly when a
+ * quarter-second is the cheapest thing in the run.
+ */
+async function withinDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: number | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} was still pending after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A peer connection that gathers nothing: the probe times out. */

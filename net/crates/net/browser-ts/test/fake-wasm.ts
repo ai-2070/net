@@ -19,7 +19,7 @@
  * Rust-generated fixture by `abi.test.ts`.
  */
 
-import { streamDataEvent } from './leaf-abi.js';
+import { NODE_CLOSED_REFUSAL, streamDataEvent } from './leaf-abi.js';
 import type {
   LeafWasmConnectOptions,
   LeafWasmModule,
@@ -40,6 +40,7 @@ export class FakeStream implements LeafWasmStream {
   constructor(
     readonly options: LeafWasmStreamOptions,
     private readonly sendError: unknown = null,
+    private readonly onClose: () => void = () => {},
   ) {}
 
   send(payload: Uint8Array): void {
@@ -61,6 +62,7 @@ export class FakeStream implements LeafWasmStream {
 
   close(): void {
     this.closed = true;
+    this.onClose();
   }
 
   /** Drive an inbound payload from a test, the way Rust delivers it. */
@@ -117,6 +119,16 @@ export class FakeNode implements LeafWasmNode {
   enrollments = 0;
   enrolled = false;
   closed = false;
+  /**
+   * Teardown in the order the wrapper drove it: one `'stream'` per
+   * stream handle retired, `'node'` for the node itself.
+   *
+   * The real leaf retires a stream handle **through** the node, so a
+   * handle closed after the node is a handle that was never retired
+   * at all — the wasm side reports it and moves on. A double that
+   * only recorded flags could not tell the two apart.
+   */
+  readonly teardown: string[] = [];
   private sink: ((json: string) => void) | null = null;
 
   constructor(private readonly behaviour: FakeNodeBehaviour = {}) {}
@@ -142,7 +154,12 @@ export class FakeNode implements LeafWasmNode {
   }
 
   open_stream(options: LeafWasmStreamOptions): LeafWasmStream {
-    const stream = new FakeStream(options, this.behaviour.streamSendError ?? null);
+    // `Inner::admit`: a closed node refuses every outbound
+    // operation, and the refusal is the one text Rust spells.
+    if (this.closed) throw new Error(NODE_CLOSED_REFUSAL);
+    const stream = new FakeStream(options, this.behaviour.streamSendError ?? null, () =>
+      this.teardown.push('stream'),
+    );
     this.streams.push(stream);
     return stream;
   }
@@ -263,6 +280,7 @@ export class FakeNode implements LeafWasmNode {
 
   close(): void {
     this.closed = true;
+    this.teardown.push('node');
   }
 
   /** Deliver one event JSON string, as the wasm node would. */

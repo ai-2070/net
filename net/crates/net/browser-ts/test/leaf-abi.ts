@@ -56,3 +56,18 @@ export function vectorPayload(vector: StreamDataVector): Uint8Array {
 export function streamDataEvent(streamId: string, seq: string, payload: Uint8Array): string {
   return `{"type":"stream_data","stream_id":"${streamId}","seq":"${seq}","payload":"${toBase64(payload)}"}`;
 }
+
+/**
+ * The exact `LeafError` Display text the leaf refuses an outbound
+ * operation on a **closed** node with — `Inner::admit` in
+ * `leaf/src/wasm.rs`, which is what makes `openStream` after
+ * `close()` a typed `SessionError` instead of a dead handle.
+ *
+ * Here for the reason {@link streamDataEvent} is here: a double that
+ * invents its own refusal text agrees with whatever this package
+ * believes, which is the thing under test. The string is extracted
+ * from the Rust source and compared with this constant by
+ * `tests/abi_real_package.mjs`, so drifting either side goes red.
+ */
+export const NODE_CLOSED_REFUSAL =
+  "session: the node is closed: it no longer holds this origin's identity";

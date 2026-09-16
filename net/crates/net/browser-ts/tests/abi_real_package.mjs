@@ -24,6 +24,15 @@
  * claim "no test doubles"; that was false, and the label at the
  * bottom now says what it is.
  *
+ * The two close-disposition probes (ruling 3: a direct
+ * `BrowserNode.close()` ends the iterators it handed out) go through
+ * the package's own `connect()`, so the retained set, the terminal
+ * and the typed refusal are all compiled `dist/` code. Their
+ * stand-in is never driven — it emits no bytes and answers no call,
+ * because what they assert is exactly what a consumer sees when
+ * nothing arrives again — and the closed-node refusal text is read
+ * out of `leaf/src/wasm.rs` instead of being restated here.
+ *
  * The real direct and leader-proxied stream exercises — a stream
  * opened through the built package against a live native anchor
  * over real WebRTC, with the bytes originating on the native side —
@@ -326,6 +335,135 @@ await probe('real_wasm_keeps_u64_stream_ids_off_the_number_path', () => {
   refusal(() => LeafNode.effective_stream_options({ streamId: 'nine' }), 'a non-numeric streamId');
 });
 
+// ───────── ruling 3: a direct node's close ends its iterators ─────────
+
+/**
+ * The exact text the leaf fences a CLOSED node with, read out of
+ * `leaf/src/wasm.rs` itself.
+ *
+ * `Inner::admit` is the only fence — `BrowserNode.openStream` adds
+ * no second check in TypeScript — so this string, re-typed, is what
+ * a page sees when it opens a stream after `close()`. Extracted from
+ * the Rust source for the same reason the export probe below
+ * extracts its symbol list from the harness page: a constant copied
+ * into a test agrees with whatever this package already believes,
+ * which is the thing under test.
+ */
+const admitFence =
+  /fn admit\(&self\) -> Result<\(\), LeafError> \{[\s\S]{0,400}?LeafError::Session\(\s*"([^"]+)"/.exec(
+    await readFile(fileURLToPath(new URL('../../leaf/src/wasm.rs', import.meta.url)), 'utf8'),
+  );
+if (admitFence === null) {
+  throw new Error(
+    "could not find Inner::admit's LeafError::Session text in leaf/src/wasm.rs — this probe " +
+      'reads the Rust source so the package and its doubles cannot drift from it, so the ' +
+      'extraction must be fixed rather than the constant inlined',
+  );
+}
+const CLOSED_NODE_DISPLAY = `session: ${admitFence[1]}`;
+
+/**
+ * One `BrowserNode` from the BUILT package, reached through the
+ * package's own `connect()`, over a stand-in wasm node.
+ *
+ * The stand-in is the TRANSPORT, per this file's header: Node has no
+ * `RTCPeerConnection`, so no wasm-owned node — and therefore no
+ * wasm-owned stream — can exist in this process. Everything the
+ * ruling touched is the real compiled artifact: `connect`,
+ * `BrowserNode.openStream`, the retained set, `LeafStream`, and the
+ * `close` that ends it.
+ *
+ * And the stand-in is never DRIVEN. It emits no bytes and answers no
+ * call, because the property under test is precisely what a consumer
+ * sees when nothing ever arrives again; feeding it anything would
+ * settle the iterator for a reason other than the terminal. Its two
+ * jobs are to record the retirement order and to fence a closed node
+ * with Rust's own text.
+ */
+function packageDirectNode() {
+  const teardown = [];
+  let closed = false;
+  const inner = {
+    node_id_hex: () => 'beefcafe00000001',
+    on_event() {},
+    open_stream() {
+      if (closed) throw new Error(CLOSED_NODE_DISPLAY);
+      return {
+        send() {},
+        on_message() {},
+        is_reliable: () => true,
+        stream_id_hex: () => '00000000000000ff',
+        close() {
+          teardown.push('stream');
+        },
+      };
+    },
+    close() {
+      closed = true;
+      teardown.push('node');
+    },
+  };
+  return { wasm: { LeafNode: { connect: async () => inner } }, teardown };
+}
+
+await probe('real_package_re_types_the_leafs_closed_node_fence', async () => {
+  const pkg = await import(new URL('index.js', dist).href);
+  const retyped = pkg.fromWasmError(new Error(CLOSED_NODE_DISPLAY));
+  eq(retyped instanceof pkg.SessionError, true, `${CLOSED_NODE_DISPLAY} re-typed by the built package`);
+  eq([retyped.kind, retyped.message], ['session', CLOSED_NODE_DISPLAY], 'the fence, kind and verbatim Display');
+
+  // The unit suite's double must speak the same sentence, or a green
+  // `npm test` means a refusal the leaf never emits.
+  const double = await readFile(fileURLToPath(new URL('../test/leaf-abi.ts', import.meta.url)), 'utf8');
+  eq(double.includes(CLOSED_NODE_DISPLAY), true, `test/leaf-abi.ts carries "${CLOSED_NODE_DISPLAY}"`);
+});
+
+await probe('real_package_ends_a_parked_iterator_when_the_direct_node_closes', async () => {
+  const { connect } = await import(new URL('index.js', dist).href);
+  const { wasm, teardown } = packageDirectNode();
+  const node = await connect({ credentialB64: 'Y3JlZA==', origin: 'https://page.example', wasm });
+  const stream = node.openStream({ reliability: 'reliable' });
+
+  // Parked with nothing buffered — the consumer that, before this
+  // ruling, waited forever for a payload a closed node cannot send.
+  const parked = stream[Symbol.asyncIterator]().next();
+  node.close();
+
+  // A BOUNDED RACE, not a widened timeout: "never settles" is not
+  // observable by waiting longer, so the deadline is the assertion.
+  // Green pays no wall clock at all — the race resolves on an
+  // already-settled promise and the timer is cleared.
+  let timer;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('the parked iterator was still pending 250ms after node.close()')),
+      250,
+    );
+  });
+  let settled;
+  try {
+    settled = await Promise.race([parked, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+  eq(settled, { value: undefined, done: true }, 'the iterator parked before node.close()');
+
+  // Handles retired through a LIVE node, then the node: the leaf
+  // retires a stream handle via the node, so one closed afterwards
+  // is never retired at all.
+  eq(teardown, ['stream', 'node'], 'the retirement order');
+
+  // And the closed node refuses the next stream, typed.
+  let thrown = null;
+  try {
+    node.openStream({ reliability: 'reliable' });
+  } catch (error) {
+    thrown = error;
+  }
+  if (thrown === null) throw new Error('openStream on a closed node: accepted silently');
+  eq([thrown.kind, thrown.message], ['session', CLOSED_NODE_DISPLAY], 'openStream on a closed node');
+});
+
 // ──────────── the surface the real harness page imports ────────────
 
 /**
@@ -381,8 +519,12 @@ console.log(
       evidence:
         'the built @net-mesh/browser dist plus the wasm-bindgen pkg beside it, and no network. ' +
         'The wasm option readers and the fixture decode are exercised for real; the stream ' +
-        'probes drive the package\'s own LeafStream over a STAND-IN inner object, because ' +
-        'Node has no RTCPeerConnection and therefore no wasm-owned stream. The real direct ' +
+        "probes drive the package's own LeafStream over a STAND-IN inner object, because " +
+        'Node has no RTCPeerConnection and therefore no wasm-owned stream. The two ' +
+        'close-disposition probes reach the compiled BrowserNode through the package\'s own ' +
+        'connect() and never drive the stand-in at all — it emits nothing, which is the ' +
+        "point — and the leaf's closed-node fence text is read out of leaf/src/wasm.rs " +
+        'rather than restated here. The real direct ' +
         'and leader-proxied stream exercises are the Stage 5 browser witnesses named in this ' +
         "file's header.",
       package: fileURLToPath(dist),

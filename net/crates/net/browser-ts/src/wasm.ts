@@ -160,6 +160,20 @@ export interface LeafWasmNode {
   call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array>;
   subscribe(channel: string): Promise<void>;
   publish(channel: string, payload: Uint8Array): Promise<void>;
+  /**
+   * Open a stream on this node.
+   *
+   * **Throws on a closed node.** `Inner::admit` fences every
+   * outbound operation once `close()` (or a leadership retirement)
+   * has run, with the `LeafError::Session` Display
+   * `session: the node is closed: it no longer holds this origin's
+   * identity` — so the refusal arrives as a `SessionError` through
+   * `fromWasmError` rather than as a silent dead handle. Declared
+   * here because it is the contract `BrowserNode.openStream` relies
+   * on instead of adding a second fence of its own; the text is
+   * pinned against `leaf/src/wasm.rs` by
+   * `tests/abi_real_package.mjs`.
+   */
   open_stream(options: LeafWasmStreamOptions): LeafWasmStream;
   announce(capabilities: string[]): Promise<void>;
   /**
@@ -225,6 +239,16 @@ export interface LeafWasmNode {
   retry_report(): string;
   /** One JSON-string event per call. Registered once per node. */
   on_event(callback: (eventJson: string) => void): void;
+  /**
+   * Close the node: every session, every channel, every pending
+   * call.
+   *
+   * After it, nothing is delivered and every outbound operation is
+   * refused — which is why `BrowserNode.close` closes the
+   * streams it handed out **before** calling this, rather than
+   * leaving their handles to be retired through a node that would
+   * only report the attempt as a failure.
+   */
   close(): void;
 }
 

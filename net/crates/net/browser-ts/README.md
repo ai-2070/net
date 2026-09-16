@@ -407,6 +407,55 @@ the vectors in `test/fixtures/leaf-abi.json`, which
 `leaf/tests/ts_abi_fixture.rs` regenerates and pins against production
 `LeafEvent::to_json`.
 
+## Closing a node ends the iterators it handed out
+
+**Iterators returned by a direct `BrowserNode` now complete when
+`close()` is called.** A consumer sitting in
+`for await (const bytes of stream)` leaves the loop; one awaiting
+`iterator.next()` resolves `{ value: undefined, done: true }`;
+`onMessage` listeners are dropped. Opening a stream on a node that is
+already closed is a typed `SessionError`
+(`kind: 'session'`, message
+`session: the node is closed: it no longer holds this origin's identity`)
+— the leaf's own fence, not a dead handle and not a generic throw.
+
+```ts
+const stream = node.openStream({ reliability: 'reliable' });
+(async () => {
+  for await (const bytes of stream) render(bytes);
+  // Reached on node.close(). Before this change, never.
+})();
+node.close();
+```
+
+**This is a behaviour change.** Code written against the old
+behaviour — an iterator that outlived its node, or a `for await` loop
+expected to park indefinitely and be torn down some other way — now
+sees the loop finish. Nothing new is thrown at the consumer: the
+terminal is the normal end of iteration, so a loop that already
+handles "the stream ended" needs no change, while a loop whose only
+exit was an `AbortController` can drop it.
+
+**The symmetry, and which side moved.** `MeshSession` — the
+leader-proxied surface — has always ended its streams when the
+generation moved or leadership was lost: a stream is session-scoped,
+Rust fences a stale handle by the generation it was opened under, and
+a consumer parked on a handle that will never emit again has to be
+settled by *something*. The direct surface was the outlier. It closed
+the wasm node and left its iterators parked forever, because the wasm
+side simply stops calling `on_message` and nothing else can end the
+queue. **The direct path moved to match the proxied one**; the
+proxied path is unchanged, and both now dispose of a stream the same
+way.
+
+Order matters inside `close()` and is part of the contract: the
+streams are retired **before** the node, because the leaf retires a
+stream handle *through* the node — a handle closed after the node is
+never retired at all. `tests/abi_real_package.mjs` asserts the
+terminal, the retirement order and the typed refusal against the
+built `dist/`, with the refusal text read out of
+`leaf/src/wasm.rs` rather than restated in the test.
+
 ## Identity and the trust boundary
 
 By default the identity is generated inside the wasm leaf from the

@@ -1747,15 +1747,17 @@ must be versioned as one; the release owner handles the bump and the
 note when the branch ships. We deliberately did not take the release
 work and still have not.
 
-**3. Direct `BrowserNode.close` and iterator lifetime.** Pre-existing
-and not introduced by this stage: a direct wrapper's stream iterators
-are not ended when the parent node closes, so a consumer awaiting one
-can hang past close. The leader-proxied path ends them on generation
-change (L2). Options: end direct wrappers' iterators on parent close
-— consistent, and a behaviour change for anyone relying on the
-current lifetime — or document the asymmetry as intended. We have not
-picked, because the answer depends on whether a direct node's
-iterators are meant to outlive it at all.
+**3. Direct `BrowserNode.close` and iterator lifetime. RULED — end
+iterators on parent close. Implemented in §14.3.** Pre-existing and
+not introduced by this stage: a direct wrapper's stream iterators
+were not ended when the parent node closed, so a consumer awaiting
+one hung past close — the wasm side stops calling `on_message` and
+nothing else could settle the queue. The leader-proxied path has
+always ended them on a generation change or a leadership loss (L2),
+so the direct surface was the outlier and it is the direct surface
+that moved. The behaviour change is stated in the package's README
+and CHANGELOG as a behaviour change, in the words a consumer would
+search for, together with which of the two paths moved.
 
 **4. Is above-one-event fragmentation a Stage 5 contract, or an
 explicit bound?** Today: the leaf fragments up to a 64 832-byte
@@ -1915,3 +1917,165 @@ wasm32-unknown-unknown` clean. The `cross_lang_wire` fixtures that
 carry an announcement with a TTL still decode on both sides: **13
 passed, unchanged** — the ruling changes when a record is *believed*,
 not how it is *encoded*, and that distinction is why no fixture moved.
+
+### 14.3 Ruling 3 — a direct node's close ends its iterators
+
+**The ruling.** `BrowserNode.close()` ends every stream iterator the
+node handed out — the same terminal the leader-proxied path emits on
+a generation change (L2) — so a consumer parked in `for await`
+completes rather than hangs, and a subsequent `openStream` on a
+closed node is a typed refusal. A behaviour change; said so in the
+package docs.
+
+**The change.** No new terminal was invented: the one L2 already
+uses is `LeafStream.close()`, which ends each registered
+`AsyncQueue` (so an iterator resolves `{ value: undefined, done:
+true }` — the normal end of iteration, not a rejection) and clears
+the listeners. `BrowserNode` now retains the streams it hands out
+and drains that set in `close()`, exactly as `MeshSession.endStreams`
+does, **before** `inner.close()`: the leaf retires a stream handle
+*through* the node, so a handle closed after the node is never
+retired at all. `LeafStream` gained an `@internal onClosed`
+callback — the shape `AsyncQueue` already uses for a departing
+consumer — so a page that opens and closes a stream per frame does
+not grow the retained set for the node's lifetime.
+
+The typed refusal needed no new code and, deliberately, no second
+fence in TypeScript: `Inner::admit` in `leaf/src/wasm.rs` already
+refuses every outbound operation on a closed node with
+`session: the node is closed: it no longer holds this origin's identity`,
+and `openStream` re-types it as `SessionError` (`kind: 'session'`)
+through the same `fromWasmError` path every other boundary failure
+takes. What was missing was that this is a *contract*: it is now
+declared on `LeafWasmNode.open_stream` in `src/wasm.ts`, spoken by
+the unit-suite double (`test/leaf-abi.ts`'s `NODE_CLOSED_REFUSAL`),
+and — so the double cannot drift from Rust the way the Stage 5 stream
+callback did — extracted from `leaf/src/wasm.rs`'s source by the
+real-package probe and compared against both. `Inner::admit`'s
+doc comment names that coupling from the Rust side; that is the only
+change to `wasm.rs` and it is documentation.
+
+Files: `browser-ts/src/node.ts`, `src/stream.ts`, `src/wasm.ts`,
+`test/node.test.ts`, `test/fake-wasm.ts`, `test/leaf-abi.ts`,
+`tests/abi_real_package.mjs`, `README.md`, `CHANGELOG.md`;
+`leaf/src/wasm.rs` (doc only).
+
+**The witnesses.** Through the real built package,
+`tests/abi_real_package.mjs`, 12 → 14 probes (the 12 are unchanged):
+
+- `real_package_ends_a_parked_iterator_when_the_direct_node_closes` —
+  the built `connect()` → `BrowserNode.openStream` → `LeafStream`
+  chain: park an iterator with nothing buffered, `node.close()`, the
+  iterator completes with the terminal; the handles are retired
+  before the node; a further `openStream` refuses with
+  `kind: 'session'` and the verbatim Rust `Display`.
+- `real_package_re_types_the_leafs_closed_node_fence` — the fence
+  text read out of `leaf/src/wasm.rs`, re-typed by the built package
+  as `SessionError`, and the unit-suite double asserted to speak the
+  same sentence.
+
+What is real and what is not, stated in the file and in its evidence
+label: Node has no `RTCPeerConnection`, so no wasm-owned node or
+stream can exist in the process. Everything the ruling touched is
+compiled `dist/` code; the stand-in is the transport, and it is never
+*driven* — it emits no bytes and answers no call, because the
+property under test is precisely what a consumer sees when nothing
+arrives again. The fully-real direct and proxied stream exercises
+remain the Stage 5 browser witnesses.
+
+And in the unit suite, `npm test` 172 → 175:
+
+- `ends an iterator parked in for-await when the node closes, so the
+  consumer completes`
+- `refuses a stream on a closed node with the leaf's typed session
+  refusal`
+- `retires every stream handle through a live node, and each one only
+  once`
+
+**The raw inverse receipt.** The diff that undoes the behaviour —
+the three lines of `BrowserNode.close` that drain the retained set:
+
+```diff
+--- a/net/crates/net/browser-ts/src/node.ts
++++ b/net/crates/net/browser-ts/src/node.ts
+@@ close(): void {
+     if (this.closed) return;
+     this.closed = true;
+-    const open = [...this.streams];
+-    this.streams.clear();
+-    for (const stream of open) stream.close();
+     this.hub.close();
+     this.inner.close();
+   }
+```
+
+`cd net/crates/net/browser-ts && npm test` — exit **1**:
+
+```
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/node.test.ts > BrowserNode > ends an iterator parked in for-await when the node closes, so the consumer completes
+AssertionError: promise rejected "Error: the iterator parked before node.cl…" instead of resolving
+ ❯ test/node.test.ts:352:6
+    350|     await expect(
+    351|       withinDeadline(parked, 250, 'the iterator parked before node.clo…
+    352|     ).resolves.toEqual({ value: undefined, done: true });
+       |      ^
+    353|     expect(inner.streams[0]?.closed).toBe(true);
+    354|   });
+
+Caused by: Error: the iterator parked before node.close() was still pending after 250ms
+ ❯ Timeout.<anonymous> test/node.test.ts:510:37
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  test/node.test.ts > BrowserNode > retires every stream handle through a live node, and each one only once
+AssertionError: expected [ 'stream', 'node' ] to deeply equal [ 'stream', 'stream', 'node' ]
+
+- Expected
++ Received
+
+  [
+    "stream",
+-   "stream",
+    "node",
+  ]
+
+ ❯ test/node.test.ts:394:28
+    392|     // stream the page had already closed, which the leaf would refuse
+    393|     // as a handle it no longer holds.
+    394|     expect(inner.teardown).toEqual(['stream', 'stream', 'node']);
+       |                            ^
+    395|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+ Test Files  1 failed | 6 passed (7)
+      Tests  2 failed | 173 passed (175)
+```
+
+`npm run build && node tests/abi_real_package.mjs` — exit **1**:
+
+```json
+{
+  "name": "real_package_ends_a_parked_iterator_when_the_direct_node_closes",
+  "pass": false,
+  "error": "the parked iterator was still pending 250ms after node.close()"
+}
+```
+
+Note that the typed-refusal assertion stays **green** under this
+inverse: the fence is Rust's and is witnessed independently of the
+terminal, which is the point of not adding a second fence in
+TypeScript.
+
+Restored: `npm test` → `Tests 175 passed (175)`, `Test Files 7 passed
+(7)`; `node tests/abi_real_package.mjs` → exit 0, 14 probes, 0
+failed.
+
+The deadline is a **bounded race**, not a widened timeout: "never
+settles" is not observable by waiting longer, so `Promise.race`
+against a 250 ms timer that *fails the test* is the assertion. It
+costs no wall clock when green — the race resolves on an
+already-settled promise and the timer is cleared in `finally` (suite
+duration 353 ms green vs 596 ms with the inverse applied).

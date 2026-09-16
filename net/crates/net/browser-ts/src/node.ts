@@ -31,6 +31,7 @@ import {
   loadLeafWasm,
   type LeafWasmConnectOptions,
   type LeafWasmNode,
+  type LeafWasmStream,
   type WasmSource,
 } from './wasm.js';
 
@@ -251,6 +252,21 @@ export class BrowserNode {
   private readonly hub = new EventHub();
   private readonly nodeId: string;
   private closed = false;
+  /**
+   * Streams this node handed out and that are still open, so closing
+   * the node can end them.
+   *
+   * The direct surface's half of the same guarantee `MeshSession`
+   * gives across a leader change: after `close()` the wasm node
+   * delivers nothing and no stream will ever emit again, so a
+   * consumer sitting in `await iterator.next()` would never settle.
+   * Nothing else can end it — the queue is fed only by the stream's
+   * `on_message` callback, and a closed node does not call it. So
+   * the node owns the set and drains it, which turns "no more data,
+   * ever" into the end of the iteration a page is already written to
+   * handle.
+   */
+  private readonly streams = new Set<LeafStream>();
   /** The last `rtc_addr` an anchor told us about; the probe's subject. */
   private anchorRtcAddr: string | null;
   /** Set once the leaf reports a session — a bootstrap that demonstrably worked. */
@@ -360,13 +376,30 @@ export class BrowserNode {
     }
   }
 
-  /** Open a reliable or fire-and-forget stream. */
+  /**
+   * Open a reliable or fire-and-forget stream.
+   *
+   * The stream is retained until it or the node closes, so
+   * {@link BrowserNode.close} can end the consumers it handed out.
+   *
+   * On a **closed** node this is a typed refusal, not a dead handle:
+   * the leaf's own fence (`Inner::admit`) rejects every outbound
+   * operation on a node that no longer holds the origin's identity,
+   * and that is re-typed here as `SessionError` (`kind: 'session'`)
+   * like every other boundary failure. There is deliberately no
+   * second check in TypeScript — one fence, on the side that owns
+   * the node's lifetime.
+   */
   openStream(options: OpenStreamOptions): LeafStream {
+    let inner: LeafWasmStream;
     try {
-      return new LeafStream(this.inner.open_stream(options));
+      inner = this.inner.open_stream(options);
     } catch (error) {
       throw fromWasmError(error);
     }
+    const stream: LeafStream = new LeafStream(inner, () => this.streams.delete(stream));
+    this.streams.add(stream);
+    return stream;
   }
 
   /**
@@ -693,10 +726,29 @@ export class BrowserNode {
     });
   }
 
-  /** Close the node, its streams and its event surface. */
+  /**
+   * Close the node, its streams and its event surface.
+   *
+   * **Every stream this node handed out is ended first**, and that
+   * is a behaviour change: an iterator parked in `for await`
+   * completes here rather than hanging forever on a node that will
+   * never emit again, and `onMessage` listeners are dropped. It is
+   * the disposition the leader-proxied surface already gave its
+   * streams on a generation change (`MeshSession.endStreams`), so
+   * the two surfaces now dispose of a stream the same way; the
+   * direct one was the outlier.
+   *
+   * The order is load-bearing: the streams go before
+   * `inner.close()`, because a wasm `LeafStream.close` retires its
+   * handle *through the node* and a node already closed would
+   * report that as a failed close instead of performing it.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    const open = [...this.streams];
+    this.streams.clear();
+    for (const stream of open) stream.close();
     this.hub.close();
     this.inner.close();
   }

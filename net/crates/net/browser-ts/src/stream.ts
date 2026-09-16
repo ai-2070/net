@@ -93,8 +93,18 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
    * `MeshSession.openStream` (a proxied one, whose `send` is a
    * promise because another tab puts the packet on the wire). A page
    * writes `await stream.send(bytes)` either way.
+   *
+   * `onClosed` tells the owner it may forget this stream — the same
+   * shape {@link AsyncQueue} uses for a departing consumer. A node
+   * has to retain the streams it handed out to end them on its own
+   * close, and `BrowserNode` passes this so a page that opens and
+   * closes a stream per frame does not grow that set for the node's
+   * lifetime.
    */
-  constructor(private readonly inner: LeafWasmStreamLike) {
+  constructor(
+    private readonly inner: LeafWasmStreamLike,
+    private readonly onClosed?: () => void,
+  ) {
     this.wireId = wireId(inner);
     inner.on_message((event) => this.receive(event));
   }
@@ -149,6 +159,9 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     for (const queue of [...this.queues]) queue.end();
     this.queues.clear();
     this.listeners.clear();
+    // Before the boundary call, so an owner's bookkeeping is correct
+    // even if a host-supplied wrapper's `close` throws.
+    this.onClosed?.();
     this.inner.close();
   }
 
