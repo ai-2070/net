@@ -262,6 +262,16 @@ pub struct RtcTestHooks {
     /// **timeout** arm of [`RtcDriverHandle::shutdown_and_join`]
     /// against a task that will not cooperate (H1).
     stall_loop: AtomicBool,
+    /// Wedge the driver loop in a **synchronous** sleep, in
+    /// milliseconds. `0` disables it.
+    ///
+    /// Distinct from [`Self::stall_loop`], and the distinction is
+    /// the whole point: that one parks the loop at an `await`, where
+    /// `abort()` lands. This one blocks the worker thread, where it
+    /// does not — which is what a task in a blocking syscall looks
+    /// like, and the case that turned a bounded shutdown into an
+    /// unbounded one.
+    block_loop_ms: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(test, feature = "fixtures"))]
@@ -371,6 +381,17 @@ impl RtcTestHooks {
 
     fn loop_stalled(&self) -> bool {
         self.stall_loop.load(Ordering::Acquire)
+    }
+
+    /// Wedge the driver loop in a synchronous sleep of `ms`, where
+    /// `abort()` cannot reach it. `0` disables.
+    pub fn set_block_loop_ms(&self, ms: u64) {
+        self.block_loop_ms.store(ms, Ordering::Release);
+    }
+
+    fn loop_blocked_for(&self) -> Option<Duration> {
+        let ms = self.block_loop_ms.load(Ordering::Acquire);
+        (ms > 0).then(|| Duration::from_millis(ms))
     }
 
     fn pump_paused(&self) -> bool {
@@ -838,10 +859,22 @@ impl TaskRelease {
                 {
                     tracing::debug!(task = self.what, "rtc task did not exit in time; aborting");
                     handle.abort();
-                    // The join the abort is not: without this the
-                    // method returned while cancellation — and the
-                    // socket's release — was still pending.
-                    let _ = handle.await;
+                    // The join the abort is not: without waiting
+                    // here the method returned while cancellation —
+                    // and the socket's release — was still pending.
+                    //
+                    // **Bounded, because `abort()` is cooperative.**
+                    // It takes effect at an await point, so a task
+                    // wedged in a SYNCHRONOUS call — a blocking
+                    // syscall, a `std::sync` wait, a test's blocking
+                    // hook — never reaches one and the cancellation
+                    // never lands. An unbounded wait here therefore
+                    // did not protect the release; it converted "a
+                    // task that cannot be cancelled" into "shutdown
+                    // never returns", in production as well as under
+                    // test. The wait is what the release record is
+                    // for; when it cannot be had, saying so is
+                    // strictly better than hanging the caller.
                 }
             }
             // Joined: the task is gone, so drop the handle rather
@@ -1098,6 +1131,13 @@ async fn driver_loop(
         #[cfg(any(test, feature = "fixtures"))]
         if hooks.loop_stalled() {
             tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        // The same support for the case `abort()` cannot reach: a
+        // worker thread blocked outside the async machinery, which
+        // is what a task in a blocking syscall is.
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(blocked) = hooks.loop_blocked_for() {
+            std::thread::sleep(blocked);
         }
         // --- 1. signalling: each is one mutation plus a full drain ---
         //

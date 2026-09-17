@@ -717,3 +717,68 @@ async fn the_rtc_drivers_own_release_is_observable_by_a_late_joiner() {
     .await
     .expect("concurrent late joiners must all finish");
 }
+
+/// **S6-08, the escalation.** A task that CANNOT be aborted must not
+/// prevent a joining shutdown from returning.
+///
+/// This is the defect CI found at the repaired head, and it is not
+/// only a test problem: `abort()` is cooperative — it lands at an
+/// await point — so a driver wedged in a blocking syscall never
+/// reaches one and the cancellation never takes effect. The join's
+/// post-abort wait was unbounded, which turned "a task that cannot
+/// be cancelled" into "shutdown never returns", for an operator as
+/// much as for a witness.
+///
+/// Bounding it narrows the promise, deliberately and loudly: the
+/// release record is published only when the task is genuinely
+/// gone, so a caller that returns from a stuck join has been told
+/// through `tracing::error!` that the socket is STILL BOUND rather
+/// than being told nothing. What must not happen is the caller
+/// never returning at all.
+///
+/// `set_block_loop_ms` blocks the worker thread rather than parking
+/// it at an `await`; the existing `set_stall_loop` parks, where
+/// abort DOES land, which is why that witness passes either way and
+/// this one is a different row.
+///
+/// Inverse: restore `let _ = handle.await;` (unbounded) after
+/// `handle.abort()` in `TaskRelease::join` — this test hangs until
+/// its own outer timeout and the `expect` fails, which is exactly
+/// what CI observed as `TERMINATING [>180.000s]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_driver_that_cannot_be_aborted_does_not_hang_the_join() {
+    let driven = spawn(RtcConfig::new().with_bind_addr(loopback_ephemeral()))
+        .await
+        .expect("spawn");
+    // Long enough that the join's two bounded waits (2 s each) both
+    // elapse well inside it, so the escalation arm is what returns.
+    driven.handle.hooks().set_block_loop_ms(12_000);
+    // Let the loop reach the block: until it does, this is an
+    // ordinary cooperative driver and the row proves nothing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(8), driven.handle.shutdown_and_join())
+        .await
+        .expect(
+            "a joining shutdown must return even when the task cannot be \
+             cancelled — an uncancellable task is a diagnostic, not a hang",
+        );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(8),
+        "the join returned only because the outer bound fired: {waited:?}"
+    );
+
+    // And it is not silent about it. The release is NOT recorded —
+    // the port really is still bound — so a second join must also
+    // return bounded rather than parking on a record that will
+    // never arrive.
+    tokio::time::timeout(Duration::from_secs(8), driven.handle.shutdown_and_join())
+        .await
+        .expect("a second join must also return, not wait for a release that is pending");
+
+    // Release the wedge so the runtime's own teardown is not the
+    // thing this test measures.
+    driven.handle.hooks().set_block_loop_ms(0);
+}

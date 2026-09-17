@@ -113,6 +113,17 @@ const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 /// receiver NACK.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
 
+/// How long [`MeshNode::shutdown`] waits for one background task,
+/// first for it to finish and then again for a cancellation to land.
+///
+/// Two seconds because the drain is sequential and a node can hold
+/// several tasks: long enough that an ordinary busy task is joined
+/// rather than aborted, short enough that a wedged one cannot turn
+/// shutdown into a hang. It matches the RTC driver's own
+/// `TASK_JOIN_TIMEOUT`, which bounds the same obligation one layer
+/// down.
+const SHUTDOWN_TASK_JOIN: Duration = Duration::from_secs(2);
+
 /// Max fixed-size control events packed into one batched control
 /// packet, per message type (STREAM_ACK_BATCHING B-2/B-3):
 /// `floor(MAX_PAYLOAD_SIZE / (event-frame length prefix + payload))`.
@@ -47576,9 +47587,40 @@ impl Adapter for MeshNode {
 
         // Wait for background tasks. Taken under the synchronous lock in its own
         // scope so the guard is released before the first await.
+        //
+        // BOUNDED, and the bound is the point. This drain used to be
+        // a bare `handle.await` per task with no abort and no
+        // deadline, so one task that never yields — wedged in a
+        // synchronous block, or simply starved on a loaded machine —
+        // hung `shutdown()` forever, and a caller could not tell that
+        // from a slow drain. The cancellation is cooperative, so the
+        // abort is a request rather than a guarantee: that is exactly
+        // why the wait AFTER it is bounded too, instead of trading an
+        // unbounded join for an unbounded await on the same handle.
+        //
+        // Escalation is loud. A task still running here is not a
+        // tidy-up detail — it holds whatever it was holding while the
+        // node it belongs to is being torn down — so it is named at
+        // `warn`, not swallowed.
         let tasks = { std::mem::take(&mut *self.tasks.lock()) };
-        for handle in tasks {
-            let _ = handle.await;
+        for mut handle in tasks {
+            if tokio::time::timeout(SHUTDOWN_TASK_JOIN, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                if tokio::time::timeout(SHUTDOWN_TASK_JOIN, &mut handle)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        node = format!("{:#x}", self.node_id()),
+                        "shutdown: a background task did not exit and could not be \
+                         cancelled; it is wedged in a non-cancellable section and \
+                         shutdown is proceeding without it"
+                    );
+                }
+            }
         }
 
         // **NR3: shutdown owns the mesh's reassembly.** The map

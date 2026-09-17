@@ -4792,7 +4792,7 @@ jobs:
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
             --floor natsim_browser=38 \
-            --floor rtc_stun_endpoint=13 \
+            --floor rtc_stun_endpoint=14 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
