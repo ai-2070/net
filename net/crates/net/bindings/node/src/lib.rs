@@ -2049,18 +2049,19 @@ mod mesh_bindings {
         /// class-based re-throw layer.
         ///
         /// **Oversize events** reject with a plain `Error` whose
-        /// message names BOTH numbers — the offending event's size
-        /// and the per-event limit in bytes (`MAX_PAYLOAD_SIZE` minus
-        /// the event frame's 4-byte length prefix; 8 104 on the
-        /// current wire format). Deliberately NOT given a sniffable
-        /// prefix: those route to `BackpressureError` /
-        /// `NotConnectedError`, i.e. to a retry or a reconnect, and
-        /// neither is a sane response to a payload that no receive
-        /// path will ever accept. The message carries the limit
-        /// because it is the only place a JS caller can read it — a
-        /// caller that cannot see the bound can only discover it by
-        /// being refused. Nothing in the batch is sent; the check
-        /// runs before the peer is resolved.
+        /// message names BOTH numbers — the refused event's size and
+        /// the limit that applied to it, which is 8 104
+        /// (`MAX_PAYLOAD_SIZE` minus the event frame's 4-byte length
+        /// prefix) for a peer that does not reassemble fragments and
+        /// the eight-packet fragmentation ceiling for one that does.
+        /// Deliberately NOT given a sniffable prefix: those route to
+        /// `BackpressureError` / `NotConnectedError`, i.e. to a retry
+        /// or a reconnect, and neither is a sane response to a
+        /// payload that no receive path will ever accept. The message
+        /// carries the limit because it is the only place a JS caller
+        /// can read it — a caller that cannot see the bound can only
+        /// discover it by being refused. Nothing in the batch is
+        /// sent; the check runs before the peer is resolved.
         #[napi]
         pub async fn send_on_stream(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
             let guard = self.load_node()?;

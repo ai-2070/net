@@ -811,17 +811,18 @@ class NetMesh:
         `BackpressureError` if the window is full, `NotConnectedError`
         if the peer session is gone.
 
-        Raises `ValueError` when any ONE event is larger than a single
-        Net packet can carry. The message names both numbers — the
-        offending event's size and the per-event limit in bytes
-        (`MAX_PAYLOAD_SIZE` minus the event frame's 4-byte length
-        prefix, 8104 on the current wire format) — because a caller
-        that cannot see the limit has no way to discover its send
-        bound except by being refused. Nothing in the batch is sent:
-        the check runs before the peer is even resolved. It is not a
-        transport fault and retrying cannot help, so `ValueError`
-        rather than `RuntimeError`; split the payload, or carry it on
-        a producer that fragments."""
+        Raises `ValueError` when any ONE event is larger than the
+        stream can carry to its peer. The message names both numbers
+        — the refused event's size and the limit that applied, which
+        is 8104 (`MAX_PAYLOAD_SIZE` minus the event frame's 4-byte
+        length prefix) for a peer that does not reassemble fragments
+        and the eight-packet fragmentation ceiling for one that does
+        — because a caller that cannot see the limit has no way to
+        discover its send bound except by being refused. Nothing in
+        the batch is sent: the check runs before the peer is even
+        resolved. It is not a transport fault and retrying cannot
+        help, so `ValueError` rather than `RuntimeError`; split the
+        payload, or carry it on a producer that fragments."""
         ...
     def send_with_retry(
         self,

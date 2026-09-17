@@ -369,6 +369,55 @@ fn stream_err_to_code(err: &StreamError) -> c_int {
     }
 }
 
+/// Map a send failure to its code **and** hand the caller the two
+/// numbers a [`StreamError::EventTooLarge`] carried.
+///
+/// The pair is the core's own attribution, copied out verbatim:
+/// `size` is the length of the event `send_on_stream` refused —
+/// which is not necessarily the first element of the batch above
+/// [`MAX_EVENT_SIZE`] — and `limit` is the bound that actually
+/// applied to *this* peer, which is `MAX_EVENT_SIZE` (8 104) for a
+/// peer that does not reassemble fragments and
+/// `protocol::MAX_FRAGMENTED_EVENT_SIZE` (64 832) for one that
+/// does.
+///
+/// Before this, the refusal crossed as a bare `c_int` and every
+/// binding had to guess both numbers back. Go guessed with the
+/// single-packet accessor plus a first-match scan of the caller's
+/// own array, which is wrong in exactly the two cases the core
+/// already distinguishes: a fragmenting peer's refusal reported
+/// 8 104 instead of the ceiling that applied, and a mixed batch
+/// refused for its SECOND event was attributed to its first. A
+/// reconstruction cannot know either fact; only the error does.
+///
+/// # Contract
+///
+/// The out-params are written **if and only if** the return value
+/// is `NET_ERR_MESH_EVENT_TOO_LARGE`. On every other outcome —
+/// success included — they are left untouched, so a caller must
+/// not read them without checking the code first. Either may be
+/// null, which means "do not report that half".
+///
+/// # Safety
+///
+/// `out_size` and `out_limit` must each be null or point to a
+/// writable `usize`.
+unsafe fn stream_err_to_code_attributed(
+    err: &StreamError,
+    out_size: *mut usize,
+    out_limit: *mut usize,
+) -> c_int {
+    if let StreamError::EventTooLarge { size, limit } = err {
+        if !out_size.is_null() {
+            unsafe { *out_size = *size };
+        }
+        if !out_limit.is_null() {
+            unsafe { *out_limit = *limit };
+        }
+    }
+    stream_err_to_code(err)
+}
+
 // =========================================================================
 // MeshNode
 // =========================================================================
@@ -1807,6 +1856,15 @@ fn handles_match(sh: &MeshStreamHandle, nh: &MeshNodeHandle) -> bool {
     Arc::ptr_eq(&sh._node, &nh.inner)
 }
 
+/// Send a batch of events on an open stream.
+///
+/// `out_size` / `out_limit` report the two numbers a
+/// `NET_ERR_MESH_EVENT_TOO_LARGE` refusal carried: the length of
+/// the event that was refused, and the limit that applied to this
+/// peer. **Written only when that code is returned**; either may
+/// be null. See `stream_err_to_code_attributed` for why the
+/// caller cannot derive them from `lens` and
+/// `net_mesh_max_event_size()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_send(
     handle: *mut MeshStreamHandle,
@@ -1814,6 +1872,8 @@ pub unsafe extern "C" fn net_mesh_send(
     lens: *const usize,
     count: usize,
     node_handle: *mut MeshNodeHandle,
+    out_size: *mut usize,
+    out_limit: *mut usize,
 ) -> c_int {
     if handle.is_null() || node_handle.is_null() {
         return NetError::NullPointer.into();
@@ -1844,10 +1904,15 @@ pub unsafe extern "C" fn net_mesh_send(
     let stream = sh.stream.clone();
     match block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
         Ok(()) => 0,
-        Err(e) => stream_err_to_code(&e),
+        Err(e) => unsafe { stream_err_to_code_attributed(&e, out_size, out_limit) },
     }
 }
 
+/// [`net_mesh_send`] with backpressure retries. `out_size` /
+/// `out_limit` carry the same refusal attribution, under the same
+/// write-only-on-`NET_ERR_MESH_EVENT_TOO_LARGE` contract — a
+/// refusal is not retried, so what they report is the one refusal
+/// that ended the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_send_with_retry(
     handle: *mut MeshStreamHandle,
@@ -1856,6 +1921,8 @@ pub unsafe extern "C" fn net_mesh_send_with_retry(
     count: usize,
     max_retries: u32,
     node_handle: *mut MeshNodeHandle,
+    out_size: *mut usize,
+    out_limit: *mut usize,
 ) -> c_int {
     if handle.is_null() || node_handle.is_null() {
         return NetError::NullPointer.into();
@@ -1889,10 +1956,13 @@ pub unsafe extern "C" fn net_mesh_send_with_retry(
             .await
     }) {
         Ok(()) => 0,
-        Err(e) => stream_err_to_code(&e),
+        Err(e) => unsafe { stream_err_to_code_attributed(&e, out_size, out_limit) },
     }
 }
 
+/// [`net_mesh_send`] blocking until the window opens. `out_size` /
+/// `out_limit` carry the same refusal attribution under the same
+/// contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_send_blocking(
     handle: *mut MeshStreamHandle,
@@ -1900,6 +1970,8 @@ pub unsafe extern "C" fn net_mesh_send_blocking(
     lens: *const usize,
     count: usize,
     node_handle: *mut MeshNodeHandle,
+    out_size: *mut usize,
+    out_limit: *mut usize,
 ) -> c_int {
     if handle.is_null() || node_handle.is_null() {
         return NetError::NullPointer.into();
@@ -1930,22 +2002,22 @@ pub unsafe extern "C" fn net_mesh_send_blocking(
     let stream = sh.stream.clone();
     match block_on(async move { node.send_blocking(&stream, &payloads).await }) {
         Ok(()) => 0,
-        Err(e) => stream_err_to_code(&e),
+        Err(e) => unsafe { stream_err_to_code_attributed(&e, out_size, out_limit) },
     }
 }
 
-/// The largest single event any native send path will carry, in
-/// bytes — the `limit` half of every
-/// `NET_ERR_MESH_EVENT_TOO_LARGE` refusal.
+/// The largest single event one packet can carry, in bytes.
 ///
-/// The refusal itself is a `c_int`, so `StreamError::EventTooLarge
-/// { size, limit }` loses both fields crossing the ABI. `size` is
-/// not lost in any meaningful sense — it is an element of the
-/// caller's own `lens` array — but `limit` is a build constant of
-/// the linked cdylib (`MAX_PAYLOAD_SIZE` minus the event frame's
-/// 4-byte length prefix), and a caller that cannot read it has no
-/// way to discover its send bound except by being refused. This is
-/// that read.
+/// This is the bound a peer that does **not** reassemble fragments
+/// is held to — every UDP peer, and every RTC peer that has not
+/// advertised fragment reassembly — so it is the `limit` most
+/// `NET_ERR_MESH_EVENT_TOO_LARGE` refusals name. It is **not**
+/// every refusal's limit: a peer that does reassemble is held to
+/// the fragmentation ceiling
+/// (`protocol::MAX_FRAGMENTED_EVENT_SIZE`, eight packets' worth)
+/// instead. Read the limit that applied from the send call's
+/// `out_limit`; this accessor is for sizing a payload *before*
+/// sending, when there is no refusal to read.
 ///
 /// Does **not** admit or refuse anything: it is a pure accessor on
 /// a constant, needs no node and no stream, and never returns 0.
@@ -1955,6 +2027,73 @@ pub unsafe extern "C" fn net_mesh_send_blocking(
 #[unsafe(no_mangle)]
 pub extern "C" fn net_mesh_max_event_size() -> usize {
     MAX_EVENT_SIZE
+}
+
+/// Unstable fixtures-only test bridge; not supported core API.
+///
+/// Drives the refusal-attribution seam every send entry point
+/// shares with a known attribution, so a language binding can
+/// prove it *reports* the pair the core produced instead of
+/// reconstructing one.
+///
+/// **This is not a send.** It opens nothing, resolves no peer and
+/// puts no byte on any wire. It collects `payloads` through the
+/// same `collect_payloads` the send entry points use, builds the
+/// same [`StreamError::EventTooLarge`] the core builds — `size` is
+/// the length of `payloads[attributed_index]`, `limit` is the
+/// supplied `limit` — and returns it through
+/// `stream_err_to_code_attributed`, the one writer all three
+/// send entry points return through.
+///
+/// **Why it has to exist.** The 64 832-byte fragmentation ceiling
+/// is only reachable when the resolved peer address is RTC, and
+/// this cdylib is built without the `webrtc` feature, so no send
+/// through it can produce that attribution live — nor the
+/// second-element attribution that goes with it, since without the
+/// ceiling every batch is refused at its first element above
+/// `MAX_EVENT_SIZE`. Those live attributions are covered on the
+/// Rust side (`tests/rtc_repairs.rs`); this seam covers the C →
+/// binding half of the same two pairs for a library that cannot
+/// reach them. Gated on `fixtures`, so no production build
+/// exports it.
+///
+/// Returns `NET_ERR_MESH_EVENT_TOO_LARGE`,
+/// `NetError::NullPointer` for a null/undersized array, or
+/// `NetError::InvalidArgument` when `attributed_index` names no
+/// element.
+///
+/// # Safety
+///
+/// `payloads` / `lens` must describe `count` valid slices, and the
+/// out-params must each be null or point to a writable `usize` —
+/// the same contract as [`net_mesh_send`].
+#[cfg(feature = "fixtures")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_test_send_refusal_attribution(
+    payloads: *const *const u8,
+    lens: *const usize,
+    count: usize,
+    attributed_index: usize,
+    limit: usize,
+    out_size: *mut usize,
+    out_limit: *mut usize,
+) -> c_int {
+    if count == 0 || payloads.is_null() || lens.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
+        Some(v) => v,
+        None => return NetError::NullPointer.into(),
+    };
+    let Some(attributed) = payloads.get(attributed_index) else {
+        return NetError::InvalidArgument.into();
+    };
+    let err = StreamError::EventTooLarge {
+        size: attributed.len(),
+        limit,
+    };
+    unsafe { stream_err_to_code_attributed(&err, out_size, out_limit) }
 }
 
 #[derive(Serialize)]
