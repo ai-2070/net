@@ -1088,6 +1088,13 @@ export function getDocIndex(): DocIndex {
 // check is too — two entries differing only in casing would make which spellings
 // exist depend on array order. Run from `generateStaticParams` so a rename that
 // orphans a keyword fails the build instead of rendering a dead link.
+//
+// It also witnesses the documented slug form against the real index: `_` and `-`
+// are interchangeable WITHIN a segment, so an underscored spelling of a real
+// slug must reach the same page. A regex is not proof and the contract is easy
+// to "simplify" into splitting on `_` (which would break every underscore-named
+// page, e.g. `RELEASE_v0.36_PARANOID.md`); this is the cheap guard against that,
+// and it needs no test harness because the tree is already in hand.
 export function assertKeywordLinksResolve(): void {
   const index = getDocIndex();
   const problems: string[] = [];
@@ -1103,6 +1110,19 @@ export function assertKeywordLinksResolve(): void {
       problems.push(`"${term}" → "${slug}" matches no docs page`);
     }
   }
+
+  const hyphenated = [...index.bySlug.values()].find((p) => p.slug.includes("-"));
+  if (hyphenated) {
+    const underscored = hyphenated.slug.replace(/-/g, "_");
+    const alt = resolveDocLink(index, underscored);
+    if (alt?.page.url !== hyphenated.url) {
+      problems.push(
+        `"${underscored}" does not reach ${hyphenated.url} — ` +
+          `"_" must be interchangeable with "-" within a segment`,
+      );
+    }
+  }
+
   if (problems.length > 0) {
     throw new Error(
       `keyword links cannot resolve:\n  ${problems.join("\n  ")}`,

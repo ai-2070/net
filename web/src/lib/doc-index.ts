@@ -30,9 +30,16 @@ export type DocIndex = {
 
 export type DocLink = { href: string; page: DocPage };
 
-/** Lowercase and normalize `_`/`-` the same way `lib/docs.ts` builds slugs, so
- *  a map authored as `concepts/capabilities` or `concepts_capabilities` names
- *  the same page. */
+/** Lowercase and normalize `_`/`-` the same way `lib/docs.ts` builds slugs.
+ *
+ *  The two separators are interchangeable WITHIN a segment — `release_v0.36_paranoid`
+ *  names the page served at `release-v0.36-paranoid` — and `/` is the only path
+ *  separator. So `concepts/capabilities` and `docs/concepts/capabilities` both
+ *  resolve, while `concepts_capabilities` is a single segment named
+ *  `concepts-capabilities`, which is not how any page is built (underscores in
+ *  filenames are intra-name, e.g. `RELEASE_v0.36_PARANOID.md`). An unsupported
+ *  form never silently matches: `assertKeywordLinksResolve` fails the build
+ *  because no page carries that slug. */
 export function normalizeDocSlug(raw: string): string {
   return raw
     .trim()
