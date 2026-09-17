@@ -4411,7 +4411,7 @@ pub(crate) fn parse_peer_id(raw: &str) -> Result<u64, JsError> {
 /// the same shape — needs to be told which of the two was wrong, and
 /// "is not a peer id" for a dialog argument is the kind of error text
 /// that costs an afternoon.
-fn parse_dialog_id(raw: &str) -> Result<u64, JsError> {
+pub(crate) fn parse_dialog_id(raw: &str) -> Result<u64, JsError> {
     let trimmed = raw.trim();
     let hex = trimmed
         .strip_prefix("0x")

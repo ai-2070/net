@@ -496,6 +496,49 @@ pub enum LeaderRequest {
         /// The SDP, candidate line or reason.
         payload: Bytes,
     },
+    /// Mint an offer and start an attempt with `peer` (§9 step 3).
+    ///
+    /// No dialog: this is the call that *creates* one, and the
+    /// answer carries it. Every later step in the attempt names it.
+    PeerOffer {
+        /// The peer to offer to.
+        peer: u64,
+    },
+    /// Answer the offer `peer` already filed.
+    ///
+    /// Also dialogless on the way in — the dialog is read off the
+    /// signed envelope the offerer minted, not chosen here.
+    PeerAcceptOffer {
+        /// The peer whose offer is being answered.
+        peer: u64,
+    },
+    /// Service one polling step of an attempt: harvest and apply
+    /// candidates, and report the reading.
+    ///
+    /// **Names its dialog**, and that is the ownership rule rather
+    /// than a convenience. A proxied request is served after
+    /// crossing a channel, so the attempt it was issued for may have
+    /// been superseded; the leader refuses a dialog that is not the
+    /// live one *before* servicing anything, so a stale request
+    /// cannot drive its own replacement.
+    PeerCandidate {
+        /// The peer.
+        peer: u64,
+        /// The attempt this request belongs to.
+        dialog: u64,
+    },
+    /// Run the Noise handshake for an attempt whose channel is open.
+    ///
+    /// Names its dialog for the same reason, and it matters most
+    /// here: the Noise wait is the longest await on the surface, and
+    /// the session it installs must belong to the attempt that
+    /// negotiated the channel.
+    PeerHandshake {
+        /// The peer.
+        peer: u64,
+        /// The attempt this request belongs to.
+        dialog: u64,
+    },
     /// Run the enrollment exchange, if this node is not enrolled.
     ///
     /// Proxied rather than leader-only: one node per origin means one
@@ -1953,6 +1996,24 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("signal_kind".into(), Value::from(kind.clone()));
             map.insert("payload".into(), b64(payload));
         }
+        LeaderRequest::PeerOffer { peer } => {
+            map.insert("op".into(), Value::from("peer_offer"));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+        }
+        LeaderRequest::PeerAcceptOffer { peer } => {
+            map.insert("op".into(), Value::from("peer_accept_offer"));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+        }
+        LeaderRequest::PeerCandidate { peer, dialog } => {
+            map.insert("op".into(), Value::from("peer_candidate"));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+            map.insert("dialog".into(), Value::from(dialog.to_string()));
+        }
+        LeaderRequest::PeerHandshake { peer, dialog } => {
+            map.insert("op".into(), Value::from("peer_handshake"));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+            map.insert("dialog".into(), Value::from(dialog.to_string()));
+        }
         LeaderRequest::Counters => {
             map.insert("op".into(), Value::from("counters"));
         }
@@ -2032,6 +2093,20 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
             dialog: u64_field(value, "dialog")?,
             kind: str_field(value, "signal_kind")?.to_string(),
             payload: unb64(value, "payload")?,
+        },
+        "peer_offer" => LeaderRequest::PeerOffer {
+            peer: u64_field(value, "peer")?,
+        },
+        "peer_accept_offer" => LeaderRequest::PeerAcceptOffer {
+            peer: u64_field(value, "peer")?,
+        },
+        "peer_candidate" => LeaderRequest::PeerCandidate {
+            peer: u64_field(value, "peer")?,
+            dialog: u64_field(value, "dialog")?,
+        },
+        "peer_handshake" => LeaderRequest::PeerHandshake {
+            peer: u64_field(value, "peer")?,
+            dialog: u64_field(value, "dialog")?,
         },
         "counters" => LeaderRequest::Counters,
         "enroll" => LeaderRequest::Enroll,
@@ -2690,6 +2765,31 @@ mod tests {
                     dialog: 7,
                     kind: "offer".into(),
                     payload: Bytes::from_static(b"v=0"),
+                },
+            },
+            ProxyBody::Request {
+                correlation: 23,
+                request: LeaderRequest::PeerOffer { peer: 0xAB },
+            },
+            ProxyBody::Request {
+                correlation: 24,
+                request: LeaderRequest::PeerAcceptOffer { peer: 0xAC },
+            },
+            ProxyBody::Request {
+                correlation: 25,
+                // The dialog has to survive the round trip: a proxied
+                // poll that lost it would be applied to whichever
+                // attempt is live when the leader got to it.
+                request: LeaderRequest::PeerCandidate {
+                    peer: 0xAD,
+                    dialog: 0x5109,
+                },
+            },
+            ProxyBody::Request {
+                correlation: 26,
+                request: LeaderRequest::PeerHandshake {
+                    peer: 0xAE,
+                    dialog: 0x510A,
                 },
             },
             ProxyBody::Request {

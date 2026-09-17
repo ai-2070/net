@@ -1966,6 +1966,45 @@ impl LeaderBackend for NodeBackend {
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
+            LeaderRequest::PeerOffer { peer } => spawn_fenced(&lease, &ops, async move {
+                match node.peer_offer(format!("{peer:016x}")).await {
+                    Ok(json) => reply.text(json),
+                    Err(error) => reply.fail(reported(error)),
+                }
+            }),
+            LeaderRequest::PeerAcceptOffer { peer } => spawn_fenced(&lease, &ops, async move {
+                match node.peer_accept_offer(format!("{peer:016x}")).await {
+                    Ok(json) => reply.text(json),
+                    Err(error) => reply.fail(reported(error)),
+                }
+            }),
+            LeaderRequest::PeerCandidate { peer, dialog } => {
+                spawn_fenced(&lease, &ops, async move {
+                    // The dialog-NAMED form. `peer_candidate` would
+                    // resolve whichever attempt happens to be live
+                    // when this resumes, which for a request that
+                    // crossed a channel is how a stale poll drives
+                    // its own replacement.
+                    match node
+                        .peer_candidate_in(format!("{peer:016x}"), format!("{dialog:016x}"))
+                        .await
+                    {
+                        Ok(json) => reply.text(json),
+                        Err(error) => reply.fail(reported(error)),
+                    }
+                })
+            }
+            LeaderRequest::PeerHandshake { peer, dialog } => {
+                spawn_fenced(&lease, &ops, async move {
+                    match node
+                        .peer_handshake_in(format!("{peer:016x}"), format!("{dialog:016x}"))
+                        .await
+                    {
+                        Ok(dialog_hex) => reply.text(dialog_hex),
+                        Err(error) => reply.fail(reported(error)),
+                    }
+                })
+            }
             LeaderRequest::StreamOpen {
                 label,
                 reliability,
@@ -2211,6 +2250,87 @@ impl MeshSession {
     pub async fn announce(&self, capabilities: Vec<String>) -> Result<(), JsError> {
         self.lifecycle.announce(capabilities).await?;
         Ok(())
+    }
+
+    /// Mint an offer and start an attempt with `peer_hex` (§9).
+    ///
+    /// The four peer methods below are the primitives a **shared**
+    /// TypeScript driver calls. The drive loop and its classification
+    /// live once, in the package, and are used by `BrowserNode` and
+    /// by this session alike — a second implementation of that loop
+    /// here would be two spellings of one contract.
+    pub async fn peer_offer(&self, peer_hex: String) -> Result<String, JsError> {
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        match self
+            .lifecycle
+            .request(LeaderRequest::PeerOffer { peer })
+            .await?
+        {
+            ProxyValue::Text(json) => Ok(json),
+            other => Err(JsError::new(&format!(
+                "an offer answered with {other:?}, which is not a reading"
+            ))),
+        }
+    }
+
+    /// Answer the offer `peer_hex` filed.
+    pub async fn peer_accept_offer(&self, peer_hex: String) -> Result<String, JsError> {
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        match self
+            .lifecycle
+            .request(LeaderRequest::PeerAcceptOffer { peer })
+            .await?
+        {
+            ProxyValue::Text(json) => Ok(json),
+            other => Err(JsError::new(&format!(
+                "an answer answered with {other:?}, which is not a reading"
+            ))),
+        }
+    }
+
+    /// Service one polling step of the attempt `dialog_hex`.
+    ///
+    /// The dialog is required, not optional. A proxied poll that
+    /// named only the peer would be applied to whatever attempt is
+    /// live when the leader gets to it, which is how a superseded
+    /// request drives its replacement.
+    pub async fn peer_candidate(
+        &self,
+        peer_hex: String,
+        dialog_hex: String,
+    ) -> Result<String, JsError> {
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        let dialog = crate::wasm::parse_dialog_id(&dialog_hex)?;
+        match self
+            .lifecycle
+            .request(LeaderRequest::PeerCandidate { peer, dialog })
+            .await?
+        {
+            ProxyValue::Text(json) => Ok(json),
+            other => Err(JsError::new(&format!(
+                "a candidate step answered with {other:?}, which is not a reading"
+            ))),
+        }
+    }
+
+    /// Run the Noise handshake for the attempt `dialog_hex`.
+    pub async fn peer_handshake(
+        &self,
+        peer_hex: String,
+        dialog_hex: String,
+    ) -> Result<String, JsError> {
+        let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        let dialog = crate::wasm::parse_dialog_id(&dialog_hex)?;
+        match self
+            .lifecycle
+            .request(LeaderRequest::PeerHandshake { peer, dialog })
+            .await?
+        {
+            ProxyValue::Text(dialog_hex) => Ok(dialog_hex),
+            other => Err(JsError::new(&format!(
+                "a handshake answered with {other:?}, which is not a dialog"
+            ))),
+        }
     }
 
     /// Find the nodes offering a capability.
