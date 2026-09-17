@@ -2827,9 +2827,14 @@ probes by the record-keeper is pending and nothing has been forwarded.
 **Product-owner scope, 2026-09-17; replaces the former surface-completion
 stage.** Only the browser package and this store are deliverables. The old
 `spikes/S7_BRIEF.md` is superseded, not an implementation contract for this
-stage. Freeze the bounded store API, ownership rule and executable witnesses
-in a revised brief before implementation; no prior exact store API is claimed
-to have been agreed or implemented by this document.
+stage. The proposed developer-facing API and ownership rules are specified in
+[Browser game store — developer experience and API design](BROWSER_GAME_STORE_API_DESIGN.md).
+It defines `defineStore`, `hostStore` and `joinStore`, with synchronous local
+reads, selector subscriptions, owner-only `setState`, acknowledged `actions`
+and coalesced latest-value `inputs`. The functions are design deliverables,
+not existing package exports. Carry this contract and its executable witnesses
+into a revised brief before implementation; it is not a previously agreed API
+recovered from history.
 
 ### Store contract
 
@@ -2858,6 +2863,10 @@ to have been agreed or implemented by this document.
   blindly retry an action whose outcome is unknown. These are application
   semantics above the existing transport, not a change to the DataChannel
   configuration in §3.
+  The initial store API coalesces latest-value inputs on the caller-to-owner
+  path; owner-to-replica deltas remain reliable and bounded, resynchronizing
+  slow readers rather than dropping dependent patches. Separate unreliable
+  replica-state replication is deferred pending measurement.
 - **Lifecycle:** expose connecting/ready/disconnected/failed state; reconnect
   obtains current state and resumes from a defined boundary. Unsubscribe and
   close retire network work, callbacks and local listeners. Local state access
