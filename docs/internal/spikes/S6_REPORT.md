@@ -1095,22 +1095,80 @@ ones returned. Leaf drop counters were zero across the board —
 including `establishment_unproven`, `no_session` and `unparsable`.
 
 **2. Can two permission-free leaves exchange application data over
-the ROUTED path?** **Not answered by that run, and the row could not
-have answered it.** On a row that solves direct the anchor's per-pair
-application counter is flat *by assertion* — that flatness is the
-direct row's own witness — so a direct row is structurally the one
-shape that cannot observe forwarding. What the run does show is that
-the anchor had already forwarded application-class packets for this
-pair before the nonce exchange began (`forwarded_pre_ab=2`,
-`forwarded_pre_ba=1`, a counter that excludes `0x0D02` signalling),
-which is consistent with the routed path working but is not a
-receiver-observed payload. So the gap is now instrumented rather than
-argued: `browser_symmetric_symmetric_nomedia` is the relayed row with
-the grant removed — the pair ICE cannot solve — carrying the same
-witness the granted relayed rows already use (both nonces observed by
-the receiver that did not mint them, and the anchor's per-pair
-counter moving in **both** directions). Until it runs, this answer is
-open and is reported as open.
+the ROUTED path?** **OPEN. Instrumented, not yet run.** Q1 makes this
+a real question rather than a formality: Net's routed path rides each
+leaf's authenticated anchor session, hop 1 is now demonstrated for a
+permission-free tab, and hop 2 is not.
+
+That run could not have answered it. On a row that solves direct the
+anchor's per-pair application counter is flat *by assertion* — that
+flatness is the direct row's own witness — so a direct row is
+structurally the one shape that cannot observe forwarding. **Direct
+success does not substitute for this.** What the run does show is
+that the anchor had already forwarded application-class packets for
+this pair before the nonce exchange began (`forwarded_pre_ab=2`,
+`forwarded_pre_ba=1`, on a counter that excludes `0x0D02`
+signalling) — consistent with the routed path working, but not a
+receiver-observed payload, so it is not an answer.
+
+`browser_symmetric_symmetric_nomedia` is the instrument: the relayed
+row with the grant removed, on the pair ICE cannot solve. It requires
+all three of:
+
+1. **receiver-observed nonces in BOTH directions** — the same
+   instrument as the direct row, no weaker. Each side must decode the
+   exact nonce the *other* side was given by the runner
+   (`seen_at_b == nonce_a`, `seen_at_a == nonce_b`), and each
+   direction must show a non-zero send and a non-zero receive.
+2. **increases in the APPLICATION-ONLY per-pair forwarding counters,
+   in both directions, as deltas** — `forwarded_delta()` subtracts
+   pre from post with a checked subtraction (a counter that went down
+   is an unusable reading, not a flat path), on
+   `forwarded_app_packets(src32, dest)`, which excludes `0x0D02`
+   signalling and therefore cannot move because a candidate was
+   trickled.
+3. **an accounted routed disposition, not a timeout plus a counter.**
+   This is the one that changed. `delta != 0` says the anchor
+   forwarded *something* for the pair while the exchange happened,
+   which one unrelated application packet satisfies — so it cannot
+   separate "the routed session carried these payloads" from "the
+   payloads arrived by some other route and the counter moved
+   anyway". `Forwarding::Carried` now requires the anchor to have
+   forwarded **at least as many application packets as the sender
+   itself reports handing to the transport, in each direction**
+   (`delta >= sent`; `>=` because the counter is packets and the
+   sender counts frames, so fragmentation can only make the anchor's
+   number larger). The send step is a bounded retry loop on a
+   `fireAndForget` stream, so `sent` is whatever actually went out
+   and the requirement scales with the exchange instead of collapsing
+   back to presence. Pinned by
+   `a_relayed_row_the_anchor_only_partly_carried_fails`, which is a
+   shape the previous check accepted.
+
+Beside that, and independently: both halves of the dialog must type
+the disposition themselves and agree (`connectPeer` on the offerer,
+`acceptPeer` on the answerer), `udpBlocked` is refused as a
+diagnosis the evidence does not support, the ledgers are exact
+(`attempted=2 direct=1 relayed=1 failed=0 udp_blocked=0`,
+`pending=0`), and **both gateways' conntrack must show no replied
+flow between the two public addresses** — which is what makes the row
+able to fail when the payloads arrived directly after all.
+
+**The instrument gap, stated rather than papered over.** The leaf's
+public surface exposes no per-peer route accessor: `openStream`,
+`counters`, `announce`, `query`, `connectPeer`, `acceptPeer`, and the
+`signal` event are the whole of it, and none of the leaf's counters
+is route-typed (`packets_out` increments identically whether a frame
+went to the peer or to the anchor). So "from the leaf's own view" is
+carried here by the typed outcome on both halves plus the exact
+ledger, and "the application path in use is the anchor's" is carried
+by the anchor's per-pair accounting plus both gateways' conntrack —
+three parties, none of them alone. A per-peer route accessor on the
+leaf (or the relayed `PeerConnectOutcome` carrying its live
+`dialog`/`peer` the way the direct one does) would let the row state
+it in one place from the endpoint itself. That is a `leaf/` change,
+it is not this slice's to make, and it is named here rather than
+implemented.
 
 **3. Can the same pair establish DIRECT connectivity? YES, with
 application delivery.** Measured, from the run's own verdict:
@@ -1156,8 +1214,14 @@ What the denial actually costs, all of it visible in that log:
 - priority and cost: type preference `1677729535` instead of
   `1686052607`, network cost `999` instead of `0`.
 
-None of those is the candidate class that decides a NAT'd pair. The
-srflx-versus-srflx pair is, and it is gathered and solved.
+None of those three is what decided this pair: the run solved on an
+srflx-versus-srflx pair, which the denial leaves intact. That is a
+statement about THIS row, and it is deliberately not promoted into a
+rule. "Srflx decides NAT success" would be a new oracle of exactly
+the kind this section is retracting — the previous one was
+"enumeration decides it". What remains decisive is what was measured:
+authenticated application delivery and the forwarding counters, not
+any candidate-level theory about why they came out that way.
 
 #### The claim that is withdrawn, and the observation that is kept
 
@@ -1167,11 +1231,16 @@ before any STUN parsing." **That causal claim is withdrawn.** It is
 falsified by an end-to-end result on the same topology: a
 wildcard-allocated pair parsed STUN responses, formed pairs and
 delivered application payloads in both directions. The drop observed
-in the runs that produced the claim is fully accounted for by §6.12's
-*second* defect — the anchor was the page's configured STUN server,
-so `UDPPort::OnReadPacket` consumed every datagram from it before
-`GetConnection` — which was present in those runs and was not
-separated from the first.
+in the runs that produced the claim is explained by §6.12's *second*
+defect — the anchor was the page's configured STUN server, so
+`UDPPort::OnReadPacket` consumed every datagram from it before
+`GetConnection` — which was present in those runs and was never
+separated from the first. That is the CONFOUNDER, and naming it is
+not the same as accounting for every historical dropped packet: the
+successful run falsifies the claimed *inevitability* of failure under
+denied enumeration, and does no more than that. Runs from that period
+carried both defects at once and cannot now be attributed
+retrospectively to either one alone.
 
 The **observation** is not withdrawn and is not erased: the grant was
 a material part of the environment the six matrix rows were measured
@@ -1216,7 +1285,45 @@ Narrow, and in one direction only.
   surface as a regression here — and would refuse the working
   measurement above.
 - `browser_symmetric_symmetric_nomedia` added, to answer question 2
-  with the instrument that already exists.
+  with the instrument that already existed.
+- **`Forwarding::Carried` strengthened from presence to accounting**
+  for every relayed row, granted and ungranted alike: the anchor must
+  have forwarded at least as many application packets as the sender
+  reports having sent, per direction, rather than merely having
+  forwarded something. A timeout plus a counter increment is not a
+  routed session, and the previous check could be satisfied by one
+  unrelated forwarded packet. This is the only assertion in this
+  round that moved, and it moved in the strict direction; the
+  existing granted relayed rows satisfy it (their fixture and the
+  measured exchange both have `delta >= sent`).
 - No deadline widened, no retry added, no assertion weakened, no row
   deleted or skipped, and no media permission granted anywhere it was
   not already granted.
+
+#### What is NOT closed
+
+**Question 2, and `browser_symmetric_symmetric_nomedia` has never
+executed.** Not "expected to pass", not "should pass given the
+granted relayed rows pass" — it has never run, on any machine, in any
+run of this suite. The netns rows require Linux and root; the
+implementation workstation has neither, and the row was added after
+the CI run this section is written from. No routed result is reported
+here, and none is inferred from the direct success, which is the
+substitution the reviewer ruled out.
+
+A row that has never run has also **not demonstrated its own ability
+to fail.** That is the same standard §11.6 holds S6-06's leaf half
+to, and it applies here for the same reason: green is evidence a
+witness passed and never evidence it can fail, and a witness that has
+not run is not even that. What HAS been demonstrated to fail is the
+checker the row will be decided by — `Forwarding::Carried`'s
+accounting arm is pinned by
+`a_relayed_row_the_anchor_only_partly_carried_fails` in both
+directions, on a shape the previous check accepted — but that is the
+acceptance arithmetic exercised against a synthetic verdict, not the
+row exercised against two browsers behind two symmetric NATs. The two
+are not interchangeable and are not counted as one here.
+
+So the state of Q2 is: instrumented, pinned by name at the CI floor,
+unrun. It closes when that row runs and passes, or it becomes a
+finding when it runs and does not.

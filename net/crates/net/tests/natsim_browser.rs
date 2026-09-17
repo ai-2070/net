@@ -846,6 +846,42 @@ fn a_relayed_row_whose_payload_the_anchor_never_forwarded_fails() {
     assert!(err.contains("the anchor IS the path"), "{err}");
 }
 
+/// **The routed row's accounting, not its presence.** A relayed row
+/// where the anchor forwarded *some* application traffic for the pair
+/// but FEWER packets than the sender handed to the transport is not a
+/// routed session carrying the exchange — it is payloads arriving by
+/// some other route while the counter happened to move.
+///
+/// The old `delta != 0` check passed exactly this shape, which is why
+/// it is pinned: a single unrelated forwarded packet was enough to
+/// satisfy "the anchor IS the path".
+#[test]
+fn a_relayed_row_the_anchor_only_partly_carried_fails() {
+    let row = &ROWS[5];
+    let mut v = verdict_json(row, "iceTimeout", anchor_direct_peer_relayed());
+    // pre=7, sent=4: the anchor moved by 2, so it cannot have carried
+    // the four frames the sender reports — but it DID move, so a
+    // presence check would accept this.
+    v["app"]["forwarded_post_ab"] = serde_json::json!("9");
+    let err = RowVerdict::from_json(&v)
+        .expect("parse")
+        .check(row)
+        .expect_err("the anchor forwarded less traffic than was sent");
+    assert!(
+        err.contains("routed session cannot have carried this exchange"),
+        "{err}"
+    );
+    // And the same shape on the reverse direction, because a row that
+    // only accounted A → B would pass a pair that never answered.
+    let mut v = verdict_json(row, "iceTimeout", anchor_direct_peer_relayed());
+    v["app"]["forwarded_post_ba"] = serde_json::json!("9");
+    let err = RowVerdict::from_json(&v)
+        .expect("parse")
+        .check(row)
+        .expect_err("the reverse direction was only partly carried");
+    assert!(err.contains("b→a"), "{err}");
+}
+
 /// A pair counter that went DOWN is an unusable reading, not a flat
 /// path. Saturating the subtraction would have read as flat and
 /// passed the direct row.

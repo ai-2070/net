@@ -272,6 +272,22 @@ pub struct RtcTestHooks {
     /// like, and the case that turned a bounded shutdown into an
     /// unbounded one.
     block_loop_ms: std::sync::atomic::AtomicU64,
+    /// Delay the driver task's teardown guard by this many
+    /// milliseconds; `0` disables it.
+    ///
+    /// The instrument that makes "the join waited for the task" an
+    /// **ordering** claim rather than a bet on the scheduler.
+    /// Teardown — closing every slot, making the transport
+    /// terminal, releasing the socket — is otherwise microseconds
+    /// long, so a caller that returned immediately after `abort()`
+    /// and a caller that genuinely waited for the task were
+    /// indistinguishable from outside except by timing. Widening
+    /// the guard makes the difference arithmetic: a join that did
+    /// not wait cannot have seen the guard finish.
+    ///
+    /// A **synchronous** sleep, inside `Drop`, because that is what
+    /// it has to model: teardown runs where nothing can await it.
+    teardown_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(test, feature = "fixtures"))]
@@ -391,6 +407,18 @@ impl RtcTestHooks {
 
     fn loop_blocked_for(&self) -> Option<Duration> {
         let ms = self.block_loop_ms.load(Ordering::Acquire);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    }
+
+    /// Make the driver task's teardown guard take `ms` to run, so a
+    /// caller's claim to have waited for it is checkable. `0`
+    /// disables.
+    pub fn set_teardown_delay_ms(&self, ms: u64) {
+        self.teardown_delay_ms.store(ms, Ordering::Release);
+    }
+
+    fn teardown_delay(&self) -> Option<Duration> {
+        let ms = self.teardown_delay_ms.load(Ordering::Acquire);
         (ms > 0).then(|| Duration::from_millis(ms))
     }
 
@@ -725,12 +753,31 @@ impl RtcDriverHandle {
     /// RTC socket is closed and the transport is terminal when this
     /// returns.
     ///
-    /// Bounded: a driver wedged in a syscall is aborted rather than
-    /// hanging the caller's shutdown — and then awaited, because
-    /// `abort()` requests cancellation, it does not perform it (H1).
-    /// Concurrent callers all wait for the same completion, and a
-    /// caller cancelled mid-join returns the handle rather than
-    /// detaching the task.
+    /// # The guarantee, exactly
+    ///
+    /// **For any task that can be cancelled at all, the socket is
+    /// released and the transport is terminal by the time this
+    /// returns — with no yield, sleep or retry needed by the
+    /// caller.** The task owns its socket outright (`SessionTable`,
+    /// and before the first poll the `driver_loop` future itself),
+    /// so nothing else can hold the port: the task being gone *is*
+    /// the port being free, which is why joining the task is both
+    /// necessary and sufficient.
+    ///
+    /// The one case it does not cover is a task that reaches no
+    /// await point — wedged in a blocking syscall or a synchronous
+    /// section. `abort()` is cooperative, so such a task cannot be
+    /// cancelled by anyone, and its socket cannot be released by
+    /// anyone either: it is borrowed by a thread still running.
+    /// Waiting longer does not change that, it only converts a
+    /// wedged task into a shutdown that never returns. So this
+    /// returns after a bounded escalation instead, leaves the
+    /// release UNRECORDED so a later join retries, and says so at
+    /// `error!` — see `TaskRelease::join`.
+    ///
+    /// Concurrent callers all wait for the same recorded release,
+    /// and a caller cancelled mid-join returns the handle rather
+    /// than detaching the task.
     pub async fn shutdown_and_join(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.release.join().await;
@@ -859,9 +906,25 @@ impl TaskRelease {
                 {
                     tracing::debug!(task = self.what, "rtc task did not exit in time; aborting");
                     handle.abort();
-                    // The join the abort is not: without waiting
-                    // here the method returned while cancellation —
-                    // and the socket's release — was still pending.
+                    // **This wait is load-bearing, and bounding it
+                    // is not the same as deleting it.** `abort()`
+                    // requests cancellation; it does not perform
+                    // it. Without a wait here the method returned
+                    // while the task — and therefore the socket's
+                    // release — was still pending, and the caller's
+                    // immediate rebind raced the scheduler for it.
+                    // Not a theoretical regression: bounding this
+                    // join once landed as *removing* it, and this
+                    // comment was left behind describing a wait the
+                    // code no longer performed. Both witnesses of
+                    // the strong guarantee went red on CI at that
+                    // commit — `AddrInUse` on the rebind — and they
+                    // go red on any machine, which is the whole
+                    // reason this reads as a paragraph and not as a
+                    // one-line "abort and return".
+                    // `RtcTestHooks::teardown_delay_ms` keeps those
+                    // witnesses from resting on how promptly a
+                    // cancelled task happens to be dropped.
                     //
                     // **Bounded, because `abort()` is cooperative.**
                     // It takes effect at an await point, so a task
@@ -872,9 +935,35 @@ impl TaskRelease {
                     // did not protect the release; it converted "a
                     // task that cannot be cancelled" into "shutdown
                     // never returns", in production as well as under
-                    // test. The wait is what the release record is
-                    // for; when it cannot be had, saying so is
-                    // strictly better than hanging the caller.
+                    // test. Nor could any other code release that
+                    // socket: a thread still inside the loop is
+                    // borrowing it. The wait is what the release
+                    // record is for; when it cannot be had, saying
+                    // so is strictly better than hanging the caller.
+                    if tokio::time::timeout(TASK_JOIN_TIMEOUT, &mut *handle)
+                        .await
+                        .is_err()
+                    {
+                        // Loud: at this point a task is genuinely
+                        // stuck, its socket is STILL BOUND, and the
+                        // operator's successor will fail to rebind
+                        // for a reason nothing else would explain.
+                        tracing::error!(
+                            task = self.what,
+                            waited_secs = TASK_JOIN_TIMEOUT.as_secs() * 2,
+                            "rtc task did not respond to cancellation; its socket is still \
+                             bound and its release is NOT recorded. A successor binding this \
+                             address will fail until the task unwedges. This is a stuck task, \
+                             not a slow one: `abort` lands at an await point and this one \
+                             reached none"
+                        );
+                        // Nothing was established, so record
+                        // nothing: `done` stays false and a later
+                        // join tries again. `slot`'s `Drop` returns
+                        // the handle to its home on the way out, so
+                        // that later join can own it.
+                        return;
+                    }
                 }
             }
             // Joined: the task is gone, so drop the handle rather
@@ -1116,6 +1205,8 @@ async fn driver_loop(
         stats: Arc::clone(&stats),
         closed: closed.clone(),
         done,
+        #[cfg(any(test, feature = "fixtures"))]
+        hooks: Arc::clone(&hooks),
     };
     let sessions = &mut table.sessions;
     // Taken only by teardown, which runs after this borrow ends.
@@ -1426,10 +1517,20 @@ struct SessionTable {
     stats: Arc<RtcStats>,
     closed: mpsc::Sender<RtcPeerId>,
     done: tokio::sync::watch::Sender<bool>,
+    /// Witness support only: see `RtcTestHooks::teardown_delay_ms`.
+    #[cfg(any(test, feature = "fixtures"))]
+    hooks: Arc<RtcTestHooks>,
 }
 
 impl Drop for SessionTable {
     fn drop(&mut self) {
+        // Before anything is released, so the whole guard is inside
+        // the delay and a caller that returns early cannot have
+        // seen its effects.
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(delay) = self.hooks.teardown_delay() {
+            std::thread::sleep(delay);
+        }
         for session in self.sessions.values() {
             let retained = usize::from(session.retry.is_some());
             if retained > 0 {

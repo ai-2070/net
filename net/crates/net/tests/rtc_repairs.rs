@@ -763,15 +763,21 @@ async fn node_shutdown_releases_the_rtc_socket() {
 /// reaches no await point, which is a different task from this one.
 ///
 /// **Strengthened, same claim.** This used to assert only that the
-/// port happened to be free on return. Teardown is microseconds
-/// long, so on a many-core box the cancelled task was dropped
-/// before the caller reached `bind` whether or not the join waited
-/// for it — and this row duly passed on a 20-core workstation with
-/// the post-abort wait deleted, while failing a 2-core CI runner on
-/// `AddrInUse`. `set_teardown_delay_ms` widens the guard to 250 ms,
-/// so what is asserted now is that the join outlasted the WHOLE
-/// teardown: the same guarantee, decided by arithmetic instead of
-/// by core count.
+/// port happened to be free on return, which left the row resting
+/// on *when the scheduler drops a cancelled task* — a real race,
+/// because a join that returns straight after `abort()` and a
+/// runtime that has already dropped the task are indistinguishable
+/// from outside. `set_teardown_delay_ms` widens the task's teardown
+/// guard to 250 ms, so the assertion is now that the join outlasted
+/// the WHOLE guard: the same guarantee, settled by arithmetic
+/// rather than by scheduling.
+///
+/// It is not the reason this row was ever green while CI was red.
+/// That was simpler and worse: the commit that bounded the join
+/// deleted its post-abort wait outright and kept the comment
+/// describing it, so the tree that passed locally and the tree CI
+/// compiled were not the same code. With the wait deleted this row
+/// fails here too, 3 runs of 3, in the same ~2.3 s CI reported.
 ///
 /// Inverse: move the handle into `timeout(...)` again (dropping it on
 /// the timeout) or delete the bounded `handle.await` after `abort()`
@@ -785,7 +791,7 @@ async fn a_stalled_driver_is_aborted_and_joined_before_shutdown_returns() {
     driver.hooks().set_stall_loop(true);
     // Teardown must be long enough that a join which did not wait
     // for it cannot possibly have seen it finish.
-    // disabled for flakiness check
+    driver.hooks().set_teardown_delay_ms(250);
     // Let the loop reach the stall.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -812,14 +818,13 @@ async fn a_stalled_driver_is_aborted_and_joined_before_shutdown_returns() {
 /// returned while the driver was still running.
 ///
 /// **Strengthened, same claim.** Both joiners' assertions are
-/// unchanged; what changed is that they can no longer pass by
-/// accident. Teardown used to be microseconds long, so on a
-/// many-core box a joiner that returned too early still found
-/// `is_terminal()` set and the port free — this row passed on a
-/// 20-core workstation with the post-abort wait deleted and failed
-/// a 2-core CI runner. `set_teardown_delay_ms` widens the guard to
-/// 250 ms, so "observed completed teardown" is now a claim about
-/// ordering rather than about scheduling luck.
+/// unchanged; what changed is what they rest on. Teardown was
+/// microseconds long, so "observed completed teardown" was in
+/// practice a bet on the scheduler having dropped the cancelled
+/// task before the joiner read `is_terminal()`.
+/// `set_teardown_delay_ms` widens the guard to 250 ms, which makes
+/// it an ordering claim: no joiner can report completed teardown
+/// unless it really waited for the guard to finish.
 ///
 /// Inverse: return immediately on `None` instead of waiting on the
 /// shared completion, or delete the bounded `handle.await` after
@@ -832,7 +837,7 @@ async fn two_concurrent_joiners_both_observe_completed_teardown() {
     let driver = a.rtc_driver().expect("driver").clone();
     let addr = driver.local_addr();
     driver.hooks().set_stall_loop(true);
-    // disabled for flakiness check
+    driver.hooks().set_teardown_delay_ms(250);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Each joiner reports the completion marker the task's own

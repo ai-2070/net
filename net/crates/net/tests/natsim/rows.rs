@@ -204,16 +204,22 @@ impl fmt::Display for Disposition {
 /// camera/microphone is what a user does before a call, and it is
 /// what the six matrix rows do.
 ///
-/// **What that costs is candidate CLASSES, not reachability.** A
-/// wildcard port still binds `0.0.0.0` and still receives; measured
-/// in run 35182320241, the permission-free pair reached the STUN
-/// endpoint, gathered srflx on both sides and landed `direct`
-/// (S6_REPORT.md §11.8). What enumeration denial removes is the real
-/// host candidate — replaced by an mDNS `<uuid>.local` name — and the
+/// **What that observably cost on the one row measured was candidate
+/// classes, not reachability.** A wildcard port still binds
+/// `0.0.0.0` and still receives; in run 35182320241 the
+/// permission-free pair reached the STUN endpoint, solved `direct`
+/// and delivered nonce-correlated payloads both ways
+/// (S6_REPORT.md §11.8). What the denial removed there was the real
+/// host candidate — replaced by an mDNS `<uuid>.local` name — the
 /// IPv6 leg, whose wildcard port logs `STUN server address is
-/// incompatible` and has its host candidate discarded by the filter.
-/// Neither is a candidate class that solves a NAT'd pair, which is
-/// why the boundary is invisible on this topology.
+/// incompatible` and has its host candidate discarded by the filter,
+/// and candidate priority/cost. None of those decided that row.
+///
+/// That is a statement about that row and deliberately NOT a rule
+/// that srflx decides NAT success: swapping an enumeration oracle
+/// for an srflx one is the same mistake with a different noun. What
+/// stays decisive is authenticated delivery and the measured
+/// forwarding counters.
 ///
 /// A row that runs with `None` is therefore measuring something the
 /// granted rows cannot: whether the PRODUCT works in an ordinary
@@ -323,13 +329,34 @@ impl Enumeration {
 /// EXCLUDES `0x0D02` signalling (`mesh.rs`, the
 /// `inner_sub != SUBPROTOCOL_RTC_SIGNAL` arm), so it is a statement
 /// about application bytes and nothing else.
+///
+/// # A presence check wearing the clothes of a quantity check
+///
+/// Recorded here rather than in the match arm because it generalises
+/// past this table. [`Carried`](Forwarding::Carried) once asked only
+/// that the counter MOVED (`delta != 0`), which reads as a
+/// measurement and is not one: a single unrelated forwarded packet
+/// satisfies it, so it could not separate "the routed session
+/// carried these payloads" from "these payloads arrived by some other
+/// route and the counter moved anyway". That is the same shape as a
+/// relayed disposition asserted from `iceTimeout` plus an
+/// `ice_relayed` increment — the absence of a direct session, plus a
+/// counter, presented as a positive fact.
+///
+/// The repair is to scale the requirement to the exchange: the anchor
+/// must have forwarded **at least as many application packets as the
+/// sender itself reports handing to the transport**, per direction.
+/// Ambient traffic cannot satisfy that. A counter compared against
+/// zero should always be suspected of this; a counter compared
+/// against the quantity that was supposed to produce it cannot be.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Forwarding {
     /// The anchor carried none of these application bytes: the pair
     /// is direct and the bytes went leaf → leaf.
     Flat,
-    /// The anchor carried them, in both directions: the pair is
-    /// relayed and the routed session is what delivered.
+    /// The anchor carried them, in both directions, and carried
+    /// enough of them to account for what the senders sent: the pair
+    /// is relayed and the routed session is what delivered.
     Carried,
 }
 
@@ -432,6 +459,15 @@ impl Row {
     /// What this row does with Chromium's interface enumeration:
     /// `Required` wherever the grant was made, `Observed` on the
     /// permission-free legs. Chromium tabs only.
+    ///
+    /// **`Required` means required BY THIS FIXTURE, never required by
+    /// the product.** A granted row that stops enumerating has had
+    /// its environment change underneath it and its other readings
+    /// are no longer comparable with the rows beside it, so it
+    /// refuses. That is a statement about holding the fixture still.
+    /// The product's own requirement is the opposite way round and is
+    /// measured, not assumed: `browser_cone_cone_nomedia` reaches a
+    /// direct authenticated exchange with `real = 0`.
     ///
     /// See [`Enumeration`] for why those are two different kinds of
     /// statement rather than two strengths of one check.
@@ -552,10 +588,11 @@ pub const CONTROL: Row = Row {
 /// both nonces delivered, the anchor's per-pair application
 /// forwarding FLAT in both directions, and a replied two-way UDP flow
 /// between the two public addresses in BOTH gateways' conntrack. The
-/// wildcard port binds `0.0.0.0`, reaches the STUN endpoint and
-/// gathers srflx; what the denial costs is the real host candidate
-/// (an mDNS `.local` name instead) and the IPv6 leg, and neither of
-/// those is what solves a NAT'd pair.
+/// wildcard port binds `0.0.0.0` and reaches the STUN endpoint; what
+/// the denial cost here was the real host candidate (an mDNS
+/// `.local` name instead), the IPv6 leg and candidate priority/cost,
+/// none of which decided this row — an observation about this row,
+/// not a candidate-level rule.
 ///
 /// **Scope.** That is one Chromium build, one IP-handling policy and
 /// one topology (two address-restricted cone gateways, srflx against
@@ -577,7 +614,7 @@ pub const NO_MEDIA: Row = Row {
     nat_b: Nat::ConeAr,
     expect: Disposition::Direct,
     why: "row 1 with no camera/microphone grant: enumeration is denied and the ports are \
-          wildcard, and the srflx pair a NAT'd row needs is gathered and solved anyway",
+          wildcard, and the pair still solves and still delivers in both directions",
     media: Media::None,
 };
 
@@ -603,13 +640,37 @@ pub const NO_MEDIA: Row = Row {
 ///
 /// `symmetric × symmetric` is the pair ICE cannot solve — neither
 /// side can predict the other's mapping — so it drives the routed
-/// path deliberately, and it does so with the instrument the granted
-/// relayed rows already use and this slice already asserts: both
-/// nonces observed by the RECEIVER that did not mint them, and the
-/// anchor's own per-pair application counter moving in BOTH
-/// directions across the exchange ([`Forwarding::Carried`]). No new
-/// witness, no widened deadline, no weakened assertion — the one
-/// variable against `browser_symmetric_symmetric` is the grant.
+/// path deliberately. It requires all three of:
+///
+/// 1. **receiver-observed nonces in BOTH directions**, the same
+///    instrument as the direct row and no weaker: each side decodes
+///    the exact nonce the *other* side was given, with a non-zero
+///    send and a non-zero receive per direction.
+/// 2. **increases in the APPLICATION-ONLY per-pair forwarding
+///    counters, in both directions, as deltas** — a checked
+///    subtraction over `forwarded_app_packets`, which excludes
+///    `0x0D02` signalling and so cannot move because a candidate was
+///    trickled.
+/// 3. **an accounted routed disposition, not a timeout plus a
+///    counter.** `delta != 0` is satisfiable by one unrelated
+///    forwarded packet, so [`Forwarding::Carried`] requires the
+///    anchor to have forwarded at least as many application packets
+///    as the sender reports handing to the transport, per direction.
+///    Beside it, both halves type the disposition themselves and must
+///    agree, `udpBlocked` is refused, the ledgers are exact, and both
+///    gateways' conntrack must show NO replied flow between the
+///    public addresses — which is what lets the row fail when the
+///    payloads arrived directly after all.
+///
+/// The leaf's public surface exposes no per-peer route accessor and
+/// none of its counters is route-typed, so "the application path in
+/// use is the anchor's" is carried by three parties — the two
+/// endpoints' typed outcomes, the anchor's accounting, and the
+/// gateways — and by none of them alone. That limitation is recorded
+/// in S6_REPORT.md §11.8 rather than worked around here.
+///
+/// No new witness, no widened deadline, no weakened assertion — the
+/// one variable against `browser_symmetric_symmetric` is the grant.
 pub const NO_MEDIA_RELAYED: Row = Row {
     scenario: "browser_symmetric_symmetric_nomedia",
     nat_a: Nat::Symmetric,
@@ -952,19 +1013,61 @@ impl AppExchange {
                 Ok(())
             }
             Forwarding::Carried => {
-                if ab == 0 || ba == 0 {
-                    return Err(format!(
-                        "row {} is relayed and both nonces arrived — but the anchor's per-pair \
-                         application counter moved {ab} a→b and {ba} b→a ({} → {} and {} → {}). \
-                         On a relayed row the anchor IS the path, so a direction that delivered \
-                         without the anchor forwarding anything means the payload arrived by a \
-                         route this row does not model.",
-                        row.scenario,
+                // ACCOUNTING, not presence. `ab != 0` says the anchor
+                // forwarded *something* for this pair while the
+                // exchange happened, which a single unrelated
+                // application packet satisfies — so on its own it
+                // cannot tell "the routed session carried these
+                // payloads" from "these payloads arrived by some
+                // other route and the counter moved anyway". The
+                // anchor must have forwarded AT LEAST as many
+                // application packets as the sender itself reports
+                // handing to the transport, in each direction.
+                //
+                // `>=` and not `==`: the counter is packets and the
+                // sender counts frames, so fragmentation can only
+                // make the anchor's number larger. And the send step
+                // is a bounded retry loop on a `fireAndForget`
+                // stream, so `sent` is whatever actually went out —
+                // which is what makes this scale with the exchange
+                // instead of collapsing back to `!= 0`.
+                for (who, delta, sent, pre, post) in [
+                    (
+                        "a→b",
+                        ab,
+                        self.sent_a_to_b,
                         self.forwarded_pre_ab,
                         self.forwarded_post_ab,
+                    ),
+                    (
+                        "b→a",
+                        ba,
+                        self.sent_b_to_a,
                         self.forwarded_pre_ba,
-                        self.forwarded_post_ba
-                    ));
+                        self.forwarded_post_ba,
+                    ),
+                ] {
+                    if delta == 0 {
+                        return Err(format!(
+                            "row {} is relayed and both nonces arrived — but the anchor's \
+                             per-pair application counter did not move {who} ({pre} → {post}). \
+                             On a relayed row the anchor IS the path, so a direction that \
+                             delivered without the anchor forwarding anything means the payload \
+                             arrived by a route this row does not model.",
+                            row.scenario
+                        ));
+                    }
+                    if delta < sent {
+                        return Err(format!(
+                            "row {} is relayed: the sender handed {sent} {who} application \
+                             frame(s) to the transport, but the anchor forwarded only {delta} \
+                             application packet(s) for this exact pair ({pre} → {post}). The \
+                             routed session cannot have carried this exchange; the counter moved \
+                             for less traffic than was sent, so some of it took a path neither \
+                             the anchor nor this row accounts for.",
+                            row.scenario
+                        ));
+                    }
                 }
                 Ok(())
             }

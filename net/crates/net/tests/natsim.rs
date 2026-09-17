@@ -709,9 +709,13 @@ fn natsim_browser_cone_cone_is_direct_on_firefox() {
 /// non-loopback candidate needs. §11.8 measured the answer: both
 /// tabs log `permission status: denied` and allocate wildcard ports,
 /// and the pair still solves `direct` with flat anchor forwarding and
-/// a replied two-way flow in both gateways' conntrack — a wildcard
-/// port still binds `0.0.0.0` and still gathers the srflx candidate
-/// a NAT'd row is decided by.
+/// a replied two-way flow in both gateways' conntrack. A wildcard
+/// port still binds `0.0.0.0` and still receives; what the denial
+/// cost on that row was the real host candidate, the IPv6 leg and
+/// candidate priority — none of which decided it. That is an
+/// observation about the row, not a rule that srflx decides NAT
+/// success; what stays decisive is authenticated delivery and the
+/// measured forwarding counters.
 ///
 /// The verdict records what the DRIVERS reported granting, so a row
 /// that quietly acquired the permission fails here rather than

@@ -4791,7 +4791,7 @@ jobs:
             --floor rtc_admission=26 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
-            --floor natsim_browser=40 \
+            --floor natsim_browser=41 \
             --floor rtc_stun_endpoint=14 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
