@@ -918,3 +918,305 @@ any verdict a row reached would be about that and nothing else.
   downgrade to the routed path.
 - **Stage 5's four open owner questions remain open.** Stage 6
   neither answers nor depends on them.
+
+
+## 11. First repair round — answering the Stage 6 HOLD
+
+Kyra's Stage 6 review (`KYRA_STAGE6_REVIEW.md`, pinned at
+`9ef5b6a03`) returned eight required repairs, three missing acceptance
+items and five secondary corrections. This section states what each
+became. **Nothing here closes a Stage 5 item**, and the Stage 5
+fourth-repair HOLD remains separate and open.
+
+**Read this first: the tree moved under the review.** She pinned
+`9ea5bc8`…`9ef5b6a03`; this round lands on top of Stage 5 rounds 4 and
+5, which she has not reviewed. Line numbers in her report no longer
+resolve. Every finding below was located by symbol and re-verified
+against current source before being repaired — none was taken as read
+from a line reference.
+
+### 11.1 The eight repairs
+
+| item | what it became |
+|---|---|
+| **S6-01** | A signed establishment proof on its own subprotocol, verified against the initiator's announced identity, bounding the responder to a provisional admission until it verifies. §11.2 |
+| **S6-02** | An internal `Attempt{peer,dialog}` captured before every await and compared before every mutation, settlement, removal, install or publication |
+| **S6-03** | One terminal transition spanning ICE, Noise and installation, retiring the exact owned resources — including S6-01's provisional admission — and excluding late installation |
+| **S6-04** | Bounded retention under the authorizing dialog across both phases that discarded candidates, with the bound itself witnessed |
+| **S6-05** | Arming and pair ownership moved into the single retry owner; the answerer install now revokes, which is the role-reversal half |
+| **S6-06** | Completion claims the attempt before installing or charging; `PeerLink`'s destructor performs the discard accounting replacement used to skip |
+| **S6-07** | All five configurations: bound-before-override, resolved-pair validation, the effective server list, the per-peer PC check, and parsed-address comparison |
+| **S6-08** | Durable release published with `send_replace`, read before waiting, with a bounded post-abort wait added after CI found the unbounded one |
+
+### 11.2 S6-01, because it is the one that is not mechanical
+
+The owner ruled the mechanism: retain Noise, add a domain-separated
+signed proof verified against the initiator's already-verified
+announcement identity. Two implementation facts are worth a reviewer's
+attention because they were forced rather than chosen.
+
+**The proof cannot ride a Noise payload.** Message 1 is written before
+the final handshake hash exists and message 2 is the responder's, so
+no Noise payload can carry a signature over the final transcript — it
+could only bind a partial hash, which is a *different value on the two
+sides*. It rides its own subprotocol frame on the established session,
+which additionally seals it under the keys that transcript produced.
+
+**The transcript binds roles, not just identities.** Both node ids in
+role order *plus* an explicit role byte, because ordering alone leaves
+the two roles' statements identical for a symmetric pair — an
+initiator's proof could then be presented as a responder's. The
+handshake hash is what makes a proof non-transferable to any other
+establishment; the peer id, the announcement and the signalling dialog
+are all stable across attempts, which is exactly why none of them is
+sufficient.
+
+Kyra's own impostor reproduction is now a pinned witness, with an
+honest control beside it so the refusal cannot pass by breaking
+everything.
+
+### 11.3 The preserved reviewer probes are no longer byte-identical
+
+Stated plainly because she verified the property herself and recorded
+it as evidence: her retained `prior-probe-preservation.diff` is empty
+and **will not be empty again**. The four files gained 12 lines each
+inside their `connect()` helper — 48 insertions, **0 deletions**, no
+test name, assertion, expected value or message changed, all 42 still
+passing, verified here rather than taken on a lane's report.
+
+The old helper handshook and then let every probe treat the responder
+as holding a session immediately after message 1, which is precisely
+the PSK-only attribution S6-01 removes. The helper now completes the
+protocol. **Adding discovery restores the premise those probes always
+meant** — two mutually discovered leaves with a real session — which
+the old form could skip only because the responder never checked who
+it was talking to.
+
+### 11.4 What the acceptance work withdrew
+
+Two claims in this report were overstated and are withdrawn rather
+than quietly adjusted:
+
+- the "same three witnesses" claim transferred the strong loopback
+  payload proof into every NAT row; the rows never contained a payload
+  exchange at all, and now do;
+- §8's claim that every Stage 6 row had a mutation → RED → revert →
+  GREEN chain was untraceable. Inventory first: the repository held
+  **zero** captured Stage 6 receipts. Two were described in prose and
+  the rest rested on green CI logs, which establish that a witness
+  passed and never that it can fail. `spikes/S6_RECEIPTS/` now holds
+  the receipts taken this round and an index that records *no receipt*
+  where none was taken.
+
+### 11.5 Two witnesses that would have run zero times
+
+Both caught before push, both the same shape, and the reason this
+round pins counts rather than presence:
+
+- `wasm_rtc_conservation` (S6-06's leaf half) is a new `--test`
+  binary, and the leaf job's suite list is hardcoded — a fourth suite
+  runs nothing until it is named. Added with `floor=2`.
+- the 13 S6-02/03/04 witnesses are **lib** tests on the wasm32 target,
+  because they must reach the private `Inner`. The job's only wasm
+  invocation passes `--test <name>` and cannot reach a `#[cfg(test)]`
+  child module of `wasm.rs`. A `--lib` step with `floor=13` now runs
+  them; the target was previously uninvoked in that job.
+
+### 11.6 What is witnessed only in CI, and what is not witnessed at all
+
+- **S6-06's leaf half has no native witness and will not get one.**
+  `leaf/src/rtc.rs` is `#![cfg(target_arch = "wasm32")]` in its
+  entirety, so a native test could only re-implement `PeerLink` and
+  assert the copy — while the claim under test is *which production
+  paths perform the accounting*, which a fake link cannot carry. Its
+  two assertions had never been observed to hold at the time they were
+  written: the author could compile for wasm32 but not execute.
+- **The Firefox leg of the browser matrix does not run on the
+  implementation workstation** — the harness refuses to start without
+  NSS `certutil` rather than fall back to a root store it never
+  writes. Chromium ran 42/42 locally; Firefox is CI's.
+- **The NAT and demo acceptance legs require Linux netns and root**
+  and therefore execute only in CI.
+
+### 11.7 A hang CI found that no local run reproduces
+
+`a_frame_captured_under_a_retired_incarnation_cannot_revive_its_reassembly`
+hit nextest's 180 s terminate on the first repaired head. It passes
+alone in ~3.2 s and the binary is 49/49 under nextest on the
+workstation, so the cause needs the contention of 193 tests on a small
+runner. The obvious explanation was checked and **killed**: the test's
+synchronous dispatch pause runs on the mesh's ingress task, not on a
+task `TaskRelease` owns, and `driver.close()` awaits no reply.
+
+Two unbounded waits on the shutdown path were found from source and
+bounded — one new in this round (`TaskRelease::join`'s post-abort
+await) and one pre-existing (`MeshNode::shutdown`'s task drain, a bare
+`handle.await` with no abort and no deadline). `abort()` is
+cooperative: it lands at an await point, so a task wedged in a
+synchronous call never reaches one and an unbounded wait converts "a
+task that cannot be cancelled" into "shutdown never returns" — in
+production, not only under test. Neither bound is deadline padding: no
+test deadline moved, no retry was added, and the timing-out witness is
+untouched. Neither is claimed as the confirmed cause.
+
+### 11.8 The permission-free Chromium leg: what was measured, and what §6.12 over-claimed
+
+Kyra's E1 third item asked for an ordinary permission-free Chromium
+NAT leg and noted that the required no-grant SUCCESS was unproven.
+The leg was built, it ran, and **it succeeded** — including on the
+direct path. The failing row in
+[35182320241](https://github.com/ai-2070/net/actions/runs/35182320241)
+was the harness refusing its own successful measurement.
+
+Nothing below re-derives §6.12's mechanism. The gate is real and is
+not in dispute: `FilteringNetworkManager` withholds the network list
+until a media permission exists, and both permission-free tabs logged
+`received permission status: denied`, `Allocate ports on any any`,
+and ports created on `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999.
+
+#### Three questions, answered separately
+
+Deliberately not collapsed, because Net's anchor-routed fallback is
+**not TURN** — it rides each leaf's authenticated session with the
+anchor rather than a relay allocation, so "it falls back to the
+anchor" is itself a claim about leaf-to-anchor application delivery.
+If the anchor hop failed, there would be no fallback to fall back to.
+
+**1. Can the permission-free leaf establish its authenticated anchor
+session, with an application request/reply? YES.** Not "ICE
+succeeded", not "a DataChannel opened": tab A issued a **capability
+query** over the session and got back the peer set containing B's
+node id, which only the anchor could supply and only from B's signed
+announcement. Both tabs completed `Connect` (distinct node ids
+`4ad9c8926e4cbc99`, `ed508e02ebdd68b6`) and both completed
+`Announce`. Every one of those steps is a `require` in
+`drive_sequence`, so reaching the later steps is proof the earlier
+ones returned. Leaf drop counters were zero across the board —
+including `establishment_unproven`, `no_session` and `unparsable`.
+
+**2. Can two permission-free leaves exchange application data over
+the ROUTED path?** **Not answered by that run, and the row could not
+have answered it.** On a row that solves direct the anchor's per-pair
+application counter is flat *by assertion* — that flatness is the
+direct row's own witness — so a direct row is structurally the one
+shape that cannot observe forwarding. What the run does show is that
+the anchor had already forwarded application-class packets for this
+pair before the nonce exchange began (`forwarded_pre_ab=2`,
+`forwarded_pre_ba=1`, a counter that excludes `0x0D02` signalling),
+which is consistent with the routed path working but is not a
+receiver-observed payload. So the gap is now instrumented rather than
+argued: `browser_symmetric_symmetric_nomedia` is the relayed row with
+the grant removed — the pair ICE cannot solve — carrying the same
+witness the granted relayed rows already use (both nonces observed by
+the receiver that did not mint them, and the anchor's per-pair
+counter moving in **both** directions). Until it runs, this answer is
+open and is reported as open.
+
+**3. Can the same pair establish DIRECT connectivity? YES, with
+application delivery.** Measured, from the run's own verdict:
+
+| witness | permission-free `cone-ar × cone-ar` |
+|---|---|
+| `page_type` / `peer_page_type` | `direct` / `direct`, and they agree |
+| `connect_peer_ms` | 273 |
+| leaf ICE ledgers (A and B) | `attempted=2 direct=2 relayed=0 failed=0 udp_blocked=0`, `pending=0` |
+| anchor ICE ledger | `attempted=2 direct=2` |
+| application payloads | `seen_at_a` = B's nonce `1cd3a6cc73980c73`; `seen_at_b` = A's nonce `b04608cf1698adee` — each side decoded a nonce it could not have minted |
+| anchor per-pair app forwarding | `a→b 2 → 2`, `b→a 1 → 1` — **flat both ways** across the exchange |
+| `nsim_gwa` conntrack | `192.168.101.2:54230 → 10.99.0.3:39308`, reply tuple present, `[ASSURED]`, **not** `[UNREPLIED]` |
+| `nsim_gwb` conntrack | the mirror image, also replied |
+| enumeration | tab a `real=0 wildcard=117`, tab b `real=0 wildcard=157`, `nets=[any:0.0.0.x/0:Wildcard, any:0:0:0:x…/0:Wildcard]` |
+
+Direct-versus-forwarded is therefore carried by two independent
+witnesses that are not the endpoints' own opinion: the anchor's
+counter did not move while the payloads crossed, and both gateways
+saw a two-way flow between the public addresses.
+
+#### Why it works with enumeration off
+
+From the permission-free tabs' own renderer log
+(`/tmp/natsim.o3TSU0/runner.log`), and this is the part §6.12 got
+wrong. The wildcard IPv4 port binds `0.0.0.0:60339` (tab b) /
+`0.0.0.0:53892` (tab a) and **still reaches the announced STUN
+endpoint and still learns its mapping**:
+
+```
+Gathered candidate: Cand[…:1677729535:10.99.0.x:60339:srflx:192.168.102.x:60339:…:0:999:0]
+New selected connection: Conn[…Net[any:0.0.0.x/0:Wildcard:id=0]…srflx:udp:10.99.0.x:60339->…host:udp:10.99.0.x:7100|CRWS|S…]
+```
+
+What the denial actually costs, all of it visible in that log:
+
+- the real **host** candidate, replaced by an mDNS name
+  (`68136645-…-634e5139be50.local:60339`) because the renderer does
+  not know its own address;
+- the **IPv6** leg — its wildcard port logs `STUN server address is
+  incompatible` (the STUN endpoint is IPv4) and its host candidate is
+  `Discarding candidate because it doesn't match filter`;
+- priority and cost: type preference `1677729535` instead of
+  `1686052607`, network cost `999` instead of `0`.
+
+None of those is the candidate class that decides a NAT'd pair. The
+srflx-versus-srflx pair is, and it is gathered and solved.
+
+#### The claim that is withdrawn, and the observation that is kept
+
+§6.12 concluded that with enumeration denied "inbound datagrams are
+matched against a network list that is empty — so they are dropped
+before any STUN parsing." **That causal claim is withdrawn.** It is
+falsified by an end-to-end result on the same topology: a
+wildcard-allocated pair parsed STUN responses, formed pairs and
+delivered application payloads in both directions. The drop observed
+in the runs that produced the claim is fully accounted for by §6.12's
+*second* defect — the anchor was the page's configured STUN server,
+so `UDPPort::OnReadPacket` consumed every datagram from it before
+`GetConnection` — which was present in those runs and was not
+separated from the first.
+
+The **observation** is not withdrawn and is not erased: the grant was
+a material part of the environment the six matrix rows were measured
+in, `real=0` is what a permission-free Chromium tab does here, and
+the counts are now written into every row's `browser_outcome.json`
+under `enumeration`, tagged `required` or `observed`, on the passing
+path as well as the failing one.
+
+#### Scope, stated narrowly on purpose
+
+This licenses exactly one thing: **on the tested Chromium build, the
+tested IP-handling policy (`policy: default, multiple_routes: 1,
+nonproxied_udp: 1`) and this topology, a camera/microphone grant is
+not a prerequisite for a data-only Net application to reach its peer
+directly behind two address-restricted cone NATs.** It is not a
+universal statement about Chromium data-only WebRTC, it says nothing
+about the narrower NAT flavours on the permission-free axis (only
+`cone-ar × cone-ar` was run ungranted), and question 2 above is open.
+
+#### Firefox
+
+No difference to report, and that was already established: the
+control has **always** run permission-free. Firefox has no media gate
+on interface enumeration and Playwright cannot grant it camera or
+microphone, so the driver never asked — `browser_cone_cone_firefox`
+records `Media::None` because that is the environment it ran in.
+`natsim_browser_cone_cone_is_direct_on_firefox` passed in the same
+run at 04:43:01.
+
+#### The harness change
+
+Narrow, and in one direction only.
+
+- The permissioned rows' `real > 0` refusal is **unchanged as a
+  criterion**. Its message no longer asserts the withdrawn drop
+  mechanism; it names the observation and the environment the row was
+  built for.
+- On a permission-free row the counts are **recorded, not asserted**
+  (`Row::enumeration()` → `Enumeration::Observed`). Requiring them
+  would pin one browser's gating policy as though it were a promise
+  of this product — a future Chromium that stopped gating would
+  surface as a regression here — and would refuse the working
+  measurement above.
+- `browser_symmetric_symmetric_nomedia` added, to answer question 2
+  with the instrument that already exists.
+- No deadline widened, no retry added, no assertion weakened, no row
+  deleted or skipped, and no media permission granted anywhere it was
+  not already granted.

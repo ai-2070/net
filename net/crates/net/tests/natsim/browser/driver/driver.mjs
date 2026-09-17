@@ -334,14 +334,23 @@ function networksSnapshot() {
 
 function reportNetworkEnumeration(at) {
   // Named plainly, both ways: the enumerated interface is a
-  // precondition of every Chromium row, and a run that silently lost
-  // it would otherwise look like a new mystery.
+  // precondition of every GRANTED Chromium row, and a run that
+  // silently lost it would otherwise look like a new mystery.
+  //
+  // The line no longer claims inbound packets are dropped. §11.8
+  // measured a `real=0` pair reaching the STUN endpoint, gathering
+  // srflx and delivering application payloads both ways, so that
+  // clause was a conclusion this instrument cannot support. It
+  // reports what it counted, and names the permission gate that
+  // explains a zero.
   const nets = networkNames.size === 0 ? '(none)' : [...networkNames].join(' ');
   log(
     `[chromium-ice] PRECONDITION networks at ${at}: real=${realNetworkPorts} ` +
       `wildcard=${wildcardPorts} nets=${nets}` +
       (realNetworkPorts === 0
-        ? ' — ZERO enumerated networks, every inbound packet is dropped before STUN (S6_REPORT.md §6.12)'
+        ? ' — ZERO enumerated networks; expected when no media permission was granted' +
+          ' (FilteringNetworkManager gates the network list), REQUIRED of a granted row' +
+          ' (S6_REPORT.md §6.12, §11.8)'
         : ''),
   );
 }

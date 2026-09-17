@@ -191,6 +191,24 @@ case "$SCENARIO" in
   # loopback, because the enumeration this leg measures is what a
   # non-loopback candidate needs.
   browser_cone_cone_nomedia) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
+  # The PERMISSION-FREE ROUTED leg: `browser_symmetric_symmetric`
+  # again, nothing granted.
+  #
+  # `browser_cone_cone_nomedia` above answers "can an ungranted pair
+  # go DIRECT". It cannot answer "can an ungranted pair use Net's
+  # routed path", because on a row that solves direct the anchor's
+  # per-pair application counter is flat BY DESIGN — that flatness is
+  # the direct row's own assertion. And Net's fallback is not TURN:
+  # it rides each leaf's authenticated session with the anchor, so
+  # "it falls back to the anchor" is a claim about leaf-to-anchor
+  # application delivery that has to be measured, not assumed.
+  #
+  # symmetric x symmetric is the pair ICE cannot solve, so this arm
+  # drives the routed path with the SAME witness the granted relayed
+  # rows use: nonce-correlated payloads observed by the receiver, and
+  # the anchor's own per-pair forwarding counter moving in both
+  # directions across the exchange.
+  browser_symmetric_symmetric_nomedia) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 

@@ -692,7 +692,8 @@ fn natsim_browser_cone_cone_is_direct_on_firefox() {
     browser_row(&rows::CONTROL);
 }
 
-/// The permission-free leg: **row 1 again with nothing granted.**
+/// The permission-free leg: **row 1 again with nothing granted, and
+/// it lands `direct`.**
 ///
 /// The six Chromium rows grant the page's own origin camera and
 /// microphone before opening it, because Chromium withholds its
@@ -705,13 +706,58 @@ fn natsim_browser_cone_cone_is_direct_on_firefox() {
 ///
 /// One variable against row 1 — the grant — behind the same two real
 /// NATs, because the enumeration this measures is what a
-/// non-loopback candidate needs. The verdict records what the
-/// DRIVERS reported granting, so a row that quietly acquired the
-/// permission fails here rather than passing under this name.
+/// non-loopback candidate needs. §11.8 measured the answer: both
+/// tabs log `permission status: denied` and allocate wildcard ports,
+/// and the pair still solves `direct` with flat anchor forwarding and
+/// a replied two-way flow in both gateways' conntrack — a wildcard
+/// port still binds `0.0.0.0` and still gathers the srflx candidate
+/// a NAT'd row is decided by.
+///
+/// The verdict records what the DRIVERS reported granting, so a row
+/// that quietly acquired the permission fails here rather than
+/// passing under this name. The `real=0` enumeration counts are
+/// RECORDED into the verdict rather than asserted: they are the
+/// explanatory observation, the outcome under investigation is
+/// authenticated application delivery, and a row that refused on
+/// `real=0` would have thrown away the working measurement above.
+///
+/// Scoped to the tested Chromium build, policy and topology. It says
+/// the grant is not a prerequisite for a data-only Net application
+/// HERE; it does not say anything universal about Chromium, and it
+/// does not retire the fact that the grant was a material part of the
+/// environment the six matrix rows ran in.
 #[test]
 #[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
 fn natsim_browser_cone_cone_is_direct_without_media_permission() {
     browser_row(&rows::NO_MEDIA);
+}
+
+/// The permission-free **routed** leg: `symmetric × symmetric` again
+/// with nothing granted.
+///
+/// The direct row above cannot answer this one. On a row that solves
+/// direct the anchor's per-pair application counter is flat *by
+/// design* — that flatness is the direct row's own assertion — so a
+/// direct row is precisely the shape that cannot witness forwarding.
+///
+/// And it is the half that most needs witnessing, because Net's
+/// routed path is **not TURN**: it rides each leaf's authenticated
+/// session with the anchor rather than a relay allocation, so
+/// "it falls back to the anchor" is a claim about leaf-to-anchor
+/// application delivery. If a denied enumeration broke the anchor
+/// hop, there would be no fallback to fall back to, and a row that
+/// asserted one without measuring it would assert nothing.
+///
+/// So: the pair ICE cannot solve, driven with the instrument the
+/// granted relayed rows already use — both nonces observed by the
+/// receiver that did not mint them, and the anchor's own per-pair
+/// application counter moving in BOTH directions across the
+/// exchange. One variable against `browser_symmetric_symmetric`: the
+/// grant.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_symmetric_symmetric_is_relayed_without_media_permission() {
+    browser_row(&rows::NO_MEDIA_RELAYED);
 }
 
 // =========================================================================

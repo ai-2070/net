@@ -196,12 +196,24 @@ impl fmt::Display for Disposition {
 ///
 /// This is a HARNESS knob and not a product one, which is exactly why
 /// it has to be part of the table. Chromium gates local-interface
-/// enumeration on media permission (`FilteringNetworkManager` logs
-/// `received permission status: denied`), and a denied enumeration
-/// allocates wildcard ports that drop every inbound datagram before
-/// STUN parsing — the whole of S6_REPORT.md §6.12. Granting
+/// enumeration on media permission: with none,
+/// `FilteringNetworkManager` logs `received permission status:
+/// denied`, the allocator logs `Allocate ports on any any`, and every
+/// port is created on the wildcard network
+/// `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999. Granting
 /// camera/microphone is what a user does before a call, and it is
 /// what the six matrix rows do.
+///
+/// **What that costs is candidate CLASSES, not reachability.** A
+/// wildcard port still binds `0.0.0.0` and still receives; measured
+/// in run 35182320241, the permission-free pair reached the STUN
+/// endpoint, gathered srflx on both sides and landed `direct`
+/// (S6_REPORT.md §11.8). What enumeration denial removes is the real
+/// host candidate — replaced by an mDNS `<uuid>.local` name — and the
+/// IPv6 leg, whose wildcard port logs `STUN server address is
+/// incompatible` and has its host candidate discarded by the filter.
+/// Neither is a candidate class that solves a NAT'd pair, which is
+/// why the boundary is invisible on this topology.
 ///
 /// A row that runs with `None` is therefore measuring something the
 /// granted rows cannot: whether the PRODUCT works in an ordinary
@@ -240,6 +252,67 @@ impl Media {
 impl fmt::Display for Media {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.flag())
+    }
+}
+
+/// What a row does with **Chromium's interface enumeration**: require
+/// it, or record it.
+///
+/// Derived from `media` rather than stored, because it is not an
+/// independent axis: `FilteringNetworkManager` gates the network list
+/// on a media permission and nothing else in this harness touches it.
+/// Firefox has no enumerator stage and logs no `Net[…]` at all, so
+/// this is a Chromium-only field and asserting anything about nICEr
+/// here would assert nothing.
+///
+/// **The two arms are not two strengths of the same check.** They are
+/// different KINDS of statement, and keeping them apart is the whole
+/// reason this lives in the table:
+///
+/// * `Required` — the granted rows. A port on a real named network is
+///   a *precondition of the environment those rows were built for*,
+///   and a Chromium tab that lost enumeration otherwise reports an
+///   indistinguishable ICE timeout sixty seconds later. That
+///   guardrail is what named §6.12's cause in one line, and it is
+///   unchanged, verbatim, here.
+///
+/// * `Observed` — the permission-free rows. `real == 0` is the
+///   *explanatory observation*, not the outcome under investigation.
+///   Asserting it would pin a Chromium build's gating policy as
+///   though it were a promise of this product, and a row that failed
+///   because a future Chromium stopped gating would be reporting a
+///   browser change as a product regression. So the counts are
+///   recorded into the verdict verbatim and the row is decided by
+///   what it is actually about: authenticated application delivery.
+///
+/// §11.8 is why the second arm is not a relaxation of the first. It
+/// measured a pair whose tabs both logged `permission status: denied`
+/// and allocated only wildcard ports, and which still reached the
+/// STUN endpoint, gathered srflx, solved `direct` and delivered
+/// nonce-correlated payloads in both directions. `real == 0` is
+/// therefore demonstrably not a necessary condition for that path,
+/// and a check that treated it as one would refuse a working
+/// measurement.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Enumeration {
+    /// At least one port on a real named network
+    /// (`Net[eth0:192.168.10x.x/24:Ethernet:id=1]`) is REQUIRED, and
+    /// a row without one is refused.
+    Required,
+    /// Whatever the allocator did is RECORDED into the verdict and
+    /// the row is not decided by it.
+    Observed,
+}
+
+impl Enumeration {
+    /// Whether counts read off one Chromium tab's allocator log
+    /// satisfy this row. `Observed` is satisfied by anything: it is a
+    /// record, not a criterion.
+    pub fn satisfied_by(self, real: u64) -> bool {
+        match self {
+            Self::Required => real > 0,
+            Self::Observed => true,
+        }
     }
 }
 
@@ -355,6 +428,19 @@ impl Row {
             Disposition::Relayed => Forwarding::Carried,
         }
     }
+
+    /// What this row does with Chromium's interface enumeration:
+    /// `Required` wherever the grant was made, `Observed` on the
+    /// permission-free legs. Chromium tabs only.
+    ///
+    /// See [`Enumeration`] for why those are two different kinds of
+    /// statement rather than two strengths of one check.
+    pub fn enumeration(&self) -> Enumeration {
+        match self.media {
+            Media::Granted => Enumeration::Required,
+            Media::None => Enumeration::Observed,
+        }
+    }
 }
 
 /// The six rows, in the brief's order.
@@ -441,10 +527,12 @@ pub const CONTROL: Row = Row {
     media: Media::None,
 };
 
-/// The permission-free leg: **row 1 again, with nothing granted.**
+/// The permission-free leg: **row 1 again, with nothing granted —
+/// and it lands `direct`.**
 ///
-/// Kyra's E1 third item. The six Chromium matrix rows all grant the
-/// page's origin camera and microphone before it opens,
+/// Kyra's E1 third item, and now answered by measurement rather than
+/// by reading the product's source. The six Chromium matrix rows all
+/// grant the page's origin camera and microphone before it opens,
 /// because Chromium withholds its interface enumeration from WebRTC
 /// until a media permission exists (§6.12). "The product calls no
 /// media API" is true, is source evidence, and is NOT a measurement
@@ -453,27 +541,93 @@ pub const CONTROL: Row = Row {
 /// happened to be fixed by the grant.
 ///
 /// So this row is the same NAT pair, the same engine and the same
-/// expected disposition as row 1 — one variable, the grant — and it
-/// runs behind the real NATs rather than on loopback, because the
+/// disposition as row 1 — one variable, the grant — and it runs
+/// behind the real NATs rather than on loopback, because the
 /// enumeration this measures is what a non-loopback candidate needs.
-/// A row that lands `direct` here says the product works with
-/// ordinary defaults; a row that lands anything else is a real
-/// finding about what the product requires of its browsing context,
-/// which is the answer either way.
+///
+/// **What it measured** (run 35182320241, S6_REPORT.md §11.8): both
+/// tabs logged `permission status: denied` and `Allocate ports on
+/// any any`, `real=0 wildcard=117`/`157`, and both halves of the
+/// dialog still typed `direct` — leaf ledgers `attempted=2 direct=2`,
+/// both nonces delivered, the anchor's per-pair application
+/// forwarding FLAT in both directions, and a replied two-way UDP flow
+/// between the two public addresses in BOTH gateways' conntrack. The
+/// wildcard port binds `0.0.0.0`, reaches the STUN endpoint and
+/// gathers srflx; what the denial costs is the real host candidate
+/// (an mDNS `.local` name instead) and the IPv6 leg, and neither of
+/// those is what solves a NAT'd pair.
+///
+/// **Scope.** That is one Chromium build, one IP-handling policy and
+/// one topology (two address-restricted cone gateways, srflx against
+/// the anchor's announced STUN endpoint). It licenses exactly this:
+/// on the tested configuration the media grant is not a prerequisite
+/// for a data-only Net application. It does NOT license a universal
+/// claim about Chromium data-only WebRTC, and it does not retire the
+/// observation that the grant WAS a material part of the environment
+/// the six matrix rows were measured in.
+///
+/// The `real=0` observation is therefore RECORDED into the verdict
+/// rather than asserted (see [`Enumeration`]): pinning it would make
+/// a future Chromium that stopped gating look like a regression in
+/// this product, and §11.8 already shows it is not a necessary
+/// condition for the path that worked.
 pub const NO_MEDIA: Row = Row {
     scenario: "browser_cone_cone_nomedia",
     nat_a: Nat::ConeAr,
     nat_b: Nat::ConeAr,
     expect: Disposition::Direct,
-    why: "row 1 with no camera/microphone grant — an ordinary browsing context, product \
-          defaults, behind the same two NATs",
+    why: "row 1 with no camera/microphone grant: enumeration is denied and the ports are \
+          wildcard, and the srflx pair a NAT'd row needs is gathered and solved anyway",
+    media: Media::None,
+};
+
+/// The permission-free **ROUTED** leg: `symmetric × symmetric` again,
+/// with nothing granted.
+///
+/// [`NO_MEDIA`] answers whether an ungranted pair goes DIRECT. It
+/// cannot answer whether an ungranted pair can use Net's routed path,
+/// and the reason is structural rather than incidental: on a row that
+/// solves direct the anchor's per-pair application counter is
+/// **flat by design** — that flatness is the direct row's own
+/// assertion ([`Row::pair_forwarding`]) — so a direct row is exactly
+/// the shape that cannot witness forwarding.
+///
+/// And the fallback is the half that most needs witnessing, because
+/// **Net's routed path is not TURN.** It rides each leaf's own
+/// authenticated session with the anchor rather than a relay
+/// allocation, so "it falls back to the anchor" is a claim about
+/// leaf-to-anchor application delivery. A row that reported it
+/// without measuring it would be reporting nothing: if the anchor hop
+/// were the thing a denied enumeration broke, there would be no
+/// fallback to fall back to.
+///
+/// `symmetric × symmetric` is the pair ICE cannot solve — neither
+/// side can predict the other's mapping — so it drives the routed
+/// path deliberately, and it does so with the instrument the granted
+/// relayed rows already use and this slice already asserts: both
+/// nonces observed by the RECEIVER that did not mint them, and the
+/// anchor's own per-pair application counter moving in BOTH
+/// directions across the exchange ([`Forwarding::Carried`]). No new
+/// witness, no widened deadline, no weakened assertion — the one
+/// variable against `browser_symmetric_symmetric` is the grant.
+pub const NO_MEDIA_RELAYED: Row = Row {
+    scenario: "browser_symmetric_symmetric_nomedia",
+    nat_a: Nat::Symmetric,
+    nat_b: Nat::Symmetric,
+    expect: Disposition::Relayed,
+    why: "the relayed row with no camera/microphone grant — whether Net's anchor-routed \
+          path, which is not TURN and depends on a working leaf-to-anchor session, carries \
+          application bytes for a page that was never asked for a media permission",
     media: Media::None,
 };
 
 /// Every scenario this slice defines: the six rows, the Firefox
-/// control, then the permission-free leg.
+/// control, then the two permission-free legs — direct and routed.
 pub fn all_scenarios() -> Vec<Row> {
-    ROWS.iter().copied().chain([CONTROL, NO_MEDIA]).collect()
+    ROWS.iter()
+        .copied()
+        .chain([CONTROL, NO_MEDIA, NO_MEDIA_RELAYED])
+        .collect()
 }
 
 // =========================================================================

@@ -130,8 +130,8 @@ jobs:
             grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
               echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
           done
-          grep -q "^test result: ok. 38 passed" /tmp/natsim_rows.log || {
-            echo "::error::expected 38 matrix-table witnesses"; exit 1; }
+          grep -q "^test result: ok. 40 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 40 matrix-table witnesses"; exit 1; }
 
       # The repo root resolves `stable`; `net/crates/net/**` resolves the
       # PINNED toolchain from `rust-toolchain.toml`, and they are separate
@@ -222,6 +222,7 @@ jobs:
           natsim_browser_cone_cone_is_direct_on_firefox
           natsim_browser_cone_cone_is_direct_without_media_permission
           natsim_natted_anchor_publishes_both_mapped_endpoints
+          natsim_browser_symmetric_symmetric_is_relayed_without_media_permission
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "NAT conformance rows" --mode fn \
@@ -235,8 +236,8 @@ jobs:
           # (the granted camera/microphone was part of the measured
           # environment, not of the product) and the NAT'd anchor that
           # observes BOTH of its mapped endpoints answering.
-          if [ "${ran:-0}" -lt 15 ]; then
-            echo "::error::natsim ran ${ran:-0} scenarios, floor is 15 — \
+          if [ "${ran:-0}" -lt 16 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 16 — \
           lower the floor deliberately or restore the row"
             exit 1
           fi

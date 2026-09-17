@@ -129,7 +129,7 @@ use net_sdk::identity::Identity;
 use net_sdk::rtc_bootstrap::{serve_bootstrap, BootstrapConfig, BootstrapTls};
 
 use driver::Driver;
-use rows::{Disposition, IceCounters, Row};
+use rows::{Disposition, Enumeration, IceCounters, Row};
 
 /// The transport trust domain's PSK — one value for the anchor and
 /// every credential this run mints.
@@ -911,6 +911,12 @@ struct Verdict {
     /// row's own `media` field is asserted against. Empty until both
     /// pages have opened.
     media: String,
+    /// What each Chromium tab's allocator enumerated, per tab:
+    /// `{"real":N,"wildcard":N,"nets":[…]}`. Recorded on every path
+    /// because it is the row's `Enumeration` witness — load-bearing
+    /// in both directions (`rows.rs`), and for the permission-free
+    /// row it is the finding itself.
+    enumeration: serde_json::Value,
     app: AppExchangeReport,
 }
 
@@ -938,6 +944,7 @@ impl Verdict {
             // runner that echoed its own flag here could not detect a
             // driver that ignored it.
             "media": self.media,
+            "enumeration": self.enumeration,
             "app": self.app.to_json(),
             "a": self.a.to_json(),
             "b": self.b.to_json(),
@@ -1481,34 +1488,88 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     }
     let networks_a = driver_a.shutdown().await;
     let networks_b = driver_b.shutdown().await;
-    // THE CHROMIUM-BEHIND-NAT PRECONDITION, pinned (§6.12).
+    // THE CHROMIUM ENUMERATION OBSERVATION — REQUIRED of a granted
+    // row (§6.12), RECORDED on a permission-free one (§11.8).
     //
-    // A Chromium row whose ports were allocated on
-    // `Net[any:0.0.0.x/0:Wildcard:id=0]` at cost 999 enumerated ZERO
-    // interfaces, and a wildcard port drops every inbound datagram
-    // before STUN parsing. The inverse fact is a port on a real named
-    // network — `Net[eth0:192.168.10x.x/24:Ethernet:id=1]` — and it is
-    // REQUIRED of every Chromium tab here rather than hoped for, so a
-    // row that loses interface enumeration fails naming it instead of
-    // failing sixty seconds later as an indistinguishable ICE timeout.
+    // `Row::enumeration()` derives the arm from the row's own `media`
+    // field, so the split is one lookup in the table rather than a
+    // policy this loop invents. The two arms are different KINDS of
+    // statement, not two strengths of one check:
+    //
+    // * GRANTED rows: a port on `Net[eth0:192.168.10x.x/24:…]` is
+    //   REQUIRED and the refusal below is unchanged, verbatim. A
+    //   Chromium row that loses interface enumeration otherwise
+    //   reports an ICE timeout sixty seconds later, indistinguishable
+    //   from a real ICE failure; that one line is what diagnosed
+    //   §6.12 and nothing here weakens it.
+    //
+    // * PERMISSION-FREE rows: `real=0 wildcard=N` is the EXPLANATORY
+    //   OBSERVATION, not the outcome under investigation, and the row
+    //   is decided by authenticated application delivery instead.
+    //   Refusing on it would (a) pin one Chromium build's gating
+    //   policy as though it were a promise of this product, and (b)
+    //   discard a measurement that §11.8 shows is a WORKING one: a
+    //   denied, wildcard-allocated pair reached the STUN endpoint,
+    //   gathered srflx, solved `direct` and delivered nonces both
+    //   ways. The observation is kept — in the verdict, verbatim, on
+    //   every path — rather than erased or promoted to a criterion.
+    //
+    // Firefox's nICEr has no enumerator stage and logs no `Net[…]` at
+    // all; requiring one of it would assert nothing.
+    let mut enumeration = serde_json::Map::new();
     for (tab, engine, nets) in [
         ("a", m.engine_a.as_str(), &networks_a),
         ("b", m.engine_b.as_str(), &networks_b),
     ] {
-        // Firefox's nICEr has no enumerator stage and logs no
-        // `Net[…]` at all; requiring one of it would assert nothing.
         if engine != "chromium" {
             continue;
         }
-        if nets.real == 0 {
+        enumeration.insert(
+            tab.to_owned(),
+            serde_json::json!({
+                "real": nets.real,
+                "wildcard": nets.wildcard,
+                "nets": nets.nets,
+                // Which arm of the table this tab was read under, so
+                // the artifact says whether the numbers beside it
+                // were a criterion or a record.
+                "expectation": match row.enumeration() {
+                    Enumeration::Required => "required",
+                    Enumeration::Observed => "observed",
+                },
+            }),
+        );
+        if !row.enumeration().satisfied_by(nets.real) {
+            // The CRITERION is unchanged: `real > 0`, of every
+            // Chromium tab on a granted row. The causal clause is
+            // corrected — §11.8 measured a wildcard-allocated pair
+            // delivering application payloads, so "every inbound
+            // datagram is dropped before STUN parsing" is not a
+            // statement this harness can make. What is left is the
+            // observation and the environment the row was built for.
             verdict.errors.push(format!(
                 "tab {tab}: {engine} allocated no port on an enumerated network \
-                 (real={} wildcard={} nets={:?}) — interface enumeration is OFF, so every \
-                 inbound datagram is dropped before STUN parsing (S6_REPORT.md §6.12)",
+                 (real={} wildcard={} nets={:?}) — this row grants camera+microphone and \
+                 REQUIRES the enumerated interfaces that grant produces; a tab that lost \
+                 them is not the environment it was built for (S6_REPORT.md §6.12, and \
+                 §11.8 for why the permission-free rows record this instead)",
                 nets.real, nets.wildcard, nets.nets
             ));
         }
+        if matches!(row.enumeration(), Enumeration::Observed) {
+            println!(
+                "[runner] tab {tab}: {engine} ran permission-free and allocated real={} \
+                 wildcard={} nets={:?} — RECORDED, not required; this row is decided by \
+                 authenticated application delivery (S6_REPORT.md §11.8)",
+                nets.real, nets.wildcard, nets.nets
+            );
+        }
     }
+    // Written on every path, pass or fail: for a permission-free row
+    // these counters ARE the finding, beside whatever disposition the
+    // row reached, so the row's own artifact has to carry them rather
+    // than leaving them in a runner log the report cannot cite.
+    verdict.enumeration = serde_json::Value::Object(enumeration);
     for mut child in page_children {
         let _ = child.kill().await;
     }

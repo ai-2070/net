@@ -21,8 +21,8 @@
 mod rows;
 
 use rows::{
-    AppExchange, Disposition, Forwarding, IceCounters, Media, Nat, NatFlows, Row, RowVerdict,
-    CONTROL, NO_MEDIA, ROWS,
+    all_scenarios, AppExchange, Disposition, Enumeration, Forwarding, IceCounters, Media, Nat,
+    NatFlows, Row, RowVerdict, CONTROL, NO_MEDIA, NO_MEDIA_RELAYED, ROWS,
 };
 
 // =========================================================================
@@ -95,6 +95,94 @@ fn the_permission_free_leg_is_row_one_with_only_the_grant_removed() {
     assert_eq!(CONTROL.media, Media::None);
 }
 
+/// The permission-free ROUTED leg is the relayed row with ONE
+/// variable: the grant.
+///
+/// It exists because the direct leg structurally cannot answer the
+/// routed question — a direct row asserts the anchor's per-pair
+/// forwarding counter is FLAT, so it is the one shape that cannot
+/// witness forwarding. If this row drifted off `Relayed`, or off the
+/// symmetric pair ICE genuinely cannot solve, it would stop driving
+/// the routed path and the fallback would go unmeasured while
+/// appearing to be covered.
+#[test]
+fn the_permission_free_routed_leg_is_the_relayed_row_with_only_the_grant_removed() {
+    let relayed = ROWS[5];
+    assert_eq!(
+        (
+            NO_MEDIA_RELAYED.nat_a,
+            NO_MEDIA_RELAYED.nat_b,
+            NO_MEDIA_RELAYED.expect
+        ),
+        (relayed.nat_a, relayed.nat_b, relayed.expect),
+        "the permission-free routed leg must be the SAME symmetric pair and expectation"
+    );
+    assert_eq!(relayed.media, Media::Granted);
+    assert_eq!(NO_MEDIA_RELAYED.media, Media::None);
+    assert_ne!(NO_MEDIA_RELAYED.scenario, relayed.scenario);
+    assert_eq!(
+        NO_MEDIA_RELAYED.pair_forwarding(),
+        Forwarding::Carried,
+        "and it must require the anchor to have CARRIED the application bytes — a routed leg \
+         that expected flat forwarding would witness nothing"
+    );
+    assert_eq!(
+        NO_MEDIA.pair_forwarding(),
+        Forwarding::Flat,
+        "while the direct leg requires them NOT to have been carried, which is exactly why it \
+         cannot answer the routed question and this row has to exist"
+    );
+}
+
+/// Interface enumeration is REQUIRED of a granted Chromium row and
+/// merely RECORDED on a permission-free one — and the runner reads
+/// exactly this predicate.
+///
+/// The asymmetry is the finding, so it is pinned rather than left to
+/// a comment. Requiring `real > 0` of a granted row is what named
+/// §6.12's cause in one line instead of a sixty-second ICE timeout.
+/// Requiring it of a permission-free row would refuse the very
+/// measurement that row exists to take: §11.8 observed both tabs at
+/// `real=0`, on wildcard ports, reaching the STUN endpoint, solving
+/// `direct` and delivering nonce-correlated payloads both ways. A
+/// flip in either direction is a silent change of subject.
+#[test]
+fn enumeration_is_required_where_the_grant_was_made_and_recorded_where_it_was_not() {
+    for row in all_scenarios() {
+        let required = row.enumeration() == Enumeration::Required;
+        assert_eq!(
+            required,
+            row.media == Media::Granted,
+            "row {}: media {} must map to {}",
+            row.scenario,
+            row.media,
+            if row.media == Media::Granted {
+                "Enumeration::Required"
+            } else {
+                "Enumeration::Observed"
+            }
+        );
+        // The predicate itself, as the runner calls it: a tab that
+        // allocated nothing on a named network.
+        assert_eq!(
+            row.enumeration().satisfied_by(0),
+            !required,
+            "row {}: real=0 must be {} here",
+            row.scenario,
+            if required { "a refusal" } else { "acceptable" }
+        );
+        // …and a tab that did enumerate is acceptable on EVERY row.
+        // The permission-free legs record the observation instead of
+        // asserting its inverse, so a Chromium that stopped gating
+        // does not become a product regression.
+        assert!(
+            row.enumeration().satisfied_by(1),
+            "row {}: a tab that enumerated must never be refused",
+            row.scenario
+        );
+    }
+}
+
 /// The seam this whole file exists for: `run_scenario.sh` carries its
 /// own copy of the matrix (it has to — it provisions the topology),
 /// and nothing but this test stops the two from drifting.
@@ -157,9 +245,17 @@ fn run_scenario_matrix_matches_the_rust_table() {
         "the control runs Firefox on BOTH sides — a mixed pair would not say which engine's ICE \
          stack was responsible for a failure"
     );
-    // Exactly one Chromium leg withholds the grant. Two would be two
-    // readings of the same question at twice the runtime; none is the
-    // gap Kyra's E1 named.
+    // The Chromium legs that withhold the grant, by NAME and in
+    // order. TWO, and they are not two readings of one question:
+    // `NO_MEDIA` asks whether an ungranted pair goes DIRECT, and a
+    // direct row's anchor forwarding counter is flat BY ASSERTION, so
+    // it structurally cannot witness the routed path.
+    // `NO_MEDIA_RELAYED` asks the other half — whether Net's
+    // anchor-routed fallback, which is not TURN and rides each leaf's
+    // authenticated anchor session, carries application bytes for a
+    // page that was never asked for a media permission. Pinned as an
+    // exact set so a third cannot arrive unexamined and neither can
+    // disappear.
     let ungranted: Vec<&str> = arms
         .iter()
         .filter(|a| a.media == "none" && a.engine_a == "chromium")
@@ -167,8 +263,10 @@ fn run_scenario_matrix_matches_the_rust_table() {
         .collect();
     assert_eq!(
         ungranted,
-        vec![NO_MEDIA.scenario],
-        "exactly one Chromium scenario runs permission-free, and it is the leg"
+        vec![NO_MEDIA.scenario, NO_MEDIA_RELAYED.scenario],
+        "exactly two Chromium scenarios run permission-free — the direct leg and the routed \
+         leg — because a direct row cannot witness forwarding and a routed row is the only \
+         thing that measures the fallback"
     );
 }
 
