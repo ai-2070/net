@@ -31,6 +31,37 @@ has its own memory, and inlining would imply a shared context that doesn't
 exist. Put the context in [Dataforts](/docs/guides/dataforts) and hand over the
 refs.
 
+And it is enforced, not merely advised: a brief is refused locally if its
+encoded form exceeds `A2A_MAX_BRIEF_BYTES` (~1.7 KB). That ceiling is far below
+the nRPC body cap because the A2A wire carries its payload inside a JSON
+array-of-bytes envelope, which costs up to four bytes per payload byte, and one
+mesh packet is 8 KiB. An over-large request is not refused by the far side — it
+overflows the packet and is never delivered at all — so the check happens before
+anything is sent, and a configured service may not even announce a
+`max_prompt_bytes` above the limit (`ServeError::A2aUndeliverableBounds`).
+
+A long prompt is therefore a design signal: put the bulk in an artifact ref,
+which is what briefs carry refs for.
+
+## Control calls are bounded in time
+
+Every A2A verb — submit, status, cancel, describe, prepare — is a short control
+call, and each carries a hard `A2A_CALL_TIMEOUT` (30s). The *task* stays
+unbounded; only the round trip is bounded.
+
+This matters because a request delivered to a live service whose handler never
+answers would otherwise park the caller permanently: `CallOptions::deadline`
+defaults to "wait forever". An expired deadline is `A2aFlowError::Timeout`,
+which says **unknown**, not failed — so retry it. Every verb is idempotent per
+`(owner, task id)`, and a submit that did land answers with the existing task
+rather than starting a second run.
+
+The same bound applies to the payment channel: an unanswered `pay` becomes a
+*retryable* channel error, which is what moves a durable purchase attempt to
+`unknown` (resumable by re-sending the identical stored payload) instead of
+claiming a payment did not happen after its authorization already left the
+process.
+
 ## Lifecycle
 
 ```text

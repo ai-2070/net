@@ -697,7 +697,7 @@ mod provider {
         ///         "revision": "r1",
         ///         "pricing_terms": provider.pricing_terms(
         ///             "net.a2a.task/summarize", requirements_json),
-        ///         "bounds": {"max_prompt_bytes": 4096, "max_context_refs": 8,
+        ///         "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8,
         ///                    "max_tags": 8, "max_tag_bytes": 64,
         ///                    "max_in_flight": 4},
         ///         "reservation_ttl_secs": 300,

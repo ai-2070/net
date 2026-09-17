@@ -43,6 +43,34 @@ const QUOTE_REQUEST_TTL_NS: u64 = 30_000_000_000;
 /// only marginally.
 const QUOTE_REQUEST_SKEW_NS: u64 = 5_000_000_000;
 
+/// Hard deadline on a quote or pay round trip.
+///
+/// `CallOptions::deadline` defaults to `None`, which means *wait
+/// forever*. That is the wrong default here: if the provider's payment
+/// services are not registered — unserved, dropped, mid-restart — or a
+/// request is simply never delivered, a caller with no deadline blocks
+/// indefinitely and never reaches a verdict it can record. A payment
+/// that may or may not have landed must become an **observable
+/// ambiguity**, not a hang: `map_rpc_error` maps
+/// [`RpcError::Timeout`] to `retryable`, so an expired deadline on
+/// `pay` surfaces as a retryable channel error and the caller's
+/// durable attempt records `Unknown` — resumable by re-sending the
+/// identical stored payload.
+///
+/// Matched to [`QUOTE_REQUEST_TTL_NS`]: waiting longer than a request
+/// stays valid cannot help, because the provider would refuse it as
+/// stale anyway.
+const PAYMENT_CALL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_nanos(QUOTE_REQUEST_TTL_NS);
+
+/// Typed call options carrying [`PAYMENT_CALL_TIMEOUT`] as a hard
+/// deadline, stamped fresh per call.
+fn bounded_call() -> net_sdk::mesh_rpc::CallOptionsTyped {
+    let mut opts = net_sdk::mesh_rpc::CallOptionsTyped::default();
+    opts.raw.deadline = Some(std::time::Instant::now() + PAYMENT_CALL_TIMEOUT);
+    opts
+}
+
 /// Quote-issuance service name (nRPC; channel-safe, so `.v1` not `@1`).
 pub const QUOTE_SERVICE: &str = "net.payments.quote.v1";
 /// Payment-delivery service name.
@@ -381,7 +409,7 @@ impl ProviderChannel for MeshPaymentChannel {
                     request_b64: BASE64.encode(request_bytes),
                     template_b64: BASE64.encode(template.bytes()),
                 },
-                Default::default(),
+                bounded_call(),
             )
             .await
             .map_err(Self::map_rpc_error)?;
@@ -416,7 +444,7 @@ impl ProviderChannel for MeshPaymentChannel {
                     quote_b64: BASE64.encode(quote_bytes),
                     payload_b64: BASE64.encode(payload.bytes()),
                 },
-                Default::default(),
+                bounded_call(),
             )
             .await
             .map_err(Self::map_rpc_error)

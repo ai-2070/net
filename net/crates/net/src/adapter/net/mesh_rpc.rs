@@ -6346,6 +6346,19 @@ pub enum ServeError {
          attach terms to the descriptor, or serve it free via Mesh::serve_tool"
     )]
     MissingPricingTerms(String),
+    /// A configured A2A service announces an `A2aBounds` this wire
+    /// cannot honor: its `max_prompt_bytes` exceeds the largest brief a
+    /// request can actually carry.
+    ///
+    /// An announced bound is a promise a caller sizes its work against,
+    /// and an over-large A2A request is not refused on arrival — it
+    /// exceeds one packet and is never delivered at all, so the caller
+    /// sees a silence indistinguishable from an absent peer. Refusing at
+    /// serve time is the same discipline as
+    /// [`UnenforceablePricing`](Self::UnenforceablePricing): a term this
+    /// path cannot enforce must never reach discovery.
+    #[error("a2a service bounds cannot be honored by the wire: {0}")]
+    A2aUndeliverableBounds(String),
     /// A configured paid A2A service could not be served as
     /// configured: no admission gate, or an admission journal that is
     /// missing, unreadable, or already owned by another live holder.

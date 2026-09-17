@@ -114,7 +114,7 @@ def _handshake(connector, acceptor):
         raise errs[0]
 
 
-def _offer(pricing_terms=None, *, max_prompt_bytes=4096, reservation_ttl_secs=600):
+def _offer(pricing_terms=None, *, max_prompt_bytes=1024, reservation_ttl_secs=600):
     return {
         "revision": REVISION,
         "pricing_terms": pricing_terms,
@@ -430,6 +430,19 @@ def test_serve_a2a_configured_refuses_a_price_it_cannot_enforce(tmp_path):
             )
         assert "session_peer" in str(principal.value)
 
+        # An announced max_prompt_bytes the wire cannot carry. Refused for
+        # the same reason as an unenforceable price: the failure mode for
+        # exceeding it is a request that is never delivered rather than one
+        # that is refused, so an operator must not be able to publish the
+        # promise at all.
+        with pytest.raises(ValueError) as undeliverable:
+            provider.serve_a2a_configured(
+                cb,
+                {PAID: {**_offer(terms, max_prompt_bytes=1 << 20)}},
+                str(tmp_path / "j4b.json"),
+            )
+        assert "max_prompt_bytes" in str(undeliverable.value)
+
         # Positive control: the same catalog DOES serve.
         handle = provider.serve_a2a_configured(
             cb, {PAID: _offer(terms)}, str(tmp_path / "j5.json")
@@ -469,7 +482,7 @@ try:
     offer = {
         "revision": "r1",
         "pricing_terms": terms,
-        "bounds": {"max_prompt_bytes": 4096, "max_context_refs": 8, "max_tags": 8,
+        "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8, "max_tags": 8,
                    "max_tag_bytes": 64, "max_in_flight": 4},
         "reservation_ttl_secs": 600,
         "reservation_retention_secs": 604800,

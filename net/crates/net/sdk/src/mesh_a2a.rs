@@ -142,6 +142,79 @@ pub const A2A_STATUS_SERVICE: &str = "net.a2a.status";
 /// The nRPC service an executor serves to cancel a task.
 pub const A2A_CANCEL_SERVICE: &str = "net.a2a.cancel";
 
+/// Hard deadline on every A2A round trip.
+///
+/// `CallOptions::deadline` defaults to `None`, which means *wait
+/// forever*. Every verb here is a short control call — submit returns an
+/// ack, not a result; status and cancel are lookups — so "forever" is
+/// never the right answer for any of them.
+///
+/// What actually parks a caller, measured rather than assumed: a request
+/// that is **delivered to a live service whose handler never answers**
+/// (a wedged executor, a handler blocked on a dead dependency), or one
+/// never delivered at all because it exceeded a packet — the defect
+/// [`A2A_MAX_BRIEF_BYTES`] now prevents. A peer that serves no A2A
+/// service at all is *not* this case: it fails fast with a no-route
+/// error, because the reply channel is unknown.
+///
+/// The *task* is still unbounded — that is the point of A2A. Only the
+/// control round trip is bounded, and an expired one is
+/// [`A2aFlowError::Timeout`], which a caller can retry: every verb here
+/// is idempotent per `(owner, task id)`.
+pub const A2A_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The largest [`TaskBrief::encode`] output that can actually cross the
+/// wire, in bytes.
+///
+/// **Why a brief has a limit far below the nRPC body cap.** The A2A wire
+/// carries its payload inside a JSON *array-of-bytes* envelope (the
+/// `call_typed` shape with `Req = Resp = Vec<u8>`, spoken by the Node and
+/// Python bindings and by every peer on an older build). That encoding
+/// costs up to **four bytes per payload byte** — `255,` — so an encoded
+/// brief is quadrupled before it is framed. nRPC would accept 4 MiB, but
+/// one mesh packet is `MAX_PACKET_SIZE` (8 KiB), and a request that does not
+/// fit is never delivered: before this limit existed, a brief with a
+/// ~2 KB prompt simply vanished and the caller — with no deadline — waited
+/// for a reply that could never come.
+///
+/// Derived from the transport rather than guessed: the per-packet
+/// payload budget, less a reserve for the nRPC request framing that
+/// shares the packet (service name, call id, and the payment headers a
+/// paid submit carries), divided by the envelope's worst-case expansion.
+///
+/// **A brief over this limit is refused locally**
+/// ([`A2aFlowError::BriefTooLarge`]) and a configured service may not
+/// announce a `max_prompt_bytes` above it
+/// (`ServeError::A2aUndeliverableBounds`). Work that needs more room
+/// belongs in a context artifact ref, which is what briefs carry refs
+/// for.
+pub const A2A_MAX_BRIEF_BYTES: usize =
+    (A2A_PACKET_PAYLOAD_BUDGET - A2A_FRAMING_RESERVE) / JSON_BYTE_ARRAY_COST;
+
+/// Bytes of application payload one mesh packet carries:
+/// `MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE` from the core protocol.
+///
+/// **Mirrored, not imported** — core's `protocol` module is private, and
+/// widening its public surface to publish two numbers would be a worse
+/// trade than copying them. A mirrored constant can drift, so it is not
+/// left to trust: `a_brief_at_the_wire_limit_round_trips` sends a brief
+/// of exactly [`A2A_MAX_BRIEF_BYTES`] over a real two-node wire, so a
+/// shrinking packet budget fails that witness instead of silently
+/// reintroducing vanished requests.
+const A2A_PACKET_PAYLOAD_BUDGET: usize = 8192 - 68 - 16;
+
+/// Worst-case bytes the array-of-bytes envelope spends per payload byte:
+/// three digits and a separator (`255,`).
+const JSON_BYTE_ARRAY_COST: usize = 4;
+
+/// Packet budget held back for everything that rides beside the body in
+/// one request: the nRPC frame's own fields, the longest A2A service
+/// name, and a paid submit's two payment headers (a quote id and a
+/// 64-byte signature). Generous on purpose — the cost of reserving too
+/// much is a slightly shorter prompt, and the cost of reserving too
+/// little is a request that disappears.
+const A2A_FRAMING_RESERVE: usize = 1024;
+
 /// Errors from the requester-side A2A flow.
 #[derive(Debug, thiserror::Error)]
 pub enum A2aFlowError {
@@ -168,12 +241,75 @@ pub enum A2aFlowError {
         /// The structured verdict, when the provider sent exactly one.
         schematic: Option<Box<FailureSchematic>>,
     },
+    /// The round trip outran [`A2A_CALL_TIMEOUT`]. Distinct from
+    /// [`Transport`](Self::Transport) because it says something
+    /// different: the request may or may not have arrived, so the
+    /// outcome is *unknown* rather than failed. Every A2A verb is
+    /// idempotent per `(owner, task id)`, so retrying is safe — a submit
+    /// that did land answers `Existing` rather than starting a second
+    /// run.
+    #[error("a2a call timed out after {}s", A2A_CALL_TIMEOUT.as_secs())]
+    Timeout,
+    /// The encoded brief is too large to cross the wire, refused
+    /// **locally** before any packet was sent.
+    ///
+    /// Failing here rather than on the wire is the whole point: an
+    /// over-large request is not delivered and not refused, it simply
+    /// disappears, which is indistinguishable from a peer that never
+    /// answers. See [`A2A_MAX_BRIEF_BYTES`] for why the ceiling is what
+    /// it is.
+    #[error(
+        "a2a brief is {encoded} bytes encoded, over the {limit}-byte wire limit — \
+         shorten the prompt or move the bulk into a context artifact ref"
+    )]
+    BriefTooLarge {
+        /// `TaskBrief::encode().len()`.
+        encoded: usize,
+        /// [`A2A_MAX_BRIEF_BYTES`].
+        limit: usize,
+    },
 }
 
 /// Encode a task id as a request body (a JSON string). One place so the status
 /// and cancel services agree with their callers.
 fn task_ref_bytes(task_id: &str) -> Vec<u8> {
     serde_json::to_vec(task_id).unwrap_or_default()
+}
+
+/// Typed call options carrying [`A2A_CALL_TIMEOUT`] as a hard deadline,
+/// stamped fresh per call. One place, so no A2A verb can be written
+/// without a bound by forgetting to add one.
+fn bounded_typed() -> CallOptionsTyped {
+    let mut opts = CallOptionsTyped::default();
+    opts.raw.deadline = Some(std::time::Instant::now() + A2A_CALL_TIMEOUT);
+    opts
+}
+
+/// Map a client-side RPC failure, keeping a timeout distinguishable from
+/// a hard transport error: the first leaves the outcome unknown and is
+/// safe to retry, the second does not.
+fn map_call_err(e: RpcError) -> A2aFlowError {
+    match e {
+        RpcError::Timeout { .. } => A2aFlowError::Timeout,
+        other => A2aFlowError::Transport(format!("call: {other}")),
+    }
+}
+
+/// Refuse a brief that cannot cross the wire, before a packet is sent.
+///
+/// The encoded brief — not the prompt — is what gets quadrupled by the
+/// array-of-bytes envelope, so the check is on `encode()`: context refs,
+/// tags and the service fields all count, and a caller cannot evade the
+/// limit by splitting a long prompt into many refs.
+fn check_brief(brief: &TaskBrief) -> Result<Vec<u8>, A2aFlowError> {
+    let encoded = brief.encode();
+    if encoded.len() > A2A_MAX_BRIEF_BYTES {
+        return Err(A2aFlowError::BriefTooLarge {
+            encoded: encoded.len(),
+            limit: A2A_MAX_BRIEF_BYTES,
+        });
+    }
+    Ok(encoded)
 }
 
 /// The owner a request is attributed to.
@@ -1694,6 +1830,15 @@ impl Mesh {
                 }
                 _ => {}
             }
+            if offer.bounds.max_prompt_bytes > A2A_MAX_BRIEF_BYTES as u64 {
+                return Err(ServeError::A2aUndeliverableBounds(format!(
+                    "service {id:?} announces max_prompt_bytes {} but a brief larger than \
+                     {A2A_MAX_BRIEF_BYTES} bytes encoded cannot cross the wire — a caller \
+                     sizing its work against that bound would send a request that is never \
+                     delivered rather than one that is refused",
+                    offer.bounds.max_prompt_bytes
+                )));
+            }
         }
         if paid_any && config.payment.is_none() {
             return Err(ServeError::A2aPaidMisconfigured(
@@ -1855,11 +2000,11 @@ impl Mesh {
             .call_typed(
                 target_node_id,
                 A2A_TASK_SERVICE,
-                &brief.encode(),
-                CallOptionsTyped::default(),
+                &check_brief(brief)?,
+                bounded_typed(),
             )
             .await
-            .map_err(|e| A2aFlowError::Transport(format!("call: {e}")))?;
+            .map_err(map_call_err)?;
         TaskAck::decode(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
     }
 
@@ -1876,10 +2021,10 @@ impl Mesh {
                 target_node_id,
                 A2A_STATUS_SERVICE,
                 &task_ref_bytes(task_id),
-                CallOptionsTyped::default(),
+                bounded_typed(),
             )
             .await
-            .map_err(|e| A2aFlowError::Transport(format!("call: {e}")))?;
+            .map_err(map_call_err)?;
         serde_json::from_slice(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
     }
 
@@ -1897,10 +2042,10 @@ impl Mesh {
                 target_node_id,
                 A2A_CANCEL_SERVICE,
                 &task_ref_bytes(task_id),
-                CallOptionsTyped::default(),
+                bounded_typed(),
             )
             .await
-            .map_err(|e| A2aFlowError::Transport(format!("call: {e}")))?;
+            .map_err(map_call_err)?;
         serde_json::from_slice(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
     }
 
@@ -1921,10 +2066,10 @@ impl Mesh {
                 target_node_id,
                 A2A_DESCRIBE_SERVICE,
                 &Vec::<u8>::new(),
-                CallOptionsTyped::default(),
+                bounded_typed(),
             )
             .await
-            .map_err(|e| A2aFlowError::Transport(format!("call: {e}")))?;
+            .map_err(map_call_err)?;
         serde_json::from_slice(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
     }
 
@@ -1954,11 +2099,11 @@ impl Mesh {
             .call_typed(
                 target_node_id,
                 A2A_PREPARE_SERVICE,
-                &brief.encode(),
-                CallOptionsTyped::default(),
+                &check_brief(brief)?,
+                bounded_typed(),
             )
             .await
-            .map_err(|e| A2aFlowError::Transport(format!("call: {e}")))?;
+            .map_err(map_call_err)?;
         PrepareReply::decode(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
     }
 
@@ -1990,11 +2135,14 @@ impl Mesh {
         // by peers on older builds. Dropping to the raw path to read a
         // reply header must not change the bytes on the wire, so the
         // envelope is applied here by hand.
-        let body = serde_json::to_vec(&prepared.brief.encode())
+        let body = serde_json::to_vec(&check_brief(&prepared.brief)?)
             .map_err(|e| A2aFlowError::Decode(format!("encode brief: {e}")))?;
-        let opts = CallOptions::default()
-            .with_request_header(HDR_PAYMENT_QUOTE, proof.quote_id.clone().into_bytes())
-            .with_request_header(HDR_PAYMENT_BINDING, proof.binding_sig.clone());
+        let opts = CallOptions {
+            deadline: Some(std::time::Instant::now() + A2A_CALL_TIMEOUT),
+            ..CallOptions::default()
+        }
+        .with_request_header(HDR_PAYMENT_QUOTE, proof.quote_id.clone().into_bytes())
+        .with_request_header(HDR_PAYMENT_BINDING, proof.binding_sig.clone());
         let reply = match self
             .call(
                 prepared.provider_node,
@@ -2015,7 +2163,7 @@ impl Mesh {
                     schematic: schematic_of(&headers).map(Box::new),
                 });
             }
-            Err(e) => return Err(A2aFlowError::Transport(format!("call: {e}"))),
+            Err(e) => return Err(map_call_err(e)),
         };
         let envelope: Vec<u8> = serde_json::from_slice(&reply.body)
             .map_err(|e| A2aFlowError::Decode(format!("reply envelope: {e}")))?;

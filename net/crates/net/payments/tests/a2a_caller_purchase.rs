@@ -493,7 +493,7 @@ impl World {
 
 fn bounds() -> A2aBounds {
     A2aBounds {
-        max_prompt_bytes: 4096,
+        max_prompt_bytes: 1024,
         max_context_refs: 8,
         max_tags: 8,
         max_tag_bytes: 64,

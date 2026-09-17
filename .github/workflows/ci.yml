@@ -2559,6 +2559,45 @@ jobs:
             || { echo "::error::expected at least 12 admission journal witnesses executed, saw $listed"; exit 1; }
           echo "A2A admission journal: $listed executed, $pinned pinned by name, all green"
 
+      # Two defects hid behind one symptom: the A2A wire's array-of-bytes
+      # envelope quadruples a brief, so one past ~2 KB overflowed a packet and
+      # was never delivered — and because `CallOptions::deadline` defaults to
+      # `None`, the caller then waited for a reply that could not come. These
+      # witnesses pin both halves, and `a_brief_at_the_wire_limit_round_trips`
+      # additionally guards the mirrored packet-budget constant: it sends a
+      # brief of exactly the limit over a real wire, so a shrinking budget
+      # fails here instead of silently losing requests again.
+      - name: A2A — call size and deadline bounds
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_brief_at_the_wire_limit_round_trips
+            a_brief_over_the_wire_limit_is_refused_locally_and_never_sent
+            a_brief_past_the_packet_cliff_is_refused_instead_of_vanishing
+            prepare_refuses_an_over_limit_brief_before_reserving
+            a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve
+            a_delivered_request_that_is_never_answered_times_out
+            a_healthy_peer_answers_well_inside_the_deadline
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_call_bounds 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the A2A call-bounds witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_call_bounds \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 7 ] \
+            || { echo "::error::expected at least 7 A2A call-bounds witnesses executed, saw $listed"; exit 1; }
+          echo "A2A call bounds: $listed executed, $pinned pinned by name, all green"
+
       # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
       # does inside a workspace dev build: it forwards core's own `fixtures`
       # seam, and a dev-dependency used to hide the missing forwarding. This is
@@ -2705,6 +2744,41 @@ jobs:
           [ "$listed" -ge 6 ] \
             || { echo "::error::expected at least 6 task redeem witnesses executed, saw $listed"; exit 1; }
           echo "A2A task redeem: $listed executed, $pinned pinned by name, all green"
+
+      # The payment channel's own deadline. Both verbs were built with
+      # `Default::default()`, i.e. no deadline, so a request delivered to a
+      # live `net.payments.pay.v1` whose handler never replied parked the
+      # caller forever — the worst possible place for an unbounded wait, since
+      # the payload has already left the process and the ambiguity can never
+      # be recorded. The witness stages a genuinely wedged handler (an
+      # unserved service fails fast with no-route instead, which is NOT the
+      # defect) and requires a retryable verdict, which is what drives a
+      # durable attempt to `Unknown` rather than to a false "did not happen".
+      - name: A2A — payment channel deadline (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            an_unanswered_pay_times_out_retryably_instead_of_hanging
+            a_responsive_provider_answers_well_inside_the_deadline
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(payment_channel_deadline)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the payment channel deadline witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(payment_channel_deadline) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 2 ] \
+            || { echo "::error::expected at least 2 payment channel deadline witnesses executed, saw $listed"; exit 1; }
+          echo "A2A payment channel deadline: $listed executed, $pinned pinned by name, all green"
 
       # === A2A paid end to end (WS-D) ======================================
       #
