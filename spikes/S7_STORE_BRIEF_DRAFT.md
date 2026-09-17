@@ -1,6 +1,6 @@
 # Stage 7 — the browser game store: replacement brief (PROPOSAL, not authority)
 
-**Status: proposal for Kyra's review, repair round 2. This document
+**Status: proposal for Kyra's review, repair round 3. This document
 authorizes no production implementation.** It replaces the superseded
 `spikes/S7_BRIEF.md` (packaged anchor, binding parity, shared TS types),
 which must not be dispatched.
@@ -54,6 +54,23 @@ settled and unchanged.
 | R4 | Generations fenced audiences only, so a same-generation resync could roll the installed revision back or revive a retired assembly | `g` becomes the **installation generation**, allocated for every accepted replacement (join, audience, resume, resync, owner-initiated), with solicited/unsolicited admission rules | §1.7, §1.8 |
 | R5 | Renewal at "step 4 (binding)" preceded payload validation (binding is step 5, payload step 6); and a 60 s/20 s lease does not actually tolerate two losses | renewal linearizes **after full validation and acceptance**; expiry ordering stated; the two-loss claim **withdrawn** and replaced by a measurement; action refusal explicitly distinguished from read revocation | §1.6 |
 | — | Cleanup: prose said `h` is absent on a join reply (the `man` carries it) and that every caller message has `q` (`in` does not); `canonical(in)` and the digest were undefined | §1.12's per-kind table is **normative** where prose disagrees; the binding's canonical form and retention form are defined | §1.2, §1.10, §1.12 |
+
+### Repair round 3 — one bounded state-machine repair
+
+Held at `7969a585f`. No new subsystem, and the accepted codec,
+chunking, replay and lease choices are unchanged. What was missing was
+**coherence between the lifecycle states**, so the repair is a single
+explicit state machine (§1.7a) plus the admission split (§1.7b), and the
+surrounding prose now reads off it.
+
+| # | Incoherence | Repair | Where |
+|---|---|---|---|
+| S1 | `resync` described `g` as the caller's *installed* generation while the binding ladder required it to equal the owner's *current* one — so a replacement whose assembly timed out left the client unable to ask for recovery | `resync`'s `(g, have)` are **advisory historical position**. Authenticate and bind the handle; never require the caller to have installed the generation whose failed delivery prompted recovery | §1.8 |
+| S2 | Admission tested `g > installed`, which does not stop a **delayed manifest reopening an abandoned generation** that never installed | three distinct values — `installed`, `assembling`, and a **`retired` watermark** (highest ever admitted). Admission tests `g > retired`, so an abandoned generation is inadmissible for ever. Duplicate active manifests fall out of the same rule | §1.7a, §1.8 |
+| S3 | An **empty** transition slot was read as consent to an unsolicited install, so an owner emission could undo the cancellation/refusal fence promised one paragraph earlier | explicit states: only **`ready`** accepts owner refreshes; **`fenced`** is left exclusively by the caller's own next request. Equal pending callers reconciled: **one wire request and one `q` per transition**, many independently cancellable local waiters | §1.7a, §2 |
+| S4 | `aud` was refused until every chunk of the *previous* installation had been emitted, contradicting audience-change-during-synchronization — the client cleared locally and could then be refused a new view | **gameplay readiness** (`act`, `in`) is separated from **lifecycle control admission** (`aud`, `resync`, `resume`, `leave`, `alive`). A newer `aud` supersedes an in-progress installation and retires its unsent chunks; `leave` and recovery never depend on finishing the work they stop | §1.7b |
+| — | Reconnect state contradicted itself: one place retained the stale snapshot, another cleared it | **reconnect retains** (same audience, so the game keeps rendering); **an audience change clears** (visibility changed, so continuing to show it is a disclosure) | §1.6, §1.7a |
+| — | The SHA-256 path introduced an `await` inside what must be a synchronous admission | canonicalize and digest **before** the transaction, then revalidate handle/session liveness, generation and replay state; **no** captured authorization or transaction context crosses the await | §1.10 |
 
 Scope is unchanged from the plan's Stage 7
 (`docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md:2825`) and
@@ -303,7 +320,17 @@ the simpler way:
   store machinery; game code neither calls it nor is asked whether to.
 - While recovering, the view is **`reconnecting`/`stale` and not
   ready**. `getState()` keeps returning the last snapshot, marked stale;
-  no action or input is admitted (§1.12 step 4).
+  no `act`/`in` is admitted (§1.7b).
+
+  **Reconnect retains; an audience change clears.** The distinction is
+  deliberate and the two must not be collapsed: a same-audience
+  reconnect has not changed what the caller may see, so the last
+  snapshot is **retained** and marked stale — a game keeps rendering the
+  world it had while recovery runs. An audience change *has* changed
+  visibility, so the projection is **cleared** to `empty()` at request
+  time, because continuing to show data the new audience may not include
+  is a disclosure. §1.7a's transition table carries this: `reconnect`
+  retains, `setAudience` clears.
 - A successful `resume` **always establishes a fresh snapshot/live
   boundary**: a new installation generation, a `man`, its chunks, and
   validated installation before the handle is ready again. There is no
@@ -325,8 +352,9 @@ the simpler way:
 | Replica | The manifest for the **currently desired** installation has been received, every chunk assembled, the byte total matched, the assembled document validated by `state()`, and the result published as revision `r` of generation `g`. Not before; a partial or unvalidated assembly is never ready. |
 | Owner | The handle exists, is bound to this authenticated peer and incarnation, has a current generation whose manifest it has **emitted in full** (all `n` chunks handed to the transport), and has not expired. |
 
-Before ready, the owner refuses `act`/`in`/`aud` with `not-ready`. The
-two definitions are deliberately different: the owner cannot know the
+Before ready the owner refuses **gameplay** traffic (`act`, `in`) with
+`not-ready`; lifecycle controls stay admissible (§1.7b). The two
+definitions are deliberately different: the owner cannot know the
 replica installed anything, so its readiness is about what it has
 emitted, and the replica's is about what it has validated. Neither side
 infers the other's.
@@ -358,84 +386,175 @@ accepted snapshot replacement, whatever caused it.
   the caller is *currently installed at*, as context for the owner's
   projection, never as a proposal.)
 - The owner stamps `man`/`snap`/`delta` with the generation they belong
-  to. A replica **drops and counts** anything whose `g` is not its
-  current installation generation, and a **stale `man` can neither roll
-  back the installed revision nor recreate a retired assembly** (§1.8).
+  to. What a replica does with an arriving generation is **§1.7a's
+  admission rules, not a single "is it current" test**: a `man` needs
+  `g > retired`, a `snap` needs `g = assembling`, a `delta` needs
+  `g = installed`. A stale `man` can neither roll back the installed
+  revision nor reopen a retired assembly.
 
-**Local fencing happens at request time, not at acceptance.** Three
-separate moments, and conflating them is what the previous draft did:
+### 1.7a The installation state machine
 
-| Moment | What happens | Where |
+**This section is normative for admission.** Round 2 stated the three
+moments as prose and left four incoherences: a recovery request could be
+refused for naming a stale generation, an abandoned generation could be
+reopened by a late manifest, an owner emission could undo a local
+cancellation fence, and a newer audience request could be refused
+because the *previous* installation was still being emitted. One state
+machine settles all four.
+
+#### Replica state, per handle
+
+Three monotone values, and they are different things:
+
+| Value | Meaning |
+|---|---|
+| `installed` | the generation whose snapshot is published, or none |
+| `assembling` | the generation of the **open** assembly, or none |
+| `retired` | the **highest generation ever admitted**, whether or not it went on to install |
+
+`retired` is the watermark, and it is what round 2 was missing: a
+manifest is admissible only when `g > retired`, so a generation that was
+admitted and then abandoned **cannot be reopened**, even though it never
+became `installed` and therefore still satisfies `g > installed`. One
+bounded monotone number, not a tombstone collection.
+
+Four states:
+
+| State | Meaning | Unsolicited `man` |
 |---|---|---|
-| **Local intent** — `setAudience` returns / `resume` begins | The prior view is invalidated **immediately**: status → `syncing`/`stale`, the projection cleared to the definition's validated `empty()`, older waiters rejected `aborted` by their own `q`. Nothing waits for the owner. | Replica |
-| **Owner acceptance** | The owner allocates the next generation and answers `man` for it | Owner |
-| **Installation** | Only the manifest for the **currently desired** transition may become current | Replica |
+| `joining` | no view yet, a `join` in flight | **inadmissible** |
+| `ready` | a view is installed and current; accepting owner refreshes | **admissible** |
+| `installing` | a caller-initiated transition is in flight (its `q` is the slot) | **inadmissible** |
+| `fenced` | locally fenced: the previous view was invalidated and the transition then failed or was cancelled. Not ready, no view | **inadmissible** |
+| `closed` | handle gone | inadmissible |
 
-**How "currently desired" is decided, given that `q` orders nothing.**
-The replica keeps one **desired-transition slot** per handle: the `q` of
-the latest transition its own API contract has accepted from the
-application, set synchronously when the call is made. Then:
+**`fenced` is the repair for item 3.** Round 2 admitted an unsolicited
+manifest whenever "the slot is empty", and cancellation/refusal clears
+the slot — so an owner emission could silently undo the very fence the
+preceding paragraph promised. An empty slot is not consent: only `ready`
+accepts owner refreshes, and `fenced` is left **exclusively** by a new
+caller-initiated request (`aud`, `resync`, `resume`).
 
-- a solicited `man` installs **iff** its `q` equals the slot; any other
-  `q` is dropped and counted, including one for a transition the
-  application has since superseded;
-- issuing a newer transition overwrites the slot and rejects the
-  previous waiters immediately — so supersession is decided by the
-  caller's own ordering, never by comparing two random ids;
-- a **refusal** for the slot's `q` clears the slot and leaves the handle
-  non-ready with the error; a refusal for any other `q` rejects only
-  that waiter;
-- **cancellation** of the slot's only waiter clears the slot and leaves
-  the handle non-ready and fenced — it does not restore the previous
-  view, which was already invalidated at request time;
-- **reconnect** clears the slot and begins a `resume`, whose own `q`
-  becomes the slot. An in-flight pre-reconnect manifest is therefore
-  dropped on arrival, by `q` and by generation.
+#### Transitions
 
-### 1.8 Resynchronization, fenced
+| From | Event | To | Side effects |
+|---|---|---|---|
+| `ready`/`fenced` | `setAudience` accepted locally | `installing` | **immediately**: status `syncing`/`stale`, projection cleared to `empty()`, one wire `aud` with one fresh `q` as the slot |
+| `ready` | reconnect | `installing` | status `reconnecting`/`stale`; **the last snapshot is retained, not cleared** (§1.6 — the audience has not changed); one `resume`, its `q` the slot |
+| `ready` | gap / patch failure / assembly abandoned | `installing` | one `resync` carrying the **advisory** `(g, have)` of what is installed now (§1.8) |
+| `installing` | `man` admitted (`q` = slot, `g > retired`) | `installing` | `retired := g`; `assembling := g`; open the assembly |
+| `installing` | assembly complete, byte total matched, document validated | `ready` | `installed := g`; publish; slot cleared; waiters resolve |
+| `installing` | assembly deadline, conflict, or validation failure | `installing` | `assembling := none`; **`retired` keeps `g`**; one new `resync` with the advisory position of `installed` |
+| `installing` | `no` for the slot's `q` | `fenced` | waiters reject with the code; slot cleared |
+| `installing` | every local waiter cancelled | `fenced` | slot cleared; the previous view is **not** restored — it was invalidated at request time |
+| `installing` | newer `setAudience` | `installing` | previous waiters reject `aborted`; **new** `q` becomes the slot; the old generation stays consumed |
+| `ready` | unsolicited `man` (`g > retired`) | `installing` | `retired := g`; `assembling := g`; no slot (unsolicited) |
+| any | `no {closed}` / lease expiry | `closed` | — |
+
+**Duplicate active manifest.** A second `man` for a generation whose
+assembly is already open fails `g > retired` (because admitting the
+first set `retired := g`), so it is **dropped and counted** and the open
+assembly is untouched. Round 2 had no rule for this; it now falls out of
+the watermark rather than needing one.
+
+#### One wire request, many local waiters
+
+Round 2 said each waiter has its own `q` (§2) while admission used a
+single slot `q` — those cannot both hold. Resolved the way Kyra
+indicated: **one wire request and one `q` per shared transition**, with
+multiple **local** waiters attached to it, each independently
+cancellable with its own deadline and signal. Cancelling one removes
+that waiter only; cancelling the last moves the handle to `fenced`. A
+later equal-set request joins the in-flight transition as another local
+waiter rather than issuing a second `q`.
+
+#### Owner state, per handle
+
+| Value | Meaning |
+|---|---|
+| `allocated` | highest generation ever allocated; monotone, **never rolled back**, even for a generation that was superseded before anything was installed |
+| `emitting` | the generation whose chunks are still being handed to the transport, or none |
+| `emitted` | the generation whose chunks have all been handed over — the owner's "gameplay ready" (§1.6) |
+
+### 1.7b Control admission is not gameplay readiness
+
+**The repair for item 4.** Round 2 refused `aud` until every chunk of
+the previous installation had been emitted, which contradicts the
+required audience-change-during-synchronization behaviour: the client
+clears immediately and its new request would then be refused *because
+the old snapshot was still going out*.
+
+Two separate admission classes:
+
+| Class | Kinds | Admitted when |
+|---|---|---|
+| **Gameplay** | `act`, `in` | the handle is `emitted` for its current generation — these need an installed view to be meaningful |
+| **Lifecycle control** | `aud`, `resync`, `resume`, `leave`, `alive` | the handle is live and bound, **including while a previous installation is still being emitted** |
+
+- A valid newer `aud` **supersedes an in-progress installation**: the
+  owner allocates the next generation, **retires the unsent chunks** of
+  the superseded one (they are never emitted, and the superseded
+  generation stays consumed), and emits the new manifest.
+- `leave` and the recovery controls likewise **cannot depend on
+  completing the work they exist to stop**. A `leave` during emission
+  retires the unsent remainder and closes the handle.
+- `not-ready` therefore refuses only gameplay traffic. It is never the
+  answer to a lifecycle control on a live handle.
+
+### 1.8 Resynchronization
 
 - A replica sends `resync {h, g, have}` when a `delta.base` does not
   equal its current revision, when a chunk assembly is abandoned (§2),
-  or when a patch fails validation. `g` is where it is installed now;
-  `have` is its current revision.
+  or when a patch fails validation.
+- **`g` and `have` are advisory historical position, not a claim about
+  the owner's current state.** The owner authenticates the session,
+  binds the handle, and **does not require `g` to be its current
+  generation**. This is the repair for item 1, and the sequence that
+  forced it is an ordinary recovery path rather than malformed traffic:
+  the replica is installed at A; the owner allocates B and sends a
+  replacement; B's assembly times out before installation; the replica
+  asks to recover, and the only generation it can honestly name is
+  **A** — the one it actually has. A current-generation check refuses
+  exactly the client that most needs recovering.
 - The owner answers a solicited `resync` with a **newly allocated
   installation generation** and its `man` + chunks, or
   `no {code:"not-ready"}` if it cannot take a projection now (the
   replica retries under its own deadline), or `no {code:"closed"}` for a
-  dead handle.
-- `have` is advisory: the owner may always answer with a full snapshot.
-  v1 defines no delta-from-`have` path and a caller must not depend on
+  dead handle. A `resync` is **never** refused for naming a stale or
+  unknown generation.
+- v1 defines no delta-from-`have` path and a caller must not depend on
   one.
 - The owner may **initiate** a replacement — used when a delta would
   exceed the message budget (§1.9) — by allocating a generation and
-  emitting an unsolicited `man` (no `q`) followed by its chunks.
+  emitting an unsolicited `man` (no `q`) followed by its chunks. It is
+  admissible only in `ready` (§1.7a).
 
-**Admission, solicited and unsolicited.** Because every accepted
-replacement gets its own generation, the rules are mechanical:
+**Admission, in one table.** Every rule reads off §1.7a's three values
+and the state:
 
 | Arrival | Admitted iff | Otherwise |
 |---|---|---|
-| Solicited `man` (has `q`) | `q` equals the desired-transition slot **and** `g` is greater than the installed generation | dropped, counted |
-| Unsolicited `man` (no `q`) | the slot is **empty** (no transition in flight) **and** `g` is greater than the installed generation | dropped, counted; the replica sends its own `resync` once its transition settles, so an owner-initiated replacement is never simply lost |
-| `snap` chunk | `(h, g, r, n)` match an **open** assembly for the current desired generation | dropped, counted |
-| `delta` | `g` equals the installed generation and `base` equals the installed revision | dropped (wrong `g`) or `resync` (gap) |
+| Solicited `man` (has `q`) | state is `installing`, `q` = slot, **`g > retired`** | dropped, counted |
+| Unsolicited `man` (no `q`) | state is **`ready`** and `g > retired` | dropped, counted; in `fenced` it is *specifically* refused, so an owner emission cannot undo a cancellation fence. The replica's own next request is what leaves `fenced`. |
+| `snap` chunk | `(h, g, r, n)` match the **open** assembly and `g = assembling` | dropped, counted |
+| `delta` | `g = installed` and `base` = installed revision | dropped (wrong `g`) or `resync` (gap) |
 
-Consequences stated explicitly, because they are the cases the HOLD
-named:
+Consequences, including the cases the HOLDs named:
 
-- **An old manifest arriving after a newer view is installed** fails the
-  `g`-greater test and is dropped. It cannot roll back the installed
-  revision.
+- **An old manifest after a newer view is installed** fails
+  `g > retired`; it cannot roll back the installed revision.
+- **An abandoned generation cannot be reopened.** B is admitted
+  (`retired := B`), its assembly is abandoned, and a delayed second B
+  manifest — or a late first one — fails `g > retired`. Under round 2's
+  `g > installed` rule it would have passed, because B never installed.
+- **A restarted snapshot at the same revision** is a different
+  generation, so the abandoned attempt's chunks cannot join it.
+- **Old assembly chunks after a restart** carry a generation that is no
+  longer `assembling` and are dropped. A retired assembly is never
+  recreated, by a chunk or by a manifest.
 - **A solicited resync overlapping an unsolicited one**: the unsolicited
-  manifest is dropped because the slot is occupied; the solicited one
-  installs. Exactly one of them can be current.
-- **A restarted snapshot at the same revision** is a *different*
-  generation, so its chunks cannot be confused with the abandoned
-  attempt's even though `r` is identical. This is why re-using `(h,g,r)`
-  as assembly identity was not sufficient.
-- **Old assembly chunks arriving after a restart** carry the retired
-  generation, fail the open-assembly match, and are dropped. A retired
-  assembly is never recreated by a late chunk.
+  one is inadmissible because the state is `installing`; exactly one is
+  current.
 
 ### 1.9 Snapshot chunks, and the budget for every kind
 
@@ -529,6 +648,27 @@ cross-implementation agreement.
   equality of whichever form is retained, and the form is recorded with
   the entry so a 2 KiB boundary crossing cannot make two encodings of
   one request compare unequal.
+- **The digest's `await` happens before the transaction, and nothing is
+  carried across it.** WebCrypto's `digest` is asynchronous, and a
+  handler transaction is synchronous by construction (`store/core.ts`),
+  so the order is fixed: canonicalize and digest **first**, then
+  **revalidate** — handle still live and bound, session still the same
+  incarnation and peer, generation still current, and the replay state
+  re-read — and only then enter the synchronous transaction and
+  authorize.
+
+  No authorization decision, and no transaction context, may be captured
+  before that `await` and used after it. Both are exactly the
+  stale-continuation hazard §2 already fences for handlers: a
+  permission checked before the await could have been revoked during it,
+  and a context is valid only inside its own synchronous transaction.
+  The ledger must also be re-read rather than remembered, because a
+  concurrent request for the same `s` may have retired or retained an
+  entry while the digest was computing.
+
+  This is why the ≤ 2 KiB string path is the common case and not an
+  optimization: it has no `await` at all, so the hazard does not arise
+  for it.
 - Storing the string where it fits is deliberate: it keeps the common
   case free of a hash dependency and makes a mismatch inspectable when
   a witness fails.
@@ -584,13 +724,21 @@ Ordered. Cheap checks first, and none of them may run after a mutation.
    numbers finite. On failure `invalid-data`, counted.
 3. **Envelope**: `v` known; `k` in the closed set; `q` present iff the
    kind requires it; `h` present iff the kind requires it.
-4. **Direction and state**: a kind may only arrive in its defined
+4. **Direction and class**: a kind may only arrive in its defined
    direction — a replica that receives `act` or an owner that receives
-   `delta` refuses `invalid-data` and counts it. `act`/`in`/`aud` before
-   the handle is ready, or after `leave`, are refused `not-ready` /
-   `closed`.
+   `delta` refuses `invalid-data` and counts it. Then by admission class
+   (§1.7b): **gameplay** (`act`, `in`) before the handle is ready is
+   `not-ready`; **lifecycle controls** (`aud`, `resync`, `resume`,
+   `leave`, `alive`) are admissible on a live handle **including during
+   an emission**, and are never refused `not-ready`. Anything after
+   `leave` is `closed`.
 5. **Binding**: handle active, bound to this authenticated peer and
-   incarnation, generation current where the kind carries one.
+   incarnation. Generation is checked **per kind against §1.7a/§1.8**,
+   not by one blanket "must be current" rule: `delta` requires
+   `g = installed`, a `man` requires `g > retired`, a `snap` requires
+   `g = assembling`, and **`resync`'s `g` is advisory and is checked
+   against nothing** — requiring it to be current is exactly the defect
+   S1 repaired.
 6. **Payload**: per-kind required/optional fields (below), then the
    definition's validators.
 
@@ -701,13 +849,18 @@ Fencing:
 - **Chunk assembly** is discarded on generation change, handle expiry and
   deadline. A partial snapshot is never published and never merged into a
   later one.
-- **Cancellation is per waiter.** Equal pending audience requests share
-  the transition but not its cancellation: each waiter has its own
-  deadline/signal and its own `q`; cancelling one removes only that
-  waiter, and if none remain the transition is fenced and the handle
-  stays non-ready. A newer accepted request supersedes and rejects the
-  older's waiters by `q`. No aborted promise may later resolve from a
-  snapshot callback.
+- **Cancellation is per waiter; the wire request is not.** Equal pending
+  audience requests share **one** wire request and **one** `q` (§1.7a),
+  with a local waiter each — its own deadline and signal. Cancelling one
+  removes that waiter only; cancelling the last moves the handle to
+  `fenced` and it stays non-ready. A newer transition rejects the
+  previous waiters `aborted` and takes the slot with a **new** `q`. No
+  aborted promise may later resolve from a snapshot callback.
+
+  Round 2 gave each waiter its own `q` here while admission compared a
+  single slot `q` — the two could not both hold, and the per-waiter
+  spelling is the one that had to go: `q` is the transition's identity
+  on the wire, not a waiter's.
 - **Stale continuations** cannot write: a transaction context is valid
   only during its synchronous transaction (`store/core.ts`, `dcc13ca7c`).
 - **Expired handles** are refused `closed` before dispatch, and the
@@ -852,6 +1005,22 @@ to re-test the thing that already worked.
 | R4 — solicited vs unsolicited overlap | An owner-initiated `man` arrives while a `resync` is in flight | Repaired: the unsolicited one is dropped (slot occupied), the solicited one installs, and exactly one is current. |
 | R5 — lease margin | The chosen interval/lease pair under one lost renewal, and under two | Not a pass/fail of a claim but a **measurement**: record what one loss and two losses actually do at the chosen pair, and let the pair move on the result. The brief no longer asserts two-loss tolerance, so a test asserting it would be testing a claim that was withdrawn. |
 | R5 — action refusal is not read revocation | A forbidden `act`, then continued `delta` delivery | Repaired: the handle stays live, the read subscription intact, deltas still arriving, and only the action refused. A pre-repair conflation drops the spectator's view on one forbidden action. |
+
+### 5.1c Discriminating cases for round 3's state machine
+
+| Repair | Discriminating case | What separates repaired from not |
+|---|---|---|
+| S1 — stale resync accepted | Installed at A; owner allocates B and sends it; **B's assembly times out before installation**; the replica sends `resync` naming A | Pre-repair the owner's current-generation check refuses the recovery request, and the client that most needs recovering is the one that cannot. Repaired: the `resync` is accepted, a fresh generation C is allocated, and the replica ends **installed at C**. Assert the recovery *succeeded*, not merely that a `resync` was sent. |
+| S2 — abandoned generation cannot reopen | A installed; unsolicited B admitted; B's assembly abandoned; a **delayed B manifest** arrives | Pre-repair, `g > installed` holds (B never installed), so the stale manifest reopens the abandoned installation. Repaired: `g > retired` fails, it is dropped, and the installed view stays at A. The existing old-**chunk** witness does not cover this — it takes an old **manifest**. |
+| S2 — duplicate active manifest | Two `man` for the same generation while its assembly is open | Repaired: the second is dropped and the open assembly is untouched. Pre-repair there was no rule, so either could restart the assembly. |
+| S3 — cancellation fence survives an owner refresh | A transition cancelled (handle `fenced`), then an **unsolicited** `man` arrives | Pre-repair the slot is empty, so "no pending request" admits it and the owner's emission silently undoes the cancellation fence. Repaired: inadmissible in `fenced`; the handle stays non-ready until the caller's own next request. Assert the status **and** that nothing installed. |
+| S3 — ready still accepts refreshes | The same unsolicited `man` while `ready` | The control: it **must** install. A repair that simply refused all unsolicited manifests would pass S3 and fail this. |
+| S3 — one `q`, many waiters | Two equal `setAudience` calls, then one cancelled | Repaired: one wire request was sent, the surviving waiter still resolves, and the handle reaches `ready`. Pre-repair, per-waiter `q`s mean either two wire requests or a slot that cannot match both. |
+| S4 — newer audience during emission | `setAudience` issued while the previous installation's chunks are still being emitted | Pre-repair it is refused `not-ready` — the client has already cleared its view locally and now cannot get a new one. Repaired: admitted, the unsent chunks of the superseded generation are retired, and the new generation installs. |
+| S4 — leave during emission | `leave` mid-emission | Repaired: the unsent remainder is retired and the handle closes. A control must not depend on completing the work it exists to stop. |
+| S4 — gameplay still gated | `act` before the manifest is fully emitted | The control for S4: gameplay **stays** refused `not-ready`, so the repair separated the two classes rather than opening both. |
+| Reconnect vs audience | Same-audience reconnect, and an audience change, each inspected mid-recovery | Repaired: reconnect **retains** the stale snapshot (the game keeps rendering); the audience change **clears** to `empty()`. A single "clear on recovery" rule passes one and leaks or blanks on the other. |
+| Digest await | An action whose canonical input exceeds 2 KiB, with the handle expired **during** the digest `await` | Repaired: revalidation after the await refuses `closed`, the handler runs 0 times, and no authorization captured before the await is used. Pre-repair the pre-await decision is honoured and a dead handle's action executes. |
 
 ### 5.2 Contract behaviour — required
 
