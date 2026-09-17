@@ -312,6 +312,29 @@ impl FollowerRegistry {
             .insert(channel.to_string());
     }
 
+    /// Release one follower's claim on `channel`, and say whether the
+    /// channel is still wanted by anyone.
+    ///
+    /// `true` means some other tab still declares it, so the leader
+    /// keeps the membership and this caller has merely stopped being
+    /// one of its consumers. `false` means this was the **last**
+    /// consumer and the wire membership is now the leader's to give
+    /// up.
+    ///
+    /// This is the whole of the last-consumer rule, in one place and
+    /// returning the decision rather than performing it: one tab
+    /// closing a store must not silently cancel delivery to another
+    /// tab that is still reading the same channel, and a leader that
+    /// unsubscribed on every release would do exactly that.
+    pub fn release(&mut self, follower: u64, channel: &str) -> bool {
+        if let Some(declared) = self.followers.get_mut(&follower) {
+            declared.subscriptions.remove(channel);
+        }
+        self.followers
+            .values()
+            .any(|declared| declared.subscriptions.contains(channel))
+    }
+
     /// Record the capabilities a follower announced after attaching.
     ///
     /// Replaces rather than unions: `announce(caps)` publishes a
@@ -381,6 +404,17 @@ pub enum LeaderRequest {
     },
     /// Subscribe to a channel.
     Subscribe {
+        /// The channel name.
+        channel: String,
+    },
+    /// Release this tab's claim on a channel.
+    ///
+    /// Not the mirror image of [`Self::Subscribe`]: a subscribe is one
+    /// tab declaring an interest, and the leader holds ONE membership
+    /// for the union of them, so an unsubscribe releases a claim and
+    /// only the last one released gives up the membership. The
+    /// decision is [`FollowerRegistry::release`]'s.
+    Unsubscribe {
         /// The channel name.
         channel: String,
     },
@@ -1300,6 +1334,39 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 if let LeaderRequest::Subscribe { channel } = &request {
                     self.followers.declare(follower, channel);
                 }
+                // A release is bookkeeping HERE and a decision
+                // elsewhere, and the split is the whole point.
+                //
+                // Dropping the follower's claim is safe and necessary:
+                // a successor must not restore a subscription the tab
+                // has given up. Acting on it is NOT safe from here.
+                // This server sees its followers' declarations and
+                // **not** the leader tab's own `declared` set, so a
+                // follower releasing a channel the leader's own page
+                // is still reading would look like the last consumer
+                // and cancel the leader's delivery. The last-consumer
+                // decision needs both sets, so it belongs one layer up
+                // where `declared` and `restoration()` are both
+                // visible — the same place the announcement union is
+                // computed, and for the same reason.
+                //
+                // Until that is wired, a proxied release is refused
+                // with the reason rather than served wrongly: the
+                // session surface does not expose one, so this is
+                // unreachable from a page and is here so it cannot
+                // become reachable by accident.
+                if let LeaderRequest::Unsubscribe { channel } = &request {
+                    self.followers.release(follower, channel);
+                    let error = LeafError::ControlPlane(format!(
+                        "a proxied release of '{channel}' is not served yet: the \
+                         last-consumer decision needs this tab's own declarations \
+                         beside its followers', and this server sees only the \
+                         followers'"
+                    ));
+                    self.replier(correlation)
+                        .fail(ProxyFailure::Typed(error.clone()));
+                    return Err(error);
+                }
                 // # A follower does not publish the document
                 //
                 // An `Announce` performed verbatim publishes *that
@@ -1550,6 +1617,15 @@ impl ProxyClient {
                     self.subscriptions.push(channel.clone());
                 }
             }
+            LeaderRequest::Unsubscribe { channel } => {
+                // Symmetric with the arm above, and for the same
+                // reason: a re-attach after a leader change must carry
+                // what this tab wants NOW. Leaving a released channel
+                // in the standing intent would have the next leader
+                // faithfully restore a subscription this tab had
+                // already given up.
+                self.subscriptions.retain(|c| c != channel);
+            }
             LeaderRequest::Announce { capabilities } => {
                 self.capabilities = capabilities.clone();
             }
@@ -1759,6 +1835,10 @@ fn encode_request(request: &LeaderRequest) -> Value {
             map.insert("op".into(), Value::from("subscribe"));
             map.insert("channel".into(), Value::from(channel.clone()));
         }
+        LeaderRequest::Unsubscribe { channel } => {
+            map.insert("op".into(), Value::from("unsubscribe"));
+            map.insert("channel".into(), Value::from(channel.clone()));
+        }
         LeaderRequest::Publish { channel, payload } => {
             map.insert("op".into(), Value::from("publish"));
             map.insert("channel".into(), Value::from(channel.clone()));
@@ -1849,6 +1929,9 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
             },
         },
         "subscribe" => LeaderRequest::Subscribe {
+            channel: str_field(value, "channel")?.to_string(),
+        },
+        "unsubscribe" => LeaderRequest::Unsubscribe {
             channel: str_field(value, "channel")?.to_string(),
         },
         "publish" => LeaderRequest::Publish {
@@ -2595,6 +2678,39 @@ mod tests {
         assert!(ProxyEnvelope::from_json("{\"v\":\"2\"}").is_err());
     }
 
+    /// The last-consumer arithmetic, which is the whole reason a
+    /// release is not a subscribe run backwards.
+    #[test]
+    fn a_release_keeps_the_channel_while_another_follower_still_wants_it() {
+        let mut registry = FollowerRegistry::new();
+        registry.attach(1, ["shared".to_string(), "mine".to_string()], []);
+        registry.attach(2, ["shared".to_string()], []);
+
+        assert!(
+            registry.release(1, "shared"),
+            "follower 2 still declares it, so the membership stays"
+        );
+        assert_eq!(
+            registry.subscription_union(),
+            vec!["mine".to_string(), "shared".to_string()],
+            "the released claim is gone from the union's owner, not from the union"
+        );
+
+        assert!(
+            !registry.release(2, "shared"),
+            "that was the last consumer, so the membership is the leader's to give up"
+        );
+        assert_eq!(
+            registry.subscription_union(),
+            vec!["mine".to_string()],
+            "and it leaves the restoration list, so a successor does not bring it back"
+        );
+
+        assert!(
+            !registry.release(1, "never-declared"),
+            "releasing something nobody declared is not somebody else's claim"
+        );
+    }
     // ────────────────────────── the follower registry ────────────────────
 
     /// Restoration is the union, not the last writer: two followers

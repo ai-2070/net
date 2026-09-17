@@ -1925,6 +1925,23 @@ impl LeafNode {
         .map_err(js)
     }
 
+    /// Release membership of `channel` on the anchor.
+    ///
+    /// The direct surface's release is unconditional — this node is
+    /// the only consumer it knows about. The last-consumer arithmetic
+    /// belongs to the session surface, where several tabs share one
+    /// node and one of them stopping is not all of them stopping.
+    pub async fn unsubscribe(&self, channel: String) -> Result<(), JsError> {
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let peer = guard.anchor;
+            guard.node.unsubscribe(peer, &channel)?;
+            guard.pump();
+            Ok::<_, LeafError>(())
+        })
+        .map_err(js)
+    }
+
     /// Publish `payload` on `channel`.
     pub async fn publish(&self, channel: String, payload: Uint8Array) -> Result<(), JsError> {
         with_node(&self.inner, |guard| {

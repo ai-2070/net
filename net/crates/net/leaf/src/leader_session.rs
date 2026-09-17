@@ -1807,6 +1807,15 @@ impl LeaderBackend for NodeBackend {
                     Err(error) => reply.fail(reported(error)),
                 }
             }),
+            LeaderRequest::Unsubscribe { channel } => spawn_fenced(&lease, &ops, async move {
+                // Reached only when the server decided this was the
+                // LAST consumer; a release with a sibling tab still
+                // reading is answered there and never gets here.
+                match node.unsubscribe(channel).await {
+                    Ok(()) => reply.bytes(Bytes::new()),
+                    Err(error) => reply.fail(reported(error)),
+                }
+            }),
             LeaderRequest::Publish { channel, payload } => spawn_fenced(&lease, &ops, async move {
                 match node.publish(channel, Uint8Array::from(&payload[..])).await {
                     Ok(()) => reply.bytes(Bytes::new()),

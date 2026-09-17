@@ -1500,6 +1500,47 @@ impl LeafNode {
         Ok(nonce)
     }
 
+    /// Release membership of `channel` on `peer`, through the same
+    /// production `0x0A00` encoder [`Self::subscribe`] uses.
+    ///
+    /// Returns the nonce the Ack will echo.
+    ///
+    /// The channel's stream id is **deregistered**, and that is the
+    /// point of the operation rather than tidiness: `stream_kinds` is
+    /// what the receive path classifies on, so a frame that arrives
+    /// after this leaf gave up the channel is no longer claimed as
+    /// channel traffic. Leaving the registration behind would make an
+    /// unsubscribed channel keep dispatching to a consumer that asked
+    /// to stop.
+    ///
+    /// Only a `Channel` registration is removed. An id the nRPC reply
+    /// plane owns is a different plane's reservation, and unsubscribing
+    /// an application channel must not strand a reply carrier that
+    /// happens to hash to the same id.
+    pub fn unsubscribe(&mut self, peer: NodeId, channel: &str) -> Result<u64> {
+        let channel = Channel::new(channel)?;
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.wrapping_add(1);
+        let payload = channel.unsubscribe_payload(nonce);
+        self.send_subprotocol(
+            peer,
+            channel.publish_stream_id(),
+            SUBPROTOCOL_MEMBERSHIP,
+            channel.wire_hash(),
+            &payload,
+            true,
+        )?;
+        // Deregistered only after the frame is queued: a release this
+        // leaf could not send is not one the anchor knows about, and
+        // dropping the classification first would blind the consumer
+        // to traffic it is still subscribed to.
+        let key = (peer, channel.publish_stream_id());
+        if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
+            self.stream_kinds.remove(&key);
+        }
+        Ok(nonce)
+    }
+
     /// Publish `payload` on `channel` to `peer`.
     ///
     /// The stream id and the header's channel hint are the ones
@@ -3071,6 +3112,82 @@ mod tests {
         let out = node.take_outbound();
         let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
         assert_eq!(parsed.header.subprotocol_id, 0x0A00);
+    }
+
+    /// A release rides the same `0x0A00` plane as the subscribe and
+    /// carries a real `Unsubscribe`.
+    ///
+    /// The payload is **decrypted and decoded**, not merely counted.
+    /// Asserting the subprotocol id and the nonce would pass just as
+    /// happily if this sent a `Subscribe` on the release path — which
+    /// is the one mistake a release is likely to make — so the oracle
+    /// has to name the message it expects.
+    #[test]
+    fn an_unsubscribe_goes_out_as_a_membership_release_not_a_subscribe() {
+        let (mut node, anchor) = connected();
+        let channel = "net.mesh.enroll.replies.0000000000000001";
+        node.subscribe(ANCHOR, channel).expect("subscribe");
+        let _ = node.take_outbound();
+
+        let nonce = node.unsubscribe(ANCHOR, channel).expect("unsubscribe");
+        assert_eq!(nonce, 2, "the release takes the next nonce, not the first");
+        let out = node.take_outbound();
+        assert_eq!(out.len(), 1, "one release frame");
+
+        let parsed = ParsedPacket::parse(out[0].packet.clone(), rtc_addr(0, 1)).expect("parses");
+        assert_eq!(parsed.header.subprotocol_id, 0x0A00, "the membership plane");
+        let wire = Channel::new(channel).expect("valid");
+        assert_eq!(parsed.header.stream_id, wire.publish_stream_id());
+
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().expect("nonce"));
+        let plain = anchor
+            .rx_cipher()
+            .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+            .expect("the anchor decrypts");
+        let frames = EventFrame::read_events(plain, parsed.header.event_count);
+        let membership =
+            net_wire::channel::membership::decode(&frames[0]).expect("a membership message");
+        match membership {
+            net_wire::channel::membership::MembershipMsg::Unsubscribe {
+                channel: named,
+                nonce: echoed,
+            } => {
+                assert_eq!(
+                    named.as_str(),
+                    channel,
+                    "it names the channel being released"
+                );
+                assert_eq!(echoed, nonce, "and the nonce the Ack will echo");
+            }
+            other => panic!("a release must encode Unsubscribe, got {other:?}"),
+        }
+    }
+
+    /// The release is what stops the channel being claimed, and the
+    /// observable is the classification the receive path uses — not
+    /// the frame going out, which a broken implementation would also
+    /// produce.
+    #[test]
+    fn a_released_channel_is_no_longer_claimed_as_channel_traffic() {
+        let (mut node, _anchor) = connected();
+        let channel = "net.mesh.enroll.replies.0000000000000001";
+        let stream_id = Channel::new(channel).expect("valid").publish_stream_id();
+
+        node.subscribe(ANCHOR, channel).expect("subscribe");
+        assert_eq!(
+            node.stream_kinds.get(&(ANCHOR, stream_id)),
+            Some(&StreamKind::Channel),
+            "a subscribe claims the channel's id"
+        );
+
+        node.unsubscribe(ANCHOR, channel).expect("unsubscribe");
+        assert_eq!(
+            node.stream_kinds.get(&(ANCHOR, stream_id)),
+            None,
+            "a release gives the claim up, so a later frame there is not \
+             dispatched to a consumer that asked to stop"
+        );
     }
 
     /// A call goes out as `EventMeta ‖ route ‖ payload` and its reply
