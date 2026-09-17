@@ -463,6 +463,15 @@ pub enum LeaderRequest {
         stream_id: Option<u64>,
         /// Likewise verbatim: the channel hash the stream rides.
         channel_hash: Option<u16>,
+        /// The node the stream addresses; the leader's anchor when
+        /// absent.
+        ///
+        /// Carried because a follower's stream is opened by the
+        /// leader tab's node. Without it a peer-addressed stream
+        /// could only be refused on a follower, which made §9's
+        /// "`connectPeer` installs a direct session and this puts
+        /// application bytes on it" a leader-only sentence.
+        peer: Option<u64>,
     },
     /// Send on an open stream.
     StreamSend {
@@ -1890,6 +1899,7 @@ fn encode_request(request: &LeaderRequest) -> Value {
             reliability,
             stream_id,
             channel_hash,
+            peer,
         } => {
             map.insert("op".into(), Value::from("stream_open"));
             map.insert("label".into(), Value::from(label.clone()));
@@ -1911,6 +1921,13 @@ fn encode_request(request: &LeaderRequest) -> Value {
                 "channel_hash".into(),
                 match channel_hash {
                     Some(hash) => Value::from(*hash),
+                    None => Value::Null,
+                },
+            );
+            map.insert(
+                "peer".into(),
+                match peer {
+                    Some(id) => Value::from(id.to_string()),
                     None => Value::Null,
                 },
             );
@@ -1997,6 +2014,10 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
                 _ => Some(u64_field(value, "channel_hash")?.try_into().map_err(|_| {
                     LeafError::ControlPlane("proxy channel_hash does not fit a u16".into())
                 })?),
+            },
+            peer: match field(value, "peer")? {
+                Value::Null => None,
+                _ => Some(u64_field(value, "peer")?),
             },
         },
         "stream_send" => LeaderRequest::StreamSend {
@@ -2642,6 +2663,10 @@ mod tests {
                     reliability: Reliability::FireAndForget,
                     stream_id: Some(77),
                     channel_hash: Some(0xBEEF),
+                    // A peer-addressed proxied stream: the field has
+                    // to survive the round trip or a follower's
+                    // stream silently addresses the anchor instead.
+                    peer: Some(0xDEAD_BEEF_0000_0001),
                 },
             },
             ProxyBody::Request {
@@ -2651,6 +2676,7 @@ mod tests {
                     reliability: Reliability::Reliable,
                     stream_id: None,
                     channel_hash: None,
+                    peer: None,
                 },
             },
             ProxyBody::Request {

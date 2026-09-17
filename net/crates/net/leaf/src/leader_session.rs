@@ -787,11 +787,6 @@ impl Lifecycle {
     /// spelling of it.
     pub async fn open_stream(&self, opts: &JsValue) -> Result<ProxyStream, JsError> {
         let options = crate::wasm::stream_options(opts)?;
-        // A follower's stream is opened by the LEADER tab's node and
-        // `LeaderRequest::StreamOpen` carries no peer, so a `peer`
-        // here would be silently dropped and the stream would
-        // address the leader's anchor. Refused by name instead.
-        options.require_anchor_addressed("a leader-proxied openStream")?;
         let reliable = options.reliability.is_reliable();
         // Read before the request, not after: a request that crosses a
         // handoff must produce a handle stamped with the generation it
@@ -804,6 +799,12 @@ impl Lifecycle {
                 reliability: options.reliability,
                 stream_id: options.stream_id,
                 channel_hash: options.channel_hash,
+                // Carried now rather than refused by name: the
+                // request addresses the peer on the leader's node, so
+                // a follower can put application bytes on a direct
+                // leaf-to-leaf session the same way the leader tab
+                // can.
+                peer: options.peer,
             })
             .await?;
         let ProxyValue::Stream { stream_id } = value else {
@@ -1970,6 +1971,7 @@ impl LeaderBackend for NodeBackend {
                 reliability,
                 stream_id,
                 channel_hash,
+                peer,
             } => {
                 let opts = Object::new();
                 let spelling = match reliability {
@@ -1990,6 +1992,14 @@ impl LeaderBackend for NodeBackend {
                 }
                 if let Some(hash) = channel_hash {
                     let _ = set(&opts, "channelHash", &JsValue::from_f64(f64::from(hash)));
+                }
+                if let Some(peer) = peer {
+                    // 16 lowercase hex, the only spelling the direct
+                    // surface accepts — a decimal id addresses a
+                    // different node rather than failing, which is
+                    // why the conversion happens here and not in the
+                    // page.
+                    let _ = set(&opts, "peer", &JsValue::from_str(&format!("{peer:016x}")));
                 }
                 match node.open_stream(opts.into()) {
                     Ok(stream) => {

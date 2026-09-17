@@ -1996,9 +1996,9 @@ impl LeafNode {
     /// Both are read by `stream_options`, which
     /// [`crate::leader_session::MeshSession::open_stream`] also
     /// calls: the direct and the proxied surface cannot read the
-    /// same option object two ways. That surface **refuses** `peer`
-    /// rather than dropping it — see
-    /// `StreamOptions::require_anchor_addressed`.
+    /// same option object two ways. That surface now **carries**
+    /// `peer` in its request rather than refusing it, so a follower
+    /// addresses a peer exactly as this surface does.
     pub fn open_stream(&self, opts: JsValue) -> Result<LeafStream, JsError> {
         let options = stream_options(&opts)?;
 
@@ -4160,30 +4160,6 @@ impl StreamOptions {
              \"channelHash\":{channel_hash},\"peer\":{peer}}}",
             json_string(&self.label)
         )
-    }
-
-    /// Refuse a `peer` option on a surface that cannot honour it.
-    ///
-    /// [`stream_options`] is shared with the leader-proxied surface
-    /// ([`crate::leader_session::MeshSession::open_stream`]) —
-    /// deliberately, so the direct and the proxied path cannot read
-    /// one options object two ways. But a follower's stream is
-    /// opened by the LEADER tab's node, and `LeaderRequest::
-    /// StreamOpen` carries no peer, so a `peer` that crossed there
-    /// would be dropped and the stream would quietly address the
-    /// leader's anchor instead. "The positions stopped arriving" is
-    /// indistinguishable from a slow peer, so the proxied surface
-    /// refuses the option by name instead of honouring it
-    /// approximately.
-    pub(crate) fn require_anchor_addressed(&self, surface: &str) -> Result<(), JsError> {
-        match self.peer {
-            None => Ok(()),
-            Some(peer) => Err(JsError::new(&format!(
-                "{surface} cannot address a peer: the stream would be opened by the leader \
-                 tab's node, which this request carries no peer to. Call `openStream({{ peer: \
-                 \"{peer:016x}\" }})` on the leader's own node."
-            ))),
-        }
     }
 }
 

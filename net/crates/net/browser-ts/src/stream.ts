@@ -54,9 +54,12 @@ export interface OpenStreamOptions {
    *
    * A peer with no session at all rejects typed from `send`.
    *
-   * Not accepted by {@link MeshSession.openStream}: a follower's
-   * stream is opened by the leader tab's node, so the option is
-   * refused by name there rather than dropped.
+   * Accepted by {@link MeshSession.openStream} as well. A follower's
+   * stream is opened by the leader tab's node, and the request
+   * carries this peer, so a follower addresses a direct
+   * leaf-to-leaf session exactly as the leader tab does. It used to
+   * be refused by name there, because the proxy request had no peer
+   * field to carry.
    */
   peer?: string;
 }
