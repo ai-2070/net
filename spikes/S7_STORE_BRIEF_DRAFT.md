@@ -404,7 +404,8 @@ machine settles all four.
 
 #### Replica state, per handle
 
-Three monotone values, and they are different things:
+Per-handle state. Three of these are monotone generation values, and
+they are different things:
 
 | Value | Meaning |
 |---|---|
@@ -412,6 +413,8 @@ Three monotone values, and they are different things:
 | `assembling` | the generation of the **open** assembly, or none |
 | `retired` | the **highest generation ever admitted**, whether or not it went on to install |
 | `skipped` | the highest owner generation **dropped because it arrived mid-transition**, or none — bounded recovery knowledge |
+| `behind` | the owner is known to have moved past the revision being assembled — one flag, coalesced into the same recovery as `skipped` (§1.9a) |
+| `handle` | the `h` the owner issued, once one has been **learned** from a `man`, or none. Only `join` creates one (§2) |
 
 `retired` is the watermark, and it is what round 2 was missing: a
 manifest is admissible only when `g > retired`, so a generation that was
@@ -419,7 +422,7 @@ admitted and then abandoned **cannot be reopened**, even though it never
 became `installed` and therefore still satisfies `g > installed`. One
 bounded monotone number, not a tombstone collection.
 
-Four states:
+Five states:
 
 | State | Meaning | Unsolicited `man` |
 |---|---|---|
@@ -440,10 +443,13 @@ caller-initiated request (`aud`, `resync`, `resume`).
 
 | From | Event | To | Side effects |
 |---|---|---|---|
-| `joining` | **initial `man`** admitted (`q` = the pending join's slot, expected authenticated owner, `g > retired`) | `installing` | bind the issued handle and incarnation; `retired := g`; open the assembly |
+| `joining` | **initial `man`** admitted (`q` = the pending join's slot, expected authenticated owner, `g > retired`) | `installing` | **the handle is learned** from `man.h`; bind the incarnation; `retired := g`; open the assembly |
 | `ready`/`fenced` | `setAudience` accepted locally | `installing` | **immediately**: status `syncing`/`stale`, projection cleared to `empty()`, **any open assembly retired**, one wire `aud` with one fresh `q` as the slot |
 | `ready` | reconnect | `installing` | status `reconnecting`/`stale`; **the last snapshot is retained, not cleared** (§1.6 — the audience has not changed); one `resume`, its `q` the slot |
-| `joining`/`installing` | reconnect | `installing` | **the lost session's assembly is retired**; one `resume` whose `aud` is the **latest desired audience**, never the owner's older one; a published view is retained and marked stale |
+| `joining`/`installing`, **handle learned** | reconnect | `installing` | **the lost session's assembly is retired**; one `resume` whose `aud` is the **latest desired audience**, never the owner's older one; a published view is retained and marked stale |
+| `joining`, **no handle learned yet** | reconnect | `joining` | a fresh **`join`**, not a `resume`: only `join` creates a handle, and the replica has none to resume (§2) |
+| any live | `no {unknown-handle}` for the slot's `q` | `joining` | the handle is discarded, the view cleared, and **one fresh `join`** issued — the only path that can produce a new handle |
+| any | a message naming a handle other than the learned one | unchanged | dropped and counted (`foreign-handle`) |
 | `ready` | gap / patch failure / assembly abandoned | `installing` | one `resync` carrying the **advisory** `(g, have)` of what is installed now (§1.8) |
 | `installing` | `man` admitted (`q` = slot, `g > retired`) | `installing` | `retired := g`; `assembling := g`; open the assembly |
 | `installing` | assembly complete **and still the active installation** (its `q` is still the slot; an owner refresh additionally requires the state to still be `installing`) | `ready` | `installed := g`; publish; slot cleared; waiters resolve; then §1.8's skipped-refresh recovery |
@@ -514,6 +520,12 @@ Two separate admission classes:
   retires the unsent remainder and closes the handle.
 - `not-ready` therefore refuses only gameplay traffic. It is never the
   answer to a lifecycle control on a live handle.
+- The converse bound is on the **owner**: a *caller* control supersedes
+  an in-flight emission, but the owner does not supersede its own
+  (§1.9a). The asymmetry is not arbitrary — a caller's replacement is
+  solicited and the replica is waiting for that exact `q`, whereas an
+  unsolicited one arrives at a replica that is correctly refusing
+  unsolicited manifests mid-transition.
 
 ### 1.8 Resynchronization
 
@@ -558,17 +570,22 @@ Two separate admission classes:
   and returns to `installing`; several skipped refreshes still produce
   one request. `skipped` is cleared once an installation subsumes it.
   A `fenced` replica records nothing, so this is not a way to reopen a
-  cancellation fence.
+  cancellation fence. Under §1.9a's ordered stream plus the owner's
+  no-self-supersession rule this path is **unreachable**; it is retained
+  and witnessed by explicit out-of-order injection, because the
+  alternative is a replica whose convergence depends on an assumption
+  with no defence behind it.
 
 **Admission, in one table.** Every rule reads off §1.7a's four values
 and the state:
 
 | Arrival | Admitted iff | Otherwise |
 |---|---|---|
+| Anything, once a handle is learned | `h` = the learned handle | dropped, counted (`foreign-handle`) |
 | Solicited `man` (has `q`) | state is `joining` or `installing`, `q` = slot, **`g > retired`** | dropped, counted |
 | Unsolicited `man` (no `q`) | state is **`ready`** and `g > retired` | dropped, counted; `joining`/`installing` record the skip, `fenced` *specifically* does not, so an owner emission cannot undo a cancellation fence. The replica's own next request is what leaves `fenced`. |
 | `snap` chunk | `(h, g, r, n)` match the **open** assembly and `g = assembling` | dropped, counted |
-| `delta` | state is **`ready`**, `g = installed`, `base` = installed revision | dropped (wrong state or `g`) or `resync` (gap) |
+| `delta` | state is **`ready`**, `g = installed`, `base` = installed revision | dropped (wrong state or `g`), `resync` (gap), or — for `g = assembling`, which ordering makes unreachable — dropped with `behind` set, so completion recovers (§1.9a) |
 
 The `delta` row is **state-gated as well as generation-gated**. Without
 the state test, a delta naming the generation the replica last installed
@@ -648,7 +665,49 @@ Consequences, including the cases the HOLDs named:
 | `delta` | Encoded `ops` must fit the 7 912 B above. If a revision's ops do not, the owner emits **no delta for it**: it initiates a resynchronization (§1.8) for that handle instead. A bounded, defined path — not a silent drop and not an oversized frame. |
 | `in` | Caller-side measured like `act`; over budget → `dropped/capacity` disposition, nothing sent. |
 | `no.detail` | ≤ 256 B, truncated at the owner with a trailing `…`. A refusal that cannot be delivered is worse than a terse one. |
-| `ok`, `resume`, `resync`, `alive`, `leave`, `man` | Fixed shape, bounded by construction and checked at startup. `aud` is bounded by 32 labels × 128 B, checked before send. |
+| `ok`, `resync`, `alive`, `leave`, `man` | Fixed shape, bounded by construction and checked at startup. `aud` is bounded by 32 labels × 128 B, checked before send. |
+| `resume` | Fixed shape plus `aud`, bounded by the same 32 × 128 B check. |
+
+### 1.9a The snapshot/live boundary, and the ordering it assumes
+
+**Assumption, stated because it is load-bearing: one reliable, ordered
+stream per handle.** Every kind for a handle — `man`, `snap`, `delta`,
+`res`, `no` — rides that one stream in emission order, so a `delta`
+cannot arrive before the chunks of the installation it applies to, and
+a replacement `man` cannot arrive before the chunks of the installation
+it replaces. This is what makes the snapshot/live boundary a boundary
+rather than a race, and it is why v1 needs no delta buffer.
+
+Two rules keep that assumption from becoming load-bearing for
+**silence** as well as for liveness — a broken assumption must produce
+recovery, never a replica that quietly renders a revision behind the
+owner for ever:
+
+- **The owner never supersedes its own in-flight emission.** An
+  unsolicited replacement is allocated only when the previous
+  installation's chunks have all been handed over. Otherwise the
+  replica — which correctly refuses unsolicited manifests while
+  installing (§1.7a) — would hold an assembly whose remaining chunks
+  the owner just retired, and would then drop the replacement's chunks
+  as belonging to no assembly: *both* generations stalled until a
+  deadline. The delta-over-budget replacement of §1.9 is decided at
+  delta time, which is idle by construction, so this costs nothing.
+  A **caller** control still supersedes mid-emission (§1.7b): its
+  manifest is solicited, and the replica is waiting for exactly that
+  `q`.
+- **A `delta` naming the generation being assembled sets `behind`.**
+  Ordering makes it unreachable; if it is ever seen, the owner has
+  moved past the revision of the snapshot in flight, so the replica
+  records one flag and, on completing the installation, issues **one**
+  `resync` — coalesced with the skipped-refresh recovery of §1.8, so
+  two reasons to recover still produce one request.
+
+Under this assumption the `skipped` watermark of §1.8 is likewise
+unreachable: a refresh cannot overtake the chunks of the installation
+it replaces, and the owner will not emit one mid-emission. It is
+retained, and witnessed by explicit out-of-order injection (§5.1d),
+because an invariant whose only defence is an assumption is an
+assumption.
 
 ### 1.10 Actions: retirement, rejection, replay
 
@@ -787,7 +846,7 @@ silently-ignored security-relevant field.
 | Kind | Required | Optional |
 |---|---|---|
 | `join` | `v k q def ver key aud` | — |
-| `resume` | `v k q h` | — |
+| `resume` | `v k q h aud` | — |
 | `resync` | `v k q h g have` | — |
 | `aud` | `v k q h aud` | — |
 | `alive`, `leave` | `v k q h` | — |
@@ -804,6 +863,33 @@ A `no` **with** `q` answers that request; a `no` **without** `q` is an
 unsolicited notification about `h` (only `closed`, at lease expiry) and is
 applied to the handle rather than correlated. A `no` carrying neither `q`
 nor `h` is refused `invalid-data`: it names nothing.
+
+**`resume` carries `aud`; `resync` does not.** A reconnecting caller
+must not be re-shown the audience the owner happened to have last:
+that audience may be wider than what the caller now wants, and
+re-delivering it is the disclosure §1.6 refuses to accept. So `resume`
+states the caller's **latest desired audience** and is authorized
+exactly like `aud` — the read-authorization check for the requested
+audience runs before any projection is taken, and a `resume` naming an
+audience the caller may not read is refused, not narrowed. `resync` is
+a *position* recovery **within the audience already bound to the
+handle**, so it carries no audience and the owner reads that from the
+handle; a `resync` cannot change what a caller can see. Recovering the
+desired audience with a bare `resume` plus a follow-up `aud` was the
+alternative and is rejected: it opens exactly the window in which the
+wider previous audience is delivered.
+
+**Only `join` creates a handle.** Every other request carries `h` and
+is refused `unknown-handle` when `h` is unknown or expired — an owner
+must never allocate a handle to satisfy a `resume`, because an
+unauthenticated-by-construction `h` is exactly what a forged `resume`
+supplies. Before a handle has been **learned** (the caller has sent
+`join` but no `man` has arrived), automatic reconnect therefore issues
+a **fresh `join`**, not a `resume`: the replica has nothing to resume.
+On `no {unknown-handle}` the replica discards its handle and rejoins,
+which is the only path that can produce a new one. The handle is
+learned from the `man` that answers the join; traffic naming any other
+handle is dropped and counted.
 
 **Canonical encodings.** A non-canonical spelling is `invalid-data`, not
 normalized — one spelling per value, so a digest and a comparison cannot
@@ -1061,48 +1147,96 @@ to re-test the thing that already worked.
 
 ### 5.1d The transition model, executed
 
-The four composition failures above were found by **reading** the
-tables. A fifth would not have been, so the tables are now executed:
-`browser-ts/test/store/lifecycle-model.ts` is a local model of §1.7a /
-§1.7b / §1.8 — two reducers (replica, owner) and a scheduler that
-delivers, loses and reorders messages — and
-`browser-ts/test/store/lifecycle.test.ts` runs **28 witnesses** over it.
+The composition failures of round 3 were found by **reading** the
+tables; the round-4 findings were found by **running** them. The model
+is `browser-ts/test/store/lifecycle-model.ts` — a replica reducer, an
+owner reducer, and a harness in `browser-ts/test/store/lifecycle.test.ts`
+that delivers in per-direction FIFO order, stalls the owner, breaks
+sessions, and (only for the §1.9a witnesses) injects out-of-order
+delivery. **37 witnesses**, plus a **22-inverse** campaign.
 
 It is test-only by construction: no production export, no transport, no
-new protocol subsystem, no `src/` change. It is not byte-level; the
-codec has its own witnesses (§5.1) and mixing the two would make a
-lifecycle failure look like a parse failure.
+new protocol subsystem, no `src/` change, bundle unchanged. It is not
+byte-level; the codec has its own witnesses (§5.1) and mixing the two
+would make a lifecycle failure look like a parse failure.
 
-Convergence is asserted against **two independent models**: `converged()`
+**What the model's agreement does and does not establish.** `converged()`
 requires the replica to be `ready`, published, not stale, and equal to
-the owner's own generation *and* revision; `stillLive()` then advances
-the owner and requires the delta to land. Generations are never
-synthesised — every `g` comes from the owner's allocator, so the
-watermark is tested against numbers the owner would really have issued.
+the owner's own handle, generation *and* revision; `stillLive()` then
+advances the owner and requires the delta to land. That is agreement
+between **two reducers written by the same author**, not between
+independently derived specifications — as the round-3 model demonstrated
+by omitting handle admission on *both* sides at once. It catches
+composition failures; it cannot catch a shared blind spot, and the
+review that found one is the control. Generations come from the owner's
+allocator in every transition trace; the two whitebox fence witnesses
+construct a generation directly, which is deliberate — they assert an
+invariant against a state no owner-issued trace reaches — and they are
+not transition traces.
 
-| Blocker | Executed witness | Inverse applied, red, reverted |
+| Property | Executed witness | Inverse applied, red, reverted |
 |---|---|---|
-| 1 — no legal initial manifest transition | "admits the first manifest against the pending join and publishes"; plus refusals for a foreign `q` and for an unsolicited manifest while `joining` | solicited `man` restricted to `installing` → **23 failed** (the literal old table cannot even join) |
-| 2 — supersession does not retire the assembly | "a superseded transition publishes nothing and its successor converges"; "late chunks of a superseded assembly publish nothing" | supersession keeps the assembly → **2 failed**; completion not checked against the slot → **1 failed**; completion of a refresh not checked against the state → **1 failed** |
-| 2 — deltas not state-gated | "an old-generation delta cannot repopulate a cleared view"; "…a fenced view" | delta gated on generation only → **2 failed** |
-| 3 — a skipped refresh strands the replica | "recovers to the owner generation it had to skip"; "coalesces several skipped refreshes into one recovery"; "does not reopen a fenced replica with an owner refresh" | skip not recorded → **2 failed**; recovery not triggered → **2 failed**; `fenced` reopened by a refresh → **1 failed** |
-| 4 — reconnect only from `ready` | "reconnects during installation, keeping the latest desired audience"; "reconnects during the initial join" | reconnect restricted to `ready` → **2 failed** |
-| 4 — `not-ready` still answered a control | "an unavailable projection defers and still converges" | owner refuses instead of deferring → **1 failed** |
-| watermark | "an abandoned generation cannot be reopened by a late manifest"; "a duplicate manifest leaves an open assembly untouched" | `g > installed` instead of `g > retired` → **2 failed** |
+| initial join has a legal transition | "admits the first manifest against the pending join and publishes", plus refusals for a foreign `q` and an unsolicited manifest while `joining` | solicited `man` restricted to `installing` → **34 failed** |
+| supersession retires the assembly | "a superseded transition publishes nothing and its successor converges"; "late chunks … publish nothing" | supersession keeps the assembly → **2 failed** |
+| publication fenced to the active installation | the two whitebox fence witnesses | drop the slot check → **1 failed**; drop the state check → **1 failed** |
+| deltas state-gated | "…cannot repopulate a cleared view"; "…a fenced view" | generation-only gate → **2 failed** |
+| only `join` creates a handle | "reconnecting before a handle is learned rejoins instead of resuming" | reconnect resumes a handle never issued → **1 failed**; reconnect restricted to `ready` → **3 failed** |
+| unknown/expired handle refused | "an expired handle is refused, and recovery rejoins" | owner honours an expired handle → **1 failed**; refusal does not rejoin → **1 failed**; one handle per owner → **1 failed** |
+| handle-scoped traffic | "an unsolicited manifest for another handle installs nothing" | accept foreign handles → **1 failed** |
+| `resume` carries the audience, `resync` does not | "a resync recovers within the audience bound to the handle" | `resync` carries `aud` → **1 failed** |
+| one wire request per transition | "two equal audience requests share one wire request", with "a different audience supersedes instead of joining" as its control | coalescing removed → **1 failed** |
+| owner does not supersede its own emission | "refuses a refresh while emitting, and the installation completes" | allow mid-emission refresh → **1 failed** |
+| a violated ordering assumption recovers | "a refresh that overtakes an in-flight assembly is recovered"; "a delta that overtakes its own assembly is recovered"; "…coalesce into one resync" | skip not recorded → **2 failed**; `behind` not recorded → **2 failed**; post-install recovery not triggered → **3 failed** |
+| `fenced` is the caller's to lift | "does not reopen a fenced replica with an owner refresh" | admit refreshes while `fenced` → **1 failed** |
+| reconnect from every live state | "reconnects mid-assembly, fencing the lost session's work"; "reconnect from ready retains the stale view" | reconnect restricted to `ready` → **3 failed** |
+| controls never answer `not-ready` | "an unavailable projection defers and still converges"; "a deferred initial join still converges" | owner refuses instead of deferring → **1 failed** |
+| retirement watermark | "an abandoned generation cannot be reopened by a late manifest"; "a duplicate manifest leaves an open assembly untouched" | `g > installed` instead of `g > retired` → **2 failed** |
 
-Two inverses are controls on the model itself, so that strictness cannot
-be mistaken for correctness: **drop every arrival** → 28 failed, 0
-passed, and **never emit chunks** → 26 failed. A drop-everything
-implementation fails every positive control and every `converged()`
-assertion in the file.
+Three inverses are controls on the model itself, so that strictness
+cannot be mistaken for correctness: **drop every arrival** → 37 failed,
+0 passed; **never emit chunks** → 35 failed; **issue one handle for
+every join** → 1 failed. A drop-everything implementation fails every
+positive control and every `converged()` assertion in the file.
 
-One inverse initially came back **green**: removing the publication
-fence changed nothing, because every supersession path already retires
-the assembly. The fence is the invariant and clearing is only the
-mechanism, so it is kept and now has its own whitebox witness against
-the state a forgetful supersession path would leave behind. That is the
-third non-discriminating oracle this stage has caught by running
-inverses rather than by reading tests.
+The inverse ledger is **implementer-run**: the mutation campaign is
+mine, and the review independently ran the baseline, the typecheck and
+its own probes. The two are different evidence and the distinction is
+not cosmetic — an implementer-run mutation campaign proves the oracles
+discriminate, while an independent probe is what found that they were
+discriminating about the wrong state.
+
+**What running it found that reading it did not.**
+
+- The initial join never reached the owner and the replica sent
+  `resume` for a handle it had never been issued — and the model owner
+  answered it, because neither side modelled handle admission. That is
+  the shared blind spot above: a caller could be served a projection
+  for a handle that was never authenticated.
+- `resume` and `resync` carried an audience the §2 schema forbade, so
+  the desired-audience recovery depended on a field the wire could not
+  deliver. Resolved by putting `aud` on `resume` (authorized exactly
+  like `aud`) and keeping `resync` audience-free.
+- The equal-pending witness set `waiters` by hand instead of issuing
+  both requests through the reducer, so it asserted the behaviour it was
+  supposed to test. Both requests now go through `setAudience`, and the
+  different-audience control proves the coalescing rule is not "ignore
+  the second request".
+- Enforcing FIFO delivery made the skipped-refresh scenario
+  **unreachable**, which in turn exposed that an owner refresh
+  mid-emission stalls *both* generations: the replica keeps an assembly
+  whose chunks were just retired, then drops the replacement's chunks.
+  Fixed on the owner side (§1.9a), the option the review offered as the
+  alternative.
+- A delta for the generation being assembled was silently dropped,
+  leaving the replica `ready` a revision behind the owner with no
+  recovery. It now sets `behind` and recovers.
+
+One round-3 inverse came back **green**: removing the publication fence
+changed nothing, because every supersession path already retires the
+assembly. The fence is the invariant and clearing is the mechanism, so
+it is kept and witnessed directly. That is the third non-discriminating
+oracle this stage has caught by running inverses rather than by reading
+tests.
 
 ### 5.2 Contract behaviour — required
 
