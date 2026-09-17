@@ -3258,6 +3258,43 @@ availability constraints can filter the pool. Add sensing only for a named
 need, not to duplicate the platform's scheduler. Keep deployment registrations
 distinguishable internally without exposing provider selection to callers.
 
+### Latency-aware resolution in both directions
+
+Organization-scoped invocation may prefer lower observed latency among
+eligible providers. The caller still addresses organization + capability,
+optionally expressing a latency preference; full Net nodes or their adapters
+perform selection. Serverless callers do not run a selector. Reuse suitable
+existing selection mechanisms rather than introduce another load-balancing
+subsystem.
+
+| Direction | Selection owner | Relevant observation |
+|---|---|---|
+| Net node -> serverless deployment | Full Net node, using adapter observations where needed | The actual invocation path through the adapter to the deployment, not merely node-to-adapter RTT |
+| Serverless -> native Net provider | Net-connected adapter acting for the authenticated caller | Adapter-to-provider path; the function-to-adapter leg also consumes the end-to-end deadline |
+| Serverless -> serverless deployment | Adapter/full-node resolution path | The path to the selected deployment, including any additional adapter hop |
+
+Organization, capability, authorization and placement constraints filter the
+candidate pool before latency ranking. Provider-local admission remains final.
+For a fixed ingress adapter, the function-to-adapter leg is common to the
+candidates: include it in the deadline budget without pretending it
+distinguishes their relative latency. Ingress-adapter placement is a separate
+deployment concern; provider selection cannot undo a distant ingress hop.
+
+Observations must identify the deployment/provider, capability, measuring
+location, measurement scope and freshness. Distinguish network RTT from
+service response time, which can include cold start, queuing and execution.
+Do not treat geographic proximity or an adapter ping as proof of function
+response latency. Unknown or stale measurements use a documented fallback
+policy; they are neither zero latency nor proof that a provider is unavailable.
+
+Selection happens before execution. A latency preference does not authorize
+speculative duplicate calls, bypass admission, or retry an ambiguously
+completed request on another provider. Active load sensing, per-instance
+telemetry and a global latency map are not prerequisites for this integration.
+The follow-on brief must witness eligibility-before-ranking, scoped/fresh
+observations and the unknown-observation fallback in both invocation
+directions, without requiring callers to name an exact target.
+
 ### Authority and execution boundaries
 
 - Organization attribution of a registration must be authenticated and
