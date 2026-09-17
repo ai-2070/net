@@ -360,7 +360,6 @@ impl FollowerRegistry {
     pub fn is_empty(&self) -> bool {
         self.followers.is_empty()
     }
-
     /// The union of every follower's declared subscriptions, sorted.
     ///
     /// Sorted because it drives a sequence of network operations and a
@@ -382,6 +381,23 @@ impl FollowerRegistry {
         }
         union.into_iter().collect()
     }
+}
+
+/// Whether `channel` is still wanted once a claim on it has been
+/// dropped: by this tab itself, or by any attached follower.
+///
+/// The two sets together are the whole last-consumer question, and
+/// this function exists so the answer is testable without a browser.
+/// The session layer that owns `own` is `wasm32`-only, so an
+/// arithmetic left up there would compile — and be witnessed — only in
+/// the wasm job, and "the leader cancelled a sibling tab's delivery"
+/// is not a defect to discover on a runner.
+pub fn membership_still_wanted(
+    own: &BTreeSet<String>,
+    followers: &[String],
+    channel: &str,
+) -> bool {
+    own.contains(channel) || followers.iter().any(|held| held == channel)
 }
 
 // ──────────────────────────── proxy protocol ───────────────────────────
@@ -1082,6 +1098,15 @@ pub struct ProxyServer<B: LeaderBackend> {
     /// Follower announcements parked on the next authoritative union
     /// publication. See [`Self::take_pending_announcements`].
     pending_announcements: Vec<Replier>,
+    /// Follower releases parked on the last-consumer decision, with
+    /// the channel each one asked to leave.
+    ///
+    /// Parked for the same reason announcements are: the answer
+    /// depends on state this server cannot see. A release is only the
+    /// last one if the leader tab's **own** declarations do not carry
+    /// the channel either, and `declared` lives a layer up. See
+    /// [`Self::take_pending_releases`].
+    pending_releases: Vec<(String, Replier)>,
     closed: bool,
 }
 
@@ -1111,6 +1136,7 @@ impl<B: LeaderBackend> ProxyServer<B> {
             stamped: 0,
             superseded: None,
             pending_announcements: Vec::new(),
+            pending_releases: Vec::new(),
             closed: false,
         }
     }
@@ -1229,6 +1255,18 @@ impl<B: LeaderBackend> ProxyServer<B> {
     /// and this is the handoff between the two.
     pub fn take_pending_announcements(&mut self) -> Vec<Replier> {
         core::mem::take(&mut self.pending_announcements)
+    }
+
+    /// Take the parked releases, each with the channel it asked to
+    /// leave.
+    ///
+    /// The caller decides: it can see this tab's own declarations as
+    /// well as [`Self::restoration`], and only the two together say
+    /// whether a release was the last one. Each replier must be
+    /// settled — dropping one answers it typed, which is the right
+    /// failure but the wrong answer.
+    pub fn take_pending_releases(&mut self) -> Vec<(String, Replier)> {
+        core::mem::take(&mut self.pending_releases)
     }
 
     /// The backend, for the leader's own local operations.
@@ -1350,22 +1388,17 @@ impl<B: LeaderBackend> ProxyServer<B> {
                 // visible — the same place the announcement union is
                 // computed, and for the same reason.
                 //
-                // Until that is wired, a proxied release is refused
-                // with the reason rather than served wrongly: the
-                // session surface does not expose one, so this is
-                // unreachable from a page and is here so it cannot
-                // become reachable by accident.
+                // So the claim is dropped here and the caller is
+                // parked on the decision, exactly as an `Announce` is
+                // parked on the publication that actually happens.
+                // What the follower is told is the outcome of the real
+                // decision, not a success for an operation nobody
+                // made.
                 if let LeaderRequest::Unsubscribe { channel } = &request {
                     self.followers.release(follower, channel);
-                    let error = LeafError::ControlPlane(format!(
-                        "a proxied release of '{channel}' is not served yet: the \
-                         last-consumer decision needs this tab's own declarations \
-                         beside its followers', and this server sees only the \
-                         followers'"
-                    ));
-                    self.replier(correlation)
-                        .fail(ProxyFailure::Typed(error.clone()));
-                    return Err(error);
+                    let reply = self.replier(correlation);
+                    self.pending_releases.push((channel.clone(), reply));
+                    return Ok(());
                 }
                 // # A follower does not publish the document
                 //
@@ -2710,6 +2743,37 @@ mod tests {
             !registry.release(1, "never-declared"),
             "releasing something nobody declared is not somebody else's claim"
         );
+    }
+
+    /// The last-consumer question, over the two sets that answer it.
+    ///
+    /// Native on purpose: the session layer that holds the first set
+    /// is `wasm32`-only, and an arithmetic witnessed only there is
+    /// witnessed only on a runner.
+    #[test]
+    fn a_channel_is_still_wanted_while_either_set_holds_it() {
+        let mine: BTreeSet<String> = ["mine".to_string(), "both".to_string()]
+            .into_iter()
+            .collect();
+        let theirs = vec!["theirs".to_string(), "both".to_string()];
+
+        assert!(
+            membership_still_wanted(&mine, &theirs, "mine"),
+            "this tab still declares it, so the membership stays — the leader \
+             must not cancel its own page's delivery because a follower left"
+        );
+        assert!(
+            membership_still_wanted(&mine, &theirs, "theirs"),
+            "a follower still declares it"
+        );
+        assert!(membership_still_wanted(&mine, &theirs, "both"));
+        assert!(
+            !membership_still_wanted(&mine, &theirs, "nobody"),
+            "neither set holds it, so this was the last consumer"
+        );
+
+        let empty = BTreeSet::new();
+        assert!(!membership_still_wanted(&empty, &[], "anything"));
     }
     // ────────────────────────── the follower registry ────────────────────
 

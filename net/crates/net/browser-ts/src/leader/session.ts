@@ -217,6 +217,23 @@ export class MeshSession {
     await this.guard(() => this.inner.subscribe(channel));
   }
 
+  /**
+   * Release this tab's claim on a channel.
+   *
+   * Not `subscribe` run backwards. The origin runs one node and the
+   * leader holds **one** membership for the union of every tab's
+   * declarations, so this drops this tab's claim and the membership
+   * itself is given up only when no other tab still wants the
+   * channel. One tab closing a subscription therefore cannot stop
+   * another tab that is still reading the same channel.
+   *
+   * Also removes it from what a future leader restores, so a handoff
+   * does not silently bring back a channel this tab released.
+   */
+  async unsubscribe(channel: string): Promise<void> {
+    await this.guard(() => this.inner.unsubscribe(channel));
+  }
+
   /** Publish one payload to a channel. */
   async publish(channel: string, payload: Uint8Array): Promise<void> {
     await this.guard(() => this.inner.publish(channel, payload));

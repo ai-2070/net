@@ -648,6 +648,49 @@ impl Lifecycle {
         self.request(LeaderRequest::Subscribe { channel }).await
     }
 
+    /// Drop this tab's claim on `channel`, and give up the membership
+    /// only if nobody else still wants it.
+    ///
+    /// The counterpart to [`Self::subscribe`], and deliberately not
+    /// its mirror image. A subscribe is one tab declaring an interest
+    /// and the leader holds ONE membership for the union of them, so a
+    /// release is a claim being dropped and only the **last** claim
+    /// gives the membership up. Unsubscribing on every release would
+    /// cancel a sibling tab's delivery — one tab closing a store must
+    /// not stop another tab that is still reading the same channel.
+    ///
+    /// On a leader the union is visible here: this tab's `declared`
+    /// beside every follower's declarations. On a follower it is not,
+    /// so the request goes to the leader, which parks it and answers
+    /// from [`serve_releases`] once it has both sets.
+    pub async fn unsubscribe(&self, channel: String) -> ProxyOutcome {
+        let is_leader = {
+            let mut state = self.shared.state.borrow_mut();
+            state.declared.remove(&channel);
+            state.role == Role::Leader
+        };
+        if !is_leader {
+            return self.request(LeaderRequest::Unsubscribe { channel }).await;
+        }
+        if still_wanted(&self.shared, &channel) {
+            // Somebody else is reading it. This tab's claim is gone,
+            // which is what it asked for, and no frame goes out.
+            return Ok(ProxyValue::Bytes(Bytes::new()));
+        }
+        let outcome = self
+            .request(LeaderRequest::Unsubscribe {
+                channel: channel.clone(),
+            })
+            .await;
+        if outcome.is_ok() {
+            // Reconciliation subscribes what is wanted and not yet
+            // subscribed, so forgetting this is what lets a later
+            // re-declaration actually re-subscribe.
+            self.shared.state.borrow_mut().subscribed.remove(&channel);
+        }
+        outcome
+    }
+
     /// Publish the announcement, and record it as this tab's current
     /// intent.
     ///
@@ -1355,6 +1398,57 @@ async fn announce_union(shared: &Rc<Shared>) -> ProxyOutcome {
     outcome
 }
 
+/// Whether anyone still wants `channel`: this tab's own declaration,
+/// or any attached follower's.
+///
+/// The two sets together are the whole question, and the reason the
+/// decision cannot live in [`crate::leader::ProxyServer`], which holds
+/// only the second one.
+fn still_wanted(shared: &Rc<Shared>, channel: &str) -> bool {
+    let own_wants = shared.state.borrow().declared.clone();
+    let followers = shared
+        .server
+        .borrow()
+        .as_ref()
+        .map(ProxyServer::restoration)
+        .unwrap_or_default();
+    crate::leader::membership_still_wanted(&own_wants, &followers, channel)
+}
+
+/// Answer the releases the server parked, each against the union.
+///
+/// A release whose channel somebody else still declares succeeds
+/// without a frame; the last one gives the membership up. Every parked
+/// replier is settled: dropping one answers its caller typed, which is
+/// the correct failure but not the answer it is owed.
+async fn serve_releases(shared: &Rc<Shared>) {
+    let parked = {
+        let mut server = shared.server.borrow_mut();
+        match server.as_mut() {
+            Some(server) => server.take_pending_releases(),
+            None => return,
+        }
+    };
+    for (channel, replier) in parked {
+        if still_wanted(shared, &channel) {
+            replier.bytes(Bytes::new());
+            continue;
+        }
+        let lifecycle = Lifecycle {
+            shared: shared.clone(),
+        };
+        let outcome = lifecycle
+            .request(LeaderRequest::Unsubscribe {
+                channel: channel.clone(),
+            })
+            .await;
+        if outcome.is_ok() {
+            shared.state.borrow_mut().subscribed.remove(&channel);
+        }
+        settle_declarations(vec![replier], &outcome);
+    }
+}
+
 /// Answer the followers whose `announce()` was parked on this
 /// publication, with the outcome it actually had.
 ///
@@ -1419,8 +1513,17 @@ fn dispatch(shared: &Rc<Shared>, text: &str) {
             stand_down(shared, generation);
             return;
         }
+        // Releases before reconciliation, and in their own task:
+        // `serve_releases` may perform a wire unsubscribe, and
+        // reconciliation subscribes what is still wanted. Running the
+        // release first means the two cannot argue about a channel
+        // this message just gave up.
+        let releasing = Rc::clone(shared);
         let reconciling = Rc::clone(shared);
-        spawn_local(async move { reconcile(&reconciling).await });
+        spawn_local(async move {
+            serve_releases(&releasing).await;
+            reconcile(&reconciling).await;
+        });
         flush_events(shared);
         return;
     }
@@ -2066,6 +2169,16 @@ impl MeshSession {
     /// successor restores and what an attach carries to a new leader.
     pub async fn subscribe(&self, channel: String) -> Result<(), JsError> {
         self.lifecycle.subscribe(channel).await?;
+        Ok(())
+    }
+
+    /// Release this tab's claim on a channel.
+    ///
+    /// The membership itself is given up only when no other tab still
+    /// declares the channel: the origin runs one node, and one tab
+    /// closing a subscription is not every tab closing it.
+    pub async fn unsubscribe(&self, channel: String) -> Result<(), JsError> {
+        self.lifecycle.unsubscribe(channel).await?;
         Ok(())
     }
 

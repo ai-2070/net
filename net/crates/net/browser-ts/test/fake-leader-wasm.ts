@@ -108,6 +108,7 @@ export interface FakeSessionBehaviour {
 export class FakeSession implements LeafWasmSession {
   readonly calls: { service: string; payload: Uint8Array; timeoutMs?: number }[] = [];
   readonly subscribed: string[] = [];
+  readonly released: string[] = [];
   readonly published: { channel: string; payload: Uint8Array }[] = [];
   readonly announced: string[][] = [];
   readonly signalled: { peerHex: string; dialog: number; kind: string }[] = [];
@@ -188,6 +189,10 @@ export class FakeSession implements LeafWasmSession {
 
   async subscribe(channel: string): Promise<void> {
     this.subscribed.push(channel);
+  }
+
+  async unsubscribe(channel: string): Promise<void> {
+    this.released.push(channel);
   }
 
   async publish(channel: string, payload: Uint8Array): Promise<void> {

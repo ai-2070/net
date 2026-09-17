@@ -60,6 +60,11 @@ export interface LeafWasmSession {
   interruption_ms(): number | undefined;
   call(service: string, payload: Uint8Array, timeout_ms?: number): Promise<Uint8Array>;
   subscribe(channel: string): Promise<void>;
+  /**
+   * Release this tab's claim on a channel. The membership survives
+   * while another tab still declares it.
+   */
+  unsubscribe(channel: string): Promise<void>;
   publish(channel: string, payload: Uint8Array): Promise<void>;
   announce(capabilities: string[]): Promise<void>;
   query(capability: string): Promise<string>;

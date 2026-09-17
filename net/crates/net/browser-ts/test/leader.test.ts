@@ -140,6 +140,8 @@ describe('MeshSession', () => {
 
     await session.subscribe('chan');
     expect(fake.subscribed).toEqual(['chan']);
+    await session.unsubscribe('chan');
+    expect(fake.released).toEqual(['chan']);
     await session.publish('chan', new Uint8Array([7]));
     expect(fake.published).toEqual([{ channel: 'chan', payload: new Uint8Array([7]) }]);
     await session.announce(['cap:one']);
