@@ -3,7 +3,8 @@
 Make a browser tab a first-class Net node: its own entity identity, its own
 Noise sessions, its own streams, channels, nRPC calls and fold participation —
 with WebRTC DataChannels as the **primary** transport so browser ↔ browser and
-browser ↔ native traffic never transits a server on the data path. Native
+browser ↔ native traffic takes a direct data path whenever ICE connects the
+pair. Native
 "anchor" nodes exist to bootstrap signalling, answer STUN, and forward for the
 minority of pairs ICE cannot connect. They are control plane and fallback, not
 the path.
@@ -11,8 +12,8 @@ the path.
 > **Framing.** This plan inverts the [`NAT_TRAVERSAL_PLAN.md`](NAT_TRAVERSAL_PLAN.md)
 > framing on purpose. There, a direct path is an *optimization* and the relay
 > is the correctness guarantee. Here, for the products that motivate the work
-> (in-browser three.js multiplayer, collaborative editing, synchronized scene
-> state for audiovisual worlds), a direct path is a **product requirement** —
+> (in-browser Three.js multiplayer and synchronized game state), a direct
+> path is a **product requirement** —
 > a server hop on every position update is the thing we are refusing to ship.
 > The relay stays as the correctness fallback exactly as before, but the plan
 > is measured on the fraction of sessions that land direct, not on whether the
@@ -22,7 +23,47 @@ the path.
 
 ## Status
 
-**Draft, revision 3 — not started.** First draft 2026-09-05 against
+**Current scope — browser package + networked game store (product owner,
+2026-09-17).** The deliverables are `@net-mesh/browser` and a Zustand-style
+networked store for Three.js games. The owner's shorthand `@mesh/browser`
+refers to the existing browser package here; no package rename is authorized.
+The developer outcome is: install the browser package, create a store, join
+a game audience, and drive a multiplayer Three.js scene without managing
+WebRTC signalling, connection bookkeeping or packet dispatch in game code.
+
+**Scope rule:** for every proposed task, name the browser-package or
+game-store operation that cannot work correctly without it. If there is no
+such dependency, defer the task. A necessary native support path is not an
+independent anchor product. Use the existing Rust/CLI host path, with only
+the bounded changes needed for bootstrap, enrollment, STUN, discovery and
+attributed fallback. The default CLI feature set is not widened.
+
+This decision **supersedes the broad Stage 7 authorization of 2026-09-16
+and the subsequent Docker-only deferral**. Stage 7 below now defines the
+store and its end-to-end browser demonstration. Dedicated anchor packaging,
+cross-language anchor-role parity and cross-SDK type generation are deferred.
+`spikes/S7_BRIEF.md` describes the superseded scope and must not be dispatched
+unchanged; reconcile its deliverables and pin a committed base before a new
+implementation slice. This plan update does not edit that brief.
+
+**Acceptance is not waived.** Stages 5 and 6 have implementation and repair
+history below; the completed HOLD reviews remain evidence at their recorded
+SHAs. Subsequent repairs require independent closure on the browser/store
+path and its shared dependencies. Green CI is not reviewer acceptance, and
+an old HOLD is not proof that every finding still reproduces at a later
+head. Deferral does not delete implemented features, weaken existing tests,
+or excuse identity, delivery, lifecycle or compatibility regressions.
+
+### Historical baseline and authorization record
+
+The dated entries below record decisions at their original heads, not the
+current implementation status or permission to restart a superseded slice.
+Source inventories in §Context, §Critical files and §Dependencies retain
+their stated baseline; consult current source before using their paths or
+counts for implementation.
+
+**Original draft, revision 3 — not started at that baseline.** First draft
+2026-09-05 against
 `net-mesh` 0.36.0 (`master` at `079894c76`); revised the same day after
 Kyra's source-checked review; revised again 2026-09-11 after Fable's
 review of revision 2 and Kyra's dispositions (see [Review log](#review-log)).
@@ -276,9 +317,10 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   NAT-matrix row ICE is expected to solve lands direct in the deterministic
   harness. **Deployment:** the field direct ratio is reported as telemetry
   with its own denominator; no fixed percentage is a gate.
-- No third-party STUN, TURN or signalling infrastructure. Anchors answer STUN
-  on their RTC socket; the mesh is the signalling network after the first
-  session; the mesh relay is the fallback for pairs whose anchors are
+- No third-party STUN, TURN or signalling infrastructure. Anchors expose the
+  distinct announced STUN gathering endpoint adopted in Stage 6; `rtc_addr`
+  remains the RTC/diagnostic endpoint. The mesh is the signalling network
+  after the first session; the mesh relay is the fallback for pairs whose anchors are
   reachable.
 - Wire parity: a browser node speaks the exact Net wire — 68-byte header,
   Noise NKpsk0, ChaCha20-Poly1305, the same subprotocol ids — so native peers
@@ -287,8 +329,13 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   the default build's exported C-ABI symbol set and observable behaviour are
   unchanged.** (Not byte-identical binaries — the endpoint refactor changes
   code layout under default features and that is fine.)
-- Node, Python and Go bindings gain the anchor role behind the same feature
-  flag; a new `@net-mesh/browser` package ships the wasm leaf.
+- `@net-mesh/browser` ships a usable wasm leaf, TypeScript types and a runnable
+  browser example. Native anchor-role parity in Node, Python, Go and C is
+  deferred; the browser release does not depend on those binding additions.
+- A Zustand-style networked store makes state reads, selected subscriptions,
+  permitted updates/actions, audience changes and reconnect usable from a
+  Three.js render loop without requiring React. Stage 7 defines its bounded
+  contract and acceptance demonstration, not a general state framework.
 
 ## Non-goals
 
@@ -313,16 +360,28 @@ napi binding (Node ≥ 20). `web/` is a Next.js site. Every `wasm-bindgen` /
   them can host bootstrap, STUN, announcement flooding or the relay
   fallback. A browser cannot cover for that either — a tab has no raw UDP,
   so it can neither answer STUN nor serve a bootstrap URL. v1 therefore
-  requires at least one always-on native anchor. The intended product
-  answer is a **packaged anchor** (Stage 7): one small container or VM with
-  one UDP port, off the data path, serving many browsers. A third-party
-  STUN escape hatch is *not* offered in v1 (see §6, "Serverless"). The
+  requires at least one always-on native anchor. For this milestone, run
+  the existing Rust/CLI host path as a process on a host or VM, serving
+  bootstrap, distinct RTC/STUN endpoints and fallback. A dedicated
+  **packaged anchor is deferred**, not a browser/store release prerequisite.
+  The anchor is off the application data path once a pair is direct. A
+  third-party STUN escape hatch is *not* offered in v1 (see §6, "Serverless"). The
   serverless substitute for each anchor function is sketched under
   §Follow-on.
 - **Browser-side persistence beyond identity.** RedEX / Dataforts on
   IndexedDB is a separate plan.
 - **A collaborative-text CRDT.** Net carries and persists updates; the CRDT
   is the application's.
+- **Adjacent WebRTC products.** Dedicated anchor crate/distribution, binary
+  release matrices, Docker/compose/GHCR, native binding anchor-role parity,
+  shared generated types across `sdk-ts` and the browser package, and
+  general-purpose telemetry expansion are deferred. A bounded repair needed
+  by an actual browser/store operation remains in scope; broad parity does not.
+- **Game-engine and economy systems.** Physics, prediction/reconciliation,
+  general spatial indexing, cross-host simulation handoff, asset transfer and
+  item/currency provenance systems are not prerequisites for the initial
+  store. The game chooses audiences and validates actions; the store must
+  respect that authority rather than grant arbitrary shared-state writes.
 
 ---
 
@@ -912,8 +971,9 @@ pairs whose anchors are reachable**.
 static host or edge CDN says nothing about the browser's network path — a
 tab on an ordinary connection has UDP regardless of where it loaded from.
 What serverless hosting removes is any place to *run the anchor*. That is a
-deployment constraint, not a connectivity class, and it is handled by the
-packaged anchor (Stage 7), not by this section's fallback logic. The
+deployment constraint, not a connectivity class. This milestone uses an
+existing native anchor process; its separate packaging and a serverless
+replacement are deferred, not handled by this section's fallback logic. The
 tempting shortcut — a serverless HTTPS signalling relay plus a public
 third-party STUN server — would reintroduce the external dependency the
 goals exclude and would still leave no relay fallback and no announcement
@@ -2276,6 +2336,10 @@ credentials untested across a process boundary. Stage 5 brief:
   and therefore cannot establish that prerequisite. Stage 5 must specify the
   **session-independent signalling path** that makes an anchorless start
   possible, or the follow-on is a refactor after all.
+- **Current scope qualification (2026-09-17):** retain the implemented
+  `ControlPlane` boundary, session-independent signalling and existing mock
+  witnesses. They do not authorize a serverless backend or new speculative
+  portability work as a prerequisite for the browser package or game store.
 - `cross_lang_wire` replay inside the wasm test runner.
 - Playwright CI: Chromium + Firefox against a native anchor — handshake,
   reliable round-trip, fire-and-forget loss under injected DataChannel loss,
@@ -2549,6 +2613,10 @@ questions remain open as stated in §12.1/§12.2/§13.
 - **Field telemetry:** `ice_direct / ice_attempted` exported through the
   existing stats surface and Deck; documented as a deployment metric with
   its own denominator.
+  Under the 2026-09-17 scope, retain existing instrumentation and the
+  measurements needed to prove direct/fallback delivery. New Deck work,
+  native-binding statistics and public route-accessor expansion are deferred
+  unless a named browser/store operation actually requires them.
 
 ### Exit criteria
 
@@ -2666,8 +2734,9 @@ peer advertising `FRAGMENT_REASSEMBLY_TAG` (a plain signed tag, not a
 canonical field) **and** the resolved address being `PeerAddr::Rtc` —
 because the native receive arm is RTC-only by design, and fragmenting
 toward a UDP peer would hand its application N partial events.
-Native ↔ native unchanged. **Stage 7 authorized by the product owner
-the same day** (brief `spikes/S7_BRIEF.md`): the packaged anchor with
+Native ↔ native unchanged. **Historical Stage 7 authorization by the product
+owner that day, superseded by the 2026-09-17 browser/store scope** (old brief
+`spikes/S7_BRIEF.md`): the packaged anchor with
 persisted identity and a built-in local enrollment authority,
 anchor-role parity in the bindings, shared generated TS types;
 ICE-TCP / DTLS exporter / browser RedEX stay deferred; the serverless
@@ -2753,20 +2822,108 @@ implementer session took this packet directly and delivered
 (CI green, natsim green at `be1cde7e3`); verification against her
 probes by the record-keeper is pending and nothing has been forwarded.
 
-## Stage 7 — Surface completion and deferred items (**authorized 2026-09-16**; brief `spikes/S7_BRIEF.md`)
+## Stage 7 — Zustand-style networked store and Three.js proof
 
-- Node / Python / Go anchor-role parity for `RtcConfig` + `RtcStats`.
-- `sdk-ts` / `@net-mesh/browser` shared generated types.
-- **Packaged anchor.** A single-binary / container distribution of a
-  `webrtc`-enabled node preconfigured as an anchor (`serve_bootstrap`,
-  `serve_stun`, a pinned `rtc_addr`, invite minting), so that "deploy a
-  browser-native Net app" means static assets plus one small always-on
-  process. This is the answer to serverless-only hosting (§Non-goals).
-- ICE-TCP passive candidates on anchors (S0b: candidate constructible in
-  str0m; listener/framing/lifecycle are the caller's — still deferred).
-- DTLS-exporter shortcut — **stays deferred** (S0c, §4): not a performance
-  lever; only reconsidered as a security-model decision.
-- Browser-side RedEX on IndexedDB (separate plan).
+**Product-owner scope, 2026-09-17; replaces the former surface-completion
+stage.** Only the browser package and this store are deliverables. The old
+`spikes/S7_BRIEF.md` is superseded, not an implementation contract for this
+stage. Freeze the bounded store API, ownership rule and executable witnesses
+in a revised brief before implementation; no prior exact store API is claimed
+to have been agreed or implemented by this document.
+
+### Store contract
+
+- **Familiar state access:** read current state and subscribe to selected
+  changes; dispose subscriptions explicitly. The core store works without
+  React and can be consumed from a Three.js render loop. Zustand-style names
+  and ergonomics do not require a particular dependency or package split.
+- **Explicit write authority:** the minimal design names who owns each
+  replicated state scope. A caller publishes an update it is authorized to
+  own, or submits an action to that owner. A subscription is not write
+  authority; receipt of an event is not proof of an accepted action. Do not
+  build arbitrary multi-writer merge or a universal policy framework.
+- **Audience-scoped distribution:** the game chooses audiences from
+  location, action and relationships (for example, nearby players versus
+  ship crew). The store uses actual mesh channel membership/distribution,
+  not a local JSON topic filter presented as network audience isolation.
+  No mandatory all-to-all browser topology or whole-world broadcast.
+- **Snapshot then live updates:** joining establishes a consistent boundary
+  between initial state and subsequent deltas. Leaving or changing an
+  audience retires its subscriptions and removes entities no longer visible
+  through any active audience. Late callbacks from a previous subscription
+  or session cannot repopulate the current view.
+- **Traffic semantics:** ephemeral transforms favor freshness; accepted
+  actions and essential state transitions use reliable delivery and defined
+  deduplication/recovery. Do not replay stale movement after reconnect or
+  blindly retry an action whose outcome is unknown. These are application
+  semantics above the existing transport, not a change to the DataChannel
+  configuration in §3.
+- **Lifecycle:** expose connecting/ready/disconnected/failed state; reconnect
+  obtains current state and resumes from a defined boundary. Unsubscribe and
+  close retire network work, callbacks and local listeners. Local state access
+  does not imply that a remote write has been accepted.
+
+### Required supporting work only
+
+Keep the browser package's WASM loading, exports, types, public stream/channel
+surface and documentation runnable as a package consumer. Reuse the existing
+native host path for authenticated bootstrap, enrollment, discovery, separate
+STUN gathering and attributed relay fallback. Supply a minimal repeatable
+launch/configuration recipe for that host; do not require a new executable
+crate, registry name or release workflow.
+
+If enrollment registration, restart identity reuse, configuration refusal,
+channel exposure or another missing seam blocks a named browser/store
+operation, record that dependency and repair it in a bounded slice. Do not
+import the old packaged-anchor checklist wholesale. Retain existing
+security and compatibility contracts, default-off native WebRTC, UDP
+semantics and the no-guards-across-waits discipline.
+
+### Exit criteria — new deliverables, not execution claims
+
+1. A small playable Three.js scene consumes the built browser package and
+   the real store, not a mock store or private WASM hooks. A developer can
+   follow one documented host-and-browser recipe to run it.
+2. Independent browser participants join, move and observe each other;
+   a late join receives a consistent snapshot plus live changes. Changing
+   audience stops irrelevant delivery and removes departed entities without
+   removing entities still covered by another active audience.
+3. Disconnect, reconnect and leave exercise current-state recovery,
+   non-duplication of accepted actions, rejection of stale-session updates
+   and complete subscription/listener cleanup. An unauthorized state write is refused
+   through the real public path.
+4. Chromium and Firefox exercise the supported browser path. Data-only use
+   requires no camera/microphone permission; permission state is recorded.
+   Direct and forced-fallback cases prove receiver-observed application
+   delivery, with per-pair application forwarding flat for direct and
+   increasing for routed delivery. A flat counter alone is not success.
+5. Retain Stage 5/6 identity, reliability/fragmentation, bounded-resource and
+   lifecycle gates on this path and its shared dependencies. Review repairs
+   at a pinned head; preserve existing tests and relevant inverse receipts.
+   Linux netns/root evidence may execute in CI; Windows-local inability is
+   not a reason to replace the scenario with a mock or weaken its assertion.
+
+### Deferred — not browser/store acceptance prerequisites
+
+- Dedicated anchor crate or distribution, new binary-release matrix,
+  crates.io/npm/PyPI anchor publication and general deployment walkthroughs.
+- Dockerfile, compose and GHCR publication. The earlier Docker-only deferral
+  is retained and widened to the independent packaged-anchor product.
+- Node / Python / Go / C anchor-role parity, its feature passthroughs and
+  new FFI `RtcConfig` / statistics surfaces.
+- Shared generated types across `sdk-ts` and `@net-mesh/browser`; fix a real
+  browser consumer incompatibility narrowly instead of requiring parity.
+- General statistics/Deck expansion or a new public per-peer route accessor
+  solely to simplify evidence collection.
+- Serverless control-plane implementations, collaborative editing and CRDT
+  integrations, asset economies/provenance, general game-engine systems and
+  browser-side RedEX/Dataforts on IndexedDB.
+- ICE-TCP passive candidates and the DTLS-exporter shortcut remain deferred.
+
+Deferral is not deletion: preserve already implemented features and tests.
+Reopen a deferred item only for an explicit product decision or a demonstrated
+dependency of the browser package/store, not because it appeared in the old
+Stage 7 brief.
 
 ---
 
@@ -2981,6 +3138,9 @@ Also absent, as expected at "not started": `crates/net/wire/`,
 
 ## Out of scope (for this plan)
 
+- The adjacent products listed in Stage 7's deferred section: independent
+  anchor packaging, native binding parity, cross-SDK type generation and
+  application expansions not required by the browser package/game store.
 - WebTransport; WebSocket data paths.
 - A TURN protocol server; any UDP-blocked rescue in v1.
 - Audio / video / SRTP.
@@ -2993,8 +3153,9 @@ Also absent, as expected at "not started": `crates/net/wire/`,
 
 ## Follow-on: serverless control plane (not in this plan)
 
-Recorded here so the v1 design keeps the door open; scoped and staged in a
-separate plan once Stage 6 lands.
+Recorded here as deferred design context, not an automatic next stage when
+Stage 6 lands. It requires a separate product decision and plan; none of the
+tiers below is a prerequisite for the browser package or game store.
 
 **What "serverless support" means.** Hosting a browser-native Net app with
 no always-on native anchor — static assets plus a serverless runtime
@@ -3093,8 +3254,10 @@ applied in this revision:
 | 7 | Key-storage guarantee overstated; multi-tab undefined | §8: same-origin boundary stated; leader-elected single node per origin |
 | — | Spikes before the wide refactor; wire split is a crate split; conformance vs deployment denominators; per-pair witness; compatibility guarantee precision; allow mechanical test edits | Stage 0; §7 / Stage 2; Goals + Stage 6; §10; Goals; Stage 1 |
 | — | Name the announcement route-learning path; `reflex_addr` carries a `SocketAddr` on the wire | §Context, §7; wire-address inventory |
-| — | 2026-09-05, product owner: serverless-only hosting is anchorless, not UDP-blocked | §Non-goals, §6 "Serverless", Stage 7 packaged anchor |
+| — | 2026-09-05, product owner: serverless-only hosting is anchorless, not UDP-blocked | §Non-goals, §6 "Serverless"; the historical packaged-anchor follow-on is now deferred |
 | — | 2026-09-05, product owner: document the serverless follow-on and keep v1 open to it | §Follow-on; `ControlPlane` trait + mock-driven exit criterion in Stage 5 |
+| — | 2026-09-17, product owner: initially deferred Dockerfile, compose and GHCR while retaining the anchor binary; subsequently superseded by the broader browser/store-only scope | Historical decision; container deferral retained, independent anchor distribution now also deferred |
+| — | 2026-09-17, product owner: focus only on `@net-mesh/browser` (called `@mesh/browser` in the request) and a Zustand-style store for Three.js games; defer everything not necessary for those two to work | Current Status, Goals, Non-goals, §6 deployment boundary, Stage 7 store contract and exit criteria; old `spikes/S7_BRIEF.md` superseded |
 
 **2026-09-11 — re-baseline against `master` `132dbdcff`.** No design change;
 citations only. Every `path:line` and count in §Context, §1 and §Critical
