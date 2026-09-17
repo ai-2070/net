@@ -79,7 +79,32 @@ pub enum LeafEvent {
         payload: Bytes,
     },
     /// Data on an application stream, already reordered.
+    ///
+    /// **A stream id is not an address.** It is derived from a
+    /// label, or supplied outright to match a publish contract, and
+    /// neither derivation involves the peer — so one label opened
+    /// to two peers is one id on two sessions, which is a supported
+    /// composition and not a collision. Without the peer on the
+    /// event, every consumer that filters the node-wide event
+    /// stream by id alone accepts whichever peer's payload arrived,
+    /// and two wrappers under one label both receive one peer's
+    /// bytes while the other peer's are delivered to the wrong
+    /// application inbox. The peer is authenticated by the session
+    /// the packet was opened on; what was missing was carrying it
+    /// this far.
     StreamData {
+        /// The peer whose session delivered this.
+        peer_node: NodeId,
+        /// That session's incarnation.
+        ///
+        /// Provenance, not part of any filter key: a consumer can
+        /// attribute a payload to an exact establishment rather
+        /// than to a peer id that may have been re-handshaked. The
+        /// receive path already cannot deliver under a retired
+        /// incarnation — replacement retires the predecessor's
+        /// cursors and partial reassemblies — so nothing needs to
+        /// reject on it.
+        incarnation: u64,
         /// The stream.
         stream_id: u64,
         /// The sequence this batch arrived under.
@@ -200,11 +225,13 @@ impl LeafEvent {
                 base64(payload)
             ),
             Self::StreamData {
+                peer_node,
+                incarnation,
                 stream_id,
                 seq,
                 payload,
             } => format!(
-                "{{\"type\":\"stream_data\",\"stream_id\":\"{stream_id}\",\"seq\":\"{seq}\",\"payload\":\"{}\"}}",
+                "{{\"type\":\"stream_data\",\"peer_node\":\"{peer_node}\",\"incarnation\":\"{incarnation}\",\"stream_id\":\"{stream_id}\",\"seq\":\"{seq}\",\"payload\":\"{}\"}}",
                 base64(payload)
             ),
             Self::StreamFailed {
@@ -1509,6 +1536,20 @@ impl LeafNode {
     /// this session — its sequence space cannot rewind to meet the
     /// peer's reset receive cursor, so a handle for it would be a
     /// handle onto a stream that cannot deliver.
+    ///
+    /// **Refuses an id the nRPC plane already owns on this peer.**
+    /// A reply carrier is a reservation, and the receive path
+    /// resolves a frame's plane by that reservation before it looks
+    /// at any byte of the payload — so an application stream
+    /// admitted on a reserved id was admitted onto a carrier it
+    /// could never be delivered on. Its first ordinary payload came
+    /// back `Dropped { UnknownCall }`, which is the RPC plane
+    /// correctly refusing a frame that is not a reply, on a stream
+    /// the caller had been told it owned. Contradictory owners are
+    /// therefore resolved **here**, at registration, where the
+    /// caller can still pick another id, rather than silently at
+    /// dispatch where it cannot. The conflict names the owning
+    /// plane and the recovery.
     pub fn open_stream(
         &mut self,
         peer: NodeId,
@@ -1525,6 +1566,18 @@ impl LeafNode {
             return Err(LeafError::Session(format!(
                 "stream {stream_id:#x} on the session with {peer:#x} failed terminally \
                  (incarnation {incarnation}); reconnect or use another stream id"
+            )));
+        }
+        // The nRPC reply plane's reservation. Checked before the
+        // stream registry is written, so a refused open leaves no
+        // classification behind and the carrier keeps exactly one
+        // owner.
+        if self.rpc_reply_carriers.contains(&(peer, stream_id)) {
+            return Err(LeafError::Session(format!(
+                "stream {stream_id:#x} on the session with {peer:#x} is reserved by this \
+                 leaf's nRPC reply plane (it is a reply carrier this leaf subscribed to for \
+                 its own calls, so a frame arriving there is dispatched as a reply and an \
+                 application payload would be refused as UnknownCall); use another stream id"
             )));
         }
         // The registry is what the receive path classifies on: an
@@ -1719,11 +1772,36 @@ impl LeafNode {
     /// Idempotent per `(peer, service)`. Returns whether a
     /// membership frame was queued, so a test can assert the
     /// cadence rather than infer it from packet counts.
+    ///
+    /// **The other half of the reservation.** A carrier has exactly
+    /// one owner, and registration is where that is settled — so
+    /// this refuses a reply carrier the application already holds
+    /// an open stream on, exactly as [`Self::open_stream`] refuses
+    /// an id the RPC plane already reserved. Without it the
+    /// conflict merely changed order: open the stream first, call
+    /// afterwards, and the RPC plane would take a carrier whose
+    /// application owner had been admitted and was already
+    /// receiving on it — that owner's next payload becoming
+    /// `Dropped { UnknownCall }` with no refusal anywhere.
+    /// Refusing before the membership frame is queued means a
+    /// refused call leaves no reservation and no subscription
+    /// behind.
     pub fn ensure_reply_subscription(&mut self, peer: NodeId, service: &str) -> Result<bool> {
         let reply = reply_channel(service, self.identity.origin_hash())?;
         let key = (peer, net_wire::channel::name::channel_hash(reply.as_str()));
         if self.reply_subscriptions.contains(&key) {
             return Ok(false);
+        }
+        // The application's registration. Nothing has been queued
+        // and nothing recorded yet, so this is a refusal before
+        // success rather than a rollback.
+        let carrier = route_stream_id(key.1);
+        if self.stream_kinds.get(&(peer, carrier)) == Some(&StreamKind::Stream) {
+            return Err(LeafError::Session(format!(
+                "the reply carrier for {service:?} on the session with {peer:#x} is stream \
+                 {carrier:#x}, which this leaf already opened as an application stream; \
+                 close that stream or call a service whose reply channel does not collide"
+            )));
         }
         self.subscribe(peer, reply.as_str())?;
         // Recorded only after the frame is queued: a refused
@@ -1737,8 +1815,7 @@ impl LeafNode {
         // canonical hash, and `route_stream_id` is the derivation
         // both its publisher and `call`'s
         // `CallOwner::carrier_stream_id` use.
-        self.rpc_reply_carriers
-            .insert((peer, route_stream_id(key.1)));
+        self.rpc_reply_carriers.insert((peer, carrier));
         Ok(true)
     }
 
@@ -2214,7 +2291,7 @@ impl LeafNode {
                 continue;
             }
             for payload in record.payloads.clone() {
-                self.handle_event(peer, &record, payload, now);
+                self.handle_event(peer, incarnation, &record, payload, now);
             }
         }
         // Whatever this arrival's reassembly gave up on is disposed
@@ -2415,7 +2492,14 @@ impl LeafNode {
     /// subprotocol rather than the arriving packet's: a record
     /// released from the reorder buffer was put there by a
     /// different frame than the one that unblocked it.
-    fn handle_event(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes, now: Instant) {
+    fn handle_event(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        record: &StreamRecord,
+        payload: Bytes,
+        now: Instant,
+    ) {
         let Some(decoded) =
             dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters)
         else {
@@ -2425,7 +2509,9 @@ impl LeafNode {
             return;
         };
         match decoded {
-            Decoded::Event(payload) => self.handle_event_plane(peer, record, payload),
+            Decoded::Event(payload) => {
+                self.handle_event_plane(peer, incarnation, record, payload);
+            }
             Decoded::Announcement(bytes) | Decoded::Fold(bytes) => {
                 self.ingest_announcement(&bytes);
             }
@@ -2564,13 +2650,21 @@ impl LeafNode {
     /// for the frames that genuinely are RPC: plane ownership says
     /// which plane a frame belongs to, those checks say which *call*
     /// within it. This replaces the sniffing; it relaxes no fencing.
-    fn handle_event_plane(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes) {
+    fn handle_event_plane(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        record: &StreamRecord,
+        payload: Bytes,
+    ) {
         if !self.rpc_reply_carriers.contains(&(peer, record.stream_id)) {
             // No RPC plane owns this carrier, so these are
             // application bytes — and which surface they belong to
             // is the stream's business, not the payload's.
             match self.classify(peer, record.stream_id) {
                 StreamKind::Stream => self.events.push(LeafEvent::StreamData {
+                    peer_node: peer,
+                    incarnation,
                     stream_id: record.stream_id,
                     seq: record.seq,
                     payload,
@@ -2631,10 +2725,12 @@ impl LeafNode {
         // nobody is watching, and a post-acknowledgement discard
         // the consumer cannot observe is precisely how the loss
         // above stayed invisible for three rounds.
-        let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
-            self.drop_counted(DropReason::UnknownCall);
-            return;
-        };
+        // The incarnation is the arriving packet's own, handed in by
+        // the caller: it is the session the packet was opened on,
+        // which is the only session this frame can be a reply
+        // within. Re-reading the table here would answer the same
+        // question twice and give the wrong answer if it ever
+        // stopped agreeing.
         if !self.calls.deliver(
             frame,
             CallOwner {
@@ -3974,11 +4070,21 @@ mod tests {
     #[test]
     fn the_event_json_keeps_every_u64_as_a_decimal_string() {
         let event = LeafEvent::StreamData {
+            peer_node: u64::MAX - 1,
+            incarnation: 9_007_199_254_740_995,
             stream_id: u64::MAX,
             seq: 9_007_199_254_740_993,
             payload: Bytes::from_static(b"\x00\xFF"),
         };
         let json = event.to_json();
+        assert!(
+            json.contains(&format!("\"peer_node\":\"{}\"", u64::MAX - 1)),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"incarnation\":\"9007199254740995\""),
+            "{json}"
+        );
         assert!(
             json.contains(&format!("\"stream_id\":\"{}\"", u64::MAX)),
             "{json}"
@@ -5438,5 +5544,195 @@ mod tests {
             "the head's boundary concedes the lost fire-and-forget \
              prefix, so the completed reliable message is delivered"
         );
+    }
+
+    /// **R4-10, the owner's ruling (b).** A stream record names the
+    /// peer whose session delivered it.
+    ///
+    /// One label opened to two peers is **one stream id on two
+    /// sessions**: `stream_id_from_label` hashes the label and
+    /// nothing else, and an explicit id matches a publish contract,
+    /// so neither derivation involves the peer. That composition is
+    /// supported. What was missing was the attribution — the event
+    /// carried `stream_id`, `seq` and `payload` and no peer at all,
+    /// so every consumer that filters the node-wide event stream by
+    /// id had no way to tell one session's payload from another's,
+    /// and two wrappers under one label both accepted whichever
+    /// peer's record arrived.
+    ///
+    /// The assertion is **nonce correlation, not counts**: each
+    /// peer's own payload must be attributed to that peer and the
+    /// other's must not. A count-based check passes in exactly the
+    /// broken case, where one peer's payload is delivered twice.
+    #[test]
+    fn stream_records_name_the_peer_whose_session_delivered_them() {
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+
+        // A third leaf, established with b through the same real
+        // discovery-then-proof sequence `pair` uses.
+        let mut c = LeafNode::new(identity(0x63), 3);
+        let cid = c.node_id();
+        let from_b = b.build_announcement(&["pair".to_string()]).expect("b");
+        let from_c = c.build_announcement(&["pair".to_string()]).expect("c");
+        assert!(c.ingest_announcement(&from_b));
+        assert!(b.ingest_announcement(&from_c));
+        let msg1 = c
+            .begin_handshake(bid, &PSK, b.identity().noise().public_key(), 11)
+            .expect("msg1");
+        let msg2 = b.accept_handshake(cid, &PSK, &msg1, 11).expect("msg2");
+        c.complete_handshake(bid, &msg2).expect("install");
+        assert_eq!(pump(&mut c, &mut b), 1, "c's establishment proof crossed");
+        assert_eq!(b.take_verified_admissions(), vec![cid]);
+        b.drain_events();
+
+        // ONE label. b holds a stream to each peer under it, and the
+        // two ids are the same number — that is the premise, not an
+        // accident, and it is asserted rather than assumed.
+        let label = "inbox";
+        let to_a = b
+            .open_stream(aid, label, Reliability::Reliable, None, None)
+            .expect("b opens its stream to a");
+        let to_c = b
+            .open_stream(cid, label, Reliability::Reliable, None, None)
+            .expect("b opens its stream to c");
+        assert_eq!(
+            to_a.stream_id, to_c.stream_id,
+            "one label is one id: the derivation does not involve the peer"
+        );
+        assert_eq!(to_a.stream_id, crate::stream::stream_id_from_label(label));
+
+        // Each peer sends its own nonce on that id.
+        let nonce_a = b"nonce-from-a";
+        let nonce_c = b"nonce-from-c";
+        let from_a_stream = a
+            .open_stream(bid, label, Reliability::Reliable, None, None)
+            .expect("a opens its half");
+        let from_c_stream = c
+            .open_stream(bid, label, Reliability::Reliable, None, None)
+            .expect("c opens its half");
+        a.stream_send(from_a_stream, nonce_a).expect("a sends");
+        c.stream_send(from_c_stream, nonce_c).expect("c sends");
+        assert_eq!(pump(&mut a, &mut b), 1);
+        assert_eq!(pump(&mut c, &mut b), 1);
+
+        let attributed: Vec<(NodeId, u64, Vec<u8>)> = b
+            .drain_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                LeafEvent::StreamData {
+                    peer_node,
+                    stream_id,
+                    payload,
+                    ..
+                } => Some((peer_node, stream_id, payload.to_vec())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            attributed,
+            vec![
+                (aid, to_a.stream_id, nonce_a.to_vec()),
+                (cid, to_c.stream_id, nonce_c.to_vec()),
+            ],
+            "each peer's nonce must be attributed to that peer on the shared id"
+        );
+    }
+
+    /// The same `StreamData` carries the incarnation of the session
+    /// that delivered it, so a consumer can attribute a payload to
+    /// an exact establishment rather than to a peer id that may have
+    /// been re-handshaked since.
+    #[test]
+    fn a_stream_record_carries_its_session_incarnation() {
+        let (mut a, mut b) = pair();
+        let bid = b.node_id();
+        let incarnation = b
+            .sessions
+            .get(a.node_id())
+            .expect("the session b admitted")
+            .incarnation();
+        let handle = a
+            .open_stream(bid, "provenance", Reliability::Reliable, None, None)
+            .expect("open");
+        a.stream_send(handle, b"x").expect("send");
+        pump(&mut a, &mut b);
+        let seen: Vec<u64> = b
+            .drain_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                LeafEvent::StreamData {
+                    incarnation: seen, ..
+                } => Some(seen),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen, vec![incarnation]);
+    }
+
+    /// **R4-4, the other order.** A call whose reply carrier the
+    /// application already owns is refused before anything is
+    /// queued.
+    ///
+    /// Her probe drives the order that reaches `open_stream` second.
+    /// Fixing only that one would have left the conflict intact
+    /// under the reverse schedule: open the application stream
+    /// first, call afterwards, and the RPC plane would take a
+    /// carrier whose application owner had already been admitted and
+    /// was already receiving on it — that owner's next payload
+    /// becoming `Dropped { UnknownCall }` with no refusal anywhere.
+    /// A carrier has exactly one owner, and registration is where
+    /// that is settled, in both directions.
+    #[test]
+    fn a_call_cannot_take_a_carrier_an_application_stream_already_owns() {
+        let (mut a, mut b) = pair();
+        let aid = a.node_id();
+        let service = "reverse.ownership";
+        let name = b.reply_channel_for(service).expect("a reply channel");
+        let route = crate::Channel::new(&name).expect("canonical").canonical();
+        let carrier = crate::channel::publish_stream_id(route);
+
+        // The application registers first, and succeeds.
+        b.open_stream(
+            aid,
+            "application",
+            Reliability::Reliable,
+            Some(carrier),
+            Some(route as u16),
+        )
+        .expect("an unreserved carrier admits an application stream");
+
+        let refused = b
+            .call(aid, service, b"q", Some(1))
+            .expect_err("the call must be refused, not silently shadow the admitted owner");
+        match &refused {
+            LeafError::Session(message) => {
+                assert!(
+                    message.contains("already opened as an application stream"),
+                    "the refusal must name the conflict: {message}"
+                );
+            }
+            other => panic!("expected a typed session refusal, got {other:?}"),
+        }
+        assert!(
+            b.take_outbound().is_empty(),
+            "a refused call queues nothing: no membership frame, no request"
+        );
+
+        // And the application's ownership survived the refusal: its
+        // payload is delivered, not classified as an nRPC reply.
+        let send = a
+            .open_stream(
+                b.node_id(),
+                "application",
+                Reliability::Reliable,
+                Some(carrier),
+                Some(route as u16),
+            )
+            .expect("a's half");
+        a.stream_send(send, b"opaque").expect("send");
+        pump(&mut a, &mut b);
+        assert_eq!(delivered(&mut b), vec![b"opaque".to_vec()]);
     }
 }

@@ -47,6 +47,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
             // this pin are the same bytes.
             "two bytes",
             LeafEvent::StreamData {
+                peer_node: 200,
+                incarnation: 1,
                 stream_id: 9,
                 seq: 1,
                 payload: Bytes::from_static(&[1, 2]),
@@ -58,6 +60,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
             // stream ids as BigInt rather than Number.
             "u64 ids beyond the JS safe integer",
             LeafEvent::StreamData {
+                peer_node: u64::MAX,
+                incarnation: 9_007_199_254_740_995,
                 stream_id: u64::MAX,
                 seq: 9_007_199_254_740_993,
                 payload: Bytes::from_static(b"\x00\xff"),
@@ -68,6 +72,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
             // "no event".
             "empty payload",
             LeafEvent::StreamData {
+                peer_node: 0x0102_0304_0506_0708,
+                incarnation: 2,
                 stream_id: 255,
                 seq: 0,
                 payload: Bytes::new(),
@@ -78,9 +84,28 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
             // padding are all exercised by the decoder.
             "all 256 byte values",
             LeafEvent::StreamData {
+                peer_node: 11_696_303_054_639_710_820,
+                incarnation: 3,
                 stream_id: 0x0102_0304_0506_0708,
                 seq: 42,
                 payload: Bytes::from_iter((0..=255u8).collect::<Vec<_>>()),
+            },
+        ),
+        (
+            // **The R4-10 vector.** One label opened to two peers is
+            // one stream id on two sessions, and this is the second
+            // of the pair: same `streamId`, different `peerNode`. A
+            // decoder that filters on the id alone accepts both, so
+            // the TypeScript side's `(peer, streamId)` filter is
+            // exactly what this vector distinguishes — the two
+            // strings differ in nothing else.
+            "same stream id, a different peer",
+            LeafEvent::StreamData {
+                peer_node: 300,
+                incarnation: 1,
+                stream_id: 9,
+                seq: 1,
+                payload: Bytes::from_static(&[1, 2]),
             },
         ),
     ]
@@ -96,6 +121,8 @@ fn the_typescript_fixture_is_exactly_what_the_leaf_emits() {
         .into_iter()
         .map(|(note, event)| {
             let LeafEvent::StreamData {
+                peer_node,
+                incarnation,
                 stream_id,
                 seq,
                 payload,
@@ -105,6 +132,8 @@ fn the_typescript_fixture_is_exactly_what_the_leaf_emits() {
             };
             json!({
                 "note": note,
+                "peerNode": peer_node.to_string(),
+                "incarnation": incarnation.to_string(),
                 "streamId": stream_id.to_string(),
                 "seq": seq.to_string(),
                 "payloadHex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),

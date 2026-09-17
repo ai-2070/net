@@ -377,6 +377,19 @@ type RetryTrigger = (crate::retry::TriggerSource, Option<NodeId>);
 /// which does not detach anything.
 type RetryListener = (&'static str, Closure<dyn FnMut(JsValue)>);
 
+/// One registered event callback, under the token that cancels it.
+///
+/// A pair rather than a map: a node has a handful of listeners, the
+/// dispatch loop walks them in registration order, and a linear
+/// scan over a `Vec` beats hashing at that size while keeping the
+/// order the arrival contract promises.
+struct Subscription {
+    /// The token handed to whoever registered the callback.
+    id: u64,
+    /// The callback itself.
+    callback: js_sys::Function,
+}
+
 /// The shared interior. One per node; the transport's inbound
 /// closure holds a `Weak` to it, so a closed node's callbacks cannot
 /// resurrect it.
@@ -476,7 +489,23 @@ struct Inner {
     /// The inner call leaves them in the outbox and the outer loop
     /// picks them up, so order is arrival order either way.
     dispatching: bool,
-    listeners: Vec<js_sys::Function>,
+    /// Every callback registered on this node, each under the token
+    /// its registrar can cancel it with.
+    ///
+    /// **A registration is owned, not forgotten.** `LeafStream`'s
+    /// `on_message` appends a filter closure here and the closure
+    /// captures the consumer's wrapper, so before the token existed
+    /// a page that opened and closed streams for the life of the
+    /// node accumulated one permanently-retained closure per open —
+    /// each still invoked for every event the node produced, each
+    /// still holding its wrapper alive. Closing the stream removed
+    /// nothing, because nothing named the registration.
+    listeners: Vec<Subscription>,
+    /// The next token. Process-monotonic within the node, never
+    /// reused: a token is the right to remove exactly one
+    /// registration, and a reused one would let a closed stream's
+    /// stale token cancel a live stream's callback.
+    next_listener_id: u64,
     closed: bool,
     // ───────── the network-change re-attempt owner (slice 3) ─────────
     /// The one owner of the network-change re-attempt.
@@ -909,6 +938,23 @@ impl Inner {
         }
         self.outbox
             .extend(events.iter().map(crate::node::LeafEvent::to_json));
+    }
+
+    /// Register `callback`, returning the token that removes it.
+    fn add_listener(&mut self, callback: js_sys::Function) -> u64 {
+        let id = self.next_listener_id;
+        self.next_listener_id = self.next_listener_id.wrapping_add(1);
+        self.listeners.push(Subscription { id, callback });
+        id
+    }
+
+    /// Remove the registration `id` names. `false` when it is
+    /// already gone — which is the outcome a second cancellation
+    /// wanted, so it is not an error.
+    fn remove_listener(&mut self, id: u64) -> bool {
+        let before = self.listeners.len();
+        self.listeners.retain(|s| s.id != id);
+        self.listeners.len() != before
     }
 
     /// File one verified envelope where the §9 drive loop will find
@@ -1348,7 +1394,19 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
                 return;
             }
             guard.dispatching = true;
-            (core::mem::take(&mut guard.outbox), guard.listeners.clone())
+            // The callbacks only: a snapshot is what makes a
+            // listener free to cancel its own subscription (or
+            // close its stream) from inside the call without
+            // mutating the list being walked. This turn still
+            // delivers to it; the next one does not.
+            (
+                core::mem::take(&mut guard.outbox),
+                guard
+                    .listeners
+                    .iter()
+                    .map(|s| s.callback.clone())
+                    .collect::<Vec<_>>(),
+            )
         };
         for json in events {
             let value = JsValue::from_str(&json);
@@ -1506,6 +1564,7 @@ impl LeafNode {
             outbox: Vec::new(),
             dispatching: false,
             listeners: Vec::new(),
+            next_listener_id: 1,
             closed: false,
             // One window for the episode and for the re-attempt it
             // starts: the same number a peer attempt's own ICE
@@ -1942,6 +2001,7 @@ impl LeafNode {
         Ok(LeafStream {
             inner: Rc::clone(&self.inner),
             handle,
+            subscriptions: RefCell::new(Vec::new()),
         })
     }
 
@@ -2799,8 +2859,39 @@ impl LeafNode {
 
     /// Register an event listener. Each receives one JSON string per
     /// event.
-    pub fn on_event(&self, callback: js_sys::Function) {
-        self.inner.borrow_mut().listeners.push(callback);
+    ///
+    /// Returns the token that cancels it, the same currency
+    /// [`LeafStream::on_message`] hands back. A node-wide listener
+    /// lives as long as the node by default, which is what a page
+    /// registering one at startup wants; a harness or a component
+    /// that registers per episode needs to be able to give it back.
+    pub fn on_event(&self, callback: js_sys::Function) -> String {
+        self.inner.borrow_mut().add_listener(callback).to_string()
+    }
+
+    /// Cancel the registration `token` names.
+    ///
+    /// `false` when it is already gone, which is the outcome a
+    /// second cancellation wanted. An unparseable token is also
+    /// `false`: it names no registration, and throwing for it would
+    /// make a double-close harder to write than a leak.
+    pub fn remove_listener(&self, token: &str) -> bool {
+        token
+            .parse::<u64>()
+            .is_ok_and(|id| self.inner.borrow_mut().remove_listener(id))
+    }
+
+    /// How many callbacks are registered on this node right now.
+    ///
+    /// **Observable so the bound can be asserted rather than
+    /// inferred**, exactly as `Reassembler::outstanding` is. The
+    /// property that matters is that repeated stream open/close
+    /// leaves this flat: a registration that close does not remove
+    /// is retained for the life of the node, keeps being invoked
+    /// for every event, and keeps its captured consumer wrapper
+    /// alive. A number nobody can read is a bound nobody can test.
+    pub fn listener_count(&self) -> usize {
+        self.inner.borrow().listeners.len()
     }
 
     /// Run the enrollment exchange against the anchor.
@@ -3251,6 +3342,14 @@ impl LeafNode {
 pub struct LeafStream {
     inner: Rc<RefCell<Inner>>,
     handle: StreamHandle,
+    /// The node-wide registrations this stream owns.
+    ///
+    /// Interior mutability because `on_message` and `close` are both
+    /// `&self` across the `wasm_bindgen` boundary, and because the
+    /// ownership is the point: the registrations are on the *node*,
+    /// so without a list naming them the stream has nothing to give
+    /// back when it closes.
+    subscriptions: RefCell<Vec<u64>>,
 }
 
 #[wasm_bindgen]
@@ -3258,6 +3357,31 @@ impl LeafStream {
     /// The stream id, 16 lowercase hex digits.
     pub fn stream_id_hex(&self) -> String {
         format!("{:016x}", self.handle.stream_id)
+    }
+
+    /// The peer this stream is with, 16 lowercase hex digits.
+    ///
+    /// **Spelled exactly like [`Self::stream_id_hex`], deliberately.**
+    /// A stream is addressed by `(peer, stream_id)` and both halves
+    /// of that key are read through the same accessor shape and
+    /// reconciled against the event's decimal field by the same
+    /// `BigInt` conversion, so a consumer has one idiom to get right
+    /// rather than two. A peer-blind filter is the R4-10 defect: one
+    /// label opened to two peers is one id on two sessions, and
+    /// filtering the node-wide event stream by the id alone hands
+    /// each wrapper whichever peer's payload arrived.
+    pub fn peer_node_hex(&self) -> String {
+        format!("{:016x}", self.handle.peer)
+    }
+
+    /// The incarnation of the session this stream was opened on,
+    /// decimal — the spelling the event carries, so there is no
+    /// conversion to get wrong.
+    ///
+    /// Provenance, not part of the filter key: see
+    /// [`crate::node::LeafEvent::StreamData`].
+    pub fn incarnation(&self) -> String {
+        self.handle.incarnation.to_string()
     }
 
     /// Whether this stream retransmits.
@@ -3288,42 +3412,88 @@ impl LeafStream {
     /// **The callback receives the node's `stream_data` event JSON
     /// string**, not bytes — the same string
     /// [`LeafNode::on_event`] delivers, filtered to this stream's
-    /// id:
+    /// **peer and** id:
     ///
     /// ```text
-    /// {"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}
+    /// {"type":"stream_data","peer_node":"200","incarnation":"1","stream_id":"9","seq":"1","payload":"AQI="}
     /// ```
     ///
-    /// `stream_id` and `seq` are decimal `u64` strings and `payload`
-    /// is standard padded base64. One contract, one direction: the
-    /// leaf emits its canonical event JSON and the consumer decodes
-    /// it. Emitting bytes here instead would mean a second encoding
-    /// of an event that already exists, and would throw away `seq`
-    /// and the rest of the event's provenance at the boundary.
+    /// Every `u64` is a decimal string and `payload` is standard
+    /// padded base64. One contract, one direction: the leaf emits
+    /// its canonical event JSON and the consumer decodes it.
+    /// Emitting bytes here instead would mean a second encoding of
+    /// an event that already exists, and would throw away `seq` and
+    /// the rest of the event's provenance at the boundary.
     /// `@net-mesh/browser`'s `LeafStream` does that decode, which is
     /// why its `onMessage` and its async iterator yield
     /// `Uint8Array`; a host wiring this callback itself must parse
     /// the same way.
+    ///
+    /// **The peer is half of the key, not decoration.** A stream id
+    /// comes from a label or from a publish contract and neither
+    /// involves the peer, so one label opened to two peers is one id
+    /// on two sessions — a supported composition. Filtering the
+    /// node-wide event stream by the id alone made both wrappers
+    /// accept whichever peer's payload arrived, delivering one
+    /// peer's bytes into the other peer's inbox; a page that echoes
+    /// then amplifies it. The incarnation rides the event as
+    /// provenance and is deliberately **not** part of this key: see
+    /// [`crate::node::LeafEvent::StreamData`].
     ///
     /// The callback runs with **no** borrow of the node held, so it
     /// may call straight back in: [`Self::send`], [`LeafNode::close`]
     /// and the rest are all reachable from here. That was not true
     /// before — the event was emitted from inside `flush`'s `&mut
     /// self` — so the advertised echo trapped instead of sending.
-    pub fn on_message(&self, callback: js_sys::Function) {
-        let wanted = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
+    ///
+    /// **Returns the token that cancels the registration**, decimal.
+    /// The closure is registered on the node and captures the
+    /// consumer's callback, so a registration nothing names is
+    /// retained for the node's whole life and keeps being invoked
+    /// for every event it produces — which is what repeated
+    /// open/close accumulated before the token existed.
+    /// [`Self::close`] gives back every token this stream took, so
+    /// an ordinary consumer never has to; [`Self::remove_listener`]
+    /// is for one that wants to stop listening without closing.
+    pub fn on_message(&self, callback: js_sys::Function) -> String {
+        // Both halves of the key, and the event's own spelling of
+        // each: decimal, exactly as `to_json` writes them.
+        let peer = format!("\"peer_node\":\"{}\"", self.handle.peer);
+        let stream = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
-            if json
-                .as_string()
-                .is_some_and(|text| text.contains(&wanted) && text.contains("\"stream_data\""))
-            {
+            if json.as_string().is_some_and(|text| {
+                text.contains("\"stream_data\"") && text.contains(&peer) && text.contains(&stream)
+            }) {
                 let _ = callback.call1(&JsValue::NULL, &json);
             }
         }) as Box<dyn FnMut(JsValue)>);
         let function: js_sys::Function =
             filter.as_ref().unchecked_ref::<js_sys::Function>().clone();
         filter.forget();
-        self.inner.borrow_mut().listeners.push(function);
+        let id = self.inner.borrow_mut().add_listener(function);
+        self.subscriptions.borrow_mut().push(id);
+        id.to_string()
+    }
+
+    /// Cancel one registration [`Self::on_message`] returned.
+    ///
+    /// `false` when the token names no live registration of this
+    /// stream — already cancelled, already closed, or never ours.
+    /// Scoped to this stream on purpose: a token is the right to
+    /// remove one subscription, and one stream must not be able to
+    /// silence another's consumer by guessing a number.
+    pub fn remove_listener(&self, token: &str) -> bool {
+        let Ok(id) = token.parse::<u64>() else {
+            return false;
+        };
+        let mut owned = self.subscriptions.borrow_mut();
+        let before = owned.len();
+        owned.retain(|held| *held != id);
+        if owned.len() == before {
+            return false;
+        }
+        drop(owned);
+        self.inner.borrow_mut().remove_listener(id)
     }
 
     /// Stop using the stream. The session stays; a stream is
@@ -3339,11 +3509,30 @@ impl LeafStream {
     /// stream: a page that closed and reopened the same id got the
     /// old cursor.
     ///
+    /// **Every registration this stream took is given back**, so
+    /// repeated open/close leaves [`LeafNode::listener_count`] flat.
+    /// A callback registered through [`Self::on_message`] lives on
+    /// the node, not on this object, and it captures the consumer's
+    /// own callback — so a close that removed only the node's stream
+    /// state left the closure attached, still invoked for every
+    /// event the node produced and still holding its consumer
+    /// alive, for as long as the node lived.
+    ///
     /// A refusal here is reported rather than returned: the handle is
     /// being discarded either way, and `close` is the one operation
     /// for which "it was already gone" is the outcome the caller
     /// wanted.
     pub fn close(&self) {
+        // The subscriptions first, and unconditionally: they are
+        // this object's own bookkeeping, and a stale handle whose
+        // `close_stream` is refused must still stop listening.
+        let owned = core::mem::take(&mut *self.subscriptions.borrow_mut());
+        {
+            let mut guard = self.inner.borrow_mut();
+            for id in owned {
+                guard.remove_listener(id);
+            }
+        }
         with_node(&self.inner, |guard| {
             if let Err(e) = guard.node.close_stream(self.handle) {
                 console_error(&format!("net-mesh-leaf: stream close: {e}"));

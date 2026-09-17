@@ -177,6 +177,7 @@ fn pair() -> Pair {
         outbox: Vec::new(),
         dispatching: false,
         listeners: Vec::new(),
+        next_listener_id: 1,
         closed: false,
         retry: crate::retry::RetryPolicy::new(PEER_ICE_DEADLINE_MS),
         retry_listeners: Vec::new(),
@@ -1353,4 +1354,268 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
     );
     p.leaf.close();
     q.leaf.close();
+}
+
+// ───────── R4-10 / R5-L2: per-peer stream identity, owned subscriptions ─────────
+
+/// A second real peer for this leaf, discovered and established the
+/// way [`Pair`]'s first one is.
+///
+/// Two peers is the whole point: a stream id comes from a label or a
+/// publish contract and neither involves the peer, so one label
+/// opened to two peers is one id on two sessions. That is the
+/// composition R4-10 is about, and it cannot be witnessed with one
+/// peer.
+fn second_peer(p: &Pair) -> (crate::node::LeafNode, NodeId) {
+    let identity = LeafIdentity::generate().expect("a second peer identity");
+    let peer_id = identity.node_id();
+    let mut peer = crate::node::LeafNode::new(identity, 0x5003);
+    let theirs = peer
+        .build_announcement(&["chat".to_string()])
+        .expect("the second peer signs its own announcement");
+    let ours = with_node(&p.leaf.inner, |guard| {
+        assert!(
+            guard.node.ingest_announcement(&theirs),
+            "the second peer's announcement must verify on its own"
+        );
+        guard
+            .node
+            .build_announcement(&["chat".to_string()])
+            .expect("this leaf signs its own")
+    });
+    assert!(peer.ingest_announcement(&ours));
+
+    let noise = *peer.identity().noise().public_key();
+    let msg1 = with_node(&p.leaf.inner, |guard| {
+        let slot = guard.transport.next_slot();
+        guard
+            .node
+            .begin_handshake(peer_id, &PSK, &noise, slot)
+            .expect("message 1")
+    });
+    let msg2 = peer
+        .accept_handshake(p.us, &PSK, &msg1, 0)
+        .expect("message 2");
+    with_node(&p.leaf.inner, |guard| {
+        guard
+            .node
+            .complete_handshake(peer_id, &msg2)
+            .expect("the initiator installs on message 2");
+    });
+    (peer, peer_id)
+}
+
+/// Carry every packet this leaf has queued for `peer_id` to `peer`.
+///
+/// There is no anchor and no channel in these witnesses, so the
+/// establishment PROOF the responder is waiting for has to be
+/// carried. It is a real packet the peer really verifies: without it
+/// the peer holds keys and no attributed session, and nothing it
+/// sends would be accepted.
+fn carry_to(p: &Pair, peer_id: NodeId, peer: &mut crate::node::LeafNode) {
+    let queued = with_node(&p.leaf.inner, |guard| guard.node.take_outbound());
+    let now = clock::now();
+    for out in queued {
+        if out.peer == peer_id {
+            peer.on_datagram(p.us, out.packet, now);
+        }
+    }
+    peer.tick(now);
+    assert_eq!(
+        peer.take_verified_admissions(),
+        vec![p.us],
+        "the proof is what makes this leaf's session real at the peer"
+    );
+    peer.drain_events();
+}
+
+/// Put everything `peer` has queued through this leaf's real inbound
+/// path — the queue its transport closure feeds — and pump.
+fn carry_from(p: &Pair, peer_id: NodeId, peer: &mut crate::node::LeafNode) {
+    let queued = peer.take_outbound();
+    with_node(&p.leaf.inner, |guard| {
+        for out in queued {
+            guard.inbox.push_back((peer_id, out.packet));
+        }
+        guard.pump();
+    });
+}
+
+/// A stream options object as a page would pass one.
+fn stream_opts(peer: NodeId, label: &str) -> JsValue {
+    js_sys::JSON::parse(&format!(
+        "{{\"label\":\"{label}\",\"peer\":\"{peer:016x}\",\"reliability\":\"reliable\"}}"
+    ))
+    .expect("a stream options object")
+}
+
+/// A callback that records the event JSON it is handed.
+fn recorder(into: &Rc<RefCell<Vec<String>>>) -> js_sys::Function {
+    let sink = Rc::clone(into);
+    let closure = Closure::wrap(Box::new(move |json: JsValue| {
+        sink.borrow_mut()
+            .push(json.as_string().expect("the event JSON string"));
+    }) as Box<dyn FnMut(JsValue)>);
+    let function: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    closure.forget();
+    function
+}
+
+/// **R4-10.** Two wrappers under ONE label on distinct peers each
+/// receive their own peer's payload, and not the other's.
+///
+/// The subject is the production `LeafStream::on_message` filter,
+/// registered on a real bindgen node with two real established
+/// sessions, fed real packets two real peer nodes produced. Before
+/// the peer rode on `StreamData` the filter had only the numeric
+/// stream id to work with — and one label is one id — so both
+/// wrappers matched both arrivals and one peer's bytes were
+/// delivered into the other peer's inbox.
+///
+/// The assertion is **exact nonce correlation**, per inbox, against
+/// the event the production encoder emits. Counts cannot carry this
+/// property: in the broken case each inbox holds exactly one entry
+/// too, and both hold the same peer's nonce.
+#[wasm_bindgen_test]
+fn two_streams_under_one_label_do_not_cross_peers() {
+    const NONCE_A: &[u8] = b"nonce-for-the-first-peer";
+    const NONCE_B: &[u8] = b"nonce-for-the-second-peer";
+    const LABEL: &str = "inbox";
+
+    let p = pair();
+    p.install_session();
+    let mut first = p.peer.borrow_mut();
+    carry_to(&p, p.peer_id, &mut first);
+    drop(first);
+    let (mut second, second_id) = second_peer(&p);
+    carry_to(&p, second_id, &mut second);
+
+    // One label, two peers, and the ids really are the same number.
+    let to_first = p
+        .leaf
+        .open_stream(stream_opts(p.peer_id, LABEL))
+        .expect("a stream to the first peer");
+    let to_second = p
+        .leaf
+        .open_stream(stream_opts(second_id, LABEL))
+        .expect("a stream to the second peer");
+    assert_eq!(
+        to_first.stream_id_hex(),
+        to_second.stream_id_hex(),
+        "one label is one id: the derivation does not involve the peer"
+    );
+    assert_ne!(to_first.peer_node_hex(), to_second.peer_node_hex());
+    assert_eq!(to_first.peer_node_hex(), format!("{:016x}", p.peer_id));
+    assert_eq!(to_second.peer_node_hex(), format!("{second_id:016x}"));
+
+    let first_inbox: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let second_inbox: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    to_first.on_message(recorder(&first_inbox));
+    to_second.on_message(recorder(&second_inbox));
+
+    // Each peer sends its own nonce on the shared id.
+    let stream_id = u64::from_str_radix(&to_first.stream_id_hex(), 16).expect("hex");
+    for (peer, peer_id, nonce) in [
+        (&mut *p.peer.borrow_mut(), p.peer_id, NONCE_A),
+        (&mut second, second_id, NONCE_B),
+    ] {
+        let handle = peer
+            .open_stream(
+                p.us,
+                LABEL,
+                crate::stream::Reliability::Reliable,
+                Some(stream_id),
+                None,
+            )
+            .expect("the peer's own half");
+        peer.stream_send(handle, nonce).expect("the peer sends");
+        carry_from(&p, peer_id, peer);
+    }
+
+    let expected = |peer_node: NodeId, incarnation: &str, payload: &'static [u8]| {
+        LeafEvent::StreamData {
+            peer_node,
+            incarnation: incarnation.parse().expect("a decimal incarnation"),
+            stream_id,
+            seq: 0,
+            payload: Bytes::from_static(payload),
+        }
+        .to_json()
+    };
+    assert_eq!(
+        *first_inbox.borrow(),
+        vec![expected(p.peer_id, &to_first.incarnation(), NONCE_A)],
+        "the first peer's wrapper must hold the first peer's nonce and nothing else"
+    );
+    assert_eq!(
+        *second_inbox.borrow(),
+        vec![expected(second_id, &to_second.incarnation(), NONCE_B)],
+        "the second peer's wrapper must hold the second peer's nonce and nothing else"
+    );
+
+    p.leaf.close();
+}
+
+/// **R5-L2.** A stream's subscription is owned: close gives it back.
+///
+/// `on_message` registers a filter closure on the NODE and the
+/// closure captures the consumer's callback, so a close that removed
+/// only the node's per-stream state left the registration attached —
+/// still invoked for every event the node produced, still holding
+/// its consumer alive, for as long as the node lived. Repeated
+/// open/close therefore accumulated one permanent closure per open.
+///
+/// The witness is the count, flat across churn. No heap measurement:
+/// the retention is the registration, and the registration is
+/// countable.
+#[wasm_bindgen_test]
+fn repeated_stream_open_and_close_leaves_the_listener_count_flat() {
+    let p = pair();
+    p.install_session();
+    let baseline = p.leaf.listener_count();
+
+    let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    for _ in 0..8 {
+        let stream = p
+            .leaf
+            .open_stream(stream_opts(p.peer_id, "churn"))
+            .expect("open");
+        stream.on_message(recorder(&seen));
+        stream.on_message(recorder(&seen));
+        assert_eq!(
+            p.leaf.listener_count(),
+            baseline + 2,
+            "each registration is one listener on the node"
+        );
+        stream.close();
+        assert_eq!(
+            p.leaf.listener_count(),
+            baseline,
+            "close must give back every registration the stream took"
+        );
+    }
+    assert_eq!(p.leaf.listener_count(), baseline);
+
+    // And the token cancels one registration on its own, once.
+    let stream = p
+        .leaf
+        .open_stream(stream_opts(p.peer_id, "churn"))
+        .expect("open");
+    let token = stream.on_message(recorder(&seen));
+    let other = stream.on_message(recorder(&seen));
+    assert_ne!(token, other, "a token names exactly one registration");
+    assert!(stream.remove_listener(&token));
+    assert_eq!(p.leaf.listener_count(), baseline + 1);
+    assert!(
+        !stream.remove_listener(&token),
+        "a second cancellation is already-gone, not a second removal"
+    );
+    assert!(
+        !stream.remove_listener("not-a-token"),
+        "an unparseable token names no registration"
+    );
+    stream.close();
+    assert_eq!(p.leaf.listener_count(), baseline);
+
+    p.leaf.close();
 }
