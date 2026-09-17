@@ -2368,3 +2368,59 @@ now compares against the core's own `FRAGMENT_REASSEMBLY_TAG` constant
 instead of a repeated literal: a leaf spelling the tag differently from
 the core would not produce a refusal, it would produce a silent
 fallback to the 8 104-byte cap that nothing else would notice.
+
+### 14.5 Validation, and two greens that needed a second run
+
+**At `683735478`:** main CI **56/56**, browser matrix **42/42 on both
+Chromium and Firefox**, natsim **13/13**.
+
+Counts against the round-4 baseline: leaf 269 → **270**, browser-ts
+172 → **175**, real-package ABI probes 12 → **14**, `rtc_repairs`
+44 → **49**, browser matrix 41 → **42**, `--lib` **5788** unchanged,
+export set unchanged and verified against the pinned baseline, no
+consumer-tree diff (`go/`, `bindings/`, `sdk*/`, `cli/`, `deck/`,
+`adapters/` are byte-identical to `f4ffb718c`).
+
+**Two jobs went green only on a second attempt, at the same commit,
+and that is reported rather than smoothed over:**
+
+- **natsim** failed once on `browser_symmetric_symmetric`, which timed
+  out after the harness's 120 s budget while ICE was still checking,
+  then passed on a re-run with no code change. The row is the slowest
+  in the matrix by construction (symmetric ↔ symmetric must exhaust
+  ICE before it can be relayed) and the harness budget is 120 s
+  against the runner's own 90 s step timeout — a 30 s margin for a
+  row whose whole job is to wait. Not repaired here: it is not this
+  round's subject, and a deadline change is exactly the kind of edit
+  that hides a real slowdown.
+- **The browser matrix** failed once on Chromium with
+  `provisional_transit_is_refused` and
+  `local_envelope_accepted_redirected_denied`, both
+  `no session: timeout: noise msg2` — a handshake that never
+  completed. An earlier run on the previous head failed a different,
+  overlapping set including `enrollment_exchange_promotes_this_session`
+  on Chromium and one Stage 6 witness on Firefox. Different sets each
+  time, all handshake-timeout shaped, and 42/42 on both engines on the
+  re-run.
+
+What that evidence supports is "this runner class is currently
+variance-prone under load", which the natsim flip at an unchanged
+commit independently corroborates. What it does **not** support is
+calling either failure benign: a handshake that times out under load
+is also what a genuine regression in session setup looks like, and the
+honest statement is that these rows are not currently distinguishing
+the two. Nothing in this round touches the Noise handshake — the
+diff is the leaf's expiry predicate, one announcement tag, the direct
+node's close, and the native stream sender — so no mechanism is
+proposed here; the observation is logged for whoever next sees it.
+
+**Local verification** (Windows workstation): workspace
+`--all-targets` clean; `clippy --all-features --lib --bins -D
+warnings` clean; `clippy --all-targets` with CI's own `-A` set clean;
+`cargo doc --no-deps --all-features` clean with
+`RUSTDOCFLAGS=-D warnings`; `cargo fmt --check` per crate **including
+the three nested workspaces** (`leaf/`, `browser-ts` toolchain, the
+browser runner), since no root-level `fmt` reaches them. The Firefox
+leg of the browser matrix could not run locally: the harness refuses
+to start without NSS `certutil` rather than fall back to a root store
+it never writes. Chromium ran 42/42 locally; Firefox is CI's.
