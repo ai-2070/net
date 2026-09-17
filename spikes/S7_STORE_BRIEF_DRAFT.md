@@ -215,7 +215,7 @@ Owner → caller:
  "ops":[{"o":"r","p":["ship","heading"],"val":90},
         {"o":"x","p":["crew","bosun"]}]}
 
-{"v":1,"k":"resume","q":"<16hex>","h":"<32hex>"}
+{"v":1,"k":"resume","q":"<16hex>","h":"<32hex>","aud":["crew"]}
 {"v":1,"k":"resync","q":"<16hex>","h":"<32hex>","g":"1","have":"418"}
 {"v":1,"k":"aud","q":"<16hex>","h":"<32hex>","aud":["sea.havana"]}
 {"v":1,"k":"alive","q":"<16hex>","h":"<32hex>"}

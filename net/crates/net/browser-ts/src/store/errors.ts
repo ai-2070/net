@@ -38,19 +38,33 @@
  *   non-reexecution floor is not evidence of successful execution, so this
  *   code must never be read — or reported — as a success receipt.
  */
-export type StoreErrorCode =
-  | 'invalid-data'
-  | 'version-mismatch'
-  | 'forbidden'
-  | 'not-ready'
-  | 'capacity'
-  | 'timeout'
-  | 'aborted'
-  | 'indeterminate'
-  | 'owner-lost'
-  | 'closed'
-  | 'action-rejected'
-  | 'result-expired';
+/**
+ * The codes, as a runtime set.
+ *
+ * `no.code` on the wire is **exactly** this list (brief §2), so the
+ * parser needs it at runtime and not only in the type system: a code
+ * the caller cannot branch on is a refusal it cannot act on.
+ *
+ * {@link StoreErrorCode} is derived from it, so the two cannot drift —
+ * a code added to one and not the other would be a type the parser
+ * refuses or a wire value the caller cannot name.
+ */
+export const STORE_ERROR_CODES = [
+  'invalid-data',
+  'version-mismatch',
+  'forbidden',
+  'not-ready',
+  'capacity',
+  'timeout',
+  'aborted',
+  'indeterminate',
+  'owner-lost',
+  'closed',
+  'action-rejected',
+  'result-expired',
+] as const;
+
+export type StoreErrorCode = (typeof STORE_ERROR_CODES)[number];
 
 /** A refused store operation, carrying the code a caller branches on. */
 export class StoreError extends Error {
