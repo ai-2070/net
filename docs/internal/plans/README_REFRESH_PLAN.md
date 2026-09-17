@@ -2,9 +2,8 @@
 
 **Status:** REVISED ×1 (2026-09-18). A read-only audit of all **28** `README.md` files
 outside `web/` is complete, and a positioning review of the root front door has been folded
-in. **Nothing is edited yet.** The plan now runs **two workstreams**: a bounded *accuracy
-pass* across all 28 files, and a *positioning rewrite* of the root `README.md` that the
-existing docs strategy already obliges. Decisions D1 and D2 are open; each carries a
+in. **Stage 0 is drafted** — the root `README.md` rewrite is staged for review; the accuracy
+workstream (Stages 1–5) is not started. Decisions D1 and D2 remain open; each carries a
 recommendation, and the remaining stages are independent of them.
 
 This plan covers the `README.md` layer of the documentation surface — the files rendered as
@@ -128,11 +127,14 @@ swapped. The first draft proposed keeping the full duplication and enforcing a w
 byte-match; the review rejected that: *readers need a complete package page, but every registry
 does not need the parent's entire presentation.*
 
-**Choose (modified): a shared-facts contract.** Registry pages stay self-contained, but the
-enforced invariant is the set of **shared facts** — package name, install command, license,
-current version, and the capability-federation one-liner — plus the designated shared block(s)
-(e.g. the subcommand/tab table). Per-registry framing and section selection may differ. Stage 5
-checks *facts*, not every word.
+**Choose (modified): shared facts, correct per registry — not equal across registries.** Registry
+pages stay self-contained. The enforced invariant is that each page is **correct for its own
+registry**: versions, licensing, product facts and the designated shared blocks (e.g. the
+subcommand/tab table) *agree* across the family, while package identifiers and install commands
+**differ by design** — npm, PyPI and Cargo have different commands and possibly different
+identifiers — and are checked against that registry's own manifest. The capability-federation
+one-liner is not compulsory identical prose for the CLI and Deck pages; those lead with their
+operator-facing purpose. Stage 5 checks facts per registry, not command equality.
 
 **D2 — Whether the Stage 5 checkers become a CI job.** Options: *(a)* throwaway scripts;
 *(b)* a permanent `.github/scripts/check-readmes.py` pinned in `ci.yml`.
@@ -168,24 +170,37 @@ system, and scopes its claims where they first appear.
    differentiator is that discovery, invocation, identity, authority and artifact movement are
    **one coherent system**, not adapters the customer assembles.
 
-2. **One concrete system before the component catalogue.** A worked example (a GPU-backed
-   service, a document-processing tool, or similar provider) showing the whole relationship:
-   what the caller discovers, what it invokes, **what result it receives**, **what happens on
-   failure**, and how the provider's owner retains control over access. No channels/nRPC/subnets/
+2. **One concrete system that demonstrates federation — not merely remote RPC.** A provider
+   returning a typed result is something many systems can do; the example must make the
+   distinction visible: the caller **selects a capability rather than hardcoding a machine**, the
+   provider **decides whether the caller is authorized**, the work **runs where the resource or
+   credential lives**, and a useful result — ideally an artifact — comes back. One coherent
+   scenario, not a feature obstacle course; a document-processing capability on another machine
+   is preferred if it demonstrates these through shipped APIs without elaborate setup (a GPU
+   example is valuable only if GPU setup does not become the reader's first problem). The
+   failure path shows a real, understandable outcome — **access denied** or **provider
+   unavailable** — not a manufactured transparent-recovery promise. No channels/nRPC/subnets/
    daemons/Dataforts catalogue before this.
 
-3. **Scope performance and recovery claims at first appearance.** Move the
-   `README.md:542` qualification up to the first performance claim (`README.md:12`), and make the
-   rerouting passage state plainly that nanosecond failure detection and recovery are **local
-   decision latency**, not wire or end-to-end time. Keep the performance story — state precisely
-   what is fast, then show why it matters to a workload.
+3. **Correct the performance claims, don't relabel them.** Processing a heartbeat, evaluating a
+   timeout, selecting an alternate, detecting a *remote* failure, and completing recovery are
+   **different measurements**; the writer must identify what each benchmark actually exercises
+   and name that operation. Move the `README.md:542` scheduling-vs-wire qualification up to the
+   first performance claim (`README.md:12`). The rerouting passage (`README.md:183–193`) must not
+   present local decision latency as distributed recovery. The "Net wins by 100x or more"
+   composed-workflow claim needs its own supporting comparison — the packet-scheduling
+   disclaimer does not establish it; **unsupported headline claims are removed pending
+   evidence**. Keep the performance story; precision makes it stronger.
 
 4. **Reposition the Cyberpunk origin and the affiliation disclaimer** below the product
    explanation. Keep the aesthetic; stop making the licensing disclaimer the first substantive
    introduction.
 
 **Proposed sequence** (a reading of the review's preferred order; the exact ordering is still
-open and should be confirmed before copy is finalized):
+open and should be confirmed before copy is finalized). **The writer has permission to select,
+compress, and link out** — the root demonstrates the breadth of the system without explaining
+every subsystem at reference depth. The test for each retained section is not *did we preserve
+it?* but *does it help someone understand, evaluate, or start using Net?*
 
 1. One-sentence what + the capability-federation lead.
 2. The concrete worked system (outcome, failure path, authority).
@@ -193,8 +208,10 @@ open and should be confirmed before copy is finalized):
 4. Why the pieces compose — identity, discovery, typed RPC, streams, durable state, artifacts on
    one substrate.
 5. The architecture / why the mesh — the reason to believe, with claims scoped inline.
-6. Component catalogue.
-7. Benchmarks (already scoped; keep).
+6. **Selected breadth** — a compressed tour of the subsystem surface that links out to the docs
+   for detail, not a reference-depth catalogue.
+7. **A small set of meaningful performance evidence**, scoped to the operations actually
+   measured, linking to `BENCHMARKS.md` for the full material.
 8. Origin + Cyberpunk character + disclaimer.
 9. License.
 
@@ -394,10 +411,11 @@ README is a link dump; the two relative-path defects are fixed.
 3. **Deck table.** Diff the Tabs table against the `Tab` enum labels.
 4. **Feature tables.** Diff each README feature matrix against `Cargo.toml [features]` /
    `package.json`.
-5. **Shared facts (D1).** Assert package name, install command, license and version are present
-   and equal across each packaging family (`cli/` + `cli/npm/` + `cli/python/`; `deck/` + npm +
-   Python), and that designated shared blocks (subcommand / tab table) match. **Not** a
-   whole-file byte-match.
+5. **Shared facts (D1).** Per packaging family (`cli/` + `cli/npm/` + `cli/python/`; `deck/` +
+   npm + Python): assert each page's install command and package identifier are **correct for
+   that registry's manifest**, and that license, version and the designated shared blocks
+   (subcommand / tab table) **agree** across the family. **Not** a whole-file byte-match, and not
+   command-equality across registries.
 6. **Packaging.** `cargo package --list -p net-mesh -p net-mesh-sdk -p net-mesh-sdk-macros` and a
    `pyproject.toml` metadata read to confirm every README is the declared long-description.
 
