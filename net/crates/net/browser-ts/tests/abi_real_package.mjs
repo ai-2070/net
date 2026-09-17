@@ -308,6 +308,27 @@ await probe('real_wasm_refuses_an_ice_server_shape_it_cannot_configure', () => {
   refusal(() => LeafNode.effective_ice_servers({ iceServers: 'stun:stun.example:3478' }), 'a bare string');
 });
 
+await probe('real_wasm_publishes_the_unfragmented_payload_limit', () => {
+  if (typeof LeafNode.maxEventBytes !== 'function') {
+    throw new Error('the built wasm has no LeafNode.maxEventBytes — the package declares it');
+  }
+  const limit = LeafNode.maxEventBytes();
+  // The relationship, not a magic number: the packet cap minus the
+  // event frame's 4-byte length prefix. An application that kept a
+  // message inside `MAX_PACKET`'s payload cap instead would overrun
+  // by exactly that prefix, which is the mistake this getter exists
+  // to remove — so the assertion pins the arithmetic, and a wire
+  // change that moves the cap moves this with it.
+  const MAX_PACKET = 8192;
+  const HEADER = 68;
+  const TAG = 16;
+  const LEN_PREFIX = 4;
+  eq(limit, MAX_PACKET - HEADER - TAG - LEN_PREFIX, 'the unfragmented payload limit');
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error(`the limit is not a usable byte count: ${limit}`);
+  }
+});
+
 await probe('real_wasm_reads_stream_options_the_way_the_package_declares_them', () => {
   eq(
     JSON.parse(

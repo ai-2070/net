@@ -345,6 +345,21 @@ export interface LeafWasmModule {
      */
     effective_ice_servers?(options: LeafWasmConnectOptions): string;
     /**
+     * The largest payload one packet carries: the wire's
+     * `MAX_EVENT_SIZE`, which is `MAX_PAYLOAD_SIZE` minus the event
+     * frame's 4-byte length prefix.
+     *
+     * An application that must keep a message inside one packet
+     * reads it from here rather than hardcoding a figure. The packet
+     * cap is **not** this number, and treating it as available data
+     * bytes overruns by the prefix.
+     *
+     * Optional for the same reason `effective_ice_servers` is: glue
+     * built before this existed still loads, and
+     * `tests/abi_real_package.mjs` asserts the shipped one has it.
+     */
+    maxEventBytes?(): number;
+    /**
      * What an `open_stream()` with these options would ask the node
      * for, as JSON: `{"reliability":"reliable","label":"app",
      * "streamId":"0000000000000009","channelHash":7,

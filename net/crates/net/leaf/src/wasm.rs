@@ -2022,6 +2022,24 @@ impl LeafNode {
         })
     }
 
+    /// The largest payload one packet carries, as the wire defines
+    /// it: `MAX_PAYLOAD_SIZE` minus the event frame's length prefix.
+    ///
+    /// Published because an application that must keep a message
+    /// inside one packet has no other way to learn the number, and
+    /// the two wrong ways are both reachable: hardcoding 8 108
+    /// treats the packet cap as available data bytes and overruns by
+    /// the prefix, and hardcoding any figure freezes a wire constant
+    /// into application code.
+    ///
+    /// A **static**, not a node method: it is a property of the wire,
+    /// identical for every node, so reading it must not require a
+    /// connection.
+    #[wasm_bindgen(js_name = maxEventBytes)]
+    pub fn max_event_bytes() -> usize {
+        net_wire::protocol::MAX_EVENT_SIZE
+    }
+
     /// The ICE servers a `connect(opts)` with this options object
     /// would configure its `RTCPeerConnection` with, as JSON.
     ///
