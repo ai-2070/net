@@ -490,11 +490,45 @@ waiter rather than issuing a second `q`.
 
 #### Owner state, per handle
 
+**Per handle means per handle.** Every value below is scoped to one
+handle, including the generation allocator, the audience, the unsent
+remainder and any deferred projection. Nothing about an installation is
+owner-global except the store revision, which is a property of the
+document rather than of a subscription.
+
 | Value | Meaning |
 |---|---|
-| `allocated` | highest generation ever allocated; monotone, **never rolled back**, even for a generation that was superseded before anything was installed |
-| `emitting` | the generation whose chunks are still being handed to the transport, or none |
+| `allocated` | highest generation ever allocated **for this handle**; monotone, **never rolled back**, even for a generation that was superseded before anything was installed |
+| `emitting` | the generation whose chunks are still being handed to the transport for this handle, or none |
 | `emitted` | the generation whose chunks have all been handed over — the owner's "gameplay ready" (§1.6) |
+| `aud` | the audience bound to this handle — what a `resync` recovers (§2) |
+| `deferred` | one pending projection for this handle, if availability made it wait (§1.8) |
+| `live` | whether the handle is still valid; expiry sets this and **retires this handle's pending projection and unsent chunks** |
+
+Consequences that are easy to lose by keeping installation state on the
+owner instead of the handle:
+
+- **A second `join` disturbs nothing.** Its installation is allocated
+  against its own handle, so it cannot retire or redirect another
+  handle's unsent chunks.
+- **Generations restart per handle.** Handle B's first installation is
+  generation 1 even though handle A reached 7. This is why a replica
+  that discards a handle (§2's `unknown-handle` path) must discard
+  `installed`/`retired`/`assembling` with it: keeping A's watermark
+  would fail `g > retired` against B's generation 1 and strand the
+  rejoin.
+- **Superseding or expiring one handle leaves every other operational**
+  — including `advance`, which emits a delta to each live handle and
+  none to a dead one.
+- **Expiry retires pending work; it does not merely mark a flag.** A
+  deferred projection left behind by expiry would be completed when
+  availability returned, installing for a handle nobody holds.
+  Completion is therefore a **second admission point**: the pending
+  projection is re-submitted to the one place where a projection
+  becomes an installation, which revalidates the handle and refuses a
+  dead one with a **delivered** `no {unknown-handle}` — so the caller
+  rejoins instead of waiting out its deadline. Refusal never recreates
+  admission: only `join` does that.
 
 ### 1.7b Control admission is not gameplay readiness
 
@@ -553,7 +587,11 @@ Two separate admission classes:
   and a timeout is retried with capped backoff, so a control never has
   to interpret `not-ready` — the disposition §1.7b promised and the
   earlier text contradicted. A newer control replaces the pending
-  projection rather than queueing behind it.
+  projection rather than queueing behind it. **A dead handle never
+  acquires one:** a control on an expired handle is refused
+  `unknown-handle` before the deferral branch, and expiry retires any
+  projection already pending (§1.7a). Completion revalidates regardless,
+  because the handle can die between deferral and availability.
 - v1 defines no delta-from-`have` path and a caller must not depend on
   one.
 - The owner may **initiate** a replacement — used when a delta would
@@ -887,7 +925,12 @@ supplies. Before a handle has been **learned** (the caller has sent
 `join` but no `man` has arrived), automatic reconnect therefore issues
 a **fresh `join`**, not a `resume`: the replica has nothing to resume.
 On `no {unknown-handle}` the replica discards its handle and rejoins,
-which is the only path that can produce a new one. The handle is
+which is the only path that can produce a new one. It discards the
+handle's **generation state** with it — `installed`, `retired`,
+`assembling`, and the recovery flags — because generations are monotone
+per handle (§1.7a) and the new handle's first installation is generation
+1. A retained watermark would fail `g > retired` and strand the rejoin
+it was supposed to enable. The handle is
 learned from the `man` that answers the join; traffic naming any other
 handle is dropped and counted.
 
@@ -1151,9 +1194,10 @@ The composition failures of round 3 were found by **reading** the
 tables; the round-4 findings were found by **running** them. The model
 is `browser-ts/test/store/lifecycle-model.ts` — a replica reducer, an
 owner reducer, and a harness in `browser-ts/test/store/lifecycle.test.ts`
-that delivers in per-direction FIFO order, stalls the owner, breaks
-sessions, and (only for the §1.9a witnesses) injects out-of-order
-delivery. **37 witnesses**, plus a **22-inverse** campaign.
+that delivers in per-direction FIFO order, routes by handle to either
+of two replicas, stalls the owner, expires handles, breaks sessions,
+and (only for the §1.9a witnesses) injects out-of-order delivery.
+**47 witnesses**, plus a **29-inverse** campaign.
 
 It is test-only by construction: no production export, no transport, no
 new protocol subsystem, no `src/` change, bundle unchanged. It is not
@@ -1191,12 +1235,17 @@ not transition traces.
 | reconnect from every live state | "reconnects mid-assembly, fencing the lost session's work"; "reconnect from ready retains the stale view" | reconnect restricted to `ready` → **3 failed** |
 | controls never answer `not-ready` | "an unavailable projection defers and still converges"; "a deferred initial join still converges" | owner refuses instead of deferring → **1 failed** |
 | retirement watermark | "an abandoned generation cannot be reopened by a late manifest"; "a duplicate manifest leaves an open assembly untouched" | `g > installed` instead of `g > retired` → **2 failed** |
+| handles have independent lifecycles | "a second join does not disturb the first handle's installation"; "both handles receive subsequent updates"; "superseding one handle leaves the other operational"; "expiring one …"; "expiring a handle mid-emission retires only its own chunks" | installation state owner-global again → **5 failed**; expiry does not retire its own unsent chunks → **1 failed**; `advance` emits to expired handles → **1 failed** |
+| expiry retires pending work | "expiry retires the pending projection instead of completing it", with "a live deferred projection still completes" as its control | expiry marks only the flag → **1 failed** |
+| completion is a second admission point | "completion refuses a handle that died without retiring its work"; "a control on an expired handle is refused, not deferred" | completion does not revalidate → **1 failed**; control admitted on a dead handle → **1 failed** |
+| generations are per handle | "a request on an expired handle is refused, and recovery rejoins at generation 1" | discarded handle's watermark retained → **3 failed** |
 
-Three inverses are controls on the model itself, so that strictness
-cannot be mistaken for correctness: **drop every arrival** → 37 failed,
-0 passed; **never emit chunks** → 35 failed; **issue one handle for
-every join** → 1 failed. A drop-everything implementation fails every
-positive control and every `converged()` assertion in the file.
+Four inverses are controls on the model itself, so that strictness
+cannot be mistaken for correctness: **drop every arrival** → 47 failed,
+0 passed; **never emit chunks** → 45 failed; **reuse one handle id for
+every join** → 9 failed; **never allocate a generation** → 45 failed. A
+drop-everything implementation fails every positive control and every
+`converged()` assertion in the file.
 
 The inverse ledger is **implementer-run**: the mutation campaign is
 mine, and the review independently ran the baseline, the typecheck and
@@ -1207,36 +1256,56 @@ discriminating about the wrong state.
 
 **What running it found that reading it did not.**
 
+Round 4, from the reviewer's probes:
+
 - The initial join never reached the owner and the replica sent
   `resume` for a handle it had never been issued — and the model owner
-  answered it, because neither side modelled handle admission. That is
-  the shared blind spot above: a caller could be served a projection
-  for a handle that was never authenticated.
+  answered it, because neither side modelled handle admission.
 - `resume` and `resync` carried an audience the §2 schema forbade, so
-  the desired-audience recovery depended on a field the wire could not
-  deliver. Resolved by putting `aud` on `resume` (authorized exactly
-  like `aud`) and keeping `resync` audience-free.
-- The equal-pending witness set `waiters` by hand instead of issuing
-  both requests through the reducer, so it asserted the behaviour it was
-  supposed to test. Both requests now go through `setAudience`, and the
-  different-audience control proves the coalescing rule is not "ignore
-  the second request".
+  desired-audience recovery depended on a field the wire could not
+  deliver.
+- The equal-pending witness set `waiters` by hand, asserting the
+  behaviour it was supposed to test.
 - Enforcing FIFO delivery made the skipped-refresh scenario
-  **unreachable**, which in turn exposed that an owner refresh
-  mid-emission stalls *both* generations: the replica keeps an assembly
-  whose chunks were just retired, then drops the replacement's chunks.
-  Fixed on the owner side (§1.9a), the option the review offered as the
-  alternative.
+  unreachable, which exposed that an owner refresh mid-emission stalls
+  *both* generations. Fixed on the owner side (§1.9a).
 - A delta for the generation being assembled was silently dropped,
   leaving the replica `ready` a revision behind the owner with no
-  recovery. It now sets `behind` and recovers.
+  recovery. It now sets `behind`.
 
-One round-3 inverse came back **green**: removing the publication fence
-changed nothing, because every supersession path already retires the
-assembly. The fence is the invariant and clearing is the mechanism, so
-it is kept and witnessed directly. That is the third non-discriminating
-oracle this stage has caught by running inverses rather than by reading
-tests.
+Round 5, from the reviewer's probes:
+
+- **A deferred projection resurrected an expired handle.** Expiry
+  marked the record dead but left its pending work intact, and
+  completion called the installation path unconditionally, writing
+  `live: true` back. Expiry now retires the handle's pending projection
+  and unsent chunks, and completion revalidates (§1.7a).
+- **Two handles shared one installation slot.** `g`, `aud`, `unsent`
+  and `deferred` were owner-global, so a second `join` retired the
+  first handle's unsent chunks and redirected the remainder. All
+  installation state is now per handle; only the store revision is
+  global. The "one handle per owner" inverse had proved distinct
+  issuance, which is not independent lifecycles — the gap the review
+  named exactly.
+- Fixing that exposed the generation-scope boundary the global
+  allocator had been hiding: generations restart at 1 on a new handle,
+  so a replica that discards a handle must discard its watermark or
+  strand its own rejoin.
+
+Two round-5 inverses came back **green** on first run, and both were
+untested paths rather than redundant rules: a control admitted on an
+expired handle reached the *deferral* branch (no witness covered
+expiry + unavailable projection), and `advance` emitted deltas to
+expired handles (the isolation witness drained the wire without
+checking who the messages were addressed to). Both now have witnesses
+and both inverses are red.
+
+One round-3 inverse came back green for the other reason: removing the
+publication fence changed nothing, because every supersession path
+already retires the assembly. The fence is the invariant and clearing
+is the mechanism, so it is kept and witnessed directly. Three
+non-discriminating oracles this stage, all caught by running inverses
+rather than by reading tests.
 
 ### 5.2 Contract behaviour — required
 
