@@ -4,7 +4,7 @@
 
 **The sentence:** an A2A service is *explicitly* free or paid by provider configuration; a paid task is **prepared** (validated, capacity-reserved, provider-minted admission id) before any money moves, **purchased** against that exact reservation with a durable caller-side attempt that is resumed rather than re-quoted, **submitted** with the evidence, and **launched once** under a lifetime-exclusive journal owner — and a crash anywhere between money and work leaves a recoverable record rather than a second charge or a second run.
 
-**Status (2026-09-17): DRAFT, revision 3 — not started.** Revision 1 was held for six architecture-level gaps; revision 2 for five state-machine/persistence contract gaps. §0.1 indexes each finding to the section and witness that closes it. Source-grounded against this worktree.
+**Status (2026-09-17): DRAFT, revision 4 — not started.** Revision 1 was held for six architecture-level gaps; revision 2 for five state-machine/persistence contract gaps; revision 3 for two branch/table inconsistencies. §0.1 indexes each finding to the section and witness that closes it. Source-grounded against this worktree.
 
 **Not a new payments system.** No new signature scheme, no new settlement path, no new store engine. This slice composes `net-payments`' existing `PaymentEngine` / `CallerPaymentFlow` with the SDK's `TaskRegistry` through SDK-owned admission and evidence contracts.
 
@@ -54,6 +54,12 @@ Revision 1 → 2 (architecture): six findings. Revision 2 → 3 (state-machine a
 | r3-4 | Caller store had durable writes but no atomic attempt selection | **D4** single authoritative attempt with a `Preparing` lease and CAS transitions; concurrent prepare/purchase witnesses | closed |
 | r3-5 | `Refused` inferred "no money moved" that the existing flow deliberately does not infer for bearer schemes | **D4** `RefusedUnexposed` vs `RefusedExposed`; `reject_releases_reservation` preserved via `pay_exact`; witness mirrors `a_solana_reject_keeps_the_reservation` | closed |
 
+| # | Finding (r3) | Where | Status |
+|---|---|---|---|
+| r4-1 | Configured free submit without prepare skipped preflight and assumed a journal | **D2** S4 free-none → S5 preflight → S5a inline admission (capacity) → S7; `AdmissionStore::{Journal, Memory}` so an all-free catalog needs no journal; legacy `serve_a2a` untouched | closed |
+| r4-2 | Caller table omitted promised paths (`RefusedUnexposed` re-prepare, expired `AwaitingApproval`, `Unknown` auto-recovery vs "only exit", late paid submit) | **D4** every path is a table row under three stated boundaries; new `Submitted` / `PaidUnexecutable` / `Resolved` states; `A2aCallerFlow::submit_task` records outcomes; `resolve_attempt` domain fixed | closed |
+| r4-3 | S6′ mismatch row keyed on `Reserved`; `OfferV1` omitted `reservation_retention_secs` | **D2** table row is `Paid → Paid + AttemptNote`; **D3** `OfferV1` commits every retention term | closed |
+
 ### 0.2 The five requirements, mapped to today's gaps
 
 | Requirement | Gap in today's code |
@@ -84,6 +90,7 @@ pub struct A2aServiceConfig {
     /// Who a submission is attributed to (D5).
     pub principal: A2aPrincipal,
     /// Required iff any service is `Paid` (D6). Opening it takes lifetime-exclusive ownership.
+    /// `None` with an all-`Free` catalog ⇒ in-memory `A2aAdmissions` (same state table, process lifetime).
     pub journal: Option<A2aAdmissionJournal>,
 }
 pub enum A2aServicePolicy { Free(A2aOffer), Paid(A2aOffer) }
@@ -137,7 +144,7 @@ P5 reply          AdmissionReservation { task_id, admission_id, commitment, purc
                                           pricing_terms: Option<String>, expires_at }
 ```
 
-`Free` services also serve prepare (no pricing; reservation optional for the caller — a free `submit` without prior prepare reserves inline). `Paid` services **require** a prior reservation: a paid submit whose `(owner, task_id)` has no journal record is refused in-body (`NoReservation`) before touching the gate — that caller cannot have a matching quote anyway.
+`Free` services also serve prepare (no pricing). A free `submit` without a prior prepare is admitted **inline** at S5a — it runs the same validation, application preflight, and capacity admission as prepare; "free" means no payment requirement, never no provider policy. When the catalog has no `Paid` entry and no journal is configured, the admission store is an in-memory `A2aAdmissions` implementing the same state table (`Reserved | Launched | Terminal`, capacity accounting, ledger for the process lifetime) — `AdmissionStore::{Journal(A2aAdmissionJournal), Memory(A2aAdmissions)}`; the handlers are written against the trait, so the free path never assumes a journal. `Paid` services **require** a prior reservation: a paid submit whose `(owner, task_id)` has no record is refused in-body (`NoReservation`) before touching the gate — that caller cannot have a matching quote anyway.
 
 **`net.a2a.task`** (configured mode):
 
@@ -148,36 +155,39 @@ S3 reserve        registry.reserve(owner, brief):
                     Existing(id)  → ack(id)                          [no gate call]
                     Pending(rx)   → await rx → same ack / refusal     [converge]
                     Reserved(t)   → continue
-S4 resolve        journal.lookup(owner, task_id) — per-state dispatch (the ONLY branch point; see transition table):
+S4 resolve        store.lookup(owner, task_id) — per-state dispatch (the ONLY branch point; see transition table):
                     none, Paid service         → t.release(); in-body NoReservation
-                    none, Free service         → journal CAS insert Reserved (no admission_id) → S7
+                    none, Free service         → S5 (preflight) → S5a (inline admission) → S7
                     Reserved, same commitment  → (expired: re-acquire capacity, else t.release(); retryable Busy, gate NOT called) → S5 → S6 → S7
                     Paid, same commitment      → S5 → S6′ → S7
-                    Launched | Terminal, same  → t.release(); ack(task_id)   [journal-Existing: status shows the recorded/Interrupted state]
+                    Launched | Terminal, same  → t.release(); ack(task_id)   [store-Existing: status shows the recorded/Interrupted state]
                     Reconcile                  → t.release(); ERR_PAYMENT schematic `admission_revoked` (no state change)
                     any, different commitment  → t.release(); in-body IdReusedForDifferentBrief
                     ledger only                → t.release(); in-body Retired { task_id }
-S5 recheck        preflight.preflight(owner, offer, brief) again (authority may have changed since prepare).
-                    Free → failure is an in-body rejection; the inline reservation is deleted.
+S5 recheck        preflight.preflight(owner, offer, brief) — for every path, prepared or not (authority may have changed since prepare).
+                    Free, no record            → failure is an in-body rejection; nothing was reserved.
+                    Free, record Reserved      → failure is an in-body rejection; the reservation is deleted (nothing financial).
                     Paid, record Reserved, NO payment headers → in-body rejection; record stays Reserved (nothing claimed paid).
-                    Paid, record Reserved WITH headers, or record Paid → RECONCILIATION: journal CAS → Reconcile { reason,
+                    Paid, record Reserved WITH headers, or record Paid → RECONCILIATION: store CAS → Reconcile { reason,
                            claimed_quote_id: header or recorded quote_id, payer }; reply ERR_PAYMENT schematic `admission_revoked`
                            (funds_moved=unknown, prior_payment=unknown, retryable=false, safe_to_requote=false,
                            next_action=contact_provider_operator). Gate never called.
-S6 payment        (record Reserved, Paid service)
+S5a inline admit  (Free, no record only) capacity: in_flight(service) < max_in_flight else t.release(); in-body Busy;
+                  store CAS insert Reserved { admission_id: None, commitment } → S7
+S6 payment        (Paid service, record Reserved) — Free services skip S6/S6′ entirely.
                   HDR_PAYMENT_QUOTE + HDR_PAYMENT_BINDING required (bearer refused: `binding_required`);
                   gate.redeem(TaskPaymentClaim { tool_id, quote_id, binding, expected_input_hash: purchase_hash })
-                    Err(denial) → t.release(); journal appends AttemptNote { reason, claimed_quote_id, at } to the record —
+                    Err(denial) → t.release(); store appends AttemptNote { reason, claimed_quote_id, at } to the record —
                                   STATE UNCHANGED (still Reserved, same admission_id, reopen is implicit); reply ERR_PAYMENT + schematic
                     Ok(evidence) → (OrgAdmitted: evidence.payer == admitted.caller else `binding_rejected` posture, note appended)
-                                   journal CAS Reserved → Paid { quote_id, payer }
+                                   store CAS Reserved → Paid { quote_id, payer }
                                    (CAS/Io failure → t.release(); reply retryable `journal_unavailable`; redeem was idempotent, retry re-enters S4 as Reserved)
-S6′ verify        (record Paid) header quote_id must equal record.quote_id and binding must be present, else refuse
-                  `binding_rejected` posture (note appended, state unchanged). Gate NOT called — the recorded evidence is authoritative.
-S7 launch claim   journal claim_launch: CAS Paid → Launched (paid) | Reserved → Launched (free) + ledger entry, one atomic replace —
-                  durable BEFORE spawn.
-                    write failure → t.release(); journal unchanged (still Paid / Reserved); reply retryable `journal_unavailable`;
-                    nothing ran; retry re-enters S4 → Paid → S5 → S6′ → S7
+S6′ verify        (Paid service, record Paid) header quote_id must equal record.quote_id and binding must be present, else refuse
+                  `binding_rejected` posture (AttemptNote appended, record stays Paid). Gate NOT called — the recorded evidence is authoritative.
+S7 launch claim   store.claim_launch: CAS Paid → Launched (paid) | Reserved → Launched (free) + ledger entry, one atomic replace —
+                  durable BEFORE spawn (in-memory store: same CAS under its mutex).
+                    write failure → t.release(); store unchanged (still Paid / Reserved); reply retryable `journal_unavailable`;
+                    nothing ran; retry re-enters S4 → Paid → S5 → S6′ → S7   (free: → Reserved → S5 → S7)
 S8 launch         t.launch(executor) → ack(id)
 ```
 
@@ -186,8 +196,10 @@ S8 launch         t.launch(executor) → ack(id)
 | From | Event | To | Written by |
 |---|---|---|---|
 | — | prepare, capacity ok | `Reserved{admission_id}` | P4 |
-| — | free submit without prepare | `Reserved{admission_id: None}` | S4 |
-| `Reserved` | gate denied / OrgAdmitted payer mismatch / S6′ mismatch | `Reserved` + `AttemptNote` | S6 / S6′ |
+| — | free submit without prepare, preflight passed, capacity ok | `Reserved{admission_id: None}` | S5a |
+| `Reserved` | gate denied / OrgAdmitted payer mismatch | `Reserved` + `AttemptNote` | S6 |
+| `Paid` | S6′ header quote ≠ recorded quote, or binding missing | `Paid` + `AttemptNote` | S6′ |
+| `Reserved` (free) | preflight fails at submit | record deleted (in-body rejection) | S5 |
 | `Reserved` | preflight fails at submit, no headers | `Reserved` (in-body rejection) | S5 |
 | `Reserved` | preflight fails at submit, headers present | `Reconcile{claimed_quote_id}` | S5 |
 | `Reserved` | gate admitted | `Paid{quote_id, payer}` | S6 |
@@ -238,7 +250,7 @@ struct TaskCommitmentV1<'a> {
     tags: &'a [String],
 }
 #[derive(Serialize)]
-struct OfferV1<'a> { object: &'static str /* "net.a2a.offer@1" */, service_id, revision, pricing_terms: Option<&str>, bounds: &A2aBounds, reservation_ttl_secs: u64, retention_secs: u64 }
+struct OfferV1<'a> { object: &'static str /* "net.a2a.offer@1" */, service_id, revision, pricing_terms: Option<&str>, bounds: &A2aBounds, reservation_ttl_secs: u64, reservation_retention_secs: u64, retention_secs: u64 }   // every term that bounds how long the purchased admission stays usable is committed
 #[derive(Serialize)]
 struct PurchaseV1<'a> { object: &'static str /* "net.a2a.purchase@1" */, admission_id: &'a str, commitment: &'a str }
 
@@ -308,23 +320,32 @@ pub enum PurchaseState {
 }
 ```
 
-Transitions (CAS; anything else is `Conflict`):
+Transitions (CAS; anything else is `Conflict`). Three boundaries hold throughout: **(a)** re-preparing after an unexposed outcome mints a new quote, so it passes spend policy again and needs a fresh operator approval where policy demands one (approvals are keyed by `quote_id`; the stale held quote is cleared); **(b)** `Unknown` recovers **automatically** only through the stored payment — never a new quote; **(c)** a paid purchase that the provider will not execute keeps its payment evidence in a dedicated state, never a relabel.
 
-| From | Verb | To |
+| From | Verb / event | To |
 |---|---|---|
 | — | `prepare_task` | `Preparing{lease}` (atomic insert; if a record exists: same commitment → return/await it, different → `Conflict`) |
 | `Preparing` (own lease) | reservation + quote obtained | `Quoted` |
 | `Preparing` (own lease) | prepare failed | record deleted |
 | `Preparing` (stale lease > `PREPARE_LEASE_NS`) | another caller's `prepare_task` | `Preparing{new lease}` (takeover) |
-| `Quoted` \| `AwaitingApproval` | `purchase_task`: spend `check_and_reserve` → Allowed; payload authored | `Paying{lease}` — **the one payload; persisted before `pay`** |
+| `Quoted` | `purchase_task`: spend → Allowed; payload authored | `Paying{lease}` — **the one payload; persisted before `pay`** |
 | `Quoted` | spend → RequiresPaymentApproval | `AwaitingApproval` |
+| `AwaitingApproval` | `purchase_task` after operator `approve_payment(quote_id)`: `approved_quote` matches this quote's `input_hash`; payload authored | `Paying{lease}` |
+| `AwaitingApproval` | operator `reject_payment(quote_id)` | `RefusedUnexposed{reason: "operator rejected"}` |
 | `Quoted` \| `AwaitingApproval` | spend → Denied, or quote/author failed | `RefusedUnexposed` |
-| `Paying` \| `Unknown` | `pay_exact(stored quote, stored payload)` → Served | `Paid` |
+| `Quoted` \| `AwaitingApproval` (quote expired, never `Paying`) | `prepare_task` | `Preparing` → `Quoted` with a new quote; same `admission_id` (provider-idempotent); the stale held approval is cleared (`clear_approval`) — **fresh approval required** (boundary a) |
+| `RefusedUnexposed` | `prepare_task` | `Preparing` → `Quoted` with a new quote; same `admission_id`; spend policy and approval run anew (boundary a) |
+| `Paying` \| `Unknown` | `pay_exact(stored quote, stored payload)` → Served | `Paid` (automatic recovery; boundary b) |
 | `Paying` \| `Unknown` | → transport error / PendingTier / InProgress | `Unknown` (spend reservation kept, exactly as `run` does today) |
 | `Paying` \| `Unknown` | → Rejected / Failure / Invalidated / Exception | `RefusedExposed{reservation_kept: !reject_releases_reservation(&quote)}` |
-| `Quoted` (quote expired, never `Paying`) | `prepare_task` | `Preparing` → `Quoted` with a new quote — **the only re-quote path**; same `admission_id` (provider-idempotent) |
-| `Paid` | any verb | `Paid` (returns the stored proof) |
-| `Unknown` \| `RefusedExposed` | operator `resolve_attempt(key, outcome)` | `Paid` \| `RefusedUnexposed` — the only exit; ordinary verbs never re-quote these |
+| `Paid` | `purchase_task` | `Paid` (returns the stored proof) |
+| `Paid` | `submit_task` → ack `accepted` | `Submitted{task_id}` (terminal for the attempt; task lifecycle continues via status/cancel) |
+| `Paid` | `submit_task` → retryable refusal (`Busy`, `journal_unavailable`, transport) | `Paid` (resubmit the same proof) |
+| `Paid` | `submit_task` → terminal refusal (`NoReservation`, `Retired`, `admission_revoked`, `input_binding_mismatch`, any schematic with `safe_to_retry=false && safe_to_requote=false`) | `PaidUnexecutable{proof, billing, refusal}` — evidence retained (boundary c) |
+| `Unknown` | operator `resolve_attempt(key, outcome)` — additive to the automatic path, for a provider that is gone or has purged the quote | `Paid` \| `RefusedUnexposed` |
+| `RefusedExposed` \| `PaidUnexecutable` | operator `resolve_attempt(key, outcome)` — the **only** exit | `Resolved{outcome}` (refunded / written off / executed-elsewhere note; evidence kept) |
+
+`PurchaseState` therefore also has `Submitted { task_id }`, `PaidUnexecutable { proof: TaskPaymentProof, billing: Value, refusal: RefusalRecord }`, and `Resolved { outcome: String, evidence: Value }`. `A2aCallerFlow::submit_task(node, task_id) -> A2aSubmit::{ Accepted{task_id} | Retry{message} | Unexecutable{refusal} }` wraps `Mesh::submit_task_paid` and records the outcome; the raw `Mesh::submit_task_paid` remains for callers without a purchase store. Retention: `Submitted` / `Resolved` / `RefusedUnexposed` follow ordinary attempt retention; `Unknown` / `RefusedExposed` / `PaidUnexecutable` / `Paid` (never submitted) are never auto-pruned.
 
 - `A2aCallerFlow::prepare_task(node, &offer, &brief) -> Result<PreparedTask, A2aFlowError>` — **read-only** on the money side: CAS-insert `Preparing`; provider `net.a2a.prepare` → `AdmissionReservation`; `ProviderChannel::quote` with `input_hash = purchase_hash`; CAS `Preparing → Quoted`. A concurrent caller that finds `Preparing` awaits the outcome and returns the same `PreparedTask`; the quote channel is called once per key. No spend reservation, no payment. Closes G4 "display a price without spending".
 - `A2aCallerFlow::purchase_task(node, task_id) -> A2aPurchase::{ Paid(TaskPaymentProof) | RequiresPaymentApproval{quote_id, policy_reason, approve_hint} | Denied{quote_id, policy_reason, funds_ambiguous: bool} | Unknown{quote_id} | Failed{quote_id, message, retryable} }` — consumes **the stored attempt's quote and payload**, never fresh ones. The first caller to CAS `Quoted → Paying` authors the payload; a concurrent caller finding `Paying` re-sends the **identical stored payload** (`accept_payment` is payload-idempotent via `EngineState.consumed` / `idempotency_key`; the engine returns the original verdict). `Denied{funds_ambiguous: true}` is the `RefusedExposed` rendering — the spend reservation is *kept* for bearer schemes exactly as `CallerPaymentFlow::run` keeps it today (`flow/mod.rs:918-948`); this refactor must not weaken that accounting.
@@ -405,7 +426,7 @@ pub struct LaunchLedgerEntry {                     // LEDGER — never pruned au
 
   `forget()`, `evict_terminal()` and `prune()` never touch the third class or the ledger.
 - **Ledger vs retention:** `forget()`, `evict_terminal()`, and `prune()` remove **result** records only. `ledger_has` is consulted at P4/S4 and answers `Retired` — a retired result can never make its payment reusable for execution, because the redeem step is never reached once the ledger has the `(owner, task_id)`. Ledger entries are tiny (< 200 B) and bounded by the number of launches ever; the engine's `consumed_transactions` has the same never-prune policy.
-- **Write points:** P4 (`Reserved`), S4 free-inline (`Reserved`), S5 (`Reconcile`), S6 (`Paid` / `AttemptNote`), S6′ (`AttemptNote`), S7 (`claim_launch`), registry terminal hook (`Terminal`) via `TaskRegistry::with_terminal_hook` (configured mode only).
+- **Write points:** P4 (`Reserved`), S5 (`Reconcile`, or free-record deletion), S5a free-inline (`Reserved`), S6 (`Paid` / `AttemptNote`), S6′ (`AttemptNote`), S7 (`claim_launch`), registry terminal hook (`Terminal`) via `TaskRegistry::with_terminal_hook` (configured mode only). The in-memory `A2aAdmissions` store takes the same writes through the same `AdmissionStore` trait.
 
 **Recovery on `open()` (the successor owner):**
 
@@ -447,12 +468,13 @@ A and B are independent; C depends on A+B; D–F on C.
 - [ ] `PaymentEngine::redeem_for_task`, `RedeemDenialReason::InputBindingMismatch` (`"input_binding_mismatch"`), `RedeemDecision::Admitted { payer }`; one private closure shared with `redeem_for_invocation`.
 - [ ] `flow::denial_for` row; SDK `tool_payment.rs` doc table + `failure_vocab` reasons (`input_binding_mismatch`, `admission_revoked`, `no_reservation`, `journal_unavailable`).
 - [ ] `CallerPaymentFlow` staged verbs (`quote_bound`, `reserve_spend`, `author`, `pay_exact`), `run` composed from them; `CallerDecision::Failed.quote_id`; approved-quote resume checks `input_hash`.
-- [ ] `flow/a2a.rs` (feature `mesh`): `PurchaseAttempt`/`PurchaseState`/`PurchaseKey` + `a2a-purchases.json` store with CAS transitions per the D4 table (`begin_prepare` lease insert, `transition(from, to)`, stale-lease takeover, per-key in-process `Notify`); `A2aCallerFlow::{prepare_task, purchase_task, stored_attempt, resolve_attempt}`; `A2aPurchase`; `EngineTaskAdmissionGate: net_sdk::a2a_payment::TaskAdmissionGate`; `redeem_task_via_engine`.
+- [ ] `flow/a2a.rs` (feature `mesh`): `PurchaseAttempt`/`PurchaseState` (incl. `Submitted`, `PaidUnexecutable`, `Resolved`)/`PurchaseKey` + `a2a-purchases.json` store with CAS transitions per the D4 table (`begin_prepare` lease insert, `transition(from, to)`, stale-lease takeover, `clear_approval` on re-prepare, per-key in-process `Notify`); `A2aCallerFlow::{prepare_task, purchase_task, submit_task, stored_attempt, attempts, resolve_attempt}`; `A2aPurchase`, `A2aSubmit`; `EngineTaskAdmissionGate: net_sdk::a2a_payment::TaskAdmissionGate`; `redeem_task_via_engine`.
 - [ ] Tests `payments/tests/a2a_task_redeem.rs` (mock facilitator): `a_quote_carries_the_purchase_hash_into_its_id`, `redeem_for_task_refuses_a_mismatched_purchase_hash` (funds untouched, `redeemed` false), `redeem_for_task_is_idempotent_for_the_same_purchase_hash`, `a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed`, `a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools`, `an_approved_quote_resumes_only_for_its_own_purchase_hash`.
 - [ ] Tests `payments/tests/a2a_caller_purchase.rs` (scripted `ProviderChannel` with fault injection and barriers):
   - sequential recovery: `prepare_task_moves_no_money_and_reserves_no_spend`, `purchase_consumes_the_prepared_quote_not_a_fresh_one`, `a_lost_pay_reply_is_resumed_by_resending_the_identical_payload` (channel swallows the first reply; second `purchase_task` sends byte-identical payload; engine `consumed` map returns the original verdict; exactly one billing event), `a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid`, `a_caller_restart_mid_purchase_resumes_the_stored_attempt` (reopen the store from disk in `Paying`), `purchase_never_requotes_while_an_attempt_is_unresolved` (quote channel call count stays 1 across N retries), `an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id`
   - atomic attempt selection (finding r3-4): `concurrent_prepares_converge_on_one_quote` (N tasks barrier-released into `prepare_task`; quote channel called once; all receive the same `quote_id`), `concurrent_purchases_send_one_payload` (N `purchase_task` racing on `Quoted`; pay channel sees exactly one distinct payload; one billing event; all return the same proof), `a_conflicting_commitment_under_the_same_key_is_rejected`, `a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not`, `two_processes_share_one_attempt` (child process via `std::process::Command` re-exec on the same store path)
-  - refusal classes (finding r3-5): `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous` (exact-EVM / exact-SVM quote; provider answers `Rejected`; `reject_releases_reservation == false` ⇒ reservation held, state `RefusedExposed`, `purchase_task` returns `Denied{funds_ambiguous: true}` and never re-quotes), `an_unexposed_refusal_releases_and_may_prepare_again` (spend `Denied` before authoring ⇒ `RefusedUnexposed`, reservation released), `run_is_byte_for_byte_equivalent_after_the_split` (existing `a_solana_reject_keeps_the_reservation` and the `mcp_gate`/`http402` suites unchanged are the guard)
+  - refusal classes (finding r3-5): `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous` (exact-EVM / exact-SVM quote; provider answers `Rejected`; `reject_releases_reservation == false` ⇒ reservation held, state `RefusedExposed`, `purchase_task` returns `Denied{funds_ambiguous: true}` and never re-quotes; `prepare_task` on it is `Conflict`-class refusal until `resolve_attempt`), `an_unexposed_refusal_releases_and_may_prepare_again` (spend `Denied` before authoring ⇒ `RefusedUnexposed`, reservation released; `prepare_task` mints a new quote under the same `admission_id`), `run_is_byte_for_byte_equivalent_after_the_split` (existing `a_solana_reject_keeps_the_reservation` and the `mcp_gate`/`http402` suites unchanged are the guard)
+  - table consistency (r4): `every_caller_transition_outside_the_table_is_a_conflict` (table-driven), `an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare` (approve old quote; let it expire; `prepare_task` → new `quote_id`; `purchase_task` → `RequiresPaymentApproval` again; old approval cleared), `unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote` (`Unknown` → provider comes back → `purchase_task` → `Paid`; quote channel count unchanged), `a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence` (provider answers `NoReservation` / `admission_revoked` to a `Paid` attempt → `PaidUnexecutable{proof, billing, refusal}`; `purchase_task` / `prepare_task` refuse; `resolve_attempt` → `Resolved`, evidence still readable), `a_retryable_submit_refusal_keeps_the_attempt_paid` (`Busy` → still `Paid`; resubmit succeeds → `Submitted`)
 
 **Acceptance:** `redeem_for_invocation`, `tool_serve_paid.rs`, `native_tool_gate.rs`, `mcp_gate_composition.rs`, admission-matrix bench unchanged in behavior; `cargo clippy -p net-payments --features mesh -- -D warnings` clean.
 
@@ -465,6 +487,7 @@ A and B are independent; C depends on A+B; D–F on C.
 - [ ] Requester: `Mesh::describe_a2a`, `Mesh::prepare_a2a(node, &brief) -> AdmissionReservation` (raw prepare; the payments `A2aCallerFlow` composes it), `Mesh::submit_task_paid(node, &PreparedTask, &TaskPaymentProof)`, `A2aFlowError::PaymentRefused`.
 - [ ] Integration tests `sdk/tests/a2a_paid_admission.rs` (`#![cfg(all(feature = "net", feature = "cortex", feature = "testing"))]`; scripted `RecordingTaskGate` and `ScriptedPreflight` in the `RecordingGate` idiom; executor with a run counter and a barrier):
   - configuration: `a_free_configured_service_runs_without_a_gate_or_journal`, `a_paid_service_refuses_to_start_without_a_gate`, `..._without_a_journal`, `..._without_pricing`, `a_free_service_refuses_pricing`
+  - free is not policy-free (r4): `a_free_service_without_a_journal_runs_preflight_on_direct_submit` (all-free catalog, `journal: None`, scripted preflight denies, submit **without** prepare → in-body rejection, run counter 0, in-memory store has no record), `a_free_service_without_a_journal_enforces_capacity_on_direct_submit` (`max_in_flight = 1`, second direct submit → `Busy`, frees on terminal), `a_free_direct_submit_that_passes_preflight_launches_once`, `a_free_prepared_reservation_is_deleted_when_preflight_fails_at_submit`
   - ownership lock (finding r3-1): `a_second_owner_is_excluded_after_a_journal_replacement` (owner A opens, performs a successful write — the file is replaced — then a **child process** (`std::process::Command` re-exec of the test binary with an env selector) attempts `open` and must get `OwnedElsewhere`; then A drops and the child succeeds), `a_second_open_in_the_same_process_is_refused`, `the_owner_outlives_a_running_executor` (drop the `ServeHandle`s while a task runs; the terminal hook still writes `Terminal`; a second `open` is refused until the task ends)
   - preflight before money: `prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving`, `prepare_is_idempotent_and_returns_the_same_admission_id`, `prepare_refuses_a_different_brief_under_the_same_id`, `prepare_reports_busy_at_max_in_flight_and_frees_on_expiry`, `prepare_on_a_paid_record_returns_the_same_reservation`
   - refusals: `an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor` (ERR_PAYMENT, `missing_quote`, run counter 0, record stays `Reserved` with an `AttemptNote`), `a_bearer_submit_is_refused_binding_required`, `a_paid_submit_without_a_reservation_is_refused_before_the_gate`, `a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection` (gate never called; `Reconcile{claimed_quote_id}`; schematic `admission_revoked`; a second submit answers the same schematic with no state change), `a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation`
@@ -494,9 +517,10 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 | `PaymentProvider.serve_a2a_configured(callback, services: dict[str, dict], journal_path: str, *, principal="session_peer", preflight=None)` | `services[id] = {revision, pricing_terms|None, bounds{…}, reservation_ttl_secs, reservation_retention_secs, retention_secs, description}`; `preflight: async (owner_json, offer_json, brief_json) -> None | str`; executor callback gains keyword `service`, `revision` | `A2aServeHandle`; raises on misconfiguration (never serves free); raises `JournalOwnedElsewhere` if another owner holds the journal |
 | `PaymentProvider.a2a_unresolved()` / `a2a_resolve(owner_json, task_id, state_json)` | operator view / exit for the unresolved-financial class | JSON list / `None` |
 | `CapabilityGateway.prepare_task(target_node_id, service, prompt, context_refs=[], tags=[], task_id=None)` | read-only; CAS-creates or joins the single stored attempt | JSON `{status: ok|rejected|busy|retired|conflict, prepared: <prepared>, quote: {quote_id, amount, network, asset, expires_at_ns}}` |
-| `CapabilityGateway.purchase_task(prepared_json)` | consumes the stored quote/payload; concurrent calls converge | JSON `{status: paid|requires_payment_approval|denied|unknown|failed, task_id, quote_id, proof: <proof>?, policy_reason?, approve_hint?, retryable?, funds_ambiguous?: bool}` — `denied` with `funds_ambiguous: true` is `RefusedExposed` (spend reservation held; operator `resolve_attempt` is the only exit) |
-| `CapabilityGateway.a2a_attempts()` / `a2a_resolve_attempt(task_id, outcome_json)` | operator view / exit for `unknown` and `denied{funds_ambiguous}` | JSON list / `None` |
-| `NetMesh.submit_task_paid(prepared_json, proof_json)` | headers from proof, brief from prepared | `task_id`; raises `PaymentRefused(message, schematic_json)` |
+| `CapabilityGateway.purchase_task(prepared_json)` | consumes the stored quote/payload; concurrent calls converge | JSON `{status: paid|requires_payment_approval|denied|unknown|failed, task_id, quote_id, proof: <proof>?, policy_reason?, approve_hint?, retryable?, funds_ambiguous?: bool}` — `denied` with `funds_ambiguous: true` is `RefusedExposed` (spend reservation held; operator `a2a_resolve_attempt` is the only exit); `denied` with `funds_ambiguous: false` is `RefusedUnexposed` (a new `prepare_task` is allowed and re-runs policy/approval) |
+| `CapabilityGateway.submit_task(prepared_json)` | sends `prepared.brief` + the **stored** proof; records the outcome on the attempt | JSON `{status: accepted|retry|unexecutable, task_id, message?, schematic?}` — `unexecutable` = `PaidUnexecutable` (evidence retained; operator exit) |
+| `CapabilityGateway.a2a_attempts()` / `a2a_resolve_attempt(task_id, outcome_json)` | operator view / exit for `unknown`, `denied{funds_ambiguous}`, `unexecutable` | JSON list / `None` |
+| `NetMesh.submit_task_paid(prepared_json, proof_json)` | raw: headers from proof, brief from prepared; no store | `task_id`; raises `PaymentRefused(message, schematic_json)` |
 | `CapabilityGateway.approve_payment / reject_payment / pending_payments` | unchanged | as today |
 | `CapabilityGateway(..., a2a_purchase_path=None)` | new ctor kwarg for the purchase store | — |
 
@@ -517,7 +541,7 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 
 **Rust (SDK):** unchanged `serve_a2a`, `submit_task`, `task_status`, `cancel_task`, `TaskRegistry::submit`. New: `serve_a2a_configured`, `describe_a2a`, `prepare_a2a`, `submit_task_paid`; `A2aServiceConfig`, `A2aServicePolicy`, `A2aOffer`, `A2aBounds`, `A2aPrincipal`, `TaskPreflight`, `A2aAdmissionJournal` (`open`, `unresolved`, `resolve`, `prune`), `A2aJournalError::OwnedElsewhere`; `AdmissionReservation`, `PreparedTask`; `TaskRegistry::{reserve, with_terminal_hook}`, `Admission`, `AdmissionTicket`; `TaskBrief::{service, revision, with_service, with_task_id}`; `TaskOwner::Entity`; `TaskState::Interrupted`; `SubmitRejection::{UnknownService, StaleRevision, BoundsExceeded, NoReservation, Retired, Busy}`; `A2aFlowError::PaymentRefused`; `a2a_payment::{TaskAdmissionGate, TaskPaymentClaim, TaskPaymentEvidence, TaskPaymentProof, A2A_PREPARE_SERVICE, A2A_DESCRIBE_SERVICE}`; `task_commitment`, `purchase_hash`. Core: `ServeError::A2aPaidMisconfigured`.
 
-**Rust (`net-payments`, feature `mesh` unless noted):** `QuoteRequest::with_input_hash` (ungated); `ProviderChannel::quote(.., input_hash)`; `PaymentEngine::{issue_quote(.., input_hash), redeem_for_task}`; `RedeemDecision::Admitted { payer }`; `RedeemDenialReason::InputBindingMismatch`; `CallerPaymentFlow::{quote_bound, reserve_spend, author, pay_exact}`, `CallerDecision::Failed.quote_id`; `flow::a2a::{A2aCallerFlow (prepare_task, purchase_task, stored_attempt, resolve_attempt), PurchaseKey, PurchaseAttempt, PurchaseState, A2aPurchase, EngineTaskAdmissionGate}`.
+**Rust (`net-payments`, feature `mesh` unless noted):** `QuoteRequest::with_input_hash` (ungated); `ProviderChannel::quote(.., input_hash)`; `PaymentEngine::{issue_quote(.., input_hash), redeem_for_task}`; `RedeemDecision::Admitted { payer }`; `RedeemDenialReason::InputBindingMismatch`; `CallerPaymentFlow::{quote_bound, reserve_spend, author, pay_exact}`, `CallerDecision::Failed.quote_id`; `flow::a2a::{A2aCallerFlow (prepare_task, purchase_task, submit_task, stored_attempt, attempts, resolve_attempt), PurchaseKey, PurchaseAttempt, PurchaseState, A2aPurchase, A2aSubmit, EngineTaskAdmissionGate}`. SDK: `AdmissionStore` trait with `A2aAdmissionJournal` and in-memory `A2aAdmissions`.
 
 **Python:** table in WS-E.
 
@@ -533,6 +557,7 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 | Intentionally free needs no payments | `a_free_configured_service_runs_without_a_gate_or_journal`; `net_sdk` builds `a2a_payment` without `net-payments` |
 | Paid never becomes free | the four `a_paid_service_refuses_to_start_*` tests, `a_free_service_refuses_pricing` |
 | Validation before money, not before redemption | `prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving`, `prepare_task_moves_no_money_and_reserves_no_spend` |
+| Free means no payment, not no policy | `a_free_service_without_a_journal_runs_preflight_on_direct_submit`, `a_free_service_without_a_journal_enforces_capacity_on_direct_submit`, `a_free_prepared_reservation_is_deleted_when_preflight_fails_at_submit` |
 | Post-payment failure is reconciliation, never unpaid rejection | `a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection`, `a_restart_with_a_reconcile_record_keeps_refusing_until_resolved` |
 | Unpaid refusal, structured | `an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor` (+ Python schematic passthrough) |
 | Paid execution once | `a_paid_submit_redeems_once_and_runs_once`, `prepare_then_purchase_then_submit_runs_the_task_once` |
@@ -541,6 +566,7 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 | Never re-quote an ambiguous purchase | `purchase_never_requotes_while_an_attempt_is_unresolved`, `a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid`, `a_caller_restart_mid_purchase_resumes_the_stored_attempt` |
 | One authoritative caller attempt | `concurrent_prepares_converge_on_one_quote`, `concurrent_purchases_send_one_payload`, `a_conflicting_commitment_under_the_same_key_is_rejected`, `two_processes_share_one_attempt` |
 | Refusal ≠ proven non-payment | `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous`, `run_is_byte_for_byte_equivalent_after_the_split` |
+| Caller table is complete and consistent | `every_caller_transition_outside_the_table_is_a_conflict`, `an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare`, `unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote`, `a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence`, `a_retryable_submit_refusal_keeps_the_attempt_paid` |
 | Altered request | `an_altered_brief_under_the_same_id_is_rejected_before_payment`, `redeem_for_task_refuses_a_mismatched_purchase_hash`, `commitment_frames_array_boundaries` |
 | No duplicate execution across owners / after retention | `a_reused_proof_from_another_peer_is_refused_and_never_launches`, `a_retry_after_result_retention_never_relaunches_or_redeems` |
 | Once-only launch claim, single live owner | `a_failed_claim_write_never_launches_and_a_retry_launches_once`, `a_second_owner_is_excluded_after_a_journal_replacement`, `the_owner_outlives_a_running_executor`, `concurrent_identical_submits_converge_on_one_admission` |
@@ -571,7 +597,7 @@ Behavioral witnesses only — no source-string assertions; concurrency staged wi
 - **Revision retirement vs. in-flight reservations:** changing `revision` after prepare strands paid quotes (`StaleRevision` at S2, funds moved). Mitigation is operational: keep the previous revision in the catalog ≥ `reservation_ttl_secs`, or accept the refund obligation. No automatic refund is built.
 - **Journal lock on network filesystems** is not a liveness proof; documented as local-FS only (the `payment-engine.json` caveat). The `.owner` sidecar is never deleted by the journal; an operator who removes it while an owner is live defeats the exclusion (documented, same class as deleting a lock file by hand).
 - **Unresolved-financial records accumulate until an operator resolves them** — by design; `unresolved()` / `PaymentProvider.a2a_unresolved()` is the operator's queue, and the release note must say so.
-- **Late paid submit after `reservation_retention_secs`** answers `NoReservation`; the caller's `PurchaseAttempt` (`Paid`, never submitted) is the reconciliation evidence and the operator's `resolve_attempt` is the exit. The default (7 days) is chosen to exceed any quote TTL by orders of magnitude.
+- **Late paid submit after `reservation_retention_secs`** answers `NoReservation`; the caller's attempt moves `Paid → PaidUnexecutable{proof, billing, refusal}` (evidence retained, never auto-pruned) and the operator's `resolve_attempt` is the exit. The default (7 days) is chosen to exceed any quote TTL by orders of magnitude and is part of `OfferV1`, so it is committed at purchase time.
 - **`TaskState::Interrupted` decode on old Rust requesters** — configured path only; called out in the release note.
 - **`submit` + `Pending`** in the sync free path returns the id without awaiting the verdict (today's callers only race identical retransmits; the entry already exists). Configured mode always awaits.
 - **Idempotent redemption widens `redeem_for_task` only.** `redeem_for_invocation` keeps strict at-most-once; the two share one closure so the difference is one visible branch, and the hash it is idempotent on names one reservation of one owner's one task.
