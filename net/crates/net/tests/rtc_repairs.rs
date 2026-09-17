@@ -4856,8 +4856,19 @@ async fn a_native_sender_fragments_for_a_peer_that_advertises_reassembly() {
 /// The raw-egress injector cannot make this claim at all and the
 /// first attempt at this witness proved it: one 8 KiB Net packet
 /// rides ~7 DTLS datagrams, so arming it at 3 counted 43 qualifying
-/// datagrams and lost a chunk of the FIRST piece. Hence
-/// `set_ingress_drop_at`, which drops one whole packet.
+/// datagrams and lost a chunk of the FIRST piece.
+///
+/// The ORDINAL ingress injector (`set_ingress_drop_at(3)`) was the
+/// second attempt, and CI found its flaw: an ordinal is the piece
+/// this witness means only if nothing else arrives in between, and
+/// credit grants and acknowledgements share the channel. It selected
+/// the middle piece on Windows and the group's HEAD on the Linux
+/// runner — where the assertion below read `held 0`, which its own
+/// message already interprets as the head being lost. The injector
+/// now names the piece by its own `fragment_offset`, which no other
+/// traffic can shift, and fires ONCE: a retransmission carries the
+/// same offset, so a still-armed injector would eat the recovery
+/// this witness exists to observe.
 ///
 /// Inverse: delete the `if let Some(f) = d.fragment` restamp from
 /// either rebuild site — the recovered piece arrives unfragmented,
@@ -4891,7 +4902,8 @@ async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() 
     // so once the announcement traffic flushes, B's next inbound
     // packets are this group's pieces.
     settle_egress().await;
-    hooks_b.set_ingress_drop_at(3);
+    // The THIRD piece by its own identity, not by arrival ordinal.
+    hooks_b.set_ingress_drop_fragment_offset(Some(2 * MAX_EVENT_SIZE as u16));
     a.send_on_stream(&stream, std::slice::from_ref(&payload))
         .await
         .expect("the group is admitted");
@@ -4911,11 +4923,12 @@ async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() 
         b.rtc_reassembly().held_bytes(session_id),
         4 * MAX_EVENT_SIZE as u64
     );
-    let counted = hooks_b.ingress_counted();
-    assert!(
-        counted >= 3,
-        "the injector counted {counted} inbound packets: the armed drop was \
-         never reached, so nothing below measures recovery"
+    let dropped = hooks_b.ingress_fragment_dropped();
+    assert_eq!(
+        dropped, 1,
+        "the offset-targeted injector must have dropped exactly the one piece \
+         it names: {dropped} means it matched nothing, so nothing below \
+         measures recovery"
     );
 
     let delivered = collect_payload_events(&b, &payload, Duration::from_secs(60)).await;
@@ -4942,8 +4955,8 @@ async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() 
     assert!(
         retransmits >= 1,
         "and `reliability.rs` is what carried it: {retransmits} retransmitted \
-         packets against {counted} counted inbound packets and one armed \
-         drop. Zero would mean the piece was never actually lost"
+         packets against {dropped} fragment(s) actually dropped at the \
+         receiver. Zero would mean the piece was never actually lost"
     );
 
     // ONCE, measured rather than assumed: keep draining after the

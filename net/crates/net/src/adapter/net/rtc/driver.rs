@@ -184,6 +184,32 @@ pub struct RtcTestHooks {
     /// armed, so a receipt can state that the drop happened rather
     /// than that it was requested.
     ingress_seen_since_arm: std::sync::atomic::AtomicU64,
+    /// Drop the inbound Net packet whose header carries a given
+    /// `fragment_offset`, stored as **offset + 1** so that `0` is
+    /// "disabled" and the struct keeps its derived `Default`. Offset
+    /// 0 is a legitimate target — it is the group's head — so it
+    /// cannot double as the sentinel.
+    ///
+    /// # Why this exists beside `ingress_drop_at`
+    ///
+    /// `ingress_drop_at` names an ARRIVAL ORDINAL, and an ordinal is
+    /// only the piece a witness means if nothing else arrives in
+    /// between. Credit grants, ACKs and the peer's own traffic share
+    /// this channel, so "the third inbound message" is the third
+    /// fragment on one machine and something else on another. That
+    /// is not a flake to retry: the instrument was naming a position
+    /// in a sequence it does not control.
+    ///
+    /// `a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once`
+    /// passed on Windows and failed on the Linux runner with "held 0
+    /// bytes", which its own message reads as the HEAD having been
+    /// lost — the ordinal had selected a different packet. This
+    /// injector names the piece by its own identity instead, so the
+    /// witness drops the middle fragment on every machine.
+    ingress_drop_frag_offset: std::sync::atomic::AtomicU32,
+    /// Fragments the offset-targeted injector actually dropped,
+    /// counted since it was armed.
+    ingress_frag_dropped: std::sync::atomic::AtomicU64,
     /// Drop the Nth RAW outbound datagram carrying DTLS
     /// application data — i.e. below SCTP (0 = disabled).
     ///
@@ -263,6 +289,42 @@ impl RtcTestHooks {
         self.ingress_seen_since_arm.load(Ordering::Acquire)
     }
 
+    /// Arm the ingress injector on a fragment's OWN identity: drop
+    /// the inbound Net packet whose header carries this
+    /// `fragment_offset`. `None` disables it.
+    ///
+    /// **Fires exactly once, then disarms.** A retransmission of the
+    /// lost piece carries the same offset, so an injector that
+    /// stayed armed would eat the recovery the witness exists to
+    /// observe — the payload would never arrive and the failure
+    /// would look like a broken reassembler rather than a greedy
+    /// instrument. This is not hypothetical: the first version of
+    /// this injector did exactly that.
+    ///
+    /// Prefer this to [`Self::set_ingress_drop_at`] whenever the
+    /// witness means "that piece" rather than "that arrival". An
+    /// ordinal is only the intended piece if nothing else shares the
+    /// channel, and credit grants, ACKs and the peer's own traffic
+    /// do share it — the ordinal form selected the group's head on a
+    /// Linux runner and its middle piece on Windows for the very
+    /// witness this was added for.
+    pub fn set_ingress_drop_fragment_offset(&self, offset: Option<u16>) {
+        self.ingress_frag_dropped.store(0, Ordering::Release);
+        self.ingress_drop_frag_offset.store(
+            offset.map_or(0, |o| u32::from(o).saturating_add(1)),
+            Ordering::Release,
+        );
+    }
+
+    /// Fragments dropped by
+    /// [`Self::set_ingress_drop_fragment_offset`] since it was armed,
+    /// so a witness can assert the loss HAPPENED rather than that it
+    /// was requested — the difference between an injector that fired
+    /// and one that silently matched nothing.
+    pub fn ingress_fragment_dropped(&self) -> u64 {
+        self.ingress_frag_dropped.load(Ordering::Acquire)
+    }
+
     /// Arm the PRE-SCTP injector: drop the `nth` outbound datagram
     /// that carries DTLS application data, counting from this call.
     /// `0` disables and resets the counter.
@@ -312,15 +374,44 @@ impl RtcTestHooks {
         self.inject_conn_reset.swap(false, Ordering::AcqRel)
     }
 
-    fn drop_this_ingress(&self) -> bool {
-        // The two injectors keep independent counters, so arming
-        // one does not perturb the other's schedule, and an
-        // unarmed injector counts nothing.
+    fn drop_this_ingress(&self, data: &[u8]) -> bool {
+        // The injectors keep independent counters, so arming one
+        // does not perturb another's schedule, and an unarmed
+        // injector counts nothing.
         let mut drop = false;
         let nth = self.ingress_drop_at.load(Ordering::Acquire);
         if nth != 0 {
             let seen = self.ingress_seen_since_arm.fetch_add(1, Ordering::Relaxed) + 1;
             drop = seen == nth;
+        }
+        // Targeted by the piece's own identity, and it fires ONCE.
+        // The header is plaintext — it is the AAD the payload is
+        // sealed against — so this reads the offset without touching
+        // the ciphertext, and a datagram that is not a parseable Net
+        // packet simply does not match.
+        //
+        // Disarming on the first match is the whole point: a
+        // retransmission of the lost piece carries the SAME
+        // `fragment_offset`, so an injector that stayed armed would
+        // eat the recovery it exists to observe and the group would
+        // never complete. `compare_exchange` rather than a store, so
+        // two pieces arriving on different driver tasks cannot both
+        // see themselves as the first.
+        let armed = self.ingress_drop_frag_offset.load(Ordering::Acquire);
+        if armed != 0 {
+            let want = armed - 1;
+            if let Some(header) = net_wire::protocol::NetHeader::from_bytes(data) {
+                if header.frag_flags & net_wire::protocol::FRAG_FRAGMENTED != 0
+                    && u32::from(header.fragment_offset) == want
+                    && self
+                        .ingress_drop_frag_offset
+                        .compare_exchange(armed, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    self.ingress_frag_dropped.fetch_add(1, Ordering::Relaxed);
+                    drop = true;
+                }
+            }
         }
         let n = self.ingress_drop_one_in.load(Ordering::Acquire);
         if n != 0 {
@@ -1446,7 +1537,7 @@ async fn drain_session(
                     // which is the point: `reliability.rs` is the
                     // only mechanism that can.
                     #[cfg(any(test, feature = "fixtures"))]
-                    if hooks.drop_this_ingress() {
+                    if hooks.drop_this_ingress(&data.data) {
                         continue;
                     }
                     // Rule 5: never block the driver. A full input

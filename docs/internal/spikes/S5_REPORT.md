@@ -2222,6 +2222,42 @@ fragmentation ceiling — and only for a peer that advertises the tag. A
 binding parity test that sends over-cap to a peer without the tag still
 observes limit 8 104, unchanged.
 
+#### Witness (c)'s injector named an arrival, not a piece — CI found it
+
+Worth its own heading because it is the recurring defect class of this
+whole stage, caught once more, and this time by the Linux runner
+rather than by a person.
+
+(c) drops a middle fragment and checks the payload still arrives once.
+It armed `set_ingress_drop_at(3)` — the THIRD inbound message. An
+ordinal only names the intended piece if nothing else arrives in
+between, and credit grants and acknowledgements share that channel. It
+selected the middle piece on Windows and the group's **head** on the
+Linux runner, where the witness failed with `held 0 bytes` — which its
+own assertion message already spells out as the head having been lost.
+The instrument was naming a position in a sequence it does not
+control.
+
+Repaired by naming the piece instead of the arrival:
+`set_ingress_drop_fragment_offset(Some(2 * MAX_EVENT_SIZE))` matches
+the inbound packet whose header carries that `fragment_offset`, read
+from the plaintext AAD without touching the ciphertext. No other
+traffic can shift it.
+
+It **fires once and disarms**, which the first version did not — and
+that mistake is instructive rather than embarrassing: a retransmission
+of the lost piece carries the same offset, so a still-armed injector
+ate the recovery, the group never completed, and the failure presented
+as a broken reassembler. The `compare_exchange` is what makes "first
+match" well defined when pieces land on different driver tasks.
+
+The witness now also asserts the drop **fired** —
+`ingress_fragment_dropped() == 1` — so an injector that silently
+matches nothing fails loudly instead of producing a green run in which
+no loss ever happened. Inverse receipt: arming it at offset 63 000,
+which no piece carries, reds at the hole assertion (`rtc_repairs.rs:4914`)
+rather than passing.
+
 #### The five witnesses, and what each is for
 
 In `tests/rtc_repairs.rs`, **44 → 49** (the brief said 43; 44 was the
