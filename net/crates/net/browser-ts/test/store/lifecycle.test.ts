@@ -1478,6 +1478,124 @@ describe('overflow recovery is scheduled, not hoped for', () => {
   });
 });
 
+describe('a refused refresh does not cancel work someone else owed', () => {
+  it('an armed overflow survives a refused refresh and still converges', () => {
+    let s = joined(4);
+    const h = handleOf(s);
+
+    // Overflow while chunks remain: a replacement is owed.
+    s = owner(s, { t: 'refresh', h });
+    for (let i = 0; i < 8; i += 1) s = owner(s, { t: 'advance' });
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(true);
+    expect(unsentOf(s, h)).toBeGreaterThan(0);
+
+    // An optional refresh arrives and is refused, because this handle's
+    // own emission is outstanding. It must not arm recovery — and must
+    // not disarm the recovery the overflow already required.
+    s = owner(s, { t: 'refresh', h });
+    expect(s.wire.filter((m) => m.k === 'man')).toHaveLength(1);
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(true);
+
+    // Drain everything, with no further updates at all.
+    s = settle(s);
+
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(s.pending.filter((q) => q.k === 'resync')).toHaveLength(0);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('an armed overflow survives a refresh refused for availability', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+
+    // Arm the obligation, then let the chunks drain while a projection
+    // is unavailable, so the obligation is owed with an empty queue.
+    s = owner(s, { t: 'refresh', h });
+    for (let i = 0; i < 3; i += 1) s = owner(s, { t: 'advance' });
+    s = emit(s, h);
+    s = emit(s, h);
+    while (s.wire.length > 0) s = pump(s);
+    s = owner(s, { t: 'projectable', can: false });
+    for (let i = 0; i < 4; i += 1) s = owner(s, { t: 'advance' });
+    expect(deferredOf(s, h)?.q).toBeNull();
+
+    // A refused optional refresh must leave that pending recovery.
+    s = owner(s, { t: 'refresh', h });
+    expect(deferredOf(s, h)?.q).toBeNull();
+
+    s = settle(owner(s, { t: 'projectable', can: true }));
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('a refusal for availability preserves an owed replacement', () => {
+    // Unreachable through the reducers: an overflow with an empty queue
+    // is converted to a pending projection or installed at once, so an
+    // obligation never coexists with an empty queue. Asserted against
+    // the constructed state, because the rule is "a refusal never
+    // disarms what someone else owed" on **every** branch — an
+    // exception justified only by reachability is the kind that stops
+    // being true when a later path reaches it.
+    let s = joined(2);
+    const h = handleOf(s);
+    s = owner(s, { t: 'projectable', can: false });
+    const armed = { ...rec(s, h), queue: [], deferred: null, replaceWhenDrained: true };
+    s = { ...s, owner: { ...s.owner, handles: { ...s.owner.handles, [h]: armed } } };
+
+    s = owner(s, { t: 'refresh', h });
+
+    // The obligation became this handle's pending projection rather
+    // than being dropped.
+    expect(s.wire).toHaveLength(0);
+    expect(deferredOf(s, h)).not.toBeNull();
+    expect(deferredOf(s, h)?.q).toBeNull();
+
+    s = settle(owner(s, { t: 'projectable', can: true }));
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('a refused refresh with nothing owed arms nothing (control)', () => {
+    let s = joined(4);
+    const h = handleOf(s);
+
+    // An installation in flight, but no overflow: nothing is owed.
+    s = owner(s, { t: 'refresh', h });
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(false);
+    const allocated = allocOf(s, h);
+
+    s = owner(s, { t: 'refresh', h });
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(false);
+
+    s = settle(s);
+
+    // No second installation appeared behind the caller's back.
+    expect(allocOf(s, h)).toBe(allocated);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('an installation satisfies the obligation and clears it', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+
+    s = owner(s, { t: 'refresh', h });
+    for (let i = 0; i < 3; i += 1) s = owner(s, { t: 'advance' });
+    s = emit(s, h);
+    s = emit(s, h);
+    while (s.wire.length > 0) s = pump(s);
+    for (let i = 0; i < 4; i += 1) s = owner(s, { t: 'advance' });
+
+    // The replacement ran, so nothing is owed any more …
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(false);
+    s = settle(s);
+    const allocated = allocOf(s, h);
+
+    // … and draining does not install a second time.
+    expect(allocOf(s, h)).toBe(allocated);
+    expect(converged(s)).toBe(true);
+  });
+});
+
 describe('handle loss preserves local intent', () => {
   it('an expiry notice does not reopen a cancelled subscription', () => {
     let s = joined(2);

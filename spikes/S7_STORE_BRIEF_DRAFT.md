@@ -574,6 +574,15 @@ owner instead of the handle:
   Overflow recovery is the owner's own and is retained for the drain;
   an explicit refresh is the caller's and is simply refused, so nothing
   is left armed behind them.
+- **"Must not arm recovery" is not "clear recovery already owed."** A
+  refused optional refresh leaves an overflow obligation someone else
+  incurred exactly as it found it. An obligation is discharged only
+  when an installation **satisfies** it, a solicited transition
+  **subsumes** it, or the handle is **retired** — never as a side
+  effect of refusing an unrelated request. The two halves need separate
+  witnesses: one that a refusal arms nothing, and one that a refusal
+  disarms nothing, the second ending in convergence with no further
+  update to carry it.
 
 ### 1.7b Control admission is not gameplay readiness
 
@@ -1267,7 +1276,7 @@ owner reducer, and a harness in `browser-ts/test/store/lifecycle.test.ts`
 that delivers in per-direction FIFO order, routes by handle to either
 of two replicas, stalls the owner, expires handles, breaks sessions,
 and (only for the §1.9a witnesses) injects out-of-order delivery.
-**66 witnesses**, plus a **39-inverse** campaign.
+**71 witnesses**, plus a **41-inverse** campaign.
 
 It is test-only by construction: no production export, no transport, no
 new protocol subsystem, no `src/` change, bundle unchanged. It is not
@@ -1314,14 +1323,15 @@ not transition traces.
 | an owner refresh never takes the caller's turn | "does not replace a deferred caller transition"; "does not emit a manifest it cannot follow with chunks"; "does not replace a pending transition even when it could project" (whitebox) | ignore availability → **1 failed**; replace a pending transition → **1 failed**; ignore its own emission → **2 failed** |
 | overflow recovery is scheduled, not hoped for | "a delta-only queue that overflows still converges"; "overflow with chunks still outstanding waits for the drain"; "overflow while a projection is unavailable recovers on restoration"; "a pending caller request subsumes the overflow recovery" | overflow not scheduled → **2 failed**; scheduling bypasses the admission point → **2 failed**; drained queue never replaces → **2 failed** |
 | one admission point for every owner replacement | the three "an owner refresh never takes the caller's turn" witnesses, plus the overflow ones above | overwrite a pending transition → **2 failed**; ignore availability → **2 failed**; pre-empt its own emission → **4 failed**; explicit refresh arms the flag → **2 failed** |
+| a refusal never disarms an owed replacement | "an armed overflow survives a refused refresh and still converges"; "…survives a refresh refused for availability"; "a refusal for availability preserves an owed replacement" (whitebox); with "a refused refresh with nothing owed arms nothing" and "an installation satisfies the obligation and clears it" as controls | a refused refresh disarms the obligation → **1 failed**; a refusal for availability disarms it → **1 failed**; an explicit refresh arms it → **3 failed** |
 | handle loss preserves local intent | "an expiry notice does not reopen a cancelled subscription"; "the caller's own next request rejoins after a fenced expiry"; with the active-subscription and local-leave controls | expiry reopens a cancelled subscription → **2 failed** |
 | one recoverable handle-loss disposition | "`closed` discards the handle and rejoins, replaying nothing"; "an unsolicited `closed` notice recovers the subscription"; "`owner-lost` is terminal"; "a local leave is terminal"; "any other refusal fences without rejoining" | `closed` terminal → **6 failed**; `owner-lost` rejoins → **1 failed**; any refusal discards the subscription → **1 failed** |
 
 Four inverses are controls on the model itself, so that strictness
-cannot be mistaken for correctness: **drop every arrival** → 66 failed,
-0 passed; **never hand over queued work** → 64 failed; **reuse one
+cannot be mistaken for correctness: **drop every arrival** → 71 failed,
+0 passed; **never hand over queued work** → 69 failed; **reuse one
 handle id for every join** → 11 failed; **never allocate a generation**
-→ 64 failed. A drop-everything implementation fails every positive
+→ 69 failed. A drop-everything implementation fails every positive
 control and every `converged()` assertion in the file.
 
 The inverse ledger is **implementer-run**: the mutation campaign is
@@ -1415,6 +1425,20 @@ Round 7, from the reviewer's probes:
   arriving by a different door. Handle loss now discards the handle and
   its generation state from every state, and rejoins only where
   subscription intent is still active.
+
+Round 8, from the reviewer's probes:
+
+- **A refused explicit refresh cleared recovery an earlier overflow
+  already required.** The shared admission point wrote
+  `replaceWhenDrained: keepPending`, which correctly refuses to *arm*
+  an obligation for an optional refresh and incorrectly *erased* one
+  already owed: the replica ended at revision 100 against an owner at
+  105, queue empty, nothing pending. Both of the reviewer's controls
+  passed, which is what made it a real finding rather than a strictness
+  complaint — a refused refresh with nothing owed armed nothing, and
+  the same overflow without the intervening refresh converged. The
+  obligation is now discharged only by satisfaction, subsumption or
+  retirement.
 
 Two round-5 inverses came back **green** on first run, and both were
 untested paths rather than redundant rules: a control admitted on an

@@ -598,9 +598,16 @@ function install(o: Owner, h: string, q: string | null, aud: readonly string[]):
  * on one path and bypassed on another.
  *
  * Returns the owner unchanged (`out: []`) when the replacement is not
- * admissible *now*; `keepPending` says whether the need survives for a
- * later attempt, which is true for overflow recovery and false for an
- * explicit refresh (the caller retries that one itself).
+ * admissible *now*. `keepPending` says whether **this request** may
+ * arm recovery for a later attempt: true for overflow recovery, false
+ * for an explicit refresh, which the caller retries itself.
+ *
+ * `keepPending: false` means "do not **arm** recovery" — never "clear
+ * recovery already owed". An optional refresh that is refused must
+ * leave an overflow obligation someone else incurred exactly as it
+ * found it, so the obligation is cleared only when an installation
+ * **satisfies** it, a solicited transition **subsumes** it, or the
+ * handle is **retired**.
  */
 function replace(o: Owner, h: string, keepPending: boolean): Owner {
   const rec = o.handles[h];
@@ -618,13 +625,18 @@ function replace(o: Owner, h: string, keepPending: boolean): Owner {
     };
   }
 
+  // Whether a replacement is owed at all: this request may arm one,
+  // and an earlier overflow may already have.
+  const owed = rec.replaceWhenDrained || keepPending;
+
   // Not while this handle's own emission is outstanding: the replica
   // refuses unsolicited manifests mid-transition, so both generations
-  // would stall until a deadline. The need is kept for the drain.
+  // would stall until a deadline. Any owed replacement waits for the
+  // drain.
   if (rec.queue.length > 0) {
     return {
       ...o,
-      handles: { ...o.handles, [h]: { ...rec, replaceWhenDrained: keepPending } },
+      handles: { ...o.handles, [h]: { ...rec, replaceWhenDrained: owed } },
       out: [],
     };
   }
@@ -638,7 +650,7 @@ function replace(o: Owner, h: string, keepPending: boolean): Owner {
       ...o,
       handles: {
         ...o.handles,
-        [h]: keepPending
+        [h]: owed
           ? { ...rec, replaceWhenDrained: false, deferred: { q: null, aud: rec.aud } }
           : { ...rec, replaceWhenDrained: false },
       },
