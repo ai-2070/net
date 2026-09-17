@@ -174,6 +174,23 @@ Discovery, invocation, and outcome are separate: finding a provider does not aut
 a successful invocation is not proof that the real-world outcome holds. See [Submitted is not
 completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
+## What it enables
+
+A capability mesh changes what an application may assume about *where* work runs:
+
+- **Tools on other machines.** A caller discovers a capability and invokes it; the credential stays with the provider. [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke), [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent).
+- **Work placed by capability.** A stateful daemon is addressed by identity, not host; placement follows capability, and migration carries a running daemon to another node with its history. [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement), [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration).
+- **Data that follows its readers.** Content-addressed blobs replicate toward the nodes reading them, with read-your-writes at the producer. [Dataforts](https://ai2070.net/docs/guides/dataforts).
+- **Coordination without a coordinator.** Peers observe, derive, and reroute; there is no registry, broker, or leader to operate. [Event bus](https://ai2070.net/docs/guides/event-bus), [Architecture](https://ai2070.net/docs/concepts/architecture).
+- **Cheap devices, remote compute.** A sensor announces what it produces; the mesh routes the work to a node that has the capability. [Capabilities](https://ai2070.net/docs/concepts/capabilities).
+- **Jobs that outlive a failure.** A long task can be handed to another participant with a lifecycle and an explicitly verified outcome. [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle), [Submitted is not completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
+
+These patterns show up in agent runtimes, robotics and fleet operations, industrial process
+control, edge and IoT, and local-first collaboration. Worked end to end:
+[Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
+[Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
+[Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
+
 ## What's in the box
 
 A compressed tour; each links to the page that goes deep.
