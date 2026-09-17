@@ -2435,3 +2435,170 @@ browser runner), since no root-level `fmt` reaches them. The Firefox
 leg of the browser matrix could not run locally: the harness refuses
 to start without NSS `certutil` rather than fall back to a root store
 it never writes. Chromium ran 42/42 locally; Firefox is CI's.
+
+
+### 13.8 Sixth round — both outstanding HOLDs answered
+
+Kyra's fourth review (HOLD at `516a45c33`) and fifth (HOLD at
+`60e120609`). Fifteen items, one to four commits each, and the raw
+inverse receipts are IN THE TREE rather than described: her round-5
+evidence item 4 rejected author-reported excerpts and unretained
+fragmentation receipts explicitly, so every repair this round carries
+an applied diff, the exact command, the exit code, verbatim RED, a
+restoration identity and verbatim GREEN under `spikes/S5_R6_*_RECEIPTS/`.
+
+**Her round-4 packet was 6 pass / 4 fail at `9a0615fbf` and is 10/10
+now**, with all six controls still green and the probe file unmodified.
+The four reds were R4-1, R4-2, R4-3 and R4-4.
+
+| item | repair |
+|---|---|
+| R4-1 | receiver: `rx_resume_point()` replaces the high-water concession. Producer: reliability derived as `is_reliable() \|\| tx_promoted()`, boundary stamped on the packet whose sequence won the claim |
+| R4-2 | `reset_rx_lifetime()` returns boundary authority to the unstated value for the mode the receive half is in; send half untouched by construction |
+| R4-3 | bounded completed-group memory, discriminating by SEQUENCE SPAN not fragment id, because the leaf's id is a u16 counter that wraps |
+| R4-4 | contradictory owners resolved at registration, in BOTH directions — her probe drives one |
+| R4-5 | the bound moved to admission; a refusal is a disposition returned on the piece, which no queue can drop. 8 sessions 64/64, 9 sessions 72/72 |
+| R4-6 | a reassembly loss settles its own receive half; FAF loss keeps permitted-loss semantics, witnessed separately |
+| R4-7 | fragment identity carries the epoch, so predecessor cleanup cannot resolve the current stream by id |
+| R4-8 | the lifetime authority governs AT the guarded insertion. Obsolete-owner admission, not cross-session byte merge |
+| R4-9 | acceptance, not buffering, creates the obligation |
+| R4-10 | `peer_node` + `incarnation` on `StreamData`, filters keyed on `(peer, stream_id)`, both halves |
+| R5-N1 | whole-group sequence ownership through one admission |
+| R5-N2 | descriptor admission for the whole group before the first piece commits |
+| R5-G1 | the attributed size and limit cross the C boundary instead of being reconstructed |
+| R5-L1 | every child, the hub and the parent close despite one throwing child; aggregate error |
+| R5-L2 | listeners are owned subscriptions with tokens, released on close |
+
+#### Three witnesses that went past their own bar
+
+**R4-9 delivers the SACK and then proves the sender's copy is gone.**
+Her requirement was "deliver the SACK, not merely observe local
+acceptance". The witness builds the feedback through the real path
+(`collect_gap_reports`), applies it through the real sender path
+(`on_ack_ranges`), and then issues a NACK for `{0,1}` that returns
+descriptors `[0]` only. That last step is not in her bar and it is
+what closes the "the sender could still retransmit it" reading.
+
+**R4-1's producer witness loses its packet BY IDENTITY.** A new
+fixtures-only injector names a packet by `(stream_id, sequence)`
+rather than by arrival ordinal — the same reasoning the fragment-offset
+injector adopted after CI caught an ordinal naming a different packet
+on a different machine.
+
+**R5-G1's cgo evidence is a negative control, not an assertion.**
+`CGO_ENABLED=0 go test` cannot BUILD those tests (`undefined:
+MeshNode`, `Net`, `Identity`), so a cgo-less run cannot produce a
+verdict at all — which closes the silent-skip trap by construction
+rather than by claiming the flag was set.
+
+#### One self-correction worth more than the thing it corrected
+
+R6Ts had cited the ABI fixture's past-2^53 vector as covering the
+`JSON.parse` rounding hazard, then withdrew it unprompted: **the
+fixture spells its u64s QUOTED**, so it proves the decode is exact and
+never exercises the re-quote path. The property was then established
+against the built `dist/` with the values unquoted, which is the only
+input shape where `U64_EVENT_KEYS` does any work:
+
+```
+incarnation: 9007199254740995   exact
+naive JSON.parse would give:    9007199254740996
+```
+
+Off by one, no error, no throw, in a provenance field a page may use
+to attribute a payload to a session. "There is a past-2^53 vector"
+reads like coverage it is not.
+
+#### A defect this round's own evidence machinery caused
+
+Two `rtc_repairs` witnesses failed for me mid-round, one of them a
+Stage 6 witness that had been green — a 40 000-byte send leaving as
+ONE piece instead of five. I read it as a regression in the new
+producer and said so.
+
+It was a stranded inverse mutation. The R5-N1 receipt replaced the
+group admission's `seqs` argument with `1`, and the RESTORE step
+failed because `1,` is not unique in `mesh.rs`, leaving the tree
+deliberately wrong with no marker. The fingerprint accounts for both
+failures exactly: `tx_seq` advancing by one instead of five gives
+`left: 1 right: 5`, and the group's pieces then overlapping a
+concurrent send makes the receiver refuse on its contiguity rule,
+giving `left: 1 right: 2`. The 54/55/56 spread across three runs was
+that mutate/restore cycle sampled at different points.
+
+Fixed at the source: a unique mutation token, and a runner that cannot
+strand on a failed restore. The process rule it produced: **a receipt
+window is a period in which the tree is deliberately wrong, and nobody
+outside it can distinguish that from a regression.** It is announced
+now, and I hold my own runs until it closes.
+
+#### Evidence items
+
+1. **Browser → native above one event, through the public producer.**
+   The prior leaf→native test hand-builds leaf-shaped fragments with a
+   native fixture and never executes the leaf's producer. The new
+   witness makes ONE public `send` of 32 768 B and asserts both that
+   the page saw it become 5 DataChannel messages and that the anchor
+   found exactly one byte-identical event. The collector recognises
+   PIECES too, so a failure to reassemble is measured as 5 events
+   rather than a timeout.
+2. **Two close outcomes, two witnesses.** Parked-iterator completion
+   and post-close typed refusal, in the live package, as separate
+   names — a conjunction passes while either half is broken. The
+   expected refusal text is READ OUT of `Inner::admit` at runtime, so
+   a reword cannot leave the witness asserting a sentence the product
+   no longer says.
+3. **Pins.** Her ten round-4 probes (roster 42 → 52), the six
+   previously unpinned real-package probes including both close
+   probes she named, the five new browser witnesses, the seven new
+   RTC witnesses, and
+   `a_locally_deactivated_session_still_receives_its_peers_frames`,
+   unpinned since round 4. Floors to measured counts: leaf 266 → 308,
+   `rtc_repairs` 49 → 56, browser matrix 42 → 47. The leaf floor had
+   been 42 witnesses below the real count, which cannot detect the
+   loss it exists to detect.
+4. **Receipts** — see above; all retained, none reconstructed.
+5. **`RetransmitDescriptor.fragment`** and this round's additions
+   (`FragmentPiece.epoch`, `AbandonedGroup.epoch`,
+   `RtcReassembly::retire_stream`'s epoch argument, and the three send
+   entry points' `out_size`/`out_limit`) are public source breaks
+   recorded in the release section independently of N4, with no
+   version change. The C signature change is invisible to the export
+   checker — a symbol-set guard cannot see a prototype change — so it
+   is written down by hand.
+6. **Stale prose** aligned at three sites; the false claim that no
+   native node reassembles leaf fragments was still being printed in a
+   PASS string.
+7. **Compatibility accounting:** `peer_node_hex?()` and
+   `incarnation?()` are OPTIONAL on the injected WASM interface.
+   Required methods would be a second breaking input-contract change
+   on the surface she already flagged; a host that spells no peer
+   keeps the pass-through branch. It is still an input-contract
+   addition and is listed as one.
+8. **The two wiring witnesses** for ConnectGuard arming and X7
+   follower observation, each built to fail if the wiring is
+   disconnected.
+
+#### Not closed, and not claimed
+
+- Her two exact-head CI reds at `60e120609` are green via
+  `aa925dd6b`, `795c208b1` and `683735478`. **She has not reviewed
+  those.** No closure is claimed for them here.
+- **A typed-surface gap found and deliberately deferred.**
+  `stream_failed` has no typed variant in `browser-ts`: the leaf emits
+  it, `parseEvent` falls to its `default` arm, and a page receives
+  `{ type: 'unknown', tag: 'stream_failed', raw: … }`. The README's
+  typed-tag list omits it, so the docs agree with the gap rather than
+  the leaf. It is in NEITHER packet, it is a missing capability rather
+  than a misdelivery — nothing is lost or mistyped — and doing it
+  properly needs a Rust-generated fixture vector, because a
+  hand-written TS declaration agreeing with a hand-written TS double
+  is the shape that produced the `Uint8Array`-vs-JSON defect. Found by
+  one lane looking at something else, reported across a boundary it
+  does not own, verified twice before being ruled on.
+- **A rustdoc break under a narrow feature set**, mine:
+  `deck.rs:807`'s `rtc_anchors` is `#[cfg(feature = "webrtc")]` while
+  the doc link at `deck.rs:353` is unconditional. It resolves under
+  CI's feature sets and breaks under others. It arrived with
+  `f5f561db9`, a Stage 6 commit, and is left untouched while Stage 6
+  is frozen for separate verification.
