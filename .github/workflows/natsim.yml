@@ -220,6 +220,8 @@ jobs:
           natsim_browser_portrestricted_symmetric_is_relayed
           natsim_browser_symmetric_symmetric_is_relayed
           natsim_browser_cone_cone_is_direct_on_firefox
+          natsim_browser_cone_cone_is_direct_without_media_permission
+          natsim_natted_anchor_publishes_both_mapped_endpoints
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "NAT conformance rows" --mode fn \
@@ -228,9 +230,13 @@ jobs:
             -- --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/natsim.log
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/natsim.log || true)
           echo "natsim scenarios: $ran"
-          # 6 pre-existing native scenarios + 7 browser rows.
-          if [ "${ran:-0}" -lt 13 ]; then
-            echo "::error::natsim ran ${ran:-0} scenarios, floor is 13 — \
+          # 6 pre-existing native scenarios + 7 browser rows, plus the
+          # two S6 acceptance rows: the permission-free Chromium leg
+          # (the granted camera/microphone was part of the measured
+          # environment, not of the product) and the NAT'd anchor that
+          # observes BOTH of its mapped endpoints answering.
+          if [ "${ran:-0}" -lt 15 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 15 — \
           lower the floor deliberately or restore the row"
             exit 1
           fi

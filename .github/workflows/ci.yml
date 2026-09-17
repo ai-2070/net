@@ -4787,12 +4787,12 @@ jobs:
             --floor rtc_reclaim=5 \
             --floor rtc_classifier=2 \
             --floor rtc_admission_probes=11 \
-            --floor rtc_signalling=12 \
+            --floor rtc_signalling=14 \
             --floor rtc_admission=26 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
-            --floor natsim_browser=22 \
-            --floor rtc_stun_endpoint=7 \
+            --floor natsim_browser=38 \
+            --floor rtc_stun_endpoint=13 \
             --required-file - <<'REQUIRED'
           rtc_admission:a_registered_client_streaming_provider_refuses_a_provisional_caller
           rtc_admission:a_registered_duplex_provider_refuses_a_provisional_caller
@@ -5231,7 +5231,7 @@ jobs:
             --source tests/wasm_leaf.rs $REPLAYS $LEAF_WITNESSES
           python3 "$CHECK" --label wasm_leader --mode fn \
             --source tests/wasm_leader.rs $LEADER_WITNESSES
-          for suite in wasm_leaf wasm_anchorless wasm_leader; do
+          for suite in wasm_leaf wasm_anchorless wasm_leader wasm_rtc_conservation; do
             cargo test --target wasm32-unknown-unknown --features mock-control-plane \
               --test "$suite" -- --nocapture 2>&1 | tee "/tmp/$suite.log"
             grep -q "test result: ok" "/tmp/$suite.log" || {
@@ -5245,6 +5245,16 @@ jobs:
               wasm_leaf)       floor=16 ;;
               wasm_leader)     floor=27 ;;
               wasm_anchorless) floor=2  ;;
+              # S6-06's leaf half. `leaf/src/rtc.rs` is
+              # `#![cfg(target_arch = "wasm32")]` in its entirety, so
+              # a native test could only re-implement `PeerLink` and
+              # assert the copy — and the claim is precisely "every
+              # production path that destroys a link performs the
+              # discard accounting", which a fake link cannot carry.
+              # This suite is therefore the ONLY witness for that
+              # half, and it first executes here: the author could
+              # compile it for wasm32 but not run it.
+              wasm_rtc_conservation) floor=2 ;;
             esac
             if [ "${ran:-0}" -lt "$floor" ]; then
               echo "::error::$suite ran ${ran:-0} tests, floor is $floor — \
@@ -5252,6 +5262,31 @@ jobs:
               exit 1
             fi
           done
+          # The LIB target, which nothing here ran until S6-02/03/04.
+          #
+          # The loop above passes `--test <name>`, so it reaches only
+          # `leaf/tests/*.rs`. `wasm.rs`'s own `#[cfg(test)]` child
+          # module (`wasm_witnesses.rs`) is a LIB test and therefore
+          # executed nowhere — the attempt-ownership, terminality and
+          # candidate-retention witnesses would have compiled, been
+          # committed, been pinned, and run zero times. That is the
+          # same silent-skip shape as a filter that matches nothing,
+          # which this repository has already paid for twice.
+          #
+          # The floor is the count, not "> 0": these witnesses exist
+          # because a reviewer reproduced the defects they cover, and
+          # losing one quietly is the failure that matters.
+          cargo test --target wasm32-unknown-unknown --features mock-control-plane \
+            --lib -- --nocapture 2>&1 | tee /tmp/wasm_lib.log
+          grep -q "test result: ok" /tmp/wasm_lib.log || {
+            echo "::error::the leaf's wasm32 lib tests did not report a passing result"; exit 1; }
+          lib_ran=$(sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/wasm_lib.log | tail -1)
+          echo "wasm lib: ${lib_ran:-0} passed"
+          if [ "${lib_ran:-0}" -lt 13 ]; then
+            echo "::error::the leaf's wasm32 lib tests ran ${lib_ran:-0}, floor is 13 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
           # The cross_lang replay is the named exit criterion, so
           # assert the witnesses BY NAME rather than trusting the
           # suite's total — or a renamed vector would leave the
@@ -5821,6 +5856,7 @@ jobs:
           demo_the_pair_counter_is_flat_while_the_pair_is_direct
           demo_positions_sustain_60_hz_over_the_direct_path
           demo_announcements_keep_arriving_while_the_counter_is_flat
+          demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "browser demo" --mode literal \
@@ -5841,14 +5877,14 @@ jobs:
           fi
           passes=$(grep -c '^DEMO PASS ' "$log" || true)
           fails=$(grep -c '^DEMO FAIL ' "$log" || true)
-          echo "demo: $passes passed, $fails failed (floor 4)"
+          echo "demo: $passes passed, $fails failed (floor 5)"
           if [ "$fails" -ne 0 ]; then
             grep '^DEMO FAIL ' "$log"
             echo "::error::a demo witness failed"
             exit 1
           fi
-          if [ "$passes" -lt 4 ]; then
-            echo "::error::emitted $passes demo witnesses, floor is 4 — \
+          if [ "$passes" -lt 5 ]; then
+            echo "::error::emitted $passes demo witnesses, floor is 5 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
