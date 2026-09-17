@@ -925,15 +925,37 @@ any verdict a row reached would be about that and nothing else.
 Kyra's Stage 6 review (`KYRA_STAGE6_REVIEW.md`, pinned at
 `9ef5b6a03`) returned eight required repairs, three missing acceptance
 items and five secondary corrections. This section states what each
-became. **Nothing here closes a Stage 5 item**, and the Stage 5
-fourth-repair HOLD remains separate and open.
+became.
 
-**Read this first: the tree moved under the review.** She pinned
-`9ea5bc8`…`9ef5b6a03`; this round lands on top of Stage 5 rounds 4 and
-5, which she has not reviewed. Line numbers in her report no longer
-resolve. Every finding below was located by symbol and re-verified
-against current source before being repaired — none was taken as read
-from a line reference.
+**Status of this round, in the reviewer's own words rather than
+ours:** *repairs implemented; main CI green; natsim and specified
+acceptance/sensitivity evidence incomplete; independent repair
+re-review pending.* It is **not** "all required repairs and E1/E2/E3
+are closed" — implementation plus a green main CI is measured credit,
+and it does not discharge the evidence obligations listed in §11.9.
+
+**The review ledger, corrected.** An earlier draft of this section
+said Stage 5 rounds 4 and 5 were "unreviewed". That is wrong, and it
+understated the open ledger rather than overstating it:
+
+| review | reviewed pin | verdict |
+|---|---|---|
+| Stage 5 fourth repair | `516a45c33` | completed — HOLD |
+| Stage 5 fifth round | `60e120609` | completed — HOLD |
+| Stage 6 original review | `9ef5b6a03` | completed — HOLD |
+
+All three rounds were reviewed and all three returned HOLD. What is
+outstanding is **re-review of the subsequent repairs**, which is a
+different thing from a round nobody read. Carrying only "the Stage 5
+fourth-repair HOLD" is also an incomplete ledger: the fifth-round
+report raised further findings of its own, and they are open too.
+Nothing in this section closes any Stage 5 item.
+
+**The tree moved under the Stage 6 review.** It was pinned at
+`9ef5b6a03`; this round lands on top of Stage 5 rounds 4 and 5, so
+line numbers in that report no longer resolve. Every finding below was
+located by symbol and re-verified against current source before being
+repaired — none was taken as read from a line reference.
 
 ### 11.1 The eight repairs
 
@@ -1028,9 +1050,22 @@ round pins counts rather than presence:
   `leaf/src/rtc.rs` is `#![cfg(target_arch = "wasm32")]` in its
   entirety, so a native test could only re-implement `PeerLink` and
   assert the copy — while the claim under test is *which production
-  paths perform the accounting*, which a fake link cannot carry. Its
-  two assertions had never been observed to hold at the time they were
-  written: the author could compile for wasm32 but not execute.
+  paths perform the accounting*, which a fake link cannot carry.
+
+  **It has since executed.** At `1f688f4b6` the leaf job built the
+  real wasm binary and ran it in headless Chrome: `wasm_rtc_
+  conservation: 2 passed`. The earlier native invocations that ran
+  zero tests are not what is being credited here — that is precisely
+  the silent-skip this round added the pin to prevent. Its status is
+  therefore **positive production-WASM execution obtained; inverse
+  sensitivity not yet established** — the assertions have been
+  observed to hold, and their ability to FAIL has not been
+  demonstrated by mutation. Those are different claims and only the
+  first is now evidence.
+
+  Note it is a separate `--test` binary with its own floor of 2; the
+  `--lib` step added in the same round covers the other thirteen
+  witnesses (`wasm lib: 13 passed` in the same run).
 - **The Firefox leg of the browser matrix does not run on the
   implementation workstation** — the harness refuses to start without
   NSS `certutil` rather than fall back to a root store it never
@@ -1453,3 +1488,43 @@ rests on `stun_endpoint_probe_ok: true` from the RED run, which is
 real measured data and does not depend on the fix. The fix changes
 what the row can *assert* about that reply; it does not change what
 was observed.
+
+
+### 11.9 What this round does NOT discharge
+
+The status line at the head of §11 points here. Each row is an
+obligation that remains after the repairs, stated so it cannot be read
+off as closed by a green main CI.
+
+| # | obligation | state |
+|---|---|---|
+| 1 | **natsim** | `natsim_natted_anchor_publishes_both_mapped_endpoints` red at `1f688f4b6`; probe repaired and NOT re-run. Main CI is 56/56 and does not cover this workflow |
+| 2 | **Q2 — permission-free routed exchange** | an acceptance gap until EXECUTED. Instrumented as `browser_symmetric_symmetric_nomedia` with bidirectional nonce and application-only forwarding evidence, never run. Disclosure is honest; it is not closure |
+| 3 | **S6-06 leaf-half inverse sensitivity** | positive production-WASM execution obtained (`2 passed`, headless Chrome); ability to fail not demonstrated by mutation |
+| 4 | **Independent re-review** | of every repair in this section, against the three completed HOLDs in the ledger above |
+
+Three further notes, because each is a distinction that decides
+whether a later reader does the right thing:
+
+**On the NAT-mapped STUN endpoint (§11.8).** The assertion stays
+intact and the classification stays open until the packet tuples are
+traced for ONE transaction: the client's source, the source the server
+observed, and the address returned. DNAT ordinarily rewrites the
+destination and not the source, so a wrong `XOR-MAPPED-ADDRESS` is not
+by itself a deployment-envelope limitation — SNAT, hairpin routing or
+the probe's own path can each produce it. The source-selection reading
+is well evidenced and is still a reading.
+
+**On the public route accessor.** Its absence is NOT a blocker and
+not a licence to grow the API. Correlated endpoint delivery, routed
+disposition and application-only forwarding already establish the
+path between them. And the tempting shortcut is wrong on its own
+terms: attaching a dialog to an outcome would identify an ATTEMPT, not
+prove its current route. Public surface does not get added to make a
+test simpler to write.
+
+**On what a green main CI means here.** It means the repairs compile,
+the suites pass, and every floor holds at a measured count. It does
+not mean the acceptance legs ran — two of them cannot run on the
+implementation host at all — and it does not mean any witness has
+demonstrated that it can fail.
