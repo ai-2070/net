@@ -3192,6 +3192,31 @@ The same operation is available to a full Net node and to a serverless
 function. Serverless functions need neither a mesh load balancer nor a live
 provider-selection loop of their own.
 
+### Packaging: `@net-mesh/serverless`
+
+The integration targets a **separate lightweight TypeScript npm package,
+`@net-mesh/serverless`**, distinct from `@net-mesh/browser` and the native
+SDK. This is a proposed package, not a claim of a published artifact.
+
+Its scope is capability registration/update/withdrawal, authorized
+organization-scoped invocation, and provider-handler integration that
+authenticates adapter-delivered requests. It handles credentials, deadlines,
+cancellation and typed outcomes without implying that cancellation rolls back
+an already executed operation.
+
+The package must not require native bindings, browser DOM APIs, a WebRTC
+stack, a background mesh runtime or a persistent connection. Share suitable
+protocol/type code internally without depending on the full browser or native
+SDK. Platform-specific handler wrappers may use subpath exports where needed;
+exact exports and initial platform support belong to the follow-on brief,
+not an upfront promise of support for every serverless runtime.
+
+The Net-connected adapter remains a separately deployed component. Installing
+the npm package does not start an adapter or embed a full Net node inside the
+function. Follow-on package acceptance must include a packed-artifact install,
+strict TypeScript consumer checks, and real registration/invocation through
+the supported platform adapter, not only source-workspace tests.
+
 ### Minimal integration and traffic paths
 
 Use an existing Net-connected adapter with authenticated HTTPS operations
