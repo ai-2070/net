@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { connect, type BrowserNode } from '../src/node.js';
+import { connect, parseAttemptStatus, peerIdHex, type BrowserNode } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -240,14 +240,37 @@ describe('BrowserNode', () => {
     await expect(node.query('transcribe')).resolves.toEqual([
       {
         nodeId: '18446744073709551615',
+        peerIdHex: 'ffffffffffffffff',
         entityId: 'ab12',
         capabilities: ['transcribe'],
         rtcAddr: '203.0.113.9:4433',
         noisePubkey: 'cd34',
         version: '9007199254740993',
       },
-      { nodeId: '7', entityId: null, capabilities: [], rtcAddr: null, noisePubkey: null, version: null },
+      {
+        nodeId: '7',
+        peerIdHex: '0000000000000007',
+        entityId: null,
+        capabilities: [],
+        rtcAddr: null,
+        noisePubkey: null,
+        version: null,
+      },
     ]);
+  });
+
+  // A descriptor carries the DECIMAL id and the peer methods take
+  // HEX, and `7` is a valid spelling in both — which is the whole
+  // reason the two are carried side by side rather than one of them
+  // being quietly re-spelled into the other.
+  it('never lets the decimal node id pass as the hex peer id', async () => {
+    const inner = new FakeNode({
+      queryJson: '[{"node_id":"1000000000000007","capabilities":[],"rtc_addr":null}]',
+    });
+    const node = await connected(inner);
+    const [descriptor] = await node.query('transcribe');
+    expect(descriptor?.peerIdHex).toBe('00038d7ea4c68007');
+    expect(descriptor?.peerIdHex).toHaveLength(16);
   });
 
   it('exposes the anchor id and the leaf counters with u64s intact', async () => {
@@ -471,6 +494,148 @@ describe('BrowserNode', () => {
     expect(inner.closed).toBe(true);
     inner.emit('{"type":"disconnected","reason":"after close"}');
     expect(seen).toEqual([]);
+  });
+});
+
+/**
+ * The §9 drive loops, as the page observes them: which dialog a
+ * result is attributed to, and which readings end a wait.
+ *
+ * The exchange itself is the browser matrix's. What is reachable here
+ * is every decision the wrapper takes on the leaf's readings, and
+ * those decisions are where a superseded caller used to be told its
+ * own attempt had connected.
+ */
+describe('peer attempts', () => {
+  const PEER = 'beefcafe00000002';
+  const OLD = '00000000000000d1';
+  const NEW = '00000000000000d2';
+
+  /** One `peer_candidate` reading, at the leaf's own JSON shape. */
+  function reading(fields: Record<string, unknown>): string {
+    return JSON.stringify({
+      dialog: OLD,
+      state: 'gathering',
+      sent: 0,
+      applied: 0,
+      answered: false,
+      direct: false,
+      remainingMs: '9000',
+      ...fields,
+    });
+  }
+
+  // The leaf handshakes the attempt that is LIVE; the caller holds
+  // the one it was given. Reporting `direct` with the caller's dialog
+  // on any success told a superseded caller its own attempt had
+  // connected, while the session that installed belonged to the
+  // attempt that replaced it.
+  it('does not report the caller`s replaced dialog as the one that connected', async () => {
+    const inner = new FakeNode({ peerHandshakeDialog: NEW });
+    const node = await connected(inner);
+    await expect(node.handshakePeer(PEER, OLD)).resolves.toEqual({
+      type: 'superseded',
+      peer: PEER,
+      dialog: OLD,
+      liveDialog: NEW,
+    });
+  });
+
+  // A distinct schedule from the one above, and the one the sequential
+  // two-offer witness cannot reach: the replacement happens while the
+  // handshake is PARKED, so the caller's dialog was live when it
+  // asked and is not when it is answered.
+  it('reports a replacement that happened while the handshake was parked', async () => {
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    let complete!: (dialog: string) => void;
+    inner.peer_handshake = () =>
+      new Promise<string>((resolve) => {
+        complete = resolve;
+      });
+    const parked = node.handshakePeer(PEER, OLD);
+    complete(NEW);
+    await expect(withinDeadline(parked, 250, 'a parked handshakePeer')).resolves.toEqual({
+      type: 'superseded',
+      peer: PEER,
+      dialog: OLD,
+      liveDialog: NEW,
+    });
+  });
+
+  it('reports the dialog it handshook when nothing replaced it', async () => {
+    const inner = new FakeNode({ peerOfferDialog: OLD });
+    const node = await connected(inner);
+    await expect(node.handshakePeer(PEER, OLD)).resolves.toEqual({
+      type: 'direct',
+      peer: PEER,
+      dialog: OLD,
+    });
+    expect(inner.peerHandshakes).toEqual([PEER]);
+  });
+
+  // The answerer waits for `direct`, and a channel that opened with
+  // no session satisfies neither `direct` nor the two ICE terminals.
+  // The leaf's terminal transition reports `failed`, and this is the
+  // wait that has to end on it — the reading repeats, so a loop that
+  // does not recognise it never settles at all.
+  it('ends the answerer`s wait on the leaf`s terminal reading', async () => {
+    const inner = new FakeNode({
+      peerOfferDialog: OLD,
+      peerCandidateJson: [
+        reading({ state: 'open', remainingMs: '0' }),
+        reading({ state: 'failed', remainingMs: '0' }),
+      ],
+    });
+    const node = await connected(inner);
+    await expect(withinDeadline(node.acceptPeer(PEER), 500, 'acceptPeer')).resolves.toEqual({
+      type: 'handshakeFailed',
+      peer: PEER,
+      dialog: OLD,
+      detail: 'the attempt reached its terminal transition without installing a session',
+    });
+  });
+
+  // The leaf warns a refused candidate to the console AND reports it.
+  // The parser used to drop the field, which left the console line as
+  // the only copy — unreadable by a page, a witness or a diagnostic.
+  it('hands the engine`s candidate refusal to the page as a value', async () => {
+    const inner = new FakeNode({
+      peerCandidateJson: [
+        reading({ candidateError: 'InvalidStateError: The remote description was null' }),
+      ],
+    });
+    const node = await connected(inner);
+    const status = await node.peerAttempt(PEER);
+    expect(status.candidateError).toBe('InvalidStateError: The remote description was null');
+    expect(status.state).toBe('gathering');
+  });
+
+  it('reports no candidate error when the engine accepted every line', async () => {
+    const inner = new FakeNode({ peerCandidateJson: [reading({ applied: 2 })] });
+    const node = await connected(inner);
+    await expect(node.peerAttempt(PEER)).resolves.toMatchObject({
+      applied: 2,
+      candidateError: null,
+    });
+  });
+
+  // The state union grew by one term; it is still validated rather
+  // than cast, or a boundary that changed shape would spin a drive
+  // loop until the leaf's own deadline.
+  it('refuses a reading whose state it does not know', () => {
+    expect(() => parseAttemptStatus(reading({ state: 'connecting' }))).toThrow(TypeError);
+  });
+
+  // A descriptor's decimal id and a peer method's hex id are
+  // different spellings, so the conversion is explicit in both
+  // directions: it converts decimal, and it refuses anything that is
+  // already hex rather than guessing which it was handed.
+  it('converts a decimal node id and refuses a hex one', () => {
+    expect(peerIdHex('123')).toBe('000000000000007b');
+    expect(() => peerIdHex('00366d403ce19dac')).toThrow(TypeError);
+    expect(() => peerIdHex('0x7b')).toThrow(TypeError);
+    expect(() => peerIdHex('18446744073709551616')).toThrow(TypeError);
   });
 });
 

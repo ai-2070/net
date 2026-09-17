@@ -23,6 +23,7 @@ export {
   parseDescriptors,
   parseRetryReport,
   parseRtcStats,
+  peerIdHex,
   refineIceFailure,
 } from './node.js';
 export type {

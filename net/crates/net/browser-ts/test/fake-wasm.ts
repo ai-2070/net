@@ -100,6 +100,13 @@ export interface FakeNodeBehaviour {
   peerOfferError?: unknown;
   peerAcceptOfferError?: unknown;
   peerHandshakeError?: unknown;
+  /**
+   * The dialog `peer_handshake` resolves to — the attempt the leaf
+   * actually ran the handshake for. Defaults to
+   * `peerOfferDialog`; a test sets it apart to model an attempt
+   * that was replaced while the caller held the old id.
+   */
+  peerHandshakeDialog?: string;
   rtcStatsJson?: string;
   retryReportJson?: string;
   armNetworkRetryError?: unknown;
@@ -228,9 +235,12 @@ export class FakeNode implements LeafWasmNode {
     return readings[Math.min(this.peerCandidates.length - 1, readings.length - 1)] ?? last;
   }
 
-  async peer_handshake(peer_hex: string): Promise<void> {
+  async peer_handshake(peer_hex: string): Promise<string> {
     if (this.behaviour.peerHandshakeError !== undefined) throw this.behaviour.peerHandshakeError;
     this.peerHandshakes.push(peer_hex);
+    return (
+      this.behaviour.peerHandshakeDialog ?? this.behaviour.peerOfferDialog ?? '00000000000000d1'
+    );
   }
 
   async enroll(): Promise<void> {

@@ -204,23 +204,32 @@ export interface LeafWasmNode {
   /**
    * Service `peer`'s attempt once: apply its answer, trickle local
    * candidates as signed envelopes, apply the ones it sent, and
-   * evaluate the ICE deadline.
+   * evaluate the attempt's deadline.
    *
    * Resolves to JSON: `{"dialog","state","sent","applied","answered",
-   * "remainingMs"}` where `state` is `gathering | open | iceTimeout |
-   * udpBlocked`. `dialog` is the attempt CURRENTLY live for the peer,
-   * so a caller whose dialog id no longer matches was superseded.
+   * "direct","remainingMs"}`, plus `"candidateError"` when the engine
+   * refused a trickled line. `state` is `gathering | open |
+   * iceTimeout | udpBlocked | failed`; `failed` is the attempt's
+   * terminal transition for a channel that opened and a session that
+   * never installed. `dialog` is the attempt CURRENTLY live for the
+   * peer, so a caller whose dialog id no longer matches was
+   * superseded.
    */
   peer_candidate(peer_hex: string): Promise<string>;
   /**
    * Run the Noise handshake with `peer` over the direct DataChannel
-   * (§9 step 4), in the offerer's role.
+   * (§9 step 4), in the offerer's role. Resolves to the dialog id it
+   * ran for, 16 lowercase hex digits.
    *
    * **A peer id and nothing else.** A page that could supply a Noise
    * key could supply any key, so the peer's static key comes from its
    * signature-verified announcement and the PSK from the credential.
+   *
+   * The resolved dialog is what makes a stale caller's success
+   * legible: it is the attempt the handshake actually ran for, not
+   * the one the caller was holding.
    */
-  peer_handshake(peer_hex: string): Promise<void>;
+  peer_handshake(peer_hex: string): Promise<string>;
   /** Every counter as JSON; `u64`s are decimal strings. */
   counters_json(): string;
   /**

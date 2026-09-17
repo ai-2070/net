@@ -164,6 +164,117 @@ enum IceTerm {
     UdpBlocked,
 }
 
+/// Exactly which attempt a piece of asynchronous work belongs to.
+///
+/// **A peer is not an owner.** Every step of §9 crosses at least one
+/// await — `create_offer`, a STUN probe, the Noise wait — and the
+/// page may supersede an attempt or close the node while one is
+/// parked. Work that resumed and then looked the peer up by id found
+/// whatever attempt held the peer *then*: a rejected `create_offer`
+/// charged its successor a terminal term, an expiry settled a
+/// successor because the settlement carried no dialog, and a
+/// predecessor's `Reject` removed an attempt it was never addressed
+/// to. So the dialog is CARRIED, not re-read, and compared before
+/// any mutation, settlement, removal, installation or published
+/// result.
+///
+/// Internal, and deliberately so: the four `#[wasm_bindgen]` peer
+/// methods still take a peer id and nothing else. They resolve the
+/// owner once ([`LeafNode::current_attempt`]) and carry it from
+/// there, so this is an ownership requirement rather than a new
+/// parameter on the page's surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    peer: NodeId,
+    dialog: DialogId,
+}
+
+/// Who may install the session a pending Noise handshake produces.
+///
+/// `LeafNode::is_handshaking` is keyed by peer, so message 2 for a
+/// handshake whose owner had expired, been superseded or been closed
+/// used to install a session anyway: after `iceTimeout`, after
+/// `handshakeFailed`, and — in the routed case, whose failure path
+/// cleared only the relay addressing — with neither a direct
+/// transport nor a relay entry left to reach the peer on. The owner
+/// is recorded when the handshake begins, revoked with whatever
+/// owned it, and [`Inner::on_handshake`] completes nothing it cannot
+/// attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeOwner {
+    /// §9 step 2's routed establishment, numbered so a superseded
+    /// call's answer cannot install for a later one.
+    Routed(u64),
+    /// §9 step 4's direct handshake, owned by exactly one attempt.
+    Direct(Attempt),
+}
+
+/// How [`LeafNode::ensure_relayed_session`]'s wait ended.
+enum RoutedWait {
+    Installed,
+    Waiting,
+    /// The node was closed, or a later establishment took the
+    /// handshake over.
+    Retired,
+}
+
+/// How [`LeafNode::wait_for_direct_session`] ended.
+enum DirectWait {
+    Installed,
+    Expired,
+    /// The attempt stopped being the live one, or another terminal
+    /// owner settled it first.
+    Retired,
+}
+
+/// What [`LeafNode::service_peer`] took under the borrow.
+enum Serviced {
+    /// The attempt has already made its terminal transition: the
+    /// state it reports, and nothing to drive.
+    Ended(&'static str),
+    Live {
+        role: PeerRole,
+        deadline: crate::clock::Deadline,
+        remote_ready: bool,
+        outgoing: Vec<IceCandidate>,
+        incoming: Vec<(SignalKind, Vec<u8>)>,
+        transport: RtcLeafTransport,
+    },
+}
+
+/// A verified offer waiting for the page to answer it, and what
+/// arrived under it in the meantime.
+struct PendingOffer {
+    /// The dialog the offerer minted and signed the offer with.
+    dialog: DialogId,
+    /// The offer SDP, exactly as it was signed.
+    sdp: Vec<u8>,
+    /// The peer's trickled candidates for THIS dialog, held until
+    /// `peer_accept_offer` gives them a remote description to be
+    /// usable against.
+    ///
+    /// The offerer starts gathering at `setLocalDescription` and
+    /// trickles immediately, so its first candidates — the host ones
+    /// a same-network pair actually connects on — routinely arrive
+    /// while the page is still deciding whether to accept. There was
+    /// no live attempt to file them on, so they were dropped, and the
+    /// answerer then had nothing to form a pair with but whatever
+    /// arrived after it answered.
+    early: VecDeque<Vec<u8>>,
+}
+
+/// How many trickled candidates one dialog may hold for want of a
+/// usable remote description.
+///
+/// Retention has to be bounded. The payloads arrive inside verified
+/// envelopes, so this is not an attacker's queue, but a peer that
+/// gathers a large relay set while a page never answers must not
+/// grow it without limit. A browser offers well under this many per
+/// connection: the number is a ceiling, not a working size. The
+/// EARLIEST arrivals are the ones kept, because host candidates come
+/// first and are what the interval this exists for is about.
+const HELD_CANDIDATES: usize = 32;
+
 /// One browser ↔ browser attempt, as the page drives it.
 ///
 /// The page names peers; this holds everything else, which is the
@@ -188,11 +299,65 @@ struct PeerDialog {
     /// Local candidates gathered for this peer, waiting to be signed
     /// and sent.
     local: VecDeque<IceCandidate>,
+    /// The peer's candidates that arrived before this attempt had a
+    /// usable remote description.
+    ///
+    /// An `Answer` in poll N+1 cannot help a `Candidate` drained in
+    /// poll N: `addIceCandidate` with no remote description is an
+    /// `InvalidStateError` in Chromium and the line is gone. Same
+    /// batch is handled by applying answers first; ACROSS batches the
+    /// candidate has to be held, and it is held here — under the
+    /// dialog that authorized it, bounded by [`HELD_CANDIDATES`],
+    /// until [`PeerDialog::remote_ready`].
+    deferred: VecDeque<Vec<u8>>,
+    /// Whether the remote description this attempt needs is in place:
+    /// the answerer's when `accept_offer` returned, the offerer's
+    /// when its peer's `Answer` was applied.
+    remote_ready: bool,
+    /// The connection this attempt negotiates on, once it exists.
+    ///
+    /// Candidate provenance. The transport gathers into ONE queue
+    /// keyed by peer, and the lines in it carry no connection or
+    /// dialog of their own, so a predecessor's addresses could be
+    /// filed under a successor's dialog and trickled as its own. A
+    /// candidate is filed only while this is the transport's live
+    /// connection for the peer — see [`PeerDialog::gathered`].
+    connection: Option<web_sys::RtcPeerConnection>,
     /// When this attempt gives up on ICE.
     deadline: crate::clock::Deadline,
-    /// Whether one of the four terminal terms has already counted
-    /// for this attempt.
-    settled: bool,
+    /// This attempt's ONE terminal transition: the term it counted,
+    /// and the state a reading reports for it.
+    ///
+    /// It spans ICE, Noise AND installation, which is what makes it
+    /// terminal. A counter flag was not: it left the attempt's
+    /// channel open, its pending handshake installable, and a page
+    /// polling an attempt that had already ended.
+    terminal: Option<(IceTerm, &'static str)>,
+}
+
+impl PeerDialog {
+    /// Did THIS attempt's connection gather what the transport just
+    /// handed over?
+    ///
+    /// `None` on this side is the interval between registering the
+    /// dialog and `create_offer`/`accept_offer` returning. The
+    /// registration is deliberately first — the browser starts
+    /// gathering inside those calls, and a candidate with no dialog
+    /// to be filed on is lost — and the interval is sound: both calls
+    /// install the new `PeerLink` BEFORE their first await, which
+    /// drops the predecessor's link and closes its connection in the
+    /// same synchronous turn that registered this dialog, and the
+    /// registration harvests the queue first. So nothing a
+    /// predecessor gathered survives into it.
+    fn gathered(&self, live: Option<&web_sys::RtcPeerConnection>) -> bool {
+        match (&self.connection, live) {
+            (Some(mine), Some(live)) => js_sys::Object::is(mine.as_ref(), live.as_ref()),
+            (None, Some(_)) => true,
+            // No connection for this peer at all: the line belongs to
+            // one that has been closed.
+            (_, None) => false,
+        }
+    }
 }
 
 /// One filed re-attempt trigger: where it came from, and which peer
@@ -202,6 +367,15 @@ struct PeerDialog {
 /// belongs to every pair this leaf owns a repair for rather than to
 /// one. `Some(peer)` is that peer's ICE giving up.
 type RetryTrigger = (crate::retry::TriggerSource, Option<NodeId>);
+
+/// One window listener this node installed: the event it is
+/// registered for, and the closure that is registered.
+///
+/// The event name is held because detaching needs it —
+/// `removeEventListener` takes the same pair `addEventListener` was
+/// given, and a closure kept alive without it can only be dropped,
+/// which does not detach anything.
+type RetryListener = (&'static str, Closure<dyn FnMut(JsValue)>);
 
 /// The shared interior. One per node; the transport's inbound
 /// closure holds a `Weak` to it, so a closed node's callbacks cannot
@@ -245,9 +419,24 @@ struct Inner {
     /// in could pass a different one. One entry per peer — a peer
     /// that re-offers supersedes its own previous offer, which is
     /// also what a re-offer means on the wire.
-    offers: HashMap<NodeId, (DialogId, Vec<u8>)>,
+    offers: HashMap<NodeId, PendingOffer>,
     /// Live browser ↔ browser attempts, keyed by peer (§9).
     peers: HashMap<NodeId, PeerDialog>,
+    /// Who owns each pending Noise handshake, and may therefore
+    /// install what it produces. See [`HandshakeOwner`].
+    handshakes: HashMap<NodeId, HandshakeOwner>,
+    /// Which attempt admitted the inbound establishment a peer is
+    /// currently proving, keyed by that peer.
+    ///
+    /// The responder's half of [`HandshakeOwner`], and separate from
+    /// it because the two are different roles for the same peer: this
+    /// leaf can be waiting on its own message 2 and holding an
+    /// admission for the peer's message 1 at the same time. Recorded
+    /// by [`Inner::on_handshake`] and consumed by [`Inner::pump`]
+    /// when `take_verified_admissions` reports the proof verified.
+    admissions: HashMap<NodeId, Attempt>,
+    /// The number the next routed establishment is identified by.
+    next_routed: u64,
     /// Local candidates gathered for the **bootstrap** dialog,
     /// waiting for [`ControlPlane::trickle`].
     ///
@@ -295,17 +484,12 @@ struct Inner {
     /// Both trigger sources reach it and nothing else decides: see
     /// [`crate::retry::RetryPolicy`].
     retry: crate::retry::RetryPolicy,
-    /// Whether the window listeners are installed.
-    ///
-    /// Opt-in, and the page's call — see
-    /// [`LeafNode::arm_network_retry`]. Idempotent: a second arming
-    /// is a no-op, not a second listener, because two listeners for
-    /// one `online` event are two triggers for one network change
-    /// and the whole row is about that not becoming two attempts.
-    retry_armed: bool,
-    /// The `online`/`offline` listeners, kept alive for the node's
-    /// lifetime. Dropping a closure would detach the callback.
-    retry_listeners: Vec<Closure<dyn FnMut(JsValue)>>,
+    /// The window listeners, kept alive for the node's lifetime:
+    /// dropping a closure invalidates the callback the window still
+    /// holds. Kept alive is not the same as attached, which is why
+    /// each one is stored with the event it was registered for and
+    /// detached by [`Inner::unregister_retry_listeners`].
+    retry_listeners: Vec<RetryListener>,
     /// Triggers filed and not yet decided.
     ///
     /// **The single funnel.** The `online` listener runs inside a JS
@@ -316,16 +500,6 @@ struct Inner {
     /// A `None` peer is an `online` event, which belongs to every
     /// peer this leaf owns a re-attempt for rather than to one.
     retry_triggers: Rc<RefCell<VecDeque<RetryTrigger>>>,
-    /// Peers this leaf took a DIRECT session with **as the
-    /// offerer**, and therefore owns the re-attempt for.
-    ///
-    /// The answerer must not re-offer: §9 step 4 gives the offerer
-    /// the initiating role, and two leaves re-offering each other
-    /// on one network change is two attempts per pair plus a
-    /// supersession race. So the side that offered owns the repair
-    /// and the other side answers it, exactly as it answered the
-    /// first one.
-    direct_offerer: std::collections::HashSet<NodeId>,
     /// The last re-attempt's disposition, for `retryReport()`.
     retry_last: Option<&'static str>,
 }
@@ -422,24 +596,58 @@ impl Inner {
     /// displace a live session, let alone downgrade a direct one to
     /// a relayed one. A *direct* message 1 may replace, because it
     /// arrived on a DataChannel this leaf negotiated with that peer
-    /// inside an attempt it is driving; that is §9 step 4 and it
-    /// goes through `LeafNode::install_session`'s
-    /// unchanged replacement fence.
+    /// inside an attempt it is driving; that is §9 step 4.
+    ///
+    /// **Neither one installs a session here.** Since S6-01 the
+    /// responder half parks the negotiated keys in a bounded
+    /// provisional admission and `LeafNode::accept_handshake`
+    /// installs nothing: the domain PSK and a claimed id in a
+    /// prologue do not authenticate an individual, so the session
+    /// appears only when the initiator's signed establishment proof
+    /// verifies against the entity key in its verified
+    /// announcement. The promotion surfaces in
+    /// [`Inner::pump`], and the attempt that admitted the
+    /// establishment is recorded here
+    /// ([`Inner::admissions`]) so the promotion is attributed to
+    /// THAT attempt rather than to whichever one holds the peer by
+    /// the time it lands.
     fn on_handshake(&mut self, from: NodeId, packet: &[u8], relayed: bool) {
         if self.node.is_handshaking(from) {
+            // **Whose handshake is this?** `is_handshaking` is keyed
+            // by peer, and an answer that arrives after its owner
+            // expired, was superseded or was closed must not install
+            // a session under the identity it names. The anchor's
+            // bootstrap handshake is `connect`'s own, owned by the
+            // future running it.
+            if from != self.anchor && !self.handshake_may_install(from) {
+                console_error(&format!(
+                    "net-mesh-leaf: handshake answer from {from:#x} arrived after the \
+                     operation that began it was retired"
+                ));
+                return;
+            }
             if let Err(e) = self.node.complete_handshake(from, packet) {
                 console_error(&format!("net-mesh-leaf: handshake: {e}"));
-            } else if from != self.anchor && self.transport.is_open(from) {
+            } else if let Some(HandshakeOwner::Direct(attempt)) = self.handshakes.remove(&from) {
                 // An OPEN channel to this peer is what makes the
                 // session that just installed the DIRECT one:
                 // `peer_handshake` refuses to begin unless the
                 // channel is open, so nothing else can reach here
-                // with one. Deliberately not `!relayed`: which path
-                // message 2 happened to arrive on is the answerer's
-                // addressing detail, and reading it here made a
-                // direct session look relayed to the side that
-                // initiated it.
-                self.direct_installed(from);
+                // with one. Deliberately not `!relayed`: which
+                // path message 2 happened to arrive on is the
+                // answerer's addressing detail, and reading it
+                // here made a direct session look relayed to the
+                // side that initiated it.
+                //
+                // Attributed to the attempt that BEGAN this
+                // handshake, which is the only attempt whose channel
+                // message 2 can have answered. A routed
+                // establishment's completion owns no ICE term: it is
+                // §9 step 2, and the attempt that follows it settles
+                // its own.
+                if self.transport.is_open(from) {
+                    self.direct_installed(attempt);
+                }
             }
             return;
         }
@@ -452,8 +660,13 @@ impl Inner {
                 !self.node.has_session(from)
             } else {
                 // Replace, but only inside an attempt this leaf is
-                // driving.
-                self.peers.contains_key(&from)
+                // driving AND that has not already ended. A direct
+                // message 1 arriving after the attempt's terminal
+                // transition is a late installation into an attempt
+                // whose channel is closed and whose term is counted.
+                self.peers
+                    .get(&from)
+                    .is_some_and(|dialog| dialog.terminal.is_none())
             };
         if !admitted {
             console_error(&format!(
@@ -467,7 +680,9 @@ impl Inner {
             Err(e) => {
                 console_error(&format!("net-mesh-leaf: responder handshake: {e}"));
                 if !relayed {
-                    self.settle(from, IceTerm::Failed);
+                    if let Some(attempt) = self.attempt_of(from) {
+                        self.settle(attempt, IceTerm::Failed, "failed");
+                    }
                 }
                 return;
             }
@@ -480,56 +695,90 @@ impl Inner {
         } else {
             // **Message 2 goes back on the channel message 1 arrived
             // on, and the relay is dropped BEFORE the send.** Both
-            // halves of that were a real bug: this side installs the
-            // direct session here, and a relay entry still in place
-            // sent its answer back through the anchor — so the
+            // halves of that were a real bug: a relay entry still in
+            // place sent this answer back through the anchor — so the
             // initiator completed its handshake on a RELAYED packet,
             // never saw a direct arrival, and sat waiting for its
-            // own relay entry to clear until the deadline. The pair
-            // is direct from this moment; its addressing has to say
-            // so before anything else leaves.
-            self.direct_installed(from);
+            // own relay entry to clear until the deadline. The pair's
+            // addressing has to say it is direct before anything else
+            // leaves.
+            //
+            // **Addressing only.** No session exists yet (the
+            // provisional admission above is not one), so there is
+            // nothing to attribute and reporting `direct` here is
+            // exactly what the establishment ruling forbids. What is
+            // recorded instead is the OWNER of the admission: the
+            // attempt whose channel this message 1 arrived on, which
+            // `pump` settles if and when the proof verifies.
+            self.node.clear_peer_relay(from);
+            if let Some(attempt) = self.attempt_of(from) {
+                self.admissions.insert(from, attempt);
+            }
         }
         let out = self.node.route_outbound(from, msg2);
         if let Err(e) = self.transport.send(out.peer, out.packet) {
             console_error(&format!("net-mesh-leaf: responder message 2: {e}"));
             if !relayed {
-                self.settle(from, IceTerm::Failed);
+                if let Some(attempt) = self.attempt_of(from) {
+                    self.settle(attempt, IceTerm::Failed, "failed");
+                }
             }
         }
     }
 
-    /// A direct session with `peer` is installed: stop relaying for
-    /// it, and count the attempt.
+    /// `attempt`'s direct session is installed: stop relaying for
+    /// its peer, and count the attempt.
     ///
-    /// §9 step 4 from the addressing side. The session replacement
-    /// already happened inside
-    /// `LeafNode::install_session` — the Stage 3/4a
-    /// fence, untouched — and this is the part that has to follow
+    /// §9 step 4 from the addressing side. The session installation
+    /// itself is the node's — `LeafNode::install_session` behind the
+    /// establishment proof — and this is the part that has to follow
     /// it: a relay entry left behind would keep wrapping packets for
     /// a pair that now has its own channel.
-    fn direct_installed(&mut self, peer: NodeId) {
+    ///
+    /// Takes the attempt rather than the peer. `Direct` is the one
+    /// term that reports success, and a success charged to whichever
+    /// dialog happens to hold the peer is a success charged to an
+    /// attempt that never negotiated the channel it is credited with.
+    fn direct_installed(&mut self, attempt: Attempt) {
+        let peer = attempt.peer;
         self.node.clear_peer_relay(peer);
-        // The re-attempt owner's eligibility set, recorded here
-        // because this is the one place a direct session is known to
-        // be installed AND the role that installed it is still
-        // readable. The offerer owns the repair (see
-        // [`Inner::direct_offerer`]); the answerer records nothing
-        // and re-offers nothing.
-        if self.peers.get(&peer).map(|d| d.role) == Some(PeerRole::Offerer) {
-            self.direct_offerer.insert(peer);
-        }
-        self.settle(peer, IceTerm::Direct);
+        // **The role this leaf installed the pair in, registered in
+        // BOTH directions.** The offerer owns the repair (§9 step 4
+        // gives it the initiating role); the answerer's install
+        // REVOKES that ownership, which is the half that was missing
+        // — an insert-only set records history, and history is not a
+        // role, so `A→B` then `B→A` left both ends eligible to
+        // initiate and per-node coalescing cannot resolve two owners
+        // of one pair.
+        //
+        // The role comes from the dialog this ATTEMPT names, not from
+        // a lookup by peer: they are the same dialog here — `settle`
+        // below refuses any other — and a bare peer lookup would be
+        // the attempt-ownership defect reappearing inside the
+        // ownership fix. An attempt with no readable dialog maps to
+        // `Answerer` deliberately: an endpoint that cannot show it is
+        // the current offerer must not initiate repair, because the
+        // failure mode of guessing yes is two endpoints offering.
+        let role = match self
+            .peers
+            .get(&peer)
+            .filter(|dialog| dialog.dialog == attempt.dialog)
+            .map(|dialog| dialog.role)
+        {
+            Some(PeerRole::Offerer) => crate::retry::InstalledRole::Offerer,
+            _ => crate::retry::InstalledRole::Answerer,
+        };
+        self.retry.note_installed_role(peer, role);
+        self.settle(attempt, IceTerm::Direct, "open");
     }
 
-    /// Is `peer`'s direct path — one this leaf offered — not
-    /// carrying traffic?
+    /// Is `peer`'s direct path not carrying traffic?
     ///
     /// The only reading that makes a re-attempt meaningful, and the
     /// `interrupted` argument [`crate::retry::RetryPolicy::note`]
-    /// takes. Two facts, both required: this leaf took the pair
-    /// direct as the offerer, and the direct path is not usable
-    /// right now.
+    /// takes. Whether this leaf OWNS the repair is the policy's
+    /// question now; this stays the caller's, because only this
+    /// module can see a session.
     ///
     /// **Three conditions, not two.** The first version read only
     /// the session — a session exists and no relay entry stands for
@@ -546,12 +795,39 @@ impl Inner {
     /// which holds no relay entry is healthy and is not
     /// re-attempted, however many network changes arrive.
     fn direct_interrupted(&self, peer: NodeId) -> bool {
-        if !self.direct_offerer.contains(&peer) {
-            return false;
-        }
         !(self.node.has_session(peer)
             && self.node.peer_relay(peer).is_none()
             && self.transport.is_open(peer))
+    }
+
+    /// The effective ICE server list for a connection with `peer`,
+    /// checked against THAT peer's own announced endpoint.
+    ///
+    /// Every `RTCPeerConnection` this leaf builds after the bootstrap
+    /// one reused the list `connect` validated, and validation is
+    /// against a PEER: an entry that is a legitimate STUN server for
+    /// the anchor connection is a self-referential one for a
+    /// connection with the node that serves it. So the check runs
+    /// again here, per connection, against the endpoint this
+    /// particular peer's verified announcement published.
+    ///
+    /// A browser peer publishes none, and
+    /// [`crate::bootstrap::check_ice_servers_against_peer`] answers
+    /// `Ok(())` for that — which is exactly the case that must NOT be
+    /// refused: an anchor may serve STUN to a browser ↔ browser pair
+    /// it is not a party to. `None` is passed, never a placeholder.
+    /// An explicitly empty list has nothing to compare and stays
+    /// empty.
+    fn ice_servers_for(&self, peer: NodeId) -> Result<Vec<IceServer>, LeafError> {
+        crate::bootstrap::check_ice_servers_against_peer(
+            self.ice_servers
+                .iter()
+                .flat_map(|server| server.urls.iter().map(String::as_str)),
+            self.node
+                .announcement_for(peer)
+                .and_then(|announcement| announcement.rtc_addr.as_deref()),
+        )?;
+        Ok(self.ice_servers.clone())
     }
 
     /// Drain the transport's ICE `disconnected` → `failed`
@@ -575,6 +851,27 @@ impl Inner {
             return;
         }
         self.deliver();
+        // **A responder attributes an inbound establishment only
+        // once the initiator's signed proof verified** (S6-01). An
+        // open channel makes it the direct pair; a routed promotion
+        // has no channel of its own and keeps its relayed
+        // attribution.
+        //
+        // The peer is what the node hands back, and the peer is not
+        // an owner: the attempt credited is the one that ADMITTED
+        // this establishment, recorded when its message 1 arrived,
+        // and it is credited only if it is still live and not
+        // already terminal. A lookup by peer here would charge a
+        // successor with a predecessor's establishment, which is the
+        // defect this whole ownership pass exists to remove.
+        for peer in self.node.take_verified_admissions() {
+            let Some(attempt) = self.admissions.remove(&peer) else {
+                continue;
+            };
+            if peer != self.anchor && self.active(attempt) && self.transport.is_open(peer) {
+                self.direct_installed(attempt);
+            }
+        }
         self.node.tick(clock::now());
         self.flush();
     }
@@ -625,19 +922,54 @@ impl Inner {
     /// leaf is not driving is not silently adopted.
     fn file_signal(&mut self, envelope: &crate::control_plane::SignalEnvelope) {
         if envelope.kind == SignalKind::Offer {
-            self.offers
-                .insert(envelope.from, (envelope.dialog, envelope.payload.clone()));
+            self.offers.insert(
+                envelope.from,
+                PendingOffer {
+                    dialog: envelope.dialog,
+                    sdp: envelope.payload.clone(),
+                    early: VecDeque::new(),
+                },
+            );
             return;
         }
-        let Some(dialog) = self.peers.get_mut(&envelope.from) else {
+        if let Some(dialog) = self.peers.get_mut(&envelope.from) {
+            if envelope.dialog == dialog.dialog {
+                dialog
+                    .inbox
+                    .push_back((envelope.kind, envelope.payload.clone()));
+            }
+            return;
+        }
+        // No live attempt — and exactly one verified envelope still
+        // belongs somewhere: a `Candidate` for an offer this leaf
+        // holds and the page has not answered yet. The offerer
+        // trickles from `setLocalDescription`, so its first
+        // candidates routinely arrive inside that interval; dropped
+        // for want of a `peers[from]`, they were the host addresses
+        // the pair would have connected on. Held under the dialog the
+        // OFFER was signed with — an envelope naming any other dialog
+        // is not adopted — and bounded.
+        if envelope.kind != SignalKind::Candidate {
+            return;
+        }
+        let Some(pending) = self.offers.get_mut(&envelope.from) else {
             return;
         };
-        if envelope.dialog != dialog.dialog {
+        if pending.dialog != envelope.dialog {
             return;
         }
-        dialog
-            .inbox
-            .push_back((envelope.kind, envelope.payload.clone()));
+        if pending.early.len() >= HELD_CANDIDATES {
+            web_sys::console::warn_1(
+                &format!(
+                    "net-mesh-leaf: {:#x} has trickled {HELD_CANDIDATES} candidates for an \
+                     offer this page has not answered; the rest are dropped",
+                    envelope.from
+                )
+                .into(),
+            );
+            return;
+        }
+        pending.early.push_back(envelope.payload.clone());
     }
 
     /// Take the verified offer waiting from `peer`, if any.
@@ -646,7 +978,7 @@ impl Inner {
     /// `peer_accept_offer` twice for one offer is refused the second
     /// time rather than answering the same SDP on a second
     /// connection.
-    fn take_pending_offer(&mut self, peer: NodeId) -> Option<(DialogId, Vec<u8>)> {
+    fn take_pending_offer(&mut self, peer: NodeId) -> Option<PendingOffer> {
         self.offers.remove(&peer)
     }
 
@@ -659,8 +991,8 @@ impl Inner {
     /// vanished from the ledger is what makes
     /// `direct + relayed + failed + udp_blocked == attempted` drift.
     fn supersede(&mut self, peer: NodeId) {
-        if self.peers.contains_key(&peer) {
-            self.settle(peer, IceTerm::Failed);
+        if let Some(attempt) = self.attempt_of(peer) {
+            self.settle(attempt, IceTerm::Failed, "failed");
             self.peers.remove(&peer);
         }
     }
@@ -671,10 +1003,22 @@ impl Inner {
     /// The single drain point. See [`Inner::anchor_candidates`].
     fn harvest_candidates(&mut self) {
         for (peer, candidate) in self.transport.take_local_candidates() {
-            if let Some(dialog) = self.peers.get_mut(&peer) {
-                dialog.local.push_back(candidate);
-            } else if peer == self.anchor {
+            if peer == self.anchor {
                 self.anchor_candidates.push_back(candidate);
+                continue;
+            }
+            let live = self.transport.peer_connection(peer);
+            match self.peers.get_mut(&peer) {
+                // Filed only under the attempt whose OWN connection
+                // gathered it. The queue is keyed by peer alone, so
+                // without this a predecessor's addresses are trickled
+                // as a successor's own — and a candidate for an
+                // attempt that has ended, or one whose connection has
+                // been replaced, belongs to nobody.
+                Some(dialog) if dialog.terminal.is_none() && dialog.gathered(live.as_ref()) => {
+                    dialog.local.push_back(candidate);
+                }
+                _ => {}
             }
             // A candidate for a peer whose attempt is over belongs
             // to nobody, and trickling it to the anchor's dialog
@@ -683,32 +1027,300 @@ impl Inner {
         }
     }
 
-    /// Count one terminal ICE term for an attempt, at most once.
+    /// The attempt that is live for `peer`, whatever state it is in.
+    fn attempt_of(&self, peer: NodeId) -> Option<Attempt> {
+        self.peers.get(&peer).map(|dialog| Attempt {
+            peer,
+            dialog: dialog.dialog,
+        })
+    }
+
+    /// Is `attempt` still the live dialog for its peer?
+    fn live(&self, attempt: Attempt) -> bool {
+        self.peers
+            .get(&attempt.peer)
+            .is_some_and(|dialog| dialog.dialog == attempt.dialog)
+    }
+
+    /// Is `attempt` live AND not yet terminal — may this work still
+    /// change it?
+    fn active(&self, attempt: Attempt) -> bool {
+        self.peers
+            .get(&attempt.peer)
+            .is_some_and(|dialog| dialog.dialog == attempt.dialog && dialog.terminal.is_none())
+    }
+
+    /// Refuse work whose attempt is no longer the live one.
     ///
-    /// `peer == self.anchor` is the bootstrap attempt, which has no
-    /// [`PeerDialog`] and is gated on its own flag. An attempt with
-    /// neither counts nothing: a term without an attempt would break
-    /// the partition
+    /// The refusal carries [`NO_LIVE_ATTEMPT_PREFIX`], which is what
+    /// types it `superseded` for the page: the attempt the caller
+    /// still believes in is gone, and that is a disposition rather
+    /// than an error.
+    fn require_live(&self, attempt: Attempt) -> Result<(), LeafError> {
+        if self.live(attempt) {
+            Ok(())
+        } else {
+            Err(LeafError::Session(format!(
+                "{NO_LIVE_ATTEMPT_PREFIX} {:#x}",
+                attempt.peer
+            )))
+        }
+    }
+
+    /// As [`Inner::require_live`], and the attempt must not have
+    /// ended either.
+    fn require_active(&self, attempt: Attempt) -> Result<(), LeafError> {
+        if self.active(attempt) {
+            Ok(())
+        } else {
+            Err(LeafError::Session(format!(
+                "{NO_LIVE_ATTEMPT_PREFIX} {:#x}",
+                attempt.peer
+            )))
+        }
+    }
+
+    /// Record the connection `attempt` gathers on.
+    fn adopt_connection(&mut self, attempt: Attempt) {
+        let live = self.transport.peer_connection(attempt.peer);
+        if let Some(dialog) = self
+            .peers
+            .get_mut(&attempt.peer)
+            .filter(|dialog| dialog.dialog == attempt.dialog)
+        {
+            dialog.connection = live;
+        }
+    }
+
+    /// The remote description `attempt` needs is in place.
+    fn mark_remote_ready(&mut self, attempt: Attempt) {
+        if let Some(dialog) = self
+            .peers
+            .get_mut(&attempt.peer)
+            .filter(|dialog| dialog.dialog == attempt.dialog)
+        {
+            dialog.remote_ready = true;
+        }
+    }
+
+    /// Take what `attempt` held for want of a remote description,
+    /// now that it has one.
+    fn promote_deferred(&mut self, attempt: Attempt) -> Vec<Vec<u8>> {
+        match self
+            .peers
+            .get_mut(&attempt.peer)
+            .filter(|dialog| dialog.dialog == attempt.dialog)
+        {
+            Some(dialog) => {
+                dialog.remote_ready = true;
+                dialog.deferred.drain(..).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Hold `payloads` under `attempt` until its remote description
+    /// is usable.
+    fn defer_candidates(&mut self, attempt: Attempt, payloads: Vec<Vec<u8>>) {
+        let Some(dialog) = self
+            .peers
+            .get_mut(&attempt.peer)
+            .filter(|dialog| dialog.dialog == attempt.dialog && dialog.terminal.is_none())
+        else {
+            return;
+        };
+        let mut dropped = 0usize;
+        for payload in payloads {
+            if dialog.deferred.len() >= HELD_CANDIDATES {
+                dropped += 1;
+                continue;
+            }
+            dialog.deferred.push_back(payload);
+        }
+        if dropped > 0 {
+            web_sys::console::warn_1(
+                &format!(
+                    "net-mesh-leaf: {:#x}: {dropped} trickled candidate(s) dropped — a dialog \
+                     holds at most {HELD_CANDIDATES} while it has no usable remote description",
+                    attempt.peer
+                )
+                .into(),
+            );
+        }
+    }
+
+    /// Claim the pending Noise handshake with `peer` for one routed
+    /// establishment, and answer with its number.
+    fn claim_routed_handshake(&mut self, peer: NodeId) -> u64 {
+        self.next_routed = self.next_routed.wrapping_add(1);
+        let routed = self.next_routed;
+        self.handshakes.insert(peer, HandshakeOwner::Routed(routed));
+        routed
+    }
+
+    /// Does routed establishment `routed` still own `peer`'s pending
+    /// handshake?
+    fn owns_routed_handshake(&self, peer: NodeId, routed: u64) -> bool {
+        self.handshakes.get(&peer) == Some(&HandshakeOwner::Routed(routed))
+    }
+
+    /// Revoke routed establishment `routed`'s ability to install.
+    fn revoke_routed_handshake(&mut self, peer: NodeId, routed: u64) {
+        if self.owns_routed_handshake(peer, routed) {
+            self.handshakes.remove(&peer);
+        }
+    }
+
+    /// May the pending handshake with `peer` still install a
+    /// session?
+    ///
+    /// Only while the operation that began it still owns it: a live
+    /// routed establishment, or an attempt that is live and has not
+    /// made its terminal transition.
+    fn handshake_may_install(&self, peer: NodeId) -> bool {
+        match self.handshakes.get(&peer) {
+            None => false,
+            Some(HandshakeOwner::Routed(_)) => true,
+            Some(HandshakeOwner::Direct(attempt)) => self.active(*attempt),
+        }
+    }
+
+    /// Take `attempt` through its ONE terminal transition: count the
+    /// term, retire what it owns, and record the state a reading
+    /// reports for it.
+    ///
+    /// Terminal means terminal. This used to flip a counter flag and
+    /// nothing else: the attempt's DataChannel stayed open, its
+    /// pending Noise handshake stayed installable, and a page polling
+    /// it read `open` with no session for as long as it cared to ask.
+    ///
+    /// `IceTerm::Direct` is the one term that retires nothing — it IS
+    /// the installation, and closing its channel would close the
+    /// session's own transport. Every other term ends the direct
+    /// path, so the channel is closed (its retained packets accounted
+    /// for by `RtcLeafTransport::close`) and this attempt's Noise
+    /// ownership is revoked, while the routed session — a supported
+    /// disposition rather than a failure (§9 step 6) — is left
+    /// exactly where it is.
+    ///
+    /// A term for any dialog but the live one, or a second term for
+    /// one attempt, is refused: either breaks the partition
     /// `direct + relayed + failed + udp_blocked == attempted` that
     /// the conformance matrix asserts on every row.
-    fn settle(&mut self, peer: NodeId, term: IceTerm) {
-        if peer == self.anchor {
-            if self.bootstrap_settled {
-                return;
+    fn settle(&mut self, attempt: Attempt, term: IceTerm, state: &'static str) {
+        match self.peers.get_mut(&attempt.peer) {
+            Some(dialog) if dialog.dialog == attempt.dialog && dialog.terminal.is_none() => {
+                dialog.terminal = Some((term, state));
             }
-            self.bootstrap_settled = true;
-        } else {
-            match self.peers.get_mut(&peer) {
-                Some(dialog) if !dialog.settled => dialog.settled = true,
-                _ => return,
-            }
+            _ => return,
         }
+        self.count(term);
+        if self.handshakes.get(&attempt.peer) == Some(&HandshakeOwner::Direct(attempt)) {
+            self.handshakes.remove(&attempt.peer);
+        }
+        // The inbound establishment this attempt admitted is retired
+        // with it, here — in the same borrow that took the terminal
+        // term, because a `pump` between the two is a gap in which a
+        // relayed proof still lands. `retire_provisional` DESTROYS
+        // the unproven attempt: it drops the `LeafSession` holding
+        // this establishment's only copy of its keys, so afterwards a
+        // proof for it cannot be opened, let alone promoted. A proven
+        // session for the peer is untouched — that is `drop_session`'s
+        // job, and a `Direct` term is the promotion, not a
+        // retirement.
+        if self.admissions.get(&attempt.peer) == Some(&attempt) {
+            self.admissions.remove(&attempt.peer);
+        }
+        if term != IceTerm::Direct {
+            self.node.retire_provisional(attempt.peer);
+            self.transport.close(attempt.peer);
+            // Terminal for the re-attempt owner too: the episode is a
+            // coalescing window around ONE attempt, and one left open
+            // here absorbs the first trigger of a genuinely new
+            // attempt against the same peer. `forget` drops the
+            // ownership and the episode together, which is what makes
+            // it the terminal verb and `note_installed_role` the
+            // ownership-only one.
+            self.retry.forget(attempt.peer);
+        }
+    }
+
+    /// Count the BOOTSTRAP attempt's terminal term, at most once.
+    ///
+    /// It has no [`PeerDialog`] — it is `connect`'s own attempt — so
+    /// it is gated on its own flag rather than on a dialog.
+    fn settle_bootstrap(&mut self, term: IceTerm) {
+        if self.bootstrap_settled {
+            return;
+        }
+        self.bootstrap_settled = true;
+        self.count(term);
+    }
+
+    /// Move the one counter this term names.
+    fn count(&self, term: IceTerm) {
         let counters = self.node.counters();
         match term {
             IceTerm::Direct => counters.ice_direct(),
             IceTerm::Relayed => counters.ice_relayed(),
             IceTerm::Failed => counters.ice_failed(),
             IceTerm::UdpBlocked => counters.udp_blocked(),
+        }
+    }
+
+    /// Retire everything this node still owns on behalf of an
+    /// attempt, exactly once each.
+    ///
+    /// `close` and `retire` both end the ticker, and the ticker is
+    /// what would have settled a pending attempt — so an attempt left
+    /// here is an attempt the §10 partition never reconciles, a
+    /// channel nobody closes, a pending handshake that can still
+    /// install, and a held offer nobody will ever answer. The window
+    /// listeners go too: the `online` closure files into a queue
+    /// whose only consumer is the ticker that just stopped.
+    fn retire_attempts(&mut self) {
+        let live: Vec<Attempt> = self
+            .peers
+            .iter()
+            .map(|(peer, dialog)| Attempt {
+                peer: *peer,
+                dialog: dialog.dialog,
+            })
+            .collect();
+        for attempt in live {
+            self.settle(attempt, IceTerm::Failed, "failed");
+        }
+        self.settle_bootstrap(IceTerm::Failed);
+        // Every unproven establishment this node admitted, retired
+        // rather than merely forgotten: clearing the map would drop
+        // the ATTRIBUTION and leave the keys in the node, and the
+        // point of a close is that nothing installs afterwards. The
+        // settles above already retired each peer that still had a
+        // dialog; this covers an admission whose dialog was removed
+        // ahead of it.
+        for peer in self.admissions.keys().copied().collect::<Vec<_>>() {
+            self.node.retire_provisional(peer);
+        }
+        self.peers.clear();
+        self.offers.clear();
+        self.handshakes.clear();
+        self.admissions.clear();
+        self.retry.forget_all();
+        self.unregister_retry_listeners();
+    }
+
+    /// Detach the window listeners this node installed.
+    ///
+    /// A `Closure` that is merely kept alive stays ATTACHED: the
+    /// `online` listener outlived its consumer and went on appending
+    /// to the trigger queue for as long as the page held the node.
+    fn unregister_retry_listeners(&mut self) {
+        let window = web_sys::window();
+        for (event, listener) in self.retry_listeners.drain(..) {
+            if let Some(window) = &window {
+                let _ = window
+                    .remove_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
+            }
         }
     }
 }
@@ -815,37 +1427,30 @@ impl LeafNode {
         let anchor = control.anchor_node();
         let anchor_rtc_addr = control.anchor_rtc_addr();
 
-        // Stage 6, the safeguard. A caller-supplied STUN entry that
-        // names this connection's own ICE peer gathers no
-        // server-reflexive candidate, so configuring it buys an ICE
-        // deadline instead of a reason. Refused **here**: after the
-        // announcement that names the peer, and before the offer
-        // that would start ICE. Never silently stripped — stripping
-        // would turn an explicit NAT-traversal configuration into a
+        // Stage 6, the safeguard. A STUN entry that names this
+        // connection's own ICE peer gathers no server-reflexive
+        // candidate, so configuring it buys an ICE deadline instead
+        // of a reason. Refused **here**: after the anchor document
+        // that names the peer, and before the offer that would start
+        // ICE. Never silently stripped — stripping would turn an
+        // explicit NAT-traversal configuration into a
         // host-candidate-only attempt while appearing to have
         // accepted the caller's settings.
         //
         // Connection-specific by construction: the comparison is
         // against *this* connection's peer, so an anchor remains a
         // legitimate STUN server for a browser ↔ browser connection
-        // it is not a party to.
+        // it is not a party to ([`Inner::ice_servers_for`] applies
+        // the same check per peer on every later connection).
         let ice_servers = match caller_ice_servers {
-            Some(servers) => {
-                crate::bootstrap::check_ice_servers_against_peer(
-                    servers
-                        .iter()
-                        .flat_map(|server| server.urls.iter().map(String::as_str)),
-                    anchor_rtc_addr.as_deref(),
-                )
-                .map_err(js)?;
-                servers
-            }
+            Some(servers) => servers,
             // The working configuration Net supplies, so an
             // integrator does not have to discover which external
             // STUN service avoids its own anchor: the anchor's
             // separately announced endpoint. An anchor that
             // announced none leaves this empty, which is exactly
-            // the pre-Stage-6 behaviour.
+            // the pre-Stage-6 behaviour, and an explicit empty array
+            // stays empty.
             None => crate::bootstrap::default_stun_url(control.anchor_stun_addr().as_deref())
                 .map(|url| {
                     vec![IceServer {
@@ -856,6 +1461,22 @@ impl LeafNode {
                 })
                 .unwrap_or_default(),
         };
+        // **The EFFECTIVE list, not the caller's half of it.** The
+        // check used to run inside the `Some` arm only, so the
+        // synthesized default — the anchor's own announced STUN
+        // endpoint — bypassed it entirely: an anchor whose announced
+        // STUN endpoint IS its RTC endpoint configured this
+        // connection to ask its own ICE peer for a reflexive
+        // candidate, which is the deliberate misconfiguration
+        // fail-fast validation exists to catch. Same check, same
+        // equality, now over the list actually handed to the browser.
+        crate::bootstrap::check_ice_servers_against_peer(
+            ice_servers
+                .iter()
+                .flat_map(|server| server.urls.iter().map(String::as_str)),
+            anchor_rtc_addr.as_deref(),
+        )
+        .map_err(js)?;
 
         let seed = u64::from_le_bytes(
             random32().map_err(js)?[..8]
@@ -876,6 +1497,9 @@ impl LeafNode {
             ice_servers: ice_servers.clone(),
             offers: HashMap::new(),
             peers: HashMap::new(),
+            handshakes: HashMap::new(),
+            admissions: HashMap::new(),
+            next_routed: 0,
             anchor_candidates: VecDeque::new(),
             bootstrap_settled: false,
             inbox: VecDeque::new(),
@@ -888,10 +1512,8 @@ impl LeafNode {
             // deadline is, because "until this attempt is over" is
             // what an episode lasts.
             retry: crate::retry::RetryPolicy::new(PEER_ICE_DEADLINE_MS),
-            retry_armed: false,
             retry_listeners: Vec::new(),
             retry_triggers: Rc::new(RefCell::new(VecDeque::new())),
-            direct_offerer: std::collections::HashSet::new(),
             retry_last: None,
         }));
 
@@ -1011,12 +1633,12 @@ impl LeafNode {
             // anchor ended); this is the backstop for every other
             // way the block above can fail, and `settle` counts at
             // most once per attempt so it cannot double up.
-            inner.borrow_mut().settle(anchor, IceTerm::Failed);
+            inner.borrow_mut().settle_bootstrap(IceTerm::Failed);
             abandon_attempt(&inner).await;
             attempt.disarm();
             return Err(failure);
         }
-        inner.borrow_mut().settle(anchor, IceTerm::Direct);
+        inner.borrow_mut().settle_bootstrap(IceTerm::Direct);
 
         // Layer 2: enrollment, over the session just installed.
         // §12 admits a browser's session as **provisional** and
@@ -1124,7 +1746,13 @@ impl LeafNode {
     pub fn arm_network_retry(&self) -> Result<(), JsError> {
         let mut guard = self.inner.borrow_mut();
         guard.admit().map_err(js)?;
-        if guard.retry_armed {
+        // **The owner is what gets armed, not a second flag.** A flag
+        // beside the policy is a flag that can disagree with it, and
+        // the disagreement is the defect: the public report said
+        // unarmed while the owner went on starting attempts. `arm`
+        // answers whether THIS call armed it, which is also the
+        // idempotence — a second call installs no second listener.
+        if !guard.retry.arm() {
             return Ok(());
         }
         let window = web_sys::window()
@@ -1141,8 +1769,11 @@ impl LeafNode {
         window
             .add_event_listener_with_callback("online", online.as_ref().unchecked_ref())
             .map_err(|e| JsError::new(&format!("online listener: {e:?}")))?;
-        guard.retry_listeners.push(online);
-        guard.retry_armed = true;
+        // The event name is kept beside the closure: a `Closure`
+        // that is merely alive is still ATTACHED, and `close`
+        // detaches it ([`Inner::unregister_retry_listeners`]).
+        guard.retry_listeners.push(("online", online));
+
         Ok(())
     }
 
@@ -1173,16 +1804,17 @@ impl LeafNode {
         format!(
             "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"triggers\":\"{}\",\
              \"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
-             \"openEpisodes\":{},\"owned\":{},\"last\":{last}}}",
-            guard.retry_armed,
+             \"discardedUnarmed\":\"{}\",\"openEpisodes\":{},\"owned\":{},\"last\":{last}}}",
+            guard.retry.is_armed(),
             ledger.online,
             ledger.ice_failed,
             ledger.triggers(),
             ledger.started,
             ledger.coalesced,
             ledger.not_eligible,
+            ledger.discarded_unarmed,
             guard.retry.open_episodes(now),
-            guard.direct_offerer.len(),
+            guard.retry.owned_count(),
         )
     }
 
@@ -1509,7 +2141,11 @@ impl LeafNode {
                 ));
             }
             let noise = peer_noise_key(&guard, peer).map_err(js)?;
-            (guard.anchor, noise, guard.psk, guard.ice_servers.clone())
+            // The effective list, checked against THIS peer's own
+            // announced endpoint rather than against the anchor
+            // connection the list was validated for (S6-07.4).
+            let ice_servers = guard.ice_servers_for(peer).map_err(js)?;
+            (guard.anchor, noise, guard.psk, ice_servers)
         };
 
         // §9 step 2.
@@ -1525,6 +2161,12 @@ impl LeafNode {
                 .try_into()
                 .map_err(|_| JsError::new("dialog"))?,
         );
+        // **This attempt, carried from here.** Every step below
+        // crosses an await, and the page may supersede this dialog or
+        // close the node while one is parked; a step that resumed and
+        // looked the peer up again would mutate, settle or publish for
+        // whatever attempt holds the peer *then*. See [`Attempt`].
+        let attempt = Attempt { peer, dialog };
         // **The dialog is registered BEFORE the offer is created**,
         // and the ordering is load-bearing: `create_offer` sets the
         // local description, which is what makes the browser start
@@ -1538,6 +2180,12 @@ impl LeafNode {
         // afterwards threw away exactly the candidates ICE needs
         // most and left both sides gathering until their deadlines.
         with_node(&self.inner, |guard| {
+            // Whatever the OUTGOING attempt's connection gathered is
+            // harvested first, so it is filed on the dialog it was
+            // gathered for and dies with it. The transport's queue is
+            // keyed by peer alone, so a line left in it here would be
+            // trickled as this attempt's own address.
+            guard.harvest_candidates();
             // A second offer to the same peer retires the first: one
             // live attempt per peer, and the one it replaces is
             // counted rather than forgotten.
@@ -1549,8 +2197,13 @@ impl LeafNode {
                     role: PeerRole::Offerer,
                     inbox: VecDeque::new(),
                     local: VecDeque::new(),
+                    deferred: VecDeque::new(),
+                    // The offerer's remote description is the peer's
+                    // answer, and it has not arrived yet.
+                    remote_ready: false,
+                    connection: None,
                     deadline,
-                    settled: false,
+                    terminal: None,
                 },
             );
             guard.node.counters().ice_attempted();
@@ -1562,15 +2215,24 @@ impl LeafNode {
             Err(e) => {
                 // The attempt is registered and counted, so it needs
                 // a terminal term: the channel never opened and this
-                // is not its deadline.
+                // is not its deadline. Charged to THIS attempt —
+                // `create_offer` parks, and a rejection that resumed
+                // after a successor had taken the peer used to settle
+                // the successor and charge it a term it never earned.
                 with_node(&self.inner, |guard| {
-                    guard.settle(peer, IceTerm::Failed);
+                    guard.settle(attempt, IceTerm::Failed, "failed");
                 });
                 return Err(js(e));
             }
         };
+        // The connection this attempt gathers on, now that it exists:
+        // candidate provenance, so a predecessor's addresses cannot
+        // be filed under a successor
+        // ([`PeerDialog::connection`]).
+        with_node(&self.inner, |guard| guard.adopt_connection(attempt));
 
         let sent = with_node(&self.inner, |guard| {
+            guard.require_active(attempt)?;
             let envelope =
                 guard
                     .node
@@ -1581,7 +2243,7 @@ impl LeafNode {
         });
         if let Err(e) = sent {
             with_node(&self.inner, |guard| {
-                guard.settle(peer, IceTerm::Failed);
+                guard.settle(attempt, IceTerm::Failed, "failed");
             });
             return Err(js(e));
         }
@@ -1605,22 +2267,27 @@ impl LeafNode {
     /// live one, which is what the page's next call sees.
     pub async fn peer_accept_offer(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
-        let (offer, dialog, ice_servers) = with_node(&self.inner, |guard| {
+        let (offer, dialog, early, ice_servers) = with_node(&self.inner, |guard| {
             guard.admit()?;
             // The announcement is what verified the envelope, and it
             // is what this leaf will need again for every candidate
             // the peer trickles.
             let _ = peer_noise_key(guard, peer)?;
-            let (dialog, offer) = guard.take_pending_offer(peer).ok_or_else(|| {
+            let pending = guard.take_pending_offer(peer).ok_or_else(|| {
                 LeafError::Session(format!(
                     "no verified offer from {peer:#x} is waiting: an offer is answered from \
                      the envelope that arrived, never from the caller"
                 ))
             })?;
-            let offer = String::from_utf8(offer).map_err(|_| {
+            let offer = String::from_utf8(pending.sdp).map_err(|_| {
                 LeafError::ControlPlane(format!("the offer {peer:#x} signed is not UTF-8 SDP"))
             })?;
-            Ok::<_, LeafError>((offer, dialog, guard.ice_servers.clone()))
+            Ok::<_, LeafError>((
+                offer,
+                pending.dialog,
+                pending.early,
+                guard.ice_servers_for(peer)?,
+            ))
         })
         .map_err(js)?;
 
@@ -1636,22 +2303,35 @@ impl LeafNode {
         });
         debug_assert_ne!(anchor, peer);
 
+        let attempt = Attempt { peer, dialog };
         // Registered before `accept_offer`, for the reason
         // [`Self::peer_offer`] spells out: `accept_offer` sets both
         // descriptions and the browser starts gathering, and a
         // candidate that arrives before this peer has a dialog is
         // filed nowhere.
         with_node(&self.inner, |guard| {
+            guard.harvest_candidates();
             guard.supersede(peer);
             guard.peers.insert(
                 peer,
                 PeerDialog {
                     dialog,
                     role: PeerRole::Answerer,
-                    inbox: VecDeque::new(),
+                    // The candidates this peer trickled between its
+                    // offer and this answer: verified, authorized by
+                    // the dialog the OFFER was signed with, and held
+                    // until there is a remote description for them to
+                    // be usable against ([`PendingOffer::early`]).
+                    inbox: early
+                        .into_iter()
+                        .map(|payload| (SignalKind::Candidate, payload))
+                        .collect(),
                     local: VecDeque::new(),
+                    deferred: VecDeque::new(),
+                    remote_ready: false,
+                    connection: None,
                     deadline: crate::clock::Deadline::in_ms(PEER_ICE_DEADLINE_MS),
-                    settled: false,
+                    terminal: None,
                 },
             );
             guard.node.counters().ice_attempted();
@@ -1665,13 +2345,23 @@ impl LeafNode {
             Ok(answer) => answer,
             Err(e) => {
                 with_node(&self.inner, |guard| {
-                    guard.settle(peer, IceTerm::Failed);
+                    guard.settle(attempt, IceTerm::Failed, "failed");
                 });
                 return Err(js(e));
             }
         };
+        // Both descriptions are set now, so two things are true of
+        // this attempt that were not before: it has a connection of
+        // its own (candidate provenance), and its remote description
+        // is usable — which is what releases the candidates held
+        // under the offer.
+        with_node(&self.inner, |guard| {
+            guard.adopt_connection(attempt);
+            guard.mark_remote_ready(attempt);
+        });
 
         let sent = with_node(&self.inner, |guard| {
+            guard.require_active(attempt)?;
             let envelope =
                 guard
                     .node
@@ -1682,7 +2372,7 @@ impl LeafNode {
         });
         if let Err(e) = sent {
             with_node(&self.inner, |guard| {
-                guard.settle(peer, IceTerm::Failed);
+                guard.settle(attempt, IceTerm::Failed, "failed");
             });
             return Err(js(e));
         }
@@ -1720,7 +2410,10 @@ impl LeafNode {
     /// and "ICE has nothing to work with".
     pub async fn peer_candidate(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
-        let r = self.service_peer(peer).await?;
+        // The public surface is peer-only, so the owner is resolved
+        // HERE — once — and carried through every await below.
+        let attempt = self.current_attempt(peer).map_err(js)?;
+        let r = self.service_peer(attempt).await?;
         let candidate_error = match &r.candidate_error {
             Some(text) => format!(",\"candidateError\":{}", json_string(text)),
             None => String::new(),
@@ -1746,29 +2439,77 @@ impl LeafNode {
     /// re-attempt owner drives the attempt through the SAME service
     /// step a page's drive loop calls, and a private reading is a
     /// struct rather than a string it would have to re-parse.
-    async fn service_peer(&self, peer: NodeId) -> Result<AttemptReading, JsError> {
-        let (dialog, role, outgoing, incoming, transport) = with_node(&self.inner, |guard| {
+    async fn service_peer(&self, attempt: Attempt) -> Result<AttemptReading, JsError> {
+        let peer = attempt.peer;
+        let captured = with_node(&self.inner, |guard| {
             guard.admit()?;
             guard.harvest_candidates();
-            let Some(dialog) = guard.peers.get_mut(&peer) else {
+            let Some(dialog) = guard
+                .peers
+                .get_mut(&peer)
+                .filter(|dialog| dialog.dialog == attempt.dialog)
+            else {
                 return Err(LeafError::Session(format!(
                     "{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}"
                 )));
             };
-            let id = dialog.dialog;
+            // A terminal attempt is READ, never driven: its term is
+            // counted, its channel is closed and its Noise ownership
+            // is revoked, so there is nothing left to send, apply or
+            // settle. Reporting its state is what ends a page's poll
+            // promptly instead of leaving it asking an attempt that
+            // had already ended.
+            if let Some((_, state)) = dialog.terminal {
+                return Ok(Serviced::Ended(state));
+            }
             let role = dialog.role;
+            let deadline = dialog.deadline;
+            let remote_ready = dialog.remote_ready;
             let outgoing: Vec<IceCandidate> = dialog.local.drain(..).collect();
             let incoming: Vec<(SignalKind, Vec<u8>)> = dialog.inbox.drain(..).collect();
-            Ok::<_, LeafError>((id, role, outgoing, incoming, guard.transport.clone()))
+            Ok(Serviced::Live {
+                role,
+                deadline,
+                remote_ready,
+                outgoing,
+                incoming,
+                transport: guard.transport.clone(),
+            })
         })
         .map_err(js)?;
+        let (role, deadline, mut remote_ready, outgoing, incoming, transport) = match captured {
+            Serviced::Ended(state) => {
+                return Ok(AttemptReading {
+                    dialog: attempt.dialog,
+                    state,
+                    sent: 0,
+                    applied: 0,
+                    answered: false,
+                    direct: self.installed(peer),
+                    remaining_ms: 0,
+                    candidate_error: None,
+                })
+            }
+            Serviced::Live {
+                role,
+                deadline,
+                remote_ready,
+                outgoing,
+                incoming,
+                transport,
+            } => (role, deadline, remote_ready, outgoing, incoming, transport),
+        };
 
         let mut sent = 0usize;
         for candidate in &outgoing {
             with_node(&self.inner, |guard| {
+                // Nothing is signed for an attempt that stopped being
+                // the live one: the envelope would carry this dialog's
+                // id to a peer whose successor attempt owns the pair.
+                guard.require_active(attempt)?;
                 let envelope = guard.node.sign_signal(
                     peer,
-                    dialog,
+                    attempt.dialog,
                     SignalKind::Candidate,
                     candidate_payload(candidate).into_bytes(),
                 );
@@ -1799,9 +2540,20 @@ impl LeafNode {
         // The inbox is the Stage 5 dialog's, so this is a REORDER of
         // what is already held, not new state: take the answer first,
         // then the candidates, in their own arrival order.
+        //
+        // **And a candidate whose answer is in the NEXT poll is held,
+        // not spent.** The reorder settles one drained batch and can
+        // do nothing for a `Candidate` drained in poll N whose
+        // `Answer` arrives in poll N+1 — the same `InvalidStateError`,
+        // the same lost line. So until this attempt's remote
+        // description is usable its candidates are retained under it
+        // ([`PeerDialog::deferred`]) and go in, in arrival order, the
+        // moment it is.
         let mut applied = 0usize;
         let mut answered = false;
         let mut candidate_error: Option<String> = None;
+        let mut apply: Vec<Vec<u8>> = Vec::new();
+        let mut hold: Vec<Vec<u8>> = Vec::new();
         let (answers, rest): (Vec<_>, Vec<_>) = incoming
             .into_iter()
             .partition(|(kind, _)| matches!(kind, SignalKind::Answer));
@@ -1812,35 +2564,38 @@ impl LeafNode {
                         .map_err(|_| JsError::new("an answer payload is not UTF-8 SDP"))?;
                     transport.accept_answer(peer, &Sdp(sdp)).await.map_err(js)?;
                     answered = true;
+                    remote_ready = true;
+                    // The remote description exists from here, so what
+                    // was held for want of one goes in — ahead of this
+                    // batch's own candidates, which arrived later than
+                    // it did.
+                    apply.extend(
+                        with_node(&self.inner, |guard| {
+                            guard.require_active(attempt)?;
+                            Ok::<_, LeafError>(guard.promote_deferred(attempt))
+                        })
+                        .map_err(js)?,
+                    );
                 }
                 SignalKind::Candidate => {
-                    let Some(candidate) = parse_candidate(&payload) else {
-                        continue;
-                    };
-                    // The engine's refusal was swallowed here: the
-                    // count of successes rose or it did not, and no
-                    // log, counter or verdict field said why. A
-                    // candidate the engine refuses is the difference
-                    // between "ICE is working on it" and "ICE has
-                    // nothing to work with", so it is reported.
-                    match transport.add_remote_candidate(peer, &candidate).await {
-                        Ok(()) => applied += 1,
-                        Err(e) => {
-                            let text = e.to_string();
-                            web_sys::console::warn_1(
-                                &format!("net-mesh-leaf: peer candidate refused: {text}").into(),
-                            );
-                            if candidate_error.is_none() {
-                                candidate_error = Some(text);
-                            }
-                        }
+                    if remote_ready {
+                        apply.push(payload);
+                    } else {
+                        hold.push(payload);
                     }
                 }
                 SignalKind::Reject => {
                     let reason = String::from_utf8_lossy(&payload).to_string();
                     with_node(&self.inner, |guard| {
-                        guard.settle(peer, IceTerm::Failed);
-                        guard.peers.remove(&peer);
+                        // The Reject belongs to the dialog it was
+                        // drained from, and only that dialog is
+                        // removed: the inbox crossed an await, and a
+                        // predecessor's Reject used to remove whatever
+                        // attempt held the peer by then.
+                        if guard.live(attempt) {
+                            guard.settle(attempt, IceTerm::Failed, "failed");
+                            guard.peers.remove(&peer);
+                        }
                     });
                     return Err(js(LeafError::ControlPlane(format!(
                         "{peer:#x} rejected the attempt: {reason}"
@@ -1853,36 +2608,84 @@ impl LeafNode {
                 SignalKind::Offer | SignalKind::Answer => {}
             }
         }
+        for payload in apply {
+            let Some(candidate) = parse_candidate(&payload) else {
+                continue;
+            };
+            // The engine takes candidates by peer, so an attempt that
+            // has been superseded must stop handing them over: they
+            // would go into the successor's connection.
+            with_node(&self.inner, |guard| guard.require_active(attempt)).map_err(js)?;
+            // The engine's refusal was swallowed here: the count of
+            // successes rose or it did not, and no log, counter or
+            // verdict field said why. A candidate the engine refuses
+            // is the difference between "ICE is working on it" and
+            // "ICE has nothing to work with", so it is reported.
+            match transport.add_remote_candidate(peer, &candidate).await {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    let text = e.to_string();
+                    web_sys::console::warn_1(
+                        &format!("net-mesh-leaf: peer candidate refused: {text}").into(),
+                    );
+                    if candidate_error.is_none() {
+                        candidate_error = Some(text);
+                    }
+                }
+            }
+        }
+        if !hold.is_empty() {
+            with_node(&self.inner, |guard| guard.defer_candidates(attempt, hold));
+        }
 
+        // **One terminal transition, and it spans ICE, Noise AND
+        // installation.**
+        //
+        // An open channel used to win over expiry unconditionally,
+        // because the only question asked here was about ICE. That is
+        // the wrong question: what the deadline bounds is the
+        // ATTEMPT. With the peer's Noise answer withheld, an answerer
+        // read `open`, `direct:false`, `remainingMs:0` for as long as
+        // it cared to ask, and `acceptPeer` polled it forever.
+        //
+        // A channel that came up BEFORE the deadline is still not a
+        // timeout, which is the part that was right.
+        let installed = self.installed(peer);
         let open = transport.is_open(peer);
-        // The deadline is evaluated AFTER openness, the same
-        // ordering `wait_for_channel` uses and for the same reason:
-        // a channel that came up is not a timeout, whatever the
-        // clock says about the tick it came up on.
-        let state = if open {
+        let state = if installed {
             "open"
-        } else if self.peer_deadline_passed(peer) {
-            self.settle_peer_deadline(peer).await
+        } else if !deadline.expired_at(clock::now()) {
+            if open {
+                "open"
+            } else {
+                "gathering"
+            }
+        } else if open {
+            // ICE connected and the session did not install inside
+            // the attempt's bound. `udp_blocked` is unclaimable — a
+            // DataChannel opened — and this is not an ICE timeout
+            // either, so the term is the one §9 step 6 makes a
+            // supported disposition (the pair keeps its routed
+            // session) while the state says what actually failed.
+            with_node(&self.inner, |guard| {
+                guard.settle(attempt, IceTerm::Relayed, "failed");
+            });
+            "failed"
         } else {
-            "gathering"
+            self.settle_peer_deadline(attempt).await
         };
-        let remaining = self.peer_remaining_ms(peer);
-        // The direct session, which is a different fact from an open
-        // channel: the answerer's half of §9 step 4 installs from an
-        // inbound packet, so this is how its drive loop learns the
-        // pair is off the relay without calling a handshake it does
-        // not own.
-        let direct = {
-            let guard = self.inner.borrow();
-            guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
-        };
+        let remaining = deadline.remaining_ms_at(clock::now());
+        // Nothing is published for an attempt that stopped being the
+        // live one while this call ran: the reading would name this
+        // dialog and describe the successor's connection.
+        with_node(&self.inner, |guard| guard.require_live(attempt)).map_err(js)?;
         Ok(AttemptReading {
-            dialog,
+            dialog: attempt.dialog,
             state,
             sent,
             applied,
             answered,
-            direct,
+            direct: installed,
             remaining_ms: remaining,
             candidate_error,
         })
@@ -1908,22 +2711,34 @@ impl LeafNode {
     /// leaves on its own channel. The session replacement itself is
     /// the node's — `LeafNode::install_session`, the
     /// Stage 3/4a fence, unchanged and unreached from here.
-    pub async fn peer_handshake(&self, peer_hex: String) -> Result<(), JsError> {
+    pub async fn peer_handshake(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
-        self.run_handshake(peer).await
+        let attempt = self.current_attempt(peer).map_err(js)?;
+        self.run_handshake(attempt).await?;
+        Ok(format!("{:016x}", attempt.dialog))
     }
 
     /// [`Self::peer_handshake`]'s whole body. Split out so the
     /// re-attempt owner runs the production step and not a copy of
-    /// it.
-    async fn run_handshake(&self, peer: NodeId) -> Result<(), JsError> {
-        let msg1 = with_node(&self.inner, |guard| {
+    /// it, and taking the attempt it belongs to rather than a peer:
+    /// the Noise wait is the longest await on this surface, and the
+    /// session it installs must be the one THIS attempt negotiated a
+    /// channel for.
+    async fn run_handshake(&self, attempt: Attempt) -> Result<(), JsError> {
+        let peer = attempt.peer;
+        let (msg1, deadline) = with_node(&self.inner, |guard| {
             guard.admit()?;
-            let dialog = guard
+            let Some((role, deadline)) = guard
                 .peers
                 .get(&peer)
-                .ok_or_else(|| LeafError::Session(format!("{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}")))?;
-            if dialog.role != PeerRole::Offerer {
+                .filter(|dialog| dialog.dialog == attempt.dialog && dialog.terminal.is_none())
+                .map(|dialog| (dialog.role, dialog.deadline))
+            else {
+                return Err(LeafError::Session(format!(
+                    "{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}"
+                )));
+            };
+            if role != PeerRole::Offerer {
                 return Err(LeafError::Session(format!(
                     "this leaf answered {peer:#x}'s offer, so the handshake is the offerer's \
                      (§9 step 4); the responder half runs from the inbound packet"
@@ -1938,6 +2753,15 @@ impl LeafNode {
             let psk = guard.psk;
             let slot = guard.transport.next_slot();
             let packet = guard.node.begin_handshake(peer, &psk, &noise, slot)?;
+            // **This attempt owns the pending handshake.**
+            // `is_handshaking` is keyed by peer, so message 2 that
+            // arrives after this attempt expired, was superseded or
+            // was closed would otherwise install a session under an
+            // attempt that had already ended
+            // ([`HandshakeOwner`]).
+            guard
+                .handshakes
+                .insert(peer, HandshakeOwner::Direct(attempt));
             // Direct, deliberately: the channel is open, so message
             // 1 does not go through the relay even though the
             // session it replaces still has a relay entry. Sending
@@ -1945,22 +2769,32 @@ impl LeafNode {
             // anchor, which is the thing this step exists to stop
             // doing.
             guard.transport.send(peer, packet.clone())?;
-            Ok::<_, LeafError>(packet)
+            Ok::<_, LeafError>((packet, deadline))
         })
         .map_err(js)?;
         debug_assert!(!msg1.is_empty());
 
-        let installed = self.wait_for_direct_session(peer).await;
-        if !installed {
-            with_node(&self.inner, |guard| {
-                guard.settle(peer, IceTerm::Failed);
-            });
-            return Err(js(LeafError::Session(format!(
-                "{peer:#x} did not complete the Noise handshake over the direct channel \
-                 inside the deadline"
-            ))));
+        match self.wait_for_direct_session(attempt, deadline).await {
+            DirectWait::Installed => Ok(()),
+            DirectWait::Expired => {
+                with_node(&self.inner, |guard| {
+                    guard.settle(attempt, IceTerm::Failed, "failed");
+                });
+                Err(js(LeafError::Session(format!(
+                    "{peer:#x} did not complete the Noise handshake over the direct channel \
+                     inside the deadline"
+                ))))
+            }
+            // Superseded, closed, or settled by another terminal
+            // owner while the wait was parked. Typed as the
+            // supersession it is rather than as this attempt's
+            // handshake failure, because this attempt no longer holds
+            // the peer and a failure reported for it would be a
+            // failure attributed to whoever does.
+            DirectWait::Retired => Err(js(LeafError::Session(format!(
+                "{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}"
+            )))),
         }
-        Ok(())
     }
 
     /// Register an event listener. Each receives one JSON string per
@@ -2036,6 +2870,15 @@ impl LeafNode {
             guard.closed = true;
             let anchor = guard.anchor;
             guard.node.drop_session(anchor, "the node was closed");
+            // Every attempt this node still owns is retired here:
+            // each pending term counted exactly once, each channel
+            // closed, each pending Noise ownership revoked and the
+            // window listeners detached. The ticker stops with the
+            // node, so an attempt left pending here is an attempt the
+            // §10 partition never reconciles, and a listener left
+            // attached keeps filing triggers into a queue whose
+            // consumer has exited.
+            guard.retire_attempts();
             // The attempt ends through the boundary: closing the
             // carrier's socket is the carrier's business, not this
             // module's.
@@ -2073,6 +2916,7 @@ impl LeafNode {
             let failed = guard.node.fail_calls_on_leader_loss(generation);
             let anchor = guard.anchor;
             guard.node.drop_session(anchor, "leadership was released");
+            guard.retire_attempts();
             let control = guard.control.clone();
             let dialog = guard.dialog;
             wasm_bindgen_futures::spawn_local(async move {
@@ -2145,26 +2989,37 @@ impl LeafNode {
         peer: NodeId,
         deadline: crate::clock::Deadline,
     ) -> &'static str {
-        if self.offer_peer(peer, deadline).await.is_err() {
+        let dialog = match self.offer_peer(peer, deadline).await {
+            Ok(dialog) => dialog,
             // The routed session would not come up, the peer is no
             // longer discoverable, or the offer could not be signed
             // and sent. `offer_peer` counted a term for whatever it
             // allocated.
-            return "offerRefused";
-        }
+            Err(_) => return "offerRefused",
+        };
+        // **The attempt this repair owns**, and not "whatever holds
+        // the peer now": the page may start its own attempt at any
+        // moment, and a repair that serviced, settled or handshook
+        // that one would be driving a dialog it never created. The
+        // offer's own return value is the only thing that names it.
+        let attempt = Attempt { peer, dialog };
         loop {
-            let reading = match self.service_peer(peer).await {
+            let reading = match self.service_peer(attempt).await {
                 Ok(reading) => reading,
-                // The peer rejected, or the attempt is gone —
-                // superseded by a page that started its own while
-                // this ran, which is the page's to own and not
-                // this owner's to fight over.
+                // The peer rejected, or this repair's attempt is gone
+                // — superseded by a page that started its own while
+                // this ran, which is the page's to own and not this
+                // owner's to fight over.
                 Err(_) => return "superseded",
             };
             match reading.state {
                 "open" => break,
                 "iceTimeout" => return "iceTimeout",
                 "udpBlocked" => return "udpBlocked",
+                // The channel opened and the session did not install
+                // inside the episode's bound, or a responder step
+                // failed. Either way the repair is over.
+                "failed" => return "handshakeFailed",
                 _ => {}
             }
             if reading.remaining_ms == 0 {
@@ -2174,7 +3029,7 @@ impl LeafNode {
             }
             gloo_timer_sleep(TICK_MS).await.ok();
         }
-        if self.run_handshake(peer).await.is_err() {
+        if self.run_handshake(attempt).await.is_err() {
             return "handshakeFailed";
         }
         "direct"
@@ -2224,17 +3079,23 @@ impl LeafNode {
             });
             return Ok(());
         }
-        with_node(&self.inner, |guard| {
+        let routed = with_node(&self.inner, |guard| {
             // Addressing first: `route_outbound` is what turns the
             // handshake packet into something a peer with no channel
             // can be reached at.
             guard.node.set_peer_relay(peer, anchor);
             let slot = guard.transport.next_slot();
             let msg1 = guard.node.begin_handshake(peer, psk, noise, slot)?;
+            // This call owns the pending handshake it just began, so
+            // a message 2 that arrives after this call gave up cannot
+            // install a session — which it used to, leaving a session
+            // with neither a direct transport nor a relay entry to
+            // reach the peer on ([`HandshakeOwner`]).
+            let routed = guard.claim_routed_handshake(peer);
             let out = guard.node.route_outbound(peer, msg1);
             guard.transport.send(out.peer, out.packet)?;
             guard.pump();
-            Ok::<_, LeafError>(())
+            Ok::<_, LeafError>(routed)
         })
         .map_err(js)?;
 
@@ -2242,17 +3103,37 @@ impl LeafNode {
         while waited < RELAY_SESSION_DEADLINE_MS {
             gloo_timer_sleep(TICK_MS).await.ok();
             waited += TICK_MS;
-            if with_node(&self.inner, |guard| {
+            let outcome = with_node(&self.inner, |guard| {
                 guard.pump();
-                guard.node.has_session(peer)
-            }) {
-                return Ok(());
+                if guard.node.has_session(peer) {
+                    RoutedWait::Installed
+                } else if guard.owns_routed_handshake(peer, routed) {
+                    RoutedWait::Waiting
+                } else {
+                    RoutedWait::Retired
+                }
+            });
+            match outcome {
+                RoutedWait::Installed => return Ok(()),
+                RoutedWait::Waiting => {}
+                // The node was closed, or a later establishment took
+                // the handshake over. Neither is this call's to
+                // report as the peer's unreachability.
+                RoutedWait::Retired => {
+                    return Err(js(LeafError::Session(format!(
+                        "the routed handshake with {peer:#x} was retired before it completed"
+                    ))))
+                }
             }
         }
         // Nothing was allocated on the peer's behalf that outlives
         // this: no dialog, no ICE agent, no attempt. The relay entry
-        // goes, so a later attempt starts clean.
+        // goes, so a later attempt starts clean — and so does this
+        // call's Noise ownership, because the pending handshake is
+        // exactly what a late message 2 would have installed against
+        // an operation that had already failed.
         with_node(&self.inner, |guard| {
+            guard.revoke_routed_handshake(peer, routed);
             guard.node.clear_peer_relay(peer);
         });
         Err(js(LeafError::Session(format!(
@@ -2262,29 +3143,32 @@ impl LeafNode {
         ))))
     }
 
-    /// Has `peer`'s attempt passed its ICE deadline?
-    fn peer_deadline_passed(&self, peer: NodeId) -> bool {
-        let now = clock::now();
-        self.inner
-            .borrow()
-            .peers
-            .get(&peer)
-            .is_some_and(|dialog| dialog.deadline.expired_at(now))
+    /// The attempt that is CURRENTLY live for `peer`.
+    ///
+    /// The peer-only public methods resolve their owner here, once,
+    /// and carry it from there. That is what keeps both properties
+    /// true at the same time: the page still names nothing but a
+    /// peer, and the asynchronous work its call starts is
+    /// nonetheless bound to one dialog rather than to whichever one
+    /// holds the peer when each await resumes.
+    fn current_attempt(&self, peer: NodeId) -> Result<Attempt, LeafError> {
+        let guard = self.inner.borrow();
+        guard.admit()?;
+        guard
+            .attempt_of(peer)
+            .ok_or_else(|| LeafError::Session(format!("{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}")))
     }
 
-    /// Milliseconds left on `peer`'s attempt; `0` when there is no
-    /// attempt or it has expired.
-    fn peer_remaining_ms(&self, peer: NodeId) -> u64 {
-        let now = clock::now();
-        self.inner
-            .borrow()
-            .peers
-            .get(&peer)
-            .map_or(0, |dialog| dialog.deadline.remaining_ms_at(now))
+    /// Is a direct session with `peer` installed — which is a
+    /// different fact from an open channel?
+    fn installed(&self, peer: NodeId) -> bool {
+        let guard = self.inner.borrow();
+        guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
     }
 
-    /// Settle a peer attempt whose deadline has passed, and say
-    /// which term it settled as.
+    /// Settle `attempt` because its deadline passed with no session
+    /// installed and no channel open, and say which state a reading
+    /// reports for it.
     ///
     /// The STUN probe runs here and only here: `udp_blocked` may be
     /// claimed **only** where
@@ -2295,7 +3179,13 @@ impl LeafNode {
     /// aim one at — and the observation it establishes is about this
     /// browser's UDP, not about the peer, which is why a peer
     /// attempt reads it from the same place the bootstrap one does.
-    async fn settle_peer_deadline(&self, peer: NodeId) -> &'static str {
+    ///
+    /// **Bound to the exact attempt.** The probe is a network round
+    /// trip; the attempt that opened it can be superseded or closed
+    /// while it is in flight, and the term it settles used to be
+    /// charged to whatever attempt held the peer when it came back.
+    /// [`Inner::settle`] refuses a term for any dialog but this one.
+    async fn settle_peer_deadline(&self, attempt: Attempt) -> &'static str {
         let rtc_addr = self.inner.borrow().control.anchor_rtc_addr();
         let probe_failed = match &rtc_addr {
             Some(addr) => stun_probe_failed(addr).await,
@@ -2303,41 +3193,53 @@ impl LeafNode {
         };
         let failure = classify_ice_failure(true, probe_failed, rtc_addr.as_deref());
         let blocked = matches!(failure, crate::error::RtcError::UdpBlocked { .. });
-        with_node(&self.inner, |guard| {
-            guard.settle(
-                peer,
-                if blocked {
-                    IceTerm::UdpBlocked
-                } else {
-                    IceTerm::Relayed
-                },
-            );
-        });
-        if blocked {
-            "udpBlocked"
+        let (term, state) = if blocked {
+            (IceTerm::UdpBlocked, "udpBlocked")
         } else {
-            "iceTimeout"
-        }
+            (IceTerm::Relayed, "iceTimeout")
+        };
+        with_node(&self.inner, |guard| guard.settle(attempt, term, state));
+        state
     }
 
-    /// Poll until the direct session with `peer` is installed, or
-    /// the attempt's deadline passes.
+    /// Poll until `attempt`'s own direct session installs, its own
+    /// deadline passes, or it stops being the attempt that holds the
+    /// peer.
     ///
-    /// Bounded by the attempt's own deadline rather than a fresh
-    /// one: the page has been waiting since `peer_offer`, and a
-    /// second full deadline here would let one `connectPeer` outlive
-    /// two.
-    async fn wait_for_direct_session(&self, peer: NodeId) -> bool {
+    /// Bounded by the attempt's captured deadline rather than a fresh
+    /// one, and rather than by whatever deadline the peer's current
+    /// dialog carries: the page has been waiting since `peer_offer`,
+    /// a second full deadline here would let one `connectPeer`
+    /// outlive two, and reading a successor's deadline let a
+    /// predecessor's wait run on the successor's budget.
+    ///
+    /// The install it waits for is this attempt's `Direct` terminal,
+    /// not "the peer has a session": a session that arrived by
+    /// another route, or under another attempt, is not what this
+    /// handshake did.
+    async fn wait_for_direct_session(
+        &self,
+        attempt: Attempt,
+        deadline: crate::clock::Deadline,
+    ) -> DirectWait {
         loop {
-            let installed = with_node(&self.inner, |guard| {
+            let outcome = with_node(&self.inner, |guard| {
                 guard.pump();
-                guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
+                match guard.peers.get(&attempt.peer) {
+                    Some(dialog) if dialog.dialog == attempt.dialog => match dialog.terminal {
+                        Some((IceTerm::Direct, _)) => Some(DirectWait::Installed),
+                        // Another terminal owner got there first.
+                        Some(_) => Some(DirectWait::Retired),
+                        None => None,
+                    },
+                    _ => Some(DirectWait::Retired),
+                }
             });
-            if installed {
-                return true;
+            if let Some(outcome) = outcome {
+                return outcome;
             }
-            if self.peer_remaining_ms(peer) == 0 {
-                return false;
+            if deadline.expired_at(clock::now()) {
+                return DirectWait::Expired;
             }
             gloo_timer_sleep(TICK_MS).await.ok();
         }
@@ -2846,7 +3748,7 @@ fn drive_retries(inner: &Rc<RefCell<Inner>>) {
             // pairs. A peer-scoped ICE failure belongs to its peer.
             let peers: Vec<NodeId> = match peer {
                 Some(peer) => vec![peer],
-                None => guard.direct_offerer.iter().copied().collect(),
+                None => guard.retry.owned_peers(),
             };
             for peer in peers {
                 let interrupted = guard.direct_interrupted(peer);
@@ -3247,3 +4149,18 @@ fn parse_u64(raw: &str) -> Result<u64, JsError> {
     crate::bootstrap::parse_node_id(raw)
         .ok_or_else(|| JsError::new(&format!("{raw:?} is not a u64 (decimal or 0x-hex)")))
 }
+
+// ─────────────────────────── witnesses ──────────────────────────────
+
+/// Attempt ownership, terminality and candidate retention, driven
+/// on a real leaf in a real browser.
+///
+/// A separate file, and not a taste decision:
+/// `tests/control_plane_boundary.rs` scans THIS file's text for the
+/// anchor transport's vocabulary, and a witness that builds a
+/// control plane has to name the anchor document to do it. The
+/// assertion is right and the harness belongs beside it rather
+/// than inside it.
+#[cfg(test)]
+#[path = "wasm_witnesses.rs"]
+mod witnesses;

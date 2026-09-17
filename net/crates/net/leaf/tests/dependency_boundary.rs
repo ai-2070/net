@@ -147,6 +147,15 @@ fn web_sys_is_confined_to_the_transport_and_the_bindgen_surface() {
         // The RTC transport and the bindgen surface.
         "rtc.rs",
         "wasm.rs",
+        // `wasm.rs`'s own witnesses. They are a `#[cfg(test)]
+        // #[path]`-included child module of it, so this is the SAME
+        // surface rather than a new one, and it compiles only for
+        // wasm32 under test. It is a separate FILE because the
+        // witnesses must build a control plane — which means naming
+        // `AnchorInfo` — and `control_plane_boundary.rs` scans
+        // `wasm.rs`'s own text for exactly that name. Both guards
+        // are right; the split is what satisfies them together.
+        "wasm_witnesses.rs",
         // Layer 0: the bootstrap listener is HTTPS plus a
         // WebSocket, and the STUN probe needs a real
         // `RTCPeerConnection`.
