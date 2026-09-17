@@ -1,27 +1,46 @@
 # README Refresh Plan
 
-**Status:** DRAFT (2026-09-18). A read-only audit of all **28** `README.md` files outside
-`web/` is complete and its findings are folded in below. **Nothing is edited yet.** Two
-decisions are open (D1, D2), each with a recommendation; the rest of the plan is
-independent of them.
+**Status:** REVISED ×1 (2026-09-18). A read-only audit of all **28** `README.md` files
+outside `web/` is complete, and a positioning review of the root front door has been folded
+in. **Nothing is edited yet.** The plan now runs **two workstreams**: a bounded *accuracy
+pass* across all 28 files, and a *positioning rewrite* of the root `README.md` that the
+existing docs strategy already obliges. Decisions D1 and D2 are open; each carries a
+recommendation, and the remaining stages are independent of them.
 
-This plan covers the `README.md` layer of the documentation surface — the files that are
-rendered as package landing pages on crates.io, npm, PyPI and pkg.go.dev, and read from the
-repository tree. It is adjacent to, and does not overlap, the docs-site work:
-`DOCS_POLYGLOT_LENS_PLAN.md` owns `web/src/content/docs/` and never touches these files;
-`DOCS_STRATEGY_PLAN.md` and `DOCS_SDK_SPINE_PLAN.md` own positioning and the SDK spine on the
-site. Where a README and the site disagree about a fact, the **code** is the source of truth
-and both sides are wrong independently.
+This plan covers the `README.md` layer of the documentation surface — the files rendered as
+package landing pages on crates.io, npm, PyPI and pkg.go.dev, and read from the repository
+tree. It is adjacent to, and does not overlap, the docs-site work:
+`DOCS_POLYGLOT_LENS_PLAN.md` owns `web/src/content/docs/` and never touches these files.
 
-> **Framing — the READMEs are not stale by neglect, they are stale by construction.** Each was
-> written against the surface at the time its component landed and then diverged as the code
-> moved underneath it. The audit found **six** READMEs that ship the wrong license, **four**
-> documents whose tables contradict the CLI/Deck they describe, **two** code samples that do
-> not compile as written, and a small set of counts, paths and feature names that no longer
-> resolve. None of this is a rewrite: every file has a correct skeleton and a bounded list of
-> corrections. The work is a consistency pass with a verification harness, not a re-authoring.
+> **Framing — there are two different jobs here, and the first draft treated them as one.**
+> The accuracy pass is bounded: the audit found **six** READMEs shipping the wrong license,
+> **four** documents whose tables contradict the CLI/Deck they describe, **two** code samples
+> that do not compile, and a set of counts, paths and feature names that no longer resolve.
+> None of that is a rewrite. But the repository **front door is a different problem**: the
+> root README asks a cold reader to adjudicate a sweeping claim about networking before it
+> shows them one thing they can build, and it spends its strongest evidence (nanoseconds vs
+> milliseconds) in the opening line, where it is least defensible and most likely to be
+> rejected. That is positioning work, not hygiene — and `DOCS_STRATEGY_PLAN.md:41–55`
+> already froze a layered positioning decision whose *Reconciliation obligation* explicitly
+> names the root README: *"Do not let the docs quietly re-position the company while the
+> README says something else."* This plan honors that obligation instead of deferring it.
+
+**Review disposition (2026-09-18).** A positioning review of this plan returned
+*approve as a maintenance pass, not as the refresh Net needs from a positioning
+standpoint*, with six changes. All are applied:
+
+| Review item | Verdict | Where it landed |
+|---|---|---|
+| The plan excludes the highest-value work (root positioning) | **accept** | new Stage 0; the blanket "no restructure/voice" non-goal is scoped to non-root files |
+| Lead with federation; architecture is the reason to believe | **accept** | Stage 0 — sequence + copy direction |
+| The opening spends credibility (impossible-claim, ms vs ns, ns failure detection) | **accept** | Stage 0 — scope claims at first appearance |
+| Show one concrete system before the component catalogue | **accept** | Stage 0 — the worked example requirement |
+| D1: enforce shared *facts*, not whole-presentation byte-match | **modify** | D1 rewritten |
+| Stage 4: reject "every README links the union of guides" | **modify** | Stage 4 rewritten to a prioritized route |
 
 ## Goals
+
+**Accuracy (Stages 1–5):**
 
 - Every factual claim in a README — package name, install command, feature name, command flag,
   subcommand, tab label, file path, tool count, version — matches the code or manifest it
@@ -33,38 +52,48 @@ and both sides are wrong independently.
   in-repo links resolve from the file's own directory.
 - Every executable sample (Go, Python, TypeScript, Rust) is valid against the exported surface
   of the package it names.
-- The CLI and Deck README families (`cli/` + `cli/npm/` + `cli/python/`, `deck/` + `deck/npm/`
-  + `deck/python/`) are in lockstep — no shared block drifts between siblings.
-- A verification harness exists that checks the above mechanically, so the next drift is caught
-  rather than re-discovered by a read-through.
+- A verification harness exists so the next drift is caught mechanically.
+
+**Positioning (Stage 0):**
+
+- A cold reader understands what Net enables and why they might need it **before** being asked
+  to accept an architectural argument.
+- One concrete working system carries the central value — caller receives a typed result, the
+  failure path is shown, and the provider's owner retains access control.
+- Performance and recovery claims are scoped where they **first appear**, not qualified several
+  screens below.
+- The product reads as something that fits an existing estate, not a demand to replace TCP,
+  brokers, registries and cloud wholesale.
+- Every package README offers one clear next action.
+- The brand stays **Net**, the identity stays **the mesh**; the agentic use case is the entry
+  point, not a rename.
 
 ## Non-goals
 
-- **`web/`.** The site, its content pages (`web/src/content/docs/`), and its 18 content
-  READMEs are out of scope. This plan links *to* those pages; it does not edit them.
-- **Non-README files.** Two adjacent defects surfaced during the audit and are filed
-  separately (see end of plan): `integrations/hermes/plugin.yaml` at version `0.35.0`, and a
-  stale fixture count in `web/src/content/docs/releases/RELEASE_v0.13_CHIPPIN_IN.md` (web/).
-- **Re-authoring or re-positioning.** No README is restructured, re-titled, or rewritten for
-  voice. Corrections only, plus the deduplication named in Stage 1.
-- **Adding new documentation content.** If a README omits a feature, this plan does not
-  invent a section for it; it only fixes claims that are present and wrong.
-- **Translating READMEs into the docs spine.** `DOCS_SDK_SPINE_PLAN.md` owns the site's SDK
-  spine; READMEs stay READMEs.
-- **Badge/CI-status policy.** Where a badge is present it must point at the right package;
-  adding badges where none exist is not proposed.
+- **`web/`.** The site, its content pages, and its 18 content READMEs are out of scope. This
+  plan links *to* those pages; it does not edit them.
+- **Non-README files.** Two adjacent defects surfaced and are filed separately (end of plan).
+- **Restructuring non-root READMEs.** Stage 0 restructures the root front door only. The other
+  27 files get corrections, not re-authoring.
+- **Renaming Net or reframing it as an MCP utility.** The mesh stays the identity; agent
+  capability federation is the wedge, per `DOCS_STRATEGY_PLAN.md:41–55`.
+- **Adding new documentation content** beyond the Stage 0 example. If a README omits a feature,
+  this plan does not invent a section for it.
+- **Translating READMEs into the docs spine.** `DOCS_SDK_SPINE_PLAN.md` owns the site spine.
+- **Badge/CI-status policy.** Where a badge exists it must point at the right package; adding
+  badges where none exist is not proposed.
 
 ---
 
 ## Scope — 28 files
 
-| Tier | Files | Count |
-|---|---|---|
-| A. Root + meta | `README.md`; `net/crates/net/README.md`; `docs/internal/README.md`; `docs/data/README.md` | 4 |
-| B. SDK surfaces | `sdk/`; `sdk-ts/`; `sdk-py/`; `sdk-macros/`; `bindings/python/`; `bindings/python/src/` | 6 |
-| C. CLI / Deck + packaging | `cli/`; `cli/npm/`; `cli/python/`; `deck/`; `deck/npm/`; `deck/python/` | 6 |
-| D. Bindings / C / Go / integrations / skills | `go/`; `include/`; `bindings/node/`; `bindings/go/net/`; `integrations/hermes/`; `.claude/skills/`; `.claude/skills/net-event-bus/examples/` | 7 |
-| E. Tests / tools / demos | `tools/binary-size/`; `tests/natsim/`; `tests/cross_lang_payments/`; `tests/cross_lang_capability/`; `docs/demos/dir_transfer/` | 5 |
+| Tier | Files | Count | Workstream |
+|---|---|---|---|
+| A. Root + meta | `README.md`; `net/crates/net/README.md`; `docs/internal/README.md`; `docs/data/README.md` | 4 | **Positioning** (root) + accuracy |
+| B. SDK surfaces | `sdk/`; `sdk-ts/`; `sdk-py/`; `sdk-macros/`; `bindings/python/`; `bindings/python/src/` | 6 | accuracy |
+| C. CLI / Deck + packaging | `cli/`; `cli/npm/`; `cli/python/`; `deck/`; `deck/npm/`; `deck/python/` | 6 | accuracy |
+| D. Bindings / C / Go / integrations / skills | `go/`; `include/`; `bindings/node/`; `bindings/go/net/`; `integrations/hermes/`; `.claude/skills/`; `.claude/skills/net-event-bus/examples/` | 7 | accuracy |
+| E. Tests / tools / demos | `tools/binary-size/`; `tests/natsim/`; `tests/cross_lang_payments/`; `tests/cross_lang_capability/`; `docs/demos/dir_transfer/` | 5 | accuracy |
 
 ## Pre-flight — complete
 
@@ -75,16 +104,16 @@ the `cli/` and `deck/` clap/enum sources, the fixtures and example dirs on disk,
 `web/src/content/docs/` page tree (including the adaptive-route projection in
 `web/src/lib/docs.ts`). Findings carry `path:line` evidence.
 
+The positioning review separately read the root README, `DOCS_STRATEGY_PLAN.md:31–55`, and
+representative root/package READMEs. Its six changes are dispositioned above.
+
 Confirmed invariants the plan relies on:
 
-- All published surfaces are lockstep **0.36.0** (`sdk/Cargo.toml`, `sdk-ts/package.json`,
-  `sdk-py/pyproject.toml`, `bindings/node/package.json`, `cli/npm|python`, `deck/npm|python`,
-  `bindings/python/pyproject.toml`).
-- Dual license `MIT OR Apache-2.0` is declared in every crate/package/pyproject manifest.
-- `net/crates/net/include/` holds **11** `.h` files; `net/crates/net/examples/` holds **8**
-  `.c` examples.
-- Version strings and cross-links in READMEs are unqualified by release; the only pinned
-  version in any README is `sdk-macros/README.md`'s `0.24` — stale (see Stage 3).
+- All published surfaces are lockstep **0.36.0**.
+- Dual license `MIT OR Apache-2.0` is declared in every manifest.
+- `net/crates/net/include/` holds **11** `.h` files; `net/crates/net/examples/` holds **8** `.c`
+  examples.
+- The only pinned version in any README is `sdk-macros/README.md`'s `0.24` — stale.
 
 **Baseline size.** 28 files, ≈231 KB, last touched between 2026-05-17 and 2026-08-10 — none
 refreshed since before the current cut.
@@ -93,26 +122,100 @@ refreshed since before the current cut.
 
 ## Decisions
 
-**D1 — Until now, packaging READMEs duplicate the parent README's shared prose (byte-identical
-blocks), with only the install section swapped.** Options: *(a)* keep the duplication and
-enforce a mirror rule; *(b)* slim `cli/npm|python` and `deck/npm|python` to install + a short
-header, deleting the shared tables.
+**D1 — Registry-page self-containment.** The packaging READMEs (`cli/npm|python`, `deck/npm|python`)
+currently duplicate the parent README's shared prose byte-for-byte with only the install section
+swapped. The first draft proposed keeping the full duplication and enforcing a whole-file
+byte-match; the review rejected that: *readers need a complete package page, but every registry
+does not need the parent's entire presentation.*
 
-**Choose (a).** The registry README *is* the package page on npm/PyPI; a reader there never
-sees the parent README, so deleting the tables removes the only copy they will read. Keep the
-duplication, but make it enforceable: the two CLI siblings must byte-match the parent outside
-the install block, and likewise the two Deck siblings. Stage 1's checker asserts this, which is
-what makes the duplication safe rather than a standing drift hazard.
+**Choose (modified): a shared-facts contract.** Registry pages stay self-contained, but the
+enforced invariant is the set of **shared facts** — package name, install command, license,
+current version, and the capability-federation one-liner — plus the designated shared block(s)
+(e.g. the subcommand/tab table). Per-registry framing and section selection may differ. Stage 5
+checks *facts*, not every word.
 
-**D2 — Whether the Stage 5 checkers become a CI job.** Options: *(a)* throwaway scripts run at
-the end of this work; *(b)* a permanent `.github/scripts/check-readmes.py` pinned in `ci.yml`.
+**D2 — Whether the Stage 5 checkers become a CI job.** Options: *(a)* throwaway scripts;
+*(b)* a permanent `.github/scripts/check-readmes.py` pinned in `ci.yml`.
 
 **Recommend (b), scoped.** The repository already treats drift as a CI problem
-(`check-spine-symbols.py`, the routing-witness floors, the integration-test pin guard), and the
-link/table checks are cheap and deterministic. Pin the *link-resolution* and *table-vs-source*
-checks only; do not gate on prose. Because `ci.yml` is path-filtered on `net/**`, a README
-change already triggers the relevant jobs. Left open for the owner; Stages 1–4 proceed either
-way.
+(`check-spine-symbols.py`, the routing-witness floors). Pin only the *link-resolution* and
+*facts-vs-source* checks; do not gate on prose or presentation. Left open; Stages 0–4 proceed
+either way.
+
+---
+
+## Stage 0 — Root README positioning rewrite
+
+**Cost:** 1–1½ days (copy plus one executive review pass).
+**Output:** a restructured `README.md` front door that leads with federation, shows one working
+system, and scopes its claims where they first appear.
+
+**Evidence the rewrite is answering** (line refs are on the current root README):
+
+| Current material | Positioning consequence |
+|---|---|
+| `README.md:12` "…systems engineers said was impossible" | asks the reader to accept an unnamed adversary and an extraordinary victory |
+| `README.md:12` "Existing networks operate in milliseconds (10⁻³). Net operates in nanoseconds (10⁻⁹)." | invites an apples-to-oranges objection before the benchmark scope is stated |
+| `README.md:183–193` nanosecond-scale failure detection / sub-microsecond fail-and-recover | reads as a distributed operational promise; in fact it is local decision computation |
+| `README.md:542` "All numbers below measure **packet scheduling** … they do not include NIC transfer, wire latency, or speed-of-light propagation" | the correct qualification — buried several screens below the claim it qualifies |
+| repeated arguments against TCP, brokers, registries, cloud | reads as a demand to replace everything, rather than a system that fits an estate |
+
+**Required outcomes (from the review):**
+
+1. **Lead with capability federation; let architecture be the reason to believe.** Preserve the
+   layered positioning frozen in `DOCS_STRATEGY_PLAN.md:41–55` — immediate agentic use case on
+   top, broader substrate underneath — without compressing Net into "just discovery." The
+   differentiator is that discovery, invocation, identity, authority and artifact movement are
+   **one coherent system**, not adapters the customer assembles.
+
+2. **One concrete system before the component catalogue.** A worked example (a GPU-backed
+   service, a document-processing tool, or similar provider) showing the whole relationship:
+   what the caller discovers, what it invokes, **what result it receives**, **what happens on
+   failure**, and how the provider's owner retains control over access. No channels/nRPC/subnets/
+   daemons/Dataforts catalogue before this.
+
+3. **Scope performance and recovery claims at first appearance.** Move the
+   `README.md:542` qualification up to the first performance claim (`README.md:12`), and make the
+   rerouting passage state plainly that nanosecond failure detection and recovery are **local
+   decision latency**, not wire or end-to-end time. Keep the performance story — state precisely
+   what is fast, then show why it matters to a workload.
+
+4. **Reposition the Cyberpunk origin and the affiliation disclaimer** below the product
+   explanation. Keep the aesthetic; stop making the licensing disclaimer the first substantive
+   introduction.
+
+**Proposed sequence** (a reading of the review's preferred order; the exact ordering is still
+open and should be confirmed before copy is finalized):
+
+1. One-sentence what + the capability-federation lead.
+2. The concrete worked system (outcome, failure path, authority).
+3. Install / quickstart per language.
+4. Why the pieces compose — identity, discovery, typed RPC, streams, durable state, artifacts on
+   one substrate.
+5. The architecture / why the mesh — the reason to believe, with claims scoped inline.
+6. Component catalogue.
+7. Benchmarks (already scoped; keep).
+8. Origin + Cyberpunk character + disclaimer.
+9. License.
+
+**Copy direction** (from the review; a direction, not final copy):
+
+> Net connects agents, services, and devices into a capability mesh.
+>
+> Discover what another machine can do, invoke it through typed RPC, and move artifacts between
+> participants while resource owners retain control over access.
+>
+> Underneath is a latency-first encrypted mesh, with shared primitives for identity, discovery,
+> streams, durable state, and execution across heterogeneous machines.
+
+**Acceptance.** A cold reader understands what Net enables and why they might need it; one
+working example demonstrates the central value; no performance or recovery claim appears before
+its scope; no passage demands wholesale replacement of an existing stack; the brand and mesh
+identity are intact; `## Contents` anchors are re-synced after the restructure.
+
+**Risk.** Medium — this is judgment work, not a lookup, and it touches the repository's most
+public file. Mitigation: one review pass with the same reviewer before merge, and the accuracy
+stages keep the factual base clean underneath it.
 
 ---
 
@@ -124,45 +227,34 @@ version fixed.
 
 **Deliverables:**
 
-1. **License (6 files).** Replace the bare `Apache-2.0` statement with `MIT OR Apache-2.0` and
-   license links, matching the package metadata:
-   - `net/crates/net/cli/npm/README.md` (package.json: `MIT OR Apache-2.0`)
-   - `net/crates/net/cli/python/README.md` (pyproject: `MIT OR Apache-2.0`)
-   - `net/crates/net/deck/npm/README.md`
-   - `net/crates/net/deck/python/README.md`
-   - `net/crates/net/bindings/node/README.md`
-   - `net/crates/net/bindings/go/net/README.md`
+1. **License (6 files).** Replace bare `Apache-2.0` with `MIT OR Apache-2.0` + license links:
+   `cli/npm/`, `cli/python/`, `deck/npm/`, `deck/python/`, `bindings/node/`, `bindings/go/net/`.
 
 2. **Broken license links (1 file).** `.claude/skills/README.md` links `LICENSE-APACHE` /
-   `LICENSE-MIT` relative to its own directory, where neither exists (the dir holds only
-   `README.md`, `net-event-bus/`, `net-payments/`). Add the two files, or point at the
+   `LICENSE-MIT` relative to a directory that contains neither. Add the files, or point at the
    repo-root copies.
 
-3. **Duplicate blocks (1 file).** `README.md` repeats the `opensrc` fetch block — once inline
-   after the skills block, once under `### Give the agent the source too`. Delete one.
+3. **Duplicate blocks (1 file).** `README.md` repeats the `opensrc` fetch block — inline and
+   again under `### Give the agent the source too`. Delete one. (Stage 0 rewrites this region;
+   land the dedupe there if Stage 0 precedes it.)
 
-4. **Link style (1 file).** `README.md:14` links
-   `https://github.com/ai-2070/net/blob/master/web/src/content/docs/worldview` — a directory,
-   which `/blob/` cannot serve. Replace with a relative path or the docs-site URL.
+4. **Link style (1 file).** `README.md:14` links a GitHub `/blob/…/worldview` **directory**
+   (404). Replace with a relative path or the docs-site URL.
 
-5. **Stale version (1 file).** `net/crates/net/sdk-macros/README.md` pins
-   `net-mesh-sdk = { version = "0.24", … }`; the workspace is `0.36.0`. Update.
+5. **Stale version (1 file).** `sdk-macros/README.md` pins `net-mesh-sdk = "0.24"` → `0.36`.
 
 6. **Wrong in-repo path (1 file).** `README.md:243` cites `bindings/coverage.md`, which exists
-   only under `.claude/skills/net-event-bus/bindings/` and `.claude/skills/net-payments/bindings/`.
-   Give the qualified path.
+   only under `.claude/skills/{net-event-bus,net-payments}/bindings/`.
 
-**Acceptance.** No README contains a bare `Apache-2.0` license claim; no in-repo link in the
-touched files points at a non-existent path.
-
-**Risk.** Low. Every change is a string substitution with a manifest or a directory listing as
-the oracle.
+**Acceptance.** No README claims bare `Apache-2.0`; no in-repo link in a touched file points at
+a missing path.
+**Risk.** Low — string substitutions with a manifest or directory listing as the oracle.
 
 ---
 
 ## Stage 2 — Factual corrections to code-facing claims
 
-**Cost:** 1–1½ days, concentrated in the CLI/Deck and bindings tables.
+**Cost:** 1–1½ days.
 **Output:** every table/list in the affected READMEs matches the code it describes.
 
 ### 2a. Crate README (`net/crates/net/README.md`)
@@ -214,13 +306,11 @@ the oracle.
 | `docs/internal/README.md` | folder table omits `reviews/`, `audits/`; "244 files / 7 MB" and migration-path list stale | add rows; recount or drop figures |
 | `docs/data/README.md` | "`docs/` … contained only `internal/`" false (`docs/misc/` exists); record table omits `spine-symbols.yaml` | reword; add row |
 
-**Acceptance.** For CLI/Deck, the tables diff cleanly against the clap `Command` enum, the
-`Cli` global-flags struct, `ExitCodeKind`, and the Deck `Tab` enum/labels. For the feature
-tables, against `Cargo.toml` / `package.json`.
-
-**Risk.** Medium for the CLI/Deck tables — the mirror rule means each parent edit must be
-replicated into two siblings. Stage 5's byte-match check is the guard; do the parent first and
-propagate in the same commit.
+**Acceptance.** CLI/Deck tables diff cleanly against the clap `Command` enum, the `Cli`
+global-flags struct, `ExitCodeKind`, and the Deck `Tab` enum/labels; feature tables against
+`Cargo.toml` / `package.json`.
+**Risk.** Medium for CLI/Deck — the mirror rule means each parent edit is replicated into two
+siblings. Do the parent first and propagate in the same commit (Stage 5 checks the shared facts).
 
 ---
 
@@ -242,39 +332,37 @@ propagate in the same commit.
 **Manifest defect fixed in the same stage (not a README):** `sdk-py/pyproject.toml` has no
 `readme` field, so the PyPI long-description is blank. Add `readme = "README.md"`.
 
-**Acceptance.** The Go and Python snippets compile against `go/` and `bindings/python/`
-respectively (build once, run the sample); the TS `napi` invocation is accepted by cargo
-(feature set exists); the pyproject metadata reports a non-empty description.
-
-**Risk.** Low–medium. `sdk-py` and `go` samples need a real build to prove; the bindings/python
-internals doc needs a source read, not a build.
+**Acceptance.** Go and Python snippets compile/run against `go/` and `bindings/python/`; the TS
+`napi` feature set is accepted by cargo; the pyproject metadata reports a non-empty description.
+**Risk.** Low–medium. `sdk-py` and `go` need a real build to prove.
 
 ---
 
-## Stage 4 — Docs-guide link parity and remaining structure
+## Stage 4 — Per-package next action, not a link dump
 
 **Cost:** ½ day.
-**Output:** the SDK READMEs link a consistent, complete guide set; the last two relative-path
-defects are fixed.
+**Output:** each SDK-facing README presents a short, prioritized route; the last two
+relative-path defects are fixed.
 
-1. **SDK guide-line parity.** The four SDK-facing READMEs (`sdk/`, `sdk-ts/`, `sdk-py/`,
-   `bindings/python/`) link a **different subset** of the guides. Canonical set per lens = the
-   union of guides that exist under `web/src/content/docs/guides/` plus
-   `worldview/right-and-wrong-use-cases` and `start/claude-skills`. Additions:
-   - all four: `production-deployment` (linked by none today)
-   - `sdk-ts/`, `sdk-py/`: `gang-scheduler`, `task-lifecycle`
-   - `bindings/python/`: `gang-scheduler`, `task-lifecycle`, `wrap-mcp-server`,
-     `expose-net-as-mcp`, `private-capabilities`, `right-and-wrong-use-cases`,
-     `start/claude-skills`, and a `## Links` section (the only SDK README without one)
-   - `bindings/python/`: note that its quickstart link documents the `net_sdk` wrapper
+The first draft set "every README links the union of all guides" as the goal. The review
+rejected that: *give readers a short, prioritized route; complete navigation belongs on the
+documentation site.* So this stage **curates**, it does not enumerate.
+
+1. **Prioritized route (each SDK-facing README: `sdk/`, `sdk-ts/`, `sdk-py/`, `bindings/python/`).**
+   A four-step route: **quickstart → the next useful task → deployment → reference.** Concretely,
+   link the lens quickstart, one task guide appropriate to that lens, `guides/production-deployment`,
+   and the lens's `errors` / reference page. `production-deployment` is added everywhere (linked
+   by none today); `task-lifecycle` / `gang-scheduler` are added only to the lenses that expose
+   the scheduler. `bindings/python/` gets a short `## Links` section in the same shape (it is the
+   only SDK README without one). **Do not** add the full guide set; a link list that mirrors the
+   site is not the goal.
 
 2. **`include/README.md`** — example paths say `examples/basic.c` etc., but that directory does
-   not exist; the files are at `net/crates/net/examples/` (and there are 8, not 3). Use
-   `../examples/*.c`.
+   not exist; the files are at `net/crates/net/examples/` (8 of them, not 3). Use `../examples/*.c`.
 
-3. **`docs/demos/dir_transfer/README.md`** — `docs/cli/TRANSFER.md` is written
-   crate-root-relative but resolves from `docs/demos/dir_transfer/`; fix to
-   `../../cli/TRANSFER.md`, and link `FETCH_DIR_ATOMIC_PLAN.md` properly.
+3. **`docs/demos/dir_transfer/README.md`** — `docs/cli/TRANSFER.md` resolves from
+   `docs/demos/dir_transfer/`; fix to `../../cli/TRANSFER.md`, and link
+   `FETCH_DIR_ATOMIC_PLAN.md` properly.
 
 4. **`.claude/skills/README.md`** — the skill file maps omit `subnet-auth.md`,
    `source-access.md`, and each skill's `bindings/` directory. Add rows.
@@ -285,10 +373,9 @@ defects are fixed.
 6. **`tests/natsim/README.md`**, **`tests/cross_lang_payments/README.md`** — audited clean;
    re-verify in Stage 5 only.
 
-**Acceptance.** Each SDK README's guide links are a superset of the canonical set; the link
-checker in Stage 5 reports zero unresolved relative paths and zero doc-site 404s.
-
-**Risk.** Low. Link additions only.
+**Acceptance.** Each SDK README presents an ordered short route and every link resolves; no
+README is a link dump; the two relative-path defects are fixed.
+**Risk.** Low.
 
 ---
 
@@ -300,23 +387,23 @@ checker in Stage 5 reports zero unresolved relative paths and zero doc-site 404s
 **Checks:**
 
 1. **Link resolution.** Extract every Markdown link from all 28 files. Absolute URLs → HEAD/GET
-   (doc-site links resolve through the adaptive route projection in `web/src/lib/docs.ts`;
-   spot-verified live during the audit). Relative paths → `os.path.exists` resolved against the
-   *file's own* directory.
+   (doc-site links resolve through the adaptive-route projection in `web/src/lib/docs.ts`).
+   Relative paths → `os.path.exists` resolved against the *file's own* directory.
 2. **CLI table.** Build `net-mesh` once; diff the README subcommand table, global-flags list and
    exit-code table against `--help`, the `Cli` struct, and `ExitCodeKind`.
 3. **Deck table.** Diff the Tabs table against the `Tab` enum labels.
 4. **Feature tables.** Diff each README feature matrix against `Cargo.toml [features]` /
    `package.json`.
-5. **Sibling byte-match (D1).** Assert `cli/npm` + `cli/python` match `cli/` outside the install
-   block, and likewise for the Deck family.
+5. **Shared facts (D1).** Assert package name, install command, license and version are present
+   and equal across each packaging family (`cli/` + `cli/npm/` + `cli/python/`; `deck/` + npm +
+   Python), and that designated shared blocks (subcommand / tab table) match. **Not** a
+   whole-file byte-match.
 6. **Packaging.** `cargo package --list -p net-mesh -p net-mesh-sdk -p net-mesh-sdk-macros` and a
    `pyproject.toml` metadata read to confirm every README is the declared long-description.
 
 **Acceptance.** All six checks green. If D2 is taken, `.github/scripts/check-readmes.py` is
-pinned in `ci.yml` and the failing-case names are specific (per AGENTS.md's
-no-silent-skip culture: `--no-tests=fail`-style — never a check that passes by matching
-nothing).
+pinned in `ci.yml` with specific failing-case names — never a check that passes by matching
+nothing (AGENTS.md's no-silent-skip culture).
 
 ---
 
@@ -324,35 +411,46 @@ nothing).
 
 | Stage | Lands as | Reversible by |
 |---|---|---|
-| 1 | one PR, mechanical string edits across 8 files | revert the PR |
+| 0 | one PR touching `README.md` only; one review pass before merge | revert the PR |
+| 1 | one PR, mechanical edits across 8 files | revert the PR |
 | 2 | two PRs: crate+meta; CLI+Deck families (+bindings/integrations) | revert per PR |
 | 3 | one PR, samples + the `sdk-py` manifest field | revert the PR |
-| 4 | one PR, link additions and path fixes | revert the PR |
+| 4 | one PR, curated routes and path fixes | revert the PR |
 | 5 | scripts + optional CI job (D2) | drop the job / the scripts |
 
-Budget: **2½–3 person-days** across five stages. Stage 1 is independently valuable (it fixes
-the wrong-license and broken-link surface with no judgment calls); Stage 2 is the bulk; Stages
-3–4 are bounded; Stage 5 is the ratchet.
+Budget: **3½–4½ person-days** across six stages. Stage 0 is the positioning deliverable and can
+land first (it is `README.md`-only); Stages 1–5 are the accuracy workstream and can proceed in
+parallel with its review. Stage 1 is independently valuable (wrong-license and broken-link
+surface, no judgment calls); Stage 2 is the bulk; Stages 3–4 are bounded; Stage 5 is the ratchet.
 
 **Sibling-lockstep rule.** Within Stage 2, edit `cli/README.md` and `deck/README.md` first, then
-propagate the identical shared blocks into their npm/Python siblings in the same commit. Do not
+propagate the shared facts and blocks into their npm/Python siblings in the same commit. Do not
 edit a sibling before its parent.
 
 ---
 
+## Overall acceptance
+
+- A cold reader understands what Net enables and why they might need it.
+- One working example demonstrates the central value.
+- Performance and recovery claims are scoped where they first appear.
+- The product fits an existing stack without demanding a wholesale replacement.
+- Each package README offers a clear next action.
+- Every README is factually accurate against the code, uniformly licensed, and link-clean.
+
 ## What this plan does NOT address (cross-references)
 
 - **Docs-site content.** `DOCS_POLYGLOT_LENS_PLAN.md` (composition, routing, the SDK spine),
-  `DOCS_STRATEGY_PLAN.md` (positioning, worldview), `DOCS_SDK_SPINE_PLAN.md`.
+  `DOCS_STRATEGY_PLAN.md` (positioning, worldview — and the reconciliation obligation this plan
+  satisfies), `DOCS_SDK_SPINE_PLAN.md`.
 - **Skill content.** `SKILLS_LANGUAGE_ROUTING_PLAN.md` and `SKILLS_VERIFICATION_PLAN.md` own the
-  skill bodies; this plan only fixes the skill directory READMEs' links and maps.
+  skill bodies; this plan only fixes skill directory README links and maps.
 - **CI lint/format discipline.** `PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md` owns the lint gates;
-  D2 here would add one more checker script of the `check-spine-symbols.py` kind.
-- **Package publishing.** No manifest is changed except the missing `sdk-py` `readme` field,
-  which is a packaging defect the audit surfaced, not a version or dependency change.
+  D2 here would add one more checker of the `check-spine-symbols.py` kind.
+- **Package publishing.** No manifest changes except the missing `sdk-py` `readme` field.
 - **`web/` release-note fixture count.** `RELEASE_v0.13_CHIPPIN_IN.md` states "thirteen
-  golden-vector fixtures" for `tests/cross_lang_capability/`, which holds 8. Out of scope
-  (web/); file separately.
+  golden-vector fixtures" for `tests/cross_lang_capability/`, which holds 8. Out of scope (web/);
+  file separately.
 
 ## Adjacent defects (filed separately, not part of this pass)
 
