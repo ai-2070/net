@@ -224,6 +224,23 @@ mod natsim {
         // the responder was disabled AND the gateway drops
         // unsolicited inbound; only the second is by design).
         cfg.serve_stun = true;
+        // **The SECOND announced endpoint (Stage 6 §6.12.2).**
+        //
+        // A separate UDP socket that serves STUN and is never an ICE
+        // peer, announced as `rtc_stun_addr`. Two flags, not one
+        // derived port: `--stun-bind` is where the socket sits and
+        // `--stun-public` is what a NAT'd anchor is told its mapping
+        // is — the same split `--rtc-bind` / `--rtc-public` has, and
+        // for the same reason. A node given neither announces no
+        // second endpoint and behaves exactly as before.
+        cfg.stun_addr = flags.get("stun-bind").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--stun-bind must be IP:PORT, got {s:?}"))
+        });
+        cfg.stun_public_addr = flags.get("stun-public").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--stun-public must be IP:PORT, got {s:?}"))
+        });
         // A real network between the endpoints, not loopback: give ICE
         // room for the restricted-cone pinhole to open (the anchor's
         // first outbound check is what makes the client's checks
@@ -245,6 +262,14 @@ mod natsim {
         /// so every existing scenario's info file still parses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rtc_addr: Option<String>,
+        /// The `rtc_stun_addr` this node actually **announced** — the
+        /// separate STUN endpoint of Stage 6 §6.12.2, read back out
+        /// of the same emitted announcement rather than echoed from
+        /// `--stun-public`. A peer that wants to use the anchor as a
+        /// STUN server learns it from here, which is the only place
+        /// the product puts it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtc_stun_addr: Option<String>,
     }
 
     async fn wait_for_file(path: &Path) -> Vec<u8> {
@@ -438,6 +463,7 @@ mod natsim {
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
                 rtc_addr: None,
+                rtc_stun_addr: None,
             },
         );
 
@@ -533,6 +559,7 @@ mod natsim {
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
                 rtc_addr: None,
+                rtc_stun_addr: None,
             },
         );
 
@@ -603,10 +630,15 @@ mod natsim {
         // pre-announce version.
         #[cfg(feature = "webrtc")]
         if rtc_enabled {
-            let announced = node
-                .local_announcement_for_test()
-                .and_then(|ann| ann.rtc_addr)
-                .map(|a| a.to_string());
+            // BOTH announced endpoints, read out of the SAME emitted
+            // announcement. `rtc_stun_addr` is the second one
+            // (§6.12.2); taking it from the announcement rather than
+            // from `--stun-public` is what makes the leg able to
+            // assert the anchor announced its MAPPED address and not
+            // the private socket it binds.
+            let ann = node.local_announcement_for_test();
+            let announced = ann.as_ref().and_then(|a| a.rtc_addr).map(|a| a.to_string());
+            let announced_stun = ann.as_ref().and_then(|a| a.rtc_stun_addr.clone());
             write_info(
                 &state,
                 &NodeInfo {
@@ -615,6 +647,7 @@ mod natsim {
                     pubkey_hex: hex::encode(node.public_key()),
                     addr: bind.to_string(),
                     rtc_addr: announced,
+                    rtc_stun_addr: announced_stun,
                 },
             );
         }
@@ -742,14 +775,46 @@ mod natsim {
                 let learned_noise_key =
                     node.peer_announced_noise_pubkey(tinfo.node_id) == Some(t_pk);
 
-                // The anchor rewrote its info file with the `rtc_addr`
-                // it announced before it wrote `<target>_ready`, which
-                // this initiator already awaited — so this read cannot
-                // observe the pre-announce version.
-                let anchor_rtc_addr = wait_for_info(&state, &target).await.rtc_addr;
+                // The anchor rewrote its info file with the two
+                // endpoints it announced before it wrote
+                // `<target>_ready`, which this initiator already
+                // awaited — so this read cannot observe the
+                // pre-announce version.
+                let anchor_info = wait_for_info(&state, &target).await;
+                let anchor_rtc_addr = anchor_info.rtc_addr;
+                let anchor_stun_addr = anchor_info.rtc_stun_addr;
+
+                // **The SECOND announced endpoint, probed for real
+                // (Stage 6 §6.12.2).**
+                //
+                // One unsolicited binding request from a fresh
+                // socket, aimed at `rtc_stun_addr` — the address the
+                // ANCHOR ANNOUNCED, not a flag this process was
+                // given. Unlike the `rtc_addr` probe below, this one
+                // is expected to be ANSWERED: an ICE socket behind an
+                // address-restricted cone is reachable only after its
+                // own outbound opens the mapping, while a STUN
+                // endpoint that drops a stranger's first request
+                // could never serve the peers it is announced to, so
+                // `setup.sh --stun-port-a` forwards that single port.
+                //
+                // What the reply establishes is the part local sockets
+                // cannot: the request crossed the gateway to a
+                // private socket, was served, and the response came
+                // back — and its XOR-MAPPED-ADDRESS is this client's
+                // own public tuple as the ANCHOR saw it. Two
+                // externally reachable mappings on one NAT'd anchor,
+                // each observed with its own reply.
+                //
+                // Probed BEFORE the binding below, which shadows the
+                // function's own name.
+                let stun_endpoint_probe = match anchor_stun_addr.as_deref() {
+                    Some(addr) => stun_probe(addr).await,
+                    None => StunProbe::default(),
+                };
 
                 // **R8, evidence half.** One unsolicited binding
-                // request aimed at the announced address, from a
+                // request aimed at the announced RTC address, from a
                 // FRESH socket. Under this topology it is expected to
                 // be dropped, and that is worth recording rather than
                 // asserting: the cone gateway is address-restricted
@@ -830,6 +895,17 @@ mod natsim {
                                         evidence, not a verdict",
                     "stun_probe_target": stun_probe.target,
                     "stun_probe_mapped": stun_probe.mapped,
+                    // **The second announced endpoint (§6.12.2).**
+                    // The address the anchor ANNOUNCED for STUN, and
+                    // whether a stranger's binding request to it was
+                    // answered — which is the only way a mapping is
+                    // observed from outside rather than asserted from
+                    // inside. `stun_endpoint_mapped` is this client's
+                    // own public tuple as the anchor saw it.
+                    "anchor_stun_addr": anchor_stun_addr,
+                    "stun_endpoint_probe_ok": stun_endpoint_probe.ok,
+                    "stun_endpoint_target": stun_endpoint_probe.target,
+                    "stun_endpoint_mapped": stun_endpoint_probe.mapped,
                     // **R8, verdict half.** The address the client's
                     // ICE stack is actually transmitting to, and
                     // WHERE IT CAME FROM. `signalled` means it was

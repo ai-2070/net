@@ -49,6 +49,70 @@ const announces = { ok: 0, failed: 0, lastError: null, timer: null };
 /// rather than the row.
 const ANNOUNCE_EVERY_MS = 1000;
 
+/// This side's half of the application exchange.
+///
+/// `seen` is the nonce the PEER minted, decoded from a frame that
+/// arrived here. It is the only field that cannot be produced
+/// locally, which is why the row asserts on it rather than on the
+/// counts beside it.
+const app = {
+  stream: null,
+  mine: null,
+  expect: null,
+  seen: null,
+  sent: 0,
+  received: 0,
+  echoes: 0,
+  lastError: null,
+};
+
+/// How many frames one side sends, and the gap between them.
+///
+/// `fireAndForget` is the reliability class these rows exercise, so
+/// a handful of frames is the honest shape: one frame would make a
+/// single drop look like a broken path, and a flood would make the
+/// anchor's per-pair counter delta depend on how fast the loop ran.
+const APP_FRAMES = 4;
+const APP_GAP_MS = 100;
+
+/// The exchange's frame: a fixed prefix and 16 hex nonce digits.
+///
+/// Deliberately not JSON and deliberately not a bare nonce: the
+/// prefix means a frame from anything else on this stream id is
+/// ignored rather than decoded into a nonce comparison, and the
+/// fixed length means a truncated frame cannot read as a shorter
+/// nonce that happens to match.
+const APP_PREFIX = 'natsim-app:';
+
+function encodeNonce(nonce) {
+  return new TextEncoder().encode(`${APP_PREFIX}${nonce}`);
+}
+
+function decodeNonce(payload) {
+  let text;
+  try {
+    text = new TextDecoder().decode(payload);
+  } catch (e) {
+    return null;
+  }
+  if (!text.startsWith(APP_PREFIX)) return null;
+  const nonce = text.slice(APP_PREFIX.length);
+  return /^[0-9a-f]{16}$/.test(nonce) ? nonce : null;
+}
+
+/// The PUBLIC peer-addressed stream. `peer` is what the package
+/// gained in slice 6 and what a page needs to put application bytes
+/// on a direct session at all; nothing here names a key, an SDP or
+/// an address.
+async function openAppStream(peerHex, streamId) {
+  return node.openStream({
+    reliability: 'fireAndForget',
+    peer: peerHex,
+    streamId,
+    label: `natsim-app-${TAB}`,
+  });
+}
+
 async function log(line) {
   logEl.textContent += line + '\n';
   try {
@@ -339,6 +403,128 @@ async function execute(step) {
       out.counters = counters();
       out.rtc = await iceReport();
       return out;
+    }
+
+    // --- the application exchange -------------------------------
+    //
+    // A row's three original witnesses are all statements about a
+    // DIALOG: the typed outcome, the ICE ledgers, the gateways'
+    // conntrack. None of them observes an application payload, and
+    // on a relayed row the disposition does not even claim one —
+    // `iceTimeout` means the routed session was kept, not that a
+    // byte crossed it.
+    //
+    // These two steps put nonce-correlated bytes on the public
+    // peer-addressed stream surface in BOTH directions. The nonces
+    // come from the runner: a page that minted its own could report
+    // a value it had also sent, and "B decoded exactly what A sent"
+    // would then be satisfiable by one side on its own.
+
+    case 'app_arm': {
+      // The ANSWERER's half, armed before the offerer sends
+      // anything. `fireAndForget` keeps nothing for a receiver that
+      // is not attached yet, so arming after the first frame would
+      // lose it — the same ordering `arm_accept` needs and for the
+      // same reason.
+      if (!node) return { ok: false, detail: 'app_arm before connect' };
+      if (app.stream) return { ok: true, already: true };
+      try {
+        app.stream = await openAppStream(step.peer, step.stream_id);
+      } catch (e) {
+        return { ok: false, ...typed(e) };
+      }
+      app.expect = step.expect_nonce;
+      app.mine = step.nonce;
+      app.stream.onMessage((payload) => {
+        const seen = decodeNonce(payload);
+        if (!seen) return;
+        app.received += 1;
+        if (seen !== app.expect) return;
+        app.seen = seen;
+        // THE ECHO. Sent from inside the receive callback so the
+        // answer is caused by the arrival rather than by a timer
+        // that might have fired either way — the reverse direction
+        // has to be an answer to this exact frame.
+        if (app.echoes < APP_FRAMES) {
+          app.echoes += 1;
+          app.stream.send(encodeNonce(app.mine)).then(
+            () => {
+              app.sent += 1;
+            },
+            (e) => {
+              app.lastError = (e && (e.message || String(e))) || 'unknown';
+            },
+          );
+        }
+      });
+      return { ok: true };
+    }
+
+    case 'app_send': {
+      // The OFFERER's half: send this side's nonce until the peer's
+      // comes back. A bounded loop rather than one shot because the
+      // stream is `fireAndForget` — the reliability class the demo
+      // and these rows both use — so a lost frame is a normal event
+      // and not a verdict. It cannot rescue a wrong nonce: the
+      // assertion is exact equality and is made in `rows.rs`.
+      if (!node) return { ok: false, detail: 'app_send before connect' };
+      if (!app.stream) {
+        try {
+          app.stream = await openAppStream(step.peer, step.stream_id);
+        } catch (e) {
+          return { ok: false, ...typed(e) };
+        }
+      }
+      app.expect = step.expect_nonce;
+      app.mine = step.nonce;
+      app.stream.onMessage((payload) => {
+        const seen = decodeNonce(payload);
+        if (!seen) return;
+        app.received += 1;
+        if (seen === app.expect) app.seen = seen;
+      });
+      const deadline = performance.now() + (step.timeout_ms || 20000);
+      while (performance.now() < deadline && !app.seen) {
+        try {
+          await app.stream.send(encodeNonce(app.mine));
+          app.sent += 1;
+        } catch (e) {
+          app.lastError = (e && (e.message || String(e))) || 'unknown';
+          break;
+        }
+        await new Promise((r) => setTimeout(r, APP_GAP_MS));
+      }
+      // `ok` regardless of whether the nonce came back: a missing
+      // echo is a FINDING about the path, and the row fails on the
+      // reported nonce in `rows.rs` rather than here, where the
+      // message would carry none of the counters.
+      return {
+        ok: true,
+        seen_nonce: app.seen || '',
+        app_sent: app.sent,
+        app_received: app.received,
+        detail: app.lastError ? `last app stream error: ${app.lastError}` : '',
+        counters: counters(),
+      };
+    }
+
+    case 'app_result': {
+      if (!app.stream) return { ok: false, detail: 'app_result before app_arm' };
+      // Wait for the echo this side owes, bounded: the arrival that
+      // triggers it and the send it causes are both asynchronous, so
+      // the runner can ask before the callback has finished.
+      const deadline = performance.now() + (step.timeout_ms || 5000);
+      while (performance.now() < deadline && (!app.seen || app.sent === 0)) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return {
+        ok: true,
+        seen_nonce: app.seen || '',
+        app_sent: app.sent,
+        app_received: app.received,
+        detail: app.lastError ? `last app stream error: ${app.lastError}` : '',
+        counters: counters(),
+      };
     }
 
     case 'counters':

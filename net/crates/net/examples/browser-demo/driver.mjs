@@ -9,7 +9,7 @@
 // The harness driver belongs to the witness harness: it launches ONE
 // engine from a spec with Firefox profiles, WebKit, mDNS and
 // UDP-blocked knobs, and a TLS control. The demo needs a strict
-// subset (Chromium, two contexts, a page each) plus two things the
+// subset (Chromium, three contexts, a page each) plus two things the
 // harness must NOT have: a HEADED mode, and the three
 // throttling-defeat flags a 60 Hz send loop needs in a window that
 // may be occluded or backgrounded. Copying the harness driver's
@@ -95,13 +95,14 @@ async function opLaunch(req) {
   };
 }
 
-// TWO ISOLATED BROWSING CONTEXTS, one per tab.
+// THREE ISOLATED BROWSING CONTEXTS, one per tab.
 //
-// Not two tabs in one context: §8 gives an origin ONE node, and two
+// Not three tabs in one context: §8 gives an origin ONE node, and two
 // tabs on one origin share a storage partition and a Web Locks
 // namespace — so they would share one leaf identity and contend for
-// one leader election instead of being two peers. A separate context
-// is what makes "two tabs exchanging positions" two nodes.
+// one leader election instead of being separate peers. A separate
+// context per tab is what makes the demo's two position senders two
+// nodes, and the signalling prober a third.
 async function contextFor(name) {
   const existing = contexts.get(name);
   if (existing) return existing;

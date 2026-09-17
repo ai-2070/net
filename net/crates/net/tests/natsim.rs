@@ -462,6 +462,104 @@ fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
     );
 }
 
+/// **Both of a NAT'd anchor's announced endpoints, observed from
+/// outside the NAT, each with its own reply** (Kyra's E1 item 2).
+///
+/// The row above proves ONE mapping. This one adds the endpoint Stage
+/// 6 §6.12.2 introduced — the anchor's separate STUN socket,
+/// announced as `rtc_stun_addr` — and it is the leg the browser
+/// matrix structurally cannot supply: that matrix's anchor sits on
+/// the simulated internet with no NAT in front of it, where two
+/// local sockets establish nothing about two externally reachable
+/// mappings.
+///
+/// Four facts, and they are different facts:
+///
+/// 1. **Two announced addresses, both mapped.** `rtc_addr` and
+///    `rtc_stun_addr` are read back out of the anchor's own emitted
+///    announcement, and both must be the gateway's public tuples
+///    rather than the private sockets they bind.
+/// 2. **Two DIFFERENT ports.** One endpoint on one port is one
+///    endpoint; the separation is the §6.12.2 requirement, and it is
+///    asserted rather than assumed from the flags.
+/// 3. **The STUN mapping answers a stranger.** One unsolicited
+///    binding request from a fresh socket to the ANNOUNCED address
+///    gets a well-formed success response, and its
+///    XOR-MAPPED-ADDRESS is this client's own public tuple as the
+///    anchor saw it. That reply is the part a local socket cannot
+///    fake: the request crossed the gateway, was served inside, and
+///    came back.
+/// 4. **The RTC mapping carries a session.** A DataChannel installs
+///    at the announced `rtc_addr`, learned as a signalled candidate
+///    rather than peer-reflexively — the same provenance assertion
+///    the row above makes, on the other endpoint.
+///
+/// The two endpoints are reachable by deliberately DIFFERENT means,
+/// and `setup.sh` is where that asymmetry lives: the ICE port stays
+/// address-restricted (unsolicited inbound dropped, reachable once
+/// the anchor's own outbound opens the mapping) while the STUN port
+/// is forwarded, because an announced STUN endpoint that drops a
+/// stranger's first request could never serve the peers it is
+/// announced to. `stun_probe_ok` against `rtc_addr` therefore stays
+/// recorded-not-asserted, exactly as it is above.
+#[cfg(feature = "webrtc")]
+#[test]
+#[ignore = "requires root + Linux netns; run via the natsim CI job"]
+fn natsim_natted_anchor_publishes_both_mapped_endpoints() {
+    let v = scenario("rtc_anchor_stun_endpoint");
+    assert_eq!(v["ok"], true, "the relayed session must resolve: {v:#}");
+    assert_eq!(
+        v["anchor_rtc_addr"], "10.99.0.2:7101",
+        "the anchor must announce its MAPPED RTC socket: {v:#}",
+    );
+    assert_eq!(
+        v["anchor_stun_addr"], "10.99.0.2:7103",
+        "…and its MAPPED second endpoint, the §6.12.2 STUN socket it binds at \
+         192.168.101.2:7103 — an announced address the anchor's own gateway never produces is \
+         the defect this asserts against: {v:#}",
+    );
+    assert_ne!(
+        v["anchor_rtc_addr"], v["anchor_stun_addr"],
+        "the two endpoints must be two endpoints: libwebrtc consumes datagrams that arrive on \
+         an ICE port from an address configured as a STUN server, so an anchor announcing one \
+         address for both roles can never form a candidate pair with Chromium: {v:#}",
+    );
+    // The second endpoint, observed from outside the NAT.
+    assert_eq!(
+        v["stun_endpoint_target"], v["anchor_stun_addr"],
+        "the probe must have been aimed at the ANNOUNCED address, not at a flag: {v:#}",
+    );
+    assert_eq!(
+        v["stun_endpoint_probe_ok"], true,
+        "an unsolicited binding request to the announced STUN endpoint must be ANSWERED — a \
+         forwarded mapping that drops a stranger's first request is not an endpoint anything \
+         could be announced to: {v:#}",
+    );
+    let mapped = v["stun_endpoint_mapped"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the STUN reply must carry an XOR-MAPPED-ADDRESS: {v:#}"));
+    assert!(
+        mapped.starts_with("10.99.0.12:"),
+        "the reply must report THIS client's public tuple as the anchor saw it (10.99.0.12:*), \
+         which is what makes it a statement about a mapping rather than about a local socket; \
+         got {mapped}: {v:#}",
+    );
+    // The first endpoint, carrying a session — the same assertions
+    // the single-endpoint row makes, so this leg is a superset and
+    // not a substitute.
+    assert_eq!(v["transport"], "rtc", "{v:#}");
+    assert_eq!(v["direct"], true, "{v:#}");
+    assert!(rtc_stat(&v, "ice_direct") >= 1, "{v:#}");
+    assert_eq!(
+        v["selected_remote"], "10.99.0.2:7101",
+        "the client's ICE stack must be transmitting to the announced RTC address: {v:#}",
+    );
+    assert_eq!(
+        v["selected_learned"], "signalled",
+        "…learned from the announcement, not peer-reflexively: {v:#}",
+    );
+}
+
 // =========================================================================
 // Stage 6 — the browser NAT conformance matrix
 // (BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md Stage 6, §3, §9, §10)
@@ -592,6 +690,28 @@ fn natsim_browser_symmetric_symmetric_is_relayed() {
 #[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
 fn natsim_browser_cone_cone_is_direct_on_firefox() {
     browser_row(&rows::CONTROL);
+}
+
+/// The permission-free leg: **row 1 again with nothing granted.**
+///
+/// The six Chromium rows grant the page's own origin camera and
+/// microphone before opening it, because Chromium withholds its
+/// interface enumeration from WebRTC until a media permission exists
+/// (S6_REPORT.md §6.12). That the product calls no media API is
+/// source evidence about the product and not a measurement of the
+/// ungranted browsing context: the granted rows cannot distinguish a
+/// product that needs no permission from one whose networking the
+/// grant happened to fix.
+///
+/// One variable against row 1 — the grant — behind the same two real
+/// NATs, because the enumeration this measures is what a
+/// non-loopback candidate needs. The verdict records what the
+/// DRIVERS reported granting, so a row that quietly acquired the
+/// permission fails here rather than passing under this name.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct_without_media_permission() {
+    browser_row(&rows::NO_MEDIA);
 }
 
 // =========================================================================

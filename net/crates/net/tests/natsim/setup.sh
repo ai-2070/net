@@ -61,6 +61,19 @@
 # can know in advance. Requires `--nat-a cone` — a symmetric NAT has
 # no stable mapping to advertise, which is the point of symmetric.
 #
+# --stun-port-a <port> pins side A's THIRD UDP socket — the anchor's
+# separate STUN endpoint (Stage 6 §6.12.2, announced as
+# `rtc_stun_addr`) — 1:1 the same way, and additionally DNATs
+# unsolicited inbound on that port to the private socket. The
+# asymmetry with `--rtc-port-a` is deliberate and is the topology
+# being modelled: an anchor's ICE socket stays address-restricted
+# (reachable only after its own outbound opens the mapping), while a
+# STUN endpoint is useless unless a stranger's first binding request
+# is answered, so an operator forwards that one port. Two DIFFERENT
+# ports, because libwebrtc consumes datagrams arriving on an ICE port
+# from a configured STUN server before pairing. Requires
+# `--nat-a cone`, and must differ from `--rtc-port-a`.
+#
 # Requires root. Idempotent-ish: always run teardown.sh first.
 set -euo pipefail
 
@@ -69,12 +82,14 @@ NAT_B="cone"
 DROP_DIRECT=0
 PUBLIC_B=0
 RTC_PORT_A=""
+STUN_PORT_A=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nat-a) NAT_A="$2"; shift 2 ;;
     --nat-b) NAT_B="$2"; shift 2 ;;
     --drop-direct) DROP_DIRECT=1; shift ;;
     --rtc-port-a) RTC_PORT_A="$2"; shift 2 ;;
+    --stun-port-a) STUN_PORT_A="$2"; shift 2 ;;
     --public-b) PUBLIC_B=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -115,6 +130,26 @@ if [[ -n "$RTC_PORT_A" ]]; then
     exit 2
   fi
 fi
+# `--stun-port-a` is the same pin plus a DNAT, for the anchor's
+# announced SECOND endpoint. Two endpoints on one port is not two
+# endpoints, and an announced endpoint nothing maps is worse than
+# none — so both conditions are checked here, before provisioning.
+if [[ -n "$STUN_PORT_A" ]]; then
+  if [[ ! "$STUN_PORT_A" =~ ^[0-9]+$ ]] || (( STUN_PORT_A < 1 || STUN_PORT_A > 65535 )); then
+    echo "--stun-port-a wants a UDP port (1-65535), got '$STUN_PORT_A'" >&2
+    exit 2
+  fi
+  if [[ "$NAT_A" != "cone" ]]; then
+    echo "--stun-port-a requires --nat-a cone (got --nat-a $NAT_A)" >&2
+    exit 2
+  fi
+  if [[ "$STUN_PORT_A" == "$RTC_PORT_A" ]]; then
+    echo "--stun-port-a must differ from --rtc-port-a (both '$STUN_PORT_A'): the anchor's STUN \
+endpoint is a SECOND socket, and libwebrtc eats datagrams that arrive on an ICE port from an \
+address configured as a STUN server" >&2
+    exit 2
+  fi
+fi
 
 WAN=nsim_wan
 
@@ -138,9 +173,9 @@ if [[ "$PUBLIC_B" == 1 ]]; then
 fi
 
 # one_side <letter> <gw_pub_ip> <lan_subnet> <nat_mode> <joiner_port>
-#          [rtc_port]
+#          [rtc_port] [stun_port]
 one_side() {
-  local L="$1" PUB="$2" LAN="$3" MODE="$4" PORT="$5" RTC="${6:-}"
+  local L="$1" PUB="$2" LAN="$3" MODE="$4" PORT="$5" RTC="${6:-}" STUN="${7:-}"
   [[ "$MODE" == "none" ]] && return 0
   local GW="nsim_gw$L" NS="nsim_$L"
   ip netns add "$GW"
@@ -359,13 +394,40 @@ EOF
     RTC_SNAT="oifname \"gw$L-wan\" udp sport $RTC snat to $PUB:$RTC"
     RTC_DROP="iifname \"gw$L-wan\" udp dport $RTC ct state new drop"
   fi
+  # The anchor's SECOND announced endpoint: pinned 1:1 like the RTC
+  # socket, and FORWARDED rather than dropped.
+  #
+  # The difference from `$RTC_DROP` is the whole topology this models.
+  # An ICE socket behind an address-restricted cone becomes reachable
+  # only after its own outbound opens the mapping, and that is
+  # realistic. A STUN endpoint whose first unsolicited binding request
+  # is dropped is not an endpoint at all: nothing announcing it could
+  # ever be used by a peer that has not already talked to it. So an
+  # operator publishing one forwards that single port, and the DNAT
+  # here is that forward — one port, one protocol, to the one socket
+  # that serves it.
+  #
+  # Both mappings are therefore externally observable, and by
+  # DIFFERENT means: the RTC port replies only to a flow it opened,
+  # the STUN port replies to a stranger. A leg that reads both is
+  # reading two real public mappings rather than two local sockets.
+  local STUN_SNAT="" STUN_DNAT=""
+  if [[ -n "$STUN" ]]; then
+    STUN_SNAT="oifname \"gw$L-wan\" udp sport $STUN snat to $PUB:$STUN"
+    STUN_DNAT="iifname \"gw$L-wan\" udp dport $STUN dnat to $LAN.2:$STUN"
+  fi
   ip netns exec "$GW" nft -f - <<EOF
 table ip nat {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "gw$L-wan" udp sport $PORT snat to $PUB:$PORT
     $RTC_SNAT
+    $STUN_SNAT
     oifname "gw$L-wan" masquerade persistent
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    $STUN_DNAT
   }
 }
 table ip filter {
@@ -385,7 +447,7 @@ EOF
 # `--rtc-port-a` pins side A's *second* (RTC) socket the same way;
 # `run_scenario.sh` passes the same port to the helper's `--rtc-bind`
 # and `--rtc-public`.
-one_side a 10.99.0.2 192.168.101 "$NAT_A" 7001 "$RTC_PORT_A"
+one_side a 10.99.0.2 192.168.101 "$NAT_A" 7001 "$RTC_PORT_A" "$STUN_PORT_A"
 one_side b 10.99.0.3 192.168.102 "$NAT_B" 7002
 
 if [[ "$DROP_DIRECT" == 1 ]]; then

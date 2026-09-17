@@ -195,10 +195,34 @@ impl Driver {
             .to_owned())
     }
 
-    pub async fn open(&mut self, url: &str) -> Result<(), String> {
-        self.request("open", serde_json::json!({ "url": url }))
-            .await
-            .map(|_| ())
+    /// Open the row's page, and report what the driver GRANTED it.
+    ///
+    /// `media` is `granted` or `none` and is the row's own field, not
+    /// a runner preference: Chromium withholds interface enumeration
+    /// from WebRTC until a media permission exists (§6.12), so the
+    /// grant changes the networking environment the product runs in
+    /// and a row that acquired it silently would be measuring a
+    /// different environment under its own name.
+    ///
+    /// The returned string is what the DRIVER says it did, read back
+    /// rather than echoed from the request, so a driver that ignored
+    /// `media` fails the row instead of passing under the label the
+    /// runner asked for.
+    pub async fn open(&mut self, url: &str, media: &str) -> Result<String, String> {
+        let reply = self
+            .request("open", serde_json::json!({ "url": url, "media": media }))
+            .await?;
+        Ok(reply
+            .get("media")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{}: the driver did not report what it granted the page — an unreported \
+                     grant is indistinguishable from none",
+                    self.label
+                )
+            })?
+            .to_owned())
     }
 
     /// Stop the engine, and report what it enumerated.

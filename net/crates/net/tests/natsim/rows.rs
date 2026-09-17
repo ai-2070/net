@@ -191,6 +191,75 @@ impl fmt::Display for Disposition {
     }
 }
 
+/// Whether the harness grants the page's origin camera/microphone
+/// permission before the row runs.
+///
+/// This is a HARNESS knob and not a product one, which is exactly why
+/// it has to be part of the table. Chromium gates local-interface
+/// enumeration on media permission (`FilteringNetworkManager` logs
+/// `received permission status: denied`), and a denied enumeration
+/// allocates wildcard ports that drop every inbound datagram before
+/// STUN parsing — the whole of S6_REPORT.md §6.12. Granting
+/// camera/microphone is what a user does before a call, and it is
+/// what the six matrix rows do.
+///
+/// A row that runs with `None` is therefore measuring something the
+/// granted rows cannot: whether the PRODUCT works in an ordinary
+/// browsing context that was never asked for a media permission and
+/// never given one. The product calls no media API — that is good
+/// source evidence and it is not a measurement, which is Kyra's E1
+/// third item verbatim. Only a row that withholds the grant can
+/// answer it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Media {
+    /// `context.grantPermissions(['camera','microphone'])` for the
+    /// page's own origin, before the page is opened.
+    Granted,
+    /// Nothing granted, nothing prompted: product defaults.
+    None,
+}
+
+impl Media {
+    /// The `run_scenario.sh` / verdict spelling.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "granted" => Some(Self::Granted),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Media {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.flag())
+    }
+}
+
+/// What the ANCHOR's per-pair application-forwarding counter must do
+/// across a row's application exchange.
+///
+/// The counter is `forwarded_app_packets(src32, dest)` and it
+/// EXCLUDES `0x0D02` signalling (`mesh.rs`, the
+/// `inner_sub != SUBPROTOCOL_RTC_SIGNAL` arm), so it is a statement
+/// about application bytes and nothing else.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Forwarding {
+    /// The anchor carried none of these application bytes: the pair
+    /// is direct and the bytes went leaf → leaf.
+    Flat,
+    /// The anchor carried them, in both directions: the pair is
+    /// relayed and the routed session is what delivered.
+    Carried,
+}
+
 /// One matrix row.
 #[derive(Copy, Clone, Debug)]
 pub struct Row {
@@ -201,6 +270,11 @@ pub struct Row {
     pub expect: Disposition,
     /// Why this disposition, in one line, for the failure message.
     pub why: &'static str,
+    /// What the harness granted the page before it opened. Part of
+    /// the row rather than of the runner's flags because a row that
+    /// silently acquired a permission it claims not to need would be
+    /// measuring the granted environment under the other name.
+    pub media: Media,
 }
 
 impl Row {
@@ -250,6 +324,37 @@ impl Row {
             ..IceCounters::default()
         }
     }
+
+    /// What the ANCHOR's per-pair application-forwarding counter must
+    /// do across this row's application exchange.
+    ///
+    /// This is the witness the NAT rows did not have. Topology,
+    /// outcome type, ICE ledgers and conntrack together establish
+    /// that a *session* is direct or relayed; none of them observes
+    /// an application payload, and conntrack reply traffic can be
+    /// ICE or Noise. A relayed DISPOSITION is not observed delivery.
+    ///
+    /// So each row now exchanges nonce-correlated application
+    /// payloads through the public stream surface and reads the
+    /// anchor's own per-pair counter either side of it:
+    ///
+    /// * a direct row must deliver both nonces while the anchor
+    ///   forwarded NONE of those application bytes — flat, in both
+    ///   directions, which is what "leaf → leaf" physically means;
+    /// * a relayed row must deliver both nonces while the anchor
+    ///   forwarded them in BOTH directions — the routed session is
+    ///   the thing that delivered, and a relayed row whose counter
+    ///   never moved would mean the payload arrived some other way.
+    ///
+    /// Both halves fail independently: delivery without the right
+    /// counter disposition, and the right counter disposition without
+    /// delivery, are two different refusals.
+    pub fn pair_forwarding(&self) -> Forwarding {
+        match self.expect {
+            Disposition::Direct => Forwarding::Flat,
+            Disposition::Relayed => Forwarding::Carried,
+        }
+    }
 }
 
 /// The six rows, in the brief's order.
@@ -260,6 +365,7 @@ pub const ROWS: &[Row] = &[
         nat_b: Nat::ConeAr,
         expect: Disposition::Direct,
         why: "both sides admit the peer's check once their own outbound has opened the mapping",
+        media: Media::Granted,
     },
     Row {
         scenario: "browser_cone_portrestricted",
@@ -268,6 +374,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Direct,
         why: "both mappings are endpoint-independent, so each side's check hits the exact tuple \
                the other sent to",
+        media: Media::Granted,
     },
     Row {
         scenario: "browser_portrestricted_portrestricted",
@@ -276,6 +383,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Direct,
         why: "simultaneous open: each check matches the conntrack reply tuple the other side's \
                own check created",
+        media: Media::Granted,
     },
     Row {
         scenario: "browser_cone_symmetric",
@@ -284,6 +392,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Direct,
         why: "the symmetric side's check arrives from an unpredictable port and the \
                address-restricted filter admits it; ICE learns the pair peer-reflexively",
+        media: Media::Granted,
     },
     Row {
         scenario: "browser_portrestricted_symmetric",
@@ -292,6 +401,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Relayed,
         why: "the symmetric side's check arrives from a port the full-tuple filter never sent \
                to and is dropped; the reverse check dies at the symmetric gateway",
+        media: Media::Granted,
     },
     Row {
         scenario: "browser_symmetric_symmetric",
@@ -300,6 +410,7 @@ pub const ROWS: &[Row] = &[
         expect: Disposition::Relayed,
         why: "neither side can predict the other's mapping; the routed session through the \
                anchor is kept and typed as such",
+        media: Media::Granted,
     },
 ];
 
@@ -313,20 +424,56 @@ pub const ROWS: &[Row] = &[
 /// runs one row and not the matrix because the matrix's value is the
 /// NAT axis, and six rows of a second engine buys a second reading of
 /// the same netfilter behaviour at twice the runtime.
+///
+/// **This row has always been permission-free**, and that is a fact
+/// about the harness rather than a choice made here: Firefox has no
+/// media gate on interface enumeration and Playwright cannot grant
+/// it camera or microphone at all, so the driver never asked. It is
+/// recorded as `Media::None` because the alternative — recording the
+/// grant the runner *requested* — would be the verdict describing an
+/// environment the row did not run in.
 pub const CONTROL: Row = Row {
     scenario: "browser_cone_cone_firefox",
     nat_a: Nat::ConeAr,
     nat_b: Nat::ConeAr,
     expect: Disposition::Direct,
     why: "the cone × cone row on the other engine — the direct path is not Chromium-specific",
+    media: Media::None,
 };
 
-/// Every scenario this slice defines, rows then control.
+/// The permission-free leg: **row 1 again, with nothing granted.**
+///
+/// Kyra's E1 third item. The six Chromium matrix rows all grant the
+/// page's origin camera and microphone before it opens,
+/// because Chromium withholds its interface enumeration from WebRTC
+/// until a media permission exists (§6.12). "The product calls no
+/// media API" is true, is source evidence, and is NOT a measurement
+/// of the ungranted environment: the granted rows cannot tell a
+/// product that needs no permission from one whose networking
+/// happened to be fixed by the grant.
+///
+/// So this row is the same NAT pair, the same engine and the same
+/// expected disposition as row 1 — one variable, the grant — and it
+/// runs behind the real NATs rather than on loopback, because the
+/// enumeration this measures is what a non-loopback candidate needs.
+/// A row that lands `direct` here says the product works with
+/// ordinary defaults; a row that lands anything else is a real
+/// finding about what the product requires of its browsing context,
+/// which is the answer either way.
+pub const NO_MEDIA: Row = Row {
+    scenario: "browser_cone_cone_nomedia",
+    nat_a: Nat::ConeAr,
+    nat_b: Nat::ConeAr,
+    expect: Disposition::Direct,
+    why: "row 1 with no camera/microphone grant — an ordinary browsing context, product \
+          defaults, behind the same two NATs",
+    media: Media::None,
+};
+
+/// Every scenario this slice defines: the six rows, the Firefox
+/// control, then the permission-free leg.
 pub fn all_scenarios() -> Vec<Row> {
-    ROWS.iter()
-        .copied()
-        .chain(std::iter::once(CONTROL))
-        .collect()
+    ROWS.iter().copied().chain([CONTROL, NO_MEDIA]).collect()
 }
 
 // =========================================================================
@@ -468,6 +615,210 @@ fn term(v: &serde_json::Value, key: &str) -> Result<u64, String> {
 }
 
 // =========================================================================
+// The application-delivery witness
+// =========================================================================
+
+/// What one row's **application exchange** observed, plus the
+/// anchor's own per-pair application-forwarding counter either side
+/// of it.
+///
+/// Nonce-correlated and bidirectional, and both properties are
+/// load-bearing:
+///
+/// * The runner mints two nonces it never lets either page choose.
+///   A sends `nonce_a` on a peer-addressed stream and B must decode
+///   exactly that nonce; B answers with `nonce_b` and A must decode
+///   exactly that. A counting witness — "N payloads arrived" —
+///   passes when the frames are the receiver's own echo, when they
+///   are a previous row's leftovers, and when the two sides never
+///   agreed on a single byte. A nonce the *other* side minted cannot
+///   be produced by the side that reports it.
+/// * One direction proves a half-duplex path. The NAT flavors under
+///   test are asymmetric by construction — the whole reason
+///   `cone-ar × symmetric` solves and `cone-pr × symmetric` does not
+///   is which side's check the other side's filter admits — so a row
+///   that only measured A → B would pass on a pair that can never
+///   answer.
+///
+/// The counters are the anchor's, sampled in the anchor's own
+/// process, and `0x0D02` signalling is excluded from them by the
+/// anchor: they are a statement about application bytes and nothing
+/// else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppExchange {
+    /// The nonce the runner minted for A → B, and the one it minted
+    /// for B → A.
+    pub nonce_a: String,
+    pub nonce_b: String,
+    /// The nonce each side actually DECODED from the peer's frames.
+    /// Compared against the minted values rather than reported as a
+    /// boolean, so "B says it saw something" cannot stand in for "B
+    /// saw the bytes A sent".
+    pub seen_at_b: String,
+    pub seen_at_a: String,
+    /// Application frames each side delivered to `stream.send` and
+    /// each side's receiver observed.
+    pub sent_a_to_b: u64,
+    pub sent_b_to_a: u64,
+    pub received_at_b: u64,
+    pub received_at_a: u64,
+    /// `anchor.forwarded_app_packets(a32, b)` and `(b32, a)` before
+    /// the exchange started and after it finished.
+    pub forwarded_pre_ab: u64,
+    pub forwarded_pre_ba: u64,
+    pub forwarded_post_ab: u64,
+    pub forwarded_post_ba: u64,
+}
+
+impl AppExchange {
+    /// Read the witness out of the verdict's `app` object.
+    ///
+    /// Every field is REQUIRED. A missing one is an error and never a
+    /// default: "the runner did not report what the anchor forwarded"
+    /// and "the anchor forwarded nothing" are opposite facts, and a
+    /// schema that defaults the first to the second turns a
+    /// measurement failure into observed absence — which is the exact
+    /// defect the conntrack witness was rejected for one layer down.
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let text = |key: &str| -> Result<String, String> {
+            match v.get(key) {
+                Some(serde_json::Value::String(s)) => Ok(s.clone()),
+                None => Err(format!(
+                    "app.{key} is absent. A missing nonce is not an empty one — the side that \
+                     should have reported what it decoded did not."
+                )),
+                Some(other) => Err(format!("app.{key} is not a string: {other}")),
+            }
+        };
+        Ok(Self {
+            nonce_a: text("nonce_a")?,
+            nonce_b: text("nonce_b")?,
+            seen_at_b: text("seen_at_b")?,
+            seen_at_a: text("seen_at_a")?,
+            sent_a_to_b: term(v, "sent_a_to_b")?,
+            sent_b_to_a: term(v, "sent_b_to_a")?,
+            received_at_b: term(v, "received_at_b")?,
+            received_at_a: term(v, "received_at_a")?,
+            forwarded_pre_ab: term(v, "forwarded_pre_ab")?,
+            forwarded_pre_ba: term(v, "forwarded_pre_ba")?,
+            forwarded_post_ab: term(v, "forwarded_post_ab")?,
+            forwarded_post_ba: term(v, "forwarded_post_ba")?,
+        })
+    }
+
+    /// How far the anchor's per-pair counter moved across the
+    /// exchange, A → B and B → A.
+    ///
+    /// A counter that went DOWN is not a negative delta, it is a
+    /// broken reading (the anchor's map is monotonic per pair), and
+    /// it is reported as one rather than saturating to zero — a
+    /// saturating subtraction here would read as "flat" and pass a
+    /// direct row on a nonsense sample.
+    pub fn forwarded_delta(&self) -> Result<(u64, u64), String> {
+        let one = |what: &str, pre: u64, post: u64| -> Result<u64, String> {
+            post.checked_sub(pre).ok_or_else(|| {
+                format!(
+                    "the anchor's {what} pair counter went {pre} → {post}: it decreased, which \
+                     is not a flat path but an unusable reading"
+                )
+            })
+        };
+        Ok((
+            one("a→b", self.forwarded_pre_ab, self.forwarded_post_ab)?,
+            one("b→a", self.forwarded_pre_ba, self.forwarded_post_ba)?,
+        ))
+    }
+
+    /// The whole application-delivery acceptance for one row.
+    pub fn check(&self, row: &Row) -> Result<(), String> {
+        if self.nonce_a.is_empty() || self.nonce_b.is_empty() {
+            return Err(format!(
+                "row {}: the runner minted an empty nonce (a {:?}, b {:?}) — an empty nonce \
+                 matches anything, including nothing",
+                row.scenario, self.nonce_a, self.nonce_b
+            ));
+        }
+        if self.nonce_a == self.nonce_b {
+            return Err(format!(
+                "row {}: both directions were given the same nonce {:?}, so a frame looped back \
+                 to its own sender would satisfy both halves",
+                row.scenario, self.nonce_a
+            ));
+        }
+        if self.seen_at_b != self.nonce_a {
+            return Err(format!(
+                "row {}: B decoded {:?} from A's peer-addressed stream, but A sent {:?}. No \
+                 application payload of A's was observed at B, so this row has a disposition and \
+                 no delivery.",
+                row.scenario, self.seen_at_b, self.nonce_a
+            ));
+        }
+        if self.seen_at_a != self.nonce_b {
+            return Err(format!(
+                "row {}: A decoded {:?} from B's peer-addressed stream, but B sent {:?}. The \
+                 reverse direction was not observed to deliver.",
+                row.scenario, self.seen_at_a, self.nonce_b
+            ));
+        }
+        for (who, sent, received) in [
+            ("a→b", self.sent_a_to_b, self.received_at_b),
+            ("b→a", self.sent_b_to_a, self.received_at_a),
+        ] {
+            if sent == 0 {
+                return Err(format!(
+                    "row {}: no {who} application frame was ever handed to `stream.send`, so the \
+                     nonce it reports cannot have crossed the transport",
+                    row.scenario
+                ));
+            }
+            if received == 0 {
+                return Err(format!(
+                    "row {}: {sent} {who} frames were sent and the receiver counted none, while \
+                     still reporting a matching nonce — the two reports contradict each other",
+                    row.scenario
+                ));
+            }
+        }
+        let (ab, ba) = self.forwarded_delta()?;
+        match row.pair_forwarding() {
+            Forwarding::Flat => {
+                if ab != 0 || ba != 0 {
+                    return Err(format!(
+                        "row {} claims direct, and both nonces arrived — but the ANCHOR forwarded \
+                         {ab} a→b and {ba} b→a application packets for this exact pair while they \
+                         did ({} → {} and {} → {}). Bytes the anchor carried are not a direct \
+                         path, whatever the outcome type says.",
+                        row.scenario,
+                        self.forwarded_pre_ab,
+                        self.forwarded_post_ab,
+                        self.forwarded_pre_ba,
+                        self.forwarded_post_ba
+                    ));
+                }
+                Ok(())
+            }
+            Forwarding::Carried => {
+                if ab == 0 || ba == 0 {
+                    return Err(format!(
+                        "row {} is relayed and both nonces arrived — but the anchor's per-pair \
+                         application counter moved {ab} a→b and {ba} b→a ({} → {} and {} → {}). \
+                         On a relayed row the anchor IS the path, so a direction that delivered \
+                         without the anchor forwarding anything means the payload arrived by a \
+                         route this row does not model.",
+                        row.scenario,
+                        self.forwarded_pre_ab,
+                        self.forwarded_post_ab,
+                        self.forwarded_pre_ba,
+                        self.forwarded_post_ba
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+// =========================================================================
 // The verdict a row's runner writes
 // =========================================================================
 
@@ -494,6 +845,11 @@ pub struct RowVerdict {
     pub a: IceCounters,
     pub b: IceCounters,
     pub anchor: IceCounters,
+    /// What the harness granted the pages, as the DRIVERS reported
+    /// doing it rather than as the runner's flag echoed back.
+    pub media: String,
+    /// The row's application-delivery witness.
+    pub app: AppExchange,
     /// Anything the runner could not do. Non-empty fails the row
     /// before any counter is read: a verdict written around an error
     /// is not a measurement.
@@ -562,6 +918,34 @@ impl RowVerdict {
             a: side("a")?,
             b: side("b")?,
             anchor: side("anchor")?,
+            media: text("media")?,
+            // The application witness, on the same rule as the
+            // ledgers: REQUIRED on a measuring verdict, defaulted
+            // only when the runner already said why there is no
+            // measurement at all. A verdict that simply omitted `app`
+            // would otherwise present as "no payload was forwarded",
+            // which on a direct row is indistinguishable from the
+            // property the row exists to prove.
+            app: match v.get("app") {
+                Some(obj) if !obj.is_null() => {
+                    AppExchange::from_json(obj).map_err(|e| format!("app: {e}"))?
+                }
+                _ if !errors.is_empty() => AppExchange::default(),
+                Some(_) => {
+                    return Err(
+                        "verdict field app is null and the runner reported no error, so the \
+                         application exchange was neither measured nor refused"
+                            .to_owned(),
+                    )
+                }
+                None => {
+                    return Err(
+                        "verdict field app missing. The row's application-delivery witness is \
+                         not optional: without it the row observes a disposition and no payload."
+                            .to_owned(),
+                    )
+                }
+            },
             errors,
         })
     }
@@ -631,6 +1015,19 @@ impl RowVerdict {
             .check_exact("side b (leaf)", row.leaf_expectation())?;
         self.anchor
             .check_exact("anchor (native)", row.anchor_expectation())?;
+        // The application exchange, last, because it is the witness
+        // that only means something once the disposition above is
+        // established: "the anchor forwarded nothing" is the direct
+        // claim and "the anchor forwarded both ways" is the relayed
+        // one, and which of them is being asserted comes from the row.
+        if self.media != row.media.flag() {
+            return Err(format!(
+                "row {} ran with media {:?} but the table says {} — a row that acquired a \
+                 permission it claims not to need is measuring the granted environment",
+                row.scenario, self.media, row.media
+            ));
+        }
+        self.app.check(row)?;
         Ok(())
     }
 }
@@ -653,16 +1050,37 @@ impl RowVerdict {
 /// without `[UNREPLIED]` means packets crossed between the two
 /// gateways in both directions, which is what "direct" physically
 /// means here.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// A read that FAILED is not a gateway that saw nothing. The script
+/// reads conntrack through a ladder (`conntrack -L`, then
+/// `/proc/net/nf_conntrack`) and a namespace that can produce
+/// neither used to yield `{"udp_flows":0,"udp_replied":0}` — which
+/// is exactly the shape a relayed row wants to see, so a kernel
+/// without `CONFIG_NF_CONNTRACK_PROCFS` and no `conntrack` binary
+/// would have PASSED both relayed rows while observing nothing at
+/// all. Each side now reports which reader produced its numbers, and
+/// an unreadable side is a refusal rather than an absence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayFlows {
     /// UDP conntrack entries involving the peer gateway's public
     /// address.
     pub udp_flows: u64,
     /// How many of those saw traffic in BOTH directions.
     pub udp_replied: u64,
+    /// How the table was read: `conntrack` (the CLI), `procfs`, or
+    /// `unreadable` when neither worked. `unreadable` is the whole
+    /// reason this field exists.
+    pub source: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl GatewayFlows {
+    /// Whether these numbers are a measurement at all.
+    pub fn measured(&self) -> bool {
+        self.source == "conntrack" || self.source == "procfs"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NatFlows {
     pub a: GatewayFlows,
     pub b: GatewayFlows,
@@ -682,6 +1100,20 @@ impl NatFlows {
             Ok(GatewayFlows {
                 udp_flows: n("udp_flows")?,
                 udp_replied: n("udp_replied")?,
+                // REQUIRED, like every other term here: a witness
+                // that cannot say where its numbers came from is not
+                // a witness, and defaulting this to "readable" would
+                // restore the exact collapse it exists to prevent.
+                source: o
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "nat_flow.json {key}.source missing or not a string — a conntrack \
+                             read that failed and a gateway that saw no flow are opposite facts"
+                        )
+                    })?
+                    .to_owned(),
             })
         };
         Ok(Self {
@@ -692,6 +1124,23 @@ impl NatFlows {
 
     /// Assert the gateways agree with the row's disposition.
     pub fn check(&self, row: &Row) -> Result<(), String> {
+        // FIRST, on every row: were these numbers read at all?
+        //
+        // A measurement failure must not count as observed absence.
+        // This is checked before the disposition arms because it
+        // applies to both of them — a direct row would already fail
+        // loudly on zeros, but a relayed row reads zeros as its own
+        // confirmation, so an unreadable gateway would confirm it.
+        for (who, side) in [("a", &self.a), ("b", &self.b)] {
+            if !side.measured() {
+                return Err(format!(
+                    "row {}: gateway {who}'s conntrack table was not read (source {:?}); it \
+                     reported {}/{} flows. No reading is not an absence of flow, and on a \
+                     relayed row it would pass as one.",
+                    row.scenario, side.source, side.udp_replied, side.udp_flows
+                ));
+            }
+        }
         match row.expect {
             Disposition::Direct => {
                 if self.a.udp_replied == 0 || self.b.udp_replied == 0 {
@@ -740,6 +1189,12 @@ pub struct ScriptArm {
     pub expect: String,
     pub engine_a: String,
     pub engine_b: String,
+    /// `MEDIA=granted|none`. In the seam because the grant is the
+    /// only variable of the permission-free leg: an arm that dropped
+    /// it would provision the granted environment under the
+    /// ungranted row's name, and no counter in the verdict could
+    /// tell.
+    pub media: String,
 }
 
 /// Extract the browser scenarios from `run_scenario.sh`'s source.
@@ -748,7 +1203,7 @@ pub struct ScriptArm {
 /// can read them:
 ///
 /// ```text
-///   browser_cone_cone) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium ;;
+///   browser_cone_cone) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted ;;
 /// ```
 ///
 /// The alternative — a second copy of the matrix in bash, trusted to
@@ -783,6 +1238,7 @@ pub fn parse_script_arms(script: &str) -> Result<Vec<ScriptArm>, String> {
             expect: field("EXPECT")?,
             engine_a: field("ENGINE_A")?,
             engine_b: field("ENGINE_B")?,
+            media: field("MEDIA")?,
         });
     }
     if out.is_empty() {

@@ -1,6 +1,6 @@
 # The demo, from a clean checkout, in ONE command.
 #
-#   net\crates\net\examples\browser-demo\run.ps1            # two windows, 60 Hz, by hand
+#   net\crates\net\examples\browser-demo\run.ps1            # three windows, 60 Hz, by hand
 #   net\crates\net\examples\browser-demo\run.ps1 -Check      # headless, asserts, exits non-zero on failure
 #
 # Everything below is the documented build: the wasm leaf, the

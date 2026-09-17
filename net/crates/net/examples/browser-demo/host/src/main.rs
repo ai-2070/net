@@ -10,14 +10,16 @@
 //! One command starts a real native anchor (`net-mesh` with
 //! `webrtc`), the real bootstrap listener
 //! (`net_sdk::rtc_bootstrap::serve_bootstrap`) over a locally issued
-//! CA/leaf certificate, two real `BrowserBootstrapCredential`s, a
-//! page server, and a Chromium with **two isolated browsing
-//! contexts** — one leaf per context, two peers. Each page discovers
-//! the other through a capability query, reaches a direct session
-//! with `connectPeer`/`acceptPeer`, and then puts position updates on
-//! a **fire-and-forget stream addressed at the peer** at 60 Hz while
-//! this process serves the anchor's own per-pair
-//! `forwarded_app_packets` counter to the page for display.
+//! CA/leaf certificate, three real `BrowserBootstrapCredential`s, a
+//! page server, and a Chromium with **three isolated browsing
+//! contexts** — one leaf per context. Two of them are the pair: each
+//! page discovers the other through a capability query, reaches a
+//! direct session with `connectPeer`/`acceptPeer`, and then puts
+//! position updates on a **fire-and-forget stream addressed at the
+//! peer** at 60 Hz while this process serves the anchor's own
+//! per-pair `forwarded_app_packets` counter to the page for display.
+//! The third is the **signalling prober** below: it never joins the
+//! pair and never sends a position.
 //!
 //! # What the demo is actually claiming
 //!
@@ -31,6 +33,40 @@
 //! keep moving — positions arriving at the other tab, and the
 //! announcement tick this anchor keeps resolving for each leaf. Flat,
 //! with those two moving, is a direct path and nothing else.
+//!
+//! # The third context, and why the flat window needs one
+//!
+//! "Flat" has to be flat *while the anchor is still doing this pair's
+//! other business*, and after §9 step 4 the pair itself can supply no
+//! signalling at all: the direct install clears the leaf's relay
+//! entry for its peer (`leaf/src/wasm.rs`'s `direct_installed` →
+//! `clear_peer_relay`), so every `0x0D02` frame A signs for B rides
+//! the DataChannel and never reaches this anchor to be counted. Two
+//! leaves and a direct pair therefore have exactly ZERO signal
+//! transit — which is why a demo with only those two could show the
+//! signalling counter moving during SETUP and then display a number
+//! that had already stopped moving beside a window it claimed
+//! liveness over.
+//!
+//! So the demo runs a third leaf whose whole job is public
+//! signalling. Tab C discovers tab B by a capability tag and calls
+//! the public `connectPeer` on it every `PROBE_MS`; nothing in this
+//! demo ever arms `acceptPeer` for C, so the attempt is never
+//! answered, C↔B stays RELAYED for its whole life, and every offer C
+//! signs transits this anchor as `0x0D02` and lands in
+//! `note_signal_forwarded`. That is movement on the SIGNALLING path
+//! inside the same window the A↔B application pair counter is
+//! asserted flat in, and the two can never be each other because the
+//! anchor classifies them apart. It is the mechanism the merged
+//! Stage 6 runner's part 2 already proves
+//! (`tests/rtc_browser/runner/src/stage6.rs`, its `signalling_moved`
+//! term), in a demo you can watch.
+//!
+//! C is handed a TAG and never an id, like every other page here. It
+//! also must NOT announce the pair's tag: `discoverPeer` takes the
+//! first peer that is not itself, so a third leaf announcing
+//! `demo.positions` could be picked as A's peer and the demo would
+//! pair the wrong two leaves.
 //!
 //! # `--check` is the test, and its assertions are made HERE
 //!
@@ -117,12 +153,64 @@ const DEFAULT_CHECK_SECONDS: u64 = 6;
 /// the verdict.
 const RATE_FLOOR_HZ: f64 = 57.0;
 
+/// The announcement interval, and the freshness bound derived from
+/// it.
+///
+/// Each page re-announces every `ANNOUNCE_MS`, and the anchor
+/// THROTTLES how often it ingests one peer's announcement — so the
+/// tag it can resolve legitimately lags the page's latest by more
+/// than one interval. Three of them is the bound the HUD holds its
+/// "the anchor keeps resolving fresh announcements" sentence to.
+///
+/// It is a FRESHNESS bound on a claim on screen, not a deadline on an
+/// assertion: no `--check` verdict reads it, and
+/// `demo_announcements_keep_arriving_while_the_counter_is_flat` still
+/// asserts a strictly higher resolved tick with no timing term in it
+/// at all.
+const ANNOUNCE_MS: u64 = 500;
+const TICK_FRESH_MS: u64 = 3 * ANNOUNCE_MS;
+
+/// The capability tab B announces FOR the signalling prober, and the
+/// one the prober announces for itself.
+///
+/// Two tags, and neither of them is `PEER_TAG`. The prober has to be
+/// DISCOVERABLE — tab B answers a relayed handshake only from a node
+/// whose signed announcement it has verified, and that announcement
+/// reaches B through the anchor's flood — while staying invisible to
+/// `discoverPeer`, which takes the first peer that is not itself and
+/// would otherwise pair A with the prober.
+const PROBE_TARGET_TAG: &str = "demo.probe.target";
+const PROBER_TAG: &str = "demo.probe.source";
+
+/// How often the prober starts a FRESH public peer attempt.
+///
+/// Fresh, not repaired: `peer_offer` supersedes its predecessor (one
+/// live attempt per peer), and each call signs a NEW offer envelope
+/// and hands it to the relayed C↔B session — so this cadence is what
+/// puts `0x0D02` frames on the anchor's forwarding path while the
+/// pair's application path is idle. The superseded attempt's
+/// `connectPeer` resolves as `superseded`, which the page records as
+/// the expected outcome rather than as a failure.
+const PROBE_MS: u64 = 1000;
+
+/// The floor the flat window holds the prober's PUBLIC offers to.
+///
+/// One, and deliberately not `window_ms / PROBE_MS`: this floor's
+/// only job is "the page really did drive the public API inside this
+/// window". The movement claim is carried by the ANCHOR's own
+/// counter, which is asserted strictly, and a floor derived from a
+/// browser timer running beside two 60 Hz senders would fail the row
+/// for scheduler jitter while the number it is about had moved. The
+/// measured count is printed either way.
+const PROBE_FLOOR: u64 = 1;
+
 /// Every demo witness, in ledger order. CI pins these exactly.
-const WITNESSES: [&str; 4] = [
+const WITNESSES: [&str; 5] = [
     "demo_the_pair_counter_moves_while_the_anchor_carries_the_pair",
     "demo_the_pair_counter_is_flat_while_the_pair_is_direct",
     "demo_positions_sustain_60_hz_over_the_direct_path",
     "demo_announcements_keep_arriving_while_the_counter_is_flat",
+    "demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window",
 ];
 
 // ===================================================================
@@ -223,9 +311,10 @@ impl Ledger {
 
 /// One tab's self-report, posted every `reportMs`.
 ///
-/// Two of the demo's four verdicts need a fact only the page can
-/// state — the rate it achieved and whether the frames arrived — so
-/// the page reports and this process asserts. Everything about the
+/// Three of the demo's five verdicts need a fact only the page can
+/// state — the rate it achieved, whether the frames arrived, and
+/// whether the prober really called the public signalling API — so
+/// the pages report and this process asserts. Everything about the
 /// ANCHOR is read here, on the node.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -257,6 +346,21 @@ struct Report {
     webgl: bool,
     gl_frames: u64,
     error: Option<String>,
+    /// The signalling prober's own counters (tab C only).
+    ///
+    /// `probe_offers` counts `connectPeer` calls STARTED and
+    /// `probe_dialogs` counts the ones that got past `peer_offer` —
+    /// which is the boundary that matters, because an outcome
+    /// carrying a dialog id is one whose offer envelope was signed
+    /// and handed to the relayed session. A call that never reached
+    /// that point never put a frame on the anchor's forwarding path,
+    /// so it is not counted as one.
+    probe_target_found: bool,
+    probe_offers: u64,
+    probe_dialogs: u64,
+    probe_failed: u64,
+    probe_last_outcome: Option<String>,
+    probe_last_error: Option<String>,
 }
 
 // ===================================================================
@@ -266,13 +370,13 @@ struct Report {
 struct Shared {
     anchor: Arc<MeshNode>,
     bootstrap_url: String,
-    credentials: [String; 2],
+    credentials: [String; 3],
     page_dir: PathBuf,
     browser_dist: PathBuf,
     leaf_pkg: PathBuf,
     three_dir: PathBuf,
     hz: u32,
-    reports: Mutex<[Report; 2]>,
+    reports: Mutex<[Report; 3]>,
     /// The pair counter's last observed sum and when it last moved —
     /// so "flat for N seconds" is a fact and not an impression.
     flat: Mutex<Flat>,
@@ -458,6 +562,23 @@ impl Shared {
         }
         None
     }
+
+    /// What the signalling prober waits for, read on the anchor.
+    fn probe(&self) -> Probe {
+        let reports = self.reports.lock();
+        let pair_direct = reports[0].direct && reports[1].direct;
+        let prober = reports[2].node_id.as_deref().and_then(parse_hex_id);
+        drop(reports);
+        // `peer_is_provisional` on the PROBER's own id, which this
+        // process learned from the prober's own report — the page is
+        // told `start`, never an id.
+        let admitted = prober.is_some_and(|id| !self.anchor.peer_is_provisional(id));
+        Probe {
+            start: pair_direct && admitted,
+            pair_direct,
+            admitted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -507,6 +628,26 @@ struct Gate {
     admission_refused_transit: u64,
 }
 
+/// What the signalling prober is waiting for before it starts
+/// offering — two conditions, both answered HERE rather than inferred
+/// on the page.
+///
+/// `pair_direct` is the same fact `--check` opens its flat window on,
+/// so gating the prober on it is what puts the prober's signalling
+/// INSIDE that window instead of before it. `admitted` is §12's rule
+/// applied to the prober itself: the anchor refuses transit for a
+/// PROVISIONAL session, so a prober that offered before the anchor
+/// had promoted it would produce admission refusals rather than
+/// forwarded signalling — and the row would fail for a race instead
+/// of for its claim.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Probe {
+    start: bool,
+    pair_direct: bool,
+    admitted: bool,
+}
+
 fn parse_hex_id(hex: &str) -> Option<u64> {
     u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
 }
@@ -542,6 +683,7 @@ fn serve_page(listener: tokio::net::TcpListener, state: AppState) {
         .route("/config", get(config))
         .route("/pair", get(pair))
         .route("/gate", get(gate))
+        .route("/probe", get(probe))
         .route("/report", post(report))
         .route("/log", post(page_log))
         .route("/browser/{*path}", get(browser_asset))
@@ -629,25 +771,54 @@ struct TabQuery {
     tab: String,
 }
 
+/// Which report slot a tab writes to.
+///
+/// Slots 0 and 1 are the PAIR and slot 2 is the signalling prober.
+/// `pair_ids` reads 0 and 1 only, so the prober's own traffic can
+/// never enter the pair counter the demo asserts flatness on.
 fn tab_index(tab: &str) -> usize {
-    usize::from(tab == "b")
+    match tab {
+        "b" => 1,
+        "c" => 2,
+        _ => 0,
+    }
 }
 
 async fn config(State(s): State<AppState>, Query(q): Query<TabQuery>) -> Json<Value> {
     let index = tab_index(&q.tab);
+    let tab = ["a", "b", "c"][index];
+    // What THIS tab announces, decided here because the trap is here:
+    // the prober has to be discoverable without announcing
+    // `PEER_TAG`, which `discoverPeer` would happily pair tab A with.
+    let base_tags: Vec<&str> = match index {
+        0 => vec![PEER_TAG],
+        1 => vec![PEER_TAG, PROBE_TARGET_TAG],
+        _ => vec![PROBER_TAG],
+    };
     Json(json!({
-        "tab": if index == 0 { "a" } else { "b" },
-        // Tab A offers, tab B accepts. The only asymmetry in the
-        // demo, and it is the §9 asymmetry.
-        "role": if index == 0 { "offerer" } else { "accepter" },
+        "tab": tab,
+        // Tab A offers, tab B accepts, tab C only ever signals. The
+        // first two are the §9 asymmetry; the third is not part of
+        // the pair at all.
+        "role": match index {
+            0 => "offerer",
+            1 => "accepter",
+            _ => "prober",
+        },
         "credentialB64": s.credentials[index],
         "bootstrapUrl": s.bootstrap_url,
         "peerTag": PEER_TAG,
-        "tickTag": format!("demo.tick.{}", if index == 0 { "a" } else { "b" }),
+        "baseTags": base_tags,
+        "tickTag": format!("demo.tick.{tab}"),
         "streamId": POSITION_STREAM_ID,
         "hz": s.hz,
         "reportMs": 250,
-        "announceMs": 500,
+        "announceMs": ANNOUNCE_MS,
+        // How stale the anchor-resolved announcement tick may be
+        // before the HUD stops claiming the anchor is resolving FRESH
+        // announcements. See `TICK_FRESH_MS`: a bound on a sentence,
+        // not on an assertion.
+        "tickFreshMs": TICK_FRESH_MS,
         "discoveryMs": 30_000,
         // How long a page waits for the anchor to admit BOTH
         // leaves before it offers. Generous: it bounds a wait for
@@ -661,6 +832,14 @@ async fn config(State(s): State<AppState>, Query(q): Query<TabQuery>) -> Json<Va
         "routedWaitMs": 20_000,
         "routedBurst": 12,
         "routedGapMs": 20,
+        // The prober's tag, its offer cadence, and how long it waits
+        // for the window to open. The wait is generous for the same
+        // reason `admissionMs` is: it bounds a wait for something the
+        // PAIR is doing, and `--check` itself allows 150 s for the
+        // pair to go direct.
+        "probeTargetTag": PROBE_TARGET_TAG,
+        "probeMs": PROBE_MS,
+        "probeWaitMs": 240_000,
     }))
 }
 
@@ -670,6 +849,10 @@ async fn pair(State(s): State<AppState>) -> Json<PairView> {
 
 async fn gate(State(s): State<AppState>) -> Json<Gate> {
     Json(s.gate())
+}
+
+async fn probe(State(s): State<AppState>) -> Json<Probe> {
+    Json(s.probe())
 }
 
 async fn report(State(s): State<AppState>, Json(body): Json<Report>) -> StatusCode {
@@ -1085,8 +1268,8 @@ async fn run(
         .map_err(|e| format!("bootstrap listener: {e}"))?;
     let bootstrap_url = format!("https://localhost:{}", listener.local_addr().port());
 
-    // One credential per tab. Two separate invites, because two
-    // leaves enroll: a single-use invite redeemed twice is the
+    // One credential per tab, and three separate invites because
+    // three leaves enroll: a single-use invite redeemed twice is the
     // `identity: … replay` refusal, and a demo that hit it would look
     // like a broken anchor.
     let root_entity = Identity::generate().entity_id().clone();
@@ -1106,13 +1289,13 @@ async fn run(
     let state: AppState = Arc::new(Shared {
         anchor: Arc::clone(&anchor),
         bootstrap_url: bootstrap_url.clone(),
-        credentials: [credential(), credential()],
+        credentials: [credential(), credential(), credential()],
         page_dir: demo_root.join("page"),
         browser_dist: assets.browser_dist,
         leaf_pkg: assets.leaf_pkg,
         three_dir: assets.three_dir,
         hz: args.hz,
-        reports: Mutex::new([Report::default(), Report::default()]),
+        reports: Mutex::new([Report::default(), Report::default(), Report::default()]),
         flat: Mutex::new(Flat {
             sum: 0,
             since: Instant::now(),
@@ -1145,7 +1328,15 @@ async fn run(
         if args.headless { "headless" } else { "headed" }
     );
 
-    for (name, context, tab) in [("a", "demo-a", "a"), ("b", "demo-b", "b")] {
+    // Three contexts, opened in this order: the pair first, then the
+    // signalling prober. The prober holds itself behind `/probe`
+    // until the pair is direct anyway, so the order is only about
+    // which windows appear first in a headed run.
+    for (name, context, tab) in [
+        ("a", "demo-a", "a"),
+        ("b", "demo-b", "b"),
+        ("c", "demo-c", "c"),
+    ] {
         driver
             .request(
                 "open",
@@ -1165,12 +1356,13 @@ async fn run(
         return Ok(());
     }
 
-    // By hand: keep serving until Ctrl-C, printing the same three
-    // numbers the HUD shows so the terminal tells the story too.
+    // By hand: keep serving until Ctrl-C, printing the same numbers
+    // the HUD shows so the terminal tells the story too.
     println!(
-        "[demo] two tabs are open. Ctrl-C to stop.\n[demo] watching the anchor's per-pair \
-         forwarded_app_packets — it moves while the anchor carries the pair and goes FLAT once \
-         the pair is direct."
+        "[demo] three tabs are open — the pair (a, b) and the signalling prober (c). Ctrl-C to \
+         stop.\n[demo] watching the anchor's per-pair forwarded_app_packets — it moves while the \
+         anchor carries the pair and goes FLAT once the pair is direct, while the prober keeps \
+         the anchor's SIGNALLING counter moving beside it."
     );
     let watcher = tokio::spawn({
         let state = Arc::clone(&state);
@@ -1180,13 +1372,15 @@ async fn run(
                 let view = state.sample();
                 let a = state.report(0);
                 let b = state.report(1);
+                let c = state.report(2);
                 if !view.ready {
-                    println!("[demo] a: {} · b: {}", a.phase, b.phase);
+                    println!("[demo] a: {} · b: {} · c: {}", a.phase, b.phase, c.phase);
                     continue;
                 }
                 println!(
                     "[demo] pair a→b {} b→a {} (flat {:.1} s) · a {} {:.0} Hz sent {} recv {} · \
-                     b {} {:.0} Hz sent {} recv {} · signalling {} · ticks {:?}/{:?}",
+                     b {} {:.0} Hz sent {} recv {} · c {} {} offers/{} signed · signalling {} · \
+                     ticks {:?}/{:?}",
                     view.ab,
                     view.ba,
                     view.flat_ms as f64 / 1000.0,
@@ -1198,6 +1392,9 @@ async fn run(
                     b.send_hz,
                     b.sent,
                     b.received,
+                    c.phase,
+                    c.probe_offers,
+                    c.probe_dialogs,
                     view.signal_forwarded,
                     view.tick_a,
                     view.tick_b
@@ -1292,6 +1489,10 @@ async fn check(
         "[demo] t1 (direct on both leaves): pair a→b {} b→a {}; routed frames a {} b {}",
         t1.ab, t1.ba, a1.sent, b1.sent
     );
+    // The prober's baseline, read at the SAME instant as `t1`: the
+    // window this row measures has to be the window the flat row
+    // measures, not one that merely overlaps it.
+    let c1 = state.report(2);
 
     ledger.record(
         WITNESSES[0],
@@ -1325,6 +1526,7 @@ async fn check(
     let t2 = state.sample();
     let a2 = state.report(0);
     let b2 = state.report(1);
+    let c2 = state.report(2);
     let window_ms = args.seconds * 1000;
     let expected = (args.hz as u64 * args.seconds) / 2;
 
@@ -1415,10 +1617,73 @@ async fn check(
         ),
     );
 
+    // Public signalling, in the SAME window, on the anchor's OTHER
+    // counter.
+    //
+    // `flat` and `still_direct` are REUSED here rather than
+    // recomputed, so this row and the flat row provably speak about
+    // one window: the flatness term in this conjunction is literally
+    // the flatness term in that one.
+    //
+    // The prober is the only leaf that can move this counter once the
+    // pair is direct, and that is the reason it exists rather than an
+    // implementation detail. §9 step 4 clears the leaf's relay entry
+    // for its peer at the direct install, so every `0x0D02` frame A
+    // signs for B rides the DataChannel and this anchor never sees
+    // it; C↔B is still RELAYED, because nothing in this demo ever
+    // answers C, so every offer C signs transits here and is counted.
+    let probe_offers = c2.probe_offers.saturating_sub(c1.probe_offers);
+    let probe_dialogs = c2.probe_dialogs.saturating_sub(c1.probe_dialogs);
+    let probe_failures = c2.probe_failed.saturating_sub(c1.probe_failed);
+    let signal_delta = t2.signal_forwarded.saturating_sub(t1.signal_forwarded);
+    let signalling_moved = t2.signal_forwarded > t1.signal_forwarded;
+    let prober_drove = probe_dialogs >= PROBE_FLOOR;
+    // Four terms, and the prober's FAILURE count is deliberately not
+    // one of them. It is printed, in full, with the page's own words
+    // — but a relayed Noise handshake that timed out once and
+    // succeeded on the next tick does not contradict the claim this
+    // row makes, and a row that went red for it would be asserting
+    // something it does not say. The claim is movement, its
+    // attribution, and the identical window.
+    ledger.record(
+        WITNESSES[4],
+        signalling_moved && prober_drove && flat && still_direct,
+        format!(
+            "the ANCHOR's own signalling counter went {} → {} (+{signal_delta}) across the SAME \
+             {window_ms} ms window in which the per-pair application-data counter stayed {}+{} \
+             (t1 {}+{}) and both leaves still reported direct (a={} b={}). The movement is the \
+             PROBER's, and it can only be: tab C found tab B by the `{PROBE_TARGET_TAG}` tag \
+             (found={}) and called the public `connectPeer` {probe_offers} time(s) inside the \
+             window, {probe_dialogs} of which got past `peer_offer` and therefore signed an offer \
+             envelope onto the RELAYED C↔B session (floor {PROBE_FLOOR}); {probe_failures} \
+             failed, last outcome {:?}, last error {:?}, page error {:?}. A and B contribute \
+             nothing to this counter any more: §9 step 4 clears the leaf's relay entry for its \
+             peer at the direct install (`leaf/src/wasm.rs`'s `direct_installed` → \
+             `clear_peer_relay`), so a frame either of them signs for the other rides the \
+             DataChannel and never reaches this anchor to be counted. And the two counters can \
+             never be each other's movement: the anchor EXCLUDES `0x0D02` from \
+             `forwarded_app_packets` and counts it in `note_signal_forwarded` instead (`mesh.rs`, \
+             the `inner_sub != SUBPROTOCOL_RTC_SIGNAL` arm), so signalling cannot inflate the \
+             pair counter and the pair counter cannot go flat because signalling went quiet",
+            t1.signal_forwarded,
+            t2.signal_forwarded,
+            t2.ab,
+            t2.ba,
+            t1.ab,
+            t1.ba,
+            a2.direct,
+            b2.direct,
+            c2.probe_target_found,
+            c2.probe_last_outcome,
+            c2.probe_last_error,
+            c2.error
+        ),
+    );
+
     // The page's own view, read through Playwright rather than
     // through the report channel — so a report the page posted and a
     // page that is genuinely still running cannot be confused.
-    for name in ["a", "b"] {
+    for name in ["a", "b", "c"] {
         let live = driver.request("state", json!({ "name": name })).await?;
         let phase = live
             .get("state")

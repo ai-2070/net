@@ -7,6 +7,11 @@ over real ICE, and then streams its cube's position to the other at
 per-pair forwarding counter is on screen, going **flat** the moment
 the pair stops needing it.
 
+A third tab is open beside them and sends no positions at all: the
+**signalling prober**. It exists because the pair cannot prove the
+anchor is still alive on the signalling path once it stops using it
+— see [The third tab](#the-third-tab).
+
 ## Run it
 
 ```powershell
@@ -19,8 +24,8 @@ net/crates/net/examples/browser-demo/run.sh           # Linux, macOS
 
 One command, from a clean checkout. It is the documented build and
 then the demo: the wasm leaf → `@net-mesh/browser` → the demo's two
-npm dependencies (three.js, playwright-core) → the host. Two Chromium
-windows open, one per tab; Ctrl-C stops everything.
+npm dependencies (three.js, playwright-core) → the host. Three
+Chromium windows open, one per tab; Ctrl-C stops everything.
 
 Prerequisites, all of which the script assumes rather than installs:
 Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli`
@@ -42,7 +47,8 @@ pair session                     DIRECT — leaf ↔ leaf, no anchor in the path
 positions sent / received        2 391 / 2 388 (3 dropped)
 measured send / receive rate     60 Hz / 60 Hz
 signalling forwarded (0x0D02)    18 (excluded from the counter above)
-announcement tick the anchor …   23 / 22 (this leaf sent 24)
+signalling probe (tab c)         tab c only — the leaf that keeps the counter above moving
+announcement tick the anchor …   23 / 22 (this leaf sent 24; last climb 180 ms ago)
 ```
 
 The top number is the anchor's, read on the live `MeshNode` in the
@@ -55,11 +61,14 @@ arm).
 That exclusion is the whole reason "flat once direct" means anything:
 
 * it cannot go flat because signalling stopped — signalling was never
-  in it, and its own counter is displayed beside it;
+  in it, its own counter is displayed beside it, and tab C keeps that
+  counter moving for as long as the window lasts;
 * it cannot go flat because the page stopped — the positions actually
   arriving at the *other* tab are displayed beside it too, and so is
   the announcement tick this anchor keeps resolving for each leaf,
-  which climbs the whole time.
+  with the age of its last climb printed next to it. The HUD's flat
+  sentence is gated on that age, so a stale tick reads as a stale
+  tick rather than as a healthy anchor.
 
 **Flat, with those numbers moving, is a direct path and nothing
 else.** A flat counter on its own would be indistinguishable from
@@ -77,14 +86,46 @@ The three phases are visible as they happen:
    arrived. Fire-and-forget means a dropped frame stays dropped — the
    trail shows the gap rather than hiding it.
 
+## The third tab
+
+`0x0D02` signalling is excluded from the pair counter — but the pair
+cannot keep the signalling counter moving either, and that is not a
+detail. At the direct install the leaf **clears its relay entry** for
+its peer (`leaf/src/wasm.rs`'s `direct_installed` →
+`clear_peer_relay`), so every signalling frame A signs for B rides the
+DataChannel and the anchor never sees it. Two tabs and a direct pair
+produce exactly **zero** signal transit, so a two-tab demo could only
+ever display signalling that moved while the pair was being set
+**up** — a number that had already stopped, beside a window it was
+being read as evidence for.
+
+So tab C runs a third leaf whose entire job is public signalling. It
+is handed a **tag** and never an id, like every other page here: it
+discovers tab B by `demo.probe.target`, calls the public
+`connectPeer` on it every second, and **nothing in the demo ever
+answers it** — so that pair stays routed for its whole life, every
+offer it signs transits the anchor as `0x0D02`, and
+`note_signal_forwarded` keeps climbing inside the very window the
+A↔B pair counter is asserted flat in.
+
+It never announces `demo.positions`. `discoverPeer` takes the first
+peer that is not itself, so a third leaf announcing the pair's tag
+could be picked as tab A's peer and the demo would pair the wrong two
+leaves.
+
+The same mechanism is what the merged Stage 6 runner's part 2 already
+proves (`tests/rtc_browser/runner/src/stage6.rs`, its
+`signalling_moved` term); this is that argument in a window you can
+watch.
+
 ## Is it actually true?
 
 ```sh
 net/crates/net/examples/browser-demo/run.sh --check --seconds 6
 ```
 
-Headless Chromium, driven by Playwright, two isolated browsing
-contexts, and four assertions made **on the anchor** — not on a
+Headless Chromium, driven by Playwright, three isolated browsing
+contexts, and five assertions made **on the anchor** — not on a
 screenshot and not on the HUD text (the HUD renders the same numbers
 the host asserts on, which is why they cannot drift apart):
 
@@ -94,6 +135,7 @@ the host asserts on, which is why they cannot drift apart):
 | `demo_the_pair_counter_is_flat_while_the_pair_is_direct` | across the whole direct window it does not change by one, while both leaves report direct and both tabs receive at least half the expected frames |
 | `demo_positions_sustain_60_hz_over_the_direct_path` | each tab's measured average send rate is ≥ 57 Hz, with the measured value, the worst single-frame gap and the drop count printed either way |
 | `demo_announcements_keep_arriving_while_the_counter_is_flat` | the anchor resolves a **higher** announcement tick for each leaf at the end of the flat window than at its start |
+| `demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window` | across that same window the anchor's own `0x0D02` counter moved, the prober really called the public `connectPeer` inside it, and the pair counter was flat — the pair itself can contribute no signal transit at all once direct |
 
 Each prints one `DEMO PASS <name>` / `DEMO FAIL <name>` line with its
 numbers; any failure exits non-zero. The roster is a `const` in
@@ -150,13 +192,15 @@ Three things to know if you copy this page:
 ```
 browser-demo/
   run.sh / run.ps1   the one command: documented build, then the demo
-  package.json       three.js (the renderer) + playwright-core (the two contexts)
-  driver.mjs         Playwright over NDJSON on stdio — launch, two contexts, a page each
+  package.json       three.js (the renderer) + playwright-core (the three contexts)
+  driver.mjs         Playwright over NDJSON on stdio — launch, three contexts, a page each
   page/
     index.html       the scene and the HUD
-    demo.js          the leaf, discovery, connectPeer/acceptPeer, the 60 Hz loop
+    demo.js          the leaf, discovery, connectPeer/acceptPeer, the 60 Hz loop,
+                     and the prober's public signalling
   host/src/main.rs   the anchor, the bootstrap listener, the page server,
-                     /pair (the live counter), and --check's four assertions
+                     /pair (the live counter), /probe (the prober's gate),
+                     and --check's five assertions
 ```
 
 ## TLS, and why no security dialog appears

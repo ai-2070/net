@@ -127,6 +127,7 @@ public node), readiness markers, and the initiator's
 | `dropped_keepalives` | cone | cone (+ direct-UDP drop on both gateways) | attempt times out, falls back within deadline |
 | `relay_upgrade` | cone | — (B public) | relay-routed session migrates off the relay (`upgrades_succeeded ≥ 1`); the NAT'd joiner is forced to be the lower node id (C1 initiator) via `keygen` ordering |
 | `rtc_anchor_direct` | cone (+ RTC port 7101 pinned) | — (B public, the client) | the NAT'd **anchor** announces `rtc_addr = 10.99.0.2:7101` (its mapped address, not its `192.168.101.2:7101` bind), and the outside client's relay-signalled session ends up on a DataChannel (`transport: "rtc"`, `stats.rtc.ice_direct ≥ 1`). Needs a helper built with `webrtc`; the scenario refuses before provisioning if it isn't. Note B, not A, writes the verdict here — the client is the side that drives the upgrade |
+| `rtc_anchor_stun_endpoint` | cone (+ RTC port 7101 pinned, + STUN port 7103 pinned **and forwarded**) | — (B public, the client) | the same NAT'd anchor with **both** of its announced endpoints, each observed from outside the NAT: `rtc_addr = 10.99.0.2:7101` carries the DataChannel (signalled candidate, not peer-reflexive), and the separately announced `rtc_stun_addr = 10.99.0.2:7103` (Stage 6 §6.12.2) answers an unsolicited binding request whose XOR-MAPPED-ADDRESS is the client's own public tuple. The two ports are asserted distinct. Reachable by deliberately different means: the ICE port stays address-restricted, the STUN port is forwarded, because an announced STUN endpoint that drops a stranger's first request could never serve the peers it is announced to |
 
 ### The Stage 6 browser NAT conformance matrix
 
@@ -147,7 +148,8 @@ the NAT'd namespace with `ip netns exec`.
 | `browser_cone_symmetric` | cone-ar | symmetric | **direct** (peer-reflexive through the address-restricted filter) |
 | `browser_portrestricted_symmetric` | cone-pr | symmetric | **relayed**, typed `iceTimeout` |
 | `browser_symmetric_symmetric` | symmetric | symmetric | **relayed**, typed `iceTimeout` |
-| `browser_cone_cone_firefox` | cone-ar | cone-ar | **direct** — row 1 on Firefox, both sides, as a control |
+| `browser_cone_cone_firefox` | cone-ar | cone-ar | **direct** — row 1 on Firefox, both sides, as a control. Permission-free by nature: Firefox has no media gate and Playwright cannot grant it camera/microphone |
+| `browser_cone_cone_nomedia` | cone-ar | cone-ar | **direct** — row 1 on Chromium with **nothing granted**. One variable: the six rows grant the page's origin camera+microphone because Chromium withholds interface enumeration from WebRTC until a media permission exists (§6.12), and "the product calls no media API" is source evidence about the product rather than a measurement of the ungranted context. The verdict records what the DRIVERS reported granting, so a row that quietly acquired the permission fails instead of passing under this name |
 
 **A relayed row is a PASS.** The routed session through the anchor is
 the documented disposition (plan §6), and the row asserts it is
@@ -163,7 +165,7 @@ platform — it parses this script's own `browser_*` case arms and
 fails if they disagree with the Rust table, and it exercises the
 counter checker against every shape it must refuse.
 
-Each row asserts three independent witnesses:
+Each row asserts four independent witnesses:
 
 1. the typed `PeerConnectOutcome.type` on **both** halves of the
    dialog (`connectPeer` on the offerer, `acceptPeer` on the
@@ -182,7 +184,23 @@ Each row asserts three independent witnesses:
 3. `<state>/nat_flow.json` — the two gateways' own conntrack tables.
    Not "is there a flow to the peer": ICE sends checks on every row,
    so the outbound entry always exists. What discriminates is whether
-   it was ever **replied** to.
+   it was ever **replied** to. Each side also records the READER that
+   produced its numbers (`conntrack`, `procfs`, or `unreadable`), and
+   an unreadable side fails the row: a table nobody could read used
+   to yield `0/0`, which is exactly a relayed row's confirmation, so
+   measurement failure would have counted as observed absence;
+4. **application delivery, and the anchor's per-pair application
+   counter either side of it.** A nonce-correlated bidirectional
+   exchange on the public peer-addressed stream surface: the runner
+   mints both nonces, A must send its own and decode B's, B the
+   reverse, and `anchor.forwarded_app_packets` for the exact ordered
+   pair must be **flat both ways on a direct row** and **moving both
+   ways on a relayed one**. Neither of the first three witnesses
+   observes a payload — conntrack reply traffic can be ICE or Noise,
+   and a relayed *disposition* only says the routed session was kept
+   — so a direct row whose bytes the anchor carried passes all three
+   and fails only this one. Delivery and the counter disposition fail
+   independently.
 
 `udpBlocked` is refused as a disposition here, deliberately. It is
 `iceTimeout` narrowed by `UdpBlockedEvidence`, and on these rows UDP
@@ -190,10 +208,17 @@ egress demonstrably works — every leaf's anchor dialog is a UDP
 DataChannel that landed direct. A row reporting it would be claiming a
 narrower cause than the evidence supports.
 
-What the rows do **not** measure: application data flow, and the
-anchor's per-pair forwarding counter. That is the §10 three-part
-witness, a different slice, and a row asserting both would diagnose
-neither.
+What the rows still do **not** measure: the §10 three-part witness's
+*unrelated-pair* liveness leg, which needs a third context and lives
+in the browser matrix where all the tabs share one origin.
+
+Successful runs now leave an uploadable bundle at
+`<state>/artifacts/` — regular files only (verdict, runner and page
+logs, gateway snapshots, per-namespace pcaps), with its file count
+and total byte size printed. Uploading `<state>` wholesale would
+reproduce a previous cycle's empty artifact: it holds browser
+profiles, and `upload-artifact` refuses a tree containing unix
+sockets.
 
 Deferred (documented, not yet wired): the parent-decision-11 IPv6
 pair — dual-stack both-open → direct, and a NAT64/464XLAT topology

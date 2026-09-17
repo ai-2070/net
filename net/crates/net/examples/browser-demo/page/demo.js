@@ -24,6 +24,25 @@
 // actually arriving at the other tab (moving), and the announcement
 // tick the anchor keeps resolving for this leaf (moving). Flat, with
 // the other two moving, is a direct path.
+//
+// THE THIRD TAB
+// -------------
+// Two of those numbers are the pair's own, and the third — the
+// anchor's `0x0D02` counter — cannot be: at the direct install the
+// leaf CLEARS its relay entry for its peer, so every signalling frame
+// this tab signs for its peer rides the DataChannel and the anchor
+// never sees it. Two tabs and a direct pair therefore produce zero
+// signal transit, and a demo with only those two could show that
+// counter moving during SETUP and then display a number that had
+// stopped moving beside the window it was claiming liveness over.
+//
+// So a THIRD context loads this same page in the `prober` role. It
+// discovers tab B by a tag, calls the public `connectPeer` on it
+// every `probeMs`, and is never answered — so that pair stays
+// RELAYED, every offer it signs transits the anchor as `0x0D02`, and
+// the anchor's signalling counter keeps moving INSIDE the window the
+// pair counter is flat in. Two counters, two different true things,
+// and the anchor is what keeps them apart.
 
 import { connect } from '/browser/index.js';
 import * as THREE from '/vendor/three.module.js';
@@ -33,7 +52,11 @@ import * as THREE from '/vendor/three.module.js';
 // ---------------------------------------------------------------------
 
 const params = new URLSearchParams(location.search);
-const TAB = params.get('tab') === 'b' ? 'b' : 'a';
+// `c` is the signalling prober, and it has to be spelled here: a tab
+// that fell through to `a` would ask for tab A's credential, and a
+// single-use invite redeemed twice is the `identity: … replay`
+// refusal — which looks like a broken anchor rather than a typo.
+const TAB = ['b', 'c'].includes(params.get('tab')) ? params.get('tab') : 'a';
 
 const state = {
   tab: TAB,
@@ -77,6 +100,22 @@ const state = {
   streamId: null,
   webgl: false,
   glFrames: 0,
+  /**
+   * The signalling prober's own counters — tab C only.
+   *
+   * `probeOffers` counts public `connectPeer` calls STARTED;
+   * `probeDialogs` counts the outcomes that carry a dialog id, which
+   * is the boundary that matters. An outcome with a dialog is one
+   * whose offer envelope was signed and handed to the relayed
+   * session, and that is the frame the anchor forwards and counts; a
+   * call that never got that far put nothing on the wire.
+   */
+  probeTargetFound: false,
+  probeOffers: 0,
+  probeDialogs: 0,
+  probeFailed: 0,
+  probeLastOutcome: null,
+  probeLastError: null,
   error: null,
 };
 
@@ -255,21 +294,28 @@ let stream = null;
 let running = false;
 
 async function main() {
-  try {
-    buildScene();
-  } catch (error) {
-    // A page with no WebGL still exercises the transport, but the
-    // demo says so loudly rather than showing a black canvas.
-    state.error = `three.js: ${error.message}`;
-    el('error').textContent = state.error;
-  }
-  animate();
-
+  // The CONFIG is fetched FIRST, because the role decides whether
+  // this tab renders at all. The prober shares this page and needs
+  // none of the scene: a third software-rasterised three.js context
+  // would compete for CPU with the two tabs whose measured 60 Hz is a
+  // verdict, so it is never built rather than built and hidden.
   cfg = await (await fetch(`/config?tab=${TAB}`)).json();
   state.role = cfg.role;
   state.streamId = cfg.streamId;
   el('tab').textContent = `${TAB} (${cfg.role})`;
   setInterval(refreshHud, cfg.reportMs);
+
+  if (cfg.role !== 'prober') {
+    try {
+      buildScene();
+    } catch (error) {
+      // A page with no WebGL still exercises the transport, but the
+      // demo says so loudly rather than showing a black canvas.
+      state.error = `three.js: ${error.message}`;
+      el('error').textContent = state.error;
+    }
+    animate();
+  }
 
   state.phase = 'connecting';
   node = await connect({
@@ -297,8 +343,16 @@ async function main() {
   // talking to the anchor while the pair counter stays flat.
   announceForever();
 
+  // The prober's whole life is public signalling. It has no peer in
+  // the pair, so there is no pair tag to discover, no admission gate
+  // for a pair it is not in, and no stream.
+  if (cfg.role === 'prober') {
+    await runProber();
+    return;
+  }
+
   state.phase = 'discovering';
-  const peerHex = await discoverPeer();
+  const peerHex = await discoverPeer(cfg.peerTag);
   state.peerId = peerHex;
   log(`discovered peer ${peerHex}`);
 
@@ -346,9 +400,20 @@ async function main() {
   await pump();
 }
 
-/** Re-announce on a timer, with a tag that moves every tick. */
+/**
+ * Re-announce on a timer, with a tag that moves every tick.
+ *
+ * The tag SET comes from the host (`baseTags`) rather than from this
+ * page, because which tags a tab announces is load-bearing and the
+ * trap is not visible locally: the prober has to be DISCOVERABLE —
+ * tab B answers a relayed handshake only from a node whose signed
+ * announcement it has verified, and that announcement reaches B
+ * through the anchor's flood — while never announcing the PAIR's tag,
+ * since `discoverPeer` takes the first peer that is not itself and
+ * would otherwise pair tab A with the prober.
+ */
 function announceForever() {
-  const tags = () => [cfg.peerTag, `${cfg.tickTag}.${state.announceTick}`];
+  const tags = () => [...cfg.baseTags, `${cfg.tickTag}.${state.announceTick}`];
   const once = async () => {
     try {
       await node.announce(tags());
@@ -364,24 +429,126 @@ function announceForever() {
 }
 
 /**
- * Query the capability the other tab announces until it is there.
+ * Query a capability until somebody other than this leaf announces
+ * it.
  *
- * Discovery is the only way this page learns the peer: no id, key or
- * SDP is passed in by the host. `connect` gave it a credential; the
- * peer's Noise static comes from the peer's own signed announcement,
- * which is exactly §9 step 1.
+ * Discovery is the only way this page learns another node: no id, key
+ * or SDP is passed in by the host. `connect` gave it a credential;
+ * the peer's Noise static comes from the peer's own signed
+ * announcement, which is exactly §9 step 1. The TAG is the parameter
+ * because the prober discovers a different one — it is handed a tag
+ * and never an id, like every other tab here.
  */
-async function discoverPeer() {
+async function discoverPeer(tag) {
   const deadline = performance.now() + cfg.discoveryMs;
   while (performance.now() < deadline) {
-    const peers = await node.query(cfg.peerTag);
+    const peers = await node.query(tag);
     for (const peer of peers) {
       const hex = decimalToHex16(peer.nodeId);
       if (hex !== state.nodeId) return hex;
     }
     await sleep(200);
   }
-  throw new Error(`no peer announced ${cfg.peerTag} within ${cfg.discoveryMs} ms`);
+  throw new Error(`no peer announced ${tag} within ${cfg.discoveryMs} ms`);
+}
+
+/**
+ * The third tab: PUBLIC signalling, for the whole flat window.
+ *
+ * The anchor keeps two counters and they can never be each other's
+ * movement — `0x0D02` is EXCLUDED from the per-pair
+ * `forwarded_app_packets` and counted in `note_signal_forwarded`
+ * instead. What the pair cannot do is move the second one: at the
+ * direct install the leaf clears its relay entry for its peer, so
+ * every frame A signs for B goes leaf → leaf and this anchor never
+ * sees it.
+ *
+ * So this tab keeps one pair RELAYED on purpose. It discovers tab B
+ * by `probeTargetTag` and calls the public `connectPeer` on it every
+ * `probeMs`; nothing in this demo ever arms `acceptPeer` for this
+ * tab, so the attempt is never answered, the pair never goes direct,
+ * and every offer keeps transiting the anchor as signalling. It
+ * announces its own tag and never the pair's, and it never opens a
+ * stream: it is signalling and nothing else.
+ */
+async function runProber() {
+  state.phase = 'discovering the probe target';
+  const targetHex = await discoverPeer(cfg.probeTargetTag);
+  state.peerId = targetHex;
+  state.probeTargetFound = true;
+  log(`probe target ${targetHex}, found by ${cfg.probeTargetTag}`);
+
+  state.phase = 'waiting for the flat window';
+  await waitForProbeWindow();
+
+  state.phase = 'probing';
+  probeForever(targetHex);
+}
+
+/**
+ * Hold until the PAIR is direct and this leaf is ADMITTED, both read
+ * on the anchor.
+ *
+ * The first is what puts this tab's signalling inside the window
+ * `--check` asserts flatness over instead of before it. The second is
+ * §12's rule applied to this leaf: the anchor refuses transit for a
+ * PROVISIONAL session, so offering early would produce admission
+ * refusals rather than forwarded signalling. Neither answer carries
+ * an id — the host is told this leaf's id by this leaf's own report
+ * and answers `start`.
+ */
+async function waitForProbeWindow() {
+  const deadline = performance.now() + cfg.probeWaitMs;
+  for (;;) {
+    const probe = await (await fetch('/probe')).json();
+    if (probe.start) return;
+    if (performance.now() >= deadline) {
+      throw new Error(
+        `the probe window never opened after ${cfg.probeWaitMs} ms ` +
+          `(pair direct=${probe.pairDirect}, this leaf admitted=${probe.admitted})`,
+      );
+    }
+    await sleep(100);
+  }
+}
+
+/**
+ * One FRESH public attempt every `probeMs`, outcomes recorded.
+ *
+ * Fresh, not repaired: `peer_offer` retires its predecessor — one
+ * live attempt per peer — so each call signs a new offer envelope and
+ * hands it to the relayed session, which is what puts `0x0D02` on the
+ * anchor's forwarding path at a known cadence. The superseded
+ * attempt's `connectPeer` then resolves as `superseded`, and that is
+ * the EXPECTED outcome here rather than a failure: nobody is ever
+ * going to answer this tab.
+ */
+function probeForever(targetHex) {
+  const once = async () => {
+    state.probeOffers += 1;
+    try {
+      const outcome = await node.connectPeer(targetHex);
+      state.probeLastOutcome = outcome.type;
+      // A dialog id means `peer_offer` got all the way through: the
+      // envelope was signed and handed to the relayed session, which
+      // is the transit the anchor counts. `noAnnouncement` carries
+      // none, because nothing was sent.
+      if (outcome.dialog) state.probeDialogs += 1;
+      if (outcome.type === 'noAnnouncement') {
+        state.probeFailed += 1;
+        state.probeLastError = outcome.detail;
+        log(`probe target's announcement is gone: ${outcome.detail}`);
+      }
+    } catch (error) {
+      // Never thrown out of the timer: a probe that failed is a
+      // number the host prints, not a dead tab.
+      state.probeFailed += 1;
+      state.probeLastError = error && error.message ? error.message : String(error);
+      log(`probe offer failed: ${state.probeLastError}`);
+    }
+  };
+  void once();
+  setInterval(() => void once(), cfg.probeMs);
 }
 
 /**
@@ -607,6 +774,45 @@ async function pump() {
 // the HUD, and the report the host asserts on
 // ---------------------------------------------------------------------
 
+// The last announcement ticks this HUD saw the ANCHOR resolve, and
+// when either of them last CLIMBED.
+//
+// The flat sentence used to claim "the anchor keeps resolving fresh
+// announcements" from `recvHz > 0` and a flat pair counter — and
+// neither of those is about announcements at all. A tick that stopped
+// climbing a minute ago renders identically to one climbing now, so
+// the sentence was asserting something the screen did not establish.
+// Freshness is therefore MEASURED here, from the same `/pair` samples
+// the HUD already draws, and the sentence is gated on it.
+const tickWatch = { a: null, b: null, lastClimbMs: null };
+
+/**
+ * Fold one `/pair` sample into `tickWatch` and return the age of the
+ * last observed CLIMB in milliseconds, or `null` if neither tick has
+ * ever been seen to climb.
+ *
+ * A climb, not a value: the host's own witness asserts a strictly
+ * higher resolved tick, and this is the same test made continuously.
+ * Either leaf climbing counts — the claim on screen is that the
+ * ANCHOR is still resolving announcements, which one leaf's tick
+ * moving establishes.
+ */
+function noteTickClimb(pair) {
+  let climbed = false;
+  for (const [key, seen] of [
+    ['a', pair.tickA],
+    ['b', pair.tickB],
+  ]) {
+    if (typeof seen === 'number' && (tickWatch[key] === null || seen > tickWatch[key])) {
+      tickWatch[key] = seen;
+      climbed = true;
+    }
+  }
+  const now = performance.now();
+  if (climbed) tickWatch.lastClimbMs = now;
+  return tickWatch.lastClimbMs === null ? null : now - tickWatch.lastClimbMs;
+}
+
 async function refreshHud() {
   el('phase').textContent = state.phase;
   el('me').textContent = state.nodeId ?? '—';
@@ -634,28 +840,56 @@ async function refreshHud() {
     el('flat').textContent =
       pair.flatMs > 0 ? `${(pair.flatMs / 1000).toFixed(1)} s` : 'moving now';
     el('signal').textContent = `${pair.signalForwarded} (excluded from the counter above)`;
-    el('tick').textContent = `${pair.tickA ?? '—'} / ${pair.tickB ?? '—'} (this leaf sent ${state.announceTick})`;
+    el('probe').textContent =
+      cfg.role === 'prober'
+        ? `${state.probeOffers} public offers, ${state.probeDialogs} signed onto the relayed ` +
+          `pair${state.probeFailed > 0 ? `, ${state.probeFailed} failed` : ''}`
+        : 'tab c only — the leaf that keeps the counter above moving';
+    const tickAgeMs = noteTickClimb(pair);
+    const freshTicks = tickAgeMs !== null && tickAgeMs <= cfg.tickFreshMs;
+    el('tick').textContent =
+      `${pair.tickA ?? '—'} / ${pair.tickB ?? '—'} (this leaf sent ${state.announceTick}; ` +
+      `last climb ${tickAgeMs === null ? 'never' : `${tickAgeMs.toFixed(0)} ms ago`})`;
     // The on-screen sentence is held to the same rule as the host's
     // verdict strings: it may only claim what the numbers beside it
     // establish. "Flat" alone is also what a dropped stream looks
     // like, so the flat claim is gated on positions STILL ARRIVING
-    // and on a fresh announcement tick — and when either stops, the
-    // HUD says so instead of narrating the happy path.
+    // and on a tick that has been MEASURED to climb inside
+    // `tickFreshMs` — and when either stops, the HUD says so instead
+    // of narrating the happy path.
     const arriving = state.recvHz > 0;
-    el('note').textContent = !state.direct
-      ? 'The pair counter MOVES while the anchor carries this pair.'
-      : arriving && pair.flatMs > 1500
-        ? 'The pair counter is FLAT while positions keep arriving and the anchor keeps ' +
-          'resolving fresh announcements: the bytes are going leaf → leaf.'
-        : arriving
-          ? 'Direct, and the counter has just moved — read it again in a second.'
-          : 'Direct, but NOTHING is arriving: a flat counter proves nothing here.';
+    const flatFor = pair.flatMs > 1500;
+    el('note').textContent =
+      cfg.role === 'prober'
+        ? 'This tab is the SIGNALLING PROBER: it is never answered, so its pair stays routed ' +
+          'and every offer it signs moves the 0x0D02 counter on the anchor' +
+          (flatFor
+            ? ', beside a pair counter that is FLAT.'
+            : ' — the pair counter beside it is still moving.')
+        : !state.direct
+          ? 'The pair counter MOVES while the anchor carries this pair.'
+          : arriving && flatFor && freshTicks
+            ? 'The pair counter is FLAT while positions keep arriving and the anchor keeps ' +
+              'resolving fresh announcements: the bytes are going leaf → leaf.'
+            : arriving && flatFor
+              ? 'The pair counter is FLAT and positions keep arriving, but the announcement ' +
+                `tick on the anchor has not climbed for ${
+                  tickAgeMs === null ? 'the whole run' : `${tickAgeMs.toFixed(0)} ms`
+                } (bound ${cfg.tickFreshMs} ms): a flat counter beside a STALE tick proves ` +
+                'nothing about the anchor still being live.'
+              : arriving
+                ? 'Direct, and the counter has just moved — read it again in a second.'
+                : 'Direct, but NOTHING is arriving: a flat counter proves nothing here.';
   }
 
   await postReport();
 }
 
-/** The state the host reads its two page-side facts from. */
+/**
+ * The state the host reads its page-side facts from: the rate this
+ * tab achieved, whether the frames arrived, and — on the prober —
+ * how many public signalling calls it really made.
+ */
 async function postReport() {
   await fetch('/report', {
     method: 'POST',

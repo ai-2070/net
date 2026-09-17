@@ -19,6 +19,11 @@
 #                              upgrades the relayed session onto a
 #                              DataChannel reached at A's MAPPED
 #                              `rtc_addr` (needs a `webrtc` helper)
+#   rtc_anchor_stun_endpoint   the same NAT'd anchor with BOTH of its
+#                              announced endpoints pinned — `rtc_addr`
+#                              and the separate `rtc_stun_addr` of
+#                              §6.12.2 — each observed from outside
+#                              the NAT with its own reply
 #   browser_*                  the Stage 6 NAT conformance matrix: two
 #                              headless browsers behind simulated NATs
 #                              plus one anchor, six rows plus a Firefox
@@ -69,11 +74,27 @@ A_EXTRA=() PUBLIC_B_EXTRA=(--auto-upgrade)
 # is the only reason the anchor can advertise it.
 RTC_PORT_A=7101
 RTC_PORT_B=7102
+# Side A's THIRD socket: the anchor's separate STUN endpoint,
+# announced as `rtc_stun_addr` (§6.12.2). A different port from
+# `RTC_PORT_A` because that is the rule the product's own default
+# obeys — libwebrtc consumes datagrams arriving on an ICE port from
+# an address configured as a STUN server — and because two endpoints
+# on one port are one endpoint.
+STUN_PORT_A=7103
 # Stage 6 browser rows: the disposition the row asserts and the engine
 # each side runs. `EXPECT` is passed to the runner so the verdict
 # records what the topology was provisioned FOR, which is what makes a
 # mis-wired row detectable (`tests/natsim/rows.rs`).
 EXPECT="" ENGINE_A=chromium ENGINE_B=chromium
+# Whether the harness grants the page's origin camera+microphone
+# before opening it. `granted` on every conformance row, because
+# Chromium withholds its interface enumeration from WebRTC until a
+# media permission exists (S6_REPORT.md §6.12) — and `none` on the
+# one leg that exists to measure the product in an ordinary browsing
+# context that was never asked. Passed to the runner rather than
+# inferred, and echoed into the verdict by the DRIVERS, so a row
+# cannot acquire a permission it claims not to need.
+MEDIA=granted
 # The Stage 6 browser runner: anchor + HTTPS bootstrap listener + page
 # origin + both Playwright drivers, one binary, inside nsim_wan.
 BROWSER_BIN="${NATSIM_BROWSER_BIN:-$HERE/browser/target/release/natsim-browser-matrix}"
@@ -97,6 +118,32 @@ case "$SCENARIO" in
     # DataChannel, and a UDP punch racing it would decide the verdict.
     PUBLIC_B_EXTRA=(--target a --mode rtc --rtc-bind "10.99.0.12:$RTC_PORT_B")
     ;;
+  rtc_anchor_stun_endpoint)
+    # The NAT'd anchor with BOTH of its announced endpoints, and both
+    # of them observed from OUTSIDE the NAT (Kyra's E1 item 2).
+    #
+    # `rtc_anchor_direct` above proves one mapping: the announced
+    # `rtc_addr` is the gateway's, and a DataChannel reaches it. It
+    # does not exercise the second endpoint Stage 6 §6.12.2 added —
+    # the separate STUN socket announced as `rtc_stun_addr` — and the
+    # browser matrix cannot, because its anchor sits on the simulated
+    # internet with no NAT in front of it, where two local sockets
+    # prove nothing about two externally reachable mappings.
+    #
+    # So: one anchor, inside the cone NAT, with two pinned 1:1 ports.
+    # The client outside reads both addresses out of the anchor's own
+    # signed announcement, gets a STUN reply from the second one
+    # (carrying its own public tuple as the anchor saw it), and takes
+    # its session onto a DataChannel at the first. Two mappings, two
+    # replies, both announced by the product.
+    NAT_A=cone; NAT_B=none; PUBLIC_B=1; MODE=rtc; OUTCOME_NODE=b
+    SETUP_EXTRA+=(--rtc-port-a "$RTC_PORT_A" --stun-port-a "$STUN_PORT_A")
+    A_EXTRA=(--rtc-bind "192.168.101.2:$RTC_PORT_A"
+             --rtc-public "10.99.0.2:$RTC_PORT_A"
+             --stun-bind "192.168.101.2:$STUN_PORT_A"
+             --stun-public "10.99.0.2:$STUN_PORT_A")
+    PUBLIC_B_EXTRA=(--target a --mode rtc --rtc-bind "10.99.0.12:$RTC_PORT_B")
+    ;;
   # --- Stage 6 browser NAT conformance matrix -----------------------
   # Two headless browsers behind simulated NATs, one anchor. Every arm
   # is ONE line in a fixed shape because `tests/natsim/rows.rs` parses
@@ -108,12 +155,12 @@ case "$SCENARIO" in
   # both endpoint-independent in mapping and differ only in filtering
   # — see setup.sh. That difference is why ar x symmetric solves and
   # pr x symmetric cannot.
-  browser_cone_cone) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
-  browser_cone_portrestricted) NAT_A=cone-ar NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
-  browser_portrestricted_portrestricted) NAT_A=cone-pr NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
-  browser_cone_symmetric) NAT_A=cone-ar NAT_B=symmetric MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
-  browser_portrestricted_symmetric) NAT_A=cone-pr NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
-  browser_symmetric_symmetric) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser ;;
+  browser_cone_cone) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
+  browser_cone_portrestricted) NAT_A=cone-ar NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
+  browser_portrestricted_portrestricted) NAT_A=cone-pr NAT_B=cone-pr MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
+  browser_cone_symmetric) NAT_A=cone-ar NAT_B=symmetric MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
+  browser_portrestricted_symmetric) NAT_A=cone-pr NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
+  browser_symmetric_symmetric) NAT_A=symmetric NAT_B=symmetric MODE=browser EXPECT=relayed ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser ;;
   # DIAGNOSTIC, not a pinned row (S6_REPORT.md §6.12). Both browsers
   # sit directly in nsim_wan on the lab segment: no NAT, no gateway,
   # a real non-loopback interface. It bisects the one question logging
@@ -126,9 +173,24 @@ case "$SCENARIO" in
   # Rust row table against this file's `browser_*` arms and an eighth
   # arm would fail that guard - correctly, since this is a bisect and
   # not a conformance row.
-  diag_wan_wan) NAT_A=none NAT_B=none MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium OUTCOME_NODE=browser NETNS_A=nsim_wan NETNS_B=nsim_wan ;;
-  # The control: row 1 again, the other engine on both sides.
-  browser_cone_cone_firefox) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=firefox ENGINE_B=firefox OUTCOME_NODE=browser ;;
+  diag_wan_wan) NAT_A=none NAT_B=none MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=granted OUTCOME_NODE=browser NETNS_A=nsim_wan NETNS_B=nsim_wan ;;
+  # The control: row 1 again, the other engine on both sides. It has
+  # always run PERMISSION-FREE — Firefox has no media gate on
+  # interface enumeration and Playwright cannot grant it camera or
+  # microphone — so the arm records `none` rather than asking for a
+  # grant the driver would silently not perform.
+  browser_cone_cone_firefox) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=firefox ENGINE_B=firefox MEDIA=none OUTCOME_NODE=browser ;;
+  # The PERMISSION-FREE leg: row 1 again, nothing granted.
+  #
+  # One variable against `browser_cone_cone`: `MEDIA=none`. The six
+  # rows and the Firefox control all grant the page camera+microphone
+  # because Chromium gates interface enumeration on a media
+  # permission, and "the product calls no media API" is source
+  # evidence about the product, not a measurement of the ungranted
+  # browsing context. Behind the same two real NATs rather than on
+  # loopback, because the enumeration this leg measures is what a
+  # non-loopback candidate needs.
+  browser_cone_cone_nomedia) NAT_A=cone-ar NAT_B=cone-ar MODE=browser EXPECT=direct ENGINE_A=chromium ENGINE_B=chromium MEDIA=none OUTCOME_NODE=browser ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 
@@ -307,6 +369,7 @@ if [[ "$MODE" == browser ]]; then
       --nat-a "$NAT_A" --nat-b "$NAT_B" \
       --expect "$EXPECT" \
       --engine-a "$ENGINE_A" --engine-b "$ENGINE_B" \
+      --media "$MEDIA" \
       --anchor-ip 10.99.0.10 \
       --stun-ip 10.99.0.11 \
       --netns-a "${NETNS_A:-nsim_a}" --netns-b "${NETNS_B:-nsim_b}" \
@@ -426,19 +489,43 @@ fi
 # matches 10.99.0.30.
 if [[ "$MODE" == browser ]]; then
   flow_side() { # flow_side <gateway-ns> <peer public ip>
-    local ns="$1" peer="$2" raw=""
+    local ns="$1" peer="$2" raw="" out="" source="unreadable"
+    # EACH READER TRIED ON ITS OWN, WITH ITS STATUS KEPT.
+    #
+    # The previous shape was `conntrack -L || cat /proc/... || true`,
+    # which cannot distinguish "the table was read and holds no
+    # matching flow" from "no reader ran at all": both produced an
+    # empty `raw` and the awk below then printed zeros. A DIRECT row
+    # fails loudly on zeros, but a RELAYED row reads zeros as its own
+    # confirmation — so a namespace that could be read by neither
+    # reader would have CONFIRMED both relayed rows while observing
+    # nothing whatever. That is measurement failure counting as
+    # observed absence, and it is Kyra's E1 witness-hardening item.
+    #
+    # `conntrack -L` exits 0 when it successfully dumps a table,
+    # including an EMPTY one (it reports the count on stderr), and
+    # non-zero when it cannot talk to the kernel or is absent. So the
+    # command's own status is the right discriminator, and it is now
+    # used as one instead of being swallowed.
     if [[ -e "/var/run/netns/$ns" ]]; then
-      raw="$(ip netns exec "$ns" conntrack -L 2>/dev/null \
-        || ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null \
-        || true)"
+      if out="$(ip netns exec "$ns" conntrack -L 2>/dev/null)"; then
+        raw="$out"
+        source="conntrack"
+      elif out="$(ip netns exec "$ns" cat /proc/net/nf_conntrack 2>/dev/null)"; then
+        raw="$out"
+        source="procfs"
+      fi
     fi
-    printf '%s' "$raw" | awk -v peer="$peer" '
+    printf '%s' "$raw" | awk -v peer="$peer" -v source="$source" '
         $0 ~ /(^|[[:space:]])udp[[:space:]]/ {
           if ($0 !~ ("(src|dst)=" peer "([^0-9]|$)")) next
           flows++
           if ($0 !~ /\[UNREPLIED\]/) replied++
         }
-        END { printf "{\"udp_flows\":%d,\"udp_replied\":%d}", flows+0, replied+0 }
+        END {
+          printf "{\"udp_flows\":%d,\"udp_replied\":%d,\"source\":\"%s\"}",
+                 flows+0, replied+0, source
+        }
       '
   }
   {
@@ -492,6 +579,41 @@ for gw in nsim_gwa nsim_gwb; do
   } >"$STATE/${gw}_nat.log" 2>&1
   rm -f "$CT"
 done
+
+# The UPLOADABLE bundle: regular files only, with their own byte
+# count printed.
+#
+# Two facts made this necessary. A successful natsim run uploaded
+# nothing at all, so the retained green job log was the only evidence
+# a row ever produced — not a packet or gateway archive. And an
+# earlier upload of a browser profile silently produced an EMPTY
+# artifact, because `actions/upload-artifact` refuses a tree
+# containing unix sockets and the profile holds several. The state
+# directory still holds those profiles (Firefox's persistent context
+# lives in `browser/profile-*`), so uploading `$STATE` wholesale
+# would reproduce exactly that failure.
+#
+# So the script assembles what is worth keeping — the verdict, the
+# runner and page logs, the gateway snapshots, the per-namespace
+# packet captures — as copies of REGULAR FILES in one directory, and
+# prints the file count and total size. A bundle that came out empty
+# says so here, in the job log, instead of being discovered as an
+# empty artifact after the fact.
+BUNDLE="$STATE/artifacts"
+mkdir -p "$BUNDLE"
+for f in "$STATE"/*.json "$STATE"/*.log "$STATE"/*.pcap; do
+  [[ -f "$f" ]] || continue
+  cp -- "$f" "$BUNDLE/" 2>/dev/null || true
+done
+BUNDLE_FILES="$(find "$BUNDLE" -type f | wc -l)"
+BUNDLE_BYTES="$(find "$BUNDLE" -type f -printf '%s\n' 2>/dev/null | awk '{t+=$1} END {print t+0}')"
+chmod 755 "$BUNDLE"
+chmod 644 "$BUNDLE"/* 2>/dev/null || true
+echo "natsim: artifact bundle $BUNDLE: $BUNDLE_FILES file(s), $BUNDLE_BYTES byte(s)"
+if [[ "$BUNDLE_FILES" -eq 0 || "$BUNDLE_BYTES" -eq 0 ]]; then
+  echo "natsim: WARNING the artifact bundle is empty — an upload of it would produce \
+nothing, which is how a previous cycle lost its evidence" >&2
+fi
 
 # Open the artifacts read-only to non-root (no write bit anywhere)
 # so the invoking `cargo test` process can read the outcome path

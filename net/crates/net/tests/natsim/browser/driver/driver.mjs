@@ -268,7 +268,8 @@ async function opLaunch(req) {
 
 async function opOpen(req) {
   if (!live) throw new Error('open before launch');
-  // THE FIX for §6.12, and it is a permission, not a network.
+  // THE §6.12 FIX, and it is a permission, not a network — BUT IT IS
+  // NOW THE ROW'S CHOICE, NOT THIS DRIVER'S.
   //
   // Chromium gates local-interface enumeration on media permission:
   // `FilteringNetworkManager` logged `received permission status:
@@ -282,17 +283,37 @@ async function opOpen(req) {
   // has no such gate, was fine throughout.
   //
   // Granting camera/microphone for the page's own origin is what a
-  // real user does before a call. It is a HARNESS grant: no product
-  // behaviour changes, no candidate is relabelled, no deadline
-  // widened. Chromium only; Firefox's rows are untouched.
-  if (live.engine !== 'firefox') {
-    try {
-      const origin = new URL(req.url).origin;
-      await live.context.grantPermissions(['camera', 'microphone'], { origin });
-      log(`granted camera+microphone for ${origin}`);
-    } catch (e) {
-      log(`grantPermissions: ${e && e.message}`);
-    }
+  // real user does before a call, and it is what the six conformance
+  // rows and the Firefox control do. It is a HARNESS grant: no
+  // product behaviour changes, no candidate is relabelled, no
+  // deadline widened.
+  //
+  // `req.media === 'none'` is the PERMISSION-FREE leg. "The product
+  // calls no media API" is true and is source evidence about the
+  // product; it is not a measurement of the browsing context that
+  // was never asked, and only a leg that withholds the grant can
+  // make one. So the grant is a per-request decision and this driver
+  // reports back what it actually did — an unreported grant and no
+  // grant must not look the same to the runner.
+  let media = 'none';
+  if (req.media !== 'none' && live.engine !== 'firefox') {
+    const origin = new URL(req.url).origin;
+    // NOT swallowed. A failed `grantPermissions` used to be logged
+    // and the row continued as though the grant had happened, which
+    // is the same collapse as an unreported grant: the row would then
+    // measure the ungranted environment while its verdict said
+    // `granted`.
+    await live.context.grantPermissions(['camera', 'microphone'], { origin });
+    media = 'granted';
+    log(`granted camera+microphone for ${origin}`);
+  } else if (req.media === 'none') {
+    log('media permission WITHHELD: product defaults, nothing granted, nothing prompted');
+  } else {
+    // Firefox has no such gate and Playwright cannot grant camera or
+    // microphone to it at all, so the control row has always run
+    // ungranted. Reported as the fact it is instead of as the flag
+    // the runner passed.
+    log('firefox: no media permission granted (no such gate, and no Playwright support)');
   }
   page = await live.context.newPage();
   page.on('console', (m) => log(`[page] ${m.type()}: ${m.text()}`));
@@ -302,7 +323,7 @@ async function opOpen(req) {
   // Waiting for `load` would block on whatever the page is already
   // doing.
   await page.goto(req.url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-  return { url: page.url() };
+  return { url: page.url(), media };
 }
 
 // What the port allocator enumerated, as a value the runner can

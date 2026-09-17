@@ -108,8 +108,64 @@ two public addresses in both directions, and neither endpoint was
 asked. It is the one party to the session with no stake in the
 answer.
 
-The six Chromium rows pass too, on the same three witnesses — see
-§6.12, which is now closed.
+The six Chromium rows pass too — see §6.12, which is now closed.
+
+**What a NAT row does and does not witness, exactly.** The rows read
+the typed disposition on both halves of the dialog, the §10 ICE
+ledgers on both leaves and the anchor, and the gateways' own
+conntrack. Until this round they did **not** read an application
+payload, and the sentence that used to stand here — "the same three
+witnesses" — read as though §3's loopback payload proof applied to
+every NAT row. It did not, and it could not: conntrack reply traffic
+on a direct row can be ICE or Noise, and on a relayed row the typed
+`iceTimeout` says the routed session was KEPT, never that a byte
+crossed it. Kyra's E1 was right to refuse the transfer.
+
+Each row now carries its own **fourth** witness: a nonce-correlated
+bidirectional exchange on the public peer-addressed stream surface,
+plus the anchor's own per-pair `forwarded_app_packets` read in the
+anchor's process either side of it — **flat both ways on a direct
+row, moving both ways on a relayed one**
+(`tests/natsim/rows.rs`, `AppExchange`). The runner mints both
+nonces; neither page chooses one, so "B decoded exactly what A sent"
+cannot be satisfied by one side. Delivery and the counter disposition
+fail independently, and the inverse receipt for the direct row's half
+(`spikes/S6_RECEIPTS/S6A-01-direct-row-flat-forwarding.log`) shows
+why it had to exist: with only that one assertion disabled, a row
+whose payload the anchor carried still satisfies its typed outcome,
+both leaves' exact ledgers, the anchor's ledger and a two-way replied
+flow on both gateways.
+
+Three more gaps of that shape closed with it:
+
+- **A NAT'd anchor with two announced endpoints.** The matrix's
+  anchor sits on the simulated internet, outside both NATs, so its
+  two local sockets say nothing about two externally reachable
+  mappings — and the older `rtc_anchor_direct` row never exercised
+  the second endpoint §6.12.2 added. `rtc_anchor_stun_endpoint` puts
+  the anchor **inside** the cone NAT with both ports pinned 1:1 and
+  reads both announced addresses back out of the anchor's own
+  announcement; the client outside gets a STUN reply from the
+  announced `rtc_stun_addr` carrying its own public tuple, and takes
+  its session onto a DataChannel at the announced `rtc_addr`. Two
+  mappings, two replies, reachable by deliberately different means
+  (the ICE port stays address-restricted; the STUN port is
+  forwarded, because an endpoint that drops a stranger's first
+  request could never serve the peers it is announced to).
+- **A permission-free Chromium leg.** The six rows grant the page
+  camera+microphone, because Chromium withholds interface
+  enumeration from WebRTC until a media permission exists (§6.12).
+  That the product calls no media API is source evidence about the
+  product, not a measurement of the ungranted context.
+  `browser_cone_cone_nomedia` is row 1 with one variable removed, and
+  the grant is now part of the row table and asserted against what
+  the DRIVERS report doing.
+- **Measurement failure is no longer observed absence.** A gateway
+  whose conntrack table could be read by neither reader used to
+  yield `{"udp_flows":0,"udp_replied":0}` — which is exactly a
+  relayed row's confirmation. Each side now reports the reader that
+  produced its numbers and an unreadable side is a refusal
+  (`S6A-06-unreadable-gateway-is-not-absence.log`).
 
 ---
 
@@ -689,8 +745,9 @@ cause for an outcome that has several."*
 
 ## 7. The demo
 
-`net/crates/net/examples/browser-demo/` — two tabs, cursors, the
-public surface only.
+`net/crates/net/examples/browser-demo/` — three tabs, cursors, the
+public surface only. Two of them are the pair; the third is a
+signalling prober (below).
 
 - **60.00 / 59.96 Hz** sustained per tab over 6.2 s, 360 positions
   sent each way, 361 received. 1–2 fire-and-forget frames dropped in
@@ -713,30 +770,92 @@ neither with a Firefox equivalent here. Engine coverage is the
 browser matrix's job; a one-engine demo is not a matrix and is not
 described as one.
 
+**The flat window now asserts signalling inside itself.** The demo
+already asserted bidirectional receipt, flat ordered-pair counters,
+maintained direct status, the send-rate floor and advancing
+announcement ticks — and it SAMPLED the anchor's `0x0D02` counter
+while only ever reporting setup-time movement. Kyra's E2 refused
+that, correctly: a number that had already stopped moving was
+displayed beside a window the demo claimed liveness over.
+
+The reason it had stopped is worth recording, because it also rules
+out the obvious fix. §9 step 4 clears the leaf's relay entry for its
+peer at the direct install, so every `0x0D02` frame A signs for B
+rides the DataChannel and never reaches the anchor to be counted:
+**two leaves and a direct pair have exactly zero signal transit.**
+And the public `signal()` method cannot substitute —
+`AnchorControlPlane::signal` is a typed refusal (R14), pinned green
+by its own witness. A demo that drove it would have asserted a
+refusal.
+
+So the demo runs a **third leaf whose whole job is public
+signalling**: tab C discovers tab B by a capability tag, is never
+answered, and therefore stays RELAYED for life while every
+`connectPeer` it calls signs an offer that transits the anchor. That
+is the mechanism the merged runner's part 2 already proves, in a demo
+you can watch. The fifth witness,
+`demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window`,
+asserts the anchor's own signalling counter moved, that the prober
+really called the public API inside the window (floor 1, measured
+count printed), and REUSES the flat and still-direct booleans of the
+existing flat row so the two provably speak about one window. The
+four existing witnesses keep their names and predicates verbatim.
+
+The manual HUD's "fresh announcements" sentence is now gated on
+measured tick freshness — the age of the last observed climb in the
+anchor's resolved tick, against a bound derived from the announce
+interval — instead of on receiving positions and a flat counter. When
+the counter is flat and positions arrive but the tick is stale, the
+HUD says so and names the age.
+
 ---
 
-## 8. Evidence discipline
+## 8. Evidence discipline — and the receipt index
 
-Every row in this stage has a **raw inverse receipt**: the defect
-reintroduced with a bounded diff, the exact command, the exit code,
-the verbatim RED output, and the restored green. A row that has never
-been seen to fail is not a witness.
+This section used to claim that **every** row in the stage had a raw
+inverse receipt: the defect reintroduced with a bounded diff, the
+exact command, the exit code, the verbatim RED output and the
+restored green. **That claim was not traceable and is withdrawn.**
+It described two chains and retained neither; no Stage 6 chain
+existed anywhere in the tree, which is what the reviewer's filename
+search found and what an inventory of this repository confirms
+(`spikes/S6_RECEIPTS/README.md` §1: the only captured inverse
+receipts in the tree were Stage 5's, in `spikes/S5_R3_NATIVE_RECEIPTS`
+and `spikes/s5r3_inverse`). A green CI log establishes that a witness
+**passed**; it can never establish that it **can fail**.
 
-Two receipts are worth naming:
+What exists now, per witness, is
+**[`spikes/S6_RECEIPTS/README.md`](../../../spikes/S6_RECEIPTS/README.md)**:
+an index with one row per Stage 6 witness, naming for each the source
+SHA, the selective diff, the executed witness and engine, the command
+and exit, the intended assertion failure, the restoration identity
+and the restored positive output — or saying plainly that no receipt
+was taken, and why. A row marked *no receipt* is a witness whose
+ability to fail has not been demonstrated; that is worth seeing, and
+averaging it into a stage-wide sentence is what went wrong here.
 
-- **§3 part 2.** The pair is put *back on the relay* just before the
-  flat window. Payloads still arrive at B and echo, the unrelated
-  pair still moves, announcements still move — and the row goes red
-  purely because the counter moved 7 → 13 each way. **Arriving bytes
-  cannot make that row green.**
-- **The demo's flat row.** `peer:` dropped from `openStream`, so the
-  positions addressed the anchor: the pair counter stayed flat at
-  1+1 while 0/0 arrived and the anchor's ingress went 92 → 604. **A
-  flat counter with nothing arriving must not pass.**
+**Nine raw receipts** were taken for this round's new acceptance
+arithmetic, all in that directory, each with the mutated file's
+`sha256` before / during / after, both exit codes (101 mutated, 0
+restored) and both runs verbatim. Two are worth naming:
 
-Two receipts were applied in one run to show the rows fail
-independently rather than collapsing into one assertion with three
-names.
+- **`S6A-01`.** The direct row's flat-forwarding assertion is
+  disabled and nothing else. Both nonces still arrive, both leaves'
+  ledgers are exact, the anchor's ledger is exact, both gateways show
+  a two-way replied flow — and the anchor carried the payload.
+  **Nothing else in the row notices**, which is the argument for the
+  witness existing.
+- **`S6A-06`.** `GatewayFlows::measured()` returns `true`
+  unconditionally, and a relayed row then passes on
+  `{"udp_flows":0,"udp_replied":0,"source":"unreadable"}` — a
+  gateway whose conntrack table was never read, confirming that
+  nothing crossed it.
+
+The two chains this section used to describe are recorded in the
+index as **described, not captured**, with the §3 part 2 relay re-pin
+and the demo's dropped `peer:` named as prose observations rather
+than as receipts. The forced-channel-down phase remains earned credit
+and is not relabelled a receipt.
 
 ---
 
@@ -745,11 +864,20 @@ names.
 | Gate | Floor | Pinned from |
 |---|---|---|
 | Browser matrix (Chromium + Firefox) | 41 | `stage6.rs` `WITNESSES` |
-| Browser demo (Chromium) | 4 | `browser-demo/host/src/main.rs` |
+| Browser demo (Chromium) | **5** | `browser-demo/host/src/main.rs` |
 | Leaf native | 266 | run count |
 | R11 ABI probes | 12 | `abi_real_package.mjs` |
-| natsim scenarios (6 native + 6 Chromium + Firefox control) | 13 | `natsim.yml`, each row pinned by name |
+| natsim scenarios (7 native + 7 Chromium + Firefox control) | **15** | `natsim.yml`, each row pinned by name |
+| natsim row table + checker (ungated, every platform) | **38** | `tests/natsim_browser.rs` |
 | Chromium interface enumeration, per NAT'd tab | ≥1 port on `Net[eth0:…]` | `run_row`, from the driver's own count |
+
+The floors this round moves, and the names behind them: the demo
+gains `demo_public_signalling_moves_the_anchor_signal_counter_in_the_flat_window`;
+natsim gains `natsim_browser_cone_cone_is_direct_without_media_permission`
+(the permission-free Chromium leg) and
+`natsim_natted_anchor_publishes_both_mapped_endpoints` (the NAT'd
+anchor's two announced endpoints); the ungated checker goes 22 → 38
+with the application-delivery and measurement-failure rows.
 
 Each roster is validated against its **source** before any log is
 read, each parser proves it can find a known verdict line before a
@@ -771,6 +899,20 @@ any verdict a row reached would be about that and nothing else.
 - **Firefox was never run on the implementation host**; that leg is
   CI's, and no row or detail claims otherwise.
 - **The six natsim rows and the Firefox control ran in CI only.**
+- **The two new natsim legs have never been executed anywhere.** The
+  permission-free Chromium leg and the two-endpoint NAT'd anchor need
+  Linux netns and root; their first run is CI's, and their results
+  are claims until it happens. `spikes/S6_RECEIPTS/README.md` §2.2
+  records them as unexecuted rather than implying otherwise.
+- **`tests/natsim.rs` is not type-checked on the implementation
+  host.** It is `#![cfg(target_os = "linux")]` and the cross check
+  fails in `cc-rs` for want of `x86_64-linux-gnu-gcc`; the ungated
+  `tests/natsim_browser.rs` carries every assertion that can live
+  outside the gate, which is why the row table and its checker are
+  there and not in the gated file.
+- **The three-context demo was not executed on the implementation
+  host** either: it needs Playwright Chromium and a built wasm
+  bundle. Its fifth witness has no runtime receipt yet.
 - **`peer` on `openStream` is refused, not ignored, on the
   leader-proxied path** — a typed refusal rather than a silent
   downgrade to the routed path.

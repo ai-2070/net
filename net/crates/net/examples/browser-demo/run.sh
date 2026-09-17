@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # The demo, from a clean checkout, in ONE command.
 #
-#   net/crates/net/examples/browser-demo/run.sh            # two windows, 60 Hz, by hand
+#   net/crates/net/examples/browser-demo/run.sh            # three windows, 60 Hz, by hand
 #   net/crates/net/examples/browser-demo/run.sh --check     # headless, asserts, exits non-zero on failure
 #
 # Everything below is the documented build: the wasm leaf, the

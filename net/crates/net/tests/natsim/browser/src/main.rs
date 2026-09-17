@@ -56,8 +56,9 @@
 //!
 //! A row measures the **disposition of one signalling dialog** between
 //! two browser leaves behind two simulated NATs: direct, or routed
-//! through the anchor and typed as such. It reads three independent
-//! witnesses:
+//! through the anchor and typed as such — **and whether an
+//! application payload actually crossed it**. It reads four
+//! independent witnesses:
 //!
 //! 1. the typed `kind` of `connectPeer`'s settled result, at the page
 //!    surface;
@@ -65,13 +66,27 @@
 //!    the identity `direct + relayed + failed + udp_blocked ==
 //!    attempted` and `pending == 0` asserted per side;
 //! 3. the gateways' own conntrack tables — written by
-//!    `run_scenario.sh`, not by any party to the session.
+//!    `run_scenario.sh`, not by any party to the session, and each
+//!    side reporting which reader produced its numbers so an
+//!    unreadable table is a refusal rather than an absence of flow;
+//! 4. a **nonce-correlated bidirectional application exchange** on
+//!    the public peer-addressed stream surface, with the anchor's own
+//!    per-pair `forwarded_app_packets` read in this process either
+//!    side of it: flat both ways on a direct row, moving both ways on
+//!    a relayed one.
 //!
-//! It does **not** measure application data flow, and the anchor's
-//! per-pair forwarding counter is not read here: that is the §10
-//! three-part witness, which is a different slice and belongs in the
-//! browser runner where the two tabs share one origin. A row that
-//! asserted it would be asserting two things and diagnosing neither.
+//! Witness 4 is this round's addition, and the first three are why it
+//! was needed: none of them observes a payload. Conntrack reply
+//! traffic on a direct row can be ICE or Noise, and a relayed
+//! DISPOSITION only says the routed session was kept — so a direct
+//! row whose application bytes the anchor carried satisfies all three
+//! and fails only the fourth. The runner mints both nonces; neither
+//! page chooses one, so "B decoded exactly what A sent" cannot be
+//! satisfied by one side alone.
+//!
+//! What a row still does not measure is the §10 three-part witness's
+//! unrelated-pair liveness leg, which needs a third context and
+//! belongs in the browser runner where the tabs share one origin.
 //!
 //! # `udp_blocked` on the anchor
 //!
@@ -191,6 +206,11 @@ struct Matrix {
     nat_a: String,
     nat_b: String,
     expect: String,
+    /// `granted` or `none`: whether the drivers grant the page's own
+    /// origin camera+microphone before opening it. Part of the row
+    /// (`rows.rs`), passed here, and echoed into the verdict as what
+    /// the DRIVERS reported doing — never as this flag.
+    media: String,
     engine_a: String,
     engine_b: String,
     anchor_ip: Ipv4Addr,
@@ -223,6 +243,16 @@ struct Matrix {
     /// How long a side's counters may take to settle after the dialog
     /// terminated, before the last sample is taken as final.
     settle: Duration,
+    /// How long the nonce-correlated application exchange may take,
+    /// end to end, once both sides have a session.
+    ///
+    /// Bounded and short: the exchange is a handful of frames on a
+    /// fire-and-forget stream, and a pair that cannot deliver one
+    /// nonce inside this has not delivered at all. It is NOT a
+    /// retry budget around a failing assertion — the assertion is
+    /// exact nonce equality, and a longer wait cannot turn the wrong
+    /// nonce into the right one.
+    app_exchange: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +271,7 @@ enum Mode {
 fn usage() -> String {
     "usage:\n  natsim-browser-matrix --scenario <name> --state <dir> --nat-a <mode> \
      --nat-b <mode> --expect <direct|relayed> --engine-a <engine> --engine-b <engine> \
+     [--media <granted|none>] \
      --anchor-ip <ip> [--stun-ip <ip>] --netns-a <ns> --netns-b <ns>\n  \
      natsim-browser-matrix page-server \
      --bind <addr> --page <dir> --browser-dist <dir> [--ready <file>]"
@@ -288,6 +319,20 @@ fn parse_args() -> Result<Mode, String> {
         nat_a: need("nat-a")?,
         nat_b: need("nat-b")?,
         expect: need("expect")?,
+        // Defaulted to the six rows' value so an existing invocation
+        // keeps working, and VALIDATED here rather than at the
+        // driver: a typo would otherwise arrive as "not the string
+        // `none`", which the driver reads as a grant.
+        media: match flags.get("media").map(String::as_str) {
+            None | Some("granted") => "granted".to_owned(),
+            Some("none") => "none".to_owned(),
+            Some(other) => {
+                return Err(format!(
+                    "--media must be `granted` or `none`, got {other:?}\n{}",
+                    usage()
+                ))
+            }
+        },
         engine_a: need("engine-a")?,
         engine_b: need("engine-b")?,
         anchor_ip: need("anchor-ip")?
@@ -313,6 +358,7 @@ fn parse_args() -> Result<Mode, String> {
         page_port: port("page-port", 8080)?,
         step_timeout: Duration::from_secs(90),
         settle: Duration::from_secs(10),
+        app_exchange: Duration::from_secs(20),
     }))
 }
 
@@ -360,6 +406,38 @@ enum Step {
         peer: String,
         timeout_ms: u64,
     },
+    /// Open a peer-addressed stream, arm a receiver on it, and — the
+    /// moment `expect_nonce` arrives — answer with `nonce`.
+    ///
+    /// The ANSWERER's half of the application exchange, armed before
+    /// the offerer sends anything for the same reason `arm_accept`
+    /// is: a receiver installed afterwards would miss frames that
+    /// have already been delivered, and a fire-and-forget stream does
+    /// not keep them.
+    AppArm {
+        id: u64,
+        peer: String,
+        stream_id: String,
+        /// This side's nonce — what it echoes with.
+        nonce: String,
+        /// The peer's nonce — what it is waiting to decode.
+        expect_nonce: String,
+    },
+    /// Send `nonce` on a peer-addressed stream until `expect_nonce`
+    /// comes back, or the budget runs out.
+    AppSend {
+        id: u64,
+        peer: String,
+        stream_id: String,
+        nonce: String,
+        expect_nonce: String,
+        timeout_ms: u64,
+    },
+    /// Collect the armed side's account of the same exchange.
+    AppResult {
+        id: u64,
+        timeout_ms: u64,
+    },
     Counters {
         id: u64,
     },
@@ -377,6 +455,9 @@ impl Step {
             | Self::ConnectPeer { id, .. }
             | Self::ArmAccept { id }
             | Self::AcceptResult { id, .. }
+            | Self::AppArm { id, .. }
+            | Self::AppSend { id, .. }
+            | Self::AppResult { id, .. }
             | Self::Counters { id }
             | Self::Done { id } => *id,
         }
@@ -410,6 +491,18 @@ struct StepResult {
     /// outcome are both statements ABOUT ICE; this is the engine's.
     #[serde(default)]
     rtc: Option<serde_json::Value>,
+    /// The nonce this side DECODED from the peer's frames, and its
+    /// own send/receive counts, from the application exchange.
+    ///
+    /// `seen_nonce` is the whole point: a count says bytes arrived,
+    /// and only a nonce the OTHER side minted says whose bytes they
+    /// were.
+    #[serde(default)]
+    seen_nonce: Option<String>,
+    #[serde(default)]
+    app_sent: Option<u64>,
+    #[serde(default)]
+    app_received: Option<u64>,
 }
 
 impl StepResult {
@@ -747,6 +840,58 @@ impl SideReport {
     }
 }
 
+/// The row's **application-delivery** witness, as this runner
+/// measured it.
+///
+/// Two nonces the runner mints — neither page chooses one — plus the
+/// anchor's own per-pair application-forwarding counters, sampled in
+/// this process either side of the exchange. `rows.rs` asserts the
+/// nonces crossed in both directions AND that the anchor's counter
+/// did the row-appropriate thing while they did: flat on a direct
+/// row, moving in both directions on a relayed one.
+///
+/// Every field is emitted unconditionally; `rows.rs` refuses a
+/// verdict that omits one rather than reading the omission as "no
+/// forwarding observed", which on a direct row is indistinguishable
+/// from the property under test.
+#[derive(Debug, Clone, Default)]
+struct AppExchangeReport {
+    nonce_a: String,
+    nonce_b: String,
+    seen_at_a: String,
+    seen_at_b: String,
+    sent_a_to_b: u64,
+    sent_b_to_a: u64,
+    received_at_a: u64,
+    received_at_b: u64,
+    forwarded_pre_ab: u64,
+    forwarded_pre_ba: u64,
+    forwarded_post_ab: u64,
+    forwarded_post_ba: u64,
+}
+
+impl AppExchangeReport {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "nonce_a": self.nonce_a,
+            "nonce_b": self.nonce_b,
+            "seen_at_a": self.seen_at_a,
+            "seen_at_b": self.seen_at_b,
+            // Decimal strings, like every other counter this verdict
+            // carries: `JSON.parse` rounds a u64 above 2^53 and the
+            // identity these feed is exact arithmetic.
+            "sent_a_to_b": self.sent_a_to_b.to_string(),
+            "sent_b_to_a": self.sent_b_to_a.to_string(),
+            "received_at_a": self.received_at_a.to_string(),
+            "received_at_b": self.received_at_b.to_string(),
+            "forwarded_pre_ab": self.forwarded_pre_ab.to_string(),
+            "forwarded_pre_ba": self.forwarded_pre_ba.to_string(),
+            "forwarded_post_ab": self.forwarded_post_ab.to_string(),
+            "forwarded_post_ba": self.forwarded_post_ba.to_string(),
+        })
+    }
+}
+
 #[derive(Default)]
 struct Verdict {
     /// A's `PeerConnectOutcome.type`.
@@ -762,6 +907,11 @@ struct Verdict {
     engine_trust_a: String,
     engine_trust_b: String,
     connect_peer_ms: f64,
+    /// What the two drivers reported GRANTING their pages, which the
+    /// row's own `media` field is asserted against. Empty until both
+    /// pages have opened.
+    media: String,
+    app: AppExchangeReport,
 }
 
 impl Verdict {
@@ -784,6 +934,11 @@ impl Verdict {
             "connect_peer_ms": self.connect_peer_ms,
             "trust_a": self.engine_trust_a,
             "trust_b": self.engine_trust_b,
+            // What the DRIVERS said they granted, not `--media`. A
+            // runner that echoed its own flag here could not detect a
+            // driver that ignored it.
+            "media": self.media,
+            "app": self.app.to_json(),
             "a": self.a.to_json(),
             "b": self.b.to_json(),
             "anchor": { "counters": self.anchor },
@@ -870,6 +1025,18 @@ fn row_for(m: &Matrix) -> Result<Row, String> {
             m.scenario, m.expect, row.expect
         ));
     }
+    // The grant is part of the row for the same reason the topology
+    // is: `browser_cone_cone` and `browser_cone_cone_nomedia` differ
+    // in exactly this, so a script that launched one with the other's
+    // flag would run the granted environment under the ungranted
+    // row's name and every counter in the verdict would agree with
+    // it.
+    if row.media.flag() != m.media {
+        return Err(format!(
+            "scenario {} was launched with --media {} but the table says {}",
+            m.scenario, m.media, row.media
+        ));
+    }
     Ok(row)
 }
 
@@ -883,6 +1050,51 @@ fn secret_hex(scenario: &str, tab: &str, purpose: &str) -> String {
         format!("natsim/{scenario}/{tab}/{purpose}").as_bytes(),
     );
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The stream id both sides open for the application exchange.
+///
+/// Bit 49 is the leaf's stream discriminator and bit 48 (a channel
+/// publication) is deliberately clear, exactly as the Stage 5 ABI
+/// witnesses and the browser demo pin theirs. One id on both sides,
+/// because a peer-addressed stream is one stream and a mismatch would
+/// present as silence rather than as a refusal.
+const APP_STREAM_ID: &str = "0x0002000000006012";
+
+/// One direction's nonce: 16 hex digits, derived per row and side.
+///
+/// Minted HERE and never chosen by a page. A page that picked its own
+/// nonce could report a value it had also sent, and the assertion
+/// `B decoded exactly what A sent` would then be satisfiable by one
+/// side alone. Derived rather than random so a re-run of one row
+/// produces the same two values and two logs are comparable.
+fn nonce(scenario: &str, tab: &str) -> String {
+    secret_hex(scenario, tab, "app-nonce")[..16].to_owned()
+}
+
+/// A leaf's node id as the page reports it: 16 lowercase hex digits.
+fn parse_node_id(hex: &str) -> Result<u64, String> {
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("node id {hex:?} is not 16 hex digits: {e}"))
+}
+
+/// The anchor's own per-pair APPLICATION forwarding counters for this
+/// exact ordered pair, A → B and B → A.
+///
+/// `forwarded_app_packets` is keyed by the `RoutingHeader`'s `src_id`
+/// — a u32 projection of the sender's node id, the same arithmetic
+/// `rtc_signalling.rs` does — and the full u64 destination. It
+/// EXCLUDES `0x0D02` signalling (`mesh.rs`, the
+/// `inner_sub != SUBPROTOCOL_RTC_SIGNAL` arm), so it cannot move
+/// because a candidate was trickled, and it cannot go flat because
+/// signalling stopped.
+fn pair_counts(anchor: &MeshNode, a: u64, b: u64) -> (u64, u64) {
+    let a32 = (a & 0xFFFF_FFFF) as u32;
+    let b32 = (b & 0xFFFF_FFFF) as u32;
+    (
+        anchor.forwarded_app_packets(a32, b),
+        anchor.forwarded_app_packets(b32, a),
+    )
 }
 
 /// Create a directory only this (root) user may enter.
@@ -951,6 +1163,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         ice_deadline: Duration::from_secs(60),
         ..RtcConfig::new().with_bind_addr(rtc_bind)
     });
+
     let anchor = Arc::new(
         MeshNode::new(EntityKeypair::generate(), cfg)
             .await
@@ -1190,8 +1403,20 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             urlencode(&control_url)
         )
     };
-    driver_a.open(&page_url("a")).await?;
-    driver_b.open(&page_url("b")).await?;
+    // The grant, as each DRIVER reports performing it. Both sides
+    // must agree: two tabs of one row in two different permission
+    // environments is not a row, it is two halves of two rows, and
+    // the verdict could only carry one label for them.
+    let media_a = driver_a.open(&page_url("a"), &m.media).await?;
+    let media_b = driver_b.open(&page_url("b"), &m.media).await?;
+    if media_a != media_b {
+        return Err(format!(
+            "tab a opened with media {media_a} and tab b with {media_b} — the two halves of one \
+             row ran in different permission environments"
+        ));
+    }
+    verdict.media = media_a;
+    println!("[runner] media grant: {}", verdict.media);
 
     // --- 5–7. the §9 sequence --------------------------------------
     //
@@ -1210,6 +1435,11 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
         &credential,
         &bootstrap_url,
         &page_origin,
+        // The anchor itself, because the row's application witness
+        // reads ITS per-pair forwarding counter in this process,
+        // either side of the exchange. A page cannot report that
+        // number and an endpoint has no business being asked for it.
+        &anchor,
     )
     .await;
 
@@ -1313,7 +1543,8 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
 }
 
 /// The §9 sequence: connect both leaves, announce, discover, run the
-/// dialog under test, and settle the counters.
+/// dialog under test, exchange application payloads over it, and
+/// settle the counters.
 ///
 /// Everything this touches already exists; nothing here provisions.
 /// That split is what lets `run_row` read the anchor's own ledger and
@@ -1326,6 +1557,7 @@ async fn drive_sequence(
     credential: &str,
     bootstrap_url: &str,
     page_origin: &str,
+    anchor: &MeshNode,
 ) -> Result<(), String> {
     let anchor_rtc_addr = format!("{}:{}", m.anchor_ip, m.rtc_port);
     let connect_step = |tab: &'static str| {
@@ -1446,6 +1678,95 @@ async fn drive_sequence(
     println!(
         "[runner] connectPeer settled as {:?} in {:.0} ms; acceptPeer as {:?}",
         verdict.page_type, verdict.connect_peer_ms, verdict.peer_page_type
+    );
+
+    // --- 6b. the APPLICATION EXCHANGE ------------------------------
+    //
+    // The witness the rows did not have. Everything above establishes
+    // the disposition of a *dialog*: the typed outcome on both
+    // halves, the ICE ledgers, and (in `run_scenario.sh`) the
+    // gateways' own conntrack. None of it observes an application
+    // payload, and conntrack reply traffic on a direct row can be
+    // ICE or Noise rather than anything a page sent. On a relayed row
+    // the disposition is not delivery at all: `iceTimeout` says the
+    // routed session was KEPT, not that a byte ever crossed it.
+    //
+    // So: two nonces this runner mints, one per direction, over the
+    // public peer-addressed stream surface; and the ANCHOR's own
+    // per-pair application counter read here, in the anchor's
+    // process, either side of it. `rows.rs` asserts the nonces
+    // crossed both ways AND that the counter did the row's own thing
+    // while they did — flat on a direct row, moving both ways on a
+    // relayed one.
+    //
+    // The answerer is armed FIRST, for the same reason `arm_accept`
+    // is armed before the offer: a fire-and-forget stream does not
+    // keep frames for a receiver that is not there yet.
+    let a_id = parse_node_id(&verdict.a.node_id)?;
+    let b_id = parse_node_id(&verdict.b.node_id)?;
+    let nonce_a = nonce(&m.scenario, "a");
+    let nonce_b = nonce(&m.scenario, "b");
+    verdict.app.nonce_a = nonce_a.clone();
+    verdict.app.nonce_b = nonce_b.clone();
+    let (pre_ab, pre_ba) = pair_counts(anchor, a_id, b_id);
+    verdict.app.forwarded_pre_ab = pre_ab;
+    verdict.app.forwarded_pre_ba = pre_ba;
+
+    let arm = {
+        let peer = verdict.a.node_id.clone();
+        let nonce = nonce_b.clone();
+        let expect = nonce_a.clone();
+        move |id: u64| Step::AppArm {
+            id,
+            peer,
+            stream_id: APP_STREAM_ID.to_owned(),
+            nonce,
+            expect_nonce: expect,
+        }
+    };
+    tab_b.require(arm).await?;
+
+    let send = {
+        let peer = verdict.b.node_id.clone();
+        let nonce = nonce_a.clone();
+        let expect = nonce_b.clone();
+        let budget = u64::try_from(m.app_exchange.as_millis()).unwrap_or(u64::MAX);
+        move |id: u64| Step::AppSend {
+            id,
+            peer,
+            stream_id: APP_STREAM_ID.to_owned(),
+            nonce,
+            expect_nonce: expect,
+            timeout_ms: budget,
+        }
+    };
+    let sent = tab_a.require(send).await?;
+    verdict.app.seen_at_a = sent.seen_nonce.clone().unwrap_or_default();
+    verdict.app.sent_a_to_b = sent.app_sent.unwrap_or_default();
+    verdict.app.received_at_a = sent.app_received.unwrap_or_default();
+
+    let echoed = tab_b
+        .require(|id| Step::AppResult {
+            id,
+            timeout_ms: 5_000,
+        })
+        .await?;
+    verdict.app.seen_at_b = echoed.seen_nonce.clone().unwrap_or_default();
+    verdict.app.sent_b_to_a = echoed.app_sent.unwrap_or_default();
+    verdict.app.received_at_b = echoed.app_received.unwrap_or_default();
+
+    let (post_ab, post_ba) = pair_counts(anchor, a_id, b_id);
+    verdict.app.forwarded_post_ab = post_ab;
+    verdict.app.forwarded_post_ba = post_ba;
+    println!(
+        "[runner] app exchange: a sent {} received {} (saw {:?}), b sent {} received {} (saw \
+         {:?}); anchor pair a→b {pre_ab} → {post_ab}, b→a {pre_ba} → {post_ba}",
+        verdict.app.sent_a_to_b,
+        verdict.app.received_at_a,
+        verdict.app.seen_at_a,
+        verdict.app.sent_b_to_a,
+        verdict.app.received_at_b,
+        verdict.app.seen_at_b,
     );
 
     // --- 7. the counters, once each side has settled ---------------
