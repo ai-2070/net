@@ -160,7 +160,7 @@ declare function joinStore<S extends object, A extends ActionSpec, I extends Inp
 
 type StoreErrorCode = 'invalid-data' | 'version-mismatch' | 'forbidden' |
   'not-ready' | 'capacity' | 'timeout' | 'aborted' | 'indeterminate' |
-  'owner-lost' | 'closed' | 'action-rejected';
+  'owner-lost' | 'closed' | 'action-rejected' | 'result-expired';
 declare class StoreError extends Error {
   readonly code: StoreErrorCode;
   readonly cause?: unknown;
@@ -183,6 +183,19 @@ declare class StoreError extends Error {
 - Both creators are promises: success means the host is listening or the
   replica has a validated initial snapshot and live subscription. A failed
   join leaves no retained handle or hidden background reconnect loop.
+- **Projections must represent absence explicitly** (reviewer disposition,
+  2026-09-17). `project` keeps returning a **validated `S`** — not
+  `Partial<S>`, which would weaken the schema and leave nested visibility
+  ambiguous — so the *schema* carries visibility honestly:
+  - entity collections **omit** invisible entities;
+  - an individually hidden field uses explicit `null` or a tagged
+    visibility value, never a plausible substitute;
+  - `empty()` represents **absence**, not fabricated game values.
+
+  Zero must never mean "you cannot see this". A ship pointing north and no
+  visible ship must have different representations, which is why the §3
+  example models the ship as a **nullable record** rather than
+  `{ heading: 0, sail: 0, shots: 0 }`.
 
 ## 3. Developer example: a shared ship
 
@@ -202,7 +215,11 @@ instances, functions, `undefined`, non-finite numbers or implicit bigint
 rounding; identifiers requiring full integer precision are strings.
 
 ```typescript
-type ShipState = { heading: number; sail: number; shots: number };
+// `ship: null` is "no visible ship". A visible ship pointing north is
+// `{ heading: 0, ... }`. The two are different values, so a projection
+// that hides the ship cannot be mistaken for one sailing due north.
+type Ship = { heading: number; sail: number; shots: number };
+type ShipState = { ship: Ship | null };
 type ShipActions = { fire: { input: { cannon: string }; output: { shot: number } } };
 type ShipInputs = { helm: { heading: number } };
 
@@ -230,12 +247,15 @@ function count(value: unknown): number {
 const ship = defineStore<ShipState, ShipActions, ShipInputs>({
   id: 'pirate.ship',
   version: 1,
-  empty: () => ({ heading: 0, sail: 0, shots: 0 }),
+  // Absence, not a fabricated heading.
+  empty: () => ({ ship: null }),
   state(value) {
     const v = record(value);
-    const sail = finite(v.sail);
+    if (v.ship === null) return { ship: null };
+    const s = record(v.ship);
+    const sail = finite(s.sail);
     if (sail < 0 || sail > 1) throw new Error('sail out of range');
-    return { heading: heading(v.heading), sail, shots: count(v.shots) };
+    return { ship: { heading: heading(s.heading), sail, shots: count(s.shots) } };
   },
   actions: {
     fire: {
@@ -257,7 +277,7 @@ const ship = defineStore<ShipState, ShipActions, ShipInputs>({
 async function startShip(session: MeshSession, crew: ReadonlySet<string>, captain: string) {
   return hostStore({
     session, definition: ship, key: 'black-petrel',
-    initialState: { heading: 0, sail: 0, shots: 0 },
+    initialState: { ship: { heading: 0, sail: 0, shots: 0 } },
     authorize(request) {
       if (!crew.has(request.peer)) return false;
       if (request.type === 'read') {
@@ -266,19 +286,27 @@ async function startShip(session: MeshSession, crew: ReadonlySet<string>, captai
       return request.type === 'action' || request.peer === captain;
     },
     project(state, { audience }) {
-      // No active audience means an empty/default projection, not retained crew data.
+      // Not authorized for this audience: the ship is ABSENT, not a ship
+      // that happens to read as zeroed. `empty()` is the only honest answer.
       return audience.includes('crew') ? { ...state } : ship.empty();
     },
     actions: {
       fire({ cannon }, { getState, setState }) {
         // A real game also checks reload, station occupancy and ammunition here.
-        const shot = getState().shots + 1;
-        setState({ shots: shot });
+        const current = getState().ship;
+        if (current === null) throw new Error('no ship to fire from');
+        const shot = current.shots + 1;
+        setState({ ship: { ...current, shots: shot } });
         return { shot };
       },
     },
     inputs: {
-      helm({ heading }, { setState }) { setState({ heading }); },
+      helm({ heading }, { getState, setState }) {
+        const current = getState().ship;
+        if (current === null) return undefined;
+        setState({ ship: { ...current, heading } });
+        return undefined;
+      },
     },
   });
 }
@@ -292,12 +320,20 @@ path-string setter, automatic diff of a Three.js scene or deep-merge surprise.
 ### Player code: reads, selectors, actions and fresh input
 
 ```typescript
-async function boardShip(session: MeshSession, authority: string, renderHeading: (n: number) => void) {
+async function boardShip(
+  session: MeshSession,
+  authority: string,
+  renderHeading: (n: number | null) => void,
+) {
   const store = await joinStore({
     session, definition: ship, authority, key: 'black-petrel', audience: ['crew'],
   });
 
-  const stop = store.subscribe(s => s.heading, renderHeading, { fireImmediately: true });
+  // `null` reaches the renderer as "no visible ship" — the selector never
+  // has to invent a heading for a ship the viewer cannot see.
+  const stop = store.subscribe(s => s.ship?.heading ?? null, renderHeading, {
+    fireImmediately: true,
+  });
   const stopStatus = store.subscribeStatus(status => {
     // Application UI can disable controls and mark retained state stale.
     console.info(status.phase, status.stale);
@@ -337,6 +373,7 @@ no public reference-counting puzzle of `join`/`leave` calls for game code.
 | `actions.name(input, options)` | Validate, authorize, execute once within the current deduplication session, return validated result. Resolving means the owner committed its in-memory state transition and sent the result, not disk durability or that all replicas rendered it. The caller's projection may catch up later. No silent retry. |
 | `inputs.name(input)` | Validate and enqueue/coalesce locally; synchronous disposition is not remote acceptance. One pending value per input name per caller, at most one in-flight send plus one replacement. Superseded values are dropped, not replayed. Disconnected/syncing/closed stores return `dropped/not-ready`. Invalid data still throws `StoreError`. |
 | `setAudience(names, options)` | Replace the desired audience set. Resolve after the owner authorized it and installed the matching snapshot/live boundary locally. Equal canonical sets are a no-op only when installed and ready; an equal pending request awaits that transition, while an equal failed request starts a fresh generation. A different newer request supersedes an older pending request; it is aborted, never reported successful by a late callback. |
+| Replay of a retired sequence | Refused as `result-expired`, which means exactly: **this request cannot execute again, and its original result is unavailable.** It is *not* a success receipt and does not assert that the original attempt committed — a retired sequence may have been rejected, aborted before commit, or fenced without executing. Report "committed, result unavailable" only where retained evidence actually establishes the commit; otherwise the original outcome remains unknown. |
 | `getStatus` / `subscribeStatus` | Transport/readiness state kept out of game state. Stable status object until a transition; no initial subscription callback. Reconnecting means retained game state is stale, not an empty world or successful recovery. |
 | `close()` | Immediately fence new work; settle actions appropriately, clear latest inputs, remove listeners and release this handle's network subscriptions/streams. Idempotent promise resolves after local cleanup; no indefinite wait for an unreachable peer. It does not close the caller-owned `MeshSession`. |
 
@@ -439,8 +476,15 @@ fresh, non-reused owner-issued handle bound to the authenticated caller and
 store incarnation. Action traffic only addresses an already active handle;
 it must never create or reactivate one. The owner keeps a bounded
 in-memory result ledger and a non-reexecution floor for retired sequences;
-a duplicate older than the retained result is refused rather than executed
-again. Limit client concurrency, owner subscriber/action populations and
+a duplicate older than the retained result is refused as `result-expired`
+rather than executed again. **A non-reexecution floor is not evidence of
+successful execution** (reviewer disposition, 2026-09-17): depending on how
+the request ended, a retired sequence may have been rejected, aborted before
+commit, or fenced without ever executing. `result-expired` therefore asserts
+only that re-execution is refused and the original result is gone. Turning a
+replay rejection into a fabricated success receipt is prohibited; report a
+commit only where retained evidence establishes one. Limit client
+concurrency, owner subscriber/action populations and
 ledger lifetime. Expiration removes the handle and its ledger; unknown or
 expired handle ids are refused before action dispatch, without permanent
 tombstones. Rejoining creates a new owner-issued id, never one selected or
@@ -465,12 +509,21 @@ operation outside this store.
 
 Initial design defaults, to be measured by the playable demo rather than
 marketed as performance guarantees: 1 MiB validated snapshot, 64 KiB encoded
-store message (fragmented below this layer as supported), 32 pending actions
+store message, 32 pending actions
 per handle, 32 audience labels per handle; 10 s join/action/audience deadline.
 The authoritative host independently enforces its limits; callers cannot
-raise them remotely. Messages must also respect negotiated transport caps:
-split snapshots/patches into bounded chunks rather than assuming one 64 KiB
-store message fits the current leaf payload limit.
+raise them remotely.
+
+**Store chunking and transport fragmentation are separate layers**
+(reviewer disposition, 2026-09-17). A large snapshot necessarily needs
+bounded chunking at *this* layer; it does **not** follow that each chunk
+must then rely on transport fragmentation. A store that chunks to at or
+below the leaf's payload limit never invokes fragmentation at all, and that
+is a legitimate design choice. The implementation brief names which path it
+chose, and its witnesses test **that** path — chunk boundaries, loss,
+duplication, reordering and reconnect, with no partial-state publication.
+Whichever path is chosen, the existing fragmentation regressions are
+preserved unweakened; the store's choice is not licence to touch them.
 
 Keep latest inputs at one pending slot per declared input per caller and
 expire disconnected subscribers within a bounded lease. Owner-wide limits
@@ -510,6 +563,17 @@ existing files. No Node/Python/Go/C binding feature passthroughs are needed.
 1. **Type contract and local store:** implement the new exports and immutable
    reader/owner behavior; type-test inference, invalid action names/payloads,
    absence of replica `setState`, selector equality and idempotent cleanup.
+   **Reference stability gets explicit witnesses** (reviewer disposition,
+   2026-09-17), because "unchanged subtrees retain identity" is an
+   implementation property a naive snapshot apply silently breaks:
+   - updating one entity preserves unrelated entity references;
+   - applying an *equivalent* resynchronization snapshot preserves the root
+     reference;
+   - changing part of a snapshot preserves unchanged subtrees;
+   - an unchanged selector result does not notify its listener.
+
+   Audience clearing is **not** subject to these: removing visibility is a
+   genuine observable change and must notify.
 2. **Public browser dependencies:** close peer/session and membership lifecycle
    gaps with leader/follower tests, real membership acknowledgements and
    last-consumer unsubscribe. Preserve prior identity and stream fencing tests.
@@ -525,9 +589,30 @@ existing files. No Node/Python/Go/C binding feature passthroughs are needed.
 5. **Playable Three.js scene:** real player controls and renders through this
    API. Add a region/crew projection example; two independent players plus an
    unrelated observer establish selective delivery, not merely local filtering.
+   **Independent participants require distinct identities, asserted**
+   (reviewer disposition, 2026-09-17): use isolated browser
+   contexts/profiles *and* assert distinct authenticated node ids — isolation
+   alone is insufficient if the harness provisions the same identity twice.
+   Multiple same-origin tabs sharing one identity are a **separate** witness
+   covering leader replacement and subscription ownership; the two are not
+   substitutes for each other.
    Exercise Chromium/Firefox, permission-free direct and forced fallback, and
    leader-tab loss. Record receiver-observed application data and attributed
    forwarding counters at the same exact head.
+
+**Gating (reviewer disposition, 2026-09-17).** Authenticated originating
+identity, reliable transfer and leader-proxy lifecycle are product
+prerequisites, not witness details: `authorize` must receive the
+authenticated *originating* caller — never a claimed JSON identity and never
+merely the adjacent relay; snapshot delivery must survive chunking, loss,
+duplication and reconnect with no partial-state publication; and
+`MeshSession` must carry the real direct-peer and subscription lifecycle,
+follower tabs and last-consumer cleanup included. Slices 1 and 2 above are
+local/type work and may proceed. **Slices 3–5 — the real multiplayer
+acceptance — require independent closure of those gates against the
+CURRENT implementation head.** A historical HOLD is not proof that the
+repaired head still fails, and repeating an old red claim is not closure;
+equally, green CI is not reviewer acceptance.
 
 For each slice, write the failing witness before implementation, run the
 narrow test family, then the relevant existing gates. `npm test` and
