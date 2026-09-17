@@ -126,3 +126,9 @@ export { AsyncQueue } from './async-queue.js';
 // rather than `connect`, because two nodes on one origin contend for
 // one identity.
 export * from './leader/index.js';
+
+// The networked game store (Stage 7). `defineStore` plus the local
+// store core; `hostStore` / `joinStore` arrive with the leader-proxy
+// peer and subscription lifecycle they require, and are absent rather
+// than stubbed until then — see `store/index.ts`.
+export * from './store/index.js';
