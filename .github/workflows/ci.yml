@@ -2436,6 +2436,129 @@ jobs:
           done
           echo "organization exact planning units: 5 pinned by name, each executed"
 
+      # === A2A paid admission (WS-C) =======================================
+      #
+      # Same discipline as the two steps above, same reason: the
+      # auto-discovery run has already executed this binary, so this step
+      # exists to keep the roster from shrinking silently. The floor is the
+      # count the binary reports (`cargo nextest list` said 41 when it
+      # landed), and the pinned names are the ones carrying a financial or
+      # once-only property outright — cardinality cannot say WHICH witness
+      # vanished.
+      #
+      # `testing` is what gates the journal's `fail_next_write` fault hook,
+      # and it is already in the feature list above; without it
+      # `a_failed_claim_write_never_launches_and_a_retry_launches_once`
+      # cannot inject the failed write it is named for.
+      #
+      # Two of these carry each other and must both stay:
+      # `a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection`
+      # fails if post-payment revocation is rendered as an ordinary unpaid
+      # rejection, and
+      # `a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation`
+      # is the control that keeps the first from passing for a provider that
+      # simply reconciles everything.
+      - name: A2A — paid admission witnesses (WS-C)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_paid_service_refuses_to_start_without_a_gate
+            a_paid_service_refuses_to_start_without_a_journal
+            a_paid_service_refuses_to_start_without_pricing
+            a_free_service_refuses_pricing
+            a_free_service_without_a_journal_runs_preflight_on_direct_submit
+            a_free_service_without_a_journal_enforces_capacity_on_direct_submit
+            prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving
+            an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor
+            a_bearer_submit_is_refused_binding_required
+            a_paid_submit_without_a_reservation_is_refused_before_the_gate
+            a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection
+            a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation
+            a_gate_denial_keeps_the_reservation_and_a_valid_retry_launches_once
+            a_paid_record_resumes_without_a_second_redeem
+            a_paid_record_refuses_a_different_quote_header
+            every_handler_path_performs_only_its_table_transition
+            a_paid_submit_redeems_once_and_runs_once
+            an_identical_retry_returns_the_original_task_without_a_second_redeem
+            concurrent_identical_submits_converge_on_one_admission
+            an_altered_brief_under_the_same_id_is_rejected_before_payment
+            a_reused_proof_from_another_peer_is_refused_and_never_launches
+            a_retry_after_result_retention_never_relaunches_or_redeems
+            a_failed_claim_write_never_launches_and_a_retry_launches_once
+            the_owner_outlives_a_running_executor
+            another_peer_cannot_read_or_cancel_a_paid_task
+            status_cancel_prepare_and_describe_are_uncharged
+            a_restart_after_payment_before_claim_surfaces_paid_not_started_and_resumes_once
+            a_restart_after_claim_surfaces_outcome_unknown_and_never_reruns
+            a_restart_with_a_reconcile_record_keeps_refusing_until_resolved
+            legacy_serve_a2a_ignores_the_service_and_revision_fields
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_paid_admission 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-C paid admission witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_paid_admission \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          # Floor kept AT the reported count, so `$listed` equals it on a
+          # healthy run; `-ge` is what keeps ADDING a witness from tripping
+          # the gate, while a lower floor would let a dropped one pass.
+          [ "$listed" -ge 41 ] \
+            || { echo "::error::expected at least 41 paid admission witnesses executed, saw $listed"; exit 1; }
+          echo "A2A paid admission: $listed executed, $pinned pinned by name, all green"
+
+      # === A2A admission journal (WS-C) ====================================
+      #
+      # The durability half: the lifetime-exclusive `.owner` lock (including
+      # the cross-process probe that re-execs this binary), the CAS
+      # transition table, the atomic launch claim + ledger write, the three
+      # retention classes, and the successor owner's recovery reading. These
+      # are what stop a second charge or a second run after a crash, so the
+      # roster is pinned rather than left to auto-discovery.
+      - name: A2A — admission journal durability (WS-C)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_second_owner_is_excluded_after_a_journal_replacement
+            a_second_open_in_the_same_process_is_refused
+            every_transition_outside_the_table_is_a_conflict
+            the_memory_store_and_the_journal_agree_on_the_transition_table
+            a_gate_denial_note_does_not_change_state
+            claim_launch_writes_the_launched_state_and_the_ledger_atomically
+            unresolved_paid_launched_and_reconcile_records_survive_result_retention
+            an_unpaid_reservation_is_pruned_after_reservation_retention_only
+            a_retired_result_still_answers_ledger_has
+            a_failed_write_leaves_the_journal_untouched
+            a_successor_owner_surfaces_paid_not_started_and_outcome_unknown_without_relaunching
+            capacity_counts_only_in_flight_admissions
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_admission_journal 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-C admission journal witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_admission_journal \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 12 ] \
+            || { echo "::error::expected at least 12 admission journal witnesses executed, saw $listed"; exit 1; }
+          echo "A2A admission journal: $listed executed, $pinned pinned by name, all green"
+
       # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
       # does inside a workspace dev build: it forwards core's own `fixtures`
       # seam, and a dev-dependency used to hide the missing forwarding. This is
@@ -2474,6 +2597,155 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
         run: cargo nextest run --no-fail-fast --no-tests=fail --all-features
+
+      # === A2A caller purchase + task redeem (WS-B) =========================
+      #
+      # The step above ran both binaries by auto-discovery. These two exist so
+      # the roster cannot shrink silently, and because this is the money half:
+      # one authoritative attempt per intent key, a lost reply resumed rather
+      # than re-quoted, an exposed refusal that is NOT proof of
+      # non-settlement, and a redemption bound to one reservation of one
+      # brief.
+      #
+      # Floors are the counts the binaries report (`cargo nextest list` said
+      # 22 and 6 when they landed), kept AT that count for the reason the
+      # sibling SDK steps give.
+      #
+      # Two pairs carry each other:
+      # `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous`
+      # and `an_unexposed_refusal_releases_and_may_prepare_again` — without
+      # the second, the first passes for an implementation that treats every
+      # refusal as ambiguous and never lets a caller retry;
+      # `redeem_for_task_is_idempotent_for_the_same_purchase_hash` and
+      # `a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed` —
+      # without the second, the first passes for a quote that is infinitely
+      # redeemable.
+      #
+      # `-E 'binary(NAME)'` and NOT `--test NAME`, deliberately: the
+      # "Integration test pin guard" job attributes every `--test <name>`
+      # pin to a crate and inventories only the ROOT crate and the SDK, so a
+      # `--test` pin under this step's `working-directory` resolves to
+      # `dir:net/crates/net/payments`, which that guard refuses rather than
+      # guesses at — a hard failure on a pin that is perfectly correct. A
+      # filterset carries no `--test` token, and `--no-tests=fail` is the
+      # stronger guarantee anyway: a `binary()` that matches nothing FAILS
+      # here at run time, where the guard's check is only lexical.
+      - name: A2A — caller purchase store witnesses (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            prepare_task_moves_no_money_and_reserves_no_spend
+            purchase_consumes_the_prepared_quote_not_a_fresh_one
+            purchase_never_requotes_while_an_attempt_is_unresolved
+            a_lost_pay_reply_is_resumed_by_resending_the_identical_payload
+            a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid
+            unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote
+            a_caller_restart_mid_purchase_resumes_the_stored_attempt
+            an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id
+            an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare
+            an_operator_rejection_of_a_held_quote_is_an_unexposed_refusal
+            concurrent_prepares_converge_on_one_quote
+            concurrent_purchases_send_one_payload
+            a_conflicting_commitment_under_the_same_key_is_rejected
+            a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not
+            two_processes_share_one_attempt
+            an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous
+            an_unexposed_refusal_releases_and_may_prepare_again
+            every_caller_transition_outside_the_table_is_a_conflict
+            a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence
+            a_retryable_submit_refusal_keeps_the_attempt_paid
+            unresolved_financial_attempts_are_never_pruned
+            the_task_gate_refuses_a_proof_bought_for_another_reservation
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_caller_purchase)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-B caller purchase witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_caller_purchase) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 22 ] \
+            || { echo "::error::expected at least 22 caller purchase witnesses executed, saw $listed"; exit 1; }
+          echo "A2A caller purchase: $listed executed, $pinned pinned by name, all green"
+
+      - name: A2A — task redeem witnesses (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            a_quote_carries_the_purchase_hash_into_its_id
+            redeem_for_task_refuses_a_mismatched_purchase_hash
+            redeem_for_task_is_idempotent_for_the_same_purchase_hash
+            a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed
+            a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools
+            an_approved_quote_resumes_only_for_its_own_purchase_hash
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_task_redeem)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-B task redeem witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_task_redeem) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 6 ] \
+            || { echo "::error::expected at least 6 task redeem witnesses executed, saw $listed"; exit 1; }
+          echo "A2A task redeem: $listed executed, $pinned pinned by name, all green"
+
+      # === A2A paid end to end (WS-D) ======================================
+      #
+      # The whole slice against the REAL engine rather than a scripted gate:
+      # provider = `PaymentEngine` + mock facilitator + the engine-backed
+      # admission gate + a journal; requester = the caller flow over a mesh
+      # payment channel + spend policy + purchase store. It is the only
+      # binary here where a "one charge, one run" claim is made end to end,
+      # which is why it is named rather than left to auto-discovery.
+      #
+      # Floor 6 is the count the binary reports (`6 tests run: 6 passed`).
+      # All six are platform-independent (loopback UDP + tempdirs).
+      - name: A2A — paid end to end with the real engine (WS-D)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            prepare_then_purchase_then_submit_runs_the_task_once
+            a_pending_approval_resumes_after_approve_payment_for_the_same_purchase_only
+            a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge
+            a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof
+            a_provider_restart_between_redeem_and_claim_reconciles_the_original_payment
+            a_caller_restart_between_pay_and_submit_resumes_from_the_purchase_store
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_paid_end_to_end)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-D end-to-end witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_paid_end_to_end) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 6 ] \
+            || { echo "::error::expected at least 6 end-to-end witnesses executed, saw $listed"; exit 1; }
+          echo "A2A paid end to end: $listed executed, $pinned pinned by name, all green"
 
       # Same reason as the SDK doctest step: nextest does not run doctests, and
       # the `cargo test --all-features` this replaced was running net-payments'
@@ -3451,7 +3723,18 @@ jobs:
             # `delegation` / `publish` / `a2a` add the V2 enrollment, local-tool
             # publication, and A2A binding modules so clippy lints them (they
             # match the `python-tests` build set).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a
+            #
+            # `payments` / `payments-http` are here because the paid surface is
+            # NOT reachable through `a2a` alone: the paid-A2A gateway verbs
+            # (`prepare_task`, `purchase_task`, `submit_task`,
+            # `a2a_attempts`, `a2a_resolve_attempt`) and `PaymentProvider`'s
+            # `serve_a2a_configured` / `a2a_unresolved` / `a2a_resolve` sit
+            # behind `#[cfg(feature = "payments")]`. With `a2a` on and
+            # `payments` off, every one of those functions compiles OUT and
+            # this job lints an empty surface while reporting success — the
+            # same silent-coverage shape the comments above describe. The
+            # `python-tests` build set carries both.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -3572,7 +3855,18 @@ jobs:
             features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments
+            # `a2a` and `publish` join `payments` here so the paid-A2A
+            # binding surface EXISTS in this job. Three gates, not one:
+            # `mod a2a_paid` is `#[cfg(all(feature = "a2a", feature =
+            # "payments"))]`, and the `PaymentProvider` pyclass that calls
+            # into it lives in `payment_provider.rs`'s `mod provider`, which
+            # is `#[cfg(feature = "publish")]`. With `payments` alone the
+            # whole paid surface compiled out; with `payments,a2a` and no
+            # `publish` it compiled but nothing reached it, which rustc
+            # reported as 17 never-used items (measured). All three together
+            # are warning-clean and give the in-crate `#[cfg(test)]` blocks
+            # in `src/a2a.rs` / `src/a2a_paid.rs` something to run against.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""

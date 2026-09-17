@@ -30,6 +30,27 @@
       },
       "domain": "event-bus"
     },
+    "A2A — paid task admission (prepare → purchase → submit)": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Caller — payment flow": {
       "bindings": {
         "C": {

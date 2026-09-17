@@ -258,19 +258,51 @@ impl NetMesh {
     /// accepted task id. Rejects if the executor refused the brief. The
     /// node must already be connected to `targetNodeId`. (Requires the
     /// `a2a` feature.)
+    ///
+    /// `taskId` retains a caller-chosen id instead of the random one a
+    /// brief mints (omit it for random). A retained id is what makes a
+    /// submission idempotent on a provider that keeps durable admission
+    /// records: the caller that lost a reply re-submits the *same* id and
+    /// converges on the original admission instead of starting a second
+    /// one. `service` + `revision` (both or neither) name a catalog entry
+    /// on such a provider; a provider serving this free path ignores both.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_task(
         &self,
         target_node_id: BigInt,
         prompt: String,
         context_refs: Option<Vec<String>>,
         tags: Option<Vec<String>>,
+        task_id: Option<String>,
+        service: Option<String>,
+        revision: Option<String>,
     ) -> Result<String> {
         let target = u64_arg("targetNodeId", target_node_id)?;
         let mesh = mesh_over(self.node_arc_clone()?, None);
-        let brief = TaskBrief::new(prompt)
+        let mut brief = TaskBrief::new(prompt)
             .with_context_refs(context_refs.unwrap_or_default())
             .with_tags(tags.unwrap_or_default());
+        if let Some(task_id) = task_id {
+            if task_id.is_empty() {
+                return Err(a2a_err(
+                    "taskId must be a non-empty string (omit it for a random id)",
+                ));
+            }
+            brief = brief.with_task_id(task_id);
+        }
+        match (service, revision) {
+            (Some(service), Some(revision)) => brief = brief.with_service(service, revision),
+            (None, None) => {}
+            // A catalog-driven provider resolves a brief by the pair, so one
+            // without the other could never match an offer.
+            _ => {
+                return Err(a2a_err(
+                    "service and revision must be given together — a \
+                     catalog-driven provider resolves a brief by the pair",
+                ))
+            }
+        }
         let ack = mesh
             .submit_task(target, &brief)
             .await

@@ -51,11 +51,21 @@ cargo clippy --all-features --all-targets -- \
   -A clippy::multiple_unsafe_ops_per_block
 
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+# Per-crate rustdoc. The bare `cargo doc` above documents the ROOT crate only,
+# so a doc comment in any of these three is unchecked by it. Feature lists are
+# ci.yml's, verbatim (the "Documentation" job):
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps --features full
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-payments --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-python  --no-deps \
+  --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org
 ```
 
 That checklist compiles the workspace several times over with different feature sets, which is the workload [sccache](https://github.com/mozilla/sccache) is for — `export RUSTC_WRAPPER=sccache` **and** `export CARGO_INCREMENTAL=0` together (sccache does not cache incremental invocations, so setting only the first silently bypasses the cache). Opt-in per developer, from the shell only: a committed `rustc-wrapper` in `.cargo/config.toml` hard-fails the build for anyone without the binary. Full trade-offs in CONTRIBUTING.md.
 
 CI also lints workspace members individually (`net-payments`, `sdk`, the ffi crates, `bindings/node`, `bindings/python`) with their own feature lists — run `cargo clippy -p <crate>` / `cargo doc -p <crate> --no-deps` for any member you touched, with the feature list from ci.yml. Doc comments on **public** items may not intra-doc-link private items (`rustdoc::private_intra_doc_links` is denied).
+
+**`net-payments` must be documented `--all-features`, not `--features mesh`.** That is what ci.yml runs, and it is not interchangeable: under `mesh` alone, six intra-doc links in `facilitator/packs.rs` and `flow/signer.rs` point at items the narrower feature set does not compile, so they dangle and `-D warnings` fails on six pre-existing errors that have nothing to do with your change. The wide set is the gate; the narrow one is noise.
 
 ### The feature-flag trap (critical)
 

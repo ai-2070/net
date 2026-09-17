@@ -94,6 +94,116 @@ Two traps:
 
 ---
 
+## Paid A2A: prepare → purchase → submit
+
+**Free or paid is the provider's configuration, never the caller's
+choice.** `serve_a2a` is the free path and is unchanged. The catalog-driven
+path (`serve_a2a_configured` in Rust, `PaymentProvider.serve_a2a_configured`
+in Python) requires every service to be *explicitly* free or paid, and
+**refuses to start** rather than degrade: a paid service with no pricing
+terms, a free service carrying pricing terms, or a paid service with no
+payment gate or no admission journal are all serve-time errors.
+
+Free still means *no payment*, not *no policy* — a free configured service
+runs the preflight and enforces capacity.
+
+The order is the design. Everything that can refuse the work happens
+**before a quote exists**; the launch is claimed durably **before** the
+executor is spawned.
+
+| Verb | Does | Money |
+|---|---|---|
+| `prepare_task` | validate, preflight, reserve capacity, mint the admission id, quote | none — read-only on the money side |
+| `purchase_task` | spend policy, author the payload once, pay | the one charge |
+| `submit_task` | send the brief + the stored proof; provider redeems, claims, runs | none |
+
+```python
+import json, time
+from net import CapabilityGateway
+
+# All three paths are required for a paid purchase: the spend policy and
+# profile authorize it, the purchase store makes the attempt resumable.
+# A gateway built without the policy raises ValueError on prepare_task.
+gw = CapabilityGateway(
+    mesh,
+    payment_policy_path="state/payment-policy.json",
+    payment_profile="dev_test",
+    a2a_purchase_path="state/a2a-purchases.json",
+)
+
+# 1. Prepare — no money moves. Show the price, then decide.
+#    `busy` reserved nothing and quoted nothing, so it is retryable — it is
+#    also how a not-yet-routable first call to a fresh peer reports itself.
+for _ in range(8):
+    prep = json.loads(gw.prepare_task(
+        provider_node_id, "research", "summarize the quarterly filings",
+        context_refs=["artifact:q3-filings"],
+    ))
+    if prep["status"] != "busy":
+        break
+    time.sleep(0.1)
+if prep["status"] != "ok":                   # rejected | retired | conflict
+    raise SystemExit(f"provider refused to prepare: {prep['status']}")
+prepared = json.dumps(prep["prepared"])      # the complete handle; pass it on
+print("quote", prep["quote"]["quote_id"], prep["quote"]["amount"])
+
+# 2. Purchase — consumes THAT quote. Never re-quote a live attempt.
+buy = json.loads(gw.purchase_task(prepared))
+if buy["status"] == "requires_payment_approval":
+    gw.approve_payment(buy["quote_id"])      # operator decision
+    buy = json.loads(gw.purchase_task(prepared))
+if buy["status"] != "paid":
+    # denied + funds_ambiguous=True is NOT proven non-payment: an operator
+    # resolves it with gw.a2a_resolve_attempt(...). Do not retry it.
+    raise SystemExit(f"not paid: {buy['status']} {buy.get('policy_reason')}")
+
+# 3. Submit — the stored proof, byte-identical on every retry.
+ack = json.loads(gw.submit_task(prepared))
+if ack["status"] == "retry":                 # e.g. journal_unavailable, Busy
+    ack = json.loads(gw.submit_task(prepared))
+print(ack["status"], ack["task_id"])         # accepted | retry | unexecutable
+```
+
+Then poll `mesh.task_status(provider_node_id, ack["task_id"])` as usual.
+
+**Four traps.**
+
+- **Never re-quote an unresolved attempt.** `purchase_task` re-sends the
+  *stored* payload, which the engine answers idempotently. A fresh quote for
+  the same work is a second charge. `prepare_task` on a live attempt refuses.
+- **`unknown` is not `denied`.** A lost pay reply leaves the attempt
+  `unknown`; calling `purchase_task` again resolves it through the stored
+  payment. Treating it as a failure and re-preparing is the bug this store
+  exists to prevent.
+- **`unexecutable` keeps its evidence.** A paid submit the provider will not
+  execute (`no_reservation`, `admission_revoked`) is not a lost payment —
+  the proof and billing stay on the attempt, and `a2a_resolve_attempt` is the
+  only exit. Same for `denied {funds_ambiguous: true}`.
+- **Operator queues do not drain themselves.** `gw.a2a_attempts()` (caller)
+  and `PaymentProvider.a2a_unresolved()` (provider) accumulate by design:
+  money moved, or may have. Nothing prunes them.
+
+**Refusals.** Payment/admission refusals arrive as the `ERR_PAYMENT`
+application error with a `net-failure-schematic` header — reasons
+`missing_quote`, `binding_required`, `binding_rejected`, `no_reservation`,
+`input_binding_mismatch`, `admission_revoked`, and `journal_unavailable`
+(the one retryable row). Non-financial rejections stay in-body as
+`TaskAck { accepted: false }`: unknown service, stale revision, bounds
+exceeded, `Busy`, `Retired`.
+
+**After a provider restart**, status can answer a new terminal state,
+`interrupted{detail}` — `paid_not_started` (resumes on the recorded payment,
+launches once), `outcome_unknown` (never relaunched), `admission_revoked`
+(operator resolves). Python and Node pass it through as JSON; a **Rust
+requester built before it existed cannot decode it**. It is the one wire
+addition of the paid path, and only a configured catalog emits it.
+
+**Paid serving is Rust and Python only.** Node/TypeScript is requester-side
+(free) and Go has no A2A at all — say so rather than generating a call that
+does not exist.
+
+---
+
 ## Delegated agent identity
 
 **Two different things are called "delegation."** Permission tokens

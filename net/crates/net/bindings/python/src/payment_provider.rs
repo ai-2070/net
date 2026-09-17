@@ -365,6 +365,17 @@ mod provider {
         billing: Option<Arc<BillingLog>>,
         /// Keeps the `net.payments.quote/pay` services registered on the node.
         _serve: PaymentServeHandle,
+        /// The admission store the configured A2A serving path writes
+        /// through, retained so the operator verbs (`a2a_unresolved` /
+        /// `a2a_resolve`) can reach it. `None` until
+        /// `serve_a2a_configured` has been called — the journal is opened
+        /// there, not at construction, because opening it takes exclusive
+        /// ownership and a provider that serves no tasks should not hold a
+        /// lock.
+        ///
+        /// `parking_lot::Mutex` because pyo3 hands out `&self`.
+        #[cfg(feature = "a2a")]
+        a2a_store: parking_lot::Mutex<Option<net_sdk::a2a_journal::SharedAdmissionStore>>,
     }
 
     #[pymethods]
@@ -490,6 +501,8 @@ mod provider {
                 registry_version,
                 billing,
                 _serve: serve,
+                #[cfg(feature = "a2a")]
+                a2a_store: parking_lot::Mutex::new(None),
             })
         }
 
@@ -666,6 +679,137 @@ mod provider {
                 pricing.into_iter().collect(),
                 Some(admission),
             )
+        }
+
+        /// Serve the **configured** (catalog-driven) A2A task lifecycle on
+        /// this provider's node: paid services gated by this provider's own
+        /// payment engine, every admission recorded in the durable journal
+        /// at ``journal_path``. Requires the ``a2a`` build feature.
+        ///
+        /// ``callback`` is the async task executor, the free
+        /// :meth:`NetMesh.serve_a2a` signature plus two **keyword**
+        /// arguments: ``async (task_id, prompt, context_refs, tags, *,
+        /// service, revision) -> str``.
+        ///
+        /// ``services`` maps a service id to its offer::
+        ///
+        ///     {"summarize": {
+        ///         "revision": "r1",
+        ///         "pricing_terms": provider.pricing_terms(
+        ///             "net.a2a.task/summarize", requirements_json),
+        ///         "bounds": {"max_prompt_bytes": 4096, "max_context_refs": 8,
+        ///                    "max_tags": 8, "max_tag_bytes": 64,
+        ///                    "max_in_flight": 4},
+        ///         "reservation_ttl_secs": 300,
+        ///         "reservation_retention_secs": 86400,
+        ///         "retention_secs": 3600,
+        ///         "description": "summarize a document"}}
+        ///
+        /// ``pricing_terms`` is the free/paid selector: present prices the
+        /// service, ``None`` (or absent) serves it for nothing. A paid
+        /// service is **never** served free — an announced price with no
+        /// gate, terms on a free service, or a catalog key that disagrees
+        /// with its own offer all raise ``ValueError`` here rather than
+        /// registering anything.
+        ///
+        /// ``principal`` chooses who a submission is attributed to:
+        /// ``"session_peer"`` (the AEAD-authenticated session peer —
+        /// direct sessions only) or ``"same_org"`` / ``"granted"`` (the
+        /// entity an organization admission proof names, which also
+        /// enforces payer == caller on every paid admission).
+        ///
+        /// ``preflight`` is the application's own admission check, an async
+        /// callable ``(owner_json, offer_json, brief_json) -> None | str``
+        /// returning ``None`` to admit or a reason to refuse. It runs at
+        /// prepare **and again** at submit, so it must be pure.
+        ///
+        /// Raises :class:`JournalOwnedElsewhere` if another live holder —
+        /// in this process or another — already owns ``journal_path``: two
+        /// writers over one set of admission records would each believe
+        /// they may launch the same paid work.
+        ///
+        /// Hold the returned handle to keep accepting tasks.
+        #[cfg(feature = "a2a")]
+        #[pyo3(signature = (callback, services, journal_path, *, principal="session_peer", preflight=None))]
+        fn serve_a2a_configured(
+            &self,
+            py: Python<'_>,
+            callback: Py<PyAny>,
+            services: &Bound<'_, pyo3::types::PyDict>,
+            journal_path: String,
+            principal: &str,
+            preflight: Option<Py<PyAny>>,
+        ) -> PyResult<crate::a2a::PyA2aServeHandle> {
+            let (handle, store) = crate::a2a_paid::serve_configured(
+                py,
+                self.node.clone(),
+                self.runtime.clone(),
+                self.engine.clone(),
+                callback,
+                services,
+                journal_path,
+                principal,
+                preflight,
+            )?;
+            *self.a2a_store.lock() = Some(store);
+            Ok(handle)
+        }
+
+        /// The **unresolved-financial** admissions, as a JSON array of
+        /// admission records: money may have moved and the outcome is not
+        /// recorded (``paid``, ``launched`` without a terminal, or
+        /// ``reconcile``). Requires the ``a2a`` build feature.
+        ///
+        /// This class is never pruned automatically — by design. It is the
+        /// operator's queue, and :meth:`a2a_resolve` is its only exit.
+        /// Raises ``ValueError`` before :meth:`serve_a2a_configured` has
+        /// opened a journal.
+        #[cfg(feature = "a2a")]
+        fn a2a_unresolved(&self, py: Python<'_>) -> PyResult<String> {
+            crate::a2a_paid::unresolved_json(py, self.runtime.clone(), self.a2a_store()?)
+        }
+
+        /// Resolve one unresolved-financial admission to a terminal state:
+        /// ``owner_json`` and ``task_id`` as they appear on an
+        /// :meth:`a2a_unresolved` row, ``state_json`` the ``TaskState`` the
+        /// operator established (e.g.
+        /// ``{"state": "completed", "result_ref": "blob://x"}``,
+        /// ``{"state": "failed", "error": "..."}``). Returns ``None``.
+        /// Requires the ``a2a`` build feature.
+        ///
+        /// Operator surface: it records what a human established out of
+        /// band. It never relaunches the work, and the launch ledger still
+        /// bars a second execution of the same admission afterwards.
+        #[cfg(feature = "a2a")]
+        fn a2a_resolve(
+            &self,
+            py: Python<'_>,
+            owner_json: &str,
+            task_id: String,
+            state_json: &str,
+        ) -> PyResult<()> {
+            crate::a2a_paid::resolve_admission(
+                py,
+                self.runtime.clone(),
+                self.a2a_store()?,
+                owner_json,
+                task_id,
+                state_json,
+            )
+        }
+    }
+
+    #[cfg(feature = "a2a")]
+    impl PyPaymentProvider {
+        /// The admission store, or a loud error naming what to call first.
+        fn a2a_store(&self) -> PyResult<net_sdk::a2a_journal::SharedAdmissionStore> {
+            self.a2a_store.lock().clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no A2A admission journal is open — call \
+                     serve_a2a_configured(...) first; it opens the journal and \
+                     takes exclusive ownership of it",
+                )
+            })
         }
     }
 }

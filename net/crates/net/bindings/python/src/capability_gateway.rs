@@ -487,10 +487,10 @@ struct GatewayState {
     consent: Arc<ConsentPolicy>,
     /// The machine-shared pin store path, reloaded fresh per call.
     pin_store_path: Option<PathBuf>,
-    /// The caller-side payment flow for paid capabilities (`payments`
+    /// The caller-side payment wiring for paid capabilities (`payments`
     /// build feature + payment kwargs). `None` = paid capabilities fail
     /// closed at the gate, per doctrine.
-    payment: Option<Arc<dyn net_mcp::serve::PaymentFlow>>,
+    wiring: Option<PaymentWiring>,
     /// The spend-policy store path retained from the payment kwargs, so the
     /// operator approval verbs (approve/reject/pending/spent_today) open the
     /// same shared store the flow reserves against. `None` = no
@@ -502,6 +502,12 @@ struct GatewayState {
     spend_profile: String,
     /// The mesh's own runtime — where the node's socket + timers live.
     runtime: Arc<GuardedRuntime>,
+    /// The SDK mesh the gateway was built over — retained because the
+    /// paid-A2A verbs need the requester surface (`describe_a2a`) as well
+    /// as the capability gateway. Only that surface reads it, so it exists
+    /// only where it does.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    mesh: Arc<SdkMesh>,
 }
 
 /// Payment kwargs, collected before the cfg boundary so both gateway
@@ -603,6 +609,7 @@ impl GatewayState {
         pin_store_path: Option<String>,
         delegation: Option<(SdkIdentity, Vec<u8>)>,
         payment_config: Option<PaymentConfig>,
+        a2a_purchase_path: Option<String>,
     ) -> PyResult<Self> {
         // Mirror `DaemonRuntime`: reuse the live node + its runtime so the
         // gateway drives mesh I/O on the same scheduler the node runs on.
@@ -624,17 +631,75 @@ impl GatewayState {
             Some(c) => (Some(c.policy_path.clone()), c.profile.clone()),
             None => (None, "production".to_string()),
         };
-        let payment = build_payment_flow(sdk_mesh, payment_config)?;
+        let wiring = build_payment_flow(sdk_mesh.clone(), payment_config, a2a_purchase_path)?;
         Ok(Self {
             gateway: Arc::new(gateway),
             consent: Arc::new(ConsentPolicy::new()),
             pin_store_path: pin_store_path.map(PathBuf::from),
-            payment,
+            wiring,
             spend_policy_path,
             spend_profile,
             runtime,
+            #[cfg(all(feature = "payments", feature = "a2a"))]
+            mesh: sdk_mesh,
         })
     }
+
+    /// The paid-A2A caller flow, or a loud error naming the missing kwarg.
+    ///
+    /// Two ways to get here without one: no `payment_policy_path` (so
+    /// there is no payment flow at all) and no `a2a_purchase_path` (so
+    /// there is nowhere durable to record a purchase). Both are refused
+    /// rather than defaulted: a purchase attempt kept only in memory is
+    /// a payment whose evidence dies with the process.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    fn a2a_flow(&self) -> PyResult<Arc<net_payments::flow::a2a::A2aCallerFlow>> {
+        match self.wiring.as_ref() {
+            Some(w) => w.a2a.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "paid A2A needs a2a_purchase_path= at construction (the durable \
+                     purchase store: one attempt per (caller, provider, task id), \
+                     which is what makes a lost pay reply recoverable instead of \
+                     a second charge)",
+                )
+            }),
+            None => Err(PyValueError::new_err(
+                "paid A2A needs payment_policy_path= at construction (the shared \
+                 spend-policy store every outbound payment is reserved against)",
+            )),
+        }
+    }
+}
+
+/// The caller-side payment wiring: one `CallerPaymentFlow`, used twice.
+///
+/// The invoke gate needs it as `net_mcp`'s `PaymentFlow` trait object;
+/// the paid-A2A verbs need its own staged surface (`quote_bound` /
+/// `reserve_spend` / `author` / `pay_exact`, which `A2aCallerFlow`
+/// composes). One instance serves both, so a budget spent on a paid tool
+/// is a budget spent for a paid task — two flows over one policy file
+/// would each reserve against the same day's limit without seeing the
+/// other's in-process approvals.
+#[cfg(feature = "payments")]
+struct PaymentWiring {
+    /// The flow as the MCP gate's seam.
+    gate: Arc<dyn net_mcp::serve::PaymentFlow>,
+    /// The paid-A2A caller flow over the same payment flow plus a durable
+    /// purchase store. `None` when no `a2a_purchase_path` was supplied.
+    ///
+    /// Needs the `a2a` feature too: it composes the SDK's requester verbs
+    /// (`describe_a2a` / `prepare_a2a` / `submit_task_paid`). A
+    /// `payments`-only build simply has no paid-A2A surface.
+    #[cfg(feature = "a2a")]
+    a2a: Option<Arc<net_payments::flow::a2a::A2aCallerFlow>>,
+}
+
+/// Without the `payments` build feature there is no flow to hold; the
+/// payment kwargs are already a loud config error, so this is never
+/// constructed. It exists so `GatewayState` has one shape.
+#[cfg(not(feature = "payments"))]
+struct PaymentWiring {
+    gate: Arc<dyn net_mcp::serve::PaymentFlow>,
 }
 
 /// Build the caller payment flow from the payment kwargs (doctrine #1:
@@ -650,12 +715,21 @@ impl GatewayState {
 fn build_payment_flow(
     mesh: Arc<SdkMesh>,
     config: Option<PaymentConfig>,
-) -> PyResult<Option<Arc<dyn net_mcp::serve::PaymentFlow>>> {
+    a2a_purchase_path: Option<String>,
+) -> PyResult<Option<PaymentWiring>> {
     use net_payments::flow::mesh::MeshPaymentChannel;
     use net_payments::flow::{CallerPaymentFlow, SystemClock};
     use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 
     let Some(config) = config else {
+        if a2a_purchase_path.is_some() {
+            return Err(PyValueError::new_err(
+                "a2a_purchase_path requires payment_policy_path (the shared \
+                 spend-policy store every outbound payment is reserved against) \
+                 — a purchase store with no spend policy would record payments \
+                 nothing ever authorized",
+            ));
+        }
         return Ok(None);
     };
     // Vocabulary lives once in core (`SpendProfile::parse`), so the node and
@@ -679,8 +753,8 @@ fn build_payment_flow(
         caller.clone(),
         spend,
         registry,
-        Arc::new(MeshPaymentChannel::new(mesh, caller, clock.clone())),
-        clock,
+        Arc::new(MeshPaymentChannel::new(mesh.clone(), caller, clock.clone())),
+        clock.clone(),
     );
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));
@@ -691,7 +765,27 @@ fn build_payment_flow(
     if let Some((address, callable)) = config.signer_xrpl {
         flow = flow.with_signer("xrpl", python_xrpl_signer(address, callable));
     }
-    Ok(Some(Arc::new(flow)))
+    let flow = Arc::new(flow);
+    // `a2a` is opt-in on its own path: the invoke gate needs no purchase
+    // store, and opening one a caller never asked for would create a
+    // financial record file as a side effect of building a gateway.
+    #[cfg(feature = "a2a")]
+    let a2a = a2a_purchase_path
+        .as_deref()
+        .map(|path| crate::a2a_paid::build_flow(flow.clone(), mesh, path, clock));
+    // A build without `a2a` has no requester verbs to compose, so the
+    // kwarg is a loud config error rather than a silently ignored path.
+    #[cfg(not(feature = "a2a"))]
+    if a2a_purchase_path.is_some() {
+        return Err(PyValueError::new_err(
+            "this build lacks the `a2a` feature; a2a_purchase_path is unavailable",
+        ));
+    }
+    Ok(Some(PaymentWiring {
+        gate: flow,
+        #[cfg(feature = "a2a")]
+        a2a,
+    }))
 }
 
 /// Bridge a Python signing callable into the payments
@@ -821,12 +915,16 @@ pub(crate) fn python_xrpl_signer(
 fn build_payment_flow(
     _mesh: Arc<SdkMesh>,
     config: Option<PaymentConfig>,
-) -> PyResult<Option<Arc<dyn net_mcp::serve::PaymentFlow>>> {
-    match config {
-        Some(_) => Err(PyValueError::new_err(
+    a2a_purchase_path: Option<String>,
+) -> PyResult<Option<PaymentWiring>> {
+    match (config, a2a_purchase_path) {
+        (Some(_), _) => Err(PyValueError::new_err(
             "this build lacks the `payments` feature; payment_policy_path is unavailable",
         )),
-        None => Ok(None),
+        (None, Some(_)) => Err(PyValueError::new_err(
+            "this build lacks the `payments` feature; a2a_purchase_path is unavailable",
+        )),
+        (None, None) => Ok(None),
     }
 }
 
@@ -897,7 +995,7 @@ pub struct PyCapabilityGateway {
 #[pymethods]
 impl PyCapabilityGateway {
     #[new]
-    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None))]
+    #[pyo3(signature = (mesh, pin_store_path=None, delegation_leaf=None, delegation_chain=None, payment_policy_path=None, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, payment_signer_svm_address=None, payment_signer_svm=None, payment_signer_xrpl_address=None, payment_signer_xrpl=None, a2a_purchase_path=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &crate::mesh_bindings::NetMesh,
@@ -913,6 +1011,7 @@ impl PyCapabilityGateway {
         payment_signer_svm: Option<Bound<'_, PyAny>>,
         payment_signer_xrpl_address: Option<String>,
         payment_signer_xrpl: Option<Bound<'_, PyAny>>,
+        a2a_purchase_path: Option<String>,
     ) -> PyResult<Self> {
         let delegation = build_delegation(delegation_leaf, delegation_chain)?;
         let payment = PaymentConfig::collect(
@@ -927,7 +1026,13 @@ impl PyCapabilityGateway {
             unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
+            state: GatewayState::from_mesh(
+                mesh,
+                pin_store_path,
+                delegation,
+                payment,
+                a2a_purchase_path,
+            )?,
         })
     }
 
@@ -1046,6 +1151,173 @@ impl PyCapabilityGateway {
         py.detach(move || runtime.block_on(do_spent_today(path, profile, network, asset)))
     }
 
+    /// **Paid A2A, step 1 — read-only on the money side.** Ask
+    /// `target_node_id` to validate this brief and reserve capacity for it,
+    /// and obtain a provider-signed quote bound to that exact reservation.
+    /// No spend is reserved and no payment is made, so it is safe to call
+    /// merely to display a price.
+    ///
+    /// Returns a JSON string
+    /// ``{"status": ok|rejected|busy|retired|conflict, "prepared": {...},
+    /// "quote": {"quote_id", "amount", "network", "asset",
+    /// "expires_at_ns"}}``. Keep ``prepared`` — it is the complete
+    /// ``PreparedTask`` document (provider node, byte-exact brief, offer
+    /// hash, reservation) that :meth:`purchase_task` and
+    /// :meth:`submit_task` take back, and nothing is re-derived from it.
+    ///
+    /// ``busy`` means nothing was reserved and nothing was quoted — retry.
+    /// ``conflict`` means this id already names other work on this
+    /// provider; ``rejected`` and ``retired`` are dead ends.
+    ///
+    /// Exactly one attempt per ``(caller, provider, task_id)`` does the
+    /// work: a concurrent call that finds a live prepare awaits it and
+    /// returns the same reservation, and one that finds a live quote
+    /// returns it without asking for another. ``task_id=None`` mints a
+    /// random id; retaining one is what makes the purchase resumable.
+    /// Requires the ``payments`` build feature plus
+    /// ``payment_policy_path`` + ``a2a_purchase_path``.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    #[pyo3(signature = (target_node_id, service, prompt, context_refs=Vec::new(), tags=Vec::new(), task_id=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_task(
+        &self,
+        py: Python<'_>,
+        target_node_id: u64,
+        service: String,
+        prompt: String,
+        context_refs: Vec<String>,
+        tags: Vec<String>,
+        task_id: Option<String>,
+    ) -> PyResult<String> {
+        let flow = self.state.a2a_flow()?;
+        let mesh = self.state.mesh.clone();
+        let runtime = self.state.runtime.clone();
+        let mut brief = net_sdk::a2a::TaskBrief::new(prompt)
+            .with_context_refs(context_refs)
+            .with_tags(tags);
+        if let Some(task_id) = task_id {
+            if task_id.is_empty() {
+                return Err(PyValueError::new_err(
+                    "task_id must be a non-empty string (pass None for a random id)",
+                ));
+            }
+            brief = brief.with_task_id(task_id);
+        }
+        Ok(py.detach(move || {
+            runtime.block_on(crate::a2a_paid::do_prepare(
+                &flow,
+                &mesh,
+                target_node_id,
+                service,
+                brief,
+            ))
+        }))
+    }
+
+    /// **Paid A2A, step 2 — this is where money moves.** Consume the quote
+    /// :meth:`prepare_task` stored for ``prepared_json`` and pay it under
+    /// spend policy.
+    ///
+    /// Returns a JSON string ``{"status": paid|requires_payment_approval|
+    /// denied|unknown|failed, "task_id", "quote_id", "proof": {...}?,
+    /// "policy_reason"?, "approve_hint"?, "retryable"?,
+    /// "funds_ambiguous"?}``.
+    ///
+    /// - ``paid`` carries the ``proof`` :meth:`submit_task` presents.
+    /// - ``requires_payment_approval`` holds *this* quote for an operator;
+    ///   :meth:`approve_payment` on the quote id then re-run this verb.
+    /// - ``denied`` with ``funds_ambiguous: false`` is proven
+    ///   non-settlement — nothing left this process, and a fresh
+    ///   :meth:`prepare_task` is allowed (it re-runs policy and approval).
+    /// - ``denied`` with ``funds_ambiguous: true`` means an authorization
+    ///   was exposed first: the spend reservation is held and
+    ///   :meth:`a2a_resolve_attempt` is the only exit.
+    /// - ``unknown`` is a lost reply, not a failure: call this verb again
+    ///   and it re-sends the *stored* payload rather than buying twice.
+    ///
+    /// Concurrent calls converge on the one stored attempt.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    fn purchase_task(&self, py: Python<'_>, prepared_json: &str) -> PyResult<String> {
+        let flow = self.state.a2a_flow()?;
+        let runtime = self.state.runtime.clone();
+        let prepared = crate::a2a_paid::parse_prepared(prepared_json)?;
+        Ok(py.detach(move || {
+            runtime.block_on(crate::a2a_paid::do_purchase(
+                &flow,
+                prepared.provider_node,
+                &prepared.brief.task_id,
+            ))
+        }))
+    }
+
+    /// **Paid A2A, step 3.** Submit ``prepared.brief`` with the **stored**
+    /// proof, and record the outcome on the attempt.
+    ///
+    /// Returns a JSON string ``{"status": accepted|retry|unexecutable,
+    /// "task_id", "message"?, "schematic"?}``. ``retry`` keeps the purchase
+    /// good — re-submit the same proof, never re-purchase.
+    /// ``unexecutable`` means the provider will not execute this purchase;
+    /// the payment evidence is retained and
+    /// :meth:`a2a_resolve_attempt` is the operator's exit.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    fn submit_task(&self, py: Python<'_>, prepared_json: &str) -> PyResult<String> {
+        let flow = self.state.a2a_flow()?;
+        let runtime = self.state.runtime.clone();
+        let prepared = crate::a2a_paid::parse_prepared(prepared_json)?;
+        Ok(py.detach(move || {
+            runtime.block_on(crate::a2a_paid::do_submit(
+                &flow,
+                prepared.provider_node,
+                &prepared.brief.task_id,
+            ))
+        }))
+    }
+
+    /// Every stored purchase attempt, as a JSON array — the operator's
+    /// queue. The financially unresolved ones (``unknown``,
+    /// ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
+    /// that was never submitted) are exempt from retention and stay here
+    /// until :meth:`a2a_resolve_attempt` closes them.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    fn a2a_attempts(&self, py: Python<'_>) -> PyResult<String> {
+        let flow = self.state.a2a_flow()?;
+        let runtime = self.state.runtime.clone();
+        py.detach(move || runtime.block_on(crate::a2a_paid::do_attempts(&flow)))
+    }
+
+    /// Close an attempt the automatic path cannot: ``unknown``,
+    /// ``denied`` with ``funds_ambiguous``, or ``unexecutable``. Returns
+    /// ``None``.
+    ///
+    /// ``outcome_json`` is one of::
+    ///
+    ///     {"resolution": "paid", "proof": {...}, "billing": {...}}
+    ///     {"resolution": "not_paid", "reason": "..."}
+    ///     {"resolution": "closed", "outcome": "refunded", "evidence": {...}}
+    ///
+    /// ``paid`` / ``not_paid`` resolve an ``unknown`` attempt from evidence
+    /// the operator established out of band — ``not_paid`` re-opens the key
+    /// for a fresh :meth:`prepare_task`. ``closed`` retires an ambiguous or
+    /// unexecutable attempt (refunded, written off, executed elsewhere)
+    /// keeping its evidence.
+    #[cfg(all(feature = "payments", feature = "a2a"))]
+    fn a2a_resolve_attempt(
+        &self,
+        py: Python<'_>,
+        task_id: &str,
+        outcome_json: &str,
+    ) -> PyResult<()> {
+        let flow = self.state.a2a_flow()?;
+        let runtime = self.state.runtime.clone();
+        let resolution = crate::a2a_paid::parse_resolution(outcome_json)?;
+        let task_id = task_id.to_string();
+        py.detach(move || {
+            runtime.block_on(crate::a2a_paid::do_resolve_attempt(
+                &flow, &task_id, resolution,
+            ))
+        })
+    }
+
     fn __repr__(&self) -> String {
         self.state.repr("CapabilityGateway")
     }
@@ -1097,7 +1369,12 @@ impl PyAsyncCapabilityGateway {
             unbind_signer(payment_signer_xrpl)?,
         )?;
         Ok(Self {
-            state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment)?,
+            // No `a2a_purchase_path`: the paid-A2A verbs live on the sync
+            // :class:`CapabilityGateway` only. They are long, multi-round-trip
+            // financial operations, and the sync methods already release the
+            // GIL — an asyncio caller drives them with `asyncio.to_thread`
+            // rather than through a second surface that could drift.
+            state: GatewayState::from_mesh(mesh, pin_store_path, delegation, payment, None)?,
         })
     }
 
@@ -1241,7 +1518,7 @@ impl GatewayState {
             gateway: self.gateway.clone(),
             consent: self.consent.clone(),
             pin_path: self.pin_store_path.clone(),
-            payment: self.payment.clone(),
+            payment: self.wiring.as_ref().map(|w| w.gate.clone()),
         }
     }
 
@@ -1624,9 +1901,10 @@ mod paid_invoke_e2e {
             signer_svm: None,
             signer_xrpl: None,
         };
-        let flow = build_payment_flow(caller_mesh.clone(), Some(config))
+        let flow = build_payment_flow(caller_mesh.clone(), Some(config), None)
             .expect("build the payment flow")
-            .expect("a flow, since a config was supplied");
+            .expect("a flow, since a config was supplied")
+            .gate;
         let gateway = MeshGateway::new(caller_mesh.clone());
         // Consent is the gate *before* payment: allow the capability so
         // the flow under test is the payment path, not the pin prompt.

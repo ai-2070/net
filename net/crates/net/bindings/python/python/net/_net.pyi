@@ -761,12 +761,53 @@ class NetMesh:
         prompt: str,
         context_refs: List[str] = ...,
         tags: List[str] = ...,
+        *,
+        task_id: Optional[str] = None,
+        service: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> str:
         """Hand off a task to the executor at ``target_node_id``: ``prompt`` plus
         optional Datafort ``context_refs`` (the executor doesn't share your
         memory) and routing ``tags``. Returns the accepted task id; raises if the
         executor rejected it. The node must already be connected to
-        ``target_node_id``. (Requires the ``a2a`` feature.)"""
+        ``target_node_id``. (Requires the ``a2a`` feature.)
+
+        ``task_id`` retains a caller-chosen id instead of the random one a brief
+        mints (``None`` = random) — a retained id is what makes a submission
+        idempotent on a provider keeping durable admission records: the caller
+        that lost a reply re-submits the *same* id and converges on the original
+        admission. ``service`` + ``revision`` (both or neither) name a catalog
+        entry on a provider served with
+        :meth:`PaymentProvider.serve_a2a_configured`; the free
+        :meth:`serve_a2a` path ignores them."""
+        ...
+    def describe_a2a(self, target_node_id: int) -> str:
+        """What ``target_node_id`` serves, as a JSON array of ``A2aOffer``
+        objects — ``{service_id, revision, description?, pricing_terms?, bounds,
+        reservation_ttl_secs, reservation_retention_secs, retention_secs}`` per
+        configured service. Uncharged, and the only sanctioned way to learn a
+        price: a payment commitment is computed against the offer, so a caller
+        that paid against one can prove which one. A node serving the legacy
+        free path (:meth:`serve_a2a`) has no describe service and raises.
+        (Requires the ``a2a`` feature.)"""
+        ...
+    def submit_task_paid(self, prepared_json: str, proof_json: str) -> str:
+        """Submit a prepared, paid task: the brief from ``prepared_json`` (a
+        ``PreparedTask`` document — the ``prepared`` field of
+        :meth:`CapabilityGateway.prepare_task`'s result) with the quote id and
+        binding signature from ``proof_json`` (a ``TaskPaymentProof`` — the
+        ``proof`` field of :meth:`CapabilityGateway.purchase_task`'s), sent to
+        the provider node the reservation lives on. Returns the accepted task
+        id.
+
+        The **raw** verb: it keeps no records. Use
+        :meth:`CapabilityGateway.submit_task` for the durable attempt. Safe to
+        re-send — admission is idempotent per purchase, so a lost reply is
+        recovered by submitting the same proof rather than buying another.
+
+        Raises :class:`PaymentRefused` on a payment or admission refusal
+        (``args`` = ``(message, schematic_json | None)``). (Requires the
+        ``a2a`` feature.)"""
         ...
     def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:
         """The executor's status for ``task_id`` as a JSON string
@@ -1557,14 +1598,44 @@ class LocalPublicationHandle:
 
 class A2aServeHandle:
     """Keeps the served agent-to-agent task services alive (returned by
-    ``NetMesh.serve_a2a``). Dropping it or calling :meth:`stop` unregisters
-    them."""
+    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``).
+    Dropping it or calling :meth:`stop` unregisters them."""
 
     def stop(self) -> None:
         """Stop accepting A2A tasks (unregister the services)."""
         ...
     @property
     def serving(self) -> bool: ...
+    @property
+    def services(self) -> int:
+        """How many nRPC services are registered: three on the free
+        ``NetMesh.serve_a2a`` path, five on the configured
+        ``PaymentProvider.serve_a2a_configured`` one (which also serves
+        ``net.a2a.prepare`` and ``net.a2a.describe``). ``0`` once stopped."""
+        ...
+
+class PaymentRefused(Exception):
+    """A paid A2A submission was refused on payment or admission grounds — the
+    provider answered the ``net.payment`` application error rather than an ack.
+
+    ``args`` is ``(message, schematic_json | None)``: the human refusal, and
+    the machine-actionable ``net.payment.failure@1`` document when the provider
+    sent one (also on :attr:`schematic`). The schematic's ``reason`` names the
+    refusal (``missing_quote``, ``binding_required``, ``binding_rejected``,
+    ``no_reservation``, ``admission_revoked``, ``journal_unavailable``,
+    ``input_binding_mismatch``) and its ``recovery`` block says whether
+    retrying or re-quoting is safe. Distinct from a transport failure
+    (``RuntimeError``) for exactly that reason."""
+
+    schematic: Optional[str]
+
+class JournalOwnedElsewhere(Exception):
+    """The A2A admission journal at this path is already owned by a live holder
+    — another :class:`PaymentProvider` in this process, or another process on
+    this machine. Two writers over one set of admission records would each
+    believe they may launch the same paid work, so
+    :meth:`PaymentProvider.serve_a2a_configured` fails closed instead.
+    Ownership is held for the lifetime of the serve handle."""
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed
@@ -3262,6 +3333,7 @@ class CapabilityGateway:
         payment_signer_svm: Optional[Callable[[str], str]] = None,
         payment_signer_xrpl_address: Optional[str] = None,
         payment_signer_xrpl: Optional[Callable[[str], str]] = None,
+        a2a_purchase_path: Optional[str] = None,
     ) -> None:
         """Build a gateway over a started ``mesh``. ``pin_store_path`` should
         be the machine-shared pin store so approvals are honored both ways;
@@ -3311,7 +3383,19 @@ class CapabilityGateway:
         ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
         blob). Each pair is both-or-neither; an absent pair means that scheme
         is simply unavailable. The callable always sees a typed intent JSON,
-        never key material — identical doctrine to the eip155 seam."""
+        never key material — identical doctrine to the eip155 seam.
+
+        Pass ``a2a_purchase_path`` (the durable purchase store, e.g.
+        ``a2a-purchases.json``) to enable the paid agent-to-agent verbs
+        :meth:`prepare_task` / :meth:`purchase_task` / :meth:`submit_task` /
+        :meth:`a2a_attempts` / :meth:`a2a_resolve_attempt`. It holds one
+        attempt per ``(caller, provider, task id)``, written before any
+        network call, which is what makes a lost pay reply recoverable
+        instead of a second charge — so it must be durable and
+        single-owner, exactly like the spend-policy store. It requires
+        ``payment_policy_path`` (a purchase store with no spend policy
+        would record payments nothing authorized); without it the A2A
+        verbs raise ``ValueError``."""
         ...
 
     @property
@@ -3369,6 +3453,107 @@ class CapabilityGateway:
         structured ``no_payment_policy`` / ``unsupported`` / ``error``.
         ``network`` / ``asset`` are the x402 wire values (e.g.
         ``"mock:net"`` / ``"musd"``), matching the quote's requirements."""
+        ...
+
+    def prepare_task(
+        self,
+        target_node_id: int,
+        service: str,
+        prompt: str,
+        context_refs: List[str] = ...,
+        tags: List[str] = ...,
+        task_id: Optional[str] = None,
+    ) -> str:
+        """**Paid A2A, step 1 — read-only on the money side.** Ask
+        ``target_node_id`` to validate this brief and reserve capacity for it,
+        and obtain a provider-signed quote bound to that exact reservation. No
+        spend is reserved and no payment is made, so it is safe to call merely
+        to display a price.
+
+        Returns ``{"status": "ok" | "rejected" | "busy" | "retired" |
+        "conflict", "prepared": {...}, "quote": {"quote_id", "amount",
+        "network", "asset", "expires_at_ns"}}``. Keep ``prepared`` — it is the
+        complete ``PreparedTask`` document (provider node, byte-exact brief,
+        offer hash, reservation) that :meth:`purchase_task` /
+        :meth:`submit_task` / :meth:`NetMesh.submit_task_paid` take back as a
+        JSON string, and nothing is re-derived from it.
+
+        ``busy`` means nothing was reserved and nothing was quoted — retry (it
+        also covers a transport failure and a contended concurrent prepare).
+        ``conflict`` means this id already names other work on this provider;
+        ``rejected`` and ``retired`` are dead ends.
+
+        Exactly one attempt per ``(caller, provider, task_id)`` does the work:
+        a concurrent call that finds a live prepare awaits it and returns the
+        same reservation. ``task_id=None`` mints a random id; retaining one is
+        what makes the purchase resumable across a crash. Needs
+        ``payment_policy_path`` + ``a2a_purchase_path`` (else ``ValueError``)
+        and the ``payments`` build feature."""
+        ...
+
+    def purchase_task(self, prepared_json: str) -> str:
+        """**Paid A2A, step 2 — this is where money moves.** Consume the quote
+        :meth:`prepare_task` stored for ``prepared_json`` and pay it under
+        spend policy.
+
+        Returns ``{"status": "paid" | "requires_payment_approval" | "denied" |
+        "unknown" | "failed", "task_id", "quote_id", "proof": {...}?,
+        "policy_reason"?, "approve_hint"?, "retryable"?, "funds_ambiguous"?}``.
+
+        - ``paid`` carries the ``proof`` :meth:`submit_task` presents.
+        - ``requires_payment_approval`` holds *this* quote for an operator:
+          :meth:`approve_payment` on the quote id, then call this verb again.
+        - ``denied`` with ``funds_ambiguous: False`` is proven
+          non-settlement — nothing left this process, and a fresh
+          :meth:`prepare_task` is allowed (re-running policy and approval).
+        - ``denied`` with ``funds_ambiguous: True`` means an authorization was
+          exposed first: the spend reservation is held and
+          :meth:`a2a_resolve_attempt` is the only exit.
+        - ``unknown`` is a lost reply, not a failure: call this verb again and
+          it re-sends the *stored* payload rather than buying twice.
+
+        Concurrent calls converge on the one stored attempt."""
+        ...
+
+    def submit_task(self, prepared_json: str) -> str:
+        """**Paid A2A, step 3.** Submit ``prepared.brief`` with the **stored**
+        proof, recording the outcome on the attempt.
+
+        Returns ``{"status": "accepted" | "retry" | "unexecutable",
+        "task_id", "message"?, "schematic"?}``. ``retry`` keeps the purchase
+        good — re-submit the same proof, never re-purchase. ``unexecutable``
+        means the provider will not execute this purchase; the payment
+        evidence is retained and :meth:`a2a_resolve_attempt` is the exit.
+        ``schematic`` (when the provider sent one) is
+        ``{reason, safe_to_retry, safe_to_requote}``."""
+        ...
+
+    def a2a_attempts(self) -> str:
+        """Every stored purchase attempt, as a JSON array — the operator's
+        queue. Each row is ``{key: {caller_hex, provider_node, task_id},
+        commitment, prepared?, quote_id?, quote_expires_at_ns?, state: {...},
+        updated_at_ns}``. The financially unresolved states (``unknown``,
+        ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
+        never submitted) are exempt from retention and stay until
+        :meth:`a2a_resolve_attempt` closes them."""
+        ...
+
+    def a2a_resolve_attempt(self, task_id: str, outcome_json: str) -> None:
+        """Close an attempt the automatic path cannot: ``unknown``, ``denied``
+        with ``funds_ambiguous``, or ``unexecutable``.
+
+        ``outcome_json`` is one of::
+
+            {"resolution": "paid", "proof": {...}, "billing": {...}}
+            {"resolution": "not_paid", "reason": "..."}
+            {"resolution": "closed", "outcome": "refunded", "evidence": {...}}
+
+        ``paid`` / ``not_paid`` resolve an ``unknown`` attempt from evidence
+        the operator established out of band — ``not_paid`` re-opens the key
+        for a fresh :meth:`prepare_task`. ``closed`` retires an ambiguous or
+        unexecutable attempt (refunded, written off, executed elsewhere)
+        keeping its evidence. Raises ``ValueError`` if no attempt carries
+        ``task_id``, or if two providers do."""
         ...
 
     def __repr__(self) -> str: ...
@@ -3685,6 +3870,90 @@ class PaymentProvider:
         key naming no published tool is a publish error. ``version`` /
         ``owner_origin`` / ``allow_any_caller`` are as on
         ``NetMesh.publish_tools``. Hold the returned handle to keep serving."""
+        ...
+
+    def serve_a2a_configured(
+        self,
+        callback: Any,
+        services: Dict[str, Dict[str, Any]],
+        journal_path: str,
+        *,
+        principal: str = "session_peer",
+        preflight: Optional[Any] = None,
+    ) -> "A2aServeHandle":
+        """Serve the **configured** (catalog-driven) agent-to-agent task
+        lifecycle on this provider's node: paid services gated by this
+        provider's own payment engine, every admission recorded durably in the
+        journal at ``journal_path``. Requires the ``a2a`` build feature
+        alongside ``payments``.
+
+        ``callback`` is the async task executor — the free
+        ``NetMesh.serve_a2a`` signature plus two **keyword** arguments:
+        ``async (task_id, prompt, context_refs, tags, *, service, revision)
+        -> str`` returning the result's artifact ref.
+
+        ``services`` maps a service id to its offer::
+
+            {"summarize": {
+                "revision": "r1",
+                "pricing_terms": provider.pricing_terms(
+                    "net.a2a.task/summarize", requirements_json),
+                "bounds": {"max_prompt_bytes": 4096, "max_context_refs": 8,
+                           "max_tags": 8, "max_tag_bytes": 64,
+                           "max_in_flight": 4},
+                "reservation_ttl_secs": 300,
+                "reservation_retention_secs": 86400,
+                "retention_secs": 3600,
+                "description": "summarize a document"}}
+
+        ``pricing_terms`` is the free/paid selector: present prices the
+        service, ``None`` (or absent) serves it for nothing. A paid service is
+        **never** served free — an announced price with no gate, terms on a
+        free service, or a catalog key disagreeing with its own offer all
+        raise ``ValueError`` here rather than registering anything.
+
+        ``principal`` chooses who a submission is attributed to:
+        ``"session_peer"`` (the AEAD-authenticated session peer — direct
+        sessions only) or ``"same_org"`` / ``"granted"`` (the entity an
+        organization admission proof names, which additionally enforces
+        payer == caller on every paid admission).
+
+        ``preflight`` is the application's own admission check, an async
+        callable ``(owner_json, offer_json, brief_json) -> None | str``
+        returning ``None`` to admit or a reason to refuse. It runs at prepare
+        **and again** at submit, so it must be pure.
+
+        Raises :class:`JournalOwnedElsewhere` if another live holder already
+        owns ``journal_path``. Hold the returned handle to keep accepting
+        tasks."""
+        ...
+
+    def a2a_unresolved(self) -> str:
+        """The **unresolved-financial** admissions, as a JSON array of
+        admission records: money may have moved and the outcome is not
+        recorded (``paid``, ``launched`` without a terminal, or
+        ``reconcile``). Each row is ``{owner: {kind, node?, entity?}, task_id,
+        service_id, revision, admission_id?, commitment, brief, paid,
+        retention_secs, reservation_retention_secs, state: {...}, updated_at,
+        attempts: [...]}``.
+
+        This class is never pruned automatically — by design. It is the
+        operator's queue, and :meth:`a2a_resolve` is its only exit. Raises
+        ``ValueError`` before :meth:`serve_a2a_configured` has opened a
+        journal. Requires the ``a2a`` build feature."""
+        ...
+
+    def a2a_resolve(self, owner_json: str, task_id: str, state_json: str) -> None:
+        """Resolve one unresolved-financial admission to a terminal state:
+        ``owner_json`` and ``task_id`` exactly as they appear on an
+        :meth:`a2a_unresolved` row, ``state_json`` the ``TaskState`` the
+        operator established — e.g. ``{"state": "completed", "result_ref":
+        "blob://x"}``, ``{"state": "failed", "error": "..."}``.
+
+        Operator surface: it records what a human established out of band. It
+        never relaunches the work, and the launch ledger still bars a second
+        execution of the same admission afterwards. Requires the ``a2a``
+        build feature."""
         ...
 
 

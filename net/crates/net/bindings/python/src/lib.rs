@@ -84,6 +84,13 @@ mod publish;
 // (delegation + cortex).
 #[cfg(feature = "a2a")]
 mod a2a;
+// Paid agent-to-agent tasks (`A2A_PAID_ADMISSION_PLAN.md` WS-E): the
+// configured (catalog-driven) serving path behind a payment gate + admission
+// journal, and the caller's prepare → purchase → submit flow. Needs the
+// payments layer as well as `a2a`; the module itself carries the compound
+// gate so a build with only one of them simply has no paid A2A surface.
+#[cfg(all(feature = "a2a", feature = "payments"))]
+mod a2a_paid;
 // nRPC binding (B3: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
@@ -1784,8 +1791,18 @@ mod mesh_bindings {
         /// memory) and routing `tags`. Returns the accepted task id; raises if
         /// the executor rejected it. The node must already be connected to
         /// `target_node_id`. (Requires the `a2a` feature.)
+        ///
+        /// ``task_id`` retains a caller-chosen id instead of the random one a
+        /// brief mints (``None`` = random). A retained id is what makes a
+        /// submission idempotent on a catalog-driven provider: the caller
+        /// that lost a reply re-submits the *same* id and converges on the
+        /// original admission. ``service`` + ``revision`` (both or neither)
+        /// name a catalog entry on a provider served with
+        /// ``PaymentProvider.serve_a2a_configured``; the free
+        /// :meth:`serve_a2a` path ignores them.
         #[cfg(feature = "a2a")]
-        #[pyo3(signature = (target_node_id, prompt, context_refs=Vec::new(), tags=Vec::new()))]
+        #[pyo3(signature = (target_node_id, prompt, context_refs=Vec::new(), tags=Vec::new(), *, task_id=None, service=None, revision=None))]
+        #[allow(clippy::too_many_arguments)]
         fn submit_task(
             &self,
             py: Python<'_>,
@@ -1793,6 +1810,9 @@ mod mesh_bindings {
             prompt: String,
             context_refs: Vec<String>,
             tags: Vec<String>,
+            task_id: Option<String>,
+            service: Option<String>,
+            revision: Option<String>,
         ) -> PyResult<String> {
             crate::a2a::mesh_submit_task(
                 py,
@@ -1802,6 +1822,61 @@ mod mesh_bindings {
                 prompt,
                 context_refs,
                 tags,
+                task_id,
+                service,
+                revision,
+            )
+        }
+
+        /// What `target_node_id` serves, as a JSON array of ``A2aOffer``
+        /// objects — one per configured service, each with its bounds,
+        /// retention terms and (for a paid service) its
+        /// ``net.pricing.terms@1``.
+        ///
+        /// Uncharged, and the only sanctioned way to learn a price: a
+        /// commitment is computed against the offer, so a caller that paid
+        /// against one can prove which one. A node serving the legacy free
+        /// path (:meth:`serve_a2a`) has no describe service and raises.
+        /// (Requires the `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn describe_a2a(&self, py: Python<'_>, target_node_id: u64) -> PyResult<String> {
+            crate::a2a::mesh_describe_a2a(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                target_node_id,
+            )
+        }
+
+        /// Submit a prepared, paid task: the brief from ``prepared_json``, the
+        /// quote id + binding signature from ``proof_json``, sent to the
+        /// provider node the reservation lives on. Returns the accepted task
+        /// id.
+        ///
+        /// The **raw** verb — it keeps no records. Pass the `prepared` field
+        /// of :meth:`CapabilityGateway.prepare_task`'s result and the `proof`
+        /// field of :meth:`CapabilityGateway.purchase_task`'s, both verbatim;
+        /// use :meth:`CapabilityGateway.submit_task` instead if you want the
+        /// durable attempt record. Safe to re-send: admission is idempotent
+        /// per purchase, so a lost reply is recovered by submitting the same
+        /// proof rather than buying another.
+        ///
+        /// Raises :class:`PaymentRefused` on a payment or admission refusal
+        /// (``args`` = ``(message, schematic_json | None)``). (Requires the
+        /// `a2a` feature.)
+        #[cfg(feature = "a2a")]
+        fn submit_task_paid(
+            &self,
+            py: Python<'_>,
+            prepared_json: &str,
+            proof_json: &str,
+        ) -> PyResult<String> {
+            crate::a2a::mesh_submit_task_paid(
+                py,
+                self.node_arc_clone()?,
+                self.runtime.clone(),
+                prepared_json,
+                proof_json,
             )
         }
 
@@ -3908,6 +3983,17 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         // Agent-to-agent task handoff (V2 Phase 3).
         m.add_class::<a2a::PyA2aServeHandle>()?;
+        // A paid submission refused on payment/admission grounds, carrying
+        // the provider's failure schematic (A2A_PAID_ADMISSION_PLAN WS-E).
+        m.add("PaymentRefused", m.py().get_type::<a2a::PaymentRefused>())?;
+    }
+    #[cfg(all(feature = "a2a", feature = "payments"))]
+    {
+        // Two providers over one admission journal is refused, not merged.
+        m.add(
+            "JournalOwnedElsewhere",
+            m.py().get_type::<a2a_paid::JournalOwnedElsewhere>(),
+        )?;
     }
     #[cfg(feature = "cortex")]
     {

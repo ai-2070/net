@@ -30,6 +30,25 @@
 //!   one reservation of exactly one brief.
 //!
 //! The mesh wiring (serve + client) is `mesh_a2a` (gated `net + cortex`).
+//!
+//! # Where the paid path fits
+//!
+//! This module owns the admission window and the canonical hashes;
+//! the catalog-driven serving path built on them is
+//! `Mesh::serve_a2a_configured` in `mesh_a2a`, and its order is
+//! **prepare → purchase → submit → claim → launch**. A service
+//! publishes an [`A2aOffer`]; a prepare validates the brief, reserves
+//! capacity and mints the admission id; [`purchase_hash`] binds the
+//! caller's payment to *that* reservation of exactly this
+//! [`TaskBrief`] (so the same proof under another owner or another
+//! reservation computes a different hash); and the executor is
+//! spawned only after a durable launch claim. Who a submission is
+//! attributed to is `A2aPrincipal`'s decision — the session-authenticated
+//! deliverer or an organization-admitted entity, documented in
+//! `mesh_a2a` — and [`TaskOwner`] is what that decision produces here.
+//!
+//! [`TaskState::Interrupted`] is the one wire addition of that slice;
+//! its cross-version note is on the variant.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,6 +90,14 @@ pub enum TaskState {
     /// admission record; the free registry never mints one. `detail` names
     /// *which* ambiguity (`paid_not_started`, `outcome_unknown`,
     /// `admission_revoked`).
+    ///
+    /// **The one wire addition of the paid-admission slice.** Because
+    /// [`TaskState`] is a serde-tagged enum, a Rust requester built
+    /// before this variant existed cannot decode a status reply that
+    /// carries it; the Python and Node bindings return the status as a
+    /// JSON string and pass the tag through untouched. Nothing on the
+    /// free path produces it, so only a deployment that opts into a
+    /// configured catalog can put one on the wire.
     Interrupted {
         /// Which ambiguity this is, snake_case.
         detail: String,

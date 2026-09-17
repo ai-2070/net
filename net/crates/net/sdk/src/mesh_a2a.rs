@@ -82,6 +82,30 @@
 //! requester is only ever the delivering peer — which is why
 //! `OrgAdmitted` is the variant that additionally *enforces*
 //! `payer == admitted.caller`.
+//!
+//! # The one wire addition
+//!
+//! [`TaskState::Interrupted`](crate::a2a::TaskState::Interrupted) is
+//! the only new state this slice puts on the status wire, and **only
+//! the configured path mints it** — the free registry never does, so
+//! a deployment that configures no catalog keeps seeing exactly the
+//! states it always saw.
+//!
+//! Where it does appear, the cost is stated rather than hidden:
+//! `TaskState` is a serde-tagged enum, so a **Rust requester built
+//! before this slice cannot decode a status reply carrying it** and
+//! gets [`A2aFlowError::Decode`] instead of a record. The Python and
+//! Node bindings hand the status back as a JSON string and pass the
+//! new tag through untouched, so they need no upgrade to read one.
+//!
+//! Everything else here is additive and decodes on an old build:
+//! the two uncharged services ([`A2A_DESCRIBE_SERVICE`],
+//! [`A2A_PREPARE_SERVICE`]), the two optional brief fields
+//! ([`TaskBrief::service`], [`TaskBrief::revision`]) that a legacy
+//! free server ignores, the two payment request headers already
+//! spoken by paid tools ([`HDR_PAYMENT_QUOTE`],
+//! [`HDR_PAYMENT_BINDING`]), and the [`ERR_PAYMENT`] +
+//! [`HDR_FAILURE_SCHEMATIC`] refusal shape.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
