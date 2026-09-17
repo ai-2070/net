@@ -1,6 +1,6 @@
 # Stage 7 — the browser game store: replacement brief (PROPOSAL, not authority)
 
-**Status: proposal for Kyra's review, repair round 1. This document
+**Status: proposal for Kyra's review, repair round 2. This document
 authorizes no production implementation.** It replaces the superseded
 `spikes/S7_BRIEF.md` (packaged anchor, binding parity, shared TS types),
 which must not be dispatched.
@@ -35,6 +35,25 @@ One correction accepted into the text: my "a field that can be written
 cannot be an identity" was inaccurate as stated — a *signed* field can
 carry authenticated identity. The store's boundary is right for a
 different reason, now given properly in §1.3.
+
+### Repair round 2 — what changed and why
+
+Held at `7d101a157c54c8a8d4cd5c68404bff7ece2d05c5` with substantial
+repair credit: the request correlation, unified manifest, idle-client
+renewal, retained refusals, request-content binding, result-size
+validation before commit, parser/patch rules and the B1/B2′ split were
+accepted. What remained were **specific lifecycle contradictions**, not
+architecture. Strict missing-parent / missing-removal-key refusal is
+settled and unchanged.
+
+| # | Contradiction | Repair | Where |
+|---|---|---|---|
+| R1 | A replayed outcome echoed the *original* `q`, which the caller no longer has outstanding — so the reply is dropped by the correlation rule and the promise never settles | retain the **outcome** and the binding, construct a fresh envelope echoing the **current** `q`; byte identity applies to `out`, not to the envelope | §1.2, §1.10, §5.1b |
+| R2 | `resume` could answer `ok` on evidence the owner does not have, and leaked recovery into application code | a successful `resume` **always** installs a fresh snapshot/live boundary; automatic; non-ready while recovering; no action or input replayed. **"Handle ready" defined** on both sides | §1.6 |
+| R3 | Fencing at *acceptance* was later than `setAudience`'s contract, which clears the local view immediately; and a random `q` cannot order two requests | three separate moments — local intent (immediate), owner acceptance (allocates), installation (only the desired transition) — with a **desired-transition slot** deciding recency instead of comparing ids. An accepted-then-superseded generation stays **consumed** | §1.7 |
+| R4 | Generations fenced audiences only, so a same-generation resync could roll the installed revision back or revive a retired assembly | `g` becomes the **installation generation**, allocated for every accepted replacement (join, audience, resume, resync, owner-initiated), with solicited/unsolicited admission rules | §1.7, §1.8 |
+| R5 | Renewal at "step 4 (binding)" preceded payload validation (binding is step 5, payload step 6); and a 60 s/20 s lease does not actually tolerate two losses | renewal linearizes **after full validation and acceptance**; expiry ordering stated; the two-loss claim **withdrawn** and replaced by a measurement; action refusal explicitly distinguished from read revocation | §1.6 |
+| — | Cleanup: prose said `h` is absent on a join reply (the `man` carries it) and that every caller message has `q` (`in` does not); `canonical(in)` and the digest were undefined | §1.12's per-kind table is **normative** where prose disagrees; the binding's canonical form and retention form are defined | §1.2, §1.10, §1.12 |
 
 Scope is unchanged from the plan's Stage 7
 (`docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md:2825`) and
@@ -86,12 +105,15 @@ Every message carries exactly these common fields:
   because reading one is how a forward-compatible parser becomes an
   attack surface.
 - `k` — kind, from the closed set in §1.4.
-- `h` — handle id. Absent **only** on `join` and on the reply to a
-  `join`, because there is no handle yet.
-- `q` — **request id, and this is the repair.** Every caller→owner
-  request carries one; every owner→caller reply *to* a request echoes it
-  verbatim. Unsolicited owner→caller emissions (`delta`, and the `snap`
-  stream of an owner-initiated resync) carry no `q`.
+- `h` — handle id. Absent **only** on `join` itself, and on a `no` that
+  refuses a join. The reply to a `join` is a `man`, which **does** carry
+  the handle it minted — that is how the caller learns it.
+- `q` — **request id.** Every caller→owner *request* carries one; every
+  owner→caller reply *to* a request echoes it verbatim. Two exceptions,
+  both in the §1.12 table, which is normative where this prose and it
+  ever disagree: `in` carries no `q` (fire-and-forget, no reply, nothing
+  to correlate), and unsolicited owner→caller emissions (`delta`, an
+  owner-initiated `man` + `snap`, the expiry `no`) carry none.
 
 **Why a request id rather than a stream per join.** A dedicated stream
 would also work, but it makes the correlation implicit in transport
@@ -111,6 +133,22 @@ A reply whose `q` the caller does not have outstanding is **dropped and
 counted**, never applied. A duplicate `q` from the same caller within its
 retention window (§2) is refused `invalid-data`; `q` is not a
 deduplication key for actions — `s` is (§1.10).
+
+**`q` orders nothing.** It is random, so it identifies a request and
+says nothing about which of two requests is newer. Wherever recency
+matters — audience transitions, installations — the ordering comes from
+caller-local intent and owner-allocated generations, never from
+comparing request ids (§1.7, §1.8).
+
+**A replayed outcome gets a fresh envelope.** The retained thing is the
+**outcome representation** and the request binding, not the reply
+message: a duplicate `act` arrives under a *new* `q`, so the owner
+constructs a new `res`/`no` echoing **that** `q` and carrying the
+retained outcome verbatim. Byte identity is a property of `out` (or of
+`code`/`detail`), not of the envelope. Replaying the original envelope
+would echo the original `q`, which the caller no longer has outstanding
+— so the reply would be dropped by the rule three paragraphs above, and
+the caller would sit on a promise that never settles.
 
 ### 1.3 Authenticated session binding
 
@@ -214,76 +252,190 @@ defect.
   **20 s** while the handle is live. This is store machinery, never game
   code: a page that renders a spectator view does nothing to stay
   subscribed.
-- The lease is **60 s** — three intervals, so two lost `alive` messages
-  do not evict a live client.
-- **Renewal is by an accepted authenticated message only.** `act`, `in`,
-  `aud`, `alive`, `resync` and `leave` renew when they pass §1.12's
-  ladder through step 4 (binding). A malformed message, a message for an
-  unknown or expired handle, and a message refused at binding renew
-  **nothing** — otherwise a peer that cannot form a valid request could
+- The lease is **60 s**.
+
+  **No claim is made that this tolerates two lost renewals.** With a
+  20 s interval the third renewal lands *at* the 60 s boundary before
+  any scheduling or network delay is counted, so the honest statement is
+  that it tolerates **one** loss with margin and the second is a race.
+  The margin is a measured quantity, not an asserted one: §5 requires a
+  test of the chosen interval/lease pair, and the pair may move on what
+  that test shows.
+- **Expiry ordering.** Expiry is evaluated against the lease deadline
+  recorded at the last renewal. A renewal whose linearization point
+  (below) falls at or after that deadline **does not revive the
+  handle**: the handle is already gone, and the message is refused
+  `closed` like any other for an unknown handle. There is no window in
+  which a late renewal resurrects a retired handle and its ledger.
+- **Renewal's linearization point is after full validation and
+  acceptance.** The previous draft said "through step 4 (binding)",
+  which was wrong twice: binding is step 5, and payload validation is
+  step 6, so a correctly-bound message with a malformed payload would
+  have renewed before being rejected. A message renews the lease **only
+  once it has passed every applicable step of §1.12 and been accepted by
+  the owner** — for `act`, that includes authorization and execution
+  admission. Malformed, unbound, non-canonical and refused messages
+  renew **nothing**, or a peer that cannot form a valid request could
   hold a handle open indefinitely.
-- **Renewal stops** at `leave`, at handle expiry, at incarnation end, and
-  when the owner refuses the handle for policy (`forbidden`). The replica
-  stops sending `alive` on any of these and on `close()`.
+- **An action refusal is not a read revocation.** An `act` refused by
+  `authorize` renews nothing, but it does **not** end the handle, its
+  read subscription or its generation: the caller keeps receiving
+  `delta`s and keeps the handle alive with `alive`. Read access is
+  revoked only by a denied **read** check (§1.5), which closes that
+  subscription. Conflating the two would let one forbidden action drop a
+  spectator's view.
+- **Renewal stops** at `leave`, at handle expiry, at incarnation end,
+  and when a read check is denied. The replica stops sending `alive` on
+  any of these and on `close()`.
 - **Expiry notification.** On expiry the owner emits an unsolicited
   `no {code:"closed"}` for that handle if a session to the caller is
   still up, so a client that was merely slow learns why rather than
-  inferring it from silence. If no session is up, nothing is sent and the
-  handle is simply gone — the owner does not retain a tombstone to
-  announce later.
-- **Foreground recovery.** A returning caller sends `resume {h}`. The
-  owner re-authenticates the session peer, re-checks the handle binding
-  and read authorization, and answers either:
-  - `man` + `snap` chunks for the caller's current generation when the
-    handle is live but the caller's revision is unknown or stale; or
-  - `ok` when the handle is live and the caller's view is current
-    (`resume` may carry no revision claim, so `ok` means "still yours,
-    nothing installed"); or
-  - `no {code:"closed"}` when the handle is gone — and **no original
-    action outcome is inferred** from that (§1.10).
+  inferring it from silence. If no session is up, nothing is sent and
+  the handle is gone — no tombstone is retained to announce later.
+
+**Recovery: `resume` always installs.** The previous draft let `resume`
+answer `ok` when the owner "considered the view current", which the
+owner has no evidence for — `resume` carries no revision claim — and
+which pushed the decision to resync back into application code. Settled
+the simpler way:
+
+- **The store resumes automatically.** Reconnection and `resume` are
+  store machinery; game code neither calls it nor is asked whether to.
+- While recovering, the view is **`reconnecting`/`stale` and not
+  ready**. `getState()` keeps returning the last snapshot, marked stale;
+  no action or input is admitted (§1.12 step 4).
+- A successful `resume` **always establishes a fresh snapshot/live
+  boundary**: a new installation generation, a `man`, its chunks, and
+  validated installation before the handle is ready again. There is no
+  "nothing installed" success.
+- **No old action or input is replayed.** Sequences are not resent; an
+  action submitted before the interruption stays `indeterminate` unless
+  a `res`/`no` for it arrives (§1.10), and latest inputs are dropped on
+  disconnect.
+- `no {code:"closed"}` when the handle is gone, and **no original action
+  outcome is inferred** from that (§1.10).
 - A `resume` for a handle bound to a different peer is `closed`, not
   `forbidden`: the refusal must not disclose that the handle exists.
 
-### 1.7 Subscription generations, and who allocates them
+**"Handle ready", defined.** The parser refuses actions before readiness
+(§1.12 step 4), so the transition needs naming rather than implying:
 
-**The repair.** `g` is **owner-allocated**. A caller never proposes one.
+| Side | Ready means |
+|---|---|
+| Replica | The manifest for the **currently desired** installation has been received, every chunk assembled, the byte total matched, the assembled document validated by `state()`, and the result published as revision `r` of generation `g`. Not before; a partial or unvalidated assembly is never ready. |
+| Owner | The handle exists, is bound to this authenticated peer and incarnation, has a current generation whose manifest it has **emitted in full** (all `n` chunks handed to the transport), and has not expired. |
 
-- `g` is monotone per handle, allocated **only on acceptance**: at `join`
-  and at each accepted `aud`. A refused, superseded or malformed `aud`
-  consumes no generation, so **no generation is ever reused**, and a
-  caller cannot cause a gap or a collision by retrying.
-- `aud` therefore carries no `g` — it carries `q`, and the accepting
-  `man` carries the generation the owner allocated. The previous draft
-  had the caller sending `g`, which is where reuse could have crept in.
-- The owner stamps `snap`/`delta` with the generation they belong to. A
-  replica **drops and counts** any `snap`/`delta` whose `g` is not its
-  current one: it neither applies it nor treats it as a resync trigger,
-  because a late emission from a retired subscription must not repopulate
-  a view the caller has moved off.
-- An accepted `aud` fences the old generation immediately, marks the view
-  `syncing`/`stale`, and clears the projection to the definition's
-  validated `empty()` — absence, not fabricated values — before the new
-  view is exposed.
-- Two `aud` requests in flight: the newer accepted one supersedes the
-  older, whose waiters are rejected `aborted` **correlated by their own
-  `q`**. A late `no` for a superseded transition is therefore
-  attributable and cannot be mistaken for a refusal of the current one.
+Before ready, the owner refuses `act`/`in`/`aud` with `not-ready`. The
+two definitions are deliberately different: the owner cannot know the
+replica installed anything, so its readiness is about what it has
+emitted, and the replica's is about what it has validated. Neither side
+infers the other's.
 
-### 1.8 Resynchronization
+### 1.7 Generations are installation identity; local fencing is immediate
+
+**Two repairs, one mechanism.** `g` was "subscription generation",
+allocated at `join` and at each accepted `aud`. That left two holes: a
+resynchronization could replace the installed view **within** the same
+generation, so nothing fenced an old manifest against a newer one; and
+"an accepted `aud` fences the old generation" put fencing *later* than
+`setAudience`'s existing API contract, which clears the local view
+immediately.
+
+So `g` becomes the **installation generation**: the identity of one
+accepted snapshot replacement, whatever caused it.
+
+- **Owner-allocated, monotone per handle, only on acceptance**, for
+  **every** accepted installation: `join`, accepted `aud`, `resume`,
+  solicited `resync`, and an owner-initiated replacement. A refused,
+  superseded or malformed request consumes none.
+- **An allocated generation is consumed for ever.** A generation that is
+  accepted and then superseded is **not rolled back** and is never
+  reissued, even though nothing was ever installed under it. Rollback is
+  the one thing that could make two different installations share an
+  identity.
+- `aud` and `resync` carry no proposed `g`; the accepting `man` carries
+  the generation the owner allocated. (`resync` carries the generation
+  the caller is *currently installed at*, as context for the owner's
+  projection, never as a proposal.)
+- The owner stamps `man`/`snap`/`delta` with the generation they belong
+  to. A replica **drops and counts** anything whose `g` is not its
+  current installation generation, and a **stale `man` can neither roll
+  back the installed revision nor recreate a retired assembly** (§1.8).
+
+**Local fencing happens at request time, not at acceptance.** Three
+separate moments, and conflating them is what the previous draft did:
+
+| Moment | What happens | Where |
+|---|---|---|
+| **Local intent** — `setAudience` returns / `resume` begins | The prior view is invalidated **immediately**: status → `syncing`/`stale`, the projection cleared to the definition's validated `empty()`, older waiters rejected `aborted` by their own `q`. Nothing waits for the owner. | Replica |
+| **Owner acceptance** | The owner allocates the next generation and answers `man` for it | Owner |
+| **Installation** | Only the manifest for the **currently desired** transition may become current | Replica |
+
+**How "currently desired" is decided, given that `q` orders nothing.**
+The replica keeps one **desired-transition slot** per handle: the `q` of
+the latest transition its own API contract has accepted from the
+application, set synchronously when the call is made. Then:
+
+- a solicited `man` installs **iff** its `q` equals the slot; any other
+  `q` is dropped and counted, including one for a transition the
+  application has since superseded;
+- issuing a newer transition overwrites the slot and rejects the
+  previous waiters immediately — so supersession is decided by the
+  caller's own ordering, never by comparing two random ids;
+- a **refusal** for the slot's `q` clears the slot and leaves the handle
+  non-ready with the error; a refusal for any other `q` rejects only
+  that waiter;
+- **cancellation** of the slot's only waiter clears the slot and leaves
+  the handle non-ready and fenced — it does not restore the previous
+  view, which was already invalidated at request time;
+- **reconnect** clears the slot and begins a `resume`, whose own `q`
+  becomes the slot. An in-flight pre-reconnect manifest is therefore
+  dropped on arrival, by `q` and by generation.
+
+### 1.8 Resynchronization, fenced
 
 - A replica sends `resync {h, g, have}` when a `delta.base` does not
-  equal its current revision, when a chunk assembly is abandoned (§2), or
-  when a patch fails validation.
-- The owner answers `man` + `snap` chunks at the current revision of that
-  generation, or `no {code:"not-ready"}` if it cannot take a projection
-  now (the replica retries under its own deadline), or
-  `no {code:"closed"}` for a dead handle.
+  equal its current revision, when a chunk assembly is abandoned (§2),
+  or when a patch fails validation. `g` is where it is installed now;
+  `have` is its current revision.
+- The owner answers a solicited `resync` with a **newly allocated
+  installation generation** and its `man` + chunks, or
+  `no {code:"not-ready"}` if it cannot take a projection now (the
+  replica retries under its own deadline), or `no {code:"closed"}` for a
+  dead handle.
 - `have` is advisory: the owner may always answer with a full snapshot.
-  v1 defines no delta-from-`have` path, and a caller must not depend on
+  v1 defines no delta-from-`have` path and a caller must not depend on
   one.
-- The owner may also initiate a resynchronization by emitting an
-  unsolicited `man` (no `q`) followed by chunks — used when a delta would
-  exceed the message budget (§1.9).
+- The owner may **initiate** a replacement — used when a delta would
+  exceed the message budget (§1.9) — by allocating a generation and
+  emitting an unsolicited `man` (no `q`) followed by its chunks.
+
+**Admission, solicited and unsolicited.** Because every accepted
+replacement gets its own generation, the rules are mechanical:
+
+| Arrival | Admitted iff | Otherwise |
+|---|---|---|
+| Solicited `man` (has `q`) | `q` equals the desired-transition slot **and** `g` is greater than the installed generation | dropped, counted |
+| Unsolicited `man` (no `q`) | the slot is **empty** (no transition in flight) **and** `g` is greater than the installed generation | dropped, counted; the replica sends its own `resync` once its transition settles, so an owner-initiated replacement is never simply lost |
+| `snap` chunk | `(h, g, r, n)` match an **open** assembly for the current desired generation | dropped, counted |
+| `delta` | `g` equals the installed generation and `base` equals the installed revision | dropped (wrong `g`) or `resync` (gap) |
+
+Consequences stated explicitly, because they are the cases the HOLD
+named:
+
+- **An old manifest arriving after a newer view is installed** fails the
+  `g`-greater test and is dropped. It cannot roll back the installed
+  revision.
+- **A solicited resync overlapping an unsolicited one**: the unsolicited
+  manifest is dropped because the slot is occupied; the solicited one
+  installs. Exactly one of them can be current.
+- **A restarted snapshot at the same revision** is a *different*
+  generation, so its chunks cannot be confused with the abandoned
+  attempt's even though `r` is identical. This is why re-using `(h,g,r)`
+  as assembly identity was not sufficient.
+- **Old assembly chunks arriving after a restart** carry the retired
+  generation, fail the open-assembly match, and are dropped. A retired
+  assembly is never recreated by a late chunk.
 
 ### 1.9 Snapshot chunks, and the budget for every kind
 
@@ -352,16 +504,42 @@ defect.
 - The owner keeps, per handle: a `floor` (the highest retired `s`), and a
   retained window of outcomes keyed by `s`, bounded by count, age and
   **bytes** (§2).
-- Each retained entry records the outcome **and a digest of
-  `(name, canonical(in))`** — the binding that makes replay safe.
+- Each retained entry records the **outcome representation** and the
+  **request binding**, defined below. It does **not** retain a reply
+  message: a replay arrives under a new `q` and gets a freshly
+  constructed envelope carrying the retained outcome (§1.2).
+
+**The request binding, defined.** "A digest of `(name, canonical(in))`"
+named no serialization and no algorithm, and canonical *integer* fields
+do not define a canonical form for an arbitrary input object. Both are
+fixed here. Only the owner computes and compares this value — it never
+crosses the wire — so what matters is self-consistency, not
+cross-implementation agreement.
+
+- **Canonical form of `in`**: `name`, then a `0x1f` separator, then the
+  input serialized as JSON with object keys sorted ascending by UTF-16
+  code unit, no insignificant whitespace, strings escaped minimally
+  (only what JSON requires, `\uXXXX` lower-case hex for controls), and
+  numbers rendered by ECMAScript `Number::toString` — which is exact for
+  every value the store admits, because §1.12 already refuses `NaN`,
+  `Infinity` and duplicate keys, and identifiers needing full integer
+  precision are strings by the §1.1 rule.
+- **Retention form**: the canonical string itself when it is ≤ 2 KiB,
+  otherwise its SHA-256 (32 bytes, via WebCrypto). Comparison is
+  equality of whichever form is retained, and the form is recorded with
+  the entry so a 2 KiB boundary crossing cannot make two encodings of
+  one request compare unequal.
+- Storing the string where it fits is deliberate: it keeps the common
+  case free of a hash dependency and makes a mismatch inspectable when
+  a witness fails.
 
 Dispositions, exhaustively:
 
 | Case | Disposition |
 |---|---|
 | `s` > every seen `s`, handle active | validate, `authorize`, execute once, retain and reply `res`. |
-| `s` retained, same `(name, in)` digest | **re-`authorize` first**; if still permitted, replay the retained outcome byte-identically; if no longer permitted, `no {forbidden}`. A retained *refusal* replays as that refusal. |
-| `s` retained, **different** `(name, in)` digest | `no {invalid-data}`. Not executed, and the retained entry is **not** overwritten: a sequence identifies one request, not a slot. |
+| `s` retained, same binding | **re-`authorize` first**; if still permitted, reply a **new** envelope echoing this request's `q` and carrying the retained outcome verbatim; if no longer permitted, `no {forbidden}`. A retained *refusal* replays as that refusal. |
+| `s` retained, **different** binding | `no {invalid-data}`. Not executed, and the retained entry is **not** overwritten: a sequence identifies one request, not a slot. |
 | `s` ≤ `floor`, not retained, handle active | `no {result-expired}` — cannot execute again, original result unavailable, **no commit asserted**. |
 | `s` ≤ some seen `s` but skipped (a gap) | Gaps are permitted and do not block. A `s` inside a gap that was never seen is treated as new **only if** `s` > `floor`; at or below the floor it is `result-expired`. |
 | handle expired or unknown | `no {closed}`. **No original outcome is inferred** — this is not `result-expired`, because the owner no longer knows whether the sequence ever ran. |
@@ -608,7 +786,7 @@ and are **not** acceptance.
 | **Partial snapshot** — `n-1` of `n`, then the deadline | nothing published; assembly reclaimed; status stays `syncing`/`stale`, never `ready` |
 | **Byte-total mismatch** — chunks complete but decoded length ≠ `bytes` | refused; nothing published; resync |
 | **Assembled-document schema failure** — chunk envelopes all valid, assembled JSON fails `state()` | refused at the **assembled** document; nothing published |
-| **Replay within retention, same input** | retained outcome byte-identical; handler 0 times; re-authorized first |
+| **Replay within retention, same input** | the retained **outcome** byte-identical, in a **fresh envelope echoing the replay's own `q`**; handler 0 times; re-authorized first. Asserting the outcome alone passes an implementation that replays the original envelope, whose reply the caller then drops. |
 | **Replay within retention, different input at the same `s`** | `invalid-data`; not executed; retained entry unchanged |
 | **Replay of a retained refusal after policy widened** | the retained **refusal**; handler 0 times. A refusal must not become an execution because policy changed. |
 | **Replay after result eviction, handle live** | `result-expired`; handler 0 times; **no commit asserted** |
@@ -646,7 +824,7 @@ to re-test the thing that already worked.
 | 1 — concurrent join | Two `join`s issued before either replies | Pre-repair there is no field that tells the replies apart; both handles are plausible answers to either request. Repaired: each reply echoes its own `q`, and crossing them is detectable. |
 | 1 — generation allocation | `aud` refused, then `aud` accepted | Pre-repair the caller proposed `g`, so a retry could reuse or skip one. Repaired: the accepted generation is strictly greater than the last accepted, and the refused request consumed none. Assert the **sequence of allocated generations**, not just that the second succeeded. |
 | 2 — lease | A spectator that receives 4 leases' worth of deltas and sends only `alive` | Pre-repair it expires, because only incoming traffic renewed and it sent none. Repaired: still subscribed. Its twin — an absent client whose late `act` is refused `closed` — passes both, so it is not the discriminating half. |
-| 2 — renewal source | A peer sending malformed messages continuously across a lease | Pre-repair, if renewal is keyed on "a message arrived", the handle lives forever. Repaired: it expires on schedule, because only messages accepted through binding renew. |
+| 2 — renewal linearization | A peer whose messages bind correctly but carry a malformed payload, continuously across a lease | Pre-repair, renewal at "step 4 (binding)" let a correctly-bound but invalid message renew, so the handle lived forever. Repaired: renewal is after full validation **and** acceptance, so it expires on schedule. The cruder "malformed at parse" version passes both, so it is not the discriminating case. |
 | 3 — retained refusal | An action refused by `authorize`; policy then widened; the same `s` replayed | Pre-repair the rejected sequence was never retired, so the replay **executes** under the new policy. Repaired: the retained refusal replays and the handler runs 0 times. |
 | 3 — same `s`, different input | `act s=7 fire`, then `act s=7 scuttle` | Pre-repair a sequence identified a slot, so the second either executes or overwrites. Repaired: `invalid-data`, no execution, retained entry unchanged. |
 | 3 — the contradiction | Replay at `s ≤ floor` with the handle **live**, and the same replay after the handle **expired** | Pre-repair these returned the same code, so one of the two was wrong. Repaired: `result-expired` for the live handle, `closed` for the expired one, and the second asserts **no** inferred outcome. |
@@ -658,6 +836,22 @@ to re-test the thing that already worked.
 | 5 — non-canonical decimal | `g: "007"` and `g: "+7"` | Pre-repair, coerced to 7 by a permissive reader, after which a digest comparison and an equality check can disagree. Repaired: refused. |
 | 5 — missing removal key | `x` on an absent key | Pre-repair, a no-op that leaves two views silently divergent. Repaired: patch refused, resync requested, previous revision intact. |
 | 6 — gate split | B1 accepted against the in-process double; B2′ held pending current-head reliable-transfer evidence | Not a test but an acceptance case: B1's receipts must not be offered as B2′'s. |
+
+### 5.1b Discriminating cases for round 2's repairs
+
+| Repair | Discriminating case | What separates repaired from not |
+|---|---|---|
+| R1 — replay envelope | `act s=7` under `q=A` completes; the same `s=7` is resubmitted under `q=B` | Pre-repair the retained *reply* is replayed, so the envelope echoes `q=A`, the caller has no such request outstanding, and the reply is dropped — the promise never settles and the test times out rather than failing loudly. Repaired: a fresh envelope echoes `q=B` and carries the same `out` bytes. Assert the settled value **and** the echoed `q`. |
+| R2 — resume installs | Reconnect with the owner's revision unchanged since the interruption | Pre-repair `ok` is a legal answer, so a replica can be "ready" having installed nothing and validated nothing. Repaired: a new generation, a manifest, chunks, validated installation, and the handle non-ready until then. Assert the installed generation **advanced** and that `getStatus()` was non-ready throughout. |
+| R2 — no replay on resume | An action submitted, then the session drops before its `res` | Repaired: after resume the action is still `indeterminate`, is **not** resent, and the handler's invocation count is unchanged. A pre-repair implementation that resent it would show two invocations. |
+| R3 — fencing at request time | `setAudience` called, and the owner's answer **withheld** | Pre-repair the old view stays current until acceptance, so `getState()` still serves the previous audience's data and `getStatus()` reads ready. Repaired: immediately `syncing`/`stale` with the projection cleared to `empty()`, before any owner traffic. This is the case an acceptance-time implementation passes only by accident. |
+| R3 — latest intent wins | Two `setAudience` calls; the **first**'s manifest arrives last | Pre-repair, arrival order decides and the stale manifest installs. Repaired: dropped by the desired-transition slot, and the view ends at the second call's audience. |
+| R3 — no generation rollback | An `aud` accepted (generation allocated), then superseded before its manifest arrives | Repaired: the next accepted generation is strictly greater than the superseded one — the allocation is not reused. Assert the allocated sequence, not just monotonicity of installed views. |
+| R4 — stale manifest | An old `man` for a retired generation arrives after a newer view is installed | Pre-repair, same-generation resyncs made this indistinguishable from the current one and the installed revision could roll **back**. Repaired: dropped on the `g`-greater test; installed revision unchanged. |
+| R4 — restart at the same revision | An assembly abandoned at revision R, then a fresh snapshot also at R | Pre-repair, `(h,g,r)` identity makes the late chunks of attempt 1 indistinguishable from attempt 2's and they can complete a mixed assembly. Repaired: different generations, so the old chunks fail the open-assembly match and cannot recreate the retired assembly. |
+| R4 — solicited vs unsolicited overlap | An owner-initiated `man` arrives while a `resync` is in flight | Repaired: the unsolicited one is dropped (slot occupied), the solicited one installs, and exactly one is current. |
+| R5 — lease margin | The chosen interval/lease pair under one lost renewal, and under two | Not a pass/fail of a claim but a **measurement**: record what one loss and two losses actually do at the chosen pair, and let the pair move on the result. The brief no longer asserts two-loss tolerance, so a test asserting it would be testing a claim that was withdrawn. |
+| R5 — action refusal is not read revocation | A forbidden `act`, then continued `delta` delivery | Repaired: the handle stays live, the read subscription intact, deltas still arriving, and only the action refused. A pre-repair conflation drops the spectator's view on one forbidden action. |
 
 ### 5.2 Contract behaviour — required
 
@@ -755,19 +949,27 @@ the reasoning corrected in §1.3); replay of a retained committed result
 clients losing handles (accepted for v1, and §1.6 now keeps idle
 spectators live and specifies foreground recovery).
 
-Round 1 raises two, both behavioural rather than implementation:
+Round 1's two are both now dispositioned:
 
-1. **A missing parent or a missing removal key refuses the whole patch
-   and resynchronizes.** The permissive alternative — treat a removal of
-   an absent key as a no-op — is what most patch formats do, and it would
-   hide a view divergence that this protocol can detect. I have chosen
-   strict; it costs an occasional full snapshot where a lenient
-   implementation would carry on with views that disagree. Say if you
-   want lenient.
-2. **`resume` answers `ok` without a revision claim.** The caller may
-   have missed deltas while away, so `ok` means "the handle is yours" and
-   not "your view is current"; a caller that cannot prove its revision
-   should send `resync` instead. The alternative is to make `resume`
-   carry `have` and always answer a manifest — simpler to reason about,
-   one more snapshot per reconnect. I chose the cheaper default with an
-   explicit escape; this is a product-feel decision.
+1. **Strict missing-parent / missing-removal-key refusal: settled**, and
+   kept unchanged.
+2. **`resume` answering `ok`: overruled**, and the simpler alternative
+   taken — a successful `resume` always installs a fresh
+   snapshot/live boundary (§1.6). My reasoning was wrong in a specific
+   way worth recording: I treated "the caller should resync if unsure"
+   as an escape hatch, when it is recovery responsibility leaking into
+   application code, and the owner never had evidence for "the view is
+   current" in the first place.
+
+Round 2 raises **nothing new**. Every decision in this round was
+directed, and the three choices left to me — the desired-transition slot
+as the recency mechanism, a fresh installation generation per accepted
+replacement (of the two bounded transfer identities offered), and
+retaining the canonical input string below 2 KiB with SHA-256 above it —
+are implementation choices made in the text rather than escalated.
+
+One thing is deliberately *not* surfaced as a question but should be
+visible: the lease pair (20 s interval / 60 s lease) is now a
+**measurement**, not a claim. §5.1b records what must be measured, and
+the pair may move on what that shows. If you would rather fix the pair
+by fiat, that is a decision I would take from you rather than infer.
