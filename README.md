@@ -24,8 +24,10 @@ Where this fits and where it doesn't: [When to Use Net](https://ai2070.net/docs/
 A document-processing capability lives on a machine that holds an internal docs-API credential.
 The credential must not travel. A caller on another machine wants a summary.
 
-**The provider** declares the capability and serves it from the machine that holds the
-credential:
+Application code below is marked as such; every **Net** call is the real surface, and the flows
+are runnable — the commands and source links are at the end of this section.
+
+**The provider** serves the capability from the machine that holds the credential:
 
 ```rust
 use net_sdk::macros::tool;
@@ -38,8 +40,8 @@ struct SummarizeResp { summary: String }
 
 #[tool(description = "Summarize an internal document.", tag = "docs")]
 async fn summarize_document(req: SummarizeReq) -> Result<SummarizeResp, String> {
-    let cred = internal_docs_credential();        // application secret; stays on this machine
-    let summary = summarize_with(&cred, &req.doc_id).await?;
+    // Application code, not Net: this reads a credential that never leaves the machine.
+    let summary = summarize_with(&internal_docs_credential(), &req.doc_id).await?;
     Ok(SummarizeResp { summary })
 }
 
@@ -48,37 +50,52 @@ let _handle = summarize_document_register(&provider)?;   // unregisters on drop
 provider.announce_capabilities(Default::default()).await?;
 ```
 
-**The caller** asks for the capability by name — not by address — and gets a typed result:
+**The caller** discovers by capability — not by address — and invokes it:
 
 ```rust
-// Nothing was configured with the provider's hostname. Discover what's live…
+// Nothing was configured with the provider's hostname. List what's live…
 for t in caller.list_tools(None) {
     println!("{} v{}  tags={:?}", t.tool_id, t.version, t.tags);
 }
 
-// …then invoke it. The mesh routes the call to whichever peer serves it.
+// …then invoke by name. The mesh routes the call to whichever peer serves it.
 let resp: SummarizeResp = caller
     .call_tool("summarize_document", &SummarizeReq { doc_id: "q3-plan".into() })
     .await?;
 ```
 
-**When it goes wrong, it says so.** A call carries a deadline and returns an error — it does not
-hang forever. If no peer still serves the capability, or the capability was served org-private
-and is therefore not discoverable to this caller, the call fails rather than quietly succeeding:
+**The tool path above is open to any peer that can discover it.** To restrict *who may call a
+capability*, serve it as an nRPC service through the org facade. The capability is then announced
+privately, org membership is the gate, and the handler receives the verified requester:
 
 ```rust
-match caller.call_tool::<SummarizeReq, SummarizeResp>("summarize_document", &req).await {
-    Ok(resp)  => println!("{}", resp.summary),
-    Err(e)    => eprintln!("cannot summarize right now: {e}"),  // provider gone, or not authorized
-}
+// Provider: serve it to this org only. `OrgAccess::Granted` instead admits a
+// cross-org caller holding a capability grant.
+mesh.serve_org("summarize.document", OrgAccess::SameOrg, |caller: OrgCaller, req: SummarizeReq| async move {
+    Ok(summarize_with(&internal_docs_credential(), &req.doc_id).await?)
+})?;
+
+// Caller: bind org credentials once, then call the service.
+let org = mesh.org(credentials)?;
+let resp: SummarizeResp = org.call("summarize.document", &req).await?;
 ```
 
-What this shows: the caller **selected a capability, not a machine**; the handler ran **where the
-credential lives**; the result came back **typed**; the failure path is a real error, not a
-promise of transparent recovery. Authorization is a first-class part of the same system — a
-provider can serve a capability **org-private**, so an unauthorized caller never discovers it:
+A caller whose org holds no grant never reaches the handler and gets no error *from the
+provider*: the private announcement is opaque without the audience, so the call fails **locally**,
+before anything is sent, as `OrgSdkError::Discovery`. A membership revoked mid-flight turns the
+next call into `OrgSdkError::AdmissionDenied`. Both are pinned by runnable tests:
+
+```bash
+cargo run  --example tool_calling --features net,macros   # announce → discover → invoke
+cargo test -p net-mesh-sdk org::tests_live               # private discovery, no-grant refusal, revocation
+```
+
+In one scenario: the caller **selected a capability, not a machine**; the handler ran **where the
+credential lives**; the result came back **typed**; and the authority check **refused before any
+bytes were sent**. Sources: [`tool_calling.rs`](net/crates/net/sdk/examples/tool_calling.rs),
+[`org/tests_live.rs`](net/crates/net/sdk/src/org/tests_live.rs). Deeper:
 [Private capabilities](https://ai2070.net/docs/guides/private-capabilities),
-[Security model](https://ai2070.net/docs/concepts/security-model). Larger results travel as
+[Security model](https://ai2070.net/docs/concepts/security-model); larger results travel as
 content-addressed artifacts: [Dataforts](https://ai2070.net/docs/guides/dataforts).
 
 ## Install
@@ -114,27 +131,28 @@ they share a substrate:
 
 ## Why the mesh
 
-The substrate under all of that is a flat, encrypted, latency-first mesh. Two design choices do
-most of the work; the rest follows.
+The substrate under all of that is a flat, encrypted mesh. Three properties do most of the work;
+the rest follows.
 
-**State, not connections.** Traditional networking makes the connection the primary object: it
-breaks, the relationship breaks. Net propagates state. Connections are ephemeral transport, and
-identity lives in the event chain rather than in a socket — so a path breaking is a routing
-change, not a session loss. Read: [Events and causality](https://ai2070.net/docs/concepts/events-and-causality),
-[Architecture](https://ai2070.net/docs/concepts/architecture).
+**Identity outlives a path.** A node is its keypair, and its address is incidental. If a route
+breaks, traffic is rerouted and the participants keep the same identity — there is no session to
+resume, because nothing was bound to the socket in the first place. Read:
+[Architecture](https://ai2070.net/docs/concepts/architecture),
+[Events and causality](https://ai2070.net/docs/concepts/events-and-causality).
 
-**Drop instead of queue.** In a best-effort network, queues absorb bursts and a delivery
-guarantee is a virtue. At nanosecond timescales a queue is just added latency: a node that
-accepts work it cannot process has broken its own self-preservation. Net nodes drop what they
-cannot handle and go silent; neighbors observe the silence and route around it. That is why Net
-runs its own transport over UDP — the two queue models are incompatible at the buffer level, not
-merely different in tuning.
+**Bounded buffers, explicit overload behaviour.** Every node has a fixed-capacity ring buffer.
+When it fills, the node drops — oldest or newest, per configuration — instead of growing an
+unbounded queue or blocking its producer, and `stats().events_dropped` surfaces it. A node that
+cannot keep up goes quiet, and its neighbours route around it. Net's hot path needs those
+drop-not-queue semantics, which is why it carries its own transport over UDP rather than layering
+on TCP. Read: [Event bus](https://ai2070.net/docs/guides/event-bus).
 
-**What "fast" means here.** Net's per-packet *scheduling* — process, route, encrypt, queue for
-transmission — is measured in nanoseconds. Those numbers **exclude** NIC transfer, wire latency,
-and speed-of-light propagation; they show the software layer is no longer the bottleneck, not
-that a round trip is instant. The strongest end-to-end claims in this project are scoped in
-[Benchmarks](#performance). A fuller argument for the model is in the
+**No trusted middle.** Relay nodes forward encrypted bytes they cannot read, and there is no
+special node whose absence stops the mesh. Read:
+[Security model](https://ai2070.net/docs/concepts/security-model).
+
+The performance story — what is fast, and what the numbers do and do not include — is scoped in
+[Performance](#performance). A fuller treatment of the model is in the
 [worldview docs](https://ai2070.net/docs/worldview).
 
 ## What's in the box
@@ -157,24 +175,23 @@ A compressed tour; each links to the page that goes deep.
 ## Performance
 
 The full measured set and methodology live in
-[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). The numbers below are
-**packet-scheduling** measurements on an M1 Max — time to process, route, encrypt, and queue a
-packet for transmission. They do **not** include NIC transfer, wire latency, or propagation, and
-they are not end-to-end latencies.
+[`net/crates/net/BENCHMARKS.md`](net/crates/net/BENCHMARKS.md). The rows below are **local
+operation microbenchmarks** on an M1 Max: each measures one operation in isolation, not the cost
+of a packet path. None includes NIC transfer, wire latency, or propagation, and summing them
+would not produce a round trip. Desktop-class figures and per-subsystem tables — multi-hop,
+encryption, capability folds, SDK ingestion, binary size — are in the linked file.
 
-| Operation | M1 Max |
+| Operation, measured in isolation | M1 Max |
 |---|---|
-| Header serialize | 2.19 ns / 456M ops/sec |
-| Routing lookup (hit) | 37.73 ns / 26.5M ops/sec |
-| 1-hop forward | 61.66 ns / 16.2M ops/sec |
-| Heartbeat (existing node) | 39.76 ns / 25.2M ops/sec |
-| Recovery — evaluate alternates | 257.51 ns / 3.88M ops/sec |
+| Header serialize — encode the 64-byte header | 2.19 ns / 456M ops/sec |
+| Routing lookup (hit) — resolve a next hop from the local routing table | 37.73 ns / 26.5M ops/sec |
+| 1-hop forward — the forwarding path for a single hop | 61.66 ns / 16.2M ops/sec |
+| Heartbeat — process one heartbeat from a known peer | 39.76 ns / 25.2M ops/sec |
+| Evaluate alternates — pick a replacement from local state | 257.51 ns / 3.88M ops/sec |
 
-Read the failure-detection rows precisely: **heartbeat processing** (39.76 ns), **status check**
-(15.10 ns), **circuit-breaker check** (9.55 ns), and **alternate selection** (257.51 ns) are
-local computations over local state. They are not measurements of detecting a failure across the
-network or of completing distributed recovery. Desktop-class figures and per-subsystem tables —
-multi-hop, encryption, capability folds, SDK ingestion, binary size — are in the linked file.
+The last two are **local computations over local state**; they are not measurements of detecting
+a failure across the network or of completing distributed recovery. The full table separates
+heartbeat processing, status check, circuit-breaker check, and alternate selection.
 
 ## SDKs
 
