@@ -2648,7 +2648,32 @@ the re-arm instead of sampling it (`537c9c94f`). Media-permission
 qualification carried: the harness's camera/mic grant is not a
 prerequisite for a data-only application.
 
-## Stage 7 — Surface completion and deferred items (**DEFERRED**)
+**Stage 5 round 5 (2026-09-16): the four §13.7 owner questions ruled
+and delivered (`d522593f3`…`60e120609`); CI pending; forwarded to Kyra
+with round 4.** Rulings: announcement expiry **matches native**
+(nanosecond precision, `age >= ttl`, TTL-zero expired at age zero);
+**N4 confirmed**, versioning deferred to the release process; a direct
+node's `close` **ends the iterators it handed out** (symmetric with the
+proxied path, documented as a behaviour change); **native reassembly
+supplied now** — core work inside a Stage 5 round by owner decision,
+flagged in §14 for Kyra to review as such. On that last one the agent
+established before building that the receive leg already worked
+(`reassemble_rtc_fragments` from rounds 3–4 is wired into event-plane
+dispatch for every RTC source; witness (a) passed on unmodified code
+and is now pinned), and built the **sender**: `send_on_stream` decides
+a size disposition before any piece exists, gated two-factor on the
+peer advertising `FRAGMENT_REASSEMBLY_TAG` (a plain signed tag, not a
+canonical field) **and** the resolved address being `PeerAddr::Rtc` —
+because the native receive arm is RTC-only by design, and fragmenting
+toward a UDP peer would hand its application N partial events.
+Native ↔ native unchanged. **Stage 7 authorized by the product owner
+the same day** (brief `spikes/S7_BRIEF.md`): the packaged anchor with
+persisted identity and a built-in local enrollment authority,
+anchor-role parity in the bindings, shared generated TS types;
+ICE-TCP / DTLS exporter / browser RedEX stay deferred; the serverless
+control plane stays a separate plan.
+
+## Stage 7 — Surface completion and deferred items (**authorized 2026-09-16**; brief `spikes/S7_BRIEF.md`)
 
 - Node / Python / Go anchor-role parity for `RtcConfig` + `RtcStats`.
 - `sdk-ts` / `@net-mesh/browser` shared generated types.
