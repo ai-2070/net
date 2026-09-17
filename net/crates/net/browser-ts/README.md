@@ -362,11 +362,11 @@ takes down its siblings nor unwinds into the wasm frame that called it.
 `LeafStream.onMessage` and `for await (const bytes of stream)` yield
 `Uint8Array`. That promise is kept **here**, in TypeScript: the wasm
 boundary hands this package the node's own `stream_data` event JSON —
-the same string `on_event` delivers, filtered to the stream's id —
-and `LeafStream` parses it and base64-decodes `payload`.
+the same string `on_event` delivers, filtered to the stream's peer and
+id — and `LeafStream` parses it and base64-decodes `payload`.
 
 ```text
-Rust  LeafStream::on_message(cb)  ->  cb('{"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}')
+Rust  LeafStream::on_message(cb)  ->  cb('{"type":"stream_data","peer_node":"200","incarnation":"1","stream_id":"9","seq":"1","payload":"AQI="}')
 TS    new LeafStream(inner)       ->  onMessage(Uint8Array([1, 2]))
 ```
 
@@ -377,11 +377,24 @@ the event's provenance at the boundary. So the direction is fixed:
 direct stream and the leader-proxied one alike — `MeshSession`
 streams are the same `LeafStream` over the same event shape.
 
-Two consequences a page can see:
+Three consequences a page can see:
 
 - The event's `stream_id` is **decimal** and `LeafStream.streamId` is
   **hex**; they are the same `u64`. The wrapper matches inbound events
-  numerically, so an id past 2^53 routes correctly.
+  numerically, so an id past 2^53 routes correctly. `peer_node` is the
+  same pairing — decimal in the event, hex on the handle.
+- **A stream is identified by `(peer, id)`, not by its id.** A stream
+  id is an application label scoped to a session, so
+  `openStream({ peer, streamId })` against two peers under one id is
+  ordinary, and the callback is handed the node-wide event vector.
+  Matching on the id alone gave both wrappers whichever peer's frame
+  arrived, so two streams under one label received each other's bytes.
+  A host-supplied `LeafWasmStreamLike` that spells no peer
+  (`peer_node_hex` is optional) keeps the id-only behaviour: a filter
+  that cannot be evaluated must not become one that drops everything.
+  `incarnation` rides the event as provenance and is deliberately not
+  part of the key — a replaced session retires its receive cursors, so
+  no frame arrives under a dead incarnation.
 - Options are typed at the shape Rust actually reads.
   `OpenStreamOptions.channelHash` is a **number** in `0..=65535` (it
   was a string that Rust read with `as_f64` and therefore ignored, so
@@ -447,6 +460,23 @@ side simply stops calling `on_message` and nothing else can end the
 queue. **The direct path moved to match the proxied one**; the
 proxied path is unchanged, and both now dispose of a stream the same
 way.
+
+**Close finishes what it starts.** `close()` latches and empties its
+set of streams before it begins, so nothing can retry any of it —
+which is why each obligation (every stream, then the event surface,
+then the leaf) is now discharged independently. A stream whose
+`close` threw used to abort the loop and take the rest with it: the
+remaining streams stayed open with their iterators parked, the event
+surface kept dispatching, the wasm node was never closed, and a
+second `close()` returned immediately because the latch was set.
+
+If anything did throw, `close()` throws an `AggregateError` whose
+`.errors` are the typed `LeafError`s in teardown order — always an
+aggregate, however many failed, so a caller never has to branch on a
+shape to learn that part of its teardown did not happen. The ordinary
+path throws nothing. It is reachable because `LeafWasmStreamLike` is
+a public interface a host may implement; the leaf's own `close` does
+not throw.
 
 Order matters inside `close()` and is part of the contract: the
 streams are retired **before** the node, because the leaf retires a

@@ -111,6 +111,37 @@ export interface LeafWasmStream {
   is_reliable(): boolean;
   /** 16 lowercase hex digits. The event JSON's `stream_id` is the same id in decimal. */
   stream_id_hex(): string;
+  /**
+   * The peer this stream addresses, 16 lowercase hex digits — the
+   * same spelling as {@link LeafWasmStream.stream_id_hex} on
+   * purpose, so peer and id are reconciled against their decimal
+   * event fields by one idiom rather than two. The event JSON's
+   * `peer_node` is this value in decimal.
+   *
+   * **Why the wrapper needs it:** a stream id is an application
+   * label scoped to a session, so two streams to two peers under one
+   * id is the ordinary case, not a collision. The callback delivers
+   * the NODE-WIDE event vector, so without the peer a wrapper's
+   * filter admits the other peer's payload (R4-10).
+   *
+   * Optional because this interface is public and a host-supplied
+   * wrapper is allowed not to spell a peer. A wrapper that cannot
+   * read one filters on the id alone — the same disposition an
+   * unreadable id gets, since a filter that cannot be evaluated must
+   * not become one that drops everything.
+   */
+  peer_node_hex?(): string;
+  /**
+   * Which incarnation of that peer's session this stream belongs to,
+   * exact decimal — the event JSON's `incarnation`, same spelling.
+   *
+   * Provenance, not identity: the filter is `(peer, stream id)`.
+   * Send-side staleness is fenced by the leaf itself, and a replaced
+   * session retires its receive cursors, so no frame reaches a
+   * wrapper under a dead incarnation. Declared because this file is
+   * the record of the boundary the leaf actually exposes.
+   */
+  incarnation?(): string;
   close(): void;
 }
 
@@ -127,6 +158,10 @@ export interface LeafWasmProxyStream {
   on_message(callback: (event: StreamCallbackPayload) => void): void;
   is_reliable(): boolean;
   stream_id_hex(): string;
+  /** As {@link LeafWasmStream.peer_node_hex}. */
+  peer_node_hex?(): string;
+  /** As {@link LeafWasmStream.incarnation}. */
+  incarnation?(): string;
   close(): void;
 }
 

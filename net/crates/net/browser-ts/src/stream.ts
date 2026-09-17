@@ -86,6 +86,26 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
    * than someone else's bytes.
    */
   private readonly wireId: bigint | null;
+  /**
+   * The peer this stream addresses, as a number, or `null` when the
+   * inner object does not spell one.
+   *
+   * **The other half of a stream's identity, and the reason the id
+   * alone was not one.** A stream id is an application label scoped
+   * to a session, so two streams to two peers under the same id is
+   * the ordinary case — `openStream({ peer, streamId })` invites it
+   * — and the callback is handed the NODE-WIDE event vector. Keyed
+   * on the id alone, two wrappers both admitted whichever peer's
+   * frame arrived, so a page echoing what it received amplified one
+   * peer's payload onto the other's stream (R4-10). The key is
+   * `(peer, id)`.
+   *
+   * Read in the same hex spelling as the id and compared against the
+   * event's decimal `peer_node` the same way, so there is one
+   * conversion idiom in this file rather than two — a mismatch in
+   * either would fail the id comparison too, loudly.
+   */
+  private readonly peerId: bigint | null;
 
   /**
    * @internal — built by `BrowserNode.openStream` (a leader-local
@@ -105,7 +125,8 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     private readonly inner: LeafWasmStreamLike,
     private readonly onClosed?: () => void,
   ) {
-    this.wireId = wireId(inner);
+    this.wireId = u64FromHex(() => inner.stream_id_hex());
+    this.peerId = u64FromHex(() => inner.peer_node_hex?.());
     inner.on_message((event) => this.receive(event));
   }
 
@@ -204,21 +225,36 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     // the exact one lives here.
     if (parsed.type !== 'stream_data' || !/^\d+$/.test(parsed.streamId)) return null;
     if (this.wireId !== null && BigInt(parsed.streamId) !== this.wireId) return null;
+    // And the peer, because the id is only half of the identity. A
+    // frame whose peer is unattributable is dropped by a stream that
+    // knows its own: "some peer's bytes under my id" is precisely
+    // what this stream must not deliver. A stream whose HANDLE does
+    // not spell a peer keeps the id-only behaviour instead of
+    // dropping everything — the same disposition an unreadable id
+    // gets, one line above.
+    if (this.peerId !== null) {
+      if (!/^\d+$/.test(parsed.peerNode)) return null;
+      if (BigInt(parsed.peerNode) !== this.peerId) return null;
+    }
     return parsed.payload;
   }
 }
 
 /**
- * The inner stream's wire id as a number, or `null` when it does not
- * spell one — a host-supplied wrapper is allowed not to, and an id
- * that cannot be read must not become a filter that drops everything.
+ * A `u64` the inner object spells in hex, as a number — or `null`
+ * when it does not spell one.
+ *
+ * A host-supplied wrapper is allowed to omit either accessor, and a
+ * value that cannot be read must not become a filter that drops
+ * everything.
  */
-function wireId(inner: LeafWasmStreamLike): bigint | null {
+function u64FromHex(read: () => string | undefined): bigint | null {
+  let hex: string | undefined;
   try {
-    const hex = inner.stream_id_hex();
-    if (!/^[0-9a-fA-F]{1,16}$/.test(hex)) return null;
-    return BigInt(`0x${hex}`);
+    hex = read();
   } catch {
     return null;
   }
+  if (hex === undefined || !/^[0-9a-fA-F]{1,16}$/.test(hex)) return null;
+  return BigInt(`0x${hex}`);
 }

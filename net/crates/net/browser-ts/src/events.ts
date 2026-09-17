@@ -41,6 +41,7 @@ export const U64_EVENT_KEYS = [
   'call_id',
   'seq',
   'generation',
+  'incarnation',
   'version',
   'from',
   'to',
@@ -81,6 +82,32 @@ export interface ChannelMessageEvent {
 /** A frame on an open stream, after the consumer-side `seq` reorder. */
 export interface StreamDataEvent {
   readonly type: 'stream_data';
+  /**
+   * The peer this frame came from, exact decimal — the other half of
+   * the identity of a stream.
+   *
+   * A stream id is the application's label and is scoped to a
+   * session, so the SAME id is the ordinary case for two streams to
+   * two different peers. Without this, a wrapper filtering the
+   * node-wide event vector by id alone takes one peer's payload for
+   * the other's (R4-10).
+   *
+   * Always present: a frame only exists on an authenticated session,
+   * and an anchor-addressed stream's peer is the anchor.
+   */
+  readonly peerNode: string;
+  /**
+   * Which incarnation of that peer's session carried it, exact
+   * decimal.
+   *
+   * Provenance, not identity: the filter keys on `(peerNode,
+   * streamId)` only, because a replaced session retires its receive
+   * cursors, so no frame arrives under a dead incarnation. It is
+   * here so a page attributing a payload to a session reads an exact
+   * value rather than deriving one — which is also why
+   * `incarnation` is in {@link U64_EVENT_KEYS}.
+   */
+  readonly incarnation: string;
   /** The stream's id, exact decimal. */
   readonly streamId: string;
   readonly seq: number;
@@ -213,6 +240,8 @@ export function parseEvent(json: string): LeafEvent {
     case 'stream_data':
       return {
         type: 'stream_data',
+        peerNode: str(fields, 'peer_node'),
+        incarnation: str(fields, 'incarnation'),
         streamId: str(fields, 'stream_id'),
         seq: num(fields, 'seq'),
         payload: bytes(fields, 'payload'),

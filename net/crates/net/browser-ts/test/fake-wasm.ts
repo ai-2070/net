@@ -29,11 +29,22 @@ import type {
   StreamCallbackPayload,
 } from '../src/wasm.js';
 
+/**
+ * The peer a stream opened WITHOUT one addresses: the anchor, at the
+ * id {@link FakeNode.anchor_id_hex} hands out. The leaf gives each
+ * stream the peer it was opened against, and a stream's inbound
+ * frames carry that peer — which is half of the identity
+ * `LeafStream` filters on.
+ */
+const ANCHOR_PEER_HEX = '00000000000000aa';
+
 export class FakeStream implements LeafWasmStream {
   readonly sent: Uint8Array[] = [];
   closed = false;
   /** The decimal id the events it emits carry; `0xff` in hex. */
   readonly wireId = '255';
+  /** The session incarnation the events it emits carry. */
+  readonly wireIncarnation = '1';
   private seq = 0;
   private sink: ((event: StreamCallbackPayload) => void) | null = null;
 
@@ -42,6 +53,11 @@ export class FakeStream implements LeafWasmStream {
     private readonly sendError: unknown = null,
     private readonly onClose: () => void = () => {},
   ) {}
+
+  /** The decimal peer the events it emits carry — its own. */
+  get wirePeer(): string {
+    return BigInt(`0x${this.peer_node_hex()}`).toString(10);
+  }
 
   send(payload: Uint8Array): void {
     if (this.sendError !== null) throw this.sendError;
@@ -60,6 +76,14 @@ export class FakeStream implements LeafWasmStream {
     return '00000000000000ff';
   }
 
+  peer_node_hex(): string {
+    return this.options.peer ?? ANCHOR_PEER_HEX;
+  }
+
+  incarnation(): string {
+    return this.wireIncarnation;
+  }
+
   close(): void {
     this.closed = true;
     this.onClose();
@@ -68,7 +92,15 @@ export class FakeStream implements LeafWasmStream {
   /** Drive an inbound payload from a test, the way Rust delivers it. */
   arrive(payload: Uint8Array): void {
     this.seq += 1;
-    this.sink?.(streamDataEvent(this.wireId, String(this.seq), payload));
+    this.sink?.(
+      streamDataEvent({
+        peerNode: this.wirePeer,
+        incarnation: this.wireIncarnation,
+        streamId: this.wireId,
+        seq: String(this.seq),
+        payload,
+      }),
+    );
   }
 
   /** Drive one verbatim callback argument, for ABI probes. */

@@ -25,6 +25,10 @@ import { toBase64 } from '../src/events.js';
 export interface StreamDataVector {
   /** Why this vector is in the set. */
   readonly note: string;
+  /** The peer the frame came from, exact decimal. */
+  readonly peerNode: string;
+  /** The session incarnation that carried it, exact decimal. */
+  readonly incarnation: string;
   /** The wire stream id, exact decimal. */
   readonly streamId: string;
   /** The sequence, exact decimal. */
@@ -47,14 +51,35 @@ export function vectorPayload(vector: StreamDataVector): Uint8Array {
   return out;
 }
 
+/** The identifying fields of one `stream_data` event. */
+export interface StreamDataFields {
+  /** The sending peer, exact decimal. */
+  readonly peerNode: string;
+  /** The session incarnation, exact decimal. */
+  readonly incarnation: string;
+  /** The stream's id, exact decimal. */
+  readonly streamId: string;
+  /** The sequence, exact decimal. */
+  readonly seq: string;
+  readonly payload: Uint8Array;
+}
+
 /**
  * The `stream_data` event JSON Rust emits for one inbound payload.
  *
- * `streamId` and `seq` are decimal strings because they are `u64` on
- * the wire and `JSON.parse` would round them.
+ * Every id is a decimal string because each is a `u64` on the wire
+ * and `JSON.parse` would round it. The key ORDER is part of the
+ * pin: `LeafEvent::to_json` writes this arm with a hand-written
+ * `format!`, and `abi.test.ts` asserts byte identity against the
+ * Rust-generated vectors, so this is the emitted text rather than an
+ * equivalent object.
  */
-export function streamDataEvent(streamId: string, seq: string, payload: Uint8Array): string {
-  return `{"type":"stream_data","stream_id":"${streamId}","seq":"${seq}","payload":"${toBase64(payload)}"}`;
+export function streamDataEvent(fields: StreamDataFields): string {
+  return (
+    `{"type":"stream_data","peer_node":"${fields.peerNode}",` +
+    `"incarnation":"${fields.incarnation}","stream_id":"${fields.streamId}",` +
+    `"seq":"${fields.seq}","payload":"${toBase64(fields.payload)}"}`
+  );
 }
 
 /**

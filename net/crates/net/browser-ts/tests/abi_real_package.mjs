@@ -24,14 +24,25 @@
  * claim "no test doubles"; that was false, and the label at the
  * bottom now says what it is.
  *
- * The two close-disposition probes (ruling 3: a direct
- * `BrowserNode.close()` ends the iterators it handed out) go through
- * the package's own `connect()`, so the retained set, the terminal
- * and the typed refusal are all compiled `dist/` code. Their
- * stand-in is never driven — it emits no bytes and answers no call,
- * because what they assert is exactly what a consumer sees when
- * nothing arrives again — and the closed-node refusal text is read
- * out of `leaf/src/wasm.rs` instead of being restated here.
+ * The close-disposition probes — ruling 3 (a direct
+ * `BrowserNode.close()` ends the iterators it handed out, and
+ * refuses a later open typed) and R5-L1 (it discharges every
+ * obligation it latched, even when one child's `close` throws) —
+ * reach the compiled `BrowserNode` through the package's own
+ * `connect()`, so the retained set, the terminal, the refusal and
+ * the aggregate are all `dist/` code, and the closed-node refusal
+ * text is read out of `leaf/src/wasm.rs` instead of being restated
+ * here. Their stand-in is never fed a byte: it emits nothing and
+ * answers no call, because what they assert is exactly what a
+ * consumer sees when nothing arrives again. The one thing it is
+ * asked to DO is throw from a child `close` — an input
+ * `LeafWasmStreamLike` makes a page's own to supply.
+ *
+ * ONE OUTCOME PER PROBE. Iterator completion, typed refusal and
+ * teardown-despite-a-failure are separate properties of `close`; a
+ * probe that conjoins them goes red once and names none of them.
+ * The same outcomes through a REAL wasm-owned stream are the browser
+ * matrix's, because Node cannot host one at all.
  *
  * The real direct and leader-proxied stream exercises — a stream
  * opened through the built package against a live native anchor
@@ -90,6 +101,26 @@ function refusal(fn, what) {
   throw new Error(`${what}: accepted silently, no error thrown`);
 }
 
+/**
+ * `work`, or a rejection naming what stayed pending.
+ *
+ * A BOUNDED RACE, not a widened timeout: "never settles" is not
+ * observable by waiting longer, so the deadline is the assertion.
+ * Green pays no wall clock at all — the race resolves on an
+ * already-settled promise and the timer is cleared.
+ */
+async function settledWithin(work, ms, what) {
+  let timer;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} was still pending after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─────────────────────────── the artifacts ───────────────────────────
 
 const { LeafStream } = await import(new URL('index.js', dist).href);
@@ -115,18 +146,20 @@ function payloadOf(vector) {
 
 /**
  * One `LeafStream` from the built package over a STAND-IN inner
- * object — see the header. The decode, the numeric id filter, the
- * pending-payload buffering and the callback/iterator fan-out are
- * all the package's own compiled code; only the transport under it
- * is stubbed, because Node has no `RTCPeerConnection` to give it a
- * real one. `proxied` picks the `MeshSession` shape, whose `send` is
- * a promise — the only declared difference between the two inner
- * surfaces. The corresponding REAL exercises are the Stage 5 browser
- * witnesses named in the header.
+ * object — see the header. The decode, the numeric `(peer, id)`
+ * filter, the pending-payload buffering and the callback/iterator
+ * fan-out are all the package's own compiled code; only the
+ * transport under it is stubbed, because Node has no
+ * `RTCPeerConnection` to give it a real one. `proxied` picks the
+ * `MeshSession` shape, whose `send` is a promise — the only declared
+ * difference between the two inner surfaces. `peerHex` is the peer
+ * the handle answers with, omitted for the host-supplied wrapper
+ * that spells none. The corresponding REAL exercises are the Stage 5
+ * browser witnesses named in the header.
  */
-function packageStream(streamIdHex, proxied) {
+function packageStream(streamIdHex, proxied, peerHex) {
   let emit;
-  const stream = new LeafStream({
+  const inner = {
     send: proxied ? async () => undefined : () => undefined,
     close() {},
     is_reliable: () => true,
@@ -134,8 +167,18 @@ function packageStream(streamIdHex, proxied) {
     on_message(callback) {
       emit = callback;
     },
-  });
+  };
+  if (peerHex !== undefined) {
+    inner.peer_node_hex = () => peerHex;
+    inner.incarnation = () => '1';
+  }
+  const stream = new LeafStream(inner);
   return { stream, emit: (event) => emit(event) };
+}
+
+/** A fixture vector's peer in the hex spelling a handle answers with. */
+function peerHexOf(vector) {
+  return BigInt(vector.peerNode).toString(16).padStart(16, '0');
 }
 
 // ──────────────────────────── bytes + ids ────────────────────────────
@@ -143,7 +186,7 @@ function packageStream(streamIdHex, proxied) {
 await probe('real_package_decodes_every_pinned_stream_event', async () => {
   for (const vector of fixture.streamData) {
     const hex = BigInt(vector.streamId).toString(16).padStart(16, '0');
-    const rig = packageStream(hex, false);
+    const rig = packageStream(hex, false, peerHexOf(vector));
     const next = rig.stream[Symbol.asyncIterator]().next();
     rig.emit(vector.json);
     const { value } = await next;
@@ -157,7 +200,7 @@ await probe('real_package_decodes_every_pinned_stream_event', async () => {
 await probe('real_package_decodes_the_same_events_on_a_proxied_stream', async () => {
   for (const vector of fixture.streamData) {
     const hex = BigInt(vector.streamId).toString(16).padStart(16, '0');
-    const rig = packageStream(hex, true);
+    const rig = packageStream(hex, true, peerHexOf(vector));
     const seen = [];
     rig.stream.onMessage((payload) => seen.push(payload));
     rig.emit(vector.json);
@@ -180,6 +223,48 @@ await probe('real_package_drops_another_streams_event', async () => {
   rig.stream.onMessage((payload) => seen.push(payload));
   rig.emit('{"type":"stream_data","stream_id":"19","seq":"1","payload":"AQ=="}');
   eq(seen.length, 0, 'an event for stream 19 reached stream 9');
+});
+
+// R4-10 against the Rust-generated vectors. The fixture carries two
+// events that differ ONLY in `peer_node` under stream id 9 — the
+// shape a page gets from `openStream({ peer, streamId })` against two
+// peers, which is an ordinary composition and not a collision. Keyed
+// on the id alone, each wrapper admitted both, so a page echoing what
+// it received put one peer's payload on the other's stream.
+await probe('real_package_keys_a_stream_on_its_peer_as_well_as_its_id', async () => {
+  const shared = fixture.streamData.filter((vector) => vector.streamId === '9');
+  if (shared.length !== 2) {
+    throw new Error(
+      `the fixture no longer carries two stream-id-9 vectors (found ${shared.length}) — this probe ` +
+        'reads them to get Rust-emitted events that differ only in the peer, so the fixture or ' +
+        'this extraction must be fixed rather than the assertion relaxed',
+    );
+  }
+  const peers = shared.map((vector) => vector.peerNode);
+  if (peers[0] === peers[1]) throw new Error(`both stream-id-9 vectors name peer ${peers[0]}`);
+
+  const hex = BigInt('9').toString(16).padStart(16, '0');
+  for (const mine of shared) {
+    const rig = packageStream(hex, false, peerHexOf(mine));
+    const seen = [];
+    rig.stream.onMessage((payload) => seen.push(payload));
+    // Every event on the id reaches every wrapper on it: that is what
+    // the node hands each stream's callback.
+    for (const vector of shared) rig.emit(vector.json);
+    eq(seen.length, 1, `peer ${mine.peerNode}'s stream took ${seen.length} of the 2 events on id 9`);
+    eq([...seen[0]], [...payloadOf(mine)], `peer ${mine.peerNode}'s own payload`);
+  }
+});
+
+// And the host-supplied wrapper that spells no peer keeps the id-only
+// behaviour: a filter that cannot be evaluated must not become one
+// that drops everything.
+await probe('real_package_keeps_delivering_to_a_wrapper_that_spells_no_peer', async () => {
+  const rig = packageStream('0000000000000009', false);
+  const seen = [];
+  rig.stream.onMessage((payload) => seen.push(payload));
+  rig.emit('{"type":"stream_data","stream_id":"9","seq":"1","payload":"AQ=="}');
+  eq([...(seen[0] ?? [])], [1], 'a peerless wrapper received its own id');
 });
 
 // ───────────────────── the wasm option readers ──────────────────────
@@ -380,14 +465,16 @@ const CLOSED_NODE_DISPLAY = `session: ${admitFence[1]}`;
  * jobs are to record the retirement order and to fence a closed node
  * with Rust's own text.
  */
-function packageDirectNode() {
+function packageDirectNode(throwOnClose = []) {
   const teardown = [];
   let closed = false;
+  let opened = 0;
   const inner = {
     node_id_hex: () => 'beefcafe00000001',
     on_event() {},
     open_stream() {
       if (closed) throw new Error(CLOSED_NODE_DISPLAY);
+      const ordinal = ++opened;
       return {
         send() {},
         on_message() {},
@@ -395,6 +482,7 @@ function packageDirectNode() {
         stream_id_hex: () => '00000000000000ff',
         close() {
           teardown.push('stream');
+          if (throwOnClose.includes(ordinal)) throw new Error(`injected close failure ${ordinal}`);
         },
       };
     },
@@ -404,6 +492,14 @@ function packageDirectNode() {
     },
   };
   return { wasm: { LeafNode: { connect: async () => inner } }, teardown };
+}
+
+/** That stand-in reached through the BUILT package's own `connect`. */
+async function connectPackageNode(throwOnClose) {
+  const { connect } = await import(new URL('index.js', dist).href);
+  const { wasm, teardown } = packageDirectNode(throwOnClose);
+  const node = await connect({ credentialB64: 'Y3JlZA==', origin: 'https://page.example', wasm });
+  return { node, teardown };
 }
 
 await probe('real_package_re_types_the_leafs_closed_node_fence', async () => {
@@ -419,9 +515,7 @@ await probe('real_package_re_types_the_leafs_closed_node_fence', async () => {
 });
 
 await probe('real_package_ends_a_parked_iterator_when_the_direct_node_closes', async () => {
-  const { connect } = await import(new URL('index.js', dist).href);
-  const { wasm, teardown } = packageDirectNode();
-  const node = await connect({ credentialB64: 'Y3JlZA==', origin: 'https://page.example', wasm });
+  const { node, teardown } = await connectPackageNode();
   const stream = node.openStream({ reliability: 'reliable' });
 
   // Parked with nothing buffered — the consumer that, before this
@@ -429,31 +523,24 @@ await probe('real_package_ends_a_parked_iterator_when_the_direct_node_closes', a
   const parked = stream[Symbol.asyncIterator]().next();
   node.close();
 
-  // A BOUNDED RACE, not a widened timeout: "never settles" is not
-  // observable by waiting longer, so the deadline is the assertion.
-  // Green pays no wall clock at all — the race resolves on an
-  // already-settled promise and the timer is cleared.
-  let timer;
-  const deadline = new Promise((_resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new Error('the parked iterator was still pending 250ms after node.close()')),
-      250,
-    );
-  });
-  let settled;
-  try {
-    settled = await Promise.race([parked, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
-  eq(settled, { value: undefined, done: true }, 'the iterator parked before node.close()');
+  const what = 'the iterator parked before node.close()';
+  eq(await settledWithin(parked, 250, what), { value: undefined, done: true }, what);
 
   // Handles retired through a LIVE node, then the node: the leaf
   // retires a stream handle via the node, so one closed afterwards
   // is never retired at all.
   eq(teardown, ['stream', 'node'], 'the retirement order');
+});
 
-  // And the closed node refuses the next stream, typed.
+// The SECOND outcome of ruling 3, and its own probe. End-of-iteration
+// and a typed refusal of a later open are different properties of
+// `close`, and one probe asserting their conjunction is green while
+// either half is broken as long as the other fails first — it cannot
+// even say which one regressed.
+await probe('real_package_refuses_a_stream_on_the_closed_direct_node', async () => {
+  const { node } = await connectPackageNode();
+  node.close();
+
   let thrown = null;
   try {
     node.openStream({ reliability: 'reliable' });
@@ -462,6 +549,34 @@ await probe('real_package_ends_a_parked_iterator_when_the_direct_node_closes', a
   }
   if (thrown === null) throw new Error('openStream on a closed node: accepted silently');
   eq([thrown.kind, thrown.message], ['session', CLOSED_NODE_DISPLAY], 'openStream on a closed node');
+});
+
+// R5-L1 through the shipped artifact. A `LeafWasmStreamLike` is an
+// interface a page may implement, so a throwing child `close` is a
+// reachable input rather than a hypothetical: the fix is that it
+// costs the page nothing else it owns, and is still reported.
+await probe('real_package_completes_teardown_when_a_child_close_throws', async () => {
+  const { node, teardown } = await connectPackageNode([1]);
+  node.openStream({ reliability: 'reliable' });
+  const second = node.openStream({ reliability: 'reliable' });
+  const parked = second[Symbol.asyncIterator]().next();
+
+  let thrown = null;
+  try {
+    node.close();
+  } catch (error) {
+    thrown = error;
+  }
+
+  const what = "the second stream's iterator, parked when the first stream's close threw";
+  eq(await settledWithin(parked, 250, what), { value: undefined, done: true }, what);
+  eq(teardown, ['stream', 'stream', 'node'], 'every child and then the leaf, despite the failure');
+  eq(thrown instanceof AggregateError, true, 'the failing close surfaced as an aggregate');
+  eq(
+    thrown.errors.map((error) => [error.kind, error.message]),
+    [['unknown', 'injected close failure 1']],
+    'the failure the aggregate carries',
+  );
 });
 
 // ──────────── the surface the real harness page imports ────────────
@@ -520,11 +635,12 @@ console.log(
         'the built @net-mesh/browser dist plus the wasm-bindgen pkg beside it, and no network. ' +
         'The wasm option readers and the fixture decode are exercised for real; the stream ' +
         "probes drive the package's own LeafStream over a STAND-IN inner object, because " +
-        'Node has no RTCPeerConnection and therefore no wasm-owned stream. The two ' +
-        'close-disposition probes reach the compiled BrowserNode through the package\'s own ' +
-        'connect() and never drive the stand-in at all — it emits nothing, which is the ' +
-        "point — and the leaf's closed-node fence text is read out of leaf/src/wasm.rs " +
-        'rather than restated here. The real direct ' +
+        'Node has no RTCPeerConnection and therefore no wasm-owned stream. The ' +
+        "close-disposition probes reach the compiled BrowserNode through the package's own " +
+        'connect(), one outcome each, and never feed the stand-in a byte — it emits nothing, ' +
+        'which is the point; the only thing it is asked to do is throw from a child close. ' +
+        "The leaf's closed-node fence text is read out of leaf/src/wasm.rs rather than " +
+        'restated here. The real direct ' +
         'and leader-proxied stream exercises are the Stage 5 browser witnesses named in this ' +
         "file's header.",
       package: fileURLToPath(dist),

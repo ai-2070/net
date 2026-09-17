@@ -32,6 +32,8 @@ export class FakeProxyStream implements LeafWasmProxyStream {
   closed = false;
   /** The decimal id the events it emits carry; `0xff` in hex. */
   readonly wireId = '255';
+  /** The session incarnation the events it emits carry. */
+  readonly wireIncarnation = '1';
   private seq = 0;
   private sink: ((event: StreamCallbackPayload) => void) | null = null;
 
@@ -57,6 +59,15 @@ export class FakeProxyStream implements LeafWasmProxyStream {
     return '00000000000000ff';
   }
 
+  /** The proxied half of the same identity: see `FakeStream`. */
+  peer_node_hex(): string {
+    return this.options.peer ?? '00000000000000aa';
+  }
+
+  incarnation(): string {
+    return this.wireIncarnation;
+  }
+
   close(): void {
     this.closed = true;
   }
@@ -64,7 +75,15 @@ export class FakeProxyStream implements LeafWasmProxyStream {
   /** Drive an inbound payload from a test, the way Rust delivers it. */
   arrive(payload: Uint8Array): void {
     this.seq += 1;
-    this.sink?.(streamDataEvent(this.wireId, String(this.seq), payload));
+    this.sink?.(
+      streamDataEvent({
+        peerNode: BigInt(`0x${this.peer_node_hex()}`).toString(10),
+        incarnation: this.wireIncarnation,
+        streamId: this.wireId,
+        seq: String(this.seq),
+        payload,
+      }),
+    );
   }
 }
 

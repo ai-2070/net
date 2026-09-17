@@ -142,11 +142,52 @@ the README on why it is a sibling package rather than a sub-path.
   has to be settled by something. `BrowserNode` was the outlier, and
   the two surfaces now dispose of a stream identically.
 
+- **`BrowserNode.close()` finishes what it latched, and reports what
+  failed.** It closes every stream it handed out, then the event
+  surface, then the leaf — and each of those is now attempted
+  independently. Previously the first stream whose `close` threw
+  aborted the loop, and because `close` latches and empties its set
+  before starting, nothing could retry: the remaining streams stayed
+  open with their iterators parked forever, the event surface kept
+  dispatching, the wasm node was never closed, and a second
+  `close()` returned immediately.
+
+  If anything did throw, `close()` now throws an **`AggregateError`**
+  whose `.errors` are the typed `LeafError`s in teardown order —
+  always an aggregate, however many failed, so a caller does not have
+  to branch on a shape to discover that one part of its teardown did
+  not happen. The ordinary path still throws nothing. This is
+  reachable because `LeafWasmStreamLike` is a public interface a host
+  may implement; the leaf's own `close` does not throw.
+
+- **A stream delivers its own peer's payloads, not its id's.**
+  `stream_data` now carries `peerNode` (and `incarnation`), and a
+  stream matches an inbound frame on `(peerNode, streamId)` rather
+  than on the id alone.
+
+  A stream id is an application label scoped to a session, so
+  `openStream({ peer, streamId })` against two peers under one id is
+  an ordinary composition — and the wasm callback is handed the
+  node-wide event vector. Keyed on the id alone, both wrappers
+  admitted whichever peer's frame arrived first, so two streams under
+  one label received each other's bytes and a page that echoed what
+  it received amplified one peer's payload onto the other's stream.
+  The pair-specific-label workaround pages were told to use is not
+  needed for this and was never the fix.
+
+  A host-supplied `LeafWasmStreamLike` that spells no peer
+  (`peer_node_hex` is optional) keeps the id-only behaviour: a filter
+  that cannot be evaluated must not become one that drops
+  everything. If you implement that interface, add `peer_node_hex()`
+  — 16 lowercase hex digits, the spelling `nodeIdHex()` hands out —
+  to get the peer-keyed delivery.
+
 ### Notes for consumers
 
 - **64-bit ids are exact decimal strings**, never JS numbers.
   `channel_hash`, `origin_hash`, `stream_id`, `node_id`, `peer_node`,
-  `dialog`, `not_after`, `call_id`, `seq` and `generation` all arrive as
+  `dialog`, `not_after`, `call_id`, `seq`, `incarnation` and
+  `generation` all arrive as
   strings, because `JSON.parse` rounds integer literals above 2^53 and
   a rounded channel hash would match the wrong channel.
 
@@ -159,13 +200,16 @@ the README on why it is a sibling package rather than a sub-path.
 
 - **Stream payloads are decoded here, not encoded twice in Rust.** The
   wasm boundary delivers the node's `stream_data` event JSON to a
-  stream's callback — `{"type":"stream_data","stream_id":"9",
-  "seq":"1","payload":"AQI="}` — and `LeafStream` parses and
+  stream's callback —
+  `{"type":"stream_data","peer_node":"200","incarnation":"1",`
+  `"stream_id":"9","seq":"1","payload":"AQI="}` — and `LeafStream`
+  parses and
   base64-decodes it, so `onMessage` and `for await` yield
   `Uint8Array` on the direct and the leader-proxied surface alike.
   The declaration in `src/wasm.ts` used to say `Uint8Array` and the
   argument was forwarded verbatim, so a page received the JSON string.
-  If you wired `LeafWasmStream.on_message` yourself, parse it.
+  If you wired `LeafWasmStream.on_message` yourself, parse it — and
+  filter on `peer_node` as well as `stream_id`.
 
 - **`OpenStreamOptions.channelHash` is a `number`**, not a string, and
   must be a whole number in `0..=65535`. Rust reads it as a number;

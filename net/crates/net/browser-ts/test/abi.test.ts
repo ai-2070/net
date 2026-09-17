@@ -23,8 +23,21 @@ import { FakeStream } from './fake-wasm.js';
 import { FakeProxyStream } from './fake-leader-wasm.js';
 import { STREAM_DATA_VECTORS, streamDataEvent, vectorPayload } from './leaf-abi.js';
 
+/**
+ * The decimal peer every hand-driven event below carries, and the
+ * hex spelling the handle answers with — the two spellings of one
+ * id, which is the whole reason the comparison is numeric.
+ */
+const PEER = '200';
+const PEER_HEX = '00000000000000c8';
+
+/** One `stream_data` event from `PEER`, at the Rust key order. */
+function fromPeer(streamId: string, seq: string, payload: Uint8Array): string {
+  return streamDataEvent({ peerNode: PEER, incarnation: '1', streamId, seq, payload });
+}
+
 /** A stream whose inner object is driven by hand, direct or proxied. */
-function harness(streamIdHex: string, proxied = false) {
+function harness(streamIdHex: string, proxied = false, peerHex = PEER_HEX) {
   let emit: ((event: StreamCallbackPayload) => void) | undefined;
   let closed = false;
   const inner: LeafWasmStreamLike = {
@@ -34,6 +47,8 @@ function harness(streamIdHex: string, proxied = false) {
     },
     is_reliable: () => true,
     stream_id_hex: () => streamIdHex,
+    peer_node_hex: () => peerHex,
+    incarnation: () => '1',
     on_message: (callback) => {
       emit = callback;
     },
@@ -48,11 +63,16 @@ function harness(streamIdHex: string, proxied = false) {
   };
 }
 
+/** A vector's peer in the hex spelling the handle answers with. */
+function vectorPeerHex(vector: { readonly peerNode: string }): string {
+  return BigInt(vector.peerNode).toString(16).padStart(16, '0');
+}
+
 describe('the stream callback ABI', () => {
   for (const vector of STREAM_DATA_VECTORS) {
     it(`decodes the leaf's own event JSON: ${vector.note}`, async () => {
       const hex = BigInt(vector.streamId).toString(16);
-      const rig = harness(hex.padStart(16, '0'));
+      const rig = harness(hex.padStart(16, '0'), false, vectorPeerHex(vector));
       const next = rig.stream[Symbol.asyncIterator]().next();
       rig.emit(vector.json);
       await expect(next).resolves.toEqual({ value: vectorPayload(vector), done: false });
@@ -60,7 +80,7 @@ describe('the stream callback ABI', () => {
 
     it(`delivers the same bytes on a proxied stream: ${vector.note}`, async () => {
       const hex = BigInt(vector.streamId).toString(16);
-      const rig = harness(hex.padStart(16, '0'), true);
+      const rig = harness(hex.padStart(16, '0'), true, vectorPeerHex(vector));
       const seen: Uint8Array[] = [];
       rig.stream.onMessage((payload) => seen.push(payload));
       rig.emit(vector.json);
@@ -74,7 +94,15 @@ describe('the stream callback ABI', () => {
     // taught the new shape — so a test double can never again be the
     // only thing that agrees with the package.
     for (const vector of STREAM_DATA_VECTORS) {
-      expect(streamDataEvent(vector.streamId, vector.seq, vectorPayload(vector))).toBe(vector.json);
+      expect(
+        streamDataEvent({
+          peerNode: vector.peerNode,
+          incarnation: vector.incarnation,
+          streamId: vector.streamId,
+          seq: vector.seq,
+          payload: vectorPayload(vector),
+        }),
+      ).toBe(vector.json);
     }
   });
 
@@ -84,8 +112,8 @@ describe('the stream callback ABI', () => {
     rig.stream.onMessage((payload) => seen.push(payload));
     // The node's event stream is shared; Rust's filter is a substring
     // match on the JSON, so the exact one has to be here.
-    rig.emit(streamDataEvent('19', '1', new Uint8Array([7])));
-    rig.emit(streamDataEvent('9', '2', new Uint8Array([8])));
+    rig.emit(fromPeer('19', '1', new Uint8Array([7])));
+    rig.emit(fromPeer('9', '2', new Uint8Array([8])));
     expect(seen).toEqual([new Uint8Array([8])]);
   });
 
@@ -95,14 +123,14 @@ describe('the stream callback ABI', () => {
     // payload is dropped.
     const rig = harness('000000000000002a');
     const next = rig.stream[Symbol.asyncIterator]().next();
-    rig.emit(streamDataEvent('42', '1', new Uint8Array([1, 2, 3])));
+    rig.emit(fromPeer('42', '1', new Uint8Array([1, 2, 3])));
     await expect(next).resolves.toEqual({ value: new Uint8Array([1, 2, 3]), done: false });
   });
 
   it('survives a u64 stream id past the JS safe integer', async () => {
     const rig = harness('ffffffffffffffff');
     const next = rig.stream[Symbol.asyncIterator]().next();
-    rig.emit(streamDataEvent('18446744073709551615', '1', new Uint8Array([4])));
+    rig.emit(fromPeer('18446744073709551615', '1', new Uint8Array([4])));
     await expect(next).resolves.toEqual({ value: new Uint8Array([4]), done: false });
   });
 
@@ -113,7 +141,7 @@ describe('the stream callback ABI', () => {
     rig.emit('{"type":"disconnected","peer_node":"7","reason":"anchor went away"}');
     rig.emit('not json at all');
     expect(seen).toEqual([]);
-    rig.emit(streamDataEvent('9', '1', new Uint8Array([1])));
+    rig.emit(fromPeer('9', '1', new Uint8Array([1])));
     expect(seen).toEqual([new Uint8Array([1])]);
   });
 
