@@ -96,6 +96,30 @@ pub const MAX_OUTSTANDING_REASSEMBLIES: usize = 8;
 /// a lost tail does not hold the slot against live traffic.
 pub const REASSEMBLY_TTL_MS: u64 = 2_000;
 
+/// Completed groups remembered long enough to recognise their own
+/// retransmissions.
+///
+/// A sender rebuilds every unacknowledged fragment with a fresh AEAD
+/// counter whenever its acknowledgement is lost, and it cannot know
+/// the group already completed here — the acknowledgement that would
+/// have told it is the one that went missing. Without a record of
+/// what completed, the rebuilt head is indistinguishable from the
+/// first piece of a brand-new group: a fresh partial opens, nothing
+/// ever arrives to finish it because the peer's remaining pieces
+/// were already delivered, and the reassembly deadline then reports
+/// an abandoned reliable group for a message this leaf had **already
+/// handed to its consumer**. That is a terminal invented out of a
+/// successful delivery.
+///
+/// So a completed group leaves its name behind. The memory is
+/// bounded the same two ways the open groups are — a count and the
+/// same deadline — and holds no payload: a key, the sequence span
+/// the group consumed, and when it finished. Sized to
+/// [`MAX_OUTSTANDING_REASSEMBLIES`] because that is how many groups
+/// a peer can have had in flight, and therefore how many
+/// retransmitted heads one recovery burst can bring back.
+pub const MAX_COMPLETED_GROUPS: usize = MAX_OUTSTANDING_REASSEMBLIES;
+
 /// One piece of an outbound payload, ready to become one packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
@@ -301,10 +325,52 @@ fn note_abandoned(abandoned: &mut Vec<Abandoned>, scope: u64, partial: &Partial)
     }
 }
 
+/// A group that **completed**, remembered by name alone.
+///
+/// Enough to recognise the sender's own rebuilt pieces and nothing
+/// more: no payload, no offsets, no held bytes. The sequence span is
+/// what makes the recognition exact rather than approximate — a
+/// fragment id is only unique within a session's counter, so the
+/// question a rebuilt head must answer is not "was this id ever
+/// used" but "is this one of the sequences that group already
+/// delivered". A piece outside the span is a different group that
+/// happens to reuse the id, and it opens normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Completed {
+    /// The stream the group's sequences belonged to.
+    stream_id: u64,
+    /// Lowest sequence the group consumed.
+    first: u64,
+    /// Highest sequence the group consumed.
+    last: u64,
+    /// Whether the group owned stream sequences at all. The
+    /// sequence-less control path has no span to compare, so its
+    /// recognition is by id and deadline.
+    sequenced: bool,
+    /// When it completed, for the same deadline sweep the partials
+    /// get.
+    at: Instant,
+}
+
+impl Completed {
+    /// Whether a piece arriving on `sequence` is one this group
+    /// already delivered.
+    fn already_delivered(&self, sequence: u64, sequenced: bool) -> bool {
+        if self.sequenced != sequenced {
+            return false;
+        }
+        !sequenced || (sequence >= self.first && sequence <= self.last)
+    }
+}
+
 /// Inbound reassembly, bounded in both directions.
 #[derive(Debug, Default)]
 pub struct Reassembler {
     groups: HashMap<(u64, u16), Partial>,
+    /// Groups that finished, kept only long enough to tell their own
+    /// retransmissions from a new group's first piece. See
+    /// [`MAX_COMPLETED_GROUPS`].
+    completed: HashMap<(u64, u16), Completed>,
     abandoned: Vec<Abandoned>,
 }
 
@@ -329,6 +395,12 @@ impl Reassembler {
     /// is what keeps a re-handshake from mixing them.
     pub fn retire(&mut self, scope: u64) {
         self.groups.retain(|(s, _), _| *s != scope);
+        // The completed-group memory goes with them. It exists to
+        // recognise one session's own retransmissions, and the
+        // successor's fragment counter restarts at 1 — so a name
+        // kept across the replacement could swallow the successor's
+        // first group instead.
+        self.completed.retain(|(s, _), _| *s != scope);
     }
 
     /// Drop every group of one stream's receive lifetime.
@@ -346,6 +418,12 @@ impl Reassembler {
         let before = self.groups.len();
         self.groups
             .retain(|(s, _), p| *s != scope || !p.sequenced || p.first.stream_id != stream_id);
+        // The names of groups that completed on the lifetime being
+        // ended go too: the peer may restart the id from sequence
+        // zero, and a remembered span from before the reset would
+        // then overlap the fresh lifetime's own sequences.
+        self.completed
+            .retain(|(s, _), c| *s != scope || !c.sequenced || c.stream_id != stream_id);
         for _ in 0..(before - self.groups.len()) {
             counters.drop_for(DropReason::StreamFailed);
         }
@@ -448,10 +526,14 @@ impl Reassembler {
     /// capacity pressure becomes backpressure rather than silent
     /// loss.
     ///
-    /// `true` for anything that is not a fragment, and for a group
-    /// that is already open: an open group is never blocked by the
-    /// bound. A refusal is counted here, so the caller reports it by
-    /// returning rather than by inventing a second reason.
+    /// `true` for anything that is not a fragment, for a group that
+    /// is already open, and for a group this leaf remembers
+    /// completing: an open group is never blocked by the bound, and
+    /// a rebuilt piece of a finished group must be acknowledgeable
+    /// or the peer retransmits it forever while the bound is under
+    /// pressure from unrelated traffic. A refusal is counted here,
+    /// so the caller reports it by returning rather than by
+    /// inventing a second reason.
     pub fn admits(
         &mut self,
         scope: u64,
@@ -470,6 +552,7 @@ impl Reassembler {
         // very next step.
         self.expire(now, counters);
         if self.groups.contains_key(&(scope, fragment_id))
+            || self.completed.contains_key(&(scope, fragment_id))
             || self.groups.len() < MAX_OUTSTANDING_REASSEMBLIES
         {
             return true;
@@ -521,6 +604,33 @@ impl Reassembler {
         // tail arriving arbitrarily late could still complete it.
         self.expire(now, counters);
 
+        // **A group that already completed owns no new obligation.**
+        // The sender rebuilds unacknowledged pieces with a fresh
+        // AEAD counter when its acknowledgement is lost, so a
+        // delivered group's head can arrive again long after the
+        // payload reached the consumer. Opening a fresh partial for
+        // it is what turned a successful delivery into a pending
+        // one: nothing else of the group is ever coming — the peer's
+        // other pieces were consumed — so the deadline reaped it and
+        // reported an abandoned reliable group, ending a stream that
+        // had lost nothing at all.
+        //
+        // Only when no group is open under the key: an open group is
+        // the live one and its own duplicate handling below is
+        // exact. Counted as the duplicate it is, and the caller has
+        // already repeated the acknowledgement the peer is missing.
+        let sequenced = meta.is_some();
+        let arriving = meta.map_or(0, |m| m.sequence);
+        if !self.groups.contains_key(&key)
+            && self
+                .completed
+                .get(&key)
+                .is_some_and(|done| done.already_delivered(arriving, sequenced))
+        {
+            counters.drop_for(DropReason::ReassemblyDuplicate);
+            return None;
+        }
+
         if !self.groups.contains_key(&key) {
             if self.groups.len() >= MAX_OUTSTANDING_REASSEMBLIES {
                 counters.drop_for(DropReason::ReassemblyRefused);
@@ -563,7 +673,7 @@ impl Reassembler {
             return None;
         }
 
-        let sequence = meta.map_or(0, |m| m.sequence);
+        let sequence = arriving;
 
         // A legitimate retransmission: the same offset, the same
         // sequence, the same bytes. The sender rebuilds an
@@ -673,6 +783,13 @@ impl Reassembler {
             1
         };
 
+        // The group is complete and about to be delivered, so its
+        // name is remembered: from here a rebuilt piece of it is a
+        // duplicate, not the head of something new. Recorded before
+        // the payload is handed back, because the caller's next act
+        // is to deliver it.
+        self.remember_completed(key, now, partial.sequenced, partial.first, span);
+
         let mut out = BytesMut::with_capacity(total);
         for piece in &partial.pieces {
             out.extend_from_slice(&piece.data);
@@ -701,6 +818,50 @@ impl Reassembler {
         for _ in 0..(before - self.groups.len()) {
             counters.drop_for(DropReason::ReassemblyExpired);
         }
+        // The completed names age out on the same deadline the
+        // partials do, and nothing is reported for one: a group that
+        // completed delivered its bytes, so forgetting its name
+        // surrenders no ownership. The deadline is the right one
+        // because it is the window a retransmission can still arrive
+        // in — past it the peer has given up on the sequence itself.
+        self.completed
+            .retain(|_, c| now.saturating_duration_since(c.at) < ttl);
+    }
+
+    /// Remember that `key` completed, evicting the oldest name when
+    /// the bound is reached.
+    ///
+    /// Oldest rather than arbitrary: the names exist to cover the
+    /// retransmission window, and the one closest to the end of its
+    /// own window is the one least likely to be needed again.
+    fn remember_completed(
+        &mut self,
+        key: (u64, u16),
+        now: Instant,
+        sequenced: bool,
+        first: PieceMeta,
+        span: u64,
+    ) {
+        if self.completed.len() >= MAX_COMPLETED_GROUPS && !self.completed.contains_key(&key) {
+            if let Some(oldest) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, c)| c.at)
+                .map(|(k, _)| *k)
+            {
+                self.completed.remove(&oldest);
+            }
+        }
+        self.completed.insert(
+            key,
+            Completed {
+                stream_id: first.stream_id,
+                first: first.sequence,
+                last: first.sequence.saturating_add(span.saturating_sub(1)),
+                sequenced,
+                at: now,
+            },
+        );
     }
 }
 
@@ -1323,5 +1484,206 @@ mod tests {
         );
         r.retire_stream(2, 4, &c);
         assert_eq!(r.outstanding(), 2, "another scope's stream 4 is not ours");
+    }
+
+    /// **R4-3.** A completed group's rebuilt head owns nothing.
+    ///
+    /// The sender rebuilds unacknowledged pieces with a fresh AEAD
+    /// counter whenever its acknowledgement is lost, and it cannot
+    /// know the group already completed — the acknowledgement that
+    /// would have told it is the one that went missing. So the head
+    /// of a delivered group arrives again. Before the completed-group
+    /// memory it opened a fresh partial that nothing could finish,
+    /// and the deadline then reported an abandoned RELIABLE group
+    /// for a payload this leaf had already handed to its consumer:
+    /// a terminal manufactured out of a successful delivery.
+    #[test]
+    fn a_rebuilt_head_of_a_delivered_group_reports_no_abandonment() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                t0,
+                &c
+            )
+            .is_none());
+        let done = r
+            .accept_piece(
+                1,
+                provenance(1),
+                7,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                t0,
+                &c,
+            )
+            .expect("the group completes");
+        assert_eq!(&done.data[..], b"headtail");
+        assert_eq!(r.outstanding(), 0);
+
+        // The rebuilt head, on its own sequence, after delivery.
+        assert!(
+            r.accept_piece(
+                1,
+                provenance(0),
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                t0,
+                &c
+            )
+            .is_none(),
+            "a piece of a delivered group assembles nothing new"
+        );
+        assert_eq!(
+            r.outstanding(),
+            0,
+            "and it must not open a partial: there is no second message here"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 1);
+
+        // The deadline, long past. Nothing is owed, because nothing
+        // was ever outstanding.
+        r.expire(
+            t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS + 1),
+            &c,
+        );
+        assert!(
+            r.take_abandoned().is_empty(),
+            "a duplicate of a completed message creates no abandonment obligation"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyExpired), 0);
+    }
+
+    /// The discrimination the memory has to make, and the reason it
+    /// records a sequence span rather than only a name.
+    ///
+    /// A fragment id is unique only within its session's counter, so
+    /// "this id completed once" cannot be the rule: a genuinely new
+    /// group that reuses the id after the counter wraps would be
+    /// swallowed whole, which is worse than the phantom terminal it
+    /// was meant to prevent. The sequences decide — the peer's
+    /// sequence space never rewinds within a receive lifetime.
+    #[test]
+    fn a_new_group_reusing_a_completed_fragment_id_still_opens() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        r.accept_piece(
+            1,
+            provenance(0),
+            7,
+            0,
+            FRAG_FRAGMENTED,
+            Bytes::from_static(b"head"),
+            t0,
+            &c,
+        );
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(1),
+                7,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                t0,
+                &c
+            )
+            .is_some());
+
+        // Same fragment id, sequences beyond the delivered span.
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(2),
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"next"),
+                t0,
+                &c
+            )
+            .is_none());
+        let second = r
+            .accept_piece(
+                1,
+                provenance(3),
+                7,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"body"),
+                t0,
+                &c,
+            )
+            .expect("a new group on the same id must still assemble");
+        assert_eq!(&second.data[..], b"nextbody");
+        assert_eq!(second.span, 2);
+        assert_eq!(
+            c.drops(DropReason::ReassemblyDuplicate),
+            0,
+            "nothing here is a duplicate"
+        );
+    }
+
+    /// The memory is bounded and it ages out on the reassembly
+    /// deadline, which is the window a retransmission can arrive in.
+    /// Past it the peer has given up on the sequence itself, so a
+    /// piece claiming those sequences is a new group's.
+    #[test]
+    fn the_completed_group_memory_expires_with_the_deadline() {
+        let c = LeafCounters::new();
+        let mut r = Reassembler::new();
+        let t0 = now();
+        r.accept_piece(
+            1,
+            provenance(0),
+            7,
+            0,
+            FRAG_FRAGMENTED,
+            Bytes::from_static(b"head"),
+            t0,
+            &c,
+        );
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(1),
+                7,
+                4,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"tail"),
+                t0,
+                &c
+            )
+            .is_some());
+        let late = t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS + 1);
+        assert!(r
+            .accept_piece(
+                1,
+                provenance(0),
+                7,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"head"),
+                late,
+                &c
+            )
+            .is_none());
+        assert_eq!(
+            r.outstanding(),
+            1,
+            "past the retransmission window the name is forgotten and a group opens"
+        );
+        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 0);
     }
 }
