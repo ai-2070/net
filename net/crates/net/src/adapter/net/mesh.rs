@@ -11361,6 +11361,16 @@ pub struct MeshNode {
     /// Noise exchange and the commit.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_install_pause: Arc<super::rtc::RtcInstallPause>,
+    /// S6-06 witness seam: park a dialog completion between "the
+    /// channel opened" and "claim the attempt", so a witness can
+    /// land a competing terminal owner in exactly that window.
+    ///
+    /// A second instance of the install pause rather than a shared
+    /// one: the two windows are different, and a witness that armed
+    /// one and parked at the other would be describing the wrong
+    /// race.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_claim_pause: Arc<super::rtc::RtcInstallPause>,
     /// §10 part 2: packets this node forwarded per `(src, dst)`
     /// pair, **excluding signalling**. A globally flat forward
     /// counter is not the direct-path witness — signalling,
@@ -13861,6 +13871,8 @@ impl MeshNode {
             rtc_pre_insert_hook: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_claim_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -23414,6 +23426,22 @@ impl MeshNode {
         self.rtc_install_pause.wait_if_armed().await;
     }
 
+    /// Test hook: park a dialog completion between "the channel
+    /// opened" and "claim the attempt" (S6-06). Unarmed in
+    /// production — one relaxed load, and nothing at all in a build
+    /// without fixtures.
+    #[cfg(feature = "webrtc")]
+    async fn rtc_claim_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.rtc_claim_pause.wait_if_armed().await;
+    }
+
+    /// The dialog-claim pause the S6-06 contention witnesses drive.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_dialog_claim_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_claim_pause
+    }
+
     /// Hold (or release) the RTC close-notification consumer, so a
     /// witness can fill the bounded channel (H3).
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -26484,20 +26512,28 @@ impl MeshNode {
     /// announced separately, is what lets a leaf's default
     /// `iceServers` be useful instead of fatal.
     ///
-    /// **Resolved, not merely configured.** `stun_public_addr` when
-    /// the operator set one; otherwise the address the second socket
-    /// actually bound, so a `:0` bind announces a real endpoint. The
-    /// same reason the bootstrap URL falls back to the driver's
+    /// **Resolved, and bound before it is resolved.** The second
+    /// socket's actual bound address when the operator set no
+    /// override, so a `:0` bind announces a real endpoint — and
+    /// `None` whenever no second socket exists, *whatever*
+    /// `stun_public_addr` says. The override means "announce this
+    /// instead of what the socket bound", so with no socket there
+    /// is nothing to announce instead of: returning it anyway put
+    /// an endpoint this anchor never served into a signed
+    /// announcement, and a browser aiming `iceServers` at a dead
+    /// port has no symptom but a slow ICE failure. The
+    /// configuration is refused at startup by
+    /// `RtcConfig::validate`; this is the same rule at the emission
+    /// point, so no path reaches the announcement past it.
+    ///
+    /// The same reason the bootstrap URL falls back to the driver's
     /// `local_addr` below: an announcement names what exists, and
     /// never an adjacent-port guess.
     #[cfg(feature = "webrtc")]
     pub fn rtc_public_stun_addr(&self) -> Option<SocketAddr> {
         let rtc = self.config.rtc.as_ref()?;
-        if let Some(addr) = rtc.stun_public_addr {
-            return Some(addr);
-        }
-        rtc.stun_addr?;
-        self.rtc_driver.as_ref().and_then(|d| d.stun_local_addr())
+        let bound = self.rtc_driver.as_ref().and_then(|d| d.stun_local_addr());
+        rtc.advertised_stun_addr(bound)
     }
 
     /// `rtc_stats()` without requiring a driver to exist.
@@ -26722,13 +26758,32 @@ impl MeshNode {
             let Some(node) = weak.as_ref().and_then(|w| w.upgrade()) else {
                 return;
             };
-            // 2. **Take the dialog out of the EXPIRY TABLE before
-            //    the install commits** (R4-A): expiry used to be
-            //    able to close a just-installed direct endpoint
-            //    after the routed incumbent had already been
-            //    displaced, because the table stayed expirable
-            //    across the install and the post-install
-            //    announcement await.
+            // The witness seam for the contention below: armed, a
+            // test lands a competing terminal owner in exactly this
+            // window. Unarmed — every production path — one relaxed
+            // load.
+            node.rtc_claim_pause_point().await;
+            // 2. **Claim the attempt, exactly, before anything
+            //    commits** (R4-A, S6-06). Taking the dialog out of
+            //    the expiry table is what stops expiry closing a
+            //    just-installed direct endpoint after the routed
+            //    incumbent has been displaced — the table used to
+            //    stay expirable across the install and the
+            //    post-install announcement await.
+            //
+            //    The `remove` RESULT is the claim, and it is
+            //    load-bearing. Every terminal owner — the expiry
+            //    sweep, our Reject, the peer's Reject, the
+            //    bootstrap dialog's abandonment — takes the same
+            //    row and charges one terminal term. Discarding the
+            //    result meant a completion whose channel opened
+            //    just as another owner removed the row went on to
+            //    install and charge a SECOND term for one attempt,
+            //    so `direct + relayed + failed` could exceed
+            //    `attempted`. A row that is gone, or that now
+            //    belongs to a successor endpoint, is not this
+            //    attempt's to install under and not its to charge:
+            //    the other owner's outcome stands, alone.
             //
             //    Only the table. The attempt's RESERVATION — and
             //    with it the row that authorizes the attempt's own
@@ -26744,9 +26799,31 @@ impl MeshNode {
             //    live attempt and answered 404 — which a page can
             //    only read as a bare `1006`. The attempt is retired
             //    below, when it is genuinely terminal.
-            {
+            let claimed = {
                 let mut table = dialogs.lock().await;
-                table.remove(peer_node_id, dialog);
+                table.remove(peer_node_id, dialog)
+            };
+            match claimed {
+                Some(entry) if entry.peer == peer => {}
+                other => {
+                    // Lost the claim. `other` is `None` (another
+                    // terminal owner took the row) or a successor's
+                    // endpoint under the same dialog id — and a
+                    // successor's row must go back, because it is
+                    // still live and its own owner will claim it.
+                    if let Some(entry) = other {
+                        let mut table = dialogs.lock().await;
+                        table.insert(peer_node_id, dialog, entry);
+                    }
+                    tracing::debug!(
+                        peer = format!("{peer_node_id:#x}"),
+                        "rtc upgrade: the attempt was already terminal elsewhere; \
+                         not installing and not charging a second terminal term"
+                    );
+                    // This endpoint is ours and nothing will use it.
+                    let _ = driver.close(peer).await;
+                    return;
+                }
             }
             // 3. Noise over it, in this dialog's role. The offerer
             //    initiates, so both sides do not send msg1.

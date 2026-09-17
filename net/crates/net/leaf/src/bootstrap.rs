@@ -402,12 +402,13 @@ pub fn default_stun_url(announced: Option<&str>) -> Option<String> {
 /// **before any ICE work** — the whole value of the check is that it
 /// replaces an ICE deadline with a sentence.
 ///
-/// **Detection is endpoint equality only**, after default-port
+/// **Detection is endpoint equality**, after default-port
 /// normalisation (`stun:h` and `stun:h:3478` are the same endpoint,
-/// `stun:[::1]:9` and `[::1]:9` are the same endpoint). A URL naming
-/// a DNS alias of the peer is **not** detected: the leaf resolves no
-/// names, and the announced STUN endpoint is what makes detection
-/// unnecessary for the configuration Net supplies.
+/// `stun:[::1]:9` and `[::1]:9` are the same endpoint) and, for a
+/// numeric address, after **parsing** it: see [`EndpointKey`]. A URL
+/// naming a DNS alias of the peer is **not** detected: the leaf
+/// resolves no names, and the announced STUN endpoint is what makes
+/// detection unnecessary for the configuration Net supplies.
 pub fn check_ice_servers_against_peer<'a>(
     urls: impl IntoIterator<Item = &'a str>,
     peer_rtc_addr: Option<&str>,
@@ -417,14 +418,14 @@ pub fn check_ice_servers_against_peer<'a>(
     let Some(peer_rtc_addr) = peer_rtc_addr else {
         return Ok(());
     };
-    let peer = normalized_endpoint(peer_rtc_addr);
+    let peer = EndpointKey::of(peer_rtc_addr);
     for url in urls {
         let Some(endpoint) = stun_endpoint(url) else {
             // A `turn:`/`turns:` relay is a different role and a
             // different contract; this check is about STUN.
             continue;
         };
-        if normalized_endpoint(endpoint) == peer {
+        if EndpointKey::of(endpoint) == peer {
             return Err(LeafError::IceServerConflictsWithPeer {
                 entry: url.to_string(),
                 peer_rtc_addr: peer_rtc_addr.to_string(),
@@ -474,6 +475,47 @@ fn normalized_endpoint(raw: &str) -> String {
     match raw.split_once(':') {
         Some((_, port)) if !port.is_empty() => raw.to_string(),
         _ => format!("{raw}:{DEFAULT_STUN_PORT}"),
+    }
+}
+
+/// One endpoint, in the form two spellings of it compare equal in.
+///
+/// # Why a parse and not a string
+///
+/// [`normalized_endpoint`] makes `stun:h` and `stun:h:3478` and
+/// `[::1]:9` and `::1` agree, and it has to: they are textual
+/// differences. It cannot make `[2001:db8::1]:3478` agree with
+/// `[2001:0db8:0000:0000:0000:0000:0000:0001]:3478`, because those
+/// differ in the address itself and RFC 4291 gives one address many
+/// legal spellings — compression, leading-zero omission, and
+/// `::ffff:192.0.2.1` for an IPv4-mapped tuple. No amount of text
+/// rewriting enumerates them, and every one that escapes is an
+/// `iceServers` entry aimed at the peer of the connection: the
+/// deadline this check exists to replace with a sentence.
+///
+/// So a numeric endpoint is compared as the `SocketAddr` it
+/// parses to, and a name is compared as normalised text. A name and
+/// an address never compare equal, which is right: the leaf
+/// resolves nothing, so it does not know whether they name one
+/// endpoint, and inventing a match is the one disposition that
+/// could refuse a working configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndpointKey {
+    /// A numeric `ip:port`, parsed — so every legal spelling of one
+    /// address is one key.
+    Addr(std::net::SocketAddr),
+    /// A DNS name (or something unparseable), normalised textually.
+    Name(String),
+}
+
+impl EndpointKey {
+    /// The key `raw` compares under.
+    fn of(raw: &str) -> Self {
+        let normalized = normalized_endpoint(raw);
+        match normalized.parse::<std::net::SocketAddr>() {
+            Ok(addr) => Self::Addr(addr),
+            Err(_) => Self::Name(normalized),
+        }
     }
 }
 
@@ -896,5 +938,64 @@ mod tests {
         // rather than a promise.
         check_ice_servers_against_peer(["stun:alias.example:4433"], peer)
             .expect("an unresolved alias is outside what equality can see");
+    }
+
+    /// **S6-07.5.** Two legal spellings of ONE IPv6 endpoint are one
+    /// endpoint.
+    ///
+    /// RFC 4291 lets a single address be written compressed, fully
+    /// expanded, with or without leading zeros, and — for an
+    /// IPv4-mapped tuple — in dotted form. A textual comparison
+    /// sees those as different servers, so an `iceServers` entry
+    /// aimed squarely at the peer of this connection passed the
+    /// check and bought an ICE deadline with no diagnostic. The key
+    /// is the parsed address.
+    ///
+    /// Controls, all three, because the fix must not widen the
+    /// check: the equal-string case still refuses, a genuinely
+    /// distinct address is still accepted, and a NAME is never
+    /// equal to an address (the leaf resolves nothing, so claiming
+    /// otherwise would refuse a working configuration).
+    #[test]
+    fn equivalent_ipv6_spellings_of_the_peers_endpoint_are_one_endpoint() {
+        // Compressed URL versus fully expanded peer, and back.
+        let expanded = Some("[2001:0db8:0000:0000:0000:0000:0000:0001]:4433");
+        assert!(
+            check_ice_servers_against_peer(["stun:[2001:db8::1]:4433"], expanded).is_err(),
+            "the compressed spelling of the peer's own endpoint must be refused"
+        );
+        let compressed = Some("[2001:db8::1]:4433");
+        assert!(
+            check_ice_servers_against_peer(
+                ["stun:[2001:0db8:0000:0000:0000:0000:0000:0001]:4433"],
+                compressed
+            )
+            .is_err(),
+            "and so must the expanded spelling"
+        );
+        // Leading zeros inside one group, and uppercase hex.
+        assert!(
+            check_ice_servers_against_peer(["stun:[2001:0DB8::0001]:4433"], compressed).is_err()
+        );
+
+        // Control 1 — the equal-string case still refuses.
+        assert!(
+            check_ice_servers_against_peer(["stun:[2001:db8::1]:4433"], compressed).is_err(),
+            "the case that already worked must keep working"
+        );
+
+        // Control 2 — a genuinely distinct address is accepted. The
+        // separately announced STUN endpoint of the same anchor is
+        // exactly this shape: same host, different port.
+        check_ice_servers_against_peer(["stun:[2001:db8::1]:3479"], compressed)
+            .expect("a different port is a different endpoint");
+        check_ice_servers_against_peer(["stun:[2001:db8::2]:4433"], compressed)
+            .expect("a different address is a different endpoint");
+
+        // Control 3 — a name is not an address. Nothing here
+        // resolves, so the two cannot be compared and must not be
+        // reported equal.
+        check_ice_servers_against_peer(["stun:anchor.example:4433"], compressed)
+            .expect("an unresolved name is outside what equality can see");
     }
 }

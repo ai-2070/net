@@ -67,6 +67,21 @@ impl TriggerSource {
     }
 }
 
+/// The role this leaf installed a peer's CURRENT direct session in.
+///
+/// Not "has ever been": a pair's repair belongs to one endpoint,
+/// and the only endpoint that can be identified without a second
+/// negotiation is the one that offered the session both sides are
+/// using now. `A→B` then `B→A` moves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledRole {
+    /// This leaf sent the offer, so it owns the pair's repair.
+    Offerer,
+    /// The peer sent the offer, so the peer owns it and this leaf
+    /// re-offers nothing.
+    Answerer,
+}
+
 /// What the owner does about one trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDecision {
@@ -93,8 +108,23 @@ pub enum RetryDecision {
     /// so that a late observation cannot start a second one.
     Coalesced,
     /// The peer has nothing to repair: no direct session was lost, so
-    /// there is nothing for a re-attempt to restore.
+    /// there is nothing for a re-attempt to restore — or this leaf is
+    /// not the endpoint that currently owns the pair's repair (see
+    /// [`RetryPolicy::note_installed_role`]).
     NotEligible,
+    /// The page has not opted in, so this owner does nothing and the
+    /// observation is **dropped**.
+    ///
+    /// The stated fate of a pre-arm observation, and it is a decision
+    /// rather than an omission: it is discarded here, no episode is
+    /// opened for it, and [`RetryPolicy::arm`] does not resurrect it.
+    /// Retaining it would mean the public report says retry is
+    /// unarmed while the owner is holding work it intends to act on
+    /// — the same defect in a different costume. A network change
+    /// that happened before the page asked for repairs is a network
+    /// change the page did not ask to have repaired; the next one
+    /// after arming is acted on in full.
+    NotArmed,
 }
 
 /// The owner's ledger, as `retryReport()` renders it.
@@ -112,6 +142,14 @@ pub struct RetryLedger {
     pub coalesced: u64,
     /// Triggers for a peer with nothing to repair.
     pub not_eligible: u64,
+    /// Triggers **dropped** because the page had not opted in.
+    ///
+    /// Counted, not hidden: the observation is real, and "the
+    /// watcher saw an ICE loss and this owner did nothing with it"
+    /// is the one fact that tells an unarmed leaf apart from an
+    /// engine that never reported a loss at all. `started` stays at
+    /// zero for every one of them.
+    pub discarded_unarmed: u64,
 }
 
 impl RetryLedger {
@@ -137,12 +175,41 @@ impl RetryLedger {
 /// to act on a genuinely new network change that arrived after this
 /// one had already failed. "Until this attempt is over" is the
 /// honest span, and it is one number.
+///
+/// # What arming is
+///
+/// The page's `enableRetry()` is the whole authority for this owner
+/// acting at all. It is checked HERE rather than at the observation
+/// sites because the sites are plural — a window listener and an
+/// ICE-state callback, and in a browser neither can be prevented
+/// from firing — while the decision is singular. An owner that
+/// trusted its sources to be silent until arming would publish
+/// `armed:false` and still schedule an offer, which is exactly the
+/// gap this gate closes.
+///
+/// # Who owns a pair's repair
+///
+/// The endpoint whose CURRENT installed direct session it offered,
+/// and only that one. Ownership is set by
+/// [`Self::note_installed_role`] on every direct install, in both
+/// directions, so `A→B` followed by `B→A` moves it from A to B
+/// instead of leaving both ends eligible. A historical record of
+/// "was once the offerer" cannot be resolved by per-node
+/// coalescing: two endpoints each coalescing correctly for
+/// themselves is still two re-offers for one pair.
 #[derive(Debug)]
 pub struct RetryPolicy {
     /// Peer → the deadline of the episode that currently owns it.
     episodes: HashMap<NodeId, Deadline>,
     ledger: RetryLedger,
     window_ms: u64,
+    /// Whether the page opted in. Until it does this owner starts
+    /// nothing; see [`RetryDecision::NotArmed`] for the fate of an
+    /// observation that arrives first.
+    armed: bool,
+    /// Peers whose repair this leaf currently owns, because it is
+    /// the offerer of their live installed direct session.
+    owned: std::collections::HashSet<NodeId>,
 }
 
 impl RetryPolicy {
@@ -153,23 +220,111 @@ impl RetryPolicy {
             episodes: HashMap::new(),
             ledger: RetryLedger::default(),
             window_ms,
+            armed: false,
+            owned: std::collections::HashSet::new(),
         }
+    }
+
+    /// The page opted in. Idempotent; `true` when this call is the
+    /// one that armed the owner, so a caller can install its window
+    /// listeners exactly once.
+    pub fn arm(&mut self) -> bool {
+        let first = !self.armed;
+        self.armed = true;
+        first
+    }
+
+    /// Whether the page has opted in — the value the public report
+    /// publishes, read from the owner that enforces it rather than
+    /// from a second flag that could disagree with it.
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Record the role this leaf installed `peer`'s direct session
+    /// in, which is what decides who repairs the pair.
+    ///
+    /// Called on **every** direct install, including the ones that
+    /// take this leaf out of the owning role: an answerer install
+    /// gives ownership up. That is the whole mechanism — a set that
+    /// is only ever inserted into records history, and history is
+    /// not a role.
+    ///
+    /// A caller that cannot attribute a role passes
+    /// [`InstalledRole::Answerer`]: an endpoint unable to show it is
+    /// the current offerer must not initiate repair, because the
+    /// failure mode of guessing yes is two endpoints offering.
+    pub fn note_installed_role(&mut self, peer: NodeId, role: InstalledRole) {
+        match role {
+            InstalledRole::Offerer => {
+                self.owned.insert(peer);
+            }
+            InstalledRole::Answerer => {
+                self.owned.remove(&peer);
+            }
+        }
+    }
+
+    /// Give up ownership of `peer`'s repair and close its episode.
+    ///
+    /// For a pair that is terminal for a reason other than a role
+    /// change — supersession, an explicit close, the peer going
+    /// away. An episode is a coalescing window and owns no
+    /// resource, but leaving one open would absorb the first
+    /// trigger of a genuinely new attempt against the same peer.
+    pub fn forget(&mut self, peer: NodeId) {
+        self.owned.remove(&peer);
+        self.episodes.remove(&peer);
+    }
+
+    /// [`Self::forget`] for every peer: the node is going away, so
+    /// no episode and no ownership outlives it.
+    pub fn forget_all(&mut self) {
+        self.owned.clear();
+        self.episodes.clear();
+    }
+
+    /// Whether this leaf currently owns `peer`'s repair.
+    pub fn owns(&self, peer: NodeId) -> bool {
+        self.owned.contains(&peer)
+    }
+
+    /// The peers this leaf currently owns the repair for — the fan-out
+    /// an `online` event applies to, since that event names no peer.
+    pub fn owned_peers(&self) -> Vec<NodeId> {
+        self.owned.iter().copied().collect()
+    }
+
+    /// How many pairs this leaf owns the repair for, for the report.
+    pub fn owned_count(&self) -> usize {
+        self.owned.len()
     }
 
     /// File one trigger and say what happens.
     ///
     /// `interrupted` is the caller's reading of the only thing that
-    /// makes a re-attempt meaningful: this leaf took a direct session
-    /// with `peer` as the offerer, and does not have one now. It is
-    /// the caller's because only `wasm` can see a session;
-    /// it is a parameter rather than a closure so this rule stays
-    /// assertable.
+    /// makes a re-attempt meaningful: the direct session this leaf
+    /// holds with `peer` is not usable right now. It is the
+    /// caller's because only `wasm` can see a session; it is a
+    /// parameter rather than a closure so this rule stays
+    /// assertable. **Who may act on it is not the caller's**: that
+    /// is arming plus the current installed role, and both are
+    /// enforced here.
     ///
-    /// The episode is checked **before** eligibility, so a trigger
-    /// that arrives after the re-attempt already restored the pair
-    /// reads as `Coalesced` — "this network change is accounted
-    /// for" — rather than as `NotEligible`, which would say
-    /// something quite different about it.
+    /// Order of disposition, and each step is a different fact:
+    ///
+    /// 1. **Unarmed** — the page never asked. Dropped
+    ///    ([`RetryDecision::NotArmed`]) before any episode exists,
+    ///    so nothing this owner holds can later be mistaken for
+    ///    work in flight.
+    /// 2. **Episode open** — this network change is already
+    ///    accounted for. `Coalesced`, which is what a trigger
+    ///    arriving after the re-attempt already restored the pair
+    ///    must read as rather than `NotEligible`; the two say quite
+    ///    different things.
+    /// 3. **Not ours, or nothing to repair** — `NotEligible`. An
+    ///    answerer install has given the pair up, and the endpoint
+    ///    that offered the live session is the one that re-offers.
     pub fn note(
         &mut self,
         peer: NodeId,
@@ -177,9 +332,16 @@ impl RetryPolicy {
         now: Instant,
         interrupted: bool,
     ) -> RetryDecision {
+        // The observation is counted whatever happens to it: the
+        // counters are what distinguish "the watcher saw nothing"
+        // from "the watcher saw a loss and this owner dropped it".
         match source {
             TriggerSource::Online => self.ledger.online += 1,
             TriggerSource::IceFailed => self.ledger.ice_failed += 1,
+        }
+        if !self.armed {
+            self.ledger.discarded_unarmed += 1;
+            return RetryDecision::NotArmed;
         }
         // An episode is over when its attempt's deadline has passed.
         // Pruned here rather than swept: this is the only reader, and
@@ -191,7 +353,7 @@ impl RetryPolicy {
             self.ledger.coalesced += 1;
             return RetryDecision::Coalesced;
         }
-        if !interrupted {
+        if !self.owns(peer) || !interrupted {
             self.ledger.not_eligible += 1;
             return RetryDecision::NotEligible;
         }
@@ -308,12 +470,27 @@ mod tests {
     const OTHER: NodeId = 0x00BB;
     const WINDOW_MS: u64 = 10_000;
 
+    /// A policy the page has opted into, owning the repair for
+    /// `peers` because it offered their live direct sessions.
+    ///
+    /// Both facts are now preconditions of this owner acting at
+    /// all, so the rows below that are about coalescing say so
+    /// once here instead of re-arguing it each time.
+    fn owner(window_ms: u64, peers: &[NodeId]) -> RetryPolicy {
+        let mut policy = RetryPolicy::new(window_ms);
+        policy.arm();
+        for peer in peers {
+            policy.note_installed_role(*peer, InstalledRole::Offerer);
+        }
+        policy
+    }
+
     /// **The row.** One network change reaches the leaf as two
     /// observations — the `online` event and the ICE transition — and
     /// starts exactly ONE re-attempt.
     #[test]
     fn both_triggers_for_one_network_change_start_one_re_attempt() {
-        let mut policy = RetryPolicy::new(WINDOW_MS);
+        let mut policy = owner(WINDOW_MS, &[PEER]);
         let now = clock::now();
         let first = policy.note(PEER, TriggerSource::IceFailed, now, true);
         let second = policy.note(PEER, TriggerSource::Online, now, true);
@@ -336,7 +513,7 @@ mod tests {
     /// absolute instant.
     #[test]
     fn the_episode_and_its_re_attempt_share_one_absolute_deadline() {
-        let mut policy = RetryPolicy::new(WINDOW_MS);
+        let mut policy = owner(WINDOW_MS, &[PEER]);
         let now = clock::now();
         let RetryDecision::Start(deadline) = policy.note(PEER, TriggerSource::Online, now, true)
         else {
@@ -357,7 +534,7 @@ mod tests {
     /// purpose.
     #[test]
     fn a_trigger_after_the_session_is_back_starts_nothing() {
-        let mut policy = RetryPolicy::new(WINDOW_MS);
+        let mut policy = owner(WINDOW_MS, &[PEER]);
         let now = clock::now();
         assert!(matches!(
             policy.note(PEER, TriggerSource::IceFailed, now, true),
@@ -378,7 +555,7 @@ mod tests {
     /// used.
     #[test]
     fn a_peer_with_a_live_direct_session_is_not_re_attempted() {
-        let mut policy = RetryPolicy::new(WINDOW_MS);
+        let mut policy = owner(WINDOW_MS, &[PEER]);
         let now = clock::now();
         assert_eq!(
             policy.note(PEER, TriggerSource::Online, now, false),
@@ -397,7 +574,7 @@ mod tests {
     /// bound is per peer, because the thing being repaired is a pair.
     #[test]
     fn one_online_event_re_attempts_each_interrupted_peer_once() {
-        let mut policy = RetryPolicy::new(WINDOW_MS);
+        let mut policy = owner(WINDOW_MS, &[PEER, OTHER]);
         let now = clock::now();
         assert!(matches!(
             policy.note(PEER, TriggerSource::Online, now, true),
@@ -422,7 +599,7 @@ mod tests {
         // A zero-length window: the episode is over the instant the
         // clock moves past the reading that opened it, which is what
         // "its attempt's deadline has passed" means at the limit.
-        let mut policy = RetryPolicy::new(0);
+        let mut policy = owner(0, &[PEER]);
         assert!(matches!(
             policy.note(PEER, TriggerSource::Online, clock::now(), true),
             RetryDecision::Start(_)
@@ -433,6 +610,164 @@ mod tests {
         ));
         assert_eq!(policy.ledger().started, 2);
         assert_eq!(policy.ledger().coalesced, 0);
+    }
+
+    /// **S6-05, the opt-in.** An ICE failure observed before the
+    /// page called `enableRetry()` starts nothing, and its fate is
+    /// stated: it is DROPPED. Arming afterwards replays nothing —
+    /// and then the next observation is acted on in full.
+    ///
+    /// The defect this refuses: the watcher is installed
+    /// unconditionally, so a leaf whose public report says
+    /// `armed:false` could still schedule an offer.
+    #[test]
+    fn an_unarmed_ice_failure_is_dropped_and_arming_replays_nothing() {
+        let mut policy = RetryPolicy::new(WINDOW_MS);
+        // Ownership is not the missing piece here: this leaf really
+        // does own the pair, and the trigger is a real loss.
+        policy.note_installed_role(PEER, InstalledRole::Offerer);
+        let now = clock::now();
+        assert!(!policy.is_armed(), "the page has not opted in");
+        assert_eq!(
+            policy.note(PEER, TriggerSource::IceFailed, now, true),
+            RetryDecision::NotArmed
+        );
+        let ledger = policy.ledger();
+        assert_eq!(
+            (ledger.started, ledger.discarded_unarmed, ledger.ice_failed),
+            (0, 1, 1),
+            "the observation is counted and dropped; nothing is started"
+        );
+        assert_eq!(
+            policy.open_episodes(now),
+            0,
+            "a dropped observation opens no episode, so the owner holds no work \
+             its own report would deny"
+        );
+        assert_eq!(policy.episode_remaining_ms(PEER, now), 0);
+
+        assert!(policy.arm(), "the call that arms says so, once");
+        assert!(!policy.arm(), "and arming twice is not a second arming");
+        assert_eq!(
+            policy.ledger().started,
+            0,
+            "arming is not a replay: the pre-arm observation stays dropped"
+        );
+
+        let after = policy.note(PEER, TriggerSource::IceFailed, clock::now(), true);
+        assert!(
+            matches!(after, RetryDecision::Start(_)),
+            "the first observation AFTER arming is acted on in full: {after:?}"
+        );
+        assert_eq!(policy.ledger().started, 1);
+    }
+
+    /// **S6-05, ownership.** Armed and genuinely interrupted is not
+    /// enough: a leaf that answered the pair's offer re-offers
+    /// nothing, because the endpoint that offered the live session
+    /// is the one that repairs it.
+    #[test]
+    fn an_armed_trigger_for_a_pair_this_leaf_answered_starts_nothing() {
+        let mut policy = RetryPolicy::new(WINDOW_MS);
+        policy.arm();
+        policy.note_installed_role(PEER, InstalledRole::Answerer);
+        let now = clock::now();
+        assert!(!policy.owns(PEER));
+        assert_eq!(
+            policy.note(PEER, TriggerSource::IceFailed, now, true),
+            RetryDecision::NotEligible
+        );
+        assert_eq!(policy.ledger().started, 0);
+        assert!(
+            policy.owned_peers().is_empty(),
+            "and the `online` fan-out, which names no peer, reaches nothing"
+        );
+    }
+
+    /// **S6-05, role reversal — the branch with teeth.** `A→B`
+    /// direct followed by `B→A` direct must leave exactly ONE
+    /// endpoint eligible to initiate repair.
+    ///
+    /// Asserted across BOTH endpoints' owners, because per-node
+    /// coalescing cannot resolve two owners of one pair: each would
+    /// coalesce correctly for itself and the pair would still get
+    /// two re-offers. A historical "was once the offerer" set
+    /// records A for ever and fails this row at `a.ledger().started`.
+    #[test]
+    fn role_reversal_moves_repair_ownership_and_leaves_one_owner() {
+        const A: NodeId = 0x00AA;
+        const B: NodeId = 0x00BB;
+
+        // Two leaves, two owners. A peer id names the OTHER end, so
+        // `a` speaks about `B` and `b` speaks about `A`.
+        let mut a = RetryPolicy::new(WINDOW_MS);
+        let mut b = RetryPolicy::new(WINDOW_MS);
+        a.arm();
+        b.arm();
+
+        // A→B: A offered, B answered.
+        a.note_installed_role(B, InstalledRole::Offerer);
+        b.note_installed_role(A, InstalledRole::Answerer);
+        assert!(a.owns(B), "the offerer owns the repair");
+        assert!(!b.owns(A), "the answerer owns nothing");
+
+        // B→A: the pair takes a direct session the other way round.
+        // Both ends install again, each in its new role.
+        b.note_installed_role(A, InstalledRole::Offerer);
+        a.note_installed_role(B, InstalledRole::Answerer);
+
+        let now = clock::now();
+        let at_a = a.note(B, TriggerSource::IceFailed, now, true);
+        let at_b = b.note(A, TriggerSource::IceFailed, now, true);
+
+        assert_eq!(
+            at_a,
+            RetryDecision::NotEligible,
+            "A offered a session that is no longer the installed one; it must not \
+             initiate repair for a pair B now owns"
+        );
+        assert!(
+            matches!(at_b, RetryDecision::Start(_)),
+            "B offered the live session, so B repairs it: {at_b:?}"
+        );
+        assert_eq!(
+            a.ledger().started + b.ledger().started,
+            1,
+            "ONE re-offer for one pair, counted over both endpoints"
+        );
+        assert_eq!(
+            a.owned_count() + b.owned_count(),
+            1,
+            "and exactly one endpoint is eligible at all"
+        );
+    }
+
+    /// Terminal retirement of a pair: ownership and the coalescing
+    /// window both go, so a genuinely new attempt's first trigger
+    /// is not absorbed by the dead episode.
+    #[test]
+    fn forgetting_a_pair_drops_its_ownership_and_its_episode() {
+        let mut policy = owner(WINDOW_MS, &[PEER, OTHER]);
+        let now = clock::now();
+        assert!(matches!(
+            policy.note(PEER, TriggerSource::IceFailed, now, true),
+            RetryDecision::Start(_)
+        ));
+        assert_eq!(policy.open_episodes(now), 1);
+
+        policy.forget(PEER);
+        assert!(!policy.owns(PEER));
+        assert_eq!(policy.open_episodes(now), 0);
+        assert_eq!(
+            policy.note(PEER, TriggerSource::IceFailed, now, true),
+            RetryDecision::NotEligible,
+            "a forgotten pair is not repaired, and is not coalesced either"
+        );
+
+        assert!(policy.owns(OTHER), "its sibling is untouched");
+        policy.forget_all();
+        assert_eq!(policy.owned_count(), 0);
+        assert_eq!(policy.open_episodes(now), 0);
     }
 
     /// Only `disconnected` → `failed` is a trigger.

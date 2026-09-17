@@ -830,10 +830,19 @@ struct ServeReport {
     node: String,
     listening_on: String,
     bootstrap_url: String,
+    /// The endpoint this anchor announces as `rtc_addr`, read off
+    /// the running node rather than echoed from the flag.
     rtc_addr: Option<String>,
-    /// The announced STUN endpoint (Stage 6) — the PUBLIC value the
-    /// operator configured, echoed the way `rtc_addr` echoes
-    /// `--rtc-public-addr`.
+    /// The announced STUN endpoint (Stage 6), **as resolved** — the
+    /// operator's override when a second socket was bound, the
+    /// address that socket actually bound when it was not, and
+    /// absent when there is no second socket at all.
+    ///
+    /// Not an echo of `--rtc-stun-public-addr`. An override without
+    /// a bind is refused at startup, and if it were merely echoed
+    /// here the report would describe an endpoint nothing answers
+    /// on; a `:0` bind, conversely, has no value to echo and a real
+    /// one to report.
     ///
     /// **Deliberately asymmetric with its sibling**: this key is
     /// absent when no STUN endpoint was configured, while
@@ -1004,8 +1013,16 @@ async fn run_serve(
             node: format!("{:#x}", mesh.node().node_id()),
             listening_on: handle.local_addr().to_string(),
             bootstrap_url: args.url.clone(),
-            rtc_addr: args.rtc_public_addr.clone(),
-            rtc_stun_addr: args.rtc_stun_public_addr.clone(),
+            // **The resolved endpoints, read off the node.** These
+            // used to echo the two flags back, which made the
+            // report agree with the operator's intent rather than
+            // with what the anchor serves: `--rtc-stun-public-addr`
+            // without `--rtc-stun-bind` printed an endpoint no
+            // socket answered on. The node's accessors are the
+            // same ones the signed announcement is built from, so
+            // the report and the announcement cannot disagree.
+            rtc_addr: mesh.node().rtc_public_addr().map(|a| a.to_string()),
+            rtc_stun_addr: mesh.node().rtc_public_stun_addr().map(|a| a.to_string()),
             trust_domain: sdk_psk.trust_domain().to_string(),
             noise_pubkey: hex_string(mesh.node().public_key()),
         },

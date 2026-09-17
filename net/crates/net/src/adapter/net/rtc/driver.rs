@@ -64,6 +64,17 @@ const RECV_BUF: usize = 2048;
 /// most one interval away.
 const STUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Longest a joining shutdown waits for a task to exit on its own
+/// before aborting it — and, for a caller that does not own the
+/// join, longest it parks before re-checking whether the handle
+/// came back to it.
+///
+/// The same number for both because it is the same fact: how long
+/// this driver is prepared to wait for a socket to be released. It
+/// is not a deadline on the release, which is recorded and
+/// permanent; it bounds how long a caller blocks before escalating.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// **Bounded service policy** (R6): the most `Channel::write`s one
 /// peer may take in one outer turn of the driver loop.
 ///
@@ -514,17 +525,12 @@ pub struct RtcDriverHandle {
     stats: Arc<RtcStats>,
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
-    /// The driver task, so shutdown can **join** it. Without this the
-    /// task (and its bound UDP socket) outlived the node that created
-    /// it for as long as the runtime ran — a successor could not
-    /// rebind an explicit RTC port, and a shut-down node with
-    /// `serve_stun` kept answering (R3-B).
-    task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Teardown **completion**, published by the task's own guard
-    /// (H1). `task` is ownership of the join, not completion of it:
-    /// a second caller that found `None` used to return while the
-    /// driver was still running. Every caller now waits on this.
-    done: tokio::sync::watch::Sender<bool>,
+    /// The driver task and its **release**, so shutdown can join it.
+    /// Without this the task (and its bound UDP socket) outlived the
+    /// node that created it for as long as the runtime ran — a
+    /// successor could not rebind an explicit RTC port, and a
+    /// shut-down node with `serve_stun` kept answering (R3-B).
+    release: TaskRelease,
     /// The STUN-only endpoint, when `RtcConfig::stun_addr`
     /// configured one: the address to announce and the task
     /// answering on it.
@@ -688,11 +694,9 @@ impl RtcDriverHandle {
     /// retained handle cannot submit into a dead driver.
     pub fn shutdown_detached(&self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(handle) = self.task.lock().take() {
-            handle.abort();
-        }
+        self.release.abort();
         if let Some(stun) = &self.stun {
-            stun.abort();
+            stun.release.abort();
         }
     }
 
@@ -708,68 +712,146 @@ impl RtcDriverHandle {
     /// detaching the task.
     pub async fn shutdown_and_join(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.join_driver().await;
+        self.release.join().await;
         // The STUN-only socket is a second binding under the same
         // R3-B obligation: a shut-down anchor must not keep
         // answering, and a successor must be able to rebind an
         // explicit STUN port.
         if let Some(stun) = &self.stun {
-            stun.join().await;
+            stun.release.join().await;
+        }
+    }
+}
+
+/// A spawned task whose **release is a recorded fact**, not the
+/// return of whichever caller happened to own its join handle.
+///
+/// Two tasks hold a bound UDP socket — the driver loop and the
+/// STUN-only loop — and both are under the same R3-B obligation: by
+/// the time a joining shutdown returns, the port must be free. The
+/// mechanism is one because the obligation is one; the two owners
+/// stay separately observable through [`RtcDriverHandle`] and
+/// [`StunEndpoint`].
+///
+/// # Why completion is published, and published DURABLY
+///
+/// Ownership of the join is not completion of it: a second caller
+/// that finds the handle taken must wait for the **task**, not for
+/// the first caller's return. So the task's own teardown guard
+/// records release, and every caller reads that record.
+///
+/// It is recorded with `send_replace`, which stores the value
+/// whether or not anyone is subscribed. `send` does not: it returns
+/// `Err` and **leaves the value untouched** when there are no live
+/// receivers, and this driver retains none — the spawn-time receiver
+/// is dropped immediately. A completion published while nobody was
+/// listening was therefore lost, and a subscription taken *after*
+/// the socket and the task were gone read `false` and waited for a
+/// change that could never come again.
+#[derive(Debug, Clone)]
+struct TaskRelease {
+    task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    done: tokio::sync::watch::Sender<bool>,
+    /// What the task is, for the escalation log line.
+    what: &'static str,
+}
+
+impl TaskRelease {
+    /// Take ownership of a spawned task and the release channel its
+    /// own guard publishes on.
+    fn new(
+        task: tokio::task::JoinHandle<()>,
+        done: tokio::sync::watch::Sender<bool>,
+        what: &'static str,
+    ) -> Self {
+        Self {
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
+            done,
+            what,
         }
     }
 
-    /// The driver-task half of [`Self::shutdown_and_join`].
-    async fn join_driver(&self) {
-        let handle = self.task.lock().take();
-        let Some(handle) = handle else {
-            // Someone else owns the join. Wait for the task's own
-            // completion signal, not for that caller's return.
-            self.await_teardown().await;
-            return;
-        };
-        // Cancel-safety: if this future is dropped mid-await the
-        // handle goes back where it came from, so a later
-        // `shutdown_detached` can still abort the task.
-        let mut slot = JoinSlot {
-            home: Arc::clone(&self.task),
-            handle: Some(handle),
-        };
-        // `slot.handle` is `Some` here by construction — it is set
-        // immediately above and taken only after this block.
-        if let Some(handle) = slot.handle.as_mut() {
-            if tokio::time::timeout(Duration::from_secs(2), &mut *handle)
-                .await
-                .is_err()
-            {
-                tracing::debug!("rtc driver did not exit in time; aborting");
-                handle.abort();
-                // The join the abort is not: without this the
-                // method returned while cancellation — and the
-                // socket's release — was still pending.
-                let _ = handle.await;
-            }
+    /// Signal-free abort, for a destructor.
+    ///
+    /// **The handle is left where it is.** Aborting through a
+    /// borrow rather than taking it keeps a later [`Self::join`]
+    /// able to own the join and record release — which matters most
+    /// for a task aborted *before its first poll*, because such a
+    /// task never runs its guard and so never publishes anything
+    /// itself. Taking the handle here made that release
+    /// unobservable for ever.
+    fn abort(&self) {
+        if let Some(task) = self.task.lock().as_ref() {
+            task.abort();
         }
-        // Joined: the task is gone, so drop the handle rather than
-        // returning it.
-        let _ = slot.handle.take();
-        // The guard publishes completion from inside the task; on a
-        // runtime that never polls the aborted task again this is
-        // the backstop, and it is idempotent.
-        let _ = self.done.send(true);
     }
 
-    /// Park until the driver task's teardown guard has run.
-    async fn await_teardown(&self) {
-        let mut rx = self.done.subscribe();
-        if *rx.borrow() {
-            return;
-        }
-        // `changed()` errors only if every sender is gone, which
-        // cannot happen while this handle holds one.
-        while rx.changed().await.is_ok() {
-            if *rx.borrow() {
+    /// Wait until the task is gone and its socket released.
+    ///
+    /// Bounded: a task wedged in a syscall is aborted rather than
+    /// hanging the caller's shutdown — and then awaited, because
+    /// `abort()` requests cancellation, it does not perform it
+    /// (H1). Concurrent callers all reach the same recorded
+    /// release, and a caller cancelled mid-join returns the handle
+    /// rather than detaching the task.
+    async fn join(&self) {
+        loop {
+            // The recorded fact, first: repeated and late joins are
+            // the ordinary case once a node has shut down, and
+            // there is nothing left to own by then.
+            if *self.done.borrow() {
                 return;
             }
+            let taken = self.task.lock().take();
+            let Some(handle) = taken else {
+                // Another caller owns the join. Wait for the task's
+                // own release rather than for that caller's return
+                // — and re-check, because a joiner cancelled
+                // mid-await puts the handle back (`JoinSlot`) and
+                // would otherwise leave nobody to escalate.
+                let mut rx = self.done.subscribe();
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if tokio::time::timeout(TASK_JOIN_TIMEOUT, rx.changed())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                continue;
+            };
+            // Cancel-safety: if this future is dropped mid-await the
+            // handle goes back where it came from, so a later
+            // `abort` can still cancel the task and a later `join`
+            // can still own it.
+            let mut slot = JoinSlot {
+                home: Arc::clone(&self.task),
+                handle: Some(handle),
+            };
+            // `slot.handle` is `Some` here by construction — it is
+            // set immediately above and taken only after this block.
+            if let Some(handle) = slot.handle.as_mut() {
+                if tokio::time::timeout(TASK_JOIN_TIMEOUT, &mut *handle)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(task = self.what, "rtc task did not exit in time; aborting");
+                    handle.abort();
+                    // The join the abort is not: without this the
+                    // method returned while cancellation — and the
+                    // socket's release — was still pending.
+                    let _ = handle.await;
+                }
+            }
+            // Joined: the task is gone, so drop the handle rather
+            // than returning it, and record the release. The guard
+            // records it too; a task aborted before its first poll
+            // never ran one, which is why this is not a mere
+            // backstop. Idempotent either way.
+            let _ = slot.handle.take();
+            self.done.send_replace(true);
+            return;
         }
     }
 }
@@ -805,54 +887,11 @@ impl Drop for JoinSlot {
 struct StunEndpoint {
     /// Post-bind, so a `:0` configuration yields a real port.
     local_addr: SocketAddr,
-    task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Release **completion**, published by the task's own guard —
-    /// the same reason `RtcDriverHandle::done` exists: ownership of
-    /// the join is not completion of it, so a caller that finds the
-    /// handle taken waits on this instead of returning while the
-    /// port is still bound.
-    done: tokio::sync::watch::Sender<bool>,
-}
-
-impl StunEndpoint {
-    /// Signal-free abort, for a destructor.
-    fn abort(&self) {
-        if let Some(task) = self.task.lock().take() {
-            task.abort();
-        }
-    }
-
-    /// Wait until the socket is released, bounded the way the
-    /// driver's own join is.
-    async fn join(&self) {
-        let mut slot = JoinSlot {
-            home: Arc::clone(&self.task),
-            handle: self.task.lock().take(),
-        };
-        let Some(handle) = slot.handle.as_mut() else {
-            // Another caller owns the join; wait for the task's own
-            // completion rather than for that caller's return.
-            let mut rx = self.done.subscribe();
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    return;
-                }
-            }
-            return;
-        };
-        if tokio::time::timeout(Duration::from_secs(2), &mut *handle)
-            .await
-            .is_err()
-        {
-            tracing::debug!("rtc stun socket did not exit in time; aborting");
-            handle.abort();
-            // `abort()` requests cancellation, it does not perform
-            // it: without this join the port can still be bound.
-            let _ = handle.await;
-        }
-        let _ = slot.handle.take();
-        let _ = self.done.send(true);
-    }
+    /// The answering task and its recorded release — the same
+    /// mechanism the driver task uses, for the same reason: a
+    /// caller that finds the join taken must wait for the SOCKET to
+    /// be free, not for another caller to return.
+    release: TaskRelease,
 }
 
 /// One driver-owned session.
@@ -904,10 +943,14 @@ impl RtcDriver {
     /// targets, is unchanged.
     ///
     /// Refuses **before binding anything** when the configuration
-    /// puts one UDP endpoint in both roles
-    /// ([`RtcConfig::stun_endpoint_conflict`]): an anchor must not
-    /// come up announcing a pairing that cannot work, because the
-    /// peer's only symptom is an ICE timeout with no diagnostic.
+    /// announces a STUN endpoint no socket will serve or puts one
+    /// UDP endpoint in both roles ([`RtcConfig::validate`]), and
+    /// again **after binding** against the pair this anchor will
+    /// actually advertise ([`RtcConfig::resolved_endpoint_conflict`])
+    /// — which is the only check a `:0` bind can be held to. An
+    /// anchor must not come up announcing a pairing that cannot
+    /// work, because the peer's only symptom is an ICE timeout with
+    /// no diagnostic.
     pub async fn spawn(
         config: RtcConfig,
         net_bind_addr: SocketAddr,
@@ -920,7 +963,7 @@ impl RtcDriver {
         // noticed.
         closed: mpsc::Sender<RtcPeerId>,
     ) -> std::io::Result<RtcDriverHandle> {
-        if let Some(conflict) = config.stun_endpoint_conflict() {
+        if let Some(conflict) = config.validate() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 conflict,
@@ -928,7 +971,7 @@ impl RtcDriver {
         }
         let socket = UdpSocket::bind(config.resolved_bind_addr(net_bind_addr)).await?;
         let local_addr = socket.local_addr()?;
-        let advertised = config.public_addr.unwrap_or(local_addr);
+        let advertised = config.advertised_rtc_addr(local_addr);
 
         let transport = Arc::new(RtcTransport::new(&config, Arc::clone(&stats)));
         let (signal_tx, signal_rx) = mpsc::channel(64);
@@ -939,30 +982,48 @@ impl RtcDriver {
         // A configured STUN bind that cannot be taken is fatal
         // here: the alternative is an anchor that announces an
         // endpoint it is not listening on.
-        let stun = match config.stun_addr {
+        //
+        // Bound, then CHECKED, then served: the resolved pair is
+        // known only once both sockets exist, and a refusal must
+        // leave nothing spawned. Both sockets are dropped by the
+        // early return below.
+        let stun_bound = match config.stun_addr {
             Some(bind) => {
                 let stun_socket = UdpSocket::bind(bind).await?;
                 let bound = stun_socket.local_addr()?;
-                let (stun_done, _stun_done_rx) = tokio::sync::watch::channel(false);
-                let stun_task = tokio::spawn(stun_only_loop(
-                    stun_socket,
-                    Arc::clone(&shutdown),
-                    stun_done.clone(),
-                ));
-                Some(StunEndpoint {
-                    // The bind's own truth. `stun_public_addr` is
-                    // the announcer's override, applied where the
-                    // announcement is built — one resolution rule,
-                    // in one place.
-                    local_addr: bound,
-                    task: Arc::new(parking_lot::Mutex::new(Some(stun_task))),
-                    done: stun_done,
-                })
+                Some((stun_socket, bound))
             }
             None => None,
         };
+        if let Some(conflict) = config
+            .resolved_endpoint_conflict(local_addr, stun_bound.as_ref().map(|(_, bound)| *bound))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                conflict,
+            ));
+        }
+        let stun = stun_bound.map(|(stun_socket, bound)| {
+            // No receiver is retained on purpose: release is a
+            // RECORDED value, not a notification that needs a
+            // listener — see `TaskRelease`.
+            let (stun_done, _) = tokio::sync::watch::channel(false);
+            let stun_task = tokio::spawn(stun_only_loop(
+                stun_socket,
+                Arc::clone(&shutdown),
+                stun_done.clone(),
+            ));
+            StunEndpoint {
+                // The bind's own truth. `stun_public_addr` is the
+                // announcer's override, applied where the
+                // announcement is built — one resolution rule, in
+                // one place.
+                local_addr: bound,
+                release: TaskRelease::new(stun_task, stun_done, "rtc stun socket"),
+            }
+        });
 
-        let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
+        let (done_tx, _) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(driver_loop(
             done_tx.clone(),
             config,
@@ -984,8 +1045,7 @@ impl RtcDriver {
             stats: Arc::clone(&stats),
             local_addr,
             shutdown: Arc::clone(&shutdown),
-            task: Arc::new(parking_lot::Mutex::new(Some(task))),
-            done: done_tx,
+            release: TaskRelease::new(task, done_tx, "rtc driver"),
             stun,
             #[cfg(any(test, feature = "fixtures"))]
             hooks,
@@ -1287,8 +1347,8 @@ async fn stun_only_loop(
     drop(guard);
 }
 
-/// Releases the STUN-only socket and publishes completion, whether
-/// [`stun_only_loop`] exits cooperatively or is aborted.
+/// Releases the STUN-only socket and **records** its release,
+/// whether [`stun_only_loop`] exits cooperatively or is aborted.
 struct StunSocket {
     socket: Option<UdpSocket>,
     done: tokio::sync::watch::Sender<bool>,
@@ -1297,7 +1357,12 @@ struct StunSocket {
 impl Drop for StunSocket {
     fn drop(&mut self) {
         drop(self.socket.take());
-        let _ = self.done.send(true);
+        // `send_replace`, not `send`: this driver retains no
+        // receiver, and `send` neither notifies nor STORES when
+        // there is none — so the release of a socket nobody was
+        // watching was lost, and a join taken afterwards read
+        // `false` for ever. See `TaskRelease`.
+        self.done.send_replace(true);
     }
 }
 
@@ -1314,8 +1379,8 @@ struct SessionTable {
     sessions: HashMap<u32, Session>,
     /// The RTC socket, owned here so teardown order is explicit:
     /// slots closed and counted, transport terminal, **socket
-    /// released**, and only then completion published. A joiner
-    /// woken by `done` therefore always finds the port free.
+    /// released**, and only then release recorded. A joiner woken
+    /// by `done` therefore always finds the port free.
     socket: Option<UdpSocket>,
     transport: Arc<RtcTransport>,
     stats: Arc<RtcStats>,
@@ -1338,7 +1403,8 @@ impl Drop for SessionTable {
         // becomes terminal.
         self.transport.shutdown_terminal();
         drop(self.socket.take());
-        let _ = self.done.send(true);
+        // Recorded, not merely signalled: see `StunSocket::drop`.
+        self.done.send_replace(true);
     }
 }
 

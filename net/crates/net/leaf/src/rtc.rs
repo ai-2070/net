@@ -224,6 +224,17 @@ struct PeerLink {
     retained: VecDeque<Bytes>,
     retained_bytes: usize,
     discarded_at_close: u64,
+    /// The transport's ledger, so this link's own destruction can
+    /// account for what it discards.
+    ///
+    /// The link holds it rather than the caller doing the
+    /// accounting for the same reason `Drop` closes the connection:
+    /// a link is destroyed on paths no caller runs — a `HashMap`
+    /// insertion replacing it, the map itself going away, a
+    /// cancelled bootstrap's future being dropped — and an
+    /// accounting term only the explicit `close(peer)` performed
+    /// was a term those paths silently skipped.
+    stats: Rc<RtcLinkCounters>,
     /// Kept alive for the connection's lifetime; dropping a closure
     /// would detach the JS callback.
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
@@ -255,7 +266,26 @@ impl Drop for PeerLink {
     ///
     /// `close()` on an already-closed connection is a no-op in
     /// every engine, so the explicit path and this one compose.
+    ///
+    /// **And it accounts for what it discards.** A retained packet
+    /// was ACCEPTED at admission, so the §2 conservation law is
+    /// `accepted == written + discarded_at_close + retained`, and
+    /// the discard term is owed by every path that destroys a link
+    /// with a non-empty queue — not only by
+    /// [`RtcLeafTransport::close`]. `create_offer`/`accept_offer`
+    /// replace a link by inserting over its key, and a replacement
+    /// whose destructor closed the objects but skipped the
+    /// accounting made those packets vanish from the ledger: the
+    /// snapshot's `retained` gauge dropped with them and nothing
+    /// recorded where they went.
     fn drop(&mut self) {
+        let discarded = self.retained.len() as u64;
+        if discarded > 0 {
+            self.discarded_at_close += discarded;
+            self.stats.note_discarded_at_close_n(discarded);
+            self.retained.clear();
+            self.retained_bytes = 0;
+        }
         if let Some(channel) = &self.channel {
             channel.close();
         }
@@ -396,7 +426,13 @@ impl RtcLeafTransport {
             &channel,
         );
 
-        self.peers.borrow_mut().insert(
+        // Replacing a link IS closing it. The incumbent is taken
+        // out here and dropped below, outside the borrow: its
+        // destructor performs the retained-packet discard
+        // accounting and calls `close()` on a real
+        // `RTCPeerConnection`, and neither belongs inside a
+        // `RefCell` borrow an engine callback may re-enter.
+        let replaced = self.peers.borrow_mut().insert(
             peer,
             PeerLink {
                 connection: connection.clone(),
@@ -404,12 +440,14 @@ impl RtcLeafTransport {
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
+                stats: Rc::clone(&self.stats),
                 _closures: vec![low, ice_state],
                 _message: Some(message),
                 _ice: Some(ice),
                 _data_channel: None,
             },
         );
+        drop(replaced);
 
         let offer = wasm_bindgen_futures::JsFuture::from(connection.create_offer())
             .await
@@ -489,7 +527,10 @@ impl RtcLeafTransport {
         }) as Box<dyn FnMut(RtcDataChannelEvent)>);
         connection.set_ondatachannel(Some(on_data_channel.as_ref().unchecked_ref()));
 
-        self.peers.borrow_mut().insert(
+        // Same as the offering path: the incumbent is dropped
+        // outside the borrow, and its destructor accounts for what
+        // it discards.
+        let replaced = self.peers.borrow_mut().insert(
             peer,
             PeerLink {
                 connection: connection.clone(),
@@ -497,12 +538,14 @@ impl RtcLeafTransport {
                 retained: VecDeque::new(),
                 retained_bytes: 0,
                 discarded_at_close: 0,
+                stats: Rc::clone(&self.stats),
                 _closures: vec![ice_state],
                 _message: None,
                 _ice: Some(ice),
                 _data_channel: Some(on_data_channel),
             },
         );
+        drop(replaced);
 
         // The remote description first: `createAnswer` has nothing
         // to answer without it.
@@ -654,16 +697,24 @@ impl RtcLeafTransport {
 
     /// Close `peer`'s connection, reporting how many retained
     /// packets were discarded.
+    ///
+    /// **The destructor does the accounting**, here as on every
+    /// other path that destroys a link — replacement, the map going
+    /// away, a cancelled bootstrap. This reads the count it is
+    /// about to cause and then lets the drop charge it, so the
+    /// explicit close and the implicit ones cannot disagree; doing
+    /// it here *as well* would charge the term twice.
     pub fn close(&self, peer: NodeId) -> u64 {
-        let Some(mut link) = self.peers.borrow_mut().remove(&peer) else {
+        let Some(link) = self.peers.borrow_mut().remove(&peer) else {
             return 0;
         };
-        link.discarded_at_close += link.retained.len() as u64;
-        self.stats
-            .note_discarded_at_close_n(link.retained.len() as u64);
+        let discarded = link.discarded_at_close + link.retained.len() as u64;
         // Taking the link out of the map is the close: `PeerLink`'s
-        // `Drop` shuts the channel and the connection.
-        link.discarded_at_close
+        // `Drop` shuts the channel and the connection, and counts
+        // what the queue still held. Dropped explicitly, and
+        // outside the borrow above.
+        drop(link);
+        discarded
     }
 
     /// The browser's own `RTCPeerConnection` for `peer`, when this

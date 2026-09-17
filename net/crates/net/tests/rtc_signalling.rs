@@ -380,6 +380,111 @@ async fn an_rtc_node_announces_its_noise_key_and_transport_tag() {
     assert!(tags.iter().any(|t| t == "rtc-anchor"));
 }
 
+/// **S6-07.1, at the emission point.** A signed announcement carries
+/// a STUN endpoint only when a socket is actually serving it, and
+/// the value it carries is the RESOLVED one.
+///
+/// Three configurations, and the third is the defect: an override
+/// with no bind behind it. `rtc_public_stun_addr()` returned the
+/// override before it checked whether anything was bound, so an
+/// anchor could sign an announcement naming a port it never
+/// answered on — and a browser aiming `iceServers` there has no
+/// symptom but a slow ICE failure. The configuration is now
+/// refused outright, so the node does not start at all.
+///
+/// Inverse: restore the early `if let Some(addr) = rtc.stun_public_addr
+/// { return Some(addr) }` in `MeshNode::rtc_public_stun_addr` AND
+/// drop the `unserved_stun_endpoint` arm from `RtcConfig::validate`
+/// — the third node starts and announces `203.0.113.9:3478`, so the
+/// `expect_err` fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anchor_announces_only_a_stun_endpoint_it_serves() {
+    // 1. A bind with no override: the announcement carries what the
+    //    second socket actually bound, so `:0` names a real port.
+    let bound_only = node(Some(RtcConfig {
+        public_addr: Some("198.51.100.4:4433".parse().expect("addr")),
+        ..rtc_config().with_stun_addr("127.0.0.1:0".parse().expect("addr"))
+    }))
+    .await;
+    bound_only.start_arc();
+    bound_only
+        .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+        .await
+        .expect("announce");
+    let served = bound_only
+        .rtc_public_stun_addr()
+        .expect("a bound second socket has an endpoint to announce");
+    assert_ne!(served.port(), 0, "post-bind, so the port is real: {served}");
+    let ann = bound_only
+        .local_announcement_for_test()
+        .expect("local announcement");
+    assert_eq!(
+        ann.rtc_stun_addr.as_deref(),
+        Some(served.to_string().as_str()),
+        "the signed announcement and the accessor cannot disagree"
+    );
+
+    // 2. A bind AND an override: the override is what is announced,
+    //    because that is what a peer outside the NAT can reach.
+    let overridden = node(Some(RtcConfig {
+        public_addr: Some("198.51.100.4:4433".parse().expect("addr")),
+        stun_public_addr: Some("203.0.113.9:3478".parse().expect("addr")),
+        ..rtc_config().with_stun_addr("127.0.0.1:0".parse().expect("addr"))
+    }))
+    .await;
+    overridden.start_arc();
+    assert_eq!(
+        overridden.rtc_public_stun_addr(),
+        Some("203.0.113.9:3478".parse().expect("addr"))
+    );
+
+    // 3. An override with NOTHING bound behind it: refused, so no
+    //    announcement can name it.
+    let mut unserved = config(Some(RtcConfig {
+        public_addr: Some("198.51.100.4:4433".parse().expect("addr")),
+        stun_public_addr: Some("203.0.113.9:3478".parse().expect("addr")),
+        ..rtc_config()
+    }));
+    unserved.socket_buffers = SocketBufferConfig::for_testing();
+    let err = MeshNode::new(EntityKeypair::generate(), unserved)
+        .await
+        .err()
+        .expect("an anchor must not start announcing an endpoint it never serves");
+    let text = format!("{err}");
+    assert!(
+        text.contains("stun_public_addr") && text.contains("stun_addr"),
+        "the refusal must name both flags: {text}"
+    );
+
+    // And the announcement of an anchor with no second socket at
+    // all carries no such field — absence, not a blank.
+    let plain = node(Some(rtc_config())).await;
+    plain.start_arc();
+    plain
+        .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert_eq!(plain.rtc_public_stun_addr(), None);
+    let json = String::from_utf8(
+        plain
+            .local_announcement_for_test()
+            .expect("local announcement")
+            .to_bytes(),
+    )
+    .expect("UTF-8");
+    assert!(
+        !json.contains("rtc_stun_addr"),
+        "an anchor with no second socket announces no such key: {json}"
+    );
+
+    // Released rather than left running: three extra RTC drivers
+    // and their sockets for the rest of the binary is load every
+    // other witness in this file pays for.
+    for node in [&bound_only, &overridden, &plain] {
+        node.shutdown().await.expect("shutdown");
+    }
+}
+
 /// EXIT 4: §9 end to end, natively — announcement → `connect_via` →
 /// `0x0D02` → ICE → direct install replacing routed → forced direct
 /// loss → explicit interruption → routed reconnection, with the
@@ -946,4 +1051,146 @@ fn kyra_reject_then_late_candidate_does_not_resurrect_reservation() {
         0,
         "late candidate resurrected retired budget id"
     );
+}
+
+/// A pair whose attempts have a deadline far outside this witness's
+/// window, so the **only** competing terminal owner is the one the
+/// test drives. With the production 2 s used elsewhere in this
+/// file the expiry sweep would be a second contender and the
+/// witness would be about whichever fired first.
+async fn unhurried_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+    let unhurried = || RtcConfig {
+        ice_deadline: Duration::from_secs(120),
+        ..rtc_config()
+    };
+    let a = node(Some(unhurried())).await;
+    let b = node(Some(unhurried())).await;
+    let a_id = a.node_id();
+    let b_clone = Arc::clone(&b);
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b.local_addr(), b.public_key(), b.node_id())
+        .await
+        .expect("udp handshake");
+    accept.await.expect("accept task").expect("accept");
+    a.start_arc();
+    b.start_arc();
+    (a, b)
+}
+
+/// **S6-06.** An attempt is charged ONE terminal term, whichever
+/// owner reaches it first — even when the losing owner is the
+/// completion whose channel had already opened.
+///
+/// The interleaving: the completion wakes from `await_open` and
+/// parks at the claim seam; a second terminal owner (here the
+/// attempt's abandonment, the path a trickle socket closing takes)
+/// removes the dialog row and charges its own outcome; the
+/// completion then resumes. Discarding the `remove` result meant it
+/// went on to install-or-fail and charge a SECOND term, so
+/// `direct + relayed + failed` could exceed `attempted` — a ledger
+/// that reports more endings than beginnings. The `remove` RESULT
+/// is the claim, and losing it means installing nothing and
+/// charging nothing.
+///
+/// Both orders are pinned, because the contract is symmetric: the
+/// second half lets the completion claim FIRST and then lands the
+/// same late abandonment, which must also add nothing.
+///
+/// Inverse: change the claim in `spawn_dialog_completion` back to
+/// `table.remove(peer_node_id, dialog);` (result discarded, no
+/// match) — `attempted` stays 1 while the terminal sum reaches 2
+/// and the first `assert_eq!` on the ledger fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn one_attempt_is_charged_one_terminal_term_whichever_owner_claims_it() {
+    let (a, b) = unhurried_pair().await;
+    let b_id = b.node_id();
+
+    // A's completion owner parks the moment its channel opens.
+    a.rtc_dialog_claim_pause().arm_once();
+    let dialog = a.offer_direct_path(b_id).await.expect("offer sent");
+    assert_eq!(
+        a.rtc_stats().ice_snapshot().attempted,
+        1,
+        "one dialog, one attempt"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        a.rtc_dialog_claim_pause().wait_until_reached(),
+    )
+    .await
+    .expect("the completion must reach the claim seam, i.e. its channel opened");
+
+    // The competing terminal owner, while the completion is parked.
+    a.end_bootstrap_dialog(b_id, dialog).await;
+    let after_competitor = a.rtc_stats().ice_snapshot();
+    assert_eq!(
+        (
+            after_competitor.attempted,
+            after_competitor.direct + after_competitor.relayed + after_competitor.failed
+        ),
+        (1, 1),
+        "the owner that claimed the row charged exactly one terminal term"
+    );
+
+    a.rtc_dialog_claim_pause().release();
+
+    // The completion loses the claim. Nothing it does may add a
+    // second term — and nothing it does may install a session
+    // attributed to this attempt either.
+    assert!(
+        !wait_for(
+            || {
+                let s = a.rtc_stats().ice_snapshot();
+                s.direct + s.relayed + s.failed > s.attempted
+            },
+            Duration::from_secs(3)
+        )
+        .await,
+        "terminal totals must never exceed attempts: {:?}",
+        a.rtc_stats().ice_snapshot()
+    );
+    let settled = a.rtc_stats().ice_snapshot();
+    assert_eq!(
+        (
+            settled.attempted,
+            settled.direct + settled.relayed + settled.failed,
+            settled.pending()
+        ),
+        (1, 1, 0),
+        "one attempt, one ending, nothing in flight"
+    );
+
+    // The other order. A second dialog, claimed by its own
+    // completion first; the same late abandonment must add nothing.
+    let second = a.offer_direct_path(b_id).await.expect("second offer sent");
+    assert_eq!(a.rtc_stats().ice_snapshot().attempted, 2);
+    assert!(
+        wait_for(
+            || {
+                let s = a.rtc_stats().ice_snapshot();
+                s.direct + s.relayed + s.failed == 2
+            },
+            Duration::from_secs(30)
+        )
+        .await,
+        "the second attempt's own completion must reach a terminal outcome: {:?}",
+        a.rtc_stats().ice_snapshot()
+    );
+    a.end_bootstrap_dialog(b_id, second).await;
+    let final_ledger = a.rtc_stats().ice_snapshot();
+    assert_eq!(
+        (
+            final_ledger.attempted,
+            final_ledger.direct + final_ledger.relayed + final_ledger.failed
+        ),
+        (2, 2),
+        "a late abandonment for an attempt whose completion already claimed it \
+         adds nothing: {final_ledger:?}"
+    );
+
+    // Released: two live RTC drivers doing real ICE for the rest of
+    // the binary is load every other witness here pays for.
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
 }

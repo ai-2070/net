@@ -370,3 +370,350 @@ async fn distinct_endpoints_are_not_refused() {
     );
     driven.handle.shutdown_and_join().await;
 }
+
+/// **S6-07.1.** `stun_public_addr` without `stun_addr` is refused,
+/// because it would announce an endpoint no socket ever serves.
+///
+/// The two flags are an endpoint and its NAT override, not two
+/// spellings of one thing: `stun_addr` binds, and without it the
+/// driver opens no second socket. An anchor that came up anyway put
+/// a dead port into a signed announcement, and a browser aiming
+/// `iceServers` at it has no symptom but a slow ICE failure. There
+/// is no port to guess and nothing to silently strip — the operator
+/// meant to serve STUN and one of two flags is missing.
+///
+/// Inverse: delete the `unserved_stun_endpoint` arm from
+/// `RtcConfig::validate` — the spawn succeeds, `expect_err` fails,
+/// and the second half below then reads the override back out of a
+/// driver that bound nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announcing_a_stun_endpoint_no_socket_serves_is_refused() {
+    let override_addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+    let err = spawn(RtcConfig::new().with_stun_public_addr(override_addr))
+        .await
+        .expect_err("an override with nothing bound behind it must be refused");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "the configuration is named, not a socket error: {err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("stun_public_addr")
+            && text.contains("stun_addr")
+            && text.contains("203.0.113.7:3478"),
+        "the error must name both flags and the endpoint that would be \
+         announced: {text}"
+    );
+
+    // The same rule at the EMISSION point, so no path can announce
+    // past the refusal: with no second socket there is nothing to
+    // announce instead of, whatever the override says.
+    let configured = RtcConfig::new().with_stun_public_addr(override_addr);
+    assert_eq!(
+        configured.advertised_stun_addr(None),
+        None,
+        "the bind is checked BEFORE the override is applied"
+    );
+    let bound: SocketAddr = "127.0.0.1:34793".parse().expect("addr");
+    assert_eq!(
+        configured.advertised_stun_addr(Some(bound)),
+        Some(override_addr),
+        "…and with a socket bound, the override is what is announced"
+    );
+    assert_eq!(
+        RtcConfig::new().advertised_stun_addr(Some(bound)),
+        Some(bound),
+        "no override announces the bind's own truth, so `:0` works"
+    );
+}
+
+/// **S6-07.2.** The check is on the pair this anchor would
+/// ADVERTISE, not on the two pairs that happen to be spelled out.
+///
+/// RTC `public_addr` `127.0.0.1:7101` beside a STUN *bind* of
+/// `127.0.0.1:7101` announces one endpoint in both roles: each half
+/// falls back to the other level. Comparing public-with-public and
+/// bind-with-bind saw two different pairs and let a known,
+/// deliberate collision through — the exact configuration error
+/// fail-fast validation exists for.
+///
+/// Inverse: change `rtc_announced`/`stun_announced` in
+/// `RtcConfig::stun_endpoint_conflict` back to `self.public_addr`
+/// and `self.stun_public_addr` — the pre-bind `expect` below fails.
+/// (The spawn still refuses, because the post-bind
+/// `resolved_endpoint_conflict` catches the same pair once both
+/// sockets exist. Which is why the pre-bind detection is asserted
+/// on its own: §6.12.1 asks for it *before anything is bound*, and
+/// a refusal that arrives only after two sockets were taken is a
+/// different promise.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_advertised_pair_that_collides_only_after_fallback_is_refused() {
+    let shared: SocketAddr = "127.0.0.1:7101".parse().expect("addr");
+    let config = RtcConfig {
+        public_addr: Some(shared),
+        ..RtcConfig::new().with_stun_addr(shared)
+    };
+
+    // Detected BEFORE anything is bound, which is what §6.12.1
+    // asks for: neither explicit pair collides — there is no
+    // `stun_public_addr` and no `bind_addr` — and the pair this
+    // anchor would advertise is one endpoint in both roles.
+    let pre_bind = config
+        .stun_endpoint_conflict()
+        .expect("the resolved advertised pair must be detected pre-bind");
+    assert!(
+        pre_bind.contains("public_addr")
+            && pre_bind.contains("stun_addr")
+            && pre_bind.contains("127.0.0.1:7101"),
+        "the diagnostic must name which fields resolved to the collision: {pre_bind}"
+    );
+
+    let err = spawn(config)
+        .await
+        .expect_err("the resolved advertised pair is one endpoint in both roles");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert!(
+        err.to_string().contains("127.0.0.1:7101"),
+        "the error must name the colliding endpoint: {err}"
+    );
+
+    // And the mirror image, where the STUN side carries the
+    // override and the RTC side falls back to its bind.
+    let err = spawn(RtcConfig {
+        stun_public_addr: Some(shared),
+        ..RtcConfig::new()
+            .with_bind_addr(shared)
+            .with_stun_addr("127.0.0.1:0".parse().expect("addr"))
+    })
+    .await
+    .expect_err("…and the other way round");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+    // The control: the intended shape — one host, two ports —
+    // still starts, so the widened comparison refuses nothing it
+    // should not.
+    let driven = spawn(RtcConfig {
+        public_addr: Some(shared),
+        ..RtcConfig::new().with_stun_addr("127.0.0.1:7102".parse().expect("addr"))
+    })
+    .await
+    .expect("two ports on one host is the intended configuration");
+    driven.handle.shutdown_and_join().await;
+}
+
+/// **S6-07, post-bind.** The resolved pair is checked again once
+/// both sockets exist, which is the only check a `:0` bind can be
+/// held to: port 0 names no endpoint before binding and exactly one
+/// afterwards.
+///
+/// Driven through the public helper with the bound values supplied,
+/// because an OS that happens to place a wildcard STUN bind on the
+/// port an RTC `public_addr` names is not a thing a test can
+/// arrange — and the input to the check is exactly these two
+/// values.
+///
+/// Inverse: make `resolved_endpoint_conflict` return `None`
+/// unconditionally — the first assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolved_advertised_pair_is_checked_after_binding() {
+    let announced: SocketAddr = "203.0.113.7:7101".parse().expect("addr");
+    let rtc_bound: SocketAddr = "127.0.0.1:5001".parse().expect("addr");
+
+    // A `:0` STUN bind the OS placed on the very endpoint the RTC
+    // side announces. Pre-bind this configuration is exempt — port
+    // 0 names nothing — so this is the arm that catches it.
+    let wildcard = RtcConfig {
+        public_addr: Some(announced),
+        ..RtcConfig::new().with_stun_addr("203.0.113.7:0".parse().expect("addr"))
+    };
+    assert_eq!(
+        wildcard.stun_endpoint_conflict(),
+        None,
+        "port 0 names no endpoint, so the pre-bind check must stay quiet"
+    );
+    let conflict = wildcard
+        .resolved_endpoint_conflict(rtc_bound, Some(announced))
+        .expect("the resolved pair is one endpoint in both roles");
+    assert!(
+        conflict.contains("203.0.113.7:7101"),
+        "the error must name the resolved endpoint: {conflict}"
+    );
+
+    // Controls: a different resolved port is fine, and an anchor
+    // with no second socket has no pair to collide.
+    assert_eq!(
+        wildcard
+            .resolved_endpoint_conflict(rtc_bound, Some("203.0.113.7:7102".parse().expect("addr"))),
+        None
+    );
+    assert_eq!(wildcard.resolved_endpoint_conflict(rtc_bound, None), None);
+}
+
+/// **S6-08.** The STUN socket's release is a recorded fact, so a
+/// join taken AFTER the socket and its task are gone finishes
+/// instead of waiting for a change that can never come again.
+///
+/// The lost completion: the spawn-time watch receiver is dropped,
+/// and `watch::Sender::send` neither notifies nor stores when there
+/// is no receiver. So the guard's `send(true)` returned `Err` and
+/// left the value `false`; a later `subscribe()` read `false`, and
+/// the no-handle branch waited on a change that had already
+/// happened. The port really was released — which is why a witness
+/// that only rebinds the port passes over the defect.
+///
+/// Covers repeated, late, and concurrent joins plus a join after an
+/// abort. Each one is bounded by this test's own timeout, so the
+/// defect is a failure and not a hang.
+///
+/// Inverse: restore the pre-repair publish at BOTH places release
+/// is recorded for this owner — `StunSocket::drop` and the tail of
+/// `TaskRelease::join` — back to `let _ = self.done.send(true)`.
+/// Then the late join stalls and its `expect` fails with
+/// `Elapsed(())`. Both, because either one alone still stores the
+/// value: they are two recorders of one fact, and the pre-repair
+/// code had neither. `TaskRelease::join` is shared with the driver
+/// task's own owner — one mechanism, two owners — so the sibling
+/// witness below reverts the same line beside `SessionTable::drop`.
+/// Kyra's extracted-source reproduction
+/// (`stun-lifecycle/src/main.rs`) is the same mechanism outside the
+/// driver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stun_sockets_release_is_observable_by_a_late_joiner() {
+    let driven = spawn(RtcConfig::new().with_stun_addr(loopback_ephemeral()))
+        .await
+        .expect("spawn");
+    let stun_addr = driven.handle.stun_local_addr().expect("stun addr");
+
+    // First join: the owner of the handle.
+    tokio::time::timeout(Duration::from_secs(5), driven.handle.shutdown_and_join())
+        .await
+        .expect("the first join must finish");
+
+    // The port is free — the observation that is true both with and
+    // without the defect, which is why it is not the assertion.
+    UdpSocket::bind(stun_addr)
+        .await
+        .expect("a successor must be able to rebind the STUN port")
+        .local_addr()
+        .expect("bound");
+
+    // A LATE join, taken after the socket and the task are gone.
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        driven.handle.shutdown_and_join(),
+    )
+    .await
+    .expect("a late join must observe the recorded release, not wait for it");
+
+    // Repeated, and concurrent: three joiners at once, none of them
+    // the original owner.
+    tokio::time::timeout(Duration::from_millis(500), async {
+        tokio::join!(
+            driven.handle.shutdown_and_join(),
+            driven.handle.shutdown_and_join(),
+            driven.handle.shutdown_and_join(),
+        );
+    })
+    .await
+    .expect("concurrent late joiners must all finish");
+}
+
+/// **S6-08, the abort path.** `shutdown_detached` aborts from a
+/// destructor and cannot await; a join afterwards must still
+/// finish.
+///
+/// This is the branch that includes a task aborted before its first
+/// poll: such a task never runs its own guard, so nothing it does
+/// records the release. Two things make the join finish anyway —
+/// the abort leaves the join handle in place instead of dropping
+/// it, so a later joiner can own and await it, and that joiner
+/// records the release durably.
+///
+/// Inverse: restore the pre-repair state of the abort path —
+/// `if let Some(task) = self.task.lock().take()` in
+/// `TaskRelease::abort` (dropping the handle) **and** `send`
+/// instead of `send_replace` in `StunSocket::drop` and at the tail
+/// of `TaskRelease::join`. The join then finds no handle,
+/// subscribes to a release nobody stored, and its `expect` fails
+/// with `Elapsed(())`.
+///
+/// All three, and the reason is worth stating: with a durable
+/// record the handle need not be retained *for a task that ran*,
+/// and with the handle retained the record is not needed *by the
+/// joiner that owns it*. Only a task aborted before its first poll
+/// needs both — it runs no guard, so nothing but a joiner owning
+/// the handle can establish that it is gone. This witness does not
+/// force that schedule (a multi-threaded runtime polls the task
+/// promptly), so it discriminates against the pre-repair
+/// combination rather than against the handle-retention arm alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_after_an_aborting_shutdown_still_finishes() {
+    let driven = spawn(RtcConfig::new().with_stun_addr(loopback_ephemeral()))
+        .await
+        .expect("spawn");
+    let stun_addr = driven.handle.stun_local_addr().expect("stun addr");
+    let rtc_addr = driven.handle.local_addr();
+
+    // The destructor's path: signal, abort, do not await.
+    driven.handle.shutdown_detached();
+
+    tokio::time::timeout(Duration::from_secs(5), driven.handle.shutdown_and_join())
+        .await
+        .expect("a join after an abort must finish");
+
+    // And both ports are genuinely free by the time it returned,
+    // which is what the join promises.
+    UdpSocket::bind(stun_addr).await.expect("stun port free");
+    UdpSocket::bind(rtc_addr).await.expect("rtc port free");
+}
+
+/// **S6-08, the PRE-EXISTING analogous defect on the primary RTC
+/// join.** Not newly introduced STUN code: `RtcDriverHandle`'s own
+/// `done` channel has carried the same unretained-receiver shape
+/// since H1, and `await_teardown` waited without a bound for a
+/// release that `send` had already failed to store. Repaired by the
+/// same mechanism, witnessed separately so the two owners are not
+/// confused for one.
+///
+/// Inverse: restore the pre-repair publish at both of THIS owner's
+/// recorders — `SessionTable::drop` and the tail of
+/// `TaskRelease::join` — back to `let _ = self.done.send(true)`.
+/// The late join on a driver configured with NO STUN socket then
+/// stalls and its `expect` fails with `Elapsed(())`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rtc_drivers_own_release_is_observable_by_a_late_joiner() {
+    // No STUN socket at all, so nothing here can pass because of
+    // the STUN endpoint's release.
+    let driven = spawn(RtcConfig::new().with_bind_addr(loopback_ephemeral()))
+        .await
+        .expect("spawn");
+    assert_eq!(
+        driven.handle.stun_local_addr(),
+        None,
+        "this witness is about the driver task, not the STUN socket"
+    );
+    let rtc_addr = driven.handle.local_addr();
+
+    tokio::time::timeout(Duration::from_secs(5), driven.handle.shutdown_and_join())
+        .await
+        .expect("the first join must finish");
+    UdpSocket::bind(rtc_addr)
+        .await
+        .expect("a successor must be able to rebind the RTC port");
+
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        driven.handle.shutdown_and_join(),
+    )
+    .await
+    .expect("a late join must observe the recorded release");
+    tokio::time::timeout(Duration::from_millis(500), async {
+        tokio::join!(
+            driven.handle.shutdown_and_join(),
+            driven.handle.shutdown_and_join(),
+        );
+    })
+    .await
+    .expect("concurrent late joiners must all finish");
+}

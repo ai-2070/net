@@ -216,6 +216,69 @@ impl RtcConfig {
             .unwrap_or_else(|| SocketAddr::new(net_bind_addr.ip(), 0))
     }
 
+    /// The endpoint this anchor **advertises** as `rtc_addr`, given
+    /// the address its RTC socket bound: the operator's override
+    /// when there is one, otherwise the bind's own truth.
+    #[inline]
+    pub fn advertised_rtc_addr(&self, rtc_bound: SocketAddr) -> SocketAddr {
+        self.public_addr.unwrap_or(rtc_bound)
+    }
+
+    /// The endpoint this anchor **advertises** as `rtc_stun_addr`,
+    /// given the address its second socket bound — `None` when no
+    /// second socket exists.
+    ///
+    /// **The bind is checked first, and the override cannot
+    /// substitute for it.** `stun_public_addr` says "announce THIS
+    /// instead of what the second socket bound"; with no second
+    /// socket there is nothing to announce instead of, and
+    /// returning the override anyway put an endpoint this anchor
+    /// never served into a signed announcement — a browser then
+    /// aimed `iceServers` at a port nobody answers, whose only
+    /// symptom is a slow ICE failure. The configuration is refused
+    /// outright by [`Self::validate`]; this is the same rule at the
+    /// emission point, so no path can announce past it.
+    #[inline]
+    pub fn advertised_stun_addr(&self, stun_bound: Option<SocketAddr>) -> Option<SocketAddr> {
+        let bound = stun_bound?;
+        Some(self.stun_public_addr.unwrap_or(bound))
+    }
+
+    /// Everything about this configuration that must refuse a
+    /// startup, in one call: `Some(explanation)` when the anchor
+    /// would come up unable to serve what it announces.
+    ///
+    /// Fail-fast, before anything is bound. An anchor that comes up
+    /// with either defect below has one symptom at the peer — an
+    /// ICE deadline — and none at all locally.
+    pub fn validate(&self) -> Option<String> {
+        self.unserved_stun_endpoint()
+            .or_else(|| self.stun_endpoint_conflict())
+    }
+
+    /// `Some(explanation)` when a STUN endpoint is announced that no
+    /// socket serves: `stun_public_addr` set with no `stun_addr`.
+    ///
+    /// The two flags are an endpoint and its NAT override, not two
+    /// ways of spelling the same thing. `stun_addr` is what binds;
+    /// without it the driver opens no second socket, so the
+    /// override names a port this anchor does not answer on. There
+    /// is no port to guess and nothing to silently strip: the
+    /// operator meant to serve STUN and one of the two flags is
+    /// missing, which is exactly what fail-fast validation is for.
+    pub fn unserved_stun_endpoint(&self) -> Option<String> {
+        let public = self.stun_public_addr?;
+        if self.stun_addr.is_some() {
+            return None;
+        }
+        Some(format!(
+            "rtc: stun_public_addr ({public}) is set without stun_addr, so no second socket is \
+             bound and this anchor would announce a STUN endpoint it never serves; set \
+             stun_addr (`:0` is fine — the announcement carries what it actually bound) or \
+             drop the override"
+        ))
+    }
+
     /// The configuration §6.12.1 describes, detected before anything
     /// is bound: **one endpoint in both roles**.
     ///
@@ -228,14 +291,16 @@ impl RtcConfig {
     /// eat the peer's connectivity checks and ICE never nominates.
     ///
     /// Detected equality only, and only between values this config
-    /// holds. It cannot see a `stun_public_addr` that a gateway maps
-    /// onto `public_addr`, nor a DNS name that resolves to either —
-    /// those are the boundary the leaf's connect-time check and the
-    /// documentation own.
+    /// holds — but between the **resolved** values, not merely the
+    /// explicitly-paired ones. It cannot see a `stun_public_addr`
+    /// that a gateway maps onto `public_addr`, nor a DNS name that
+    /// resolves to either — those are the boundary the leaf's
+    /// connect-time check and the documentation own.
     pub fn stun_endpoint_conflict(&self) -> Option<String> {
-        // The announced pair first: it is the one a peer acts on, and
-        // the one that produces a silent 60-second ICE timeout
-        // instead of a diagnostic.
+        // The explicitly announced pair first: it is the one a peer
+        // acts on, the one that produces a silent 60-second ICE
+        // timeout instead of a diagnostic, and the one whose
+        // diagnostic can name the two fields the operator set.
         if let (Some(stun), Some(rtc)) = (self.stun_public_addr, self.public_addr) {
             if stun == rtc {
                 return Some(format!(
@@ -264,7 +329,72 @@ impl RtcConfig {
                 ));
             }
         }
+        // **The RESOLVED announced pair**, which neither arm above
+        // can see. Comparing public with public and bind with bind
+        // compares like with like; an RTC `public_addr` of
+        // `127.0.0.1:7101` beside a STUN *bind* of `127.0.0.1:7101`
+        // announces the very same endpoint in both roles, because
+        // each half falls back to the other level. That is a known,
+        // deliberate collision and it escaped the check entirely.
+        //
+        // Third rather than first so the two arms above keep naming
+        // the fields the operator actually set: a diagnostic that
+        // says "the announced STUN endpoint" where it could say
+        // "stun_public_addr" is a worse diagnostic.
+        let rtc_announced = self.public_addr.or(self.bind_addr);
+        let stun_announced = self.stun_public_addr.or(self.stun_addr);
+        if let (Some(stun), Some(rtc)) = (stun_announced, rtc_announced) {
+            // Port 0 names no endpoint pre-bind;
+            // `resolved_endpoint_conflict` covers what it resolves
+            // to once the sockets exist.
+            if stun == rtc && rtc.port() != 0 {
+                let stun_field = if self.stun_public_addr.is_some() {
+                    "stun_public_addr"
+                } else {
+                    "stun_addr"
+                };
+                let rtc_field = if self.public_addr.is_some() {
+                    "public_addr"
+                } else {
+                    "bind_addr"
+                };
+                return Some(format!(
+                    "rtc: the announced STUN endpoint {stun_field} ({stun}) resolves to the \
+                     announced RTC endpoint {rtc_field} ({rtc}); they must be distinct UDP \
+                     endpoints, because a peer cannot be its own STUN server — libwebrtc \
+                     consumes datagrams from a configured STUN server before pairing, so the \
+                     peer's ICE checks would be eaten"
+                ));
+            }
+        }
         None
+    }
+
+    /// The same rule against the pair this anchor will **actually**
+    /// advertise, once both sockets are bound.
+    ///
+    /// What the pre-bind check cannot see: a `:0` STUN bind that the
+    /// OS happens to place on the port an RTC `public_addr` names.
+    /// Port 0 is exempt before binding because it names no
+    /// endpoint; afterwards it names exactly one, so the check that
+    /// matters is this one, and it is the last thing between a
+    /// resolved pair and a signed announcement.
+    pub fn resolved_endpoint_conflict(
+        &self,
+        rtc_bound: SocketAddr,
+        stun_bound: Option<SocketAddr>,
+    ) -> Option<String> {
+        let stun = self.advertised_stun_addr(stun_bound)?;
+        let rtc = self.advertised_rtc_addr(rtc_bound);
+        if stun != rtc {
+            return None;
+        }
+        Some(format!(
+            "rtc: the resolved STUN endpoint ({stun}) is the resolved RTC endpoint ({rtc}); they \
+             must be distinct UDP endpoints, because a peer cannot be its own STUN server — \
+             libwebrtc consumes datagrams from a configured STUN server before pairing, so the \
+             peer's ICE checks would be eaten"
+        ))
     }
 }
 
