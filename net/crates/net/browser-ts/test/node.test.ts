@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { connect, parseAttemptStatus, peerIdHex, type BrowserNode } from '../src/node.js';
+import { BrowserNode, connect, parseAttemptStatus, peerIdHex } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -15,9 +15,9 @@ import {
   SessionError,
   type LeafError,
 } from '../src/errors.js';
-import type { LeafWasmConnectOptions } from '../src/wasm.js';
+import type { LeafWasmConnectOptions, LeafWasmNode } from '../src/wasm.js';
 import { fakeModule, failingModule, FakeNode } from './fake-wasm.js';
-import { NODE_CLOSED_REFUSAL } from './leaf-abi.js';
+import { NODE_CLOSED_REFUSAL, streamDataEvent } from './leaf-abi.js';
 
 const BASE = {
   credentialB64: 'Y3JlZA==',
@@ -346,6 +346,45 @@ describe('BrowserNode', () => {
     await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
   });
 
+  // R4-10. A stream id is an application label scoped to a session,
+  // and `openStream({ peer, streamId })` invites two peers under one
+  // id — so this is the ordinary case, not a collision. The wasm
+  // callback is handed the NODE-WIDE event vector, and filtering it
+  // by numeric id alone gave both wrappers whichever peer's frame
+  // arrived: a page that echoed what it received amplified one
+  // peer's payload onto the other peer's stream.
+  //
+  // Correlated by NONCE, not by count: two payloads in an inbox that
+  // holds one peer's frame twice is the defect, and counting cannot
+  // tell that from correct delivery.
+  it('delivers each peer its own payloads when two streams share one id', async () => {
+    const PEER_A = 'beefcafe00000002';
+    const PEER_C = 'beefcafe00000003';
+    const NONCE_A = new Uint8Array([0xa1, 0xa2, 0xa3, 0xa4]);
+    const NONCE_C = new Uint8Array([0xc1, 0xc2, 0xc3, 0xc4]);
+
+    const inner = new FakeNode();
+    const node = await connected(inner);
+    const toA = node.openStream({ reliability: 'reliable', label: 'inbox', peer: PEER_A });
+    const toC = node.openStream({ reliability: 'reliable', label: 'inbox', peer: PEER_C });
+    expect([toA.streamId, toC.streamId]).toEqual(['00000000000000ff', '00000000000000ff']);
+
+    const inboxA: Uint8Array[] = [];
+    const inboxC: Uint8Array[] = [];
+    toA.onMessage((payload) => inboxA.push(payload));
+    toC.onMessage((payload) => inboxC.push(payload));
+
+    // Both frames reach both wrappers, because that is what the node
+    // hands each stream's callback.
+    for (const stream of inner.streams) {
+      stream.arriveRaw(peerFrame(PEER_A, stream.wireId, NONCE_A));
+      stream.arriveRaw(peerFrame(PEER_C, stream.wireId, NONCE_C));
+    }
+
+    expect(inboxA).toEqual([NONCE_A]);
+    expect(inboxC).toEqual([NONCE_C]);
+  });
+
   it('rejects a send on a closed stream with a typed error rather than a TypeError', async () => {
     const node = await connected(new FakeNode());
     const stream = node.openStream({ reliability: 'reliable' });
@@ -494,6 +533,151 @@ describe('BrowserNode', () => {
     expect(inner.closed).toBe(true);
     inner.emit('{"type":"disconnected","reason":"after close"}');
     expect(seen).toEqual([]);
+  });
+});
+
+/**
+ * Kyra's round-5 teardown probe (`spikes/kyra/kyra_5_round5_close_probe.mjs`),
+ * as a vitest against the real `BrowserNode`.
+ *
+ * Two iterators are parked and the FIRST inner stream's `close`
+ * throws. `close` had already latched closed and emptied its set
+ * before the loop, so the throw escaped it: the second stream was
+ * never closed and its iterator stayed parked forever, the hub was
+ * never closed, `inner.close()` never ran — and the retry her probe
+ * makes returned immediately, because the latch was already set. One
+ * failing child took the whole teardown with it.
+ *
+ * A throwing `close` is the **host-supplied wrapper** surface
+ * (`LeafWasmStreamLike` is an interface a page may implement), not a
+ * claim that the Rust `LeafStream::close` throws. The obligation is
+ * the same either way: `close` owns every child, the hub and the
+ * leaf, and an error in one of them is reported rather than allowed
+ * to cancel the rest.
+ */
+describe('direct close with a failing child', () => {
+  /**
+   * Her injected boundary: a node whose `open_stream` hands out
+   * numbered stream objects, the ones named in `throwOn` throwing
+   * from `close`. Two streams are opened, as the probe opens them.
+   */
+  function injected(throwOn: readonly number[]) {
+    const closed: number[] = [];
+    const state = { parentClosed: false };
+    let emit: (json: string) => void = () => {};
+    let count = 0;
+    const inner = {
+      node_id_hex: () => '0000000000000001',
+      on_event: (callback: (json: string) => void) => {
+        emit = callback;
+      },
+      open_stream: () => {
+        const id = ++count;
+        return {
+          stream_id_hex: () => id.toString(16).padStart(16, '0'),
+          on_message: () => {},
+          is_reliable: () => true,
+          send: () => {},
+          close: () => {
+            closed.push(id);
+            if (throwOn.includes(id)) throw new Error(`injected close failure ${id}`);
+          },
+        };
+      },
+      close: () => {
+        state.parentClosed = true;
+      },
+    };
+    const node = new BrowserNode(inner as unknown as LeafWasmNode, null, {}, null);
+    const a = node.openStream({ reliability: 'reliable' });
+    const b = node.openStream({ reliability: 'reliable' });
+    return { node, a, b, closed, state, emit: (json: string) => emit(json) };
+  }
+
+  /** `close`, keeping whatever it threw for the assertions to name. */
+  function closeCatching(node: BrowserNode): unknown {
+    try {
+      node.close();
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Her `throwFirst = false` control. It is what makes the three
+  // failing-child witnesses below non-vacuous: both iterators end and
+  // the leaf closes when no child misbehaves.
+  it('ends both parked iterators and closes the leaf when no child throws', async () => {
+    const { node, a, b, closed, state } = injected([]);
+    const first = a[Symbol.asyncIterator]().next();
+    const second = b[Symbol.asyncIterator]().next();
+
+    expect(closeCatching(node)).toBeNull();
+
+    await expect(withinDeadline(first, 250, "the first stream's parked iterator")).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    await expect(withinDeadline(second, 250, "the second stream's parked iterator")).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    expect(closed).toEqual([1, 2]);
+    expect(state.parentClosed).toBe(true);
+  });
+
+  // Her `throwFirst = true`: the second child and the leaf are the
+  // two things the aborted loop lost.
+  it("closes the remaining child and the leaf when the first child's close throws", async () => {
+    const { node, b, closed, state } = injected([1]);
+    const second = b[Symbol.asyncIterator]().next();
+
+    closeCatching(node);
+
+    await expect(withinDeadline(second, 250, "the second stream's parked iterator")).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    expect(closed).toEqual([1, 2]);
+    expect(state.parentClosed).toBe(true);
+  });
+
+  it("closes the event surface when the first child's close throws", () => {
+    const { node, emit } = injected([1]);
+    const seen: string[] = [];
+    node.onEvent((event) => seen.push(event.type));
+
+    closeCatching(node);
+    emit('{"type":"disconnected","reason":"after close"}');
+
+    expect(seen).toEqual([]);
+  });
+
+  // Completing the teardown is not swallowing the failure: the page
+  // asked for a close and one part of it did not happen.
+  it('surfaces the failing close as a typed aggregate rather than dropping it', () => {
+    const thrown = closeCatching(injected([1]).node);
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    const errors = (thrown as AggregateError).errors as LeafError[];
+    expect(errors.map((error) => [error.kind, error.message])).toEqual([
+      ['unknown', 'injected close failure 1'],
+    ]);
+  });
+
+  // "Aggregate" is load-bearing: an implementation that remembered
+  // only the last failure would pass every assertion above.
+  it('closes the leaf and keeps every failure when every child throws', () => {
+    const { node, closed, state } = injected([1, 2]);
+
+    const thrown = closeCatching(node);
+
+    expect(closed).toEqual([1, 2]);
+    expect(state.parentClosed).toBe(true);
+    expect((thrown as AggregateError).errors.map((error: LeafError) => error.message)).toEqual([
+      'injected close failure 1',
+      'injected close failure 2',
+    ]);
   });
 });
 
@@ -648,6 +832,24 @@ function iceTimeout(): LeafError {
   return fromWasmError(
     new Error('rtc: ICE did not connect inside the deadline (this does not establish that UDP is blocked)'),
   );
+}
+
+/**
+ * One `stream_data` frame as the node's event vector carries it:
+ * from `peerHex`, on stream `streamId`.
+ *
+ * The peer is spelled DECIMAL in the event and hex on the handle, so
+ * this converts once, here, rather than letting a test compare two
+ * strings that are both "the peer id" and never match.
+ */
+function peerFrame(peerHex: string, streamId: string, payload: Uint8Array): string {
+  return streamDataEvent({
+    peerNode: BigInt(`0x${peerHex}`).toString(10),
+    incarnation: '1',
+    streamId,
+    seq: '1',
+    payload,
+  });
 }
 
 /**

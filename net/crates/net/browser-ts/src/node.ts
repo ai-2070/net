@@ -847,15 +847,51 @@ export class BrowserNode {
    * `inner.close()`, because a wasm `LeafStream.close` retires its
    * handle *through the node* and a node already closed would
    * report that as a failed close instead of performing it.
+   *
+   * **Every one of those closes is attempted.** `close` latches and
+   * empties its set before the loop, so there is no second chance at
+   * any of it: a child whose `close` threw out of the loop left the
+   * next child open with its iterator parked forever, the hub
+   * dispatching, the leaf never closed — and the retry a page then
+   * makes returns immediately, because the latch is set. So each
+   * obligation is discharged independently and the failures are
+   * collected, which is the only reading under which the latch is
+   * honest.
+   *
+   * Reported, not swallowed: if anything threw, this throws an
+   * `AggregateError` whose `errors` are the {@link LeafError}s in
+   * teardown order — always an aggregate, however many failed,
+   * because "how many parts of the close failed" is not a shape a
+   * caller should have to branch on to find out that one did. A
+   * host-supplied {@link LeafWasmStreamLike} is the surface that
+   * makes this reachable; the leaf's own `close` does not throw.
    */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     const open = [...this.streams];
     this.streams.clear();
-    for (const stream of open) stream.close();
-    this.hub.close();
-    this.inner.close();
+    const failures: LeafError[] = [];
+    for (const stream of open) {
+      try {
+        stream.close();
+      } catch (error) {
+        failures.push(fromWasmError(error));
+      }
+    }
+    try {
+      this.hub.close();
+    } catch (error) {
+      failures.push(fromWasmError(error));
+    }
+    try {
+      this.inner.close();
+    } catch (error) {
+      failures.push(fromWasmError(error));
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `close: ${failures.length} of this node's teardown steps failed`);
+    }
   }
 
   /**
