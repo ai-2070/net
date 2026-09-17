@@ -18,6 +18,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  acceptPeer,
   driveAttempt,
   connectPeer,
   handshakePeer,
@@ -172,5 +173,77 @@ describe('terminal states end the loop', () => {
     // satisfies neither `direct` nor `iceTimeout`; the leaf reports
     // `failed` and this is the loop's exit for it.
     expect(outcome.type).toBe('handshakeFailed');
+  });
+});
+
+describe('proxy traffic per attempt, measured not promised', () => {
+  /**
+   * Count the primitive calls the loop makes. On a follower each one
+   * is a request and a reply over the `BroadcastChannel`, so the
+   * message count is twice this.
+   */
+  async function stepsToConnect(gatheringPolls: number): Promise<{
+    offers: number;
+    candidates: number;
+    handshakes: number;
+  }> {
+    let polls = 0;
+    const counts = { offers: 0, candidates: 0, handshakes: 0 };
+    const outcome = await connectPeer(
+      PEER,
+      primitives({
+        offer: async () => {
+          counts.offers += 1;
+          return D1;
+        },
+        candidate: async () => {
+          counts.candidates += 1;
+          polls += 1;
+          // `gathering` until the channel opens: the leaf owns the
+          // deadline, so the loop polls for as long as the attempt
+          // takes.
+          return reading({ state: polls > gatheringPolls ? 'open' : 'gathering' });
+        },
+        handshake: async (_peer, dialog) => {
+          counts.handshakes += 1;
+          return dialog;
+        },
+      }),
+      parseAttemptStatus,
+    );
+    expect(outcome.type).toBe('direct');
+    return counts;
+  }
+
+  it('costs one offer, one handshake, and one candidate step per poll', async () => {
+    // There is no fixed attempt cost, and quoting one would be wrong:
+    // `candidate` is POLLED, so the step count is a function of how
+    // long ICE takes, which is the leaf's deadline and not this
+    // loop's. What IS fixed is the shape.
+    expect(await stepsToConnect(0)).toEqual({ offers: 1, candidates: 1, handshakes: 1 });
+    expect(await stepsToConnect(3)).toEqual({ offers: 1, candidates: 4, handshakes: 1 });
+    expect(await stepsToConnect(9)).toEqual({ offers: 1, candidates: 10, handshakes: 1 });
+  });
+
+  it('adds one accept step per retry while the offer is still in flight', async () => {
+    let attempts = 0;
+    const acceptOffer = vi.fn(async () => {
+      attempts += 1;
+      // The leaf's "no verified offer yet" is retried; it is a
+      // message in flight, not a refusal.
+      if (attempts < 3) throw new Error('no verified offer from 0xa1b2c3d4e5f60718');
+      return D1;
+    });
+
+    const outcome = await acceptPeer(
+      PEER,
+      primitives({ acceptOffer, candidate: async () => reading({ direct: true }) }),
+      parseAttemptStatus,
+    );
+
+    expect(outcome.type).toBe('direct');
+    // So an accept costs 1..N accept steps plus the poll steps, and N
+    // is bounded by PEER_OFFER_WAIT_MS rather than by a count.
+    expect(acceptOffer).toHaveBeenCalledTimes(3);
   });
 });

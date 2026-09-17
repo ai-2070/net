@@ -630,8 +630,28 @@ Ownership the proxied form must carry:
 
 On cost: "four round trips" is wrong and should not be repeated.
 `peer_candidate` is **polled**, and accepting an offer **may retry**, so the
-proxy traffic per attempt is variable. Measure it; do not promise a fixed
-attempt cost.
+proxy traffic per attempt is variable.
+
+**Measured** (`browser-ts/test/peer-driver.test.ts`, "proxy traffic per
+attempt, measured not promised"), as a shape rather than a number:
+
+| Step | Count |
+|---|---|
+| offer (offerer) | 1 |
+| accept (answerer) | 1 per retry while the offer is still in flight, bounded by `PEER_OFFER_WAIT_MS`, **not** by a count |
+| candidate | **1 per poll** — 1 when the channel is already open, 4 after three gathering reads, 10 after nine |
+| handshake (offerer) | 1 |
+
+On a follower each step is one request and one reply over the
+`BroadcastChannel`, so the message count is twice the step count. The
+variable term is the poll count, and it is a function of how long ICE takes
+— which is the leaf's deadline, not the loop's; the loop deliberately adds
+no second clock.
+
+**What this does not measure.** Poll counts on a real network, against a
+real peer, with a real leader tab under load. The table is the loop's
+traffic shape, established against scripted readings; the field figure is
+the demo's to produce, and it is not to be quoted from here.
 
 ## 6. Existing implementation and the narrow missing work
 
