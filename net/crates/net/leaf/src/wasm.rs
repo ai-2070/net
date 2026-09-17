@@ -3336,8 +3336,9 @@ impl LeafNode {
         let live = self.current_attempt(peer)?;
         if live.dialog != dialog {
             return Err(LeafError::Session(format!(
-                "dialog {dialog} on {peer:#x} is not the live attempt (dialog {} is); \
-                 the attempt this request was issued for has been replaced",
+                "dialog {dialog:016x} on {peer:#x} is not the live attempt \
+                 (dialog {:016x} is); the attempt this request was issued for \
+                 has been replaced",
                 live.dialog
             )));
         }

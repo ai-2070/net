@@ -265,6 +265,23 @@ export interface LeafWasmNode {
    * the one the caller was holding.
    */
   peer_handshake(peer_hex: string): Promise<string>;
+  /**
+   * {@link LeafWasmNode.peer_candidate}, for a caller that names the
+   * dialog it is driving.
+   *
+   * Refused when that dialog is not the live one, **before** the
+   * attempt is serviced — so a request issued for an attempt that has
+   * since been replaced cannot drive its replacement. The shared
+   * drive loop uses this form on both surfaces.
+   */
+  peer_candidate_in(peer_hex: string, dialog_hex: string): Promise<string>;
+  /**
+   * {@link LeafWasmNode.peer_handshake}, for a caller that names the
+   * dialog it is driving. Refused on a mismatch, before the Noise
+   * wait — the longest await on this surface, and the one whose
+   * session must belong to the attempt that negotiated the channel.
+   */
+  peer_handshake_in(peer_hex: string, dialog_hex: string): Promise<string>;
   /** Every counter as JSON; `u64`s are decimal strings. */
   counters_json(): string;
   /**

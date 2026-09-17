@@ -28,7 +28,20 @@
  */
 
 import { fromWasmError, type LeafError } from '../errors.js';
-import { buildConnectRequest, parseCounters, parseDescriptors, type ConnectOptions, type NodeDescriptor } from '../node.js';
+import {
+  buildConnectRequest,
+  parseAttemptStatus,
+  parseCounters,
+  parseDescriptors,
+  type ConnectOptions,
+  type NodeDescriptor,
+  type PeerConnectOutcome,
+} from '../node.js';
+import {
+  acceptPeer as driveAccept,
+  connectPeer as driveConnect,
+  type PeerPrimitives,
+} from '../peer-driver.js';
 import { LeafStream, type OpenStreamOptions } from '../stream.js';
 import { loadLeafWasm } from '../wasm.js';
 import {
@@ -276,6 +289,47 @@ export class MeshSession {
    */
   async signal(peerHex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
     await this.guard(() => this.inner.signal(peerHex, dialog, kind, payload));
+  }
+
+  /**
+   * Connect directly to `nodeIdHex` (§9), wherever the node is.
+   *
+   * The same drive loop `BrowserNode.connectPeer` runs — literally
+   * the same function, from `peer-driver.ts`, with this session's
+   * primitives instead of the direct node's. One loop means the
+   * offerer and the answerer cannot disagree about what supersession
+   * or a terminal reading looks like, which is a disagreement neither
+   * side could detect.
+   *
+   * On a follower every step is a proxy round trip and the attempt
+   * runs on the leader tab's node. A step whose attempt was replaced
+   * while the request was in flight is refused by the leaf before it
+   * touches the replacement, and arrives here as `superseded`.
+   */
+  async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+  }
+
+  /**
+   * Answer the offer `nodeIdHex` filed — {@link connectPeer}'s
+   * counterpart, on whichever tab holds the lock.
+   */
+  async acceptPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
+    return driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+  }
+
+  /**
+   * The proxied primitives, each re-typed by the same mapper every
+   * other method here uses, so a proxied refusal is the same class a
+   * direct one is — which is what lets one drive loop classify both.
+   */
+  private peerPrimitives(): PeerPrimitives {
+    return {
+      offer: (peer) => this.guard(() => this.inner.peer_offer(peer)),
+      acceptOffer: (peer) => this.guard(() => this.inner.peer_accept_offer(peer)),
+      candidate: (peer, dialog) => this.guard(() => this.inner.peer_candidate(peer, dialog)),
+      handshake: (peer, dialog) => this.guard(() => this.inner.peer_handshake(peer, dialog)),
+    };
   }
 
   /**

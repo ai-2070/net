@@ -142,6 +142,24 @@ describe('MeshSession', () => {
     expect(fake.subscribed).toEqual(['chan']);
     await session.unsubscribe('chan');
     expect(fake.released).toEqual(['chan']);
+
+    // The proxied peer path: the same shared drive loop, over the
+    // session's primitives. Every step names the dialog the offer
+    // minted — a peer-only step would be resolved against whichever
+    // attempt is live when the leader gets to it.
+    const connected = await session.connectPeer('a1b2c3d4e5f60718');
+    expect(connected).toEqual({
+      type: 'direct',
+      peer: 'a1b2c3d4e5f60718',
+      dialog: '00000000000000d1',
+    });
+    expect(fake.peerOffers).toEqual(['a1b2c3d4e5f60718']);
+    expect(fake.peerCandidates).toEqual([
+      { peer: 'a1b2c3d4e5f60718', dialog: '00000000000000d1' },
+    ]);
+    expect(fake.peerHandshakes).toEqual([
+      { peer: 'a1b2c3d4e5f60718', dialog: '00000000000000d1' },
+    ]);
     await session.publish('chan', new Uint8Array([7]));
     expect(fake.published).toEqual([{ channel: 'chan', payload: new Uint8Array([7]) }]);
     await session.announce(['cap:one']);

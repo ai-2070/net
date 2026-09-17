@@ -20,6 +20,12 @@ import {
 import { fromWasmError, IdentityError, RtcError, type LeafError } from './errors.js';
 import { LeafStream, type OpenStreamOptions } from './stream.js';
 import {
+  acceptPeer as driveAccept,
+  connectPeer as driveConnect,
+  handshakePeer as driveHandshake,
+  type PeerPrimitives,
+} from './peer-driver.js';
+import {
   classifyRtcError,
   probeBootstrapReachable,
   probeStunBinding,
@@ -215,36 +221,6 @@ export interface PeerAttemptStatus {
    */
   readonly candidateError: string | null;
 }
-
-/**
- * The exact prefix the leaf's "peer not discovered" refusal carries
- * (`wasm.rs`'s `NO_ANNOUNCEMENT_PREFIX`).
- *
- * Pinned, like {@link parseLeafError}'s other `Display` strings: the
- * wasm boundary carries messages, so a message is a contract. The
- * browser ↔ browser witnesses drive this outcome end to end, so a
- * drift is a red test rather than a misclassified failure.
- */
-const NO_ANNOUNCEMENT_PREFIX = 'no verified announcement for';
-
-/** `wasm.rs`'s `NO_LIVE_ATTEMPT_PREFIX`. */
-const NO_LIVE_ATTEMPT_PREFIX = 'no live attempt with';
-
-/** How long the drive loop waits between `peer_candidate` calls. */
-const PEER_TICK_MS = 50;
-
-/**
- * How long {@link BrowserNode.acceptPeer} waits for the offer
- * envelope to arrive before it treats "no offer" as the answer.
- *
- * Two anchor hops and one pump, so this is generous rather than
- * tuned. It bounds the wait for a message IN FLIGHT and nothing
- * else — no other refusal is retried under it.
- */
-const PEER_OFFER_WAIT_MS = 5_000;
-
-/** `wasm.rs`'s refusal when no verified offer is waiting yet. */
-const NO_OFFER_PREFIX = 'no verified offer from';
 
 /** {@link connect}'s argument. */
 export interface ConnectOptions extends WasmSource {
@@ -521,21 +497,25 @@ export class BrowserNode {
    * node, a peer that answered `Reject`, a malformed peer id.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    const peer = nodeIdHex;
-    let dialog: string;
-    try {
-      dialog = await this.inner.peer_offer(peer);
-    } catch (thrown) {
-      const error = fromWasmError(thrown);
-      if (error.message.includes(NO_ANNOUNCEMENT_PREFIX)) {
-        return { type: 'noAnnouncement', peer, detail: error.message };
-      }
-      throw error;
-    }
+    return driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
+  }
 
-    const gathered = await this.driveAttempt(peer, dialog, (status) => status.state === 'open');
-    if (gathered.type !== 'direct') return gathered;
-    return this.handshakePeer(peer, dialog);
+  /**
+   * The four primitives the shared drive loop calls, bound to this
+   * tab's own node.
+   *
+   * The dialog-named `*_in` forms, not the peer-only ones: one
+   * primitive set for both surfaces means one classification, and a
+   * direct caller loses nothing by naming the dialog it already
+   * holds.
+   */
+  private peerPrimitives(): PeerPrimitives {
+    return {
+      offer: (peer) => this.inner.peer_offer(peer),
+      acceptOffer: (peer) => this.inner.peer_accept_offer(peer),
+      candidate: (peer, dialog) => this.inner.peer_candidate_in(peer, dialog),
+      handshake: (peer, dialog) => this.inner.peer_handshake_in(peer, dialog),
+    };
   }
 
   /**
@@ -561,21 +541,7 @@ export class BrowserNode {
    * handshaken the attempt that replaced it.
    */
   async handshakePeer(nodeIdHex: string, dialog: string): Promise<PeerConnectOutcome> {
-    const peer = nodeIdHex;
-    let handshaken: string;
-    try {
-      handshaken = await this.inner.peer_handshake(peer);
-    } catch (thrown) {
-      const error = fromWasmError(thrown);
-      if (error.message.includes(NO_LIVE_ATTEMPT_PREFIX)) {
-        return { type: 'superseded', peer, dialog, liveDialog: null };
-      }
-      return { type: 'handshakeFailed', peer, dialog, detail: error.message };
-    }
-    if (handshaken !== dialog) {
-      return { type: 'superseded', peer, dialog, liveDialog: handshaken };
-    }
-    return { type: 'direct', peer, dialog };
+    return driveHandshake(nodeIdHex, dialog, this.peerPrimitives());
   }
 
   /**
@@ -592,37 +558,7 @@ export class BrowserNode {
    * {@link PeerConnectOutcome}, same meanings.
    */
   async acceptPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
-    const peer = nodeIdHex;
-    // **The offer may still be in flight.** It crosses
-    // A → anchor → B as a signed `0x0D02` frame on the relayed
-    // session, and this leaf files it when it next pumps, so a page
-    // that reacts to "the peer is here" a moment before the envelope
-    // lands would otherwise be told there is no offer — which is
-    // true, and not an answer. So the accept is retried until the
-    // envelope arrives or {@link PEER_OFFER_WAIT_MS} elapses; a
-    // message in flight is not a refusal. Every OTHER refusal —
-    // an undiscovered peer, a closed node — is returned or thrown at
-    // once, because retrying those would only hide them.
-    let dialog: string | null = null;
-    const until = Date.now() + PEER_OFFER_WAIT_MS;
-    for (;;) {
-      try {
-        dialog = await this.inner.peer_accept_offer(peer);
-        break;
-      } catch (thrown) {
-        const error = fromWasmError(thrown);
-        if (error.message.includes(NO_ANNOUNCEMENT_PREFIX)) {
-          return { type: 'noAnnouncement', peer, detail: error.message };
-        }
-        if (!error.message.includes(NO_OFFER_PREFIX) || Date.now() >= until) {
-          throw error;
-        }
-        const tick = Promise.withResolvers<void>();
-        setTimeout(tick.resolve, PEER_TICK_MS);
-        await tick.promise;
-      }
-    }
-    return this.driveAttempt(peer, dialog, (status) => status.direct);
+    return driveAccept(nodeIdHex, this.peerPrimitives(), parseAttemptStatus);
   }
 
   /**
@@ -641,60 +577,6 @@ export class BrowserNode {
     }
   }
 
-  /**
-   * Pump one attempt until `done`, its terminal transition, or a
-   * newer attempt replaces it.
-   *
-   * `{ type: 'direct' }` here means only "`done` answered true" — the
-   * caller decides what remains. Both drive loops share it so the
-   * offerer and the answerer cannot disagree about what supersession
-   * or a terminal reading looks like.
-   *
-   * **Every terminal state ends the loop**, not only the two ICE
-   * ones. An answerer waits for `direct`, and a channel that opened
-   * with a session that never installed satisfies neither `direct`
-   * nor `iceTimeout`: the leaf reports `failed`, which is this loop's
-   * exit and `acceptPeer`'s answer. The bound is the leaf's, which is
-   * the side that owns the attempt's deadline — a timeout added here
-   * would be a second clock disagreeing with it.
-   */
-  private async driveAttempt(
-    peer: string,
-    dialog: string,
-    done: (status: PeerAttemptStatus) => boolean,
-  ): Promise<PeerConnectOutcome> {
-    for (;;) {
-      let status: PeerAttemptStatus;
-      try {
-        status = parseAttemptStatus(await this.inner.peer_candidate(peer));
-      } catch (thrown) {
-        const error = fromWasmError(thrown);
-        if (error.message.includes(NO_LIVE_ATTEMPT_PREFIX)) {
-          return { type: 'superseded', peer, dialog, liveDialog: null };
-        }
-        throw error;
-      }
-      if (status.dialog !== dialog) {
-        return { type: 'superseded', peer, dialog, liveDialog: status.dialog };
-      }
-      if (done(status)) return { type: 'direct', peer, dialog };
-      if (status.state === 'iceTimeout') return { type: 'iceTimeout', peer, dialog };
-      if (status.state === 'udpBlocked') return { type: 'udpBlocked', peer, dialog };
-      if (status.state === 'failed') {
-        return {
-          type: 'handshakeFailed',
-          peer,
-          dialog,
-          detail:
-            status.candidateError ??
-            'the attempt reached its terminal transition without installing a session',
-        };
-      }
-      const tick = Promise.withResolvers<void>();
-      setTimeout(tick.resolve, PEER_TICK_MS);
-      await tick.promise;
-    }
-  }
 
   /**
    * Every leaf counter, including each drop reason. Values are exact

@@ -76,6 +76,17 @@ export interface LeafWasmSession {
   is_enrolled(): Promise<boolean>;
   signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void>;
   /**
+   * The four peer-attempt primitives, proxied. `peer_candidate` and
+   * `peer_handshake` take the dialog because the leaf requires it:
+   * a proxied request is served after crossing a channel, so the
+   * attempt it named may have been replaced, and it is refused
+   * before it can drive the replacement.
+   */
+  peer_offer(peer_hex: string): Promise<string>;
+  peer_accept_offer(peer_hex: string): Promise<string>;
+  peer_candidate(peer_hex: string, dialog_hex: string): Promise<string>;
+  peer_handshake(peer_hex: string, dialog_hex: string): Promise<string>;
+  /**
    * A promise, where `LeafNode.open_stream` is synchronous: on a
    * follower the stream is opened by the tab that owns the
    * DataChannel.

@@ -109,6 +109,10 @@ export class FakeSession implements LeafWasmSession {
   readonly calls: { service: string; payload: Uint8Array; timeoutMs?: number }[] = [];
   readonly subscribed: string[] = [];
   readonly released: string[] = [];
+  readonly peerOffers: string[] = [];
+  readonly peerAccepts: string[] = [];
+  readonly peerCandidates: Array<{ peer: string; dialog: string }> = [];
+  readonly peerHandshakes: Array<{ peer: string; dialog: string }> = [];
   readonly published: { channel: string; payload: Uint8Array }[] = [];
   readonly announced: string[][] = [];
   readonly signalled: { peerHex: string; dialog: number; kind: string }[] = [];
@@ -193,6 +197,30 @@ export class FakeSession implements LeafWasmSession {
 
   async unsubscribe(channel: string): Promise<void> {
     this.released.push(channel);
+  }
+
+  // The proxied peer primitives. `peer_candidate` and
+  // `peer_handshake` take the dialog, so the double records it: the
+  // ownership rule is about which dialog a proxied step names.
+  async peer_offer(peer_hex: string): Promise<string> {
+    this.peerOffers.push(peer_hex);
+    return '00000000000000d1';
+  }
+
+  async peer_accept_offer(peer_hex: string): Promise<string> {
+    this.peerAccepts.push(peer_hex);
+    return '00000000000000d1';
+  }
+
+  async peer_candidate(peer_hex: string, dialog_hex: string): Promise<string> {
+    this.peerCandidates.push({ peer: peer_hex, dialog: dialog_hex });
+    return '{"dialog":"00000000000000d1","state":"open","sent":0,"applied":0,\
+"answered":true,"direct":true,"remainingMs":"9000"}';
+  }
+
+  async peer_handshake(peer_hex: string, dialog_hex: string): Promise<string> {
+    this.peerHandshakes.push({ peer: peer_hex, dialog: dialog_hex });
+    return dialog_hex;
   }
 
   async publish(channel: string, payload: Uint8Array): Promise<void> {

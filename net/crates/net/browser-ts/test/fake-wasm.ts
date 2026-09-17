@@ -155,6 +155,9 @@ export class FakeNode implements LeafWasmNode {
   readonly peerAccepts: string[] = [];
   readonly peerCandidates: string[] = [];
   readonly peerHandshakes: string[] = [];
+  /** The dialogs the shared drive loop named on each step. */
+  readonly peerCandidateDialogs: string[] = [];
+  readonly peerHandshakeDialogs: string[] = [];
   enrollments = 0;
   enrolled = false;
   closed = false;
@@ -273,6 +276,24 @@ export class FakeNode implements LeafWasmNode {
     return (
       this.behaviour.peerHandshakeDialog ?? this.behaviour.peerOfferDialog ?? '00000000000000d1'
     );
+  }
+
+  /**
+   * The dialog-named forms the shared drive loop calls.
+   *
+   * They record the dialog beside the peer, because "which dialog did
+   * the loop name" is the thing the proxied ownership rule is about,
+   * and delegate to the peer-only bodies so a fake reading configured
+   * by a test reaches both spellings.
+   */
+  async peer_candidate_in(peer_hex: string, dialog_hex: string): Promise<string> {
+    this.peerCandidateDialogs.push(dialog_hex);
+    return this.peer_candidate(peer_hex);
+  }
+
+  async peer_handshake_in(peer_hex: string, dialog_hex: string): Promise<string> {
+    this.peerHandshakeDialogs.push(dialog_hex);
+    return this.peer_handshake(peer_hex);
   }
 
   async enroll(): Promise<void> {
