@@ -405,7 +405,7 @@ pub fn default_stun_url(announced: Option<&str>) -> Option<String> {
 /// **Detection is endpoint equality**, after default-port
 /// normalisation (`stun:h` and `stun:h:3478` are the same endpoint,
 /// `stun:[::1]:9` and `[::1]:9` are the same endpoint) and, for a
-/// numeric address, after **parsing** it: see [`EndpointKey`]. A URL
+/// numeric address, after **parsing** it. A URL
 /// naming a DNS alias of the peer is **not** detected: the leaf
 /// resolves no names, and the announced STUN endpoint is what makes
 /// detection unnecessary for the configuration Net supplies.

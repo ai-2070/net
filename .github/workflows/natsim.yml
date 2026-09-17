@@ -130,8 +130,8 @@ jobs:
             grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
               echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
           done
-          grep -q "^test result: ok. 22 passed" /tmp/natsim_rows.log || {
-            echo "::error::expected 22 matrix-table witnesses"; exit 1; }
+          grep -q "^test result: ok. 38 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 38 matrix-table witnesses"; exit 1; }
 
       # The repo root resolves `stable`; `net/crates/net/**` resolves the
       # PINNED toolchain from `rust-toolchain.toml`, and they are separate

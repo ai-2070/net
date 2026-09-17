@@ -941,7 +941,7 @@ impl LeafNode {
     /// that built the handshake: any holder of the domain PSK can
     /// write any id into a prologue, which is exactly the
     /// reproduction [`crate::establish`] describes. So the keys go
-    /// into a bounded [`ProvisionalAdmission`] instead — no session
+    /// into a bounded provisional admission instead — no session
     /// table entry, no `Connected` event, no stream, no delivery —
     /// and only a verified establishment proof over *this*
     /// handshake's transcript promotes it
