@@ -4841,17 +4841,22 @@ async fn a_native_sender_fragments_for_a_peer_that_advertises_reassembly() {
 /// whole event to the receiver, which would hand its application a
 /// partial payload and leave the group short forever.
 ///
-/// **"Middle" is measured, not assumed.** The injector drops the
-/// third inbound Net packet, and the receiver's held-byte count then
-/// names which piece is missing, because a reliable stream parks
-/// arrivals past a sequence hole:
+/// **"Middle" is now GUARANTEED, not inferred.** The injector names
+/// the piece by its own `fragment_offset` (`2 × MAX_EVENT_SIZE`, the
+/// third of five), so which piece is lost is an input to the
+/// witness rather than something read back out of it, and
+/// `ingress_fragment_dropped() == 1` asserts the loss actually
+/// happened.
 ///
-/// * `2 × MAX_EVENT_SIZE` held ⇒ pieces 1 and 2 are in the group and
-///   the third is the hole — an interior piece, which is the case
-///   this witness is about;
-/// * `0` held would mean the HEAD was lost (every later piece
-///   parked behind it);
-/// * `4 × MAX_EVENT_SIZE` held would mean the TAIL was lost.
+/// An earlier version instead WAITED to observe the interior hole —
+/// `held == 2 × MAX_EVENT_SIZE` — and that assertion is gone
+/// deliberately, because it is a race rather than a property. The
+/// hole exists only between the loss and its recovery: on the Linux
+/// runner the retransmission lands inside the polling interval, the
+/// group completes, `held` returns to 0, and the witness reported
+/// `held 0 bytes` — the same reading it prints when the HEAD was
+/// lost. A check that cannot distinguish "recovered faster than we
+/// looked" from "lost the wrong piece" is not measuring either.
 ///
 /// The raw-egress injector cannot make this claim at all and the
 /// first attempt at this witness proved it: one 8 KiB Net packet
@@ -4884,7 +4889,10 @@ async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() 
     let (a_id, b_id) = (a.node_id(), b.node_id());
     // B reassembles and says so; A is the fragmenting sender.
     advertise_reassembly(&b, &a).await;
-    let session_id = b.peer_session_id(a_id).expect("an installed session");
+    // Asserted, not bound: the witness no longer reads per-session
+    // reassembly state, but a missing session here would make every
+    // measurement below meaningless.
+    b.peer_session_id(a_id).expect("an installed session");
     let hooks_b = b.rtc_driver().expect("driver").hooks();
     let before_retransmit = a
         .control_plane_stats()
@@ -4908,28 +4916,27 @@ async fn a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once() 
         .await
         .expect("the group is admitted");
 
-    // The interior hole, observed while it exists. It persists at
-    // least until the receiver's 25 ms gap tick plus a round trip,
-    // which is what makes it observable rather than hoped for.
+    // The LOSS, waited for as a fact rather than inferred from a
+    // transient side effect. The injector disarms as it fires, so
+    // this settles at exactly 1 and stays there; the interior hole
+    // it creates is NOT asserted, because the hole exists only until
+    // the retransmission lands and a faster machine closes it before
+    // a poll can see it (which is precisely how this witness failed
+    // on the Linux runner, reporting `held 0` — indistinguishable
+    // from having lost the head).
     assert!(
         wait_for(
-            || b.rtc_reassembly().held_bytes(session_id) == 2 * MAX_EVENT_SIZE as u64,
+            || hooks_b.ingress_fragment_dropped() == 1,
             Duration::from_secs(10)
         )
         .await,
-        "the group must be holding its first two pieces with the THIRD \
-         missing — held {} bytes, and 0 would mean the head was lost while \
-         {} would mean the tail was",
-        b.rtc_reassembly().held_bytes(session_id),
-        4 * MAX_EVENT_SIZE as u64
+        "the offset-targeted injector never fired: it is armed at offset {} \
+         and dropped {} fragment(s), so no piece was lost and nothing below \
+         measures recovery",
+        2 * MAX_EVENT_SIZE,
+        hooks_b.ingress_fragment_dropped()
     );
     let dropped = hooks_b.ingress_fragment_dropped();
-    assert_eq!(
-        dropped, 1,
-        "the offset-targeted injector must have dropped exactly the one piece \
-         it names: {dropped} means it matched nothing, so nothing below \
-         measures recovery"
-    );
 
     let delivered = collect_payload_events(&b, &payload, Duration::from_secs(60)).await;
     assert_eq!(
