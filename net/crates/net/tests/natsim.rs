@@ -544,6 +544,35 @@ fn natsim_natted_anchor_publishes_both_mapped_endpoints() {
          which is what makes it a statement about a mapping rather than about a local socket; \
          got {mapped}: {v:#}",
     );
+    // …and the reply must be that tuple EXACTLY, compared against the
+    // value the probing process read off its own socket rather than
+    // against this hardcoded prefix.
+    //
+    // The prefix alone pins WHICH address the probe used. It does not
+    // pin that the anchor echoed the source it actually saw, and the
+    // two are different claims: run 35185332604 returned a
+    // well-formed reply naming `10.99.0.1:60141` — a faithful mapping
+    // statement about the wrong socket, because the probe left
+    // `0.0.0.0` bound and the kernel chose `br0`'s primary address
+    // out of the four `setup.sh` installs. The client is un-NAT'd on
+    // this topology (`self_nat_class: Open`, no gateway between it
+    // and the wan bridge), so the mapping is the identity and exact
+    // equality is the available statement. Anything else — a rewrite
+    // in the path, a responder echoing a stale or constructed tuple —
+    // fails here instead of passing a prefix check.
+    let local = v["stun_endpoint_local"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the probe must report the tuple it bound: without it the reply can only be \
+             compared against a hardcoded address, which is what let a mapping for a \
+             different socket pass as this client's: {v:#}"
+        )
+    });
+    assert_eq!(
+        mapped, local,
+        "the anchor's XOR-MAPPED-ADDRESS must be the source tuple the probe actually sent \
+         from. This client is not behind a NAT here, so the mapping is the identity: a reply \
+         naming anything else is a statement about some other socket: {v:#}",
+    );
     // The first endpoint, carrying a session — the same assertions
     // the single-endpoint row makes, so this leg is a superset and
     // not a substitute.

@@ -1327,3 +1327,87 @@ are not interchangeable and are not counted as one here.
 So the state of Q2 is: instrumented, pinned by name at the CI floor,
 unrun. It closes when that row runs and passes, or it becomes a
 finding when it runs and does not.
+
+#### Adjacent, same round: the NAT'd anchor's second endpoint served, and the probe was lying about who asked
+
+A separate row — `natsim_natted_anchor_publishes_both_mapped_endpoints`,
+the first user of S6-07.1 — failed in run
+[35185332604](https://github.com/ai-2070/net/actions/runs/35185332604)
+at `tests/natsim.rs:541`. Recorded here because the plausible reading
+was a deployment-envelope limitation and the measurement **refutes**
+it.
+
+What the verdict actually says, in the order the row asserts it:
+
+- `stun_endpoint_target: "10.99.0.2:7103"` equals `anchor_stun_addr`
+  — the probe was aimed at the address read back out of the
+  announcement, not at a flag.
+- `stun_endpoint_probe_ok: true` — line 533 PASSED. An unsolicited
+  binding request from a stranger crossed the gateway's
+  `dnat to 192.168.101.2:7103`, reached a private socket, was served,
+  and the reply came back well-formed enough to parse an
+  XOR-MAPPED-ADDRESS out of. **A port-forwarded STUN endpoint on a
+  NAT'd anchor works, and serves strangers.** That is the deployment
+  shape the row exists to establish, and it held.
+- `stun_endpoint_mapped: "10.99.0.1:60141"` — line 541 failed. The
+  reply named a real address that was not the client's `10.99.0.12`.
+
+**It was source selection in the harness probe, not the DNAT and not
+the reply path.** Three facts separate them:
+
+1. `setup.sh` puts four addresses on `nsim_wan`'s one `br0` —
+   `10.99.0.1/24` FIRST (line 165), then `.10`, `.11`, and `.12`
+   under `--public-b`. `10.99.0.1` is therefore the device's primary.
+2. The client is a joiner launched inside `nsim_wan` with
+   `--bind 10.99.0.12:7002`, but `stun_probe` bound its socket
+   `0.0.0.0:0`. The product's own sockets are bound explicitly; only
+   the probe delegated source selection to the kernel, which picks
+   the outgoing device's primary — `10.99.0.1` — with an ephemeral
+   port, which `60141` is.
+3. Every source-rewriting rule in `one_side` is scoped
+   `oifname "gw$L-wan"` (LAN → WAN). The inbound rule is
+   `iifname "gw$L-wan" udp dport $STUN dnat to $LAN.2:$STUN` —
+   destination only. Nothing rewrote the source on the inbound path,
+   and had anything done so the anchor would have seen the gateway's
+   LAN address `192.168.101.1`, not a wan-bridge address.
+
+So the anchor reported the source it genuinely observed. The reply
+was a faithful mapping statement about the wrong socket — which is
+the failure mode the assertion's own wording names ("about a mapping
+rather than about a local socket"), arriving from the direction
+nobody was watching: the probe, not the responder.
+
+**The envelope claim is refuted, not confirmed.** "A DNAT'd STUN
+endpoint reports a post-prerouting source and so cannot be a
+reflexive oracle for its peers" would have been a real constraint. It
+is not what happened: prerouting rewrote only the destination, and
+the endpoint reported the client's true public tuple. Scoped as
+usual — one anchor behind one `cone`-mode gateway with a single
+forwarded UDP port, one un-NAT'd client on the same simulated
+internet.
+
+**The fix, and the assertion got stronger rather than weaker.**
+`stun_probe` now takes the source address and binds it (`bind.ip()`,
+the address the node's own mesh socket uses); a bind that fails is
+reported as `ok: false` rather than silently downgraded to a wildcard
+socket, because a probe that could not use this node's address cannot
+make a statement about this node's mapping. And the probe now records
+the tuple it actually bound, read back off the socket, as
+`stun_endpoint_local` — so the row asserts
+`stun_endpoint_mapped == stun_endpoint_local` **exactly**, on top of
+the `10.99.0.12:` prefix check rather than instead of it. The prefix
+pins which address was used; the equality pins that the anchor echoed
+the source it really saw. The client is un-NAT'd on this topology, so
+the mapping is the identity and exact equality is the statement
+available; a rewrite in the path or a responder echoing a constructed
+tuple now fails where a prefix check passed. No deadline moved and no
+nftables rule changed.
+
+Not yet re-run in CI, for the same reason Q2 is not: netns needs
+Linux and root. The source-addressing invariant the row now asserts
+was smoke-tested directly — a responder echoing its observed source,
+probed from an explicitly bound socket, returns exactly that socket's
+`getsockname()`, while an unbound socket's own `local_addr` is
+`0.0.0.0` and the process cannot state which source the kernel will
+choose. That is the mechanism, not the topology; the four-address
+selection itself is not reproducible off Linux.

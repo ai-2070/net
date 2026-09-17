@@ -47,7 +47,7 @@ fn main() {
 mod natsim {
 
     use std::collections::HashMap;
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -63,17 +63,43 @@ mod natsim {
         ok: bool,
         target: Option<String>,
         mapped: Option<String>,
+        /// The probe socket's OWN tuple, as the kernel bound it.
+        ///
+        /// Recorded so the row can assert the reply against a value
+        /// this process observed rather than against a hardcoded
+        /// address: on this topology the client is un-NAT'd
+        /// (`self_nat_class: Open`), so a faithful
+        /// XOR-MAPPED-ADDRESS must equal this exactly. A reply that
+        /// names any other tuple is describing a different socket —
+        /// which is the defect this field exists to catch.
+        local: Option<String>,
     }
 
-    /// Send ONE RFC 5389 binding request to `target` and read the
-    /// response's XOR-MAPPED-ADDRESS.
+    /// Send ONE RFC 5389 binding request to `target` **from `local`**,
+    /// and read the response's XOR-MAPPED-ADDRESS.
     ///
     /// Deliberately not an ICE check: a check carries `USERNAME`,
     /// belongs to a session, and never reaches the anchor's bare
     /// responder — so it could not show that the ADVERTISED address
     /// is the one being aimed at.
+    ///
+    /// # Why `local` is a parameter and not `0.0.0.0`
+    ///
+    /// The reply's XOR-MAPPED-ADDRESS is a statement about **the
+    /// source tuple the request actually arrived with**, so it says
+    /// something about THIS node only if the request left from this
+    /// node's own address. A wildcard bind delegates that choice to
+    /// the kernel's source-address selection, which picks the
+    /// outgoing device's PRIMARY address — and `setup.sh` puts four
+    /// addresses on `nsim_wan`'s `br0` (`10.99.0.1` first, then
+    /// `.10`, `.11`, and `.12` under `--public-b`). A public joiner
+    /// bound to `10.99.0.12` therefore probed from `10.99.0.1` and
+    /// was told, correctly, about a mapping that was not its own:
+    /// the reply was a statement about a local socket, which is
+    /// precisely what this probe exists not to be. Binding `local`
+    /// makes the reply about the node.
     #[cfg(feature = "webrtc")]
-    async fn stun_probe(target: &str) -> StunProbe {
+    async fn stun_probe(target: &str, local: IpAddr) -> StunProbe {
         use net::adapter::net::rtc::{parse_xor_mapped_address, STUN_MAGIC_COOKIE};
 
         let mut probe = StunProbe {
@@ -83,9 +109,18 @@ mod natsim {
         let Ok(addr) = target.parse::<SocketAddr>() else {
             return probe;
         };
-        let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+        // This node's own address, ephemeral port. A failed bind is
+        // NOT silently downgraded to a wildcard one: a probe that
+        // could not use this node's address cannot make a statement
+        // about this node's mapping, so `ok: false` is the honest
+        // outcome and the row fails naming it.
+        let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::new(local, 0)).await else {
             return probe;
         };
+        // Read back from the socket, not assembled from `local` and a
+        // guess: the port is the kernel's choice and the row compares
+        // the anchor's reply against it.
+        probe.local = socket.local_addr().ok().map(|a| a.to_string());
         // A binding request is 20 bytes: type, length, cookie, id.
         let mut request = Vec::with_capacity(20);
         request.extend_from_slice(&0x0001u16.to_be_bytes());
@@ -112,7 +147,7 @@ mod natsim {
     }
 
     #[cfg(not(feature = "webrtc"))]
-    async fn stun_probe(_target: &str) -> StunProbe {
+    async fn stun_probe(_target: &str, _local: IpAddr) -> StunProbe {
         StunProbe::default()
     }
     /// How long coordination waits (files, reflex visibility) may take.
@@ -787,8 +822,10 @@ mod natsim {
                 // **The SECOND announced endpoint, probed for real
                 // (Stage 6 §6.12.2).**
                 //
-                // One unsolicited binding request from a fresh
-                // socket, aimed at `rtc_stun_addr` — the address the
+                // One unsolicited binding request from a fresh socket
+                // bound to THIS NODE'S OWN address (`bind.ip()`, the
+                // address its mesh socket uses), aimed at
+                // `rtc_stun_addr` — the address the
                 // ANCHOR ANNOUNCED, not a flag this process was
                 // given. Unlike the `rtc_addr` probe below, this one
                 // is expected to be ANSWERED: an ICE socket behind an
@@ -804,20 +841,26 @@ mod natsim {
                 // back — and its XOR-MAPPED-ADDRESS is this client's
                 // own public tuple as the ANCHOR saw it. Two
                 // externally reachable mappings on one NAT'd anchor,
-                // each observed with its own reply.
+                // each observed with its own reply. The source
+                // address is pinned rather than left to the kernel
+                // because otherwise the reply describes whichever of
+                // `br0`'s four addresses won source selection, not
+                // this node — see `stun_probe`.
                 //
                 // Probed BEFORE the binding below, which shadows the
                 // function's own name.
                 let stun_endpoint_probe = match anchor_stun_addr.as_deref() {
-                    Some(addr) => stun_probe(addr).await,
+                    Some(addr) => stun_probe(addr, bind.ip()).await,
                     None => StunProbe::default(),
                 };
 
                 // **R8, evidence half.** One unsolicited binding
                 // request aimed at the announced RTC address, from a
-                // FRESH socket. Under this topology it is expected to
-                // be dropped, and that is worth recording rather than
-                // asserting: the cone gateway is address-restricted
+                // FRESH socket bound to this node's own address for
+                // the same reason as above. Under this topology it is
+                // expected to be dropped, and that is worth recording
+                // rather than asserting: the cone gateway is
+                // address-restricted
                 // by construction (`setup.sh` installs
                 // `iifname gw?-wan udp dport <rtc> ct state new drop`
                 // precisely so the scenario models a restricted NAT
@@ -827,7 +870,7 @@ mod natsim {
                 // STUN server" is false here BY DESIGN, and asserting
                 // it would be asserting the wrong topology.
                 let stun_probe = match anchor_rtc_addr.as_deref() {
-                    Some(addr) => stun_probe(addr).await,
+                    Some(addr) => stun_probe(addr, bind.ip()).await,
                     None => StunProbe::default(),
                 };
 
@@ -901,11 +944,16 @@ mod natsim {
                     // answered — which is the only way a mapping is
                     // observed from outside rather than asserted from
                     // inside. `stun_endpoint_mapped` is this client's
-                    // own public tuple as the anchor saw it.
+                    // own public tuple as the anchor saw it, and
+                    // `stun_endpoint_local` is the same tuple as THIS
+                    // process bound it — the client is un-NAT'd here,
+                    // so a faithful reply must equal it exactly, and
+                    // the row asserts that rather than a prefix.
                     "anchor_stun_addr": anchor_stun_addr,
                     "stun_endpoint_probe_ok": stun_endpoint_probe.ok,
                     "stun_endpoint_target": stun_endpoint_probe.target,
                     "stun_endpoint_mapped": stun_endpoint_probe.mapped,
+                    "stun_endpoint_local": stun_endpoint_probe.local,
                     // **R8, verdict half.** The address the client's
                     // ICE stack is actually transmitting to, and
                     // WHERE IT CAME FROM. `signalled` means it was
