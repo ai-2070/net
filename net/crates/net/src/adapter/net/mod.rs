@@ -168,7 +168,8 @@ pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, 
 // are absent.
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, ThreadLocalPool};
 pub use protocol::{
-    EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
+    EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, MAX_PACKET_SIZE,
+    MAX_PAYLOAD_SIZE, NONCE_SIZE, TAG_SIZE,
 };
 pub use proxy::{
     ForwardResult, HopStats, MultiHopPacketBuilder, NetProxy, ProxyConfig, ProxyError, ProxyStats,

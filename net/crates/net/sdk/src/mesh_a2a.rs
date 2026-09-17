@@ -172,15 +172,21 @@ pub const A2A_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Python bindings and by every peer on an older build). That encoding
 /// costs up to **four bytes per payload byte** — `255,` — so an encoded
 /// brief is quadrupled before it is framed. nRPC would accept 4 MiB, but
-/// one mesh packet is `MAX_PACKET_SIZE` (8 KiB), and a request that does not
+/// one mesh packet is [`MAX_PACKET_SIZE`], and a request that does not
 /// fit is never delivered: before this limit existed, a brief with a
 /// ~2 KB prompt simply vanished and the caller — with no deadline — waited
 /// for a reply that could never come.
 ///
-/// Derived from the transport rather than guessed: the per-packet
-/// payload budget, less a reserve for the nRPC request framing that
-/// shares the packet (service name, call id, and the payment headers a
-/// paid submit carries), divided by the envelope's worst-case expansion.
+/// Derived from the transport, not copied from it: the per-packet payload
+/// budget [`MAX_PAYLOAD_SIZE`] (itself `MAX_PACKET_SIZE - HEADER_SIZE -
+/// TAG_SIZE`), less a reserve for the nRPC request framing that shares
+/// the packet (service name, call id, and the payment headers a paid
+/// submit carries), divided by the envelope's worst-case expansion. A
+/// change to the packet budget therefore moves this limit at compile
+/// time rather than leaving a stale number behind — and
+/// `a_brief_at_the_wire_limit_round_trips` sends a brief of exactly this
+/// size over a real two-node wire, so the arithmetic is checked against
+/// the transport as well as against itself.
 ///
 /// **A brief over this limit is refused locally**
 /// ([`A2aFlowError::BriefTooLarge`]) and a configured service may not
@@ -188,20 +194,11 @@ pub const A2A_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// (`ServeError::A2aUndeliverableBounds`). Work that needs more room
 /// belongs in a context artifact ref, which is what briefs carry refs
 /// for.
-pub const A2A_MAX_BRIEF_BYTES: usize =
-    (A2A_PACKET_PAYLOAD_BUDGET - A2A_FRAMING_RESERVE) / JSON_BYTE_ARRAY_COST;
-
-/// Bytes of application payload one mesh packet carries:
-/// `MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE` from the core protocol.
 ///
-/// **Mirrored, not imported** — core's `protocol` module is private, and
-/// widening its public surface to publish two numbers would be a worse
-/// trade than copying them. A mirrored constant can drift, so it is not
-/// left to trust: `a_brief_at_the_wire_limit_round_trips` sends a brief
-/// of exactly [`A2A_MAX_BRIEF_BYTES`] over a real two-node wire, so a
-/// shrinking packet budget fails that witness instead of silently
-/// reintroducing vanished requests.
-const A2A_PACKET_PAYLOAD_BUDGET: usize = 8192 - 68 - 16;
+/// [`MAX_PACKET_SIZE`]: net::adapter::net::MAX_PACKET_SIZE
+/// [`MAX_PAYLOAD_SIZE`]: net::adapter::net::MAX_PAYLOAD_SIZE
+pub const A2A_MAX_BRIEF_BYTES: usize =
+    (net::adapter::net::MAX_PAYLOAD_SIZE - A2A_FRAMING_RESERVE) / JSON_BYTE_ARRAY_COST;
 
 /// Worst-case bytes the array-of-bytes envelope spends per payload byte:
 /// three digits and a separator (`255,`).
