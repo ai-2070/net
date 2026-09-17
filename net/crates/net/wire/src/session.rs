@@ -3180,7 +3180,7 @@ impl StreamState {
     /// belong to what THIS side sends, and a peer's reset is not a
     /// statement about them. The boundary returns to the unstated
     /// value for the mode the receive half is in, exactly as
-    /// [`NetSession::implicit_stream_state`] starts it, so a
+    /// `NetSession::implicit_stream_state` starts it, so a
     /// reliable stream keeps a coherent `rx_stream_mode` (assumed
     /// boundary 0 against a cursor at 0) instead of claiming to be
     /// fire-and-forget while reliable machinery tracks it.
