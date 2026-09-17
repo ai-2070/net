@@ -136,6 +136,7 @@ export type ReplicaEvent =
   | { t: 'cancel' }
   | { t: 'reconnect'; q: string }
   | { t: 'assemblyDeadline' }
+  | { t: 'leave' }
   | { t: 'recv'; m: Message };
 
 function drop(r: Replica, reason: string): Replica {
@@ -263,6 +264,10 @@ export function replicaStep(r: Replica, e: ReplicaEvent): Replica {
       };
     }
 
+    case 'leave':
+      // The caller is done: terminal, and locally decided.
+      return { ...r, state: 'closed', published: false, slot: null, waiters: 0, out: [] };
+
     case 'assemblyDeadline': {
       if (r.assembling === null) return drop(r, 'deadline-no-assembly');
       return recover({ ...r, assembling: null }, `rs-${r.retired}`);
@@ -367,17 +372,23 @@ function receive(r: Replica, m: Message): Replica {
 
     case 'no': {
       if (m.q !== null && m.q !== r.slot) return drop(r, 'no-wrong-slot');
-      if (m.code === 'closed') return { ...r, state: 'closed', published: false, out: [] };
-      if (m.code === 'unknown-handle') {
-        // The handle is gone. Only `join` can create one, so automatic
-        // recovery rejoins rather than resuming something the owner has
-        // never heard of.
-        //
-        // Generations are monotone **per handle** (§1.7a), so every
-        // generation value is scoped to the handle that issued it and
-        // MUST be discarded with it. Carrying `retired` across would
-        // make the new handle's first installation — generation 1 —
-        // fail `g > retired` and strand the rejoin.
+
+      // `owner-lost` is the terminal one: the incarnation that held the
+      // document is gone, so there is nothing to rejoin.
+      if (m.code === 'owner-lost') {
+        return { ...r, state: 'closed', handle: null, published: false, out: [] };
+      }
+
+      // `closed` covers **every** unusable handle — unknown, expired,
+      // fenced, or bound to another peer — deliberately one code, so a
+      // refusal cannot disclose that a handle exists (§2). It is
+      // terminal for the handle and for every action in flight on it:
+      // nothing is replayed and no outcome is inferred (§1.10). The
+      // *subscription* is recoverable, and the only path to a handle is
+      // `join`, so the replica discards everything handle-scoped —
+      // including the generation watermark, since generations are
+      // monotone per handle — and rejoins.
+      if (m.code === 'closed') {
         const q = `j-re-${m.q ?? 'x'}`;
         return {
           ...r,
@@ -396,6 +407,7 @@ function receive(r: Replica, m: Message): Replica {
           out: [{ k: 'join', q, aud: r.desired }],
         };
       }
+
       return {
         ...r,
         state: 'fenced',
@@ -414,12 +426,11 @@ function receive(r: Replica, m: Message): Replica {
 /**
  * Per-handle installation state.
  *
- * **Everything about an installation is scoped to its handle.** The
- * round-4 model kept `g`, `aud`, `unsent` and `deferred` owner-global,
- * so a second join retired the first handle's unsent chunks and
- * redirected the remainder — two replicas sharing one installation
- * slot. Only the store revision is genuinely global, because it is a
- * property of the document rather than of a subscription.
+ * **Everything about an installation is scoped to its handle**, including
+ * the generation allocator, the audience, the ordered output queue and
+ * any deferred projection. Only the store revision is genuinely global,
+ * because it is a property of the document rather than of a
+ * subscription.
  */
 export interface OwnerHandle {
   readonly live: boolean;
@@ -431,12 +442,23 @@ export interface OwnerHandle {
   readonly g: number;
   /** The revision the current snapshot was taken at. */
   readonly at: number;
-  /** The highest revision emitted to this handle. */
+  /** The highest revision emitted **or queued** for this handle. */
   readonly sent: number;
-  /** Chunks of the current installation not yet handed over. */
-  readonly unsent: number;
+  /**
+   * This handle's ordered output queue: work handed to the transport in
+   * exactly this order. A `delta` produced while chunks are still
+   * queued goes **behind** them, which is what makes the
+   * snapshot/live boundary of §1.9a a property of the emitter rather
+   * than a hope about scheduling.
+   */
+  readonly queue: readonly Message[];
   /** A projection waiting for availability (§1.8). */
   readonly deferred: { readonly q: string | null; readonly aud: readonly string[] } | null;
+  /**
+   * The queue overflowed its bound, so catching up incrementally is no
+   * longer possible: replace the installation once the queue drains.
+   */
+  readonly replaceWhenDrained: boolean;
 }
 
 export interface Owner {
@@ -448,14 +470,24 @@ export interface Owner {
   readonly issued: number;
   /** Whether a projection can be taken right now. */
   readonly canProject: boolean;
+  /** Messages handed over immediately: refusals, and queue-head work. */
   readonly out: readonly Message[];
-  /** Chunks retired without being emitted. */
+  /** Snapshot chunks retired without being emitted. */
   readonly retiredUnsent: number;
   /** Deferred projections discarded because their handle died first. */
   readonly deferredRetired: number;
+  /** Deltas discarded because the queue bound was reached. */
+  readonly retiredDeltas: number;
   /** Chunks each snapshot is split into, for this model. */
   readonly chunkCount: number;
 }
+
+/**
+ * How much unsent work one handle may hold before incremental catch-up
+ * is abandoned in favour of a replacement snapshot — the §1.9
+ * delta-over-budget disposition, applied to queue depth.
+ */
+export const QUEUE_MAX = 6;
 
 export function newOwner(chunks = 2): Owner {
   return {
@@ -466,6 +498,7 @@ export function newOwner(chunks = 2): Owner {
     out: [],
     retiredUnsent: 0,
     deferredRetired: 0,
+    retiredDeltas: 0,
     chunkCount: chunks,
   };
 }
@@ -479,19 +512,43 @@ export type OwnerEvent =
   | { t: 'projectable'; can: boolean };
 
 function refuse(o: Owner, h: string, q: string | null): Owner {
-  return { ...o, out: [{ k: 'no', h, q, code: 'unknown-handle' }] };
+  return { ...o, out: [{ k: 'no', h, q, code: 'closed' }] };
+}
+
+/** Snapshot chunks still queued for a handle. */
+export function unsent(o: Owner, h: string): number {
+  const rec = o.handles[h];
+  if (rec === undefined) return 0;
+  return rec.queue.filter((m) => m.k === 'snap').length;
+}
+
+/** Handles with output still to hand over, in issuance order. */
+export function emitting(o: Owner): string[] {
+  return Object.entries(o.handles)
+    .filter(([, rec]) => rec.live && rec.queue.length > 0)
+    .map(([h]) => h);
+}
+
+function countSnaps(queue: readonly Message[]): number {
+  return queue.filter((m) => m.k === 'snap').length;
 }
 
 /**
- * Allocate this handle's next installation generation and emit its
- * manifest. Liveness is revalidated here, which is what makes it safe
- * to reach from deferred completion: an expired handle is refused, and
- * refusal never recreates admission.
+ * Allocate this handle's next installation generation, hand over its
+ * manifest, and queue its chunks.
+ *
+ * Liveness is revalidated here, which is what makes it safe to reach
+ * from deferred completion: an expired handle is refused, and refusal
+ * never recreates admission.
  */
 function install(o: Owner, h: string, q: string | null, aud: readonly string[]): Owner {
   const rec = o.handles[h];
   if (rec === undefined || !rec.live) return refuse(o, h, q);
   const g = rec.allocated + 1;
+  const chunks: Message[] = [];
+  for (let i = 0; i < o.chunkCount; i += 1) {
+    chunks.push({ k: 'snap', h, g, r: o.r, n: o.chunkCount, i });
+  }
   return {
     ...o,
     handles: {
@@ -503,12 +560,15 @@ function install(o: Owner, h: string, q: string | null, aud: readonly string[]):
         g,
         at: o.r,
         sent: o.r,
-        // A superseded installation's unsent chunks are retired.
-        unsent: o.chunkCount,
+        // The superseded installation's queued work is retired: its
+        // chunks are never emitted and its deltas never sent.
+        queue: chunks,
         deferred: null,
+        replaceWhenDrained: false,
       },
     },
-    retiredUnsent: o.retiredUnsent + rec.unsent,
+    retiredUnsent: o.retiredUnsent + countSnaps(rec.queue),
+    retiredDeltas: o.retiredDeltas + rec.queue.filter((m) => m.k === 'delta').length,
     out: [{ k: 'man', h, g, r: o.r, n: o.chunkCount, q }],
   };
 }
@@ -519,11 +579,11 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
       if (!e.can) return { ...o, canProject: false, out: [] };
       // Completion after deferral is a second admission point, not a
       // continuation of the first. Each pending projection is cleared
-      // and then re-submitted to `install`, which is the single place
-      // where a projection becomes an installation and therefore the
-      // single place the handle's liveness is revalidated. A dead
-      // handle is refused — and the refusal is *delivered*, so the
-      // caller rejoins rather than waiting on silence.
+      // and re-submitted to `install`, the single place where a
+      // projection becomes an installation and therefore the single
+      // place the handle's liveness is revalidated. A dead handle is
+      // refused, and the refusal is *delivered*, so the caller rejoins
+      // instead of waiting out its deadline.
       let next: Owner = { ...o, canProject: true, out: [] };
       const emitted: Message[] = [];
       for (const [h, rec] of Object.entries(o.handles)) {
@@ -546,13 +606,16 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
     case 'expire': {
       const rec = o.handles[e.h];
       if (rec === undefined) return { ...o, out: [] };
-      // Expiry retires this handle's work: no chunks of a dead handle
-      // are emitted, and no deferred projection of a dead handle is
-      // completed later.
+      // Expiry retires this handle's work: no queued chunk of a dead
+      // handle is emitted, and no deferred projection of a dead handle
+      // is completed later.
       return {
         ...o,
-        handles: { ...o.handles, [e.h]: { ...rec, live: false, unsent: 0, deferred: null } },
-        retiredUnsent: o.retiredUnsent + rec.unsent,
+        handles: {
+          ...o.handles,
+          [e.h]: { ...rec, live: false, queue: [], deferred: null, replaceWhenDrained: false },
+        },
+        retiredUnsent: o.retiredUnsent + countSnaps(rec.queue),
         deferredRetired: o.deferredRetired + (rec.deferred === null ? 0 : 1),
         out: [],
       };
@@ -571,8 +634,9 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
           g: 0,
           at: 0,
           sent: 0,
-          unsent: 0,
+          queue: [],
           deferred: null,
+          replaceWhenDrained: false,
         };
         const seeded: Owner = {
           ...o,
@@ -590,11 +654,13 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
       }
 
       // Every other request must name a live handle this owner issued.
+      // Unknown, expired and bound-to-another-peer are one refusal, so
+      // the code cannot disclose which (§2).
       const rec = o.handles[req.h];
       if (rec === undefined || !rec.live) return refuse(o, req.h, req.q);
 
       // Lifecycle controls are admitted whatever is being emitted
-      // (§1.7b): a newer transition supersedes and retires unsent work.
+      // (§1.7b): a newer transition supersedes and retires queued work.
       // `resync` recovers within the audience bound to the handle;
       // `aud`/`resume` carry the caller's desired audience.
       const aud = req.k === 'resync' ? rec.aud : req.aud;
@@ -612,34 +678,61 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
     }
 
     case 'advance': {
-      // The document advances for every live subscription at once. A
-      // handle mid-emission still gets its delta, queued behind its own
-      // chunks on its own ordered stream, based at the revision its
-      // snapshot was taken at.
+      // The document advances for every live subscription at once —
+      // including handles mid-emission, which is ordinary. Their delta
+      // is **queued behind their own chunks**, based at the revision
+      // their snapshot was taken at, so a delta can never reach a
+      // replica before the snapshot it applies to.
       const r = o.r + 1;
       const handles: Record<string, OwnerHandle> = { ...o.handles };
       const out: Message[] = [];
+      let retiredDeltas = o.retiredDeltas;
       for (const [h, rec] of Object.entries(o.handles)) {
         if (!rec.live || rec.g === 0) continue;
-        out.push({ k: 'delta', h, g: rec.g, base: rec.sent, r });
-        handles[h] = { ...rec, sent: r };
+        const delta: Message = { k: 'delta', h, g: rec.g, base: rec.sent, r };
+        if (rec.queue.length === 0) {
+          // Nothing outstanding: hand it over now.
+          out.push(delta);
+          handles[h] = { ...rec, sent: r };
+          continue;
+        }
+        if (rec.replaceWhenDrained) {
+          // Already decided: catch-up is abandoned, so this delta is
+          // retired too rather than re-queued behind the replacement.
+          retiredDeltas += 1;
+          handles[h] = { ...rec, sent: r };
+          continue;
+        }
+        if (rec.queue.length >= QUEUE_MAX) {
+          // Bounded pending work: incremental catch-up is abandoned and
+          // the installation is replaced once the queue drains. The
+          // queued deltas are retired rather than accumulated.
+          const kept = rec.queue.filter((m) => m.k !== 'delta');
+          retiredDeltas += rec.queue.length - kept.length;
+          handles[h] = { ...rec, queue: kept, sent: r, replaceWhenDrained: true };
+          continue;
+        }
+        handles[h] = { ...rec, queue: [...rec.queue, delta], sent: r };
       }
-      return { ...o, r, handles, out };
+      return { ...o, r, handles, retiredDeltas, out };
     }
 
     case 'refresh': {
       const rec = o.handles[e.h];
       if (rec === undefined || !rec.live || rec.g === 0) return { ...o, out: [] };
-      // **The owner never supersedes its own in-flight emission.** If it
-      // did, the replica — which refuses unsolicited manifests while
-      // installing — would keep an assembly whose remaining chunks were
-      // just retired, and would then drop the replacement's chunks as
-      // belonging to no assembly: both generations stalled until a
-      // deadline. A replacement is decided when emission is complete
-      // (the delta-over-budget case in §1.9 is evaluated at delta time,
-      // which is already idle), so refreshing mid-emission is refused
-      // at the source rather than repaired at the replica.
-      if (rec.unsent > 0) return { ...o, out: [] };
+      // **An owner refresh never takes the caller's turn.**
+      // - Not while a projection cannot be taken: it would emit a
+      //   manifest the owner cannot follow with chunks.
+      // - Not while a solicited transition is pending: `install` clears
+      //   `deferred`, so refreshing here would silently discard the
+      //   caller's request and its desired audience, leaving
+      //   availability restoration with nothing to complete.
+      // - Not while this handle's own emission is outstanding: the
+      //   replica refuses unsolicited manifests mid-transition, so both
+      //   generations would stall until a deadline.
+      if (!o.canProject || rec.deferred !== null || rec.queue.length > 0) {
+        return { ...o, out: [] };
+      }
       return install(o, e.h, null, rec.aud);
     }
 
@@ -650,38 +743,52 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
       if (rec === undefined) return { ...o, out: [] };
       return {
         ...o,
-        handles: { ...o.handles, [e.h]: { ...rec, unsent: 0 } },
-        retiredUnsent: o.retiredUnsent + rec.unsent,
+        handles: { ...o.handles, [e.h]: { ...rec, queue: [] } },
+        retiredUnsent: o.retiredUnsent + countSnaps(rec.queue),
         out: [],
       };
     }
   }
 }
 
-/** The handles with chunks still to hand over, in issuance order. */
-export function emitting(o: Owner): string[] {
-  return Object.entries(o.handles)
-    .filter(([, rec]) => rec.live && rec.unsent > 0)
-    .map(([h]) => h);
-}
-
 /**
- * Hand the next unsent chunk of one handle to the transport. With no
- * handle named, the first one with work pending.
+ * Hand over one handle's next queued message, in order. With no handle
+ * named, the first one with work pending.
+ *
+ * When the queue drains and the bound was reached earlier, the
+ * replacement installation is allocated here — it is the first moment
+ * at which nothing of the old installation is outstanding.
  */
-export function emitChunk(o: Owner, handle?: string): { owner: Owner; message: Message | null } {
+export function emitNext(o: Owner, handle?: string): { owner: Owner; message: Message | null } {
   const h = handle ?? emitting(o)[0];
   const rec = h === undefined ? undefined : o.handles[h];
-  if (h === undefined || rec === undefined || !rec.live || rec.unsent === 0) {
+  if (h === undefined || rec === undefined || !rec.live || rec.queue.length === 0) {
     return { owner: { ...o, out: [] }, message: null };
   }
-  const i = o.chunkCount - rec.unsent;
-  return {
-    owner: {
-      ...o,
-      handles: { ...o.handles, [h]: { ...rec, unsent: rec.unsent - 1 } },
-      out: [],
-    },
-    message: { k: 'snap', h, g: rec.g, r: rec.at, n: o.chunkCount, i },
+  const [message, ...queue] = rec.queue;
+  if (message === undefined) return { owner: { ...o, out: [] }, message: null };
+  let next: Owner = {
+    ...o,
+    handles: { ...o.handles, [h]: { ...rec, queue } },
+    out: [],
   };
+  if (queue.length === 0 && rec.replaceWhenDrained) {
+    const drained = next.handles[h];
+    if (drained !== undefined) {
+      const cleared: Owner = {
+        ...next,
+        handles: { ...next.handles, [h]: { ...drained, replaceWhenDrained: false } },
+      };
+      next = next.canProject
+        ? install(cleared, h, null, drained.aud)
+        : {
+            ...cleared,
+            handles: {
+              ...cleared.handles,
+              [h]: { ...drained, replaceWhenDrained: false, deferred: { q: null, aud: drained.aud } },
+            },
+          };
+    }
+  }
+  return { owner: next, message };
 }

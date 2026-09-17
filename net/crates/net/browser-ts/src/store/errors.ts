@@ -19,8 +19,16 @@
  * - `capacity` — a declared bound was reached.
  * - `timeout` / `aborted` — the caller's deadline or signal fired.
  * - `indeterminate` — submitted, and no response established the outcome.
- * - `owner-lost` — the store incarnation ended.
- * - `closed` — this handle is fenced.
+ * - `owner-lost` — the store incarnation ended. Terminal: there is no
+ *   handle to obtain, because the owner that held the document is gone.
+ * - `closed` — **this handle is unusable**: unknown, expired, fenced by
+ *   the owner, or bound to another peer. Deliberately one code for all
+ *   four, so a refusal cannot disclose whether a handle exists. It is
+ *   terminal for the handle and for any action in flight on it —
+ *   nothing is replayed and no outcome is inferred, exactly as for
+ *   `result-expired` below — while the *subscription* is recoverable by
+ *   joining afresh, which yields a new handle rather than resuming the
+ *   old one.
  * - `action-rejected` — the owner refused this action, or a handler broke
  *   the synchronous-transaction contract.
  * - `result-expired` — **this request cannot execute again, and its

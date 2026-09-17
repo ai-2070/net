@@ -238,6 +238,28 @@ including `result-expired`. `s` appears only when the refusal answers a
 specific `act`. `in` carries **no** `q`: it is fire-and-forget and has no
 reply, so there is nothing to correlate (§1.11).
 
+**Handle loss has one code, and it is `closed`.** The frozen taxonomy
+already carries what is needed, so no code is added:
+
+| Code | Scope | Replica disposition |
+|---|---|---|
+| `closed` | the handle is unusable: unknown, expired, fenced by the owner, or bound to another peer | **terminal for the handle** and for every action in flight on it — nothing replayed, no outcome inferred (§1.10) — and **recoverable for the subscription**: discard all handle-scoped state and `join` afresh, under bounded backoff |
+| `owner-lost` | the store incarnation that held the document is gone | terminal: there is nothing to rejoin |
+| anything else (`forbidden`, `capacity`, `invalid-data`, `not-ready`, `timeout`, `aborted`, `action-rejected`, `indeterminate`, `result-expired`, `version-mismatch`) | the **request** was refused | the handle survives; the request's waiters reject with the code |
+
+A separate `unknown-handle` code was considered and **rejected**: it
+would re-open the disclosure channel this section closes two paragraphs
+below, where a `resume` for a handle bound to another peer must be
+`closed` rather than `forbidden` precisely so that a refusal cannot
+reveal whether a handle exists. A code that distinguishes "never
+existed" from "not yours" is that disclosure with a different spelling.
+One code, one disposition, and the recoverable/terminal distinction is
+carried by `closed` versus `owner-lost`.
+
+Rejoining is a **new** handle and a new incarnation of the view, not a
+resumption: generations restart at 1 (§1.7a), and a rejoin refused
+`forbidden` is what stops the loop rather than a retry budget.
+
 **`man` is the one manifest shape**, for all three cases that install a
 view: a `join`, an accepted `aud`, and a `resync`. It states the
 generation, the revision the snapshot is taken at, the chunk count and
@@ -448,7 +470,9 @@ caller-initiated request (`aud`, `resync`, `resume`).
 | `ready` | reconnect | `installing` | status `reconnecting`/`stale`; **the last snapshot is retained, not cleared** (§1.6 — the audience has not changed); one `resume`, its `q` the slot |
 | `joining`/`installing`, **handle learned** | reconnect | `installing` | **the lost session's assembly is retired**; one `resume` whose `aud` is the **latest desired audience**, never the owner's older one; a published view is retained and marked stale |
 | `joining`, **no handle learned yet** | reconnect | `joining` | a fresh **`join`**, not a `resume`: only `join` creates a handle, and the replica has none to resume (§2) |
-| any live | `no {unknown-handle}` for the slot's `q` | `joining` | the handle is discarded, the view cleared, and **one fresh `join`** issued — the only path that can produce a new handle |
+| any live | `no {closed}` (correlated, or the unsolicited expiry notice) | `joining` | the handle and **all** its generation state are discarded, the view cleared, and **one fresh `join`** issued — the only path that can produce a handle. Nothing is replayed (§1.10) |
+| any live | `no {owner-lost}` | `closed` | terminal: the incarnation that held the document is gone, so there is nothing to rejoin |
+| any live | any other `no` for the slot's `q` | `fenced` | the **request** was refused, not the subscription: the handle survives |
 | any | a message naming a handle other than the learned one | unchanged | dropped and counted (`foreign-handle`) |
 | `ready` | gap / patch failure / assembly abandoned | `installing` | one `resync` carrying the **advisory** `(g, have)` of what is installed now (§1.8) |
 | `installing` | `man` admitted (`q` = slot, `g > retired`) | `installing` | `retired := g`; `assembling := g`; open the assembly |
@@ -513,7 +537,7 @@ owner instead of the handle:
   handle's unsent chunks.
 - **Generations restart per handle.** Handle B's first installation is
   generation 1 even though handle A reached 7. This is why a replica
-  that discards a handle (§2's `unknown-handle` path) must discard
+  that discards a handle (§2's `closed` path) must discard
   `installed`/`retired`/`assembling` with it: keeping A's watermark
   would fail `g > retired` against B's generation 1 and strand the
   rejoin.
@@ -526,9 +550,16 @@ owner instead of the handle:
   Completion is therefore a **second admission point**: the pending
   projection is re-submitted to the one place where a projection
   becomes an installation, which revalidates the handle and refuses a
-  dead one with a **delivered** `no {unknown-handle}` — so the caller
-  rejoins instead of waiting out its deadline. Refusal never recreates
+  dead one with a **delivered** `no {closed}` — so the caller rejoins
+  instead of waiting out its deadline. Refusal never recreates
   admission: only `join` does that.
+- **An owner refresh never takes the caller's turn.** It is refused at
+  the source when a projection cannot be taken, when a solicited
+  transition is already pending for that handle, or while that handle's
+  own emission is outstanding (§1.9a). Installing clears `deferred`, so
+  a refresh in the second case would silently discard the caller's
+  request and its desired audience and leave availability restoration
+  with nothing to complete.
 
 ### 1.7b Control admission is not gameplay readiness
 
@@ -589,7 +620,7 @@ Two separate admission classes:
   earlier text contradicted. A newer control replaces the pending
   projection rather than queueing behind it. **A dead handle never
   acquires one:** a control on an expired handle is refused
-  `unknown-handle` before the deferral branch, and expiry retires any
+  `closed` before the deferral branch, and expiry retires any
   projection already pending (§1.7a). Completion revalidates regardless,
   because the handle can die between deferral and availability.
 - v1 defines no delta-from-`have` path and a caller must not depend on
@@ -710,11 +741,28 @@ Consequences, including the cases the HOLDs named:
 
 **Assumption, stated because it is load-bearing: one reliable, ordered
 stream per handle.** Every kind for a handle — `man`, `snap`, `delta`,
-`res`, `no` — rides that one stream in emission order, so a `delta`
-cannot arrive before the chunks of the installation it applies to, and
-a replacement `man` cannot arrive before the chunks of the installation
-it replaces. This is what makes the snapshot/live boundary a boundary
-rather than a race, and it is why v1 needs no delta buffer.
+`res`, `no` — rides that one stream in emission order, so what the
+owner hands over first arrives first.
+
+**Ordered transport is not an emission order.** FIFO delivery only
+preserves the order the owner *produced*; it cannot repair an owner
+that produces a `delta` while that handle's snapshot chunks are still
+unsent. So the boundary is a property of the **emitter**: each handle
+has one ordered output queue, and a `delta` produced mid-emission is
+queued **behind** that handle's remaining chunks, based at the revision
+its snapshot was taken at. The document may advance whenever it likes;
+`advance` touches every live handle and each one's delta waits for its
+own snapshot. That is what makes the snapshot/live boundary a boundary
+rather than a race, and it is why v1 needs no delta *buffer* on the
+replica — the ordering is established before the bytes leave.
+
+**Pending work is bounded.** A handle's queue has a ceiling. Reaching
+it means incremental catch-up has failed for that subscription, so the
+queued deltas are retired and the installation is **replaced** once the
+queue drains — the same disposition §1.9 gives a single over-budget
+delta, applied to queue depth. A replica is therefore never asked to
+hold unbounded work, and never has to ask for a recovery the owner
+could see coming.
 
 Two rules keep that assumption from becoming load-bearing for
 **silence** as well as for liveness — a broken assumption must produce
@@ -728,8 +776,8 @@ owner for ever:
   installing (§1.7a) — would hold an assembly whose remaining chunks
   the owner just retired, and would then drop the replacement's chunks
   as belonging to no assembly: *both* generations stalled until a
-  deadline. The delta-over-budget replacement of §1.9 is decided at
-  delta time, which is idle by construction, so this costs nothing.
+  deadline. The owner is not otherwise constrained: the document may
+  advance whenever it likes, including mid-emission (below).
   A **caller** control still supersedes mid-emission (§1.7b): its
   manifest is solicited, and the replica is waiting for exactly that
   `q`.
@@ -918,13 +966,13 @@ alternative and is rejected: it opens exactly the window in which the
 wider previous audience is delivered.
 
 **Only `join` creates a handle.** Every other request carries `h` and
-is refused `unknown-handle` when `h` is unknown or expired — an owner
+is refused `closed` when `h` is unknown or expired — an owner
 must never allocate a handle to satisfy a `resume`, because an
 unauthenticated-by-construction `h` is exactly what a forged `resume`
 supplies. Before a handle has been **learned** (the caller has sent
 `join` but no `man` has arrived), automatic reconnect therefore issues
 a **fresh `join`**, not a `resume`: the replica has nothing to resume.
-On `no {unknown-handle}` the replica discards its handle and rejoins,
+On `no {closed}` the replica discards its handle and rejoins,
 which is the only path that can produce a new one. It discards the
 handle's **generation state** with it — `installed`, `retired`,
 `assembling`, and the recovery flags — because generations are monotone
@@ -1197,7 +1245,7 @@ owner reducer, and a harness in `browser-ts/test/store/lifecycle.test.ts`
 that delivers in per-direction FIFO order, routes by handle to either
 of two replicas, stalls the owner, expires handles, breaks sessions,
 and (only for the §1.9a witnesses) injects out-of-order delivery.
-**47 witnesses**, plus a **29-inverse** campaign.
+**58 witnesses**, plus a **37-inverse** campaign.
 
 It is test-only by construction: no production export, no transport, no
 new protocol subsystem, no `src/` change, bundle unchanged. It is not
@@ -1239,13 +1287,17 @@ not transition traces.
 | expiry retires pending work | "expiry retires the pending projection instead of completing it", with "a live deferred projection still completes" as its control | expiry marks only the flag → **1 failed** |
 | completion is a second admission point | "completion refuses a handle that died without retiring its work"; "a control on an expired handle is refused, not deferred" | completion does not revalidate → **1 failed**; control admitted on a dead handle → **1 failed** |
 | generations are per handle | "a request on an expired handle is refused, and recovery rejoins at generation 1" | discarded handle's watermark retained → **3 failed** |
+| the emitter establishes the snapshot/live boundary | "an advance during emission is queued behind the chunks it depends on"; "several advances during one emission all land, in order" | hand the delta over ahead of unsent chunks → **3 failed** |
+| pending work is bounded | "pending work is bounded: catch-up gives way to a replacement" | unbounded queue → **1 failed**; drained queue never replaces → **1 failed** |
+| an owner refresh never takes the caller's turn | "does not replace a deferred caller transition"; "does not emit a manifest it cannot follow with chunks"; "does not replace a pending transition even when it could project" (whitebox) | ignore availability → **1 failed**; replace a pending transition → **1 failed**; ignore its own emission → **2 failed** |
+| one recoverable handle-loss disposition | "`closed` discards the handle and rejoins, replaying nothing"; "an unsolicited `closed` notice recovers the subscription"; "`owner-lost` is terminal"; "a local leave is terminal"; "any other refusal fences without rejoining" | `closed` terminal → **6 failed**; `owner-lost` rejoins → **1 failed**; any refusal discards the subscription → **1 failed** |
 
 Four inverses are controls on the model itself, so that strictness
-cannot be mistaken for correctness: **drop every arrival** → 47 failed,
-0 passed; **never emit chunks** → 45 failed; **reuse one handle id for
-every join** → 9 failed; **never allocate a generation** → 45 failed. A
-drop-everything implementation fails every positive control and every
-`converged()` assertion in the file.
+cannot be mistaken for correctness: **drop every arrival** → 57 failed,
+0 passed; **never hand over queued work** → 55 failed; **reuse one
+handle id for every join** → 10 failed; **never allocate a generation**
+→ 55 failed. A drop-everything implementation fails every positive
+control and every `converged()` assertion in the file.
 
 The inverse ledger is **implementer-run**: the mutation campaign is
 mine, and the review independently ran the baseline, the typecheck and
@@ -1292,6 +1344,31 @@ Round 5, from the reviewer's probes:
   so a replica that discards a handle must discard its watermark or
   strand its own rejoin.
 
+Round 6, from the reviewer's probes:
+
+- **FIFO delivery does not fix an incorrect emission order.** `advance`
+  handed a `delta` over while that handle's chunks were still unsent,
+  so the *ordinary* schedule produced `man, delta, snap, snap` and
+  reached the path §1.9a called unreachable. Removing the global
+  emission stall was right; emitting ahead of unsent chunks was not its
+  replacement. The boundary is now established by the emitter — one
+  ordered output queue per handle — with bounded queue depth and a
+  replacement installation when the bound is reached. The
+  "delta time is idle by construction" prose is gone with it.
+- **An owner refresh erased a deferred caller transition.** `refresh`
+  checked neither availability nor the pending solicited transition,
+  and `install` clears `deferred`, so the caller's request and desired
+  audience were discarded and availability restoration had nothing to
+  complete. Refresh is now refused at the source in all three cases.
+- **`unknown-handle` was not a legal refusal.** The frozen
+  `StoreErrorCode` has no such code, so the model's recovery message
+  was excluded by the very codec contract slice A is meant to freeze.
+  Resolved without adding a code: `closed` covers every unusable
+  handle and is terminal for the handle and its in-flight actions while
+  the subscription rejoins; `owner-lost` is the terminal case. A
+  distinguishable `unknown-handle` was rejected because it re-opens the
+  handle-existence disclosure channel §2 closes deliberately.
+
 Two round-5 inverses came back **green** on first run, and both were
 untested paths rather than redundant rules: a control admitted on an
 expired handle reached the *deferral* branch (no witness covered
@@ -1299,6 +1376,13 @@ expiry + unavailable projection), and `advance` emitted deltas to
 expired handles (the isolation witness drained the wire without
 checking who the messages were addressed to). Both now have witnesses
 and both inverses are red.
+
+A round-7 inverse came back green for the same reason the round-3 fence
+did: the refresh guard's `deferred` check is unreachable, because
+`deferred` is only set while a projection is unavailable and
+`projectable` completes it the instant availability returns. It is kept
+with a whitebox witness, because that coupling — not the rule — is what
+would make a future reason to defer reopen the hole.
 
 One round-3 inverse came back green for the other reason: removing the
 publication fence changed nothing, because every supersession path

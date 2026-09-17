@@ -26,8 +26,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  emitChunk,
+  emitNext,
+  QUEUE_MAX,
   emitting,
+  unsent,
   newOwner,
   newReplica,
   ownerStep,
@@ -85,7 +87,7 @@ function rec(s: Sim, h: string = handleOf(s)): OwnerHandle {
 
 const audOf = (s: Sim, h?: string): readonly string[] => rec(s, h).aud;
 const genOf = (s: Sim, h?: string): number => rec(s, h).g;
-const unsentOf = (s: Sim, h?: string): number => rec(s, h).unsent;
+const unsentOf = (s: Sim, h: string = handleOf(s)): number => unsent(s.owner, h);
 const allocOf = (s: Sim, h?: string): number => rec(s, h).allocated;
 const deferredOf = (s: Sim, h?: string): OwnerHandle['deferred'] => rec(s, h).deferred;
 
@@ -125,9 +127,9 @@ function owner(s: Sim, e: Parameters<typeof ownerStep>[1]): Sim {
 
 /** Hand the next unsent chunk to the transport, in order. */
 function emit(s: Sim, h?: string): Sim {
-  const { owner: next, message } = emitChunk(s.owner, h);
-  if (message === null) return { ...s, owner: next };
-  return { ...s, owner: next, wire: [...s.wire, message] };
+  const { owner: next, message } = emitNext(s.owner, h);
+  if (message === null) return { ...s, owner: next, wire: [...s.wire, ...next.out] };
+  return { ...s, owner: next, wire: [...s.wire, message, ...next.out] };
 }
 
 /** Does this message belong to the second replica? */
@@ -323,7 +325,7 @@ describe('handle admission — only join creates a handle', () => {
     expect(req.k).toBe('resume');
 
     s = serve(rest, req);
-    expect(s.wire[0]).toEqual({ k: 'no', h: 'h1', q: 'rc1', code: 'unknown-handle' });
+    expect(s.wire[0]).toEqual({ k: 'no', h: 'h1', q: 'rc1', code: 'closed' });
 
     s = pump(s);
     // Refused, not silently honoured — and recovery is a fresh join.
@@ -1087,7 +1089,7 @@ describe('a deferred projection is admitted again when it completes', () => {
     const taken = take(s);
     s = serve(taken.rest, taken.req);
 
-    expect(s.wire).toEqual([{ k: 'no', h, q: 'a-b', code: 'unknown-handle' }]);
+    expect(s.wire).toEqual([{ k: 'no', h, q: 'a-b', code: 'closed' }]);
     expect(deferredOf(s, h)).toBeNull();
 
     // Actionable: the replica rejoins once a projection can be taken.
@@ -1129,7 +1131,7 @@ describe('a deferred projection is admitted again when it completes', () => {
 
     // Refused, not installed — and the refusal is delivered, so the
     // caller can act on it instead of waiting out its deadline.
-    expect(s.wire).toEqual([{ k: 'no', h, q: 'a-b', code: 'unknown-handle' }]);
+    expect(s.wire).toEqual([{ k: 'no', h, q: 'a-b', code: 'closed' }]);
     expect(s.owner.deferredRetired).toBe(1);
     expect(genOf(s, h)).toBe(1);
     expect(deferredOf(s, h)).toBeNull();
@@ -1158,5 +1160,212 @@ describe('a deferred projection is admitted again when it completes', () => {
     expect(allocOf(s, 'h2')).toBe(1);
     expect(converged(s)).toBe(true);
     expect(stillLive(s)).toBe(true);
+  });
+});
+
+describe('the snapshot/live boundary is a property of the emitter', () => {
+  it('an advance during emission is queued behind the chunks it depends on', () => {
+    let s = joined(2);
+
+    // A replacement is being emitted when the document advances.
+    s = owner(s, { t: 'refresh', h: handleOf(s) });
+    s = owner(s, { t: 'advance' });
+    while (emitting(s.owner).length > 0) s = emit(s);
+
+    // Ordinary FIFO order, produced by the owner: snapshot, then live.
+    expect(s.wire.map((m) => m.k)).toEqual(['man', 'snap', 'snap', 'delta']);
+
+    s = settle(s);
+
+    // Reached the current revision without touching the out-of-order
+    // recovery fallback at all.
+    expect(s.replica.dropped['delta-ahead-of-assembly']).toBeUndefined();
+    expect(s.replica.behind).toBe(false);
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('several advances during one emission all land, in order', () => {
+    let s = joined(3);
+
+    s = owner(s, { t: 'refresh', h: handleOf(s) });
+    s = owner(s, { t: 'advance' });
+    s = owner(s, { t: 'advance' });
+    s = settle(s);
+
+    expect(s.replica.dropped['delta-ahead-of-assembly']).toBeUndefined();
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('pending work is bounded: catch-up gives way to a replacement', () => {
+    let s = joined(4);
+
+    s = owner(s, { t: 'refresh', h: handleOf(s) });
+    for (let i = 0; i < 8; i += 1) s = owner(s, { t: 'advance' });
+
+    // The queue never grows without bound …
+    expect(s.owner.handles[handleOf(s)]?.queue.length).toBeLessThanOrEqual(QUEUE_MAX);
+    expect(s.owner.retiredDeltas).toBeGreaterThan(0);
+
+    s = settle(s);
+
+    // … and the replacement is what carries the replica to the current
+    // revision, rather than a resync the replica had to ask for.
+    expect(s.replica.dropped['delta-ahead-of-assembly']).toBeUndefined();
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+});
+
+describe('an owner refresh never takes the caller’s turn', () => {
+  it('does not replace a deferred caller transition', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+
+    // The caller asks for ['deck']; the owner cannot project yet.
+    s = owner(s, { t: 'projectable', can: false });
+    s = settle(local(s, { t: 'setAudience', q: 'deck-request', aud: ['deck'] }));
+    expect(deferredOf(s, h)?.q).toBe('deck-request');
+
+    // An owner refresh here would clear that pending projection.
+    s = owner(s, { t: 'refresh', h });
+    expect(s.wire).toHaveLength(0);
+    expect(deferredOf(s, h)?.q).toBe('deck-request');
+
+    // Availability returns and the caller's own request completes.
+    s = settle(owner(s, { t: 'projectable', can: true }));
+
+    expect(audOf(s, h)).toEqual(['deck']);
+    expect(s.replica.desired).toEqual(['deck']);
+    expect(converged(s)).toBe(true);
+    expect(stillLive(s)).toBe(true);
+  });
+
+  it('does not replace a pending transition even when it could project', () => {
+    // Unreachable through the reducers: `deferred` is only set while a
+    // projection is unavailable, and `projectable` completes it the
+    // moment availability returns. Asserted against the constructed
+    // state so that the rule is a witnessed one and not a consequence
+    // of that coupling — any future reason to defer (a rate limit, a
+    // busy projector) would otherwise silently reopen the hole.
+    let s = joined(2);
+    const h = handleOf(s);
+    const pending = { ...rec(s, h), deferred: { q: 'deck-request', aud: ['deck'] as string[] } };
+    s = { ...s, owner: { ...s.owner, handles: { ...s.owner.handles, [h]: pending } } };
+    const generation = genOf(s, h);
+
+    s = owner(s, { t: 'refresh', h });
+
+    expect(s.wire).toHaveLength(0);
+    expect(genOf(s, h)).toBe(generation);
+    expect(deferredOf(s, h)?.q).toBe('deck-request');
+
+    // And the pending request — not a refresh — is what completes.
+    s = owner(s, { t: 'projectable', can: true });
+    expect(s.wire).toEqual([
+      { k: 'man', h, g: generation + 1, r: s.owner.r, n: 2, q: 'deck-request' },
+    ]);
+    expect(audOf(s, h)).toEqual(['deck']);
+  });
+
+  it('does not emit a manifest it cannot follow with chunks', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+    const generation = genOf(s, h);
+
+    s = owner(s, { t: 'projectable', can: false });
+    s = owner(s, { t: 'refresh', h });
+
+    // No manifest, no generation burned.
+    expect(s.wire).toHaveLength(0);
+    expect(genOf(s, h)).toBe(generation);
+    expect(allocOf(s, h)).toBe(generation);
+
+    // And once a projection can be taken, a refresh works (control).
+    s = settle(owner(s, { t: 'projectable', can: true }));
+    s = settle(owner(s, { t: 'refresh', h }));
+    expect(genOf(s, h)).toBe(generation + 1);
+    expect(converged(s)).toBe(true);
+  });
+});
+
+describe('the refusal taxonomy', () => {
+  it('`closed` discards the handle and rejoins, replaying nothing', () => {
+    let s = joined(2);
+    s = owner(s, { t: 'expire', h: 'h1' });
+
+    s = local(s, { t: 'reconnect', q: 'rc1' });
+    const taken = take(s);
+    s = serve(taken.rest, taken.req);
+    // One code for every unusable handle: unknown, expired, fenced or
+    // bound to another peer are indistinguishable by design (§2).
+    expect(s.wire).toEqual([{ k: 'no', h: 'h1', q: 'rc1', code: 'closed' }]);
+
+    s = pump(s);
+
+    // Exactly one request, and it is a join: nothing is resumed,
+    // nothing is resynced, no action or input is replayed.
+    expect(s.pending).toHaveLength(1);
+    expect(s.pending[0]?.k).toBe('join');
+    expect(s.replica.handle).toBeNull();
+    expect(s.replica.retired).toBe(0);
+    expect(s.replica.published).toBe(false);
+
+    s = settle(s);
+    expect(s.replica.handle).toBe('h2');
+    expect(s.replica.installed).toBe(1);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('`owner-lost` is terminal — no rejoin, no inferred outcome', () => {
+    let s = joined(2);
+
+    s = local(s, { t: 'setAudience', q: 'a-b', aud: ['deck'] });
+    s = { ...s, pending: [] };
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: 'a-b', code: 'owner-lost' }] });
+
+    expect(s.replica.state).toBe('closed');
+    expect(s.replica.published).toBe(false);
+    // The distinction that earns a second code: nothing to rejoin.
+    expect(s.pending).toHaveLength(0);
+  });
+
+  it('an unsolicited `closed` notice recovers the subscription', () => {
+    let s = joined(2);
+
+    // Lease expiry arrives with no `q` to correlate (§2).
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: null, code: 'closed' }] });
+
+    expect(s.replica.handle).toBeNull();
+    expect(s.pending[0]?.k).toBe('join');
+
+    s = settle(s);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('a local leave is terminal and sends nothing', () => {
+    let s = joined(2);
+
+    s = local(s, { t: 'leave' });
+
+    expect(s.replica.state).toBe('closed');
+    expect(s.replica.published).toBe(false);
+    expect(s.pending).toHaveLength(0);
+  });
+
+  it('any other refusal fences without rejoining', () => {
+    let s = joined(2);
+
+    s = local(s, { t: 'setAudience', q: 'a-b', aud: ['deck'] });
+    s = { ...s, pending: [] };
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: 'a-b', code: 'forbidden' }] });
+
+    expect(s.replica.state).toBe('fenced');
+    expect(s.replica.published).toBe(false);
+    expect(s.pending).toHaveLength(0);
+    // The handle survives a refused request: it was the request that
+    // was refused, not the subscription.
+    expect(s.replica.handle).toBe('h1');
   });
 });
