@@ -1328,32 +1328,59 @@ So the state of Q2 is: instrumented, pinned by name at the CI floor,
 unrun. It closes when that row runs and passes, or it becomes a
 finding when it runs and does not.
 
-#### Adjacent, same round: the NAT'd anchor's second endpoint served, and the probe was lying about who asked
+#### Adjacent, same round: a NAT'd anchor CAN serve as a reflexive-address oracle through one forwarded UDP port
 
-A separate row — `natsim_natted_anchor_publishes_both_mapped_endpoints`,
-the first user of S6-07.1 — failed in run
-[35185332604](https://github.com/ai-2070/net/actions/runs/35185332604)
-at `tests/natsim.rs:541`. Recorded here because the plausible reading
-was a deployment-envelope limitation and the measurement **refutes**
-it.
+**Measured, and it is the finding.** In run
+[35185332604](https://github.com/ai-2070/net/actions/runs/35185332604),
+an unsolicited RFC 5389 binding request from a stranger — no
+`USERNAME`, no session, no prior outbound from the anchor — crossed
+`dnat to 192.168.101.2:7103` on the anchor's gateway, reached the
+anchor's private STUN socket, **was served**, and the response came
+back carrying a parseable XOR-MAPPED-ADDRESS naming the source the
+anchor actually observed. An anchor published behind a single
+forwarded UDP port is therefore usable as a reflexive-address oracle
+for its peers.
 
-What the verdict actually says, in the order the row asserts it:
+That is the deployment shape
+`natsim_natted_anchor_publishes_both_mapped_endpoints` was built to
+establish — the first user of S6-07.1 — and it is worth more than the
+row passing, because it held under the one condition nobody had
+tested. It also **refutes** the plausible contrary reading: "a DNAT'd
+STUN endpoint reports a post-prerouting source and so cannot be a
+reflexive oracle" would have been a real constraint on the product's
+deployment envelope. Prerouting rewrote only the destination; the
+source survived; the endpoint answered truthfully.
+
+**Scope, as everywhere else in this section:** one anchor behind one
+`cone`-mode gateway with one forwarded UDP port, one un-NAT'd client
+on the same simulated internet, one run. It does not license a claim
+about port-forwarded STUN in general, about other NAT flavours, or
+about an anchor behind more than one rewriting hop.
+
+##### Why the row nevertheless went red, and what that was not
+
+The row failed at `tests/natsim.rs:541` — the claim *after* the one
+above. Line 533 (`stun_endpoint_probe_ok == true`) PASSED, which is
+how the finding above is known at all. What the verdict said:
 
 - `stun_endpoint_target: "10.99.0.2:7103"` equals `anchor_stun_addr`
   — the probe was aimed at the address read back out of the
   announcement, not at a flag.
-- `stun_endpoint_probe_ok: true` — line 533 PASSED. An unsolicited
-  binding request from a stranger crossed the gateway's
-  `dnat to 192.168.101.2:7103`, reached a private socket, was served,
-  and the reply came back well-formed enough to parse an
-  XOR-MAPPED-ADDRESS out of. **A port-forwarded STUN endpoint on a
-  NAT'd anchor works, and serves strangers.** That is the deployment
-  shape the row exists to establish, and it held.
+- `stun_endpoint_probe_ok: true` — answered, as above.
 - `stun_endpoint_mapped: "10.99.0.1:60141"` — line 541 failed. The
   reply named a real address that was not the client's `10.99.0.12`.
 
 **It was source selection in the harness probe, not the DNAT and not
-the reply path.** Three facts separate them:
+the reply path.** Four facts separate them, and the first is
+decisive on its own:
+
+0. **There was no source pin to fail.** `git show
+   1f688f4b6:examples/natsim_node.rs` line 76 is
+   `async fn stun_probe(target: &str)` — ONE parameter — binding
+   `0.0.0.0:0` at line 86. The pinned-source version and the comment
+   explaining it are the repair below, written after this run. "The
+   pin did not take" was considered and is false: nothing ever asked
+   for `10.99.0.12`.
 
 1. `setup.sh` puts four addresses on `nsim_wan`'s one `br0` —
    `10.99.0.1/24` FIRST (line 165), then `.10`, `.11`, and `.12`
@@ -1377,14 +1404,14 @@ the failure mode the assertion's own wording names ("about a mapping
 rather than about a local socket"), arriving from the direction
 nobody was watching: the probe, not the responder.
 
-**The envelope claim is refuted, not confirmed.** "A DNAT'd STUN
-endpoint reports a post-prerouting source and so cannot be a
-reflexive oracle for its peers" would have been a real constraint. It
-is not what happened: prerouting rewrote only the destination, and
-the endpoint reported the client's true public tuple. Scoped as
-usual — one anchor behind one `cone`-mode gateway with a single
-forwarded UDP port, one un-NAT'd client on the same simulated
-internet.
+**No control was available, and the report should not imply one.**
+The sibling `rtc_addr` probe would have been the natural control —
+same call, different target — but it reports `stun_probe_ok: false`
+and `stun_probe_mapped: null`, dropped by design at the
+address-restricted RTC port. It yields no address at all and so
+discriminates NOTHING between `.1` and `.12`. The discriminators are
+the git history and the `oifname` scoping above; there is no third
+observation standing behind them.
 
 **The fix, and the assertion got stronger rather than weaker.**
 `stun_probe` now takes the source address and binds it (`bind.ip()`,
@@ -1403,11 +1430,26 @@ available; a rewrite in the path or a responder echoing a constructed
 tuple now fails where a prefix check passed. No deadline moved and no
 nftables rule changed.
 
-Not yet re-run in CI, for the same reason Q2 is not: netns needs
-Linux and root. The source-addressing invariant the row now asserts
-was smoke-tested directly — a responder echoing its observed source,
-probed from an explicitly bound socket, returns exactly that socket's
-`getsockname()`, while an unbound socket's own `local_addr` is
-`0.0.0.0` and the process cannot state which source the kernel will
-choose. That is the mechanism, not the topology; the four-address
+**The row has NOT been re-run since the fix.** The example and both
+test binaries compile and the ungated suite is 41/41, and neither of
+those is the row passing — `natsim_natted_anchor_publishes_both_mapped_endpoints`
+is `#[ignore]`d and needs Linux netns and root, which the
+implementation workstation does not have. Nobody should have to infer
+that distinction from a green tick: as of this writing the row's last
+executed result is the RED above, and the repair is unexercised
+against the topology.
+
+What was exercised is the mechanism, directly: a responder echoing
+its observed source, probed from an explicitly bound socket, returns
+exactly that socket's `getsockname()`, while an unbound socket's own
+`local_addr` is `0.0.0.0` — the process cannot state which source the
+kernel will choose, which is the defect in one line. That is the
+addressing invariant, not the topology; the four-address source
 selection itself is not reproducible off Linux.
+
+Note also what the repair does NOT establish. The finding at the top
+of this subsection — a NAT'd anchor serving as a reflexive oracle —
+rests on `stun_endpoint_probe_ok: true` from the RED run, which is
+real measured data and does not depend on the fix. The fix changes
+what the row can *assert* about that reply; it does not change what
+was observed.
