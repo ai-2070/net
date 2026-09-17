@@ -5617,6 +5617,7 @@ jobs:
           stage5_native_stream_sustains_traffic_beyond_the_credit_window
           stage5_reliable_stream_recovers_injected_loss_and_reorder
           stage5_large_messages_cross_the_public_api_in_both_directions
+          stage5_native_fragments_to_an_announced_leaf
           stage5_leader_proxied_stream_carries_native_bytes_both_ways
           stage6_two_isolated_contexts_reach_a_direct_session
           stage6_each_leaf_learns_the_others_keys_from_a_signed_announcement
@@ -5661,14 +5662,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 41)"
+            echo "[$engine] $passes passed, $fails failed (floor 42)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 41 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 41 — \
+            if [ "$passes" -lt 42 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 42 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi

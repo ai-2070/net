@@ -1772,12 +1772,16 @@ advertising `net.stream.fragment_reassembly@1`.
 The large-message witness proved near-ceiling delivery and a typed
 refusal, and the report should have stopped being read as though it
 proved multi-fragment interoperability. It no longer needs the
-caveat: leg 3b of that witness has changed sides and now requires a
+caveat, though not in the shape this item predicted: a new browser
+witness, `stage5_native_fragments_to_an_announced_leaf`, requires a
 32 KiB native → leaf payload to ARRIVE as one byte-identical event,
-counting arrivals so that a group delivered as five pieces fails. Both
-directions are witnessed, and the bound that remains — 64 832 B, one
-number now shared by both ends instead of two that differed by 32
-bytes — is a refusal, not a silence.
+counting arrivals so that a group delivered as five pieces fails,
+while the older leg keeps the typed refusal for the same size sent
+*before* the peer has announced. Which outcome applies is decided by
+the peer's announcement, never by the size — §14.4 records how that
+was found. Both directions are witnessed, and the bound that remains
+— 64 832 B, one number now shared by both ends instead of two that
+differed by 32 bytes — is a refusal, not a silence.
 
 
 ## 14. Fifth round — the four owner rulings
@@ -2245,30 +2249,82 @@ conformant group. The only witness anywhere that a **real** leaf
 reassembles what the native sender cut is the browser matrix's leg 3b,
 described below. Both are needed; neither is the other.
 
-**(e) is not proved twice.** Leg 3b used to assert the typed refusal
-native → leaf. After this ruling it asserts delivery, so it has changed
-sides, not become a second copy of (e). The "no tag ⇒ `EventTooLarge`
-at 8 104" invariant is now witnessed in exactly ONE place, (e), and
-that is stated here rather than left for a reviewer to discover by
-counting.
+**(e) is not the same claim as leg 3b, and neither is redundant.**
+Both end in a typed `EventTooLarge`, so it would be easy to report the
+invariant as doubly proven. They are different peers: (e) is a native
+peer that never advertises the tag at all, and leg 3b is a real
+browser leaf that *will* advertise it but has not yet — the
+capability-unknown case, at the browser layer, on the real package.
+Lose (e) and nothing covers a native peer; lose leg 3b and nothing
+covers "not yet announced". The delivering case is witness 15 and is
+covered nowhere else.
 
-#### The browser witness changed sides
+#### The browser layer: two witnesses, because the capability is announced
 
-`stage5_large_messages_cross_the_public_api_in_both_directions` leg 3b
-sends 32 KiB native → leaf. It required `StreamError::EventTooLarge`;
-it now requires the payload to ARRIVE as one byte-identical event, and
-its gate counts arrivals: **a group that was never reassembled arrives
-as five pieces, not as nothing**, and every weaker check — "the bytes
-arrived", "a matching mark arrived" — would call that a pass.
+This is where the round's most useful finding came from, and it was
+found by a witness failing rather than by reasoning.
+
+Leg 3b of `stage5_large_messages_cross_the_public_api_in_both_directions`
+sends 32 KiB native → leaf. The plan was to flip it from the typed
+refusal to a delivery. Flipped, it failed — and its own verdict named
+the cause: *"the sender did not see this leaf's reassembly tag"*. The
+reason is a real property of the feature: **the sender fragments only
+for a peer it has seen ANNOUNCE**, and at that point in the run the
+page has not announced. Witness 5, later in the ledger, is where the
+first announcement happens.
+
+Adding an announcement to that witness made it pass — and broke
+`stage5_two_tabs_share_one_identity_without_eviction` in two
+consecutive runs. The witnesses share one identity, the leaf's
+announcement version is a per-tab counter, and the anchor dedups on
+`(node_id, version)`; one extra bump left the promoted tab's restored
+announcement indistinguishable from one already seen, so
+`find_best_node` stopped resolving after the handoff. **That
+version-numbering fragility is pre-existing, is not this ruling's to
+fix, and is reported here rather than absorbed** — a restoration whose
+success depends on how many times its predecessor announced is a
+defect waiting for a second announcer.
+
+So the browser layer states the contract as two witnesses, which is
+what it actually is:
+
+| witness | sends | outcome | why |
+|---|---|---|---|
+| 12, leg 3b | 32 KiB, before any announcement | typed `EventTooLarge` | capability unknown, and never assumed from the transport being RTC |
+| 15, `stage5_native_fragments_to_an_announced_leaf` | 32 KiB, after witness 5's announcement | one byte-identical event | the sender fragments, and the leaf's `frame::Reassembler` rebuilds it |
+
+Witness 15 makes **no announcement of its own** — it relies on witness
+5's, deliberately, so it cannot perturb the identity its neighbours
+share. It rides its own stream id, so what arrived is everything that
+arrived, with no index arithmetic. Its gate is the arrival COUNT plus
+the payload mark: a group that was never reassembled arrives as five
+payloads rather than none, which "the bytes turned up" would call a
+pass, and a group reassembled out of order arrives as one event of
+exactly the right length, which only the mark refuses.
+
+It is appended to `WITNESSES` rather than inserted beside witness 12
+where it belongs by subject, because `WITNESSES[13]` is referenced by
+index and inserting ahead of it would have silently retargeted that
+record to the new name. Ledger order is cosmetic; a mislabelled
+witness is not.
+
+Browser floor 41 → 42, the new name pinned, both engines.
 
 The round-4 comment said fragmentation "was rejected on the merits …
 fragmenting here would hand a native peer's application N partial
-events". That reasoning was never wrong, and it is preserved rather
-than deleted: it was an argument against fragmenting **blindly**, and
-it is now the gate's justification. The comment, the constant's
-rustdoc, `send_on_stream`'s own doc, and the verdict string all say so
-in those terms, because a comment that contradicts the code it sits
-above is worse than no comment.
+events". That reasoning was never wrong and is preserved rather than
+deleted: it was an argument against fragmenting **blindly**, and it is
+now the gate's justification. The constant's rustdoc, leg 3b's
+comment, `send_on_stream`'s doc and both verdict strings say so in
+those terms.
+
+One local gap, stated plainly: the **Firefox** leg of the matrix could
+not be run on this workstation — the harness refuses to start without
+NSS `certutil`, which is absent here, and it refuses rather than
+falling back to a root store it never writes. Chromium ran green at
+42/42. Firefox is covered by CI, and the report is not claiming a
+local run that did not happen.
+
 
 The leaf's pinned announcement fixture moved with the new tag — both
 copies and the core-side pin, in the same commit. The core-side check
