@@ -54,6 +54,14 @@ an old HOLD is not proof that every finding still reproduces at a later
 head. Deferral does not delete implemented features, weaken existing tests,
 or excuse identity, delivery, lifecycle or compatibility regressions.
 
+**Serverless scope clarification:** the separately recorded
+[serverless capability-provider/caller follow-on](#follow-on-serverless-capability-providers-and-callers)
+means functions advertising capabilities and making organization-scoped calls
+through a Net-connected adapter. It is not the older, still-deferred
+browser-anchor replacement proposal. Neither follow-on is a prerequisite for
+the browser/game store, and recording the contract does not authorize its
+implementation.
+
 ### Historical baseline and authorization record
 
 The dated entries below record decisions at their original heads, not the
@@ -3160,13 +3168,120 @@ Also absent, as expected at "not started": `crates/net/wire/`,
   Stage 5 gives it a transport.
 - Native ↔ native WebRTC.
 
+## Follow-on: serverless capability providers and callers
+
+**Current serverless requirement (product owner clarification).** Serverless
+functions must be able to advertise capabilities to Net and invoke
+organization-scoped capabilities supplied by full Net nodes or other
+serverless deployments. This is **not** a request to replace the browser
+anchor, run browser rooms, or port the native mesh runtime into a function.
+This section records the follow-on contract, not implemented support or
+production dispatch authority. It does not expand the current browser/game
+store milestone; implementation needs a separately scoped brief and evidence.
+
+### Caller-facing contract
+
+The caller asks: **"Invoke capability X from any eligible provider advertised
+by organization Y."** It supplies the organization, capability and request,
+not a function URL, instance identity or exact provider NodeId. Provider
+resolution selects an eligible deployment internally; binding an admitted
+request to the selected provider remains an internal routing/security step,
+not an extra caller-facing exact-target API.
+
+The same operation is available to a full Net node and to a serverless
+function. Serverless functions need neither a mesh load balancer nor a live
+provider-selection loop of their own.
+
+### Minimal integration and traffic paths
+
+Use an existing Net-connected adapter with authenticated HTTPS operations
+for registration/update/removal and outbound capability invocation:
+
+```text
+Function deployment registration -> HTTPS adapter -> Net capability discovery
+
+Net caller -> org-scoped resolution -> adapter -> function platform invocation
+
+Serverless caller -> HTTPS adapter -> org-scoped resolution
+                                      -> native Net provider
+                                      -> adapter -> serverless provider
+```
+
+The adapter publishes authorized capability registrations and connects
+serverless requests to Net's organization-scoped discovery and invocation
+semantics. A function can be a provider, a caller, or both. The initial
+contract does not require a persistent WebSocket, WebRTC, ICE, STUN, TURN,
+a Durable Object room, or a new standalone anchor distribution. Exact SDK
+methods, registration encoding and platform invocation bindings are to be
+specified in the follow-on brief, not assumed to exist from this diagram.
+
+### Advertise deployments, not ephemeral instances
+
+Registration describes **a deployed service callable on demand**, not a
+currently running execution environment. Scaling to zero does not by itself
+withdraw the capability. Registration lifetime, withdrawal and health policy
+must reflect deployment availability without requiring a sleeping function
+to maintain a socket or heartbeat. Deployment removal or revoked registration
+must stop new selection within an explicit bounded policy.
+
+The serverless platform owns instance assignment and scaling within a
+deployment, subject to its quotas and throttling. Mandatory load reporting,
+per-instance announcements and a new load-aware selector are **not required
+for the first integration**. Where multiple eligible deployments exist,
+reuse an appropriate existing selection policy; region, residency, price or
+availability constraints can filter the pool. Add sensing only for a named
+need, not to duplicate the platform's scheduler. Keep deployment registrations
+distinguishable internally without exposing provider selection to callers.
+
+### Authority and execution boundaries
+
+- Organization attribution of a registration must be authenticated and
+  authorized; a claimed organization name or visible announcement is not
+  invocation authority.
+- Authenticate the calling workload. Use its applicable organization
+  membership and capability-scoped dispatch authority, or an explicitly
+  specified bounded delegation to the adapter. Do not silently substitute the
+  adapter's unrestricted identity or privilege for the function's authority.
+- Preserve the distinction between `OrgMembershipCert`,
+  `OrgDispatcherGrant`, and provider admission. Cross-organization access
+  additionally requires the applicable provider-organization grants;
+  discovery and invocation rights remain distinct.
+- The selected provider remains responsible for admission. The serverless
+  endpoint must authenticate the adapter's delivery and the authorized call
+  context, rather than providing a public bypass around Net admission.
+- Function A calling B normally acts under A's authority. An inbound call to
+  A does not automatically delegate the original caller's privileges to A.
+- Carry bounded requests/results, deadlines and explicit failures. "Any
+  eligible provider" permits selection before execution, not blind replay on
+  another provider after an ambiguous timeout. Retries of potentially
+  effectful calls need explicit idempotency or deduplication semantics; no
+  exactly-once guarantee is implied.
+
+### Follow-on acceptance evidence
+
+The separate brief must demonstrate organization-authenticated registration,
+update and withdrawal; a full node invoking an eligible serverless provider
+without naming its endpoint; and a serverless caller invoking both a native
+provider and another serverless provider through the same org-scoped
+contract. Include unauthorized registration/call rejection, cross-org denial
+without the necessary grant, provider-local refusal, deadline/throttling
+propagation and an ambiguous-outcome case that does not silently re-execute.
+Prove a deployment remains callable after scaling idle without inventing a
+live instance or requiring load telemetry. Record the actual caller and
+selected provider in internal evidence while keeping selection out of the
+caller-facing API. No browser-anchor replacement is needed for these proofs.
+
 ## Follow-on: serverless control plane (not in this plan)
 
-Recorded here as deferred design context, not an automatic next stage when
-Stage 6 lands. It requires a separate product decision and plan; none of the
-tiers below is a prerequisite for the browser package or game store.
+**Separate, older browser-deployment proposal.** Retained as deferred design
+context, not the serverless capability-provider/caller requirement above and
+not an automatic next stage when Stage 6 lands. It requires a separate
+product decision and plan; none of the tiers below is a prerequisite for the
+browser package, game store, or serverless capability integration. Earlier
+references to the serverless `ControlPlane` hook and Tiers A/B/C in this plan
+refer only to this browser-anchor replacement proposal.
 
-**What "serverless support" means.** Hosting a browser-native Net app with
+**What this older proposal means.** Hosting a browser-native Net app with
 no always-on native anchor — static assets plus a serverless runtime
 (Cloudflare Workers / Durable Objects, Deno Deploy, Vercel or Netlify
 functions, Lambda). §Non-goals explains why v1 cannot: those runtimes cannot
