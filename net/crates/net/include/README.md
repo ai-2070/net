@@ -124,11 +124,18 @@ length validation, alignment checks, idempotent free) are in
 
 ## Examples
 
+Eight C examples ship in `../examples/`:
+
 | File | Shows |
 |---|---|
-| `examples/basic.c` | The event-bus loop above |
-| `examples/capability.c` | Capability, predicate and where-header helpers |
-| `examples/meshdb.c` | MeshDB factory AST, runner, iterator, sentinel decoder |
+| `../examples/basic.c` | The event-bus loop above |
+| `../examples/capability.c` | Capability validation, predicate evaluate / trace, `net-where:` header, debug-report aggregation and redaction |
+| `../examples/capability_aggregation.c` | Capability aggregation and capacity ranking |
+| `../examples/meshdb.c` | MeshDB factory AST, runner, iterator, sentinel decoder |
+| `../examples/scheduler.c` | Task-lifecycle workflow plus gang-claim island reserve / release |
+| `../examples/meshos.c` | MeshOS daemon-author vtable lifecycle |
+| `../examples/deck.c` | Deck operator workflow — snapshot, status, maintenance commit, stream |
+| `../examples/transport.c` | Blob + directory transfer between a holder and a fetcher |
 
 ## Claude Code Skill
 

@@ -2,14 +2,8 @@
 
 High-performance encrypted mesh runtime — the engine crate.
 
-Most people should depend on a **SDK**, not on this crate directly:
-
-```bash
-cargo add net-mesh-sdk                       # Rust
-npm install @net-mesh/sdk @net-mesh/core     # TypeScript / Node
-pip install net-mesh-sdk                     # Python
-go get github.com/ai-2070/net/go             # Go
-```
+Most people should depend on a **SDK**, not on this crate directly — see the
+root [install matrix](../../../README.md#install) for the per-language one-liners.
 
 **Docs: <https://ai2070.net/docs>** ·
 [Concepts](https://ai2070.net/docs/concepts/architecture) ·
@@ -49,32 +43,38 @@ not documentation.
 
 ## Features
 
-No features are enabled by default. Opt in explicitly.
+By default the crate enables the same stack the Python wheel and Node package ship:
+`net`, `nat-traversal`, `cortex`, `meshdb`, `meshos`, and `dataforts`. Everything else is
+opt-in.
 
 | Feature | Flag | Dependencies |
 |---|---|---|
 | Redis Streams | `redis` | `redis` |
 | NATS JetStream | `jetstream` | `async-nats` |
-| Net transport | `net` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
+| Net transport | `net` | `chacha20poly1305`, `ring`, `snow`, `getrandom`, `dashmap`, `crossbeam-queue`, `socket2`, `hex`, `libc`, `blake2`, `blake3`, `ed25519-dalek`, `x25519-dalek`, `subtle`, `postcard` |
 | NAT traversal (classifier + rendezvous + `connect_direct`) | `nat-traversal` | `net` |
 | Port mapping (NAT-PMP inlined + UPnP-IGD) | `port-mapping` | `nat-traversal`, `igd-next` |
+| Batched ingress (Linux `recvmmsg` receive path) | `batched-ingress` | `net` |
 | Regex filters | `regex` | `regex` |
 | C FFI | `ffi` | — |
+| AI tool calling (`ToolDescriptor` + `ToolEvent`) | `tool` | `cortex` |
 | RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `postcard` |
 | RedEX disk durability | `redex-disk` | `redex` |
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
-| Dataforts (greedy + gravity + blob + RYW) | `dataforts` | `cortex`, `blake3`, `xxhash-rust` |
 | MeshDB (federated query AST + planner + executor) | `meshdb` | `cortex` |
-| MeshOS (cluster-behavior engine + behavior snapshot) | `meshos` | `cortex` |
+| MeshOS (cluster-behavior engine + behavior snapshot) | `meshos` | `cortex`, `blake3` |
+| Dataforts (greedy + gravity + blob + RYW) | `dataforts` | `redex`, `redex-disk`, `blake3`, `fastcdc`, `reed-solomon-erasure`, `unicode-normalization` |
+| Operator CLI (`net-blob` binary) | `cli` | `dataforts`, `redex-disk`, `clap` |
+| Fixture helpers (test/bench only) | `fixtures` | — |
 
 ## Building
 
 ```bash
-cargo build --release                      # core only, no adapters
-cargo build --release --features net       # transport only (~2 MB)
-cargo build --release --features redis     # + Redis adapter
-cargo build --release --all-features       # everything
+cargo build --release --no-default-features                  # core only, no adapters
+cargo build --release --no-default-features --features net   # transport only (~2 MB)
+cargo build --release --features redis                       # defaults + Redis adapter
+cargo build --release --all-features                         # everything
 ```
 
 ## Tests
@@ -101,30 +101,9 @@ See [`BENCHMARKS.md`](BENCHMARKS.md) for published numbers and methodology.
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write
-integration code that runs and is quietly wrong. Install the skills first:
-
-```bash
-npx skills add ai-2070/net-claude-skill -g
-```
-
-Drop `-g` to install into the current project only. To update to the latest
-version:
-
-```bash
-npx skills update -g
-```
-
-Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
-should be listed. Full install options in
-[Claude Skills](https://ai2070.net/docs/start/claude-skills).
-
-### Give the agent the source too
-
-[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
-
-```bash
-npx -y opensrc@latest path ai-2070/net
-```
+integration code that runs and is quietly wrong. Install the skills first — see
+the root README's [Claude Code Skill](../../../README.md#claude-code-skill)
+section for the install and update commands.
 
 ## Links
 

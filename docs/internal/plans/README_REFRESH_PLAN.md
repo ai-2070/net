@@ -1,10 +1,11 @@
 # README Refresh Plan
 
-**Status:** REVISED ×1 (2026-09-18). A read-only audit of all **28** `README.md` files
-outside `web/` is complete, and a positioning review of the root front door has been folded
-in. **Stage 0 is drafted** — the root `README.md` rewrite is staged for review; the accuracy
-workstream (Stages 1–5) is not started. Decisions D1 and D2 remain open; each carries a
-recommendation, and the remaining stages are independent of them.
+**Status:** EXECUTED (2026-09-18). Stage 0 (root `README.md`) landed. Stages 1–4 applied
+across the accuracy workstream's files — the 27 non-root READMEs minus the two audited clean,
+plus `sdk-py/pyproject.toml`.
+Stage 5 verification is green: 69 relative links resolve, 0 residual overclaims/banned strings,
+license uniform, CLI/Deck sibling blocks byte-identical, and 55 docs-site URLs return 200.
+**D2 remains open** — the checker was run throwaway and is not committed or wired into CI.
 
 This plan covers the `README.md` layer of the documentation surface — the files rendered as
 package landing pages on crates.io, npm, PyPI and pkg.go.dev, and read from the repository

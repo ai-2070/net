@@ -62,8 +62,15 @@ PEP 525:
 ```rust
 #[pyclass(name = "AsyncFooIter", module = "_net")]
 pub struct PyAsyncFooIter {
-    inner: Arc<Mutex<Option<InnerStream>>>,
+    /// Tokio mutex so `__anext__` can hold the guard across
+    /// `stream.next().await` — one acquire per pull.
+    inner: Arc<TokioMutex<Option<InnerStream>>>,
+    /// Set by `close()`; the next pull exits with `StopAsyncIteration`.
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
+    /// Cancel-token reserved by the call that constructed the
+    /// stream — the same token the opening `CallOptions` carries.
+    cancel_token: u64,
 }
 
 #[pymethods]
@@ -77,19 +84,32 @@ impl PyAsyncFooIter {
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        // No cancel-token on per-chunk pulls: the stream itself
-        // carries a cancel keep-alive from construction
-        // (StreamCancelKeepAlive — see substrate's
-        // arm_stream_cancel). Closing the iterator drops the
-        // stream which fires CANCEL on the wire.
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        // Thread the construction-time token, don't mint a fresh
+        // one: a mid-stream `asyncio.wait_for(...).cancel()` must
+        // terminate the WHOLE stream (via the substrate's
+        // `arm_stream_cancel` watcher), not just this pull.
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
             let Some(stream) = guard.as_mut() else {
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             };
             match stream.next().await {
-                Some(item) => Python::attach(|py| Ok(item.into_pyobject(py)?.unbind())),
-                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+                Some(Ok(item)) => Python::attach(|py| Ok(item.into_pyobject(py)?.unbind())),
+                Some(Err(e)) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
             }
         })
     }
@@ -101,14 +121,17 @@ Key rules:
 1. **`__aiter__` returns `slf`** — PEP 525 contract; lets `async
    for x in iter` work.
 2. **`__anext__` returns a fresh awaitable per call.** Each call
-   re-enters `future_into_py`; the inner stream is the shared
-   state behind a mutex.
+   re-enters `await_with_existing_token`; the inner stream is the
+   shared state behind the mutex.
 3. **`StopAsyncIteration` for clean EOF.** Don't return `None` or
    a sentinel from `__anext__`.
-4. **No `await_with_cancel` on the per-chunk pull.** The cancel
-   keep-alive lives on the stream handle (set at construction
-   via `arm_stream_cancel`); per-chunk cancel is handled by
-   dropping the iterator, which closes the stream.
+4. **Thread the construction-time token — do not call
+   `await_with_cancel` on the per-chunk pull.** The `cancel_token`
+   was reserved by the call that opened the stream and is stored
+   on the handle; passing it to `await_with_existing_token` means
+   a task cancel fires `Mesh::cancel(token)`, and the substrate's
+   `arm_stream_cancel` watcher terminates the whole stream rather
+   than dropping one pull.
 
 ## Migration template: sync → async sibling
 
@@ -184,7 +207,7 @@ When the diff lands a new `Async*` method, the reviewer checks:
       `block_on` / `py.detach`. If either appears under the
       `Async*` impl, something is wrong.
 - [ ] **Same error mapping as the sync sibling.**
-      `rpc_error_to_pyerr` / `cortex_error_to_pyerr` / etc. —
-      shared helpers, never duplicated.
+      `rpc_error_to_pyerr` — the shared converter, never
+      duplicated.
 - [ ] **Module re-export.** `bindings/python/python/net/__init__.py`
       lists `AsyncFoo` in `__all__` alongside `Foo`.

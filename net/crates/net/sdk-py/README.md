@@ -13,7 +13,7 @@ leave the node that holds them: the machine with the secret runs the work.
 
 ```python
 # Find something that can do the job, then do it — no registry, no config.
-resp = call_tool(node, "summarize", {"text": text})
+resp = call_tool(rpc, "summarize", {"text": text})
 ```
 
 ## Why this instead of a queue
@@ -51,14 +51,16 @@ Publishes as `net-mesh-sdk`, imports as `net_sdk`. The native binding
 
 ```python
 from net_sdk import MeshNode, serve_tool
+from net.mesh_rpc import TypedMeshRpc
 
 node = MeshNode(bind_addr="127.0.0.1:0", psk="42" * 32)   # 32-byte hex string
+rpc = TypedMeshRpc.from_mesh(node._native)   # the tool surface takes the RPC handle
 
 def web_search(req):
     return {"results": [f"first hit for '{req['query']}'"]}
 
 handle = serve_tool(
-    node,
+    rpc,
     {"name": "web_search", "description": "Search the web.", "tags": ["web", "research"]},
     web_search,
 )
@@ -70,10 +72,11 @@ handle = serve_tool(
 ```python
 from net_sdk import list_tools, watch_tools
 
-for t in list_tools(node):                  # baseline snapshot
+native = node._native                       # the tool surface reads the native handle
+for t in list_tools(native):                # baseline snapshot
     print(t.tool_id, "v" + str(t.version), "tags=", t.tags)
 
-async for change in watch_tools(node):      # pushed on fold mutation
+async for change in watch_tools(native):    # pushed on fold mutation
     print(change)   # added, removed, or publisher count changed
 ```
 
@@ -81,12 +84,14 @@ async for change in watch_tools(node):      # pushed on fold mutation
 
 ```python
 from net_sdk import call_tool, call_tool_async, call_tool_streaming
+from net.mesh_rpc import AsyncTypedMeshRpc
 
-resp = call_tool(node, "web_search", {"query": "how does the capability fold work"})
+resp = call_tool(rpc, "web_search", {"query": "how does the capability fold work"})
 
-resp = await call_tool_async(node, "web_search", {"query": "…"})
+arpc = AsyncTypedMeshRpc.from_mesh(node._native)
+resp = await call_tool_async(arpc, "web_search", {"query": "…"})
 
-for chunk in call_tool_streaming(node, "tail", {"tail": "events"}):
+for chunk in call_tool_streaming(rpc, "tail", {"tail": "events"}):
     handle_chunk(chunk)
 ```
 
@@ -197,11 +202,13 @@ with. Wheels ship everything; this only bites on source builds via
 | Errors — the full exception hierarchy | [Errors](https://ai2070.net/docs/sdk/python/errors) |
 | Redis Streams dedup | [Deduplication](https://ai2070.net/docs/reference/redis-dedup) |
 
-## Links
+## Where to go next
 
-[Docs](https://ai2070.net/docs) ·
-[Quickstart](https://ai2070.net/docs/sdk/python/quickstart) ·
-[Concepts](https://ai2070.net/docs/concepts/architecture) ·
+1. [Quickstart](https://ai2070.net/docs/sdk/python/quickstart) — install the SDK and connect two nodes.
+2. [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) — announce a tool and call it by capability.
+3. [Production deployment](https://ai2070.net/docs/guides/production-deployment) — run the mesh beyond a single host.
+4. [Errors](https://ai2070.net/docs/sdk/python/errors) — the exception hierarchy, then [net-mesh-sdk on PyPI](https://pypi.org/project/net-mesh-sdk/).
+
 [GitHub](https://github.com/ai-2070/net)
 
 ## License

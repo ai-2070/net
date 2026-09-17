@@ -64,7 +64,7 @@ Redaction rules (see `redaction_rules` in the fixture):
 - `MetadataExists(<key>)` — unchanged (no value to redact).
 - All non-metadata labels (`Exists`, `Equals`, `NumericAtLeast`, `SemverAtLeast`, `Or`, `And`, `Not`, etc.) — unchanged.
 
-The substrate doesn't ship a redaction implementation (Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md` defined the API but only the trace + aggregator landed); each binding implements redaction host-side.
+There is no Rust-SDK-level redaction (Phase 6 of `CAPABILITY_ENHANCEMENTS_PLAN.md` defined the API but only the trace + aggregator landed in the Rust SDK); the C ABI (`net_predicate_redact_metadata_keys`, `src/ffi/predicate_debug.rs`) and each binding implement it host-side.
 
 ### `predicate_debug_report.json`
 

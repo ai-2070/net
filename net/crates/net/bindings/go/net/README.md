@@ -27,8 +27,8 @@ The five feature flags that gate the storage / query / OS surfaces in `libnet`. 
 | `cortex` | `net_redex_*`, `net_redex_file_*`, `net_tasks_*`, `net_memories_*`, `net_netdb_*` entry points — i.e. `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb` on the Go side, plus the `Task` / `Memory` row types, watch iterators, and the `RedexError` / `CortexError` / `NetDbError` discriminants. |
 | `redex-disk` | Disk-backed RedEX persistence — the `persistent_dir` config knob (`Persistent: true` on `RedexFileConfig`). Without it the persistent path returns `RedexError`. |
 | `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
-| `meshdb` | `net_meshdb_*` entry points plus the `libnet_meshdb` cdylib — `MeshQuery`, `MeshQueryRunner`, `Predicate`, `InMemoryChainReader`. |
-| `meshos` | `net_meshos_*` entry points plus the `libnet_meshos` cdylib — `MeshOsDaemonSdk`, `MeshOsDaemonHandle`. |
+| `meshdb` | `net_meshdb_*` entry points — `MeshQuery`, `MeshQueryRunner`, `Predicate`, `InMemoryChainReader`. |
+| `meshos` | `net_meshos_*` entry points — `MeshOsDaemonSdk`, `MeshOsDaemonHandle`. |
 
 Build with the full surface enabled:
 
@@ -50,4 +50,4 @@ Slim the build by dropping features you don't need — `cargo build --release --
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0. See [`LICENSE-MIT`](../../../../../../LICENSE-MIT) and [`LICENSE-APACHE`](../../../../../../LICENSE-APACHE).

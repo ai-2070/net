@@ -90,6 +90,7 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `a2a.md` | The peer is an **agent**, not a service — task handoff (`serve_a2a` / `submit_task` / `cancel_task`, briefs carry Datafort refs), delegated agent identity (`DelegationChain`), device enrollment (`invite → join → approve`). Rust/Python/Node only. |
 | `mcp.md` | The MCP bridge — `net-mesh wrap` a stdio server as mesh capabilities, or `net-mesh mcp serve` the mesh to a local host; pinning + credential forwarding. |
 | `org.md` | Organization capability auth — a service only authorized orgs can discover or call (invisible, not refused): `net-mesh org` offline issuance, `net-mesh node adopt`, `serve_org` / `mesh.org(..).call`. |
+| `subnet-auth.md` | Serving across a protected subnet boundary — exporting one service while the enclave stays sealed (`serve_subnet_exported` / `call_exported`, named exports, boundary declarations, revocation floors). The authority plane; `mesh.md` § Subnets is the topology plane. |
 | `redex.md` | Durable per-channel append-only logs (replay from offset, retention). |
 | `cortex.md` | Folded queryable state (SQLite-shaped queries, NetDB). |
 | `dataforts.md` | Greedy caching, data gravity, blob refs, read-your-writes. |
@@ -102,6 +103,8 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `testing.md` | Fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | Migrating from Kafka / NATS / Redis Streams / Pulsar. |
 | `event-semantics.md` | Naming events / what an event may assert — a fact observed at one layer, not an end-to-end `200 OK`. |
+| `source-access.md` | A citation to open, or a mechanism question the chapters don't answer — how to root a source path and fetch/read the real Net tree. |
+| `bindings/` | Per-language coverage (`coverage.md`: install/import/source table + the does-binding-X-support-operation-Y record) and per-binding notes (`rust.md`, `python.md`, `typescript.md`, `go.md`, `c.md`). |
 | `examples/` | Minimal runnable hello-world per SDK (TS, Py, Rust, Go, C). |
 
 </details>
@@ -128,6 +131,8 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `bindings.md` | Per-language support — Rust, Python, and Node all have a full demand+supply flow; Go is verifier-only. `CapabilityGateway` / `PaymentProvider`, Node's `close()` + `permissiveChannels` gotchas. |
 | `testing.md` | Cross-language golden vectors, the mock conformance suite, the key-invariant negative test, the env-gated live run. |
 | `gotchas.md` | Wrong mental model, migrating, or before merging — the review invariant, "what not to build," byte-preservation traps. |
+| `source-access.md` | A citation to open, or a mechanism question the chapters don't answer — how to root a payments source path and read the real crate. |
+| `bindings/` | Per-binding support notes (`rust.md`, `python.md`, `typescript.md`, `go.md`, `c.md`) and the coverage matrix (`coverage.md`) — who has a full demand+supply flow (Go is verifier-only). |
 
 </details>
 
@@ -148,7 +153,7 @@ Drop `-g` for project installs. If you installed by hand, `rm -rf ~/.claude/skil
 
 ## License
 
-Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Dual-licensed under [Apache-2.0](../../LICENSE-APACHE) or [MIT](../../LICENSE-MIT), at your option.
 
 ---
 
