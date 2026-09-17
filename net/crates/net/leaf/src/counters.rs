@@ -100,6 +100,21 @@ pub enum DropReason {
     /// consumer to deliver to, so the bytes are counted here rather
     /// than queued for one that may never come back.
     StreamClosed,
+    /// A frame offered on a **provisional** establishment — one
+    /// whose initiator has not yet proved, over this handshake's
+    /// transcript, that it owns the node id it claimed
+    /// ([`crate::establish`]).
+    ///
+    /// Three arms land here, and they are one fact: a proof that did
+    /// not verify, a proof for an attempt that had already expired
+    /// or been superseded, and anything that is not a proof at all —
+    /// including application bytes. Named separately from
+    /// [`DropReason::NoSession`] and
+    /// [`DropReason::SignalRejected`] because it is the
+    /// operator-visible evidence that the identity gate fired,
+    /// rather than that a packet arrived for a peer this leaf does
+    /// not know.
+    EstablishmentUnproven,
 }
 
 impl DropReason {
@@ -125,12 +140,13 @@ impl DropReason {
             Self::SequenceGapTooLarge => "sequence_gap_too_large",
             Self::StreamFailed => "stream_failed",
             Self::StreamClosed => "stream_closed",
+            Self::EstablishmentUnproven => "establishment_unproven",
         }
     }
 
     /// Every reason, in declaration order. Used by the snapshot so a
     /// new variant appears in the JSON without a second edit.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::NotAddressedToUs,
         Self::RoutingExpired,
         Self::UnknownSubprotocol,
@@ -150,6 +166,7 @@ impl DropReason {
         Self::SequenceGapTooLarge,
         Self::StreamFailed,
         Self::StreamClosed,
+        Self::EstablishmentUnproven,
     ];
 }
 

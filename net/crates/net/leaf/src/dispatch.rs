@@ -47,6 +47,17 @@ pub const SUBPROTOCOL_EVENT_PLANE: u16 = 0;
 /// The enum *is* the routing table: a value that does not map to a
 /// variant is an unknown subprotocol, and there is no default arm
 /// that could silently swallow one.
+///
+/// **`0x0D03` is deliberately absent.**
+/// [`crate::establish::SUBPROTOCOL_ESTABLISHMENT_PROOF`] is consumed
+/// by the responder's provisional-admission path
+/// (`node::LeafNode::admit_establishment_proof`) *before* a session
+/// exists, and that is the only context in which it means anything:
+/// it authorises one exact establishment to be installed. Arriving
+/// on an already-installed session it is a replay of a statement
+/// that has already done its work, so "unknown subprotocol, dropped
+/// and counted" is the correct and honest disposition rather than a
+/// decode arm that would have to refuse it anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subprotocol {
     /// Plain events and nRPC frames.

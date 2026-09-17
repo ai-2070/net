@@ -218,6 +218,14 @@ impl PendingHandshake {
                 "handshake did not complete after message 2".into(),
             ));
         }
+        // Read before `into_session_keys` consumes the state: this
+        // is the transcript an establishment proof is signed over
+        // (`crate::establish`), and the only projection the session
+        // keys publish is an eight-byte session name.
+        let handshake_hash = self
+            .handshake
+            .handshake_hash()
+            .map_err(|e| LeafError::Session(format!("handshake transcript: {e}")))?;
         let keys = self
             .handshake
             .into_session_keys()
@@ -225,6 +233,7 @@ impl PendingHandshake {
         Ok(LeafSession::install(
             self.peer,
             NetSession::new(keys, self.addr, POOL_SIZE, false),
+            handshake_hash,
         ))
     }
 
@@ -286,11 +295,18 @@ impl PendingHandshake {
         // Unencrypted, like message 1: the session key does not
         // exist until both halves have read.
         let packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
+        let handshake_hash = handshake
+            .handshake_hash()
+            .map_err(|e| LeafError::Session(format!("handshake transcript: {e}")))?;
         let keys = handshake
             .into_session_keys()
             .map_err(|e| LeafError::Session(format!("session keys: {e}")))?;
         Ok((
-            LeafSession::install(initiator, NetSession::new(keys, addr, POOL_SIZE, false)),
+            LeafSession::install(
+                initiator,
+                NetSession::new(keys, addr, POOL_SIZE, false),
+                handshake_hash,
+            ),
             packet,
         ))
     }
@@ -358,6 +374,16 @@ pub struct LeafSession {
     next_fragment_id: Cell<u16>,
     /// This session's process-unique incarnation.
     incarnation: u64,
+    /// The final Noise handshake hash of the establishment that
+    /// produced this session.
+    ///
+    /// Retained because it is the transcript an establishment proof
+    /// signs ([`crate::establish`]) and the only value that ties a
+    /// signature to *this* handshake rather than to the pair of
+    /// identities, which is stable across attempts. Not secret: it
+    /// is the running hash of material both endpoints sent, which is
+    /// why Noise names it as the channel binding.
+    handshake_hash: [u8; 32],
     /// Rebuild headers for packets still in the retransmit window,
     /// keyed `(stream_id, sequence)`.
     stamps: RefCell<BTreeMap<(u64, u64), PacketStamp>>,
@@ -366,14 +392,22 @@ pub struct LeafSession {
 impl LeafSession {
     /// Wrap a freshly negotiated wire session, minting its
     /// incarnation.
-    fn install(peer: NodeId, session: NetSession) -> Self {
+    fn install(peer: NodeId, session: NetSession, handshake_hash: [u8; 32]) -> Self {
         Self {
             peer,
             session,
             next_fragment_id: Cell::new(1),
             incarnation: next_incarnation(),
+            handshake_hash,
             stamps: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// The establishment transcript this session was negotiated
+    /// under — what an establishment proof is verified over.
+    #[inline]
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        &self.handshake_hash
     }
 
     /// The peer's node id.

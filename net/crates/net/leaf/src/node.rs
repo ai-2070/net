@@ -26,6 +26,9 @@ use crate::control_plane::{NodeId, SignalEnvelope};
 use crate::counters::{DropReason, LeafCounters};
 use crate::dispatch::{self, Decoded, SUBPROTOCOL_EVENT_PLANE};
 use crate::error::{LeafError, Result, RpcError};
+use crate::establish::{
+    EstablishmentProof, ProofRole, PROOF_DEADLINE_MS, SUBPROTOCOL_ESTABLISHMENT_PROOF,
+};
 use crate::frame::{PieceMeta, Reassembler};
 use crate::identity::{unhex, LeafIdentity};
 use crate::rpc::{CallOwner, CallResult, CallTable, DEFAULT_CALL_TIMEOUT_MS};
@@ -341,11 +344,64 @@ enum StreamKind {
     Channel,
 }
 
+/// A responder establishment whose initiator has **not yet proved**
+/// that it owns the identity it claimed.
+///
+/// NKpsk0's responder finishes on message 1, so keys exist before
+/// anything has authenticated the initiator individually (see
+/// [`crate::establish`] for why the prologue is not that proof).
+/// This is the bounded state that holds those keys and nothing else:
+/// the peer is **not** in [`SessionTable`], so
+/// [`LeafNode::has_session`] is false, no `Connected` event has been
+/// emitted, no stream can be opened to the claimed identity, and the
+/// only frame the leaf will open on it is the establishment proof.
+///
+/// **The attempt owns the installation right, and the attempt is its
+/// incarnation.** `session.incarnation()` is minted once, process
+/// wide, when the responder handshake completes; it is this
+/// attempt's name. Supersession replaces the map entry and drops the
+/// predecessor's `LeafSession` outright, expiry removes it, and
+/// close removes it — after any of those there is no object left to
+/// install, so a proof arriving late has nothing to promote. That is
+/// the Stage 5 sequence-ownership discipline with the same shape:
+/// the right to install belongs to an exact attempt, never to a peer
+/// id.
+struct ProvisionalAdmission {
+    /// The negotiated session, held out of the table until the proof
+    /// verifies.
+    session: crate::session::LeafSession,
+    /// This establishment's final Noise transcript hash — what the
+    /// proof must be signed over. Copied out of the session so the
+    /// verification reads the attempt's own value and never a
+    /// current-peer lookup.
+    handshake_hash: [u8; 32],
+    /// When this attempt's right to install expires.
+    ///
+    /// [`crate::clock::Deadline`], the leaf's one deadline type —
+    /// evaluated against the same `Instant` reading the inbound path
+    /// already takes, so there is no second clock.
+    deadline: crate::clock::Deadline,
+}
+
 /// The leaf.
 pub struct LeafNode {
     identity: LeafIdentity,
     sessions: SessionTable,
     handshakes: HashMap<NodeId, PendingHandshake>,
+    /// Responder establishments waiting for their initiator's
+    /// establishment proof, keyed by the **claimed** peer id.
+    ///
+    /// One per claimed peer: a second message 1 for the same claim
+    /// supersedes the first, and replacing the entry is what retires
+    /// the predecessor's right to install.
+    provisional: HashMap<NodeId, ProvisionalAdmission>,
+    /// Peers whose provisional establishment was promoted by a
+    /// verified proof since the driver last read this.
+    ///
+    /// The driver's cue that an inbound establishment became real,
+    /// which is the moment — and the only moment — a responder may
+    /// report success for it.
+    verified_admissions: Vec<NodeId>,
     reassembler: Reassembler,
     /// Consumer-side reorder, keyed by **session incarnation** and
     /// stream id. Keying on the peer would hand a replacement its
@@ -487,6 +543,8 @@ impl LeafNode {
             identity,
             sessions: SessionTable::new(),
             handshakes: HashMap::new(),
+            provisional: HashMap::new(),
+            verified_admissions: Vec::new(),
             reassembler: Reassembler::new(),
             rx_streams: HashMap::new(),
             calls: CallTable::with_seed(call_id_seed),
@@ -800,14 +858,74 @@ impl LeafNode {
     }
 
     /// Finish the handshake with `peer` from its message-2 packet.
+    ///
+    /// **The initiator also pays its own bill here.** NKpsk0 leaves
+    /// the initiator anonymous, so a responder cannot attribute this
+    /// session to this leaf's identity on the strength of the
+    /// handshake alone. The moment message 2 is read the final
+    /// transcript hash exists, and this leaf signs
+    /// [`crate::establish`]'s statement over it with its **entity**
+    /// key — the same key its capability announcement is signed with
+    /// — and queues it on the session that just installed. No key
+    /// material and no identity argument crosses the public API: the
+    /// proof is made from the identity this node already holds.
     pub fn complete_handshake(&mut self, peer: NodeId, msg2: &[u8]) -> Result<()> {
         let pending = self
             .handshakes
             .remove(&peer)
             .ok_or_else(|| LeafError::Session(format!("no handshake in flight with {peer:#x}")))?;
         let session = pending.read_msg2(msg2)?;
+        let handshake_hash = *session.handshake_hash();
         self.install_session(peer, session);
+        if self.peer_is_leaf(peer) {
+            self.send_establishment_proof(peer, &handshake_hash)?;
+        }
         Ok(())
+    }
+
+    /// Whether `peer`'s own verified announcement says it is a leaf.
+    ///
+    /// **An emission gate, with no security weight whatever.** The
+    /// verifier's demand is unconditional — a leaf responder promotes
+    /// nothing without a valid proof — so a sender that withholds a
+    /// proof only denies itself a session. What this avoids is
+    /// handing a *native* responder a subprotocol it has no arm for:
+    /// a native node's responder contract is `MeshNode::accept_rtc`,
+    /// which this repair does not change, and the anchor bootstrap
+    /// handshake would otherwise cost one counted
+    /// unknown-subprotocol drop on the anchor per connect. A native
+    /// node never announces [`announce::TAG_LEAF`] and a leaf always
+    /// does ([`announce::build_announcement`] adds it
+    /// unconditionally), so the reading is not a heuristic.
+    ///
+    /// Both §9 initiator paths already hold the peer's verified
+    /// announcement — it is where the responder static key came from
+    /// — so this never suppresses a proof a peer establishment needs.
+    fn peer_is_leaf(&self, peer: NodeId) -> bool {
+        self.announcements.get(peer).is_some_and(|a| {
+            a.capabilities
+                .iter()
+                .any(|c| c.as_str() == announce::TAG_LEAF)
+        })
+    }
+
+    /// Sign and queue this leaf's establishment proof for `peer`.
+    fn send_establishment_proof(&mut self, peer: NodeId, handshake_hash: &[u8; 32]) -> Result<()> {
+        let proof = EstablishmentProof::sign(
+            self.identity.entity(),
+            ProofRole::Initiator,
+            self.identity.node_id(),
+            peer,
+            handshake_hash,
+        );
+        self.send_subprotocol(
+            peer,
+            u64::from(SUBPROTOCOL_ESTABLISHMENT_PROOF),
+            SUBPROTOCOL_ESTABLISHMENT_PROOF,
+            0,
+            &proof.encode(),
+            false,
+        )
     }
 
     /// Accept a peer's NKpsk0 message 1 as **responder**, returning
@@ -815,13 +933,29 @@ impl LeafNode {
     ///
     /// §9's browser ↔ browser attempt has no anchor to be the
     /// responder, so one of the two leaves answers with its own
-    /// Noise static key. Both halves of the discipline the
-    /// initiator has apply here: the PSK is the trust domain's, and
-    /// the initiator's claimed node id enters the handshake
-    /// **prologue** — the same binding `MeshNode::accept_rtc` makes
-    /// for a browser's claimed id — so the installed session is
-    /// bound to the id it is keyed under and a peer that claimed a
-    /// different one cannot complete.
+    /// Noise static key.
+    ///
+    /// **What this does NOT do is install a session.** The PSK is
+    /// the trust domain's and the claimed initiator id is in the
+    /// prologue, and neither of those authenticates the *individual*
+    /// that built the handshake: any holder of the domain PSK can
+    /// write any id into a prologue, which is exactly the
+    /// reproduction [`crate::establish`] describes. So the keys go
+    /// into a bounded [`ProvisionalAdmission`] instead — no session
+    /// table entry, no `Connected` event, no stream, no delivery —
+    /// and only a verified establishment proof over *this*
+    /// handshake's transcript promotes it
+    /// ([`Self::take_verified_admissions`] is the driver's cue).
+    /// There is no PSK-only path to an application-capable session,
+    /// routed or direct: this is the single responder entry point for
+    /// both.
+    ///
+    /// A second message 1 for the same claimed peer **supersedes**:
+    /// the predecessor's `LeafSession` is dropped with the map entry,
+    /// so its proof can no longer install anything. An existing
+    /// *proven* session for the peer is untouched until the new
+    /// attempt proves itself, which is strictly stronger than the
+    /// replace-on-arrival it used to do.
     ///
     /// `slot` is the transport slot the DataChannel occupies, the
     /// same value [`Self::begin_handshake`] takes.
@@ -840,12 +974,178 @@ impl LeafNode {
             rtc_addr(slot, 1),
             msg1,
         )?;
-        // A responder that already had a session with this peer is
-        // being re-offered: §9 step 4 replaces rather than joins,
-        // and the table is keyed on identity precisely so that is a
-        // table update.
-        self.install_session(peer, session);
+        let handshake_hash = *session.handshake_hash();
+        self.provisional.insert(
+            peer,
+            ProvisionalAdmission {
+                session,
+                handshake_hash,
+                deadline: clock::Deadline::in_ms(PROOF_DEADLINE_MS),
+            },
+        );
         Ok(msg2)
+    }
+
+    /// The incarnation of the provisional establishment held for
+    /// `peer`, if any — this attempt's name, and the thing
+    /// supersession changes.
+    pub fn provisional_attempt(&self, peer: NodeId) -> Option<u64> {
+        self.provisional.get(&peer).map(|a| a.session.incarnation())
+    }
+
+    /// Retire the provisional establishment held for `peer`, if any;
+    /// `true` if one was dropped.
+    ///
+    /// **Retirement is destruction, not a flag.** Dropping the entry
+    /// drops the `LeafSession` that holds this establishment's only
+    /// copy of its keys, so a proof for it can no longer be opened,
+    /// let alone promoted.
+    ///
+    /// [`Self::drop_session`] already does this for a close, and
+    /// [`Self::tick`] does it at the deadline. This is the seam the
+    /// **attempt's** terminal transition needs: an attempt can reach
+    /// a terminal term — ICE timeout, supersession, an explicit
+    /// reject — while its unproven establishment is still inside
+    /// [`crate::establish::PROOF_DEADLINE_MS`], and a proof arriving
+    /// over a relay in that window would otherwise install a session
+    /// for an attempt the driver's ledger has already retired.
+    /// Bounding that to the proof deadline is not the same as
+    /// excluding it.
+    pub fn retire_provisional(&mut self, peer: NodeId) -> bool {
+        self.provisional.remove(&peer).is_some()
+    }
+
+    /// Take the peers whose inbound establishment became real since
+    /// the last read.
+    ///
+    /// A responder may report success for an attempt **only** from
+    /// here: `accept_handshake` returning message 2 means keys, not
+    /// an authenticated peer.
+    pub fn take_verified_admissions(&mut self) -> Vec<NodeId> {
+        core::mem::take(&mut self.verified_admissions)
+    }
+
+    /// Retire every provisional establishment whose deadline has
+    /// passed as of `now`.
+    ///
+    /// Dropping the entry drops the `LeafSession` with it, so the
+    /// attempt's right to install is gone rather than merely flagged
+    /// — including while its proof is in flight.
+    fn sweep_provisional(&mut self, now: Instant) {
+        self.provisional.retain(|_, a| !a.deadline.expired_at(now));
+    }
+
+    /// Try to read `packet` as the establishment proof the
+    /// provisional admission for `peer` is waiting for.
+    ///
+    /// `true` means the packet belonged to the provisional
+    /// establishment and is fully disposed of — promoted, or refused
+    /// and counted. `false` means it did not open under the
+    /// provisional keys at all, so it is some other session's and the
+    /// ordinary receive path owns it (which is how a §9 step 4 direct
+    /// attempt can be provisional while the relayed session it will
+    /// replace keeps delivering).
+    ///
+    /// **Everything that is not a valid proof is refused here.** An
+    /// application frame sealed under an unproven establishment's
+    /// keys is dropped and counted, never delivered and never
+    /// answered: that is the "nothing application-visible" bound,
+    /// enforced on the receive path rather than promised.
+    ///
+    /// **Why there is no separate "did the attempt survive
+    /// verification" re-check.** The right to install is not a flag
+    /// consulted after the fact; it is the `LeafSession` object
+    /// itself, and that object holds the only copy of this
+    /// establishment's keys. Expiry (below and in [`Self::tick`]),
+    /// supersession ([`Self::accept_handshake`] replacing the entry)
+    /// and close ([`Self::drop_session`]) all *destroy* it, so a
+    /// proof for a retired attempt cannot be opened at all, let
+    /// alone promoted — it is refused one step earlier, as a packet
+    /// no session can read. The leaf is sans-IO and this whole
+    /// function is synchronous, so there is also no await for a
+    /// revocation to race: nothing can retire the attempt between
+    /// the signature check and the install.
+    fn admit_establishment_proof(&mut self, peer: NodeId, packet: &Bytes, now: Instant) -> bool {
+        let Some(admission) = self.provisional.get(&peer) else {
+            return false;
+        };
+        // **The deadline is judged against this arrival's own clock
+        // reading, before the arrival can promote anything** — the
+        // same discipline the reassembly sweep follows. Read here
+        // rather than in a sweep at the top of `on_datagram` so that
+        // a proof that lost its race is refused under the name that
+        // says why (`establishment_unproven`), not as an
+        // unattributable packet.
+        if admission.deadline.expired_at(now) {
+            self.provisional.remove(&peer);
+            self.counters.drop_for(DropReason::EstablishmentUnproven);
+            self.events.push(LeafEvent::Dropped {
+                reason: DropReason::EstablishmentUnproven,
+            });
+            return true;
+        }
+        let Ok(opened) = admission.session.open_packet(packet) else {
+            return false;
+        };
+        let handshake_hash = admission.handshake_hash;
+        let verified = opened.subprotocol_id == SUBPROTOCOL_ESTABLISHMENT_PROOF
+            && opened.events.len() == 1
+            && self
+                .verify_establishment(peer, &opened.events[0], &handshake_hash)
+                .is_ok();
+        if !verified {
+            self.counters.drop_for(DropReason::EstablishmentUnproven);
+            self.events.push(LeafEvent::Dropped {
+                reason: DropReason::EstablishmentUnproven,
+            });
+            return true;
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the entry was read at the top of this synchronous function and nothing \
+                      since then can remove it"
+        )]
+        let admission = self.provisional.remove(&peer).unwrap();
+        self.install_session(peer, admission.session);
+        self.verified_admissions.push(peer);
+        true
+    }
+
+    /// Verify one establishment-proof frame against the initiator's
+    /// **announced** entity key.
+    ///
+    /// The key is resolved here, from a signed announcement this leaf
+    /// already verified — the caller never supplies one, which is
+    /// what keeps the public surface peer-only. The same expiry that
+    /// removes a peer from discovery removes its ability to prove an
+    /// establishment, because `AnnouncementStore::get` is
+    /// freshness-filtered.
+    fn verify_establishment(
+        &self,
+        initiator: NodeId,
+        frame: &[u8],
+        handshake_hash: &[u8; 32],
+    ) -> Result<()> {
+        let entity_hex = self
+            .announcements
+            .get(initiator)
+            .map(|a| a.entity_id.clone())
+            .ok_or_else(|| {
+                LeafError::Session(format!(
+                    "no fresh verified announcement for {initiator:#018x}, so there is no key \
+                     its establishment proof could be checked against"
+                ))
+            })?;
+        let entity_id: [u8; 32] = unhex(&entity_hex)?
+            .try_into()
+            .map_err(|_| LeafError::Session("announced entity_id is not 32 bytes".into()))?;
+        EstablishmentProof::decode(frame)?.verify(
+            &entity_id,
+            ProofRole::Initiator,
+            initiator,
+            self.identity.node_id(),
+            handshake_hash,
+        )
     }
 
     /// Install a session, retiring whatever it replaced.
@@ -897,6 +1197,11 @@ impl LeafNode {
             self.retire_incarnation(old.incarnation());
         }
         self.handshakes.remove(&peer);
+        // Close retires an unproven establishment too, and retires
+        // it by DELETING it: an in-flight proof for this peer then
+        // has no attempt object left to install, which is the whole
+        // of "close revokes the ability to install".
+        self.provisional.remove(&peer);
         // A call registered before its session existed has no
         // incarnation to retire it; the peer is still the right key
         // for those.
@@ -956,6 +1261,7 @@ impl LeafNode {
             );
         }
         self.sweep_reassemblies(now);
+        self.sweep_provisional(now);
         self.drive_reliability();
         expired.len()
     }
@@ -1616,6 +1922,19 @@ impl LeafNode {
         let Some(inner) = dispatch::unwrap_routing(bytes, self_node, &self.counters) else {
             return;
         };
+
+        // **A provisional establishment gets exactly one thing
+        // through: its own establishment proof.** Tried first,
+        // because an unproven attempt's keys are not the peer's
+        // session keys and nothing sealed under them may reach the
+        // application. `false` means the packet did not open under
+        // them at all, so it belongs to a session this leaf already
+        // proved — the §9 step 4 case, where a direct attempt is
+        // provisional while the relayed session it will replace goes
+        // on delivering.
+        if self.admit_establishment_proof(peer, &inner, now) {
+            return;
+        }
 
         let Some(session) = self.sessions.get(peer) else {
             self.counters.drop_for(DropReason::NoSession);
@@ -3019,7 +3338,28 @@ mod tests {
             other => panic!("expected message 2, got {other:?}"),
         }
 
+        // **The responder is not done yet, and that is the repair.**
+        // Message 1 proved the domain PSK and B's own static key; it
+        // proved nothing about who built the handshake. So B holds a
+        // bounded provisional establishment, keyed by the attempt's
+        // incarnation, and `has_session` is false.
+        assert!(
+            a.has_session(bid),
+            "the initiator authenticated b's static key"
+        );
+        assert!(
+            !b.has_session(aid),
+            "a claimed id plus the domain PSK is not an identity"
+        );
+        assert!(b.provisional_attempt(aid).is_some());
+
+        // A's establishment proof, over this handshake's transcript,
+        // is what promotes it — and it crosses the same blind relay.
+        assert_eq!(forward(&mut a, &mut b), 1);
+        assert_eq!(b.take_verified_admissions(), vec![aid]);
         assert!(a.has_session(bid) && b.has_session(aid));
+        assert_eq!(b.provisional_attempt(aid), None);
+        assert_eq!(b.counters().drops(DropReason::EstablishmentUnproven), 0);
         assert_eq!(a.peer_relay(bid), Some(RELAY));
         assert_eq!(b.peer_relay(aid), Some(RELAY));
     }
@@ -3136,6 +3476,11 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // The routed establishment is provisional on b until a's
+        // establishment proof crosses the same relay.
+        assert!(!b.has_session(aid));
+        assert_eq!(forward(&mut a, &mut b), 1, "the proof rode the relay");
+        assert_eq!(b.take_verified_admissions(), vec![aid]);
         a.drain_events();
         b.drain_events();
         (a, b)
@@ -3643,15 +3988,34 @@ mod tests {
     }
 
     /// Two real leaves with a session installed on both sides.
+    ///
+    /// Discovery comes first, and not as decoration: the responder
+    /// verifies the initiator's establishment proof against the
+    /// entity key in its announcement, so a pair that skipped Layer
+    /// 1 cannot reach an application-capable session at all.
     fn pair() -> (LeafNode, LeafNode) {
         let mut a = LeafNode::new(identity(0x61), 1);
         let mut b = LeafNode::new(identity(0x62), 2);
         let (aid, bid) = (a.node_id(), b.node_id());
+        let from_a = a.build_announcement(&["pair".to_string()]).expect("a");
+        let from_b = b.build_announcement(&["pair".to_string()]).expect("b");
+        assert!(b.ingest_announcement(&from_a));
+        assert!(a.ingest_announcement(&from_b));
         let msg1 = a
             .begin_handshake(bid, &PSK, b.identity().noise().public_key(), 10)
             .expect("msg1");
         let msg2 = b.accept_handshake(aid, &PSK, &msg1, 10).expect("msg2");
         a.complete_handshake(bid, &msg2).expect("install");
+        assert!(
+            !b.has_session(aid),
+            "message 1 buys keys, not an identity: b is provisional until the proof"
+        );
+        assert_eq!(pump(&mut a, &mut b), 1, "the establishment proof crossed");
+        assert_eq!(
+            b.take_verified_admissions(),
+            vec![aid],
+            "the proof is what makes the session real on b"
+        );
         a.drain_events();
         b.drain_events();
         (a, b)

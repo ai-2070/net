@@ -16,11 +16,23 @@ fn node(seed: u64) -> LeafNode {
 fn connect(a: &mut LeafNode, b: &mut LeafNode, slot: u32) {
     let mut psk = [0u8; 32];
     getrandom::fill(&mut psk).unwrap();
+    // S6-01: a responder attributes a fresh session to a claimed
+    // identity only after that identity's signed establishment proof
+    // verifies against the entity key in its announcement, so the
+    // pair discovers each other first and the proof is delivered
+    // before the session is usable. Helper plumbing only — no probe
+    // name, assertion or message is changed.
+    let from_a = a.build_announcement(&["kyra".to_string()]).unwrap();
+    let from_b = b.build_announcement(&["kyra".to_string()]).unwrap();
+    assert!(b.ingest_announcement(&from_a));
+    assert!(a.ingest_announcement(&from_b));
     let one = a
         .begin_handshake(b.node_id(), &psk, b.identity().noise().public_key(), slot)
         .unwrap();
     let two = b.accept_handshake(a.node_id(), &psk, &one, slot).unwrap();
     a.complete_handshake(b.node_id(), &two).unwrap();
+    transfer(a, b);
+    assert_eq!(b.take_verified_admissions(), vec![a.node_id()]);
     a.drain_events();
     b.drain_events();
 }

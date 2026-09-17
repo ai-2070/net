@@ -46,6 +46,7 @@ pub mod counters;
 pub mod dispatch;
 pub mod enroll;
 pub mod error;
+pub mod establish;
 pub mod frame;
 pub mod identity;
 /// §8 leader election and the D2 leader lifecycle: generations,

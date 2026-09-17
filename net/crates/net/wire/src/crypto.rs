@@ -276,6 +276,40 @@ impl NoiseHandshake {
         self.is_initiator
     }
 
+    /// The **final** Noise handshake hash: the transcript both
+    /// endpoints computed over *this* establishment and nothing
+    /// else.
+    ///
+    /// Exposed because [`Self::into_session_keys`] consumes the
+    /// state, and the only projection it publishes is
+    /// [`SessionKeys::session_id`] — eight bytes, a session *name*,
+    /// far too little to bind a signature to one establishment. A
+    /// leaf's establishment proof signs this value
+    /// (`net-mesh-leaf`'s `establish` module: the initiator proves
+    /// it owns the identity it claimed, bound to this handshake and
+    /// not to a peer id, an announcement or a signalling dialog),
+    /// so the value has to be readable while the handshake state is
+    /// still alive.
+    ///
+    /// Refused before the handshake finishes. An intermediate `h` is
+    /// a different value on the two sides, so a proof signed over
+    /// one would bind nothing and would not even verify honestly.
+    /// Nothing secret leaves: `h` is the running hash of material
+    /// both endpoints already sent in the clear, which is exactly
+    /// why the Noise spec names it as the channel-binding value.
+    pub fn handshake_hash(&self) -> Result<[u8; 32], CryptoError> {
+        if !self.is_finished() {
+            return Err(CryptoError::Handshake(
+                "handshake hash read before the handshake finished".to_string(),
+            ));
+        }
+        let slice = self.state.get_handshake_hash();
+        let mut out = [0u8; 32];
+        let len = slice.len().min(32);
+        out[..len].copy_from_slice(&slice[..len]);
+        Ok(out)
+    }
+
     /// Write a handshake message
     ///
     /// Returns the message to send to the peer.
