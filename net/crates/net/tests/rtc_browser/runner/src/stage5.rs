@@ -41,6 +41,12 @@ use net::adapter::net::cortex::{
     EventMeta, RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
 use net::adapter::net::{MeshNode, Reliability, StreamConfig, StreamError, MAX_EVENT_SIZE};
+// `poll_shard` — the anchor's own application queue, which is where
+// an event addressed to a plain stream id lands once the ingress has
+// reassembled whatever fragment group carried it. Witness 16 is the
+// only reader of it in this runner, so draining the one shard its
+// stream maps to destroys nothing another witness was owed.
+use net::adapter::Adapter;
 
 use crate::browser::{Driver, Engine, LaunchSpec};
 use crate::udp_block::UdpProfile;
@@ -116,6 +122,31 @@ const ABI_LARGE_STREAM_ID: u64 = 0x0002_0000_0000_5A04;
 /// another leg delivered.
 const ABI_FRAG_STREAM_ID: u64 = 0x0002_0000_0000_5A05;
 
+/// Witness 16's own stream: the leaf → native direction of the
+/// above-one-event contract, driven by the page's PUBLIC producer.
+const ABI_LEAF_FRAG_STREAM_ID: u64 = 0x0002_0000_0000_5A06;
+
+/// Witness 17's stream — the one the LEADER tab owns while a real
+/// follower is attached, so a terminal raised on it is a broadcast
+/// the follower either hears or does not.
+const X7_BROADCAST_STREAM_ID: u64 = 0x0002_0000_0000_5A07;
+
+/// Witness 18's stream: the one whose `for await` is parked when the
+/// node it belongs to is closed.
+const CLOSE_PROBE_STREAM_ID: u64 = 0x0002_0000_0000_5A08;
+
+/// How long witness 17's injected answer fault holds its rejection.
+///
+/// Long enough for the anchor's trickle socket to finish its
+/// WebSocket upgrade, which is what makes the accepted attempt
+/// retirable at all; the witness asserts that establishment rather
+/// than trusting this number.
+const GUARD_FAULT_DELAY_MS: u64 = 3_000;
+
+/// The payload witness 17 puts on its stream. Small on purpose: this
+/// witness is about which TABS hear an event, not about size.
+const X7_PAYLOAD_SIZE: usize = 256;
+
 /// Payloads the direct stream witness pushes native → leaf, and
 /// their size.
 const ABI_DIRECT_EVENTS: usize = 12;
@@ -147,17 +178,29 @@ const ABI_RELIABLE_REORDER_EVERY: u64 = 3;
 /// the size it is.
 ///
 /// `MAX_EVENT_SIZE` is 8 104 B (`MAX_PAYLOAD_SIZE` minus the event
-/// frame's 4-byte length prefix) and no NATIVE node reassembles leaf
-/// fragments (§9.2), so the largest body that can round-trip leaf →
-/// native → leaf through `call()` is one that fits, with its nRPC
-/// framing, in a single event. `ABI_CEILING_SIZE` sits just under
-/// that: the reply is `echo:` + the body, so it must fit too.
+/// frame's 4-byte length prefix), and `ABI_CEILING_SIZE` is a body
+/// that fits inside ONE event **together with its nRPC framing** —
+/// the reply is `echo:` + the body, so that has to fit too.
+///
+/// **Why the round-trip leg is a single-event size.** It is not
+/// because nothing reassembles: after the round-5 ruling (§14.4) a
+/// native node DOES reassemble a leaf fragment group, and the native
+/// sender fragments for a peer that has advertised
+/// `net.stream.fragment_reassembly@1`. The earlier text here said
+/// the opposite and the Stage 6 fragmentation work made it false.
+/// The reason this leg stays inside one event is that it is the leg
+/// which must hold with NO fragmentation on either side, so its
+/// verdict is about `call()` and not about a reassembler. The
+/// above-one-event directions are their own witnesses and are
+/// asserted there: native → leaf is witness 15, leaf → native is
+/// witness 16.
 const ABI_CEILING_SIZE: usize = 7_800;
-/// Past 64 832 B, where §9.2 says the leaf attempts nothing and
-/// returns a typed `LeafError::Wire` naming streams. The witness
-/// asserts the refusal is typed and that nothing truncated reaches
-/// the far side — which is the contract, where "96 KiB works" is
-/// not.
+/// Past 64 832 B, where the leaf attempts nothing and returns a
+/// typed `LeafError::Wire` naming streams (`frame::split_payload`,
+/// and the ceiling `ABI_LEAF_FRAG_CEILING` derives below). The
+/// witness asserts the refusal is typed and that nothing truncated
+/// reaches the far side — which is the contract, where "96 KiB
+/// works" is not.
 const ABI_OVER_LIMIT_SIZE: usize = 96 * 1024;
 /// The leaf's fragmentation ceiling, DERIVED rather than restated:
 /// `net_leaf::frame::MAX_FRAGMENTED_PAYLOAD` is `MAX_FRAGMENT_PAYLOAD`
@@ -181,9 +224,14 @@ const ABI_LEAF_FRAG_CEILING: usize = MAX_EVENT_SIZE * ABI_LEAF_MAX_FRAGMENTS;
 ///   byte-identical event.
 ///
 /// Witness 15 is the only witness anywhere that a REAL browser leaf
-/// accepts a group the native sender cut; the native-side
-/// counterpart for the refusal is
-/// `a_peer_without_the_reassembly_tag_still_gets_event_too_large`.
+/// accepts a group the NATIVE sender cut, and witness 16 is the only
+/// one anywhere that a real native node accepts a group the PUBLIC
+/// browser producer cut; the native-side counterpart for the refusal
+/// is `a_peer_without_the_reassembly_tag_still_gets_event_too_large`
+/// and the native-fixture counterpart for the leaf → native
+/// direction is `a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event`,
+/// which hand-builds its pieces and so cannot speak for the public
+/// producer.
 const ABI_STREAM_LARGE_SIZE: usize = 32 * 1024;
 
 /// Payloads the leader-PROXIED stream witness pushes native → leaf.
@@ -193,7 +241,7 @@ const ABI_PROXY_SIZE: usize = 700;
 /// Every Stage 5 witness name, in ledger order. The CI job pins these
 /// exactly; the list is here so a rename is one edit and a drop is
 /// impossible to do quietly.
-pub const WITNESSES: [&str; 15] = [
+pub const WITNESSES: [&str; 20] = [
     "stage5_leaf_handshake_over_the_real_listener",
     "stage5_reliable_round_trip",
     "stage5_nrpc_call_to_a_native_service",
@@ -213,6 +261,13 @@ pub const WITNESSES: [&str; 15] = [
     // ahead of it would silently retarget that record to this name.
     // Ledger order is cosmetic; a mislabelled witness is not.
     "stage5_native_fragments_to_an_announced_leaf",
+    // Appended for the same reason, round 6. Every one of these is
+    // indexed by position below, so they go on the END.
+    "stage5_leaf_fragments_above_one_event_to_the_native_anchor",
+    "stage5_a_follower_observes_the_leaders_terminal_broadcast",
+    "stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt",
+    "stage5_direct_close_ends_a_parked_iterator_in_the_live_package",
+    "stage5_direct_close_refuses_a_later_open_with_the_leafs_typed_fence",
 ];
 
 // ===================================================================
@@ -366,6 +421,47 @@ pub enum Step5 {
         handle: String,
         expect: usize,
         timeout_ms: u64,
+    },
+    /// Whether the `for await` [`Step5::StreamOpen`] parked has
+    /// FINISHED, decided by a bounded race rather than by waiting.
+    ///
+    /// "It never settles" is not observable by waiting longer, so
+    /// `deadline_ms` is the assertion: a consumer that has already
+    /// been ended resolves the race immediately and pays no wall
+    /// clock, and one that is still parked comes back `"pending"`.
+    StreamIteratorState {
+        id: u64,
+        handle: String,
+        deadline_ms: u64,
+    },
+    /// Arm (`arm: true`) or READ a recorder on a session's own
+    /// `onEvent` stream.
+    ///
+    /// On a FOLLOWER this is the far end of the leader's broadcast,
+    /// which is the only place the leader → follower fan-out of a
+    /// node event is observable at all.
+    SessionEvents {
+        id: u64,
+        session: String,
+        arm: bool,
+        /// The leaf tag to wait for. `None` reports immediately.
+        expect_type: Option<String>,
+        timeout_ms: u64,
+    },
+    /// The RTC resources this tab's leaf constructed, and the
+    /// one-shot fault on the next answer it installs.
+    RtcResources {
+        id: u64,
+        arm_set_remote_description_fault: bool,
+        disarm_set_remote_description_fault: bool,
+        /// How long the armed fault holds its rejection before
+        /// returning it. See `rtcFault.delayMs` in `page/leaf5.js`:
+        /// the anchor's accepted attempt is only retirable once its
+        /// trickle socket has finished upgrading, so a failure that
+        /// lands microseconds after the offer is answered has
+        /// nothing to hand back for a reason unrelated to the
+        /// guard.
+        fault_delay_ms: u64,
     },
     /// One `call()` whose request and reply are both large enough to
     /// fragment. Bodies are generated from `(seed, size)` on both
@@ -610,6 +706,9 @@ impl Step5 {
             | Self::StreamOpen { id, .. }
             | Self::StreamWrite { id, .. }
             | Self::StreamInbox { id, .. }
+            | Self::StreamIteratorState { id, .. }
+            | Self::SessionEvents { id, .. }
+            | Self::RtcResources { id, .. }
             | Self::CallSized { id, .. }
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
@@ -649,6 +748,9 @@ impl Step5 {
             | Self::StreamOpen { id, .. }
             | Self::StreamWrite { id, .. }
             | Self::StreamInbox { id, .. }
+            | Self::StreamIteratorState { id, .. }
+            | Self::SessionEvents { id, .. }
+            | Self::RtcResources { id, .. }
             | Self::CallSized { id, .. }
             | Self::Announce { id, .. }
             | Self::Query { id, .. }
@@ -952,6 +1054,9 @@ pub struct Bundle {
     /// The leaf's `wasm-bindgen` output, for the size report and as
     /// a fallback when the wrapper's copy step has not run.
     pub wasm_pkg: PathBuf,
+    /// `leaf/src/wasm.rs`, read — never restated — for the exact
+    /// text of the closed-node refusal witness 19 requires.
+    pub leaf_wasm_rs: PathBuf,
 }
 
 impl Bundle {
@@ -966,7 +1071,27 @@ impl Bundle {
         Self {
             dist: net.join("browser-ts/dist"),
             wasm_pkg: net.join("leaf/pkg"),
+            leaf_wasm_rs: net.join("leaf/src/wasm.rs"),
         }
+    }
+
+    /// The refusal `Inner::admit` raises on a closed node, read out
+    /// of the leaf's own source.
+    ///
+    /// Restating the string here would make witness 19 agree with
+    /// whatever this file believes, and what the page receives comes
+    /// from the leaf — so the leaf is where the expectation is read.
+    /// `None` when it cannot be read at all, which the witness
+    /// treats as a FAILURE rather than as a licence to accept any
+    /// message: an unreadable expectation is an unasserted one.
+    pub fn node_closed_refusal(&self) -> Option<String> {
+        let src = std::fs::read_to_string(&self.leaf_wasm_rs).ok()?;
+        let admit = src.find("fn admit(&self) -> Result<(), LeafError> {")?;
+        let window = src.get(admit..admit.saturating_add(600))?;
+        let session = window.find("LeafError::Session(")?;
+        let open = window[session..].find('"')? + session + 1;
+        let close = window[open..].find('"')? + open;
+        Some(format!("session: {}", &window[open..close]))
     }
 
     /// `Ok(())`, or the exact reason the Stage 5 half cannot run.
@@ -2824,6 +2949,399 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
     }
 
     // ================================================================
+    // 16 — the PAGE'S PUBLIC PRODUCER → native, above one event
+    //
+    // The other direction of the above-one-event contract, and the
+    // half that had no honest witness anywhere. `rtc_repairs`'
+    // `a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event`
+    // HAND-BUILDS leaf-shaped fragments with a native fixture: it
+    // proves the native receive half accepts a conformant group, and
+    // it cannot prove that the public leaf producer emits one,
+    // because the thing that cuts the pieces there is the test.
+    // Here the pieces are cut by `net_leaf::frame::split_payload`
+    // inside a real browser, reached through
+    // `@net-mesh/browser`'s `LeafStream.send` and nothing else.
+    //
+    // THE TWO HALVES, AND WHY BOTH ARE NEEDED. That ONE event was
+    // sent is a page-side fact and that ONE event arrived is an
+    // anchor-side fact, and neither alone says the payload was ever
+    // above a packet:
+    //
+    //   * the page reports how many messages the leaf handed the
+    //     DataChannel for this one `send` (`wire_messages`, counted
+    //     unconditionally in the transport hook). A payload of
+    //     {ABI_STREAM_LARGE_SIZE} B is five pieces at
+    //     `MAX_EVENT_SIZE`, so a count below that would mean the
+    //     premise never happened — nothing was fragmented and the
+    //     anchor-side assertion would be about an ordinary event;
+    //   * the anchor drains its OWN application queue for this
+    //     stream and must find exactly ONE event, byte-identical.
+    //     A receive half that did not reassemble delivers the five
+    //     pieces, and `collect_stream_events` recognises pieces, so
+    //     that outcome is MEASURED rather than reported as a
+    //     timeout.
+    //
+    // No announcement matters in this direction: the leaf fragments
+    // unconditionally (`session.rs::build_packets`) and the native
+    // ingress reassembles unconditionally. The capability gate is
+    // the native SENDER's, and it is witnesses 12 and 15.
+    //
+    // Inverse (native reassembly off): stub the reassembly hand-off
+    // in `mesh.rs::reassemble_rtc_fragments` to return its pieces
+    // unchanged — `delivered` becomes the five pieces and this
+    // witness FAILS on the count while `wire_messages` still shows
+    // the send fragmented.
+    // ================================================================
+    {
+        let up_open = script
+            .run(
+                "a",
+                Step5::StreamOpen {
+                    id: 0,
+                    session: "main".into(),
+                    handle: "leaf-frag".into(),
+                    reliable: true,
+                    label: Some("abi-leaf-frag".into()),
+                    stream_id: Some(ABI_LEAF_FRAG_STREAM_ID.to_string()),
+                    channel_hash: None,
+                },
+            )
+            .await;
+        // The anchor's side of the same id, as a real peer does: a
+        // receive half with no per-stream state of its own has
+        // nothing to acknowledge the group's sequences against, and
+        // "the pieces never completed" would then be a fact about
+        // the harness.
+        let up_native = cx
+            .anchor
+            .open_stream(
+                node_id,
+                ABI_LEAF_FRAG_STREAM_ID,
+                StreamConfig::new().with_reliability(Reliability::Reliable),
+            )
+            .map_err(|e| e.to_string());
+        let session_id = cx.anchor.peer_session_id(node_id);
+        let abandoned_before = cx.anchor.rtc_reassembly().abandoned_total();
+        let up_seed = 0x7A00 ^ (rand_u64() & 0xFFFF);
+        let up_payload = gen_bytes(up_seed, ABI_STREAM_LARGE_SIZE);
+        let up_pieces = ABI_STREAM_LARGE_SIZE.div_ceil(MAX_EVENT_SIZE);
+        let wrote = if up_open.ok && up_native.is_ok() {
+            script
+                .run(
+                    "a",
+                    Step5::StreamWrite {
+                        id: 0,
+                        handle: "leaf-frag".into(),
+                        frames: vec![],
+                        seed: up_seed,
+                        size: ABI_STREAM_LARGE_SIZE,
+                        count: 1,
+                        drop_every: 0,
+                        reorder_every: 0,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: page open ok={} anchor open={:?}",
+                up_open.ok, up_native
+            ))
+        };
+        let wire_messages = stat_u64(&wrote, "wire_messages");
+        let sent_marks = marks(&wrote, "sent");
+        let delivered = collect_stream_events(
+            cx.anchor,
+            ABI_LEAF_FRAG_STREAM_ID,
+            &up_payload,
+            Duration::from_secs(45),
+        )
+        .await;
+        let held_after = session_id.map_or(0, |s| cx.anchor.rtc_reassembly().held_bytes(s));
+        let abandoned_after = cx.anchor.rtc_reassembly().abandoned_total();
+        let want_up = Mark::of(&up_payload);
+        let fragmented = wire_messages >= up_pieces as u64;
+        let one_event = delivered.len() == 1 && delivered[0] == up_payload;
+        let up_pass = up_open.ok
+            && up_native.is_ok()
+            && wrote.ok
+            && sent_marks == vec![want_up]
+            && fragmented
+            && one_event
+            && held_after == 0
+            && abandoned_after == abandoned_before;
+        let up_outcome = if one_event {
+            "DELIVERED as ONE byte-identical event — the public producer cut the group and \
+             the native ingress put it back"
+                .to_string()
+        } else if delivered.is_empty() {
+            "NOTHING arrived on the anchor's application queue — neither the payload nor a \
+             single piece of it, so the group never completed AND never partially \
+             delivered"
+                .to_string()
+        } else {
+            format!(
+                "{} event(s) arrived, of sizes {:?} — the group reached the anchor as \
+                 PIECES, so the native receive half did not reassemble it",
+                delivered.len(),
+                delivered.iter().map(Vec::len).collect::<Vec<_>>()
+            )
+        };
+        ledger.record(
+            WITNESSES[15],
+            up_pass,
+            format!(
+                "THE PAGE'S PUBLIC PRODUCER → NATIVE, ABOVE ONE EVENT. One \
+                 `LeafStream.send(<{ABI_STREAM_LARGE_SIZE} B>)` through \
+                 `@net-mesh/browser` on a stream of its own \
+                 ({ABI_LEAF_FRAG_STREAM_ID:#x}, page open ok={}, anchor open={up_native:?}), \
+                 over MAX_EVENT_SIZE = {MAX_EVENT_SIZE} B and under the \
+                 {ABI_LEAF_FRAG_CEILING} B leaf ceiling. NOTHING here is hand-built: the \
+                 pieces are cut by the leaf's own `frame::split_payload` in the browser, \
+                 which is exactly what the native fixture witness \
+                 `a_leaf_fragmented_payload_reaches_a_native_peer_as_one_event` cannot \
+                 speak for, because there the test cuts them. \
+                 THE SEND: ok={} (error={:?}), and the page reports the payload it built \
+                 as {sent_marks:?} against the expected {want_up:?}. \
+                 THE PREMISE, asserted not assumed: that one `send` became \
+                 {wire_messages} DataChannel message(s), and {ABI_STREAM_LARGE_SIZE} B is \
+                 {up_pieces} pieces at MAX_EVENT_SIZE — so fragmented={fragmented}. A \
+                 count below {up_pieces} would mean this witness had measured an ordinary \
+                 event and called it a group. \
+                 THE ARRIVAL: the anchor drained its own application queue for shard {} \
+                 (`shard_for_stream`, so no other stream's events were consumed) and \
+                 found {} event(s): {up_outcome} (one_event={one_event}). The collector \
+                 recognises PIECES as well as the whole payload, so a receive half that \
+                 did not reassemble is measured rather than waited out. \
+                 AND NOTHING WAS LOST ON THE WAY: the anchor's reassembler holds \
+                 {held_after} bytes for this session afterwards (a completed group keeps \
+                 nothing) and its abandonment total is {abandoned_after}, unchanged from \
+                 {abandoned_before}. ANCHOR STATE: {}",
+                up_open.ok,
+                wrote.ok,
+                wrote.error,
+                cx.anchor.shard_for_stream(ABI_LEAF_FRAG_STREAM_ID),
+                delivered.len(),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+    }
+
+    // ================================================================
+    // 18 and 19 — direct `close()`, through the LIVE package, in a
+    //             real browser: two outcomes, two witnesses
+    //
+    // Round 5 evidence item 2. The new built-package ABI test runs
+    // compiled TypeScript against an INJECTED transport, so it can
+    // say what the wrapper does and not what a real wasm-owned
+    // stream does. These two run the real bundle over the real
+    // session.
+    //
+    // TWO WITNESSES, NOT ONE CONJUNCTION, and that is the point of
+    // the split: "the parked iterator ended" and "a later open is
+    // refused, typed" are different obligations with different
+    // failure modes, and a single test asserting both stays green
+    // while either half is broken as long as the other fails first —
+    // and cannot say which one regressed.
+    //
+    // A FRESH identity, not the run's custodial one: this leg closes
+    // the node it opens, and doing that to the shared identity would
+    // reach into three later witnesses.
+    // ================================================================
+    {
+        let close_probe = Step5::Connect {
+            id: 0,
+            session: "closeprobe".into(),
+            credential: cx.credential.clone(),
+            bootstrap_url: cx.bootstrap_url.clone(),
+            origin: cx.origin.clone(),
+            anchor_rtc_addr: cx.anchor_rtc_addr.to_string(),
+            stun: cx.stun.clone(),
+            // The leaf mints its own, which is what keeps this leg
+            // out of the shared identity's way.
+            entity_secret_hex: None,
+            noise_secret_hex: None,
+            use_session: false,
+            capabilities: vec![],
+            subscriptions: vec![],
+            lock_scope: None,
+            expect_failure: false,
+        };
+        let probe_connected = script.run("a", close_probe).await;
+        let probe_open = if probe_connected.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamOpen {
+                        id: 0,
+                        session: "closeprobe".into(),
+                        handle: "closeprobe".into(),
+                        reliable: true,
+                        label: Some("close-probe".into()),
+                        stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
+                        channel_hash: None,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: the probe node never connected")
+        };
+        // The parked consumer, BEFORE the close: a `for await` that
+        // had already ended for some other reason would make the
+        // witness below vacuous, so its pendency is asserted rather
+        // than assumed.
+        let parked_before = if probe_open.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamIteratorState {
+                        id: 0,
+                        handle: "closeprobe".into(),
+                        deadline_ms: 250,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let was_parked = stat_str(&parked_before, "outcome") == "\"pending\"";
+        let probe_closed = if probe_open.ok {
+            script
+                .run(
+                    "a",
+                    Step5::Close {
+                        id: 0,
+                        session: "closeprobe".into(),
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted")
+        };
+        let parked_after = if probe_closed.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamIteratorState {
+                        id: 0,
+                        handle: "closeprobe".into(),
+                        deadline_ms: 5_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: the node was never closed")
+        };
+        let outcome = stat_str(&parked_after, "outcome");
+        let ended = outcome == "\"ended\"";
+        let iterator_ended = stat_str(&parked_after, "iterator_ended") == "true";
+        let iterator_error = stat_str(&parked_after, "iterator_error");
+        // The NORMAL end of iteration. An exception is a different
+        // and worse disposition, and a loop that already handles
+        // "the stream ended" would not survive it — so it fails
+        // here rather than passing for the outcome it is not.
+        let clean = iterator_error == "null";
+        ledger.record(
+            WITNESSES[18],
+            probe_connected.ok
+                && probe_open.ok
+                && was_parked
+                && probe_closed.ok
+                && ended
+                && iterator_ended
+                && clean,
+            format!(
+                "DIRECT `close()` ENDS A PARKED ITERATOR, in the live package. A node of \
+                 its OWN identity connected (ok={}{}) and opened a reliable stream \
+                 ({CLOSE_PROBE_STREAM_ID:#x}, ok={}) whose `for await` was attached at \
+                 open, on the real wasm-owned `LeafStream` the bundle returned — not on \
+                 an injected transport, which is the whole difference from the \
+                 built-package ABI probe. BEFORE the close that consumer was genuinely \
+                 PARKED: the bounded race came back {} (pending={was_parked}), so the \
+                 witness is not vacuous. `BrowserNode.close()` then ran (ok={}) and the \
+                 consumer must FINISH: outcome={outcome} (ended={ended}), \
+                 iterator_ended={iterator_ended}. The deadline IS the assertion — \
+                 \"never settles\" is not observable by waiting longer, so the race \
+                 resolves at once on an ended consumer and reports `pending` on a parked \
+                 one. And it is the NORMAL end of iteration, not an exception: \
+                 iterator_error={iterator_error} (clean={clean}). The typed refusal of a \
+                 LATER open is a different obligation and is its own witness \
+                 (`{}`) — one test asserting both would be green while either half was \
+                 broken. ANCHOR STATE: {}",
+                probe_connected.ok,
+                probe_connected
+                    .error
+                    .as_deref()
+                    .map(|e| format!("; error: {e}"))
+                    .unwrap_or_default(),
+                probe_open.ok,
+                stat_str(&parked_before, "outcome"),
+                probe_closed.ok,
+                WITNESSES[19],
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
+        // ---- 19: the closed node refuses a LATER open, typed -----
+        //
+        // The expectation is READ OUT OF THE LEAF, not restated: a
+        // constant copied into this file would agree with whatever
+        // this file believes, and what the page receives comes from
+        // `Inner::admit`. An unreadable expectation FAILS the
+        // witness — an assertion nobody can evaluate is not one.
+        let expected_refusal = cx.bundle.node_closed_refusal();
+        let reopen = if probe_closed.ok {
+            script
+                .run(
+                    "a",
+                    Step5::StreamOpen {
+                        id: 0,
+                        session: "closeprobe".into(),
+                        handle: "closeprobe-after".into(),
+                        reliable: true,
+                        label: Some("close-probe-after".into()),
+                        stream_id: Some(CLOSE_PROBE_STREAM_ID.to_string()),
+                        channel_hash: None,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: the node was never closed")
+        };
+        let reopen_kind = reopen.kind.clone().unwrap_or_default();
+        let reopen_message = reopen.message.clone().unwrap_or_default();
+        let refused_exactly = expected_refusal
+            .as_ref()
+            .is_some_and(|want| &reopen_message == want);
+        ledger.record(
+            WITNESSES[19],
+            probe_closed.ok
+                && !reopen.ok
+                && !reopen.test_error.unwrap_or(false)
+                && reopen_kind == "session"
+                && refused_exactly,
+            format!(
+                "A CLOSED NODE REFUSES A LATER `openStream`, TYPED, through the live \
+                 package. After the close above (ok={}) the same session was asked for \
+                 the same stream id again: the call must FAIL — succeeding would hand a \
+                 page a handle on a node that no longer holds this origin's identity, \
+                 and `test_error` marks that case rather than letting it read as a pass \
+                 (ok={}, test_error={:?}). The refusal is EXACT, not \"some error\": \
+                 kind={reopen_kind:?} must be `\"session\"` and the Display must EQUAL \
+                 the leaf's own text, which is READ from \
+                 `leaf/src/wasm.rs::Inner::admit` rather than restated here \
+                 (expected={expected_refusal:?}, observed={reopen_message:?}, \
+                 equal={refused_exactly}). A constant copied into this file would agree \
+                 with this file; an unreadable expectation fails the witness instead of \
+                 widening it. ANCHOR STATE: {}",
+                probe_closed.ok,
+                reopen.ok,
+                reopen.test_error,
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+    }
+
+    // ================================================================
     // 9 — a direct node's event callback may call back into the node
     //
     // `wasm::Inner` is the leaf's one shared cell, and it exists only
@@ -3717,6 +4235,260 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             ),
         );
 
+        // ============================================================
+        // 17 — a FOLLOWER hears the leader's node events, including
+        //      the terminal one
+        //
+        // Round 4 item 4's second missing wiring witness. The named
+        // X7 unit test (`leaf/tests/wasm_leader.rs::
+        // a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking`)
+        // records events with `record_events(&leader)` and opens no
+        // follower at all: it proves the sink does not panic on the
+        // server borrow and that the leader's OWN listeners are
+        // called. The half it cannot reach is whether the event ever
+        // leaves the tab — `event_sink` queues it, `flush_events` →
+        // `flush_broadcasts` takes the server and calls
+        // `server.broadcast_event`, the BroadcastChannel carries it,
+        // and the follower's `FollowerEvent::Event` arm emits it to
+        // its own listeners. Five links, none of them exercised by a
+        // one-tab test.
+        //
+        // It runs HERE because this is the only point in the script
+        // where a real leader (tab b) and a real follower (tab a)
+        // hold one identity, and it runs BEFORE the follower is
+        // handed back below.
+        //
+        // The stream belongs to the LEADER, deliberately: a
+        // follower's own proxied stream already rides this fan-out
+        // in witness 13, so a leader-owned id is what distinguishes
+        // "the broadcast works for streams the follower asked for"
+        // from "the broadcast carries this node's events".
+        //
+        // TWO EVENTS, one wiring, two different producers inside the
+        // leaf:
+        //
+        //   * `stream_data`, produced by the inbound path when the
+        //     anchor puts a payload on the leader's stream;
+        //   * `stream_failed`/`peer_reset`, produced by the leaf's
+        //     `handle_event` when the anchor's own receive half ends
+        //     that stream. It is raised at its production entry
+        //     point — `NetSession::note_receive_terminal`, the call
+        //     the native receive-abandonment disposal makes — and
+        //     the retransmit tick turns it into the real
+        //     `StreamReset` frame. The harness supplies the
+        //     terminal, not the frame: what is under test is that a
+        //     terminal reaching the leaf reaches a FOLLOWER's page.
+        //
+        // Inverse: delete the `shared.broadcasts.borrow_mut().push(…)`
+        // line from `leaf/src/leader_session.rs::event_sink` — the
+        // leader's own rows stay exactly as they are and every
+        // follower row disappears, which is precisely the gap this
+        // witness exists to close.
+        // ============================================================
+        let x7_armed_follower = script
+            .run(
+                "a",
+                Step5::SessionEvents {
+                    id: 0,
+                    session: "abi-follow".into(),
+                    arm: true,
+                    expect_type: None,
+                    timeout_ms: 0,
+                },
+            )
+            .await;
+        let x7_armed_leader = script
+            .run(
+                "b",
+                Step5::SessionEvents {
+                    id: 0,
+                    session: "second".into(),
+                    arm: true,
+                    expect_type: None,
+                    timeout_ms: 0,
+                },
+            )
+            .await;
+        // The LEADER's stream, opened on the leader's own session.
+        let x7_open = if is_follower && x7_armed_follower.ok && x7_armed_leader.ok {
+            script
+                .run(
+                    "b",
+                    Step5::StreamOpen {
+                        id: 0,
+                        session: "second".into(),
+                        handle: "x7".into(),
+                        reliable: true,
+                        label: Some("x7-broadcast".into()),
+                        stream_id: Some(X7_BROADCAST_STREAM_ID.to_string()),
+                        channel_hash: None,
+                    },
+                )
+                .await
+        } else {
+            fail(format!(
+                "not attempted: follower={is_follower}, follower recorder \
+                 ok={} ({:?}), leader recorder ok={} ({:?})",
+                x7_armed_follower.ok,
+                x7_armed_follower.error,
+                x7_armed_leader.ok,
+                x7_armed_leader.error
+            ))
+        };
+        let x7_native = if x7_open.ok {
+            cx.anchor
+                .open_stream(
+                    node_id,
+                    X7_BROADCAST_STREAM_ID,
+                    StreamConfig::new().with_reliability(Reliability::Reliable),
+                )
+                .map_err(|e| e.to_string())
+        } else {
+            Err("not attempted: the leader never opened the stream".into())
+        };
+        let x7_payload = gen_bytes(0x0B57 ^ (rand_u64() & 0xFFFF), X7_PAYLOAD_SIZE);
+        let want_x7 = Mark::of(&x7_payload);
+        let mut x7_send_error: Option<String> = None;
+        match &x7_native {
+            Ok(stream) => {
+                let payload = Bytes::from(x7_payload.clone());
+                if let Err(e) = cx
+                    .anchor
+                    .send_with_retry(stream, std::slice::from_ref(&payload), 60)
+                    .await
+                {
+                    x7_send_error = Some(e.to_string());
+                }
+            }
+            Err(e) => x7_send_error = Some(e.clone()),
+        }
+        let x7_follower_data = script
+            .run(
+                "a",
+                Step5::SessionEvents {
+                    id: 0,
+                    session: "abi-follow".into(),
+                    arm: false,
+                    expect_type: Some("stream_data".into()),
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        // The TERMINAL, raised where the native receive half raises
+        // it. The tick that drains it into a `StreamReset` is the
+        // production one; nothing here builds a frame.
+        let x7_terminal_noted = match cx.anchor.peer_session_for_test(node_id) {
+            Some(session) => {
+                session.note_receive_terminal(X7_BROADCAST_STREAM_ID);
+                Ok(())
+            }
+            None => Err("the anchor holds no session for this leaf".to_string()),
+        };
+        let x7_follower_term = if x7_terminal_noted.is_ok() {
+            script
+                .run(
+                    "a",
+                    Step5::SessionEvents {
+                        id: 0,
+                        session: "abi-follow".into(),
+                        arm: false,
+                        expect_type: Some("stream_failed".into()),
+                        timeout_ms: 30_000,
+                    },
+                )
+                .await
+        } else {
+            fail("not attempted: no session to raise the terminal on")
+        };
+        let x7_leader_rows = script
+            .run(
+                "b",
+                Step5::SessionEvents {
+                    id: 0,
+                    session: "second".into(),
+                    arm: false,
+                    expect_type: Some("stream_failed".into()),
+                    timeout_ms: 30_000,
+                },
+            )
+            .await;
+        let follower_data_rows = event_rows(&x7_follower_data, "events");
+        let follower_term_rows = event_rows(&x7_follower_term, "events");
+        let leader_rows = event_rows(&x7_leader_rows, "events");
+        let follower_saw_data = row_for(
+            &follower_data_rows,
+            "stream_data",
+            X7_BROADCAST_STREAM_ID,
+            None,
+        )
+        .is_some_and(|row| row.mark == Some(want_x7));
+        let leader_saw_data = row_for(&leader_rows, "stream_data", X7_BROADCAST_STREAM_ID, None)
+            .is_some_and(|row| row.mark == Some(want_x7));
+        let follower_saw_terminal = row_for(
+            &follower_term_rows,
+            "stream_failed",
+            X7_BROADCAST_STREAM_ID,
+            Some("peer_reset"),
+        )
+        .is_some();
+        let leader_saw_terminal = row_for(
+            &leader_rows,
+            "stream_failed",
+            X7_BROADCAST_STREAM_ID,
+            Some("peer_reset"),
+        )
+        .is_some();
+        ledger.record(
+            WITNESSES[16],
+            x7_open.ok
+                && x7_native.is_ok()
+                && x7_send_error.is_none()
+                && x7_terminal_noted.is_ok()
+                && follower_saw_data
+                && leader_saw_data
+                && follower_saw_terminal
+                && leader_saw_terminal,
+            format!(
+                "A FOLLOWER'S PAGE HEARS THE LEADER'S NODE EVENTS — round 4 item 4's \
+                 second missing wiring witness. The named X7 unit test records events on \
+                 the LEADER only and opens no follower, so it proves the sink survives \
+                 the server borrow and never that the event leaves the tab. Here tab b is \
+                 the leader and tab a is a real FOLLOWER on the same identity \
+                 (follower={is_follower}), both with a recorder on their session's own \
+                 `onEvent` (follower armed={}, leader armed={}). \
+                 THE STREAM IS THE LEADER'S ({X7_BROADCAST_STREAM_ID:#x}, open ok={}): a \
+                 follower's own proxied stream already rides this fan-out in witness 13, \
+                 so a leader-owned id is what separates `the broadcast serves streams the \
+                 follower asked for` from `the broadcast carries this node's events`. \
+                 DATA: the anchor opened the same id ({x7_native:?}) and sent one \
+                 {X7_PAYLOAD_SIZE} B payload (error={x7_send_error:?}); the FOLLOWER's \
+                 rows carry a `stream_data` for that exact id whose payload mark is \
+                 {want_x7:?}={follower_saw_data} (waited {} ms, rows={follower_data_rows:?}), \
+                 and the leader's own listener saw it too={leader_saw_data}. \
+                 TERMINAL: `NetSession::note_receive_terminal({X7_BROADCAST_STREAM_ID:#x})` \
+                 on the anchor's session ({x7_terminal_noted:?}) — the production entry \
+                 point the native receive-abandonment disposal calls — and the anchor's \
+                 own retransmit tick turned it into the real `StreamReset`. Nothing here \
+                 builds a frame. The leaf's `handle_event` must raise \
+                 `stream_failed`/`peer_reset` for that stream, the FOLLOWER must \
+                 hear it={follower_saw_terminal} (waited {} ms, rows={follower_term_rows:?}) \
+                 and so must the leader={leader_saw_terminal} (rows={leader_rows:?}). \
+                 A leader-only pass is the exact shape of the gap: it is what the unit \
+                 test already establishes. NOTE for the report: `stream_failed` reaches \
+                 the page as the package's `{{ type: 'unknown', tag: 'stream_failed' }}` — \
+                 `browser-ts/src/events.ts` models no terminal variant — so the page's \
+                 normalizer reads the tag and the leaf's own snake_case fields out of \
+                 `raw`. That is a typing gap in the wrapper, reported rather than \
+                 asserted here. ANCHOR STATE: {}",
+                x7_armed_follower.ok,
+                x7_armed_leader.ok,
+                x7_open.ok,
+                stat_u64(&x7_follower_data, "waited_ms"),
+                stat_u64(&x7_follower_term, "waited_ms"),
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+
         // Hand the follower back before the displacement witness
         // runs: a live follower in tab a would promote itself when
         // tab b's page closes and bootstrap a node of its own, which
@@ -4121,6 +4893,184 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         }
     }
 
+    // ================================================================
+    // 17 — `ConnectGuard` is ARMED: a connect that fails after the
+    //      anchor accepted its attempt hands that attempt back
+    //
+    // Round 4 item 4's first missing wiring witness. The parked RTC
+    // factory in `leaf/tests/wasm_leader.rs` builds real transport
+    // resources but never runs production `wasm::LeafNode::connect`,
+    // so nothing anywhere sensitizes the arming line
+    // (`ConnectGuard::new(&inner, &transport, &control)`, placed
+    // before the first resource-bearing await). This runs the real
+    // `connect` in a real browser and asserts the arming's own
+    // effect.
+    //
+    // WHICH EFFECT, AND WHY THIS ONE. The guard does two things on
+    // drop: it closes the RTC resources synchronously, and — once
+    // the anchor has ACCEPTED the attempt — it spawns the
+    // `end_attempt` that hands the dialog back. Only the second is a
+    // discriminating observable. Closing is also what the ordinary
+    // `Rc` teardown reaches: when the failing `connect` returns, the
+    // last strong reference to `Inner` goes, `RtcLeafTransport`'s
+    // `PeerLink` destructor runs and it calls `close()` on the
+    // connection — so an unarmed guard would still, eventually,
+    // leave `signalingState == "closed"`. Nothing in that teardown
+    // hands the ATTEMPT back: the trickle WebSocket is a live
+    // network resource that an unreferenced handle does not close,
+    // and the anchor holds the dialog, its ICE agent and its
+    // signalling reservation until `ice_deadline` — 90 s here. So
+    // the assertion is the handback, and the connection states are
+    // recorded beside it as corroboration rather than as the test.
+    //
+    // THE INTERVAL. `connect` reaches it through `?` on
+    // `accept_answer`, which is the ONLY failure below the anchor's
+    // acceptance with no error branch of its own: the two branches
+    // that do have one (`brought_up` and `enroll`) both clean up and
+    // then DISARM. No network condition puts a run there on demand,
+    // so the page rejects exactly one `setRemoteDescription` — a
+    // rejected promise, never a throw, because `web-sys`'s binding
+    // does not catch — and disarms itself. The fault is in the
+    // BROWSER API the leaf calls, not in the leaf.
+    //
+    // It runs LAST because it needs a quiet anchor: the baseline it
+    // compares against is this identity's own open-dialog count, and
+    // a witness still driving signalling would move it underneath.
+    //
+    // Inverse: delete the `ConnectGuard::new(…)` arming line (and
+    // the `attempt.*` calls that then stop compiling) — the anchor
+    // keeps this attempt for its full 90 s `ice_deadline`, the
+    // bounded wait below expires, and the witness FAILS.
+    // ================================================================
+    {
+        let dialogs_before = cx.anchor.open_signal_dialogs(node_id);
+        let armed = script
+            .run(
+                "a",
+                Step5::RtcResources {
+                    id: 0,
+                    arm_set_remote_description_fault: true,
+                    disarm_set_remote_description_fault: false,
+                    fault_delay_ms: GUARD_FAULT_DELAY_MS,
+                },
+            )
+            .await;
+        let connections_before = stat_u64(&armed, "connection_count");
+        // The run's custodial identity, deliberately: the handback is
+        // read on the ANCHOR, which needs the claimed node id, and a
+        // freshly minted one is not knowable here without deriving
+        // it. The attempt cannot reach the anchor's own
+        // retirement path either — that one runs at DataChannel-open
+        // for an identity already installed, and this attempt never
+        // installs the answer, so it never opens a channel.
+        // SPAWNED, not awaited: the attempt has to be observed on
+        // the anchor while it is still in flight, and the fault's
+        // delay is the window in which to do it.
+        let doomed_in_flight = script.spawn("a", connect_step("guarded", true));
+        // THE ESTABLISHMENT PREMISE, observed rather than assumed:
+        // the anchor really did register an accepted attempt for
+        // this identity. Without this, a handback assertion would
+        // also be satisfied by an attempt that never existed — an
+        // offer refused before the answer leaves nothing to retire
+        // and would read as a pass.
+        let registered = wait_for(
+            || cx.anchor.open_signal_dialogs(node_id) > dialogs_before,
+            Duration::from_secs(20),
+        )
+        .await;
+        let dialogs_peak = cx.anchor.open_signal_dialogs(node_id);
+        let doomed = doomed_in_flight.await;
+        let doomed_kind = doomed.kind.clone().unwrap_or_default();
+        let doomed_message = doomed.message.clone().unwrap_or_default();
+        // The PREMISE: the run failed where this witness needs it to
+        // fail. `accept_answer` is the only producer of this text
+        // (`unsupported("setRemoteDescription", …)`), so it is also
+        // the proof that the offer POST had already been ACCEPTED —
+        // an offer refused earlier never reaches the answer, and
+        // would leave no attempt to hand back.
+        let failed_at_the_answer = !doomed.ok
+            && !doomed.test_error.unwrap_or(false)
+            && doomed_message.contains("setRemoteDescription");
+        let after = script
+            .run(
+                "a",
+                Step5::RtcResources {
+                    id: 0,
+                    arm_set_remote_description_fault: false,
+                    disarm_set_remote_description_fault: true,
+                    fault_delay_ms: 0,
+                },
+            )
+            .await;
+        let fault_fired = stat_u64(&after, "fault_fired") > 0;
+        let connections_after = stat_u64(&after, "connection_count");
+        let built_a_connection = connections_after > connections_before;
+        // The handback, on the anchor. A CONDITION with a ceiling far
+        // below the 90 s `ice_deadline`, so "it was retired" cannot
+        // be satisfied by the deadline expiring.
+        let handed_back = wait_for(
+            || cx.anchor.open_signal_dialogs(node_id) <= dialogs_before,
+            Duration::from_secs(20),
+        )
+        .await;
+        let dialogs_after = cx.anchor.open_signal_dialogs(node_id);
+        let rows = stat_str(&after, "connections");
+        ledger.record(
+            WITNESSES[17],
+            armed.ok
+                && failed_at_the_answer
+                && fault_fired
+                && built_a_connection
+                && registered
+                && handed_back,
+            format!(
+                "`ConnectGuard` IS ARMED — round 4 item 4's first missing wiring \
+                 witness, run against production `wasm::LeafNode::connect` in a real \
+                 browser. The parked RTC factory in `leaf/tests/wasm_leader.rs` builds \
+                 real transport resources without running `connect`, so it cannot \
+                 sensitize the arming line at all. \
+                 THE INTERVAL: the page armed a one-shot rejection of the next \
+                 `setRemoteDescription` (armed ok={}) and `connect()` then failed with \
+                 kind={doomed_kind:?} Display={doomed_message:?}; that text comes only \
+                 from `accept_answer`'s `unsupported(\"setRemoteDescription\", …)`, which \
+                 is BELOW the anchor's acceptance of the offer — so an attempt really \
+                 existed to hand back (premise={failed_at_the_answer}, \
+                 fault_fired={fault_fired}, test_error={:?}). The fault is a rejected \
+                 promise in the browser API the leaf calls, never a throw: `web-sys`'s \
+                 binding for that call does not catch, so a throw would trap the module \
+                 instead of opening the interval. \
+                 THE RESOURCES: this attempt constructed a real `RTCPeerConnection` — \
+                 the tab's ledger went {connections_before} → {connections_after} \
+                 (built={built_a_connection}) — and its states afterwards are {rows}. \
+                 Recorded, NOT asserted: the ordinary `Rc` teardown of `Inner` also \
+                 reaches `PeerLink`'s destructor, which closes the connection, so a \
+                 closed connection does not discriminate an armed guard from an unarmed \
+                 one. \
+                 THE ESTABLISHMENT PREMISE, observed and not assumed: the fault holds \
+                 its rejection for {GUARD_FAULT_DELAY_MS} ms, and while the attempt was \
+                 still in flight the anchor's open-dialog count for this identity ROSE \
+                 above its baseline — {dialogs_before} → {dialogs_peak} \
+                 (registered={registered}). The delay is not a tolerance: the anchor \
+                 registers its accepted attempt when it answers the offer, but the thing \
+                 that RETIRES it is the trickle socket's own handler, which only exists \
+                 once that socket has completed its WebSocket upgrade — a socket closed \
+                 while still CONNECTING never reaches it. Rejecting immediately after \
+                 the answer therefore fails before the attempt is retirable, which is a \
+                 fact about the listener and not about the guard. \
+                 THE ASSERTION is the HANDBACK, which nothing but the guard performs on \
+                 this path: that count must return to at most {dialogs_before} within \
+                 20 s — observed {dialogs_after} (handed_back={handed_back}). The \
+                 anchor's own `ice_deadline` is 90 s, so an unarmed guard cannot pass \
+                 this by waiting: the dialog, its ICE agent and its signalling \
+                 reservation would still be there when the ceiling expired. ANCHOR \
+                 STATE: {}",
+                armed.ok,
+                doomed.test_error,
+                peer_state(cx.anchor, node_id),
+            ),
+        );
+    }
+
     let _ = script.run("a", Step5::Done { id: 0 }).await;
     let _ = cx.driver.close_page("leaf5-a").await;
     println!(
@@ -4230,6 +5180,111 @@ fn expected_marks(seed: u64, size: usize, count: usize) -> Vec<Mark> {
     (0..count)
         .map(|i| Mark::of(&gen_bytes(seed + i as u64, size)))
         .collect()
+}
+
+/// One row of a session's `onEvent` stream, as the page normalizes
+/// it (`eventRow` in `page/leaf5.js`).
+///
+/// Fields are `Option` because the leaf's tags do not share a shape:
+/// a `stream_data` carries a payload and a sequence, a
+/// `stream_failed` carries a reason and neither. `kind` is the LEAF
+/// tag — `stream_failed` today reaches the page as the package's
+/// `{ type: 'unknown', tag: 'stream_failed' }`, because
+/// `browser-ts/src/events.ts` models no terminal variant, and the
+/// page's normalizer reports the tag either way so this witness is
+/// about the broadcast and not about that gap.
+#[derive(Debug, Clone, Deserialize)]
+struct EventRow {
+    #[serde(rename = "type")]
+    kind: String,
+    stream_id: Option<String>,
+    reason: Option<String>,
+    mark: Option<Mark>,
+}
+
+/// The event rows the page reported under `field`, in arrival order.
+fn event_rows(result: &StepResult, field: &str) -> Vec<EventRow> {
+    result
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.get(field))
+        .and_then(|value| serde_json::from_value::<Vec<EventRow>>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Whether `rows` carry an event of `kind` for `stream_id`, and — if
+/// `reason` is given — with exactly that reason.
+fn row_for(
+    rows: &[EventRow],
+    kind: &str,
+    stream_id: u64,
+    reason: Option<&str>,
+) -> Option<EventRow> {
+    let want = stream_id.to_string();
+    rows.iter()
+        .find(|r| {
+            r.kind == kind
+                && r.stream_id.as_deref() == Some(want.as_str())
+                && reason.is_none_or(|want| r.reason.as_deref() == Some(want))
+        })
+        .cloned()
+}
+
+/// Drain the anchor's application queue for `stream_id` and return,
+/// in arrival order, every event that is `payload` or one of the
+/// pieces a fragmenting sender would have cut it into.
+///
+/// Returns as soon as the WHOLE payload arrives; otherwise it spends
+/// the window. That is what makes "one reassembled event" and "N
+/// partial pieces" answers to the same measurement instead of a
+/// success and a timeout: a receive half that does not reassemble
+/// produces the pieces, and they are recognised here rather than
+/// waited past.
+///
+/// Only the one shard `stream_id` maps to is polled
+/// (`MeshNode::shard_for_stream`); the queue is consume-once, so
+/// polling every shard would discard events belonging to stream ids
+/// this witness has nothing to do with.
+async fn collect_stream_events(
+    anchor: &Arc<MeshNode>,
+    stream_id: u64,
+    payload: &[u8],
+    within: Duration,
+) -> Vec<Vec<u8>> {
+    let shard = anchor.shard_for_stream(stream_id);
+    let deadline = tokio::time::Instant::now() + within;
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(result) = anchor.poll_shard(shard, None, 512).await {
+            for event in result.events {
+                let raw = event.raw.to_vec();
+                if piece_offset(payload, &raw).is_some() {
+                    seen.push(raw);
+                }
+            }
+        }
+        if seen.iter().any(|e| e.len() == payload.len()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    seen
+}
+
+/// The offset `event` occupies inside `payload`, if it is one of the
+/// pieces a fragmenting sender would have cut it into.
+///
+/// Both fragmenting producers — the browser leaf's `split_payload`
+/// and the native sender — cut at `MAX_EVENT_SIZE`, so the candidate
+/// offsets are exactly its multiples. The same helper as
+/// `tests/rtc_repairs.rs`'s, and for the same reason: it makes a
+/// partial delivery measurable rather than merely absent.
+fn piece_offset(payload: &[u8], event: &[u8]) -> Option<usize> {
+    (0..payload.len().div_ceil(MAX_EVENT_SIZE))
+        .map(|i| i * MAX_EVENT_SIZE)
+        .find(|&off| {
+            payload.len() - off >= event.len() && &payload[off..off + event.len()] == event
+        })
 }
 
 /// The byte count a leaf over-cap refusal names, read out of its

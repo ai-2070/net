@@ -89,6 +89,13 @@ const reentry = new Map();
 /// payloads" is a property of the package's fan-out and not of
 /// whichever one happened to be registered first.
 const streams = new Map();
+/// Session-level event recorders, keyed by session name.
+///
+/// One per session, installed by `session_events { arm: true }` and
+/// replaced (with the predecessor unsubscribed) on re-arming, so a
+/// witness reads the events of the window it opened rather than of
+/// every window before it.
+const sessionEvents = new Map();
 
 function log(line) {
   const text = '[' + TAB + '] ' + line;
@@ -137,6 +144,51 @@ function mark(payload) {
   return { len: payload.length, fnv: fnv1a(payload) };
 }
 
+/// One event from a session's `onEvent`, flattened to a row the
+/// runner can assert fields on.
+///
+/// Two shapes arrive here. A tag the package MODELS comes back typed
+/// and camelCased (`stream_data` → `{ type, peerNode, incarnation,
+/// streamId, seq, payload }`). A tag it does not model comes back as
+/// `{ type: 'unknown', tag, raw }` with the leaf's own snake_case
+/// fields in `raw` — which is where `stream_failed` lands today, so a
+/// witness about terminal events has to read it there. The row names
+/// the event by its LEAF tag in both cases, which is the vocabulary
+/// the Rust side uses.
+///
+/// `u64`s stay strings. A payload becomes its mark, so a terminal or
+/// a data event is attributable without an index map crossing the
+/// step channel.
+function eventRow(e) {
+  if (!e || typeof e !== 'object') return { type: String(e) };
+  const unknown = e.type === 'unknown';
+  const type = unknown ? e.tag || 'unknown' : e.type;
+  const src = unknown && e.raw && typeof e.raw === 'object' ? e.raw : e;
+  const row = { type };
+  const pick = (key, ...names) => {
+    for (const name of names) {
+      if (src[name] !== undefined && src[name] !== null) {
+        row[key] = String(src[name]);
+        return;
+      }
+    }
+  };
+  pick('stream_id', 'streamId', 'stream_id');
+  pick('seq', 'seq');
+  pick('reason', 'reason');
+  pick('peer_node', 'peerNode', 'peer_node');
+  pick('incarnation', 'incarnation');
+  const payload = src.payload;
+  if (payload && (payload.byteLength !== undefined || payload.length !== undefined)) {
+    try {
+      row.mark = mark(payload instanceof Uint8Array ? payload : new Uint8Array(payload));
+    } catch (e2) {
+      row.mark_error = (e2 && (e2.message || String(e2))) || 'unknown';
+    }
+  }
+  return row;
+}
+
 // ---------------------------------------------------------------------
 // the drop hook, and the reorder hook beside it
 // ---------------------------------------------------------------------
@@ -157,12 +209,26 @@ function mark(payload) {
 
 const loss = { dropEvery: 0, seen: 0, dropped: 0 };
 const reorder = { every: 0, seen: 0, swapped: 0, held: null };
+/// Every message the leaf handed the DataChannel, counted
+/// unconditionally — hooks armed or not.
+///
+/// This is the only place a page can see how many WIRE messages one
+/// `stream.send()` became, and that is exactly what distinguishes a
+/// payload the leaf FRAGMENTED from one it passed through whole: the
+/// step channel carries marks, and a mark of the right length and
+/// checksum says nothing about how many packets carried it. The
+/// counter sits at the top of the patched `send`, before the drop and
+/// reorder decisions, so it counts SUBMISSIONS — what the leaf asked
+/// the transport to carry — rather than what survived a hook.
+const wire = { messages: 0, bytes: 0 };
 
 (function installDropHook() {
   if (typeof RTCDataChannel === 'undefined') return;
   const original = RTCDataChannel.prototype.send;
   reorder.send = (channel, data) => original.call(channel, data);
   RTCDataChannel.prototype.send = function patched(data) {
+    wire.messages += 1;
+    wire.bytes += (data && (data.byteLength !== undefined ? data.byteLength : data.length)) || 0;
     if (loss.dropEvery > 0) {
       loss.seen += 1;
       if (loss.seen % loss.dropEvery === 0) {
@@ -237,6 +303,112 @@ const channels = [];
 /// assumed.
 function channelRows() {
   return channels.map((c) => ({ index: c.index, label: c.label, state: c.channel.readyState }));
+}
+
+// ---------------------------------------------------------------------
+// the RTCPeerConnections this tab's leaf CREATED, and a one-shot
+// fault on the answer it installs
+// ---------------------------------------------------------------------
+//
+// WHY A PAGE KEEPS THEM. A `connect()` that rejects is supposed to
+// leave nothing behind, and `ConnectGuard`'s whole claim is that the
+// RTC resources the attempt built are closed SYNCHRONOUSLY on the way
+// out rather than left to whatever drops last. Neither half of that
+// is observable from the wrapper: the promise rejects either way. It
+// is observable on the connection object — a connection somebody
+// called `close()` on reports `signalingState === 'closed'`, and no
+// engine reaches that state on its own, not on ICE failure and not on
+// a remote hang-up. So the page keeps a reference to every connection
+// the leaf constructed and reports its state on demand.
+//
+// Holding the reference is also what makes a LEAK observable at all:
+// an unreferenced connection is eventually collected and torn down by
+// the engine, which would read as "it was closed". The reference is
+// the observer, and it does not create the leak it observes.
+//
+// Tracked through the CONSTRUCTOR, with a Proxy rather than a
+// subclass: `new_with_configuration` in web-sys resolves
+// `globalThis.RTCPeerConnection` and constructs it, and a `construct`
+// trap keeps the prototype, the statics and `instanceof` exactly as
+// they were.
+const connections = [];
+/// A one-shot fault on `setRemoteDescription`, which is the browser
+/// call `connect()` makes to install the anchor's ANSWER
+/// (`RtcLeafTransport::accept_answer`).
+///
+/// It exists to reach one specific production interval that no
+/// network condition reaches on demand: the window after the anchor
+/// has ACCEPTED the attempt — a dialog, an ICE agent and a
+/// signalling reservation now exist on the anchor — and before the
+/// leaf has a session. A failure there returns through `?` with no
+/// error branch of its own, so the only thing that can hand the
+/// attempt back is the cancellation owner armed before the first
+/// resource-bearing await.
+///
+/// One shot, and it disarms itself on firing: every later attempt in
+/// this tab must be unaffected, including the control the witness
+/// runs next.
+///
+/// `delayMs` holds the rejection for a bounded moment first. Not a
+/// tolerance: the anchor registers its accepted attempt when it
+/// ANSWERS the offer, but the thing that retires it is the trickle
+/// socket's own handler, which only exists once that socket has
+/// finished its WebSocket upgrade (`sdk/src/rtc_bootstrap.rs` — a
+/// socket closed while still CONNECTING never reaches the anchor's
+/// handler at all). Rejecting a few milliseconds after `POST
+/// /rtc/offer` returns therefore fails BEFORE the attempt is fully
+/// established, and the handback would have nothing to act on for a
+/// reason that has nothing to do with the guard. The delay puts the
+/// failure after establishment; the witness asserts establishment
+/// separately rather than trusting the delay.
+const rtcFault = { failSetRemoteDescription: false, fired: 0, delayMs: 0 };
+
+(function trackPeerConnections() {
+  if (typeof RTCPeerConnection === 'undefined') return;
+  const original = RTCPeerConnection.prototype.setRemoteDescription;
+  RTCPeerConnection.prototype.setRemoteDescription = function patched(...args) {
+    if (rtcFault.failSetRemoteDescription) {
+      rtcFault.failSetRemoteDescription = false;
+      rtcFault.fired += 1;
+      // REJECTED, never thrown. `web-sys`'s binding for
+      // `setRemoteDescription` does not catch, so a synchronous
+      // throw here would trap the wasm module instead of reaching
+      // the leaf's `JsFuture` — which is a crash, not the failure
+      // interval this fault exists to open.
+      const reject = () =>
+        Promise.reject(
+          new Error('leaf5 injected fault: setRemoteDescription refused this answer'),
+        );
+      const delay = rtcFault.delayMs;
+      if (delay > 0) {
+        return sleep(delay).then(reject);
+      }
+      return reject();
+    }
+    return original.apply(this, args);
+  };
+  const Real = globalThis.RTCPeerConnection;
+  globalThis.RTCPeerConnection = new Proxy(Real, {
+    construct(target, args) {
+      const pc = Reflect.construct(target, args, target);
+      connections.push({ index: connections.length, pc });
+      return pc;
+    },
+  });
+})();
+
+/// Every connection this tab's leaf constructed, with the three
+/// states that answer three different questions: `signalingState`
+/// `'closed'` means somebody called `close()`, `connectionState`
+/// distinguishes a failed attempt from a live one, and
+/// `iceConnectionState` says whether ICE ever got anywhere.
+function connectionRows() {
+  return connections.map((c) => ({
+    index: c.index,
+    signaling: c.pc.signalingState,
+    connection: c.pc.connectionState,
+    ice: c.pc.iceConnectionState,
+  }));
 }
 
 // ---------------------------------------------------------------------
@@ -701,6 +873,10 @@ async function execute(step) {
       reorder.seen = 0;
       reorder.swapped = 0;
       reorder.held = null;
+      // The wire counter's value BEFORE this step, so the stats
+      // below report the messages THIS step's `send` calls produced
+      // and not the session's running total.
+      const wireBefore = wire.messages;
       const sent = [];
       const disarm = () => {
         flushHeld();
@@ -734,6 +910,12 @@ async function execute(step) {
         dropped: loss.dropped,
         reordered: reorder.swapped,
         outbound_messages: Math.max(loss.seen, reorder.seen),
+        // How many DataChannel messages the leaf submitted for the
+        // payloads above. `sent.length` payloads that produced MORE
+        // than `sent.length` messages were fragmented; equality means
+        // one packet each. Counted unconditionally, so this is
+        // readable on a step that armed no hook at all.
+        wire_messages: wire.messages - wireBefore,
       };
       disarm();
       return { ok: true, stats };
@@ -795,6 +977,124 @@ async function execute(step) {
           reliability: state.stream.reliability,
           counters,
           waited_ms: waited,
+        },
+      };
+    }
+
+    // Whether the `for await` that `stream_open` parked has
+    // FINISHED. The inverse of a terminal is a consumer that never
+    // settles, and no amount of waiting observes "never", so the
+    // deadline is the assertion rather than a tolerance.
+    case 'stream_iterator_state': {
+      const state = streams.get(step.handle);
+      if (!state) return { ok: false, error: 'no such open stream ' + step.handle };
+      const ms = step.deadline_ms || 250;
+      let timer;
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => resolve('pending'), ms);
+      });
+      let outcome;
+      try {
+        outcome = await Promise.race([state.draining.then(() => 'ended'), deadline]);
+      } finally {
+        clearTimeout(timer);
+      }
+      return {
+        ok: true,
+        stats: {
+          outcome,
+          iterator_ended: state.iteratorEnded,
+          iterator_error: state.iteratorError || null,
+          deadline_ms: ms,
+        },
+      };
+    }
+
+    // Arm, or read, a recorder on a SESSION's own event stream.
+    //
+    // `onEvent` is the surface a page uses to hear about its node
+    // without holding a stream wrapper, and on a FOLLOWER it is the
+    // far end of the leader's broadcast: the leader's node hands an
+    // event to its sink, the sink queues it, the flush broadcasts it
+    // over the BroadcastChannel, and the follower's session delivers
+    // it to exactly these listeners. A follower that hears nothing
+    // here is a follower that was never told.
+    //
+    // Events are reported as NORMALIZED ROWS, not as the objects
+    // themselves: `payload` is a `Uint8Array`, which JSON-encodes as
+    // an index map, and the package does not model every tag the
+    // leaf emits — `stream_failed` comes back as
+    // `{ type: 'unknown', tag: 'stream_failed', raw: { … } }`, with
+    // the leaf's own snake_case fields inside `raw`. `eventRow`
+    // flattens both shapes to one row so the runner asserts on
+    // fields rather than on a spelling, and an added key cannot
+    // break a witness about broadcast wiring.
+    //
+    // `arm` clears and installs; otherwise the step WAITS for an
+    // event of `expect_type` (a condition, with `timeout_ms` as a
+    // ceiling) and reports everything recorded either way.
+    case 'session_events': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      if (step.arm) {
+        if (typeof node.onEvent !== 'function') {
+          return { ok: false, error: 'this session has no onEvent surface' };
+        }
+        const seen = [];
+        const unsubscribe = node.onEvent((event) => {
+          seen.push(event);
+        });
+        const previous = sessionEvents.get(step.session);
+        if (previous && typeof previous.unsubscribe === 'function') previous.unsubscribe();
+        sessionEvents.set(step.session, { seen, unsubscribe });
+        return { ok: true, stats: { armed: true } };
+      }
+      const recorder = sessionEvents.get(step.session);
+      if (!recorder) return { ok: false, error: 'nothing armed on ' + step.session };
+      const started = performance.now();
+      const deadline = started + (step.timeout_ms || 15000);
+      const matches = () =>
+        !step.expect_type || recorder.seen.some((e) => eventRow(e).type === step.expect_type);
+      while (performance.now() < deadline && !matches()) {
+        await sleep(25);
+      }
+      return {
+        ok: true,
+        stats: {
+          events: recorder.seen.map(eventRow),
+          waited_ms: Math.round(performance.now() - started),
+          matched: matches(),
+        },
+      };
+    }
+
+    // The RTC resources this tab's leaf built, and the one-shot
+    // answer fault.
+    //
+    // `arm_set_remote_description_fault` arms the fault for the NEXT
+    // `setRemoteDescription` in this tab and nothing else; the same
+    // step reports the ledger, so a witness can take one reading
+    // before an attempt and one after it and speak only about the
+    // connections the attempt itself created.
+    case 'rtc_resources': {
+      if (step.arm_set_remote_description_fault) {
+        rtcFault.failSetRemoteDescription = true;
+        rtcFault.delayMs = step.fault_delay_ms || 0;
+      }
+      if (step.disarm_set_remote_description_fault) {
+        rtcFault.failSetRemoteDescription = false;
+        rtcFault.delayMs = 0;
+      }
+      return {
+        ok: true,
+        stats: {
+          connections: connectionRows(),
+          connection_count: connections.length,
+          channels: channelRows(),
+          fault_armed: rtcFault.failSetRemoteDescription,
+          fault_fired: rtcFault.fired,
+          fault_delay_ms: rtcFault.delayMs,
+          wire_messages: wire.messages,
         },
       };
     }
