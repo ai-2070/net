@@ -2490,6 +2490,33 @@ impl LeafNode {
         // The public surface is peer-only, so the owner is resolved
         // HERE — once — and carried through every await below.
         let attempt = self.current_attempt(peer).map_err(js)?;
+        self.candidate_reading_json(attempt).await
+    }
+
+    /// [`Self::peer_candidate`], for a caller that names the dialog
+    /// it is driving.
+    ///
+    /// The proxied form. A follower's request is served by another
+    /// tab after crossing a channel, so the attempt it was issued for
+    /// may already have been replaced — and servicing a *replacement*
+    /// under a stale request is a mutation, not a misclassification.
+    /// [`Self::attempt_for`] refuses first.
+    pub async fn peer_candidate_in(
+        &self,
+        peer_hex: String,
+        dialog_hex: String,
+    ) -> Result<String, JsError> {
+        let peer = parse_peer_id(&peer_hex)?;
+        let dialog = parse_dialog_id(&dialog_hex)?;
+        let attempt = self.attempt_for(peer, dialog).map_err(js)?;
+        self.candidate_reading_json(attempt).await
+    }
+
+    /// Service `attempt` and render the reading a page reads.
+    ///
+    /// Shared by the peer-only and the dialog-named form so the two
+    /// cannot drift into two JSON shapes for one reading.
+    async fn candidate_reading_json(&self, attempt: Attempt) -> Result<String, JsError> {
         let r = self.service_peer(attempt).await?;
         let candidate_error = match &r.candidate_error {
             Some(text) => format!(",\"candidateError\":{}", json_string(text)),
@@ -2791,6 +2818,26 @@ impl LeafNode {
     pub async fn peer_handshake(&self, peer_hex: String) -> Result<String, JsError> {
         let peer = parse_peer_id(&peer_hex)?;
         let attempt = self.current_attempt(peer).map_err(js)?;
+        self.run_handshake(attempt).await?;
+        Ok(format!("{:016x}", attempt.dialog))
+    }
+
+    /// [`Self::peer_handshake`], for a caller that names the dialog
+    /// it is driving.
+    ///
+    /// The proxied form, and the one where a stale request costs most:
+    /// the Noise wait is the longest await on this surface, and the
+    /// session it installs must belong to the attempt that negotiated
+    /// the channel. A peer-only resolution would run a superseded
+    /// request's handshake on the replacement.
+    pub async fn peer_handshake_in(
+        &self,
+        peer_hex: String,
+        dialog_hex: String,
+    ) -> Result<String, JsError> {
+        let peer = parse_peer_id(&peer_hex)?;
+        let dialog = parse_dialog_id(&dialog_hex)?;
+        let attempt = self.attempt_for(peer, dialog).map_err(js)?;
         self.run_handshake(attempt).await?;
         Ok(format!("{:016x}", attempt.dialog))
     }
@@ -3265,6 +3312,36 @@ impl LeafNode {
         guard
             .attempt_of(peer)
             .ok_or_else(|| LeafError::Session(format!("{NO_LIVE_ATTEMPT_PREFIX} {peer:#x}")))
+    }
+
+    /// The attempt live for `peer`, **only if** it is the one the
+    /// caller names.
+    ///
+    /// [`Self::current_attempt`] is right for the direct surface: one
+    /// tab, naming a peer, resolving the owner once and carrying it.
+    /// It is wrong for a proxied caller. A follower's request crosses
+    /// a channel and is served later, so between the page calling and
+    /// the leader acting the attempt can have been superseded by a
+    /// replacement — and a peer-only resolution would then apply the
+    /// stale request to the **new** dialog. That is not a
+    /// classification problem to sort out afterwards; the mutation has
+    /// already happened.
+    ///
+    /// So a proxied caller names the dialog it believes it is driving
+    /// and is refused here, before anything is touched, when that is
+    /// not the dialog now live. The refusal is typed and says both
+    /// numbers, because "your attempt was replaced" and "there is no
+    /// attempt" send an operator to different places.
+    fn attempt_for(&self, peer: NodeId, dialog: DialogId) -> Result<Attempt, LeafError> {
+        let live = self.current_attempt(peer)?;
+        if live.dialog != dialog {
+            return Err(LeafError::Session(format!(
+                "dialog {dialog} on {peer:#x} is not the live attempt (dialog {} is); \
+                 the attempt this request was issued for has been replaced",
+                live.dialog
+            )));
+        }
+        Ok(live)
     }
 
     /// Is a direct session with `peer` installed — which is a
@@ -4323,6 +4400,31 @@ pub(crate) fn parse_peer_id(raw: &str) -> Result<u64, JsError> {
         )));
     }
     u64::from_str_radix(hex, 16).map_err(|_| JsError::new(&format!("{raw:?} is not a peer id")))
+}
+
+/// A dialog id in the spelling every surface here HANDS OUT: 16
+/// lowercase hex digits, the form `peer_offer`, `peer_accept_offer`
+/// and `peer_candidate` put in their `dialog` field.
+///
+/// Separate from [`parse_peer_id`] for its message, not its rules. A
+/// caller that passed a node id where a dialog belongs — the two are
+/// the same shape — needs to be told which of the two was wrong, and
+/// "is not a peer id" for a dialog argument is the kind of error text
+/// that costs an afternoon.
+fn parse_dialog_id(raw: &str) -> Result<u64, JsError> {
+    let trimmed = raw.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.len() != 16 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(JsError::new(&format!(
+            "{raw:?} is not a dialog id: a dialog crosses this boundary as 16 hex digits, \
+             the spelling the `dialog` field of `peerOffer` / `peerAcceptOffer` / \
+             `peerCandidate` produces"
+        )));
+    }
+    u64::from_str_radix(hex, 16).map_err(|_| JsError::new(&format!("{raw:?} is not a dialog id")))
 }
 
 /// A `u64` from a decimal or `0x`-prefixed hex string. The boundary

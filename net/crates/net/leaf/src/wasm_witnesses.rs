@@ -553,6 +553,67 @@ async fn a_superseded_attempts_rejected_continuation_charges_no_term() {
     p.leaf.close();
 }
 
+/// A stale dialog is refused **before** it can service the
+/// replacement attempt.
+///
+/// The proxied ownership rule. A follower's request crosses a
+/// channel and is served later, so by the time the leader acts the
+/// attempt it named may have been superseded. `peer_candidate_in`
+/// and `peer_handshake_in` resolve through `attempt_for`, which
+/// compares the named dialog against the live one and refuses — so
+/// the stale request never reaches `service_peer` at all.
+///
+/// The oracle is the **replacement's** state, not the refusal: a
+/// refusal that arrived after the mutation would satisfy an
+/// assertion about the error and miss the entire defect.
+#[wasm_bindgen_test]
+async fn a_stale_dialog_is_refused_before_it_services_the_replacement() {
+    let p = pair();
+    p.install_session();
+    let d1 = p.offer(5_000).await;
+    let d2 = p.offer(5_000).await;
+    assert_ne!(d1, d2, "a second offer mints its own dialog");
+
+    // What the replacement has sent so far. If the stale request
+    // serviced d2, this moves.
+    let before = p
+        .leaf
+        .service_peer(p.attempt(d2))
+        .await
+        .unwrap_or_else(|_| panic!("the replacement is live"))
+        .sent;
+
+    let peer_hex = format!("{:016x}", p.peer_id);
+    let error = p
+        .leaf
+        .peer_candidate_in(peer_hex.clone(), format!("{d1:016x}"))
+        .await
+        .expect_err("a stale dialog is refused");
+    let text = format!("{:?}", JsValue::from(error));
+    assert!(
+        text.contains("is not the live attempt"),
+        "the refusal names the replacement rather than reporting no attempt: {text}"
+    );
+
+    let after = p
+        .leaf
+        .service_peer(p.attempt(d2))
+        .await
+        .unwrap_or_else(|_| panic!("the replacement is still live"))
+        .sent;
+    assert_eq!(
+        after, before,
+        "the replacement attempt was not serviced by a request issued for its predecessor"
+    );
+
+    // And the live dialog still drives its own attempt: the fence
+    // refuses the stale request, not the operation.
+    p.leaf
+        .peer_candidate_in(peer_hex, format!("{d2:016x}"))
+        .await
+        .expect("the live dialog is served");
+}
+
 /// A predecessor's expiry settlement cannot charge its successor.
 ///
 /// The deadline settlement awaits a STUN probe, so the attempt

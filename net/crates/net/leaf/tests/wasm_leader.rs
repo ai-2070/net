@@ -588,9 +588,14 @@ impl LeaderBackend for RealNodeBackend {
                 reliability,
                 stream_id,
                 channel_hash,
+                peer,
             } => {
                 let opened = handles.node.borrow_mut().open_stream(
-                    handles.peer,
+                    // The request's peer when it names one, and this
+                    // double's own peer otherwise — the same
+                    // "absent means the anchor" rule the real backend
+                    // applies.
+                    peer.unwrap_or(handles.peer),
                     &label,
                     reliability,
                     stream_id,
@@ -2821,6 +2826,7 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
             reliability: Reliability::Reliable,
             stream_id: Some(17),
             channel_hash: None,
+            peer: None,
         })
         .await
         .expect("open X");
@@ -2837,6 +2843,7 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
             reliability: Reliability::Reliable,
             stream_id: Some(34),
             channel_hash: None,
+            peer: None,
         })
         .await
         .expect("open Y");
