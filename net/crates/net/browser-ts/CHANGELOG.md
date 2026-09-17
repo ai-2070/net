@@ -76,6 +76,43 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Changed
 
+- **A peer session is not usable the instant a handshake completes.**
+  A node that receives an inbound peer establishment now attributes it
+  only after the initiator's signed establishment proof verifies
+  against the identity in its announcement, so there is a brief window
+  in which the peer is connecting but not yet connected. A page sees
+  this only as `connectPeer`/`acceptPeer` resolving a few milliseconds
+  later; what changed is that a peer claiming an identity it does not
+  own never reaches your application at all. Nothing in the public API
+  moved, and no page supplies keys — the implementation resolves them.
+
+- **`NodeDescriptor.nodeId` is decimal; `connectPeer()` takes
+  16-digit hex.** These were always different spellings and the
+  documentation wrongly equated them, which is a data-loss trap: a
+  decimal string can be a valid-looking hex length and address a
+  different node. The types and docs now say so and a conversion is
+  provided. Deliberately NOT normalized silently — a peer id you did
+  not mean is worse than an error you can see.
+
+- **`candidateError` survives to the status surface.** It was emitted
+  by the leaf and discarded by the TypeScript parser, leaving a
+  console warning as the only trace of an ICE candidate the browser
+  refused. It is machine-readable again.
+
+- **Trickle candidates are retained across the phases that used to
+  drop them** — a candidate arriving before the page accepts an offer,
+  or before an answer makes a remote description usable, is held under
+  the dialog that authorized it and applied when it can be, bounded at
+  32 per queue. Previously such candidates were spent on a call that
+  could only fail, which cost connectivity on paths where the winning
+  pair arrived early.
+
+- **`retryReport()` reports what the policy will actually do**, and
+  gains `discardedUnarmed`. The ICE-failure watcher previously acted
+  while the report said retry was unarmed, and a node that had been
+  both offerer and answerer for one peer stayed eligible to initiate
+  repair from both ends.
+
 - **Iterators returned by a direct `BrowserNode` now complete when
   `close()` is called.** A consumer sitting in
   `for await (const bytes of stream)` leaves the loop and one awaiting
