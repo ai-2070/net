@@ -152,8 +152,27 @@ special node whose absence stops the mesh. Read:
 [Security model](https://ai2070.net/docs/concepts/security-model).
 
 The performance story — what is fast, and what the numbers do and do not include — is scoped in
-[Performance](#performance). A fuller treatment of the model is in the
-[worldview docs](https://ai2070.net/docs/worldview).
+[Performance](#performance).
+
+## Worldview
+
+Net's unit is a **capability offered by a provider, together with the authority and live state
+needed to use it**. Other systems organize distributed work around different objects — HTTP
+around an endpoint, MCP around a tool a configured host may call, NATS around a subject, Zenoh
+around a key expression. Net addresses capabilities under identity and authority.
+
+That makes it a substrate beneath applications, not a replacement for their workflows or business
+model: a workspace, fleet console, agent runtime, or industrial application can use Net and keep
+its own interface, approvals, and user experience.
+
+- [The Agentic Mesh](https://ai2070.net/docs/worldview/agentic-mesh) — the problem from an application's point of view.
+- [When to use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases) — the fit boundary, including when HTTP, MCP, NATS, or an ordinary database is the simpler choice.
+- [How Net relates to other systems](https://ai2070.net/docs/worldview/how-net-compares) — a compact comparison by abstraction, topology, and trust boundary.
+- [Net and MCP](https://ai2070.net/docs/worldview/mcp-vs-net) · [Connecting HTTP systems](https://ai2070.net/docs/worldview/rest-vs-net) · [Net and NATS](https://ai2070.net/docs/worldview/nats-vs-net) · [Net and Zenoh](https://ai2070.net/docs/worldview/zenoh-vs-net).
+
+Discovery, invocation, and outcome are separate: finding a provider does not authorize a call, and
+a successful invocation is not proof that the real-world outcome holds. See [Submitted is not
+completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
 ## What's in the box
 
