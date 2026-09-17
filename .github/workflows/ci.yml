@@ -5427,6 +5427,12 @@ jobs:
             real_wasm_keeps_u64_stream_ids_off_the_number_path
             real_wasm_reads_a_peer_addressed_stream_in_the_id_spelling_it_hands_out
             real_package_exports_every_symbol_the_browser_harness_imports
+            real_package_re_types_the_leafs_closed_node_fence
+            real_package_ends_a_parked_iterator_when_the_direct_node_closes
+            real_package_refuses_a_stream_on_the_closed_direct_node
+            real_package_completes_teardown_when_a_child_close_throws
+            real_package_keys_a_stream_on_its_peer_as_well_as_its_id
+            real_package_keeps_delivering_to_a_wrapper_that_spells_no_peer
           "
           # The roster is checked against the probe file before the
           # probes run: a pinned name the file does not contain can
@@ -5442,7 +5448,7 @@ jobs:
           if grep -q '"pass": false' /tmp/abi-real.log; then
             echo "::error::an ABI probe failed against the built package"; exit 1
           fi
-          echo "R11 ABI probes: 12/12 against the real package"
+          echo "R11 ABI probes: 18/18 against the real package"
 
       # Kyra's JS probes, landed verbatim beside her leaf ones.
       - name: Browser-package review probes
@@ -5665,6 +5671,11 @@ jobs:
           stage5_reliable_stream_recovers_injected_loss_and_reorder
           stage5_large_messages_cross_the_public_api_in_both_directions
           stage5_native_fragments_to_an_announced_leaf
+          stage5_leaf_fragments_above_one_event_to_the_native_anchor
+          stage5_direct_close_ends_a_parked_iterator_in_the_live_package
+          stage5_direct_close_refuses_a_later_open_with_the_leafs_typed_fence
+          stage5_a_follower_observes_the_leaders_terminal_broadcast
+          stage5_a_refused_connect_closes_rtc_and_hands_back_its_attempt
           stage5_leader_proxied_stream_carries_native_bytes_both_ways
           stage6_two_isolated_contexts_reach_a_direct_session
           stage6_each_leaf_learns_the_others_keys_from_a_signed_announcement
@@ -5709,14 +5720,14 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 42)"
+            echo "[$engine] $passes passed, $fails failed (floor 47)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 42 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 42 — \
+            if [ "$passes" -lt 47 ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is 47 — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
