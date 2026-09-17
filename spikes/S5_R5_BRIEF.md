@@ -4,8 +4,18 @@ Round 4 (`ae690a8c5`…`e342007a0`) closed every executed and
 source-established item from Kyra's third review and stopped, correctly,
 at four questions only the owner could settle (`S5_REPORT.md` §13.7).
 The owner has now ruled on all four. This round implements the rulings
-and nothing else. Kyra has not yet reviewed round 4; this round stacks on
-it additively so her verdict on round 4 cannot conflict.
+and nothing else, stacking additively on round 4.
+
+**Correction (2026-09-17, Fable):** the original text of this paragraph
+said Kyra had not yet reviewed round 4. That was false. Her fourth
+review (HOLD at `516a45c33`, 2026-09-16,
+`hermes/cache/webrtc-stage5-round4-516a45c33/KYRA_STAGE5_ROUND4_REVIEW.md`)
+existed before this brief was written and was never forwarded — a
+record-keeping failure on my side, not the implementer's. It names five
+executed defects (R4-1..R4-5) and five source-established ones
+(R4-6..R4-10); none of them is addressed by this round, and her fifth
+review (HOLD at `60e120609`) reproduced all five executed ones again.
+They are the subject of `S5_R6_BRIEF.md`.
 
 **The rulings, verbatim in substance:**
 

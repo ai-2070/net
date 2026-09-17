@@ -2649,8 +2649,8 @@ qualification carried: the harness's camera/mic grant is not a
 prerequisite for a data-only application.
 
 **Stage 5 round 5 (2026-09-16): the four §13.7 owner questions ruled
-and delivered (`d522593f3`…`60e120609`); CI pending; forwarded to Kyra
-with round 4.** Rulings: announcement expiry **matches native**
+and delivered (`d522593f3`…`60e120609`, follow-ups `aa925dd6b`,
+`795c208b1`, `683735478`).** Rulings: announcement expiry **matches native**
 (nanosecond precision, `age >= ttl`, TTL-zero expired at age zero);
 **N4 confirmed**, versioning deferred to the release process; a direct
 node's `close` **ends the iterators it handed out** (symmetric with the
@@ -2672,6 +2672,86 @@ persisted identity and a built-in local enrollment authority,
 anchor-role parity in the bindings, shared generated TS types;
 ICE-TCP / DTLS exporter / browser RedEX stay deferred; the serverless
 control plane stays a separate plan.
+
+**Record correction (2026-09-17): Kyra's fourth Stage 5 review was
+missed.** She reviewed round 4 at `516a45c33` on 2026-09-16 (HOLD;
+`hermes/cache/webrtc-stage5-round4-516a45c33/`) before round 5 was
+briefed; the packet was never forwarded and the round-5 brief and
+report both said round 4 was unreviewed. Both are corrected in place;
+the omission is the record-keeper's. Her fourth review credits the
+round-4 repairs (R3-1..7 closed, native abandonment/heartbeat/epoch
+work, first-poll serialization removed, Go `-118`, the eight missing
+pins) and holds on ten ownership items: **executed** R4-1 native
+producers ignore the mode boundary (ACK 4 with reliable 1 absent),
+R4-2 `reset_rx_stream` keeps the old `rx_mode_boundary`, R4-3 a
+duplicate of a completed fragmented message opens a phantom partial
+that terminals the stream, R4-4 an admitted application stream is
+shadowed by RPC carrier classification (`Dropped{UnknownCall}`), R4-5
+one expiry pass on nine sessions loses 8 of 72 terminal owners
+(`terminals.pop_front()`); **source-established** R4-6 native receive
+abandonment RESETs the opposite direction, R4-7 predecessor fragment
+terminal (no epoch in provenance) resets the successor, R4-8 retired
+check precedes guarded reassembler insertion, R4-9 positively ACKed
+frame loses ownership at eviction-before-hold, R4-10 peer-addressed
+streams dispatch by stream id alone (`StreamData` has no peer — the
+Stage 6 §6.1 cross-talk, owner decision still open). Plus seven
+evidence/owner items (one unpinned native test, the above-one-event
+contract, stale runner prose, ConnectGuard/X7 wiring witnesses,
+inverse provenance, the four owner questions since ruled, injected-WASM
+/16-digit-ID compatibility accounting).
+
+**Stage 5 round 5 review (Kyra, HOLD at `60e120609`;
+`Downloads/KYRA_STAGE5_ROUND5_EVIDENCE/`).** All five R4 executed
+defects reproduce again. New: **R5-N1** concurrent sends can produce a
+non-contiguous fragment group (pieces sequenced through separately
+awaited `flush_stream_batch` calls); **R5-N2** a newly permitted
+oversized send passes one `can_send()` then needs more descriptor slots
+than remain; **R5-G1** Go reconstructs every `EventTooLarge` with the
+fixed 8,104 limit, wrong for the tagged-RTC 64,832 refusal; **R5-L1**
+one throwing child stream aborts `BrowserNode.close` after it has
+latched closed; **R5-L2** `LeafStream.on_message` `forget()`s its
+closure and close never removes it. Her two exact-head CI reds
+(`a_lost_middle_fragment_is_retransmitted_and_the_payload_arrives_once`;
+`stage5_large_messages_cross_the_public_api_in_both_directions` with
+`EventTooLarge{32768, 8104}`) were fixed by the follow-ups above — the
+large-message witness is now two witnesses, refuse-before-announcement
+and deliver-after, because native fragmentation is gated on the peer's
+announced `FRAGMENT_REASSEMBLY_TAG`; CI green at `0772a8745`. Round 6
+(`spikes/S5_R6_BRIEF.md`) carries R4-1..10, R5-N1/N2/G1/L1/L2 and the
+evidence items; her probes `parent-round4-final.rs`, the native
+mechanism wrapper and the round-5 probes land verbatim as pinned tests.
+
+**Stage 6 review (Kyra, HOLD at `9ef5b6a03`;
+`Downloads/KYRA_STAGE6_EVIDENCE/`).** Baselines reproduced (leaf 269,
+TS 172, 42 reviewer probes byte-identical, CI 56/56 at `537c9c94f`,
+41 rows per engine, natsim 13). Seven failed contract checks, nine
+controls: **S6-01 P1** routed establishment does not authenticate the
+claimed initiator — a domain-PSK holder built an NKpsk0 initiator
+claiming A's ID and decrypted application bytes B addressed to A
+(packet-path reproduction, not a deployment); **S6-02 P1** async work
+keyed by peer not attempt (D1's rejected continuation settles D2);
+**S6-03 P1** deadlines/close do not retire installation authority
+(expired answerer loops on `open/direct:false/remainingMs:0`); **S6-04
+P2** trickle candidates lost across the pending-offer and split
+Candidate/Answer poll boundaries; **S6-05 P1** retry runs unarmed and
+`direct_offerer` is historical, so both ends of a reversed pair own
+repair; **S6-06 P2** native terminal counters can exceed attempts,
+replaced `PeerLink` skips discard accounting; **S6-07** effective
+advertised RTC/STUN pair unchecked (`stun_public_addr` without a bound
+socket; public-vs-bind-fallback equality; synthesized defaults bypass
+the leaf check; IPv6 spellings); **S6-08 P2** STUN `JoinSlot`
+completion lost when no watch receiver is retained. Evidence still
+missing: **E1** NAT rows carry no application payload exchange, no
+NAT'd-anchor leg, no permission-free Chromium leg; **E2** demo does not
+assert signalling in the flat window; **E3** the universal inverse
+receipt claim has no per-witness index. Secondary: decimal
+`NodeDescriptor.nodeId` vs 16-hex `connectPeer`, `candidateError`
+discarded by the TS parser, `stunUrl` rename is a consumer change. The
+implementer session took this packet directly and delivered
+`76c2ca8cc` (S6-01), `ca95d86c5` (S6-02/03/04), `2c33ae9d0`
+(S6-05..08), `ac8d22407` (E1/E2/E3) and follow-ups through `0772a8745`
+(CI green, natsim green at `be1cde7e3`); verification against her
+probes by the record-keeper is pending and nothing has been forwarded.
 
 ## Stage 7 — Surface completion and deferred items (**authorized 2026-09-16**; brief `spikes/S7_BRIEF.md`)
 

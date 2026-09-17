@@ -1803,9 +1803,20 @@ the section it is written in. Saying so is the point: the riskiest
 edit in this round is the one most easily waved through as "part of
 the browser work".
 
-Second, **this round stacks additively on round 4 (`e342007a0`), which
-has not been reviewed.** Nothing here rewrites a round-4 decision, so a
-verdict on round 4 cannot be contradicted by anything below.
+Second, **this round stacks additively on round 4 (`e342007a0`).**
+Nothing here rewrites a round-4 decision, so a verdict on round 4
+cannot be contradicted by anything below.
+
+*Correction (2026-09-17, Fable, record-keeper): this paragraph
+originally said round 4 "has not been reviewed". It had been. Kyra's
+fourth review (HOLD at `516a45c33`) was issued 2026-09-16 and never
+forwarded to this session — my omission, and the brief this round was
+built from repeated it. Its ten items (R4-1..R4-10) and her fifth
+review's additions (R5-N1/N2, R5-G1, R5-L1/L2, HOLD at `60e120609`)
+are the sixth round, `spikes/S5_R6_BRIEF.md`. The two exact-head CI
+reds the fifth review recorded were fixed by the follow-ups after
+`60e120609` (`aa925dd6b`, `795c208b1`, `683735478`); the rest of both
+packets is untouched by this round.*
 
 One commit per ruling. Each row states the ruling, the change, the
 witness, and the raw inverse receipt.
