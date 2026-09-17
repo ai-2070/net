@@ -374,20 +374,46 @@ fn group_grants_by_session(
 /// named: the peer goes on waiting for a reply to a request this
 /// node threw away.
 ///
-/// So the loss becomes an event, on the conversation that suffered
-/// it, in three parts:
+/// So the loss becomes an event on the conversation that suffered
+/// it, in the RECEIVE direction only:
 ///
 /// * the stream's local receive lifetime ends
 ///   ([`NetSession::reset_rx_stream`]) — the cursor and reliability
 ///   ranges go, so the peer's restarted sequences are admitted
 ///   rather than dropped below a stale frontier;
-/// * the peer is told ([`NetSession::note_receive_terminal`], which
-///   the retransmit tick drains into a `StreamReset`), so its
-///   pending read fails fast instead of timing out;
 /// * the stream's remaining groups are fenced
 ///   ([`super::rtc::RtcReassembly::retire_stream`]), so a delayed
 ///   old tail cannot complete a pre-reset group against the
 ///   lifetime that follows.
+///
+/// **R4-6: and NOTHING is sent to the peer.** This used to add
+/// [`NetSession::note_receive_terminal`], which the retransmit tick
+/// drains as a `StreamReset` — the frame that announces a **send**
+/// half giving up after its retransmits are exhausted. Both
+/// receiving implementations read it that way and answer it by
+/// clearing their OWN receive state (`mesh.rs`'s `StreamReset` arm;
+/// `leaf/src/node.rs`'s `Decoded::StreamReset`). So a native node
+/// that lost a B→A group reset B's healthy A→B receive progress: a
+/// failure in one direction ended the other one, and the half that
+/// actually failed — B's send half — was told nothing it could act
+/// on. Reusing one frame type is not directional coherence, and
+/// there is no frame that says "my receive half ended, your send
+/// half should fail": inventing one is a wire-format change, and
+/// sending the wrong one is worse than sending none. The leaf's
+/// receive-abandonment policy already rules exactly this way —
+/// `StreamFailure::ReassemblyAbandoned` sends no RESET, "a
+/// `StreamReset` announces a *send* half giving up… the peer's own
+/// send half is unaffected" — so the two engines now agree. B
+/// discovers its own loss where it owns it: its unacknowledged
+/// descriptors exhaust their retries (H-3) and it gives up typed.
+///
+/// **R4-6: a fire-and-forget group is a permitted loss**, not a
+/// terminal, which is the leaf's ruled policy too (R3-4). Its
+/// sequences were never retransmittable, so no acknowledgement took
+/// anything away and an incomplete group is precisely the outcome
+/// its mode allows. Ending the receive half over it made one
+/// expected fragment loss fatal to every later message on that id.
+/// It is counted where it is reaped and the stream carries on.
 ///
 /// A record whose session is gone is skipped: its whole receive
 /// lifetime was retired with the session and there is no live stream
@@ -404,6 +430,17 @@ fn dispose_abandoned_rtc_groups(
     }
     let now = std::time::Instant::now();
     for group in terminals {
+        if !group.provenance.reliable {
+            tracing::debug!(
+                session_id = group.session_id,
+                stream_id = format!("{:#x}", group.provenance.stream_id),
+                held = group.held,
+                reason = group.reason.as_str(),
+                "rtc: fire-and-forget reassembly loss is a permitted loss; \
+                 the stream carries on"
+            );
+            continue;
+        }
         // One owner or none: a session id is process-unique.
         let owner = peers
             .iter()
@@ -413,9 +450,28 @@ fn dispose_abandoned_rtc_groups(
             continue;
         };
         let stream_id = group.provenance.stream_id;
+        // **R4-7: the disposition is owed to the receive lifetime
+        // that lost the bytes, not to whatever holds its id now.** A
+        // stream id is reused — close + reopen replaces the state
+        // with a fresh epoch — so a predecessor's terminal used to
+        // reset the SUCCESSOR's cursor and retire the successor's
+        // younger group. The predecessor's lifetime is already over
+        // and was settled when it ended; there is nothing left to
+        // end, exactly as for a record whose session is gone.
+        let live_epoch = session.try_stream(stream_id).map(|s| s.epoch());
+        if live_epoch != Some(group.epoch) {
+            tracing::debug!(
+                session_id = group.session_id,
+                stream_id = format!("{stream_id:#x}"),
+                group_epoch = group.epoch,
+                ?live_epoch,
+                "rtc: reassembly loss belonged to a receive lifetime that is \
+                 already over; the current lifetime on that id is not touched"
+            );
+            continue;
+        }
         session.reset_rx_stream(stream_id);
-        session.note_receive_terminal(stream_id);
-        reassembly.retire_stream(group.session_id, stream_id, now);
+        reassembly.retire_stream(group.session_id, stream_id, group.epoch, now);
         tracing::warn!(
             session_id = group.session_id,
             stream_id = format!("{stream_id:#x}"),
@@ -423,8 +479,9 @@ fn dispose_abandoned_rtc_groups(
             last_sequence = group.last_sequence,
             held = group.held,
             reason = group.reason.as_str(),
-            "rtc: reassembly loss ended the stream's receive half; the peer \
-             is being reset"
+            "rtc: reassembly loss ended THIS node's receive half of the \
+             stream; the peer's send half is untouched and no StreamReset \
+             is sent, so the reverse direction keeps its progress"
         );
     }
 }
@@ -803,7 +860,7 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{
     ControlDebitGuard, NetSession, StreamCloseOutcome, StreamDrainState, StreamLifetime,
-    StreamState, TxAdmit, CONTROL_STREAM_ID,
+    StreamState, TxAdmit, TxSendAdmit, CONTROL_STREAM_ID,
 };
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
@@ -29228,6 +29285,12 @@ impl MeshNode {
                         engine.on_reset(reset.stream_id);
                     }
                 }
+                // **R4-7:** the epoch of the lifetime the reset
+                // ends, read BEFORE it is reset, so the groups
+                // released are that lifetime's and not a
+                // predecessor's leftovers on the same id.
+                #[cfg(feature = "webrtc")]
+                let reset_epoch = session.try_stream(reset.stream_id).map(|s| s.epoch());
                 session.reset_rx_stream(reset.stream_id);
                 // **NR6:** the reset ends that stream's RECEIVE
                 // lifetime, so its partial fragment groups end with
@@ -29240,11 +29303,14 @@ impl MeshNode {
                 // `Reassembler::retire_stream`, including reporting
                 // nothing: the reset IS the terminal disposition.
                 #[cfg(feature = "webrtc")]
-                ctx.rtc_reassembly.retire_stream(
-                    session.session_id(),
-                    reset.stream_id,
-                    std::time::Instant::now(),
-                );
+                if let Some(epoch) = reset_epoch {
+                    ctx.rtc_reassembly.retire_stream(
+                        session.session_id(),
+                        reset.stream_id,
+                        epoch,
+                        std::time::Instant::now(),
+                    );
+                }
             }
             return;
         }
@@ -37696,20 +37762,18 @@ impl MeshNode {
             );
             return None;
         };
-        // The NR3 seam: a captured-but-not-yet-admitted frame, held
-        // here on purpose so a retirement can land while it waits.
-        // Fixtures/test builds only, `None` by default, and it runs
-        // with no lock held.
-        #[cfg(any(test, feature = "fixtures"))]
-        ctx.rtc_reassembly.run_dispatch_pause();
-        // NR3, second half of the capture-to-dispatch bound. The
+        // NR3, first half of the capture-to-dispatch bound. The
         // top-of-dispatch check refuses a frame whose incarnation is
         // retired; this is the same question — retirement, NOT the
         // advisory `is_active` flag, see `process_local_packet` —
-        // asked immediately before the only write that could recreate
-        // retired state, so a retirement that lands between the two
-        // still finds the session's own entry guard (X9) and the
-        // marker behind it.
+        // asked again here, close to the admission, so an already
+        // retired lifetime costs nothing further.
+        //
+        // **R4-8: it is not the authority.** The authority is read
+        // INSIDE the reassembler's session guard, at the insertion
+        // itself (`accept_under_lifetime` below), because the
+        // interval this check misses is precisely the one between it
+        // and the write.
         if session.is_receive_lifetime_retired() {
             tracing::debug!(
                 session_id = session.session_id(),
@@ -37718,13 +37782,33 @@ impl MeshNode {
             );
             return None;
         }
-        let outcome = ctx.rtc_reassembly.accept(
+        // The NR3 seam: a captured-and-checked-but-not-yet-admitted
+        // frame, held on purpose so a retirement can land while it
+        // waits — AFTER the check above, which is the interval the
+        // R4-8 schedule needs and the one a seam placed before it
+        // could not reach. Fixtures/test builds only, `None` by
+        // default, and it runs with no lock held.
+        #[cfg(any(test, feature = "fixtures"))]
+        ctx.rtc_reassembly.run_dispatch_pause();
+        // **R4-7:** the piece is keyed by the receive lifetime the
+        // ingress RESOLVED it onto, not by its stream id alone. The
+        // state exists by now — this runs after the sequence was
+        // recorded and the credit returned — so a missing one means
+        // the stream was closed under us and epoch 0 is a lifetime no
+        // `StreamState` ever has, which keeps the group's owner
+        // unambiguous either way.
+        let epoch = session
+            .try_stream(parsed.header.stream_id)
+            .map_or(0, |s| s.epoch());
+        let outcome = ctx.rtc_reassembly.accept_under_lifetime(
             super::rtc::FragmentPiece::from_header(
                 session.session_id(),
+                epoch,
                 &parsed.header,
                 piece.clone(),
             ),
             std::time::Instant::now(),
+            &|| session.is_receive_lifetime_retired(),
         );
         // **NR2: the production drain.** Whatever that call destroyed
         // — this piece's own refused group, a deadline this piece's
@@ -44622,17 +44706,36 @@ impl MeshNode {
     /// teardown, the id-addressed language bindings — use
     /// [`Self::close_stream`], which is explicit about addressing
     /// whatever is open under that id.
+    ///
+    /// **R4-7: the closed lifetime's partial fragment groups are
+    /// retired with it.** A reopen allocates a fresh epoch under the
+    /// same id, so a group left behind by the predecessor was — to
+    /// every later lookup keyed by id alone — a group of the current
+    /// stream: its expiry reset the successor's cursor and retired
+    /// the successor's younger group. The groups end where the
+    /// lifetime does, and the fence they leave is that epoch's, so a
+    /// delayed old tail cannot open a headless successor either.
     pub fn close_stream_handle(&self, stream: &Stream) -> Result<(), StreamError> {
         let Some(peer) = self.peers.get(&stream.peer_node_id()) else {
             // No session at all: the lifetime this handle named is
             // definitively over, and there is nothing to tear down.
             return Ok(());
         };
-        match peer.session.close_stream_for_lifetime(
+        let outcome = peer.session.close_stream_for_lifetime(
             stream.stream_id(),
             stream.session_id(),
             stream.epoch(),
-        ) {
+        );
+        #[cfg(feature = "webrtc")]
+        if matches!(outcome, StreamCloseOutcome::Closed) {
+            self.rtc_reassembly.retire_stream(
+                stream.session_id(),
+                stream.stream_id(),
+                stream.epoch(),
+                std::time::Instant::now(),
+            );
+        }
+        match outcome {
             // Absent is the idempotent case: this lifetime is over and
             // nothing was removed, so a stream opened under that id
             // after the guard was taken is left alone.
@@ -44656,9 +44759,24 @@ impl MeshNode {
     /// displaced session's coordinates tears down whichever lifetime
     /// is current, including a **successor** session's stream of the
     /// same id.
+    ///
+    /// **R4-7:** whatever lifetime it closes takes its partial
+    /// fragment groups with it, for the reason spelled out on
+    /// [`Self::close_stream_handle`].
     pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
         if let Some(peer) = self.peers.get(&peer_node_id) {
+            #[cfg(feature = "webrtc")]
+            let closing = peer.session.try_stream(stream_id).map(|s| s.epoch());
             peer.session.close_stream(stream_id);
+            #[cfg(feature = "webrtc")]
+            if let Some(epoch) = closing {
+                self.rtc_reassembly.retire_stream(
+                    peer.session.session_id(),
+                    stream_id,
+                    epoch,
+                    std::time::Instant::now(),
+                );
+            }
         }
     }
 
@@ -44795,17 +44913,22 @@ impl MeshNode {
     /// anywhere. A refusal that names the limit is discoverable;
     /// `Ok` plus silence is not.
     ///
-    /// **The group's sequences are contiguous within one call.** A
-    /// fragment group's pieces take consecutive sequences in offset
-    /// order, because that is the rule the receiver holds a group to
-    /// (`rtc/fragment.rs`, NR6). Two concurrent `send_on_stream`
-    /// calls on one stream already interleave their packets — this
-    /// function guarantees ordering *within* a call and never across
-    /// calls — so a caller that does that while one call fragments
-    /// gets its group refused typed at the receiver and reported as
-    /// an abandoned group, rather than mixed into a payload. Loud,
-    /// attributable, and the same scope of guarantee batching
-    /// already had.
+    /// **The group's sequences are contiguous, across concurrent
+    /// calls too (R5-N1).** A fragment group's pieces take
+    /// consecutive sequences in offset order, because that is the
+    /// rule both receivers hold a group to (`rtc/fragment.rs`, NR6).
+    /// Two concurrent `send_on_stream` calls on one stream still
+    /// interleave their EVENTS — this function guarantees ordering
+    /// *within* a call and never across calls — but they can no
+    /// longer interleave a group's PIECES: the whole range is
+    /// reserved by one admission before the first piece commits
+    /// (`flush_stream_fragment_group`). The previous text here
+    /// called the receiver's typed refusal of the straddled group
+    /// "the same scope of guarantee batching already had"; it was
+    /// not. Interleaving whole events loses nothing, while a
+    /// straddled group destroys a logical event and can terminal the
+    /// shared reliable stream, so this is ownership rather than a
+    /// documented hazard.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
@@ -44872,12 +44995,58 @@ impl MeshNode {
         }
 
         let stream_id = stream.stream_id();
-        let reliable = stream.config().reliability.is_reliable();
+        // **R4-1: the promoted stream INHERITS.** Reliability is
+        // configured per handle, and two handles can be open on one
+        // stream id — so a still-fire-and-forget handle used to keep
+        // emitting `PacketFlags::NONE` above the stream's reliable
+        // boundary and registering no retransmit descriptor. The
+        // receiver of that shared sequence space has one mode per
+        // stream: it promotes at the boundary and then holds every
+        // sequence above it as a reliable obligation, so a
+        // fire-and-forget gap above the boundary is either NACKed
+        // forever or (before its fallback was made conservative)
+        // acknowledged unreceived.
+        //
+        // The leaf's producer already rules this way
+        // (`LeafSession::build_packets`): once a stream is promoted,
+        // a fire-and-forget handle's flag is a REQUEST and the
+        // stream's mode is the contract. Inheriting cannot break a
+        // caller — reliable is strictly stronger than
+        // fire-and-forget, so one that asked for "may be lost" and
+        // got "will not be lost" received everything it asked for —
+        // and it costs exactly what makes the receiver's obligation
+        // answerable: a descriptor and a stamp.
+        let reliable = stream.config().reliability.is_reliable()
+            || session
+                .try_stream(stream_id)
+                .is_some_and(|s| s.tx_promoted());
         // Opt-in: bulk-transfer streams route their originating sends
         // through the FairScheduler (T-0.5) instead of straight to the
         // socket, so they participate in per-stream weighted fairness.
         // Default streams keep the direct path (zero blast radius).
         let scheduled = stream.config().scheduled;
+
+        // **R5-N2: the packets this call will emit**, by the same
+        // rule the flush loop below applies to the same slice — the
+        // loop counts what it actually emits and the debug assertion
+        // at the end pins the two together.
+        //
+        // Byte credit is not descriptor admission. `can_send()`
+        // below is the congestion gate and it is checked ONCE for
+        // the call, while each packet then took byte admission only;
+        // past the descriptor window `ReliableStream::on_send`
+        // evicts the OLDEST unacknowledged descriptor, so a lost
+        // head became unrebuildable while its send returned `Ok`. A
+        // newly allowed multi-piece event made that reachable
+        // without caller batching or concurrency at all: 31 pending
+        // single-packet sends plus a two-piece event needs 33 slots
+        // of 32. So the whole call is admitted against the
+        // descriptor window before any piece of it commits, exactly
+        // as the leaf admits a whole message
+        // (`LeafSession::build_packets`' `retransmit_headroom`
+        // reservation), or it is refused typed with nothing on the
+        // wire.
+        let packets = Self::stream_call_packets(events, fragmenting);
 
         // Refuse to send on a stream that isn't currently open, OR
         // whose live state has a different epoch than the handle. The
@@ -44899,6 +45068,28 @@ impl MeshNode {
             // hit this (cwnd grows past the in-flight count), so normal
             // and low-volume (nRPC) traffic is unaffected.
             Some(state) if reliable && !state.with_reliability(|r| r.can_send()) => {
+                return Err(StreamError::Backpressure);
+            }
+            // R5-N2: and the descriptor window, for every packet
+            // this call will emit. Retryable for the same reason the
+            // congestion gate is — an acknowledgement frees a slot —
+            // and refused before the first commit, so
+            // `send_with_retry` may safely replay the whole slice.
+            Some(state)
+                if reliable
+                    && state
+                        .with_reliability(|r| r.retransmit_headroom())
+                        .is_some_and(|headroom| headroom < packets) =>
+            {
+                tracing::debug!(
+                    stream_id = format!("{stream_id:#x}"),
+                    packets,
+                    headroom = state
+                        .with_reliability(|r| r.retransmit_headroom())
+                        .unwrap_or(0),
+                    "stream send refused: the reliable descriptor window \
+                     cannot own every packet of this call"
+                );
                 return Err(StreamError::Backpressure);
             }
             Some(_) => {}
@@ -44937,6 +45128,10 @@ impl MeshNode {
         // that meets backpressure retries *internally* with backoff until
         // it clears, so the batch is sent exactly once, in order.
         let mut committed_any = false;
+        // R5-N2: what the loop actually emits, against what the
+        // admission above reserved. The two rules are the same rule
+        // written twice, and this is what keeps them that way.
+        let mut emitted = 0usize;
 
         for event in events {
             // An over-cap event is its own message and its own
@@ -44959,6 +45154,7 @@ impl MeshNode {
                         &mut committed_any,
                     )
                     .await?;
+                    emitted += 1;
                     current_batch.clear();
                     current_size = 0;
                 }
@@ -44974,6 +45170,7 @@ impl MeshNode {
                     &mut committed_any,
                 )
                 .await?;
+                emitted += event.len().div_ceil(protocol::MAX_EVENT_SIZE);
                 continue;
             }
             let frame_size = EventFrame::LEN_SIZE + event.len();
@@ -44992,6 +45189,7 @@ impl MeshNode {
                     &mut committed_any,
                 )
                 .await?;
+                emitted += 1;
                 current_batch.clear();
                 current_size = 0;
             }
@@ -45014,11 +45212,54 @@ impl MeshNode {
                 &mut committed_any,
             )
             .await?;
+            emitted += 1;
         }
+        debug_assert_eq!(
+            emitted, packets,
+            "R5-N2: the descriptor admission reserved {packets} packets for \
+             this call and the flush loop emitted {emitted}; the two rules \
+             have drifted"
+        );
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// How many packets one [`Self::send_on_stream`] call will emit
+    /// for `events` (**R5-N2**).
+    ///
+    /// The batching rule of the flush loop, as arithmetic: an event
+    /// past the single-packet cap is its own group of
+    /// `ceil(len / MAX_EVENT_SIZE)` pieces and flushes whatever was
+    /// pending first, and everything else accumulates until the next
+    /// event would overflow `MAX_PAYLOAD_SIZE`. It exists so the
+    /// descriptor window can be asked to own the WHOLE call before
+    /// any piece of it commits; the loop counts what it emits and
+    /// debug-asserts the two agree.
+    fn stream_call_packets(events: &[Bytes], fragmenting: bool) -> usize {
+        let mut packets = 0usize;
+        let mut pending = 0usize;
+        for event in events {
+            if fragmenting && event.len() > protocol::MAX_EVENT_SIZE {
+                if pending > 0 {
+                    packets += 1;
+                    pending = 0;
+                }
+                packets += event.len().div_ceil(protocol::MAX_EVENT_SIZE);
+                continue;
+            }
+            let frame_size = EventFrame::LEN_SIZE + event.len();
+            if pending + frame_size > protocol::MAX_PAYLOAD_SIZE && pending > 0 {
+                packets += 1;
+                pending = 0;
+            }
+            pending += frame_size;
+        }
+        if pending > 0 {
+            packets += 1;
+        }
+        packets
     }
 
     /// Flush one built batch of a [`Self::send_on_stream`] call: acquire
@@ -45084,21 +45325,36 @@ impl MeshNode {
         // sender forever (#4 follow-up). Only consulted on the committed
         // path; pre-commit backpressure still returns immediately.
         let stall_deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        // R4-1: a boundary claimed on an attempt whose packet was
+        // then rolled back is still this send's to state — the claim
+        // is one-shot, so a retry that does not restamp it would
+        // leave the receiver with no statement at all.
+        let mut claimed_boundary: Option<u64> = None;
         loop {
-            // `TxAdmit::Acquired` returns credit + sequence under the
-            // same DashMap lookup — a close+reopen race can't slip a
-            // stale sequence from the old lifetime onto the new state.
-            // The session id is passed too so the admission itself
+            // One lookup for the credit, the sequence and the
+            // reliable-mode boundary claim — a close+reopen race
+            // can't slip a stale sequence from the old lifetime onto
+            // the new state, and the claim cannot name a HIGHER
+            // sequence than a concurrent first reliable send's (R4-1:
+            // the boundary must be the lowest reliable sequence, or
+            // the receiver concedes a reliable one below it). The
+            // session id is passed too so the admission itself
             // refuses a predecessor's lifetime rather than relying on
             // the caller having resolved the right session (R12).
-            let (guard, seq) = match session.try_acquire_tx_credit_for_lifetime(
+            let (guard, seq, boundary) = match session.try_admit_stream_send(
                 stream_id,
                 stream.session_id(),
                 stream.epoch(),
                 needed,
+                1,
+                flags.contains(PacketFlags::RELIABLE),
             ) {
-                TxAdmit::Acquired { guard, seq } => (guard, seq),
-                TxAdmit::WindowFull => {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                TxSendAdmit::WindowFull => {
                     if *committed_any {
                         // Already committed earlier packets this call —
                         // a return would trigger a whole-slice replay.
@@ -45110,8 +45366,25 @@ impl MeshNode {
                     }
                     return Err(StreamError::Backpressure);
                 }
-                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-                TxAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+                TxSendAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                TxSendAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+            };
+            if boundary.is_some() {
+                claimed_boundary = boundary;
+            }
+            // **R4-1: the boundary is STATED, not inferred.** This
+            // packet's sequence is the first reliable one on the
+            // stream, and saying so is what lets the receiver concede
+            // the fire-and-forget sequences below it without
+            // acknowledging anything it never got — and what stops it
+            // conceding a reliable one. The flag rides the retransmit
+            // descriptor too, so a lost boundary packet re-announces
+            // itself on rebuild. Exactly the leaf's rule
+            // (`LeafSession::build_packets`).
+            let flags = if claimed_boundary == Some(seq) {
+                flags.with(PacketFlags::MODE_BOUNDARY)
+            } else {
+                flags
             };
             // The stamp is one-shot: `build` consumes it, so it is
             // set inside the retry loop and re-set on every attempt.
@@ -45230,16 +45503,30 @@ impl MeshNode {
     /// group, and consecutive sequences allocated in offset order —
     /// which is the sequence-ownership rule the receiver holds a
     /// group to (round 4's mode boundary: the head's sequence is the
-    /// group's, the tail's are consumed by reassembly). Each piece
-    /// is admitted, delivered and registered for retransmit by
-    /// [`Self::flush_stream_batch`], so credit, the #19 atomicity
-    /// rule and the reliable window are the ones already in force —
-    /// no second admission path.
+    /// group's, the tail's are consumed by reassembly).
+    ///
+    /// **R5-N1: the whole group's sequences are reserved before its
+    /// first piece commits.** Each piece used to take its own
+    /// sequence through a separately awaited
+    /// [`Self::flush_stream_batch`], which yields on byte credit and
+    /// on delivery pressure — so a small concurrent send on the same
+    /// stream could take the sequence between two pieces, and BOTH
+    /// sends succeeded. Both receivers require a group's piece
+    /// sequences to be contiguous in offset order (`rtc/fragment.rs`
+    /// refuses exactly that shape, and retransmission preserves it),
+    /// so the interleave destroyed a logical event and could terminal
+    /// the shared reliable stream. Interleaving whole EVENTS is
+    /// compatible with the batching contract; interleaving a group's
+    /// pieces is not, and the sequence space is the thing that has to
+    /// say so. `NetSession::try_admit_stream_send` reserves the
+    /// range, the group's byte credit and the boundary claim under
+    /// ONE lookup; nothing is held across the awaits below.
     ///
     /// A fire-and-forget group is lossy by construction: its pieces
     /// register no descriptor, so a lost piece leaves the group
     /// incomplete, the receiver reaps it on its TTL, and the stream
-    /// survives (`dispose_abandoned_groups`' reliable guard, R3-4).
+    /// survives (`dispose_abandoned_rtc_groups`' reliable guard,
+    /// R3-4/R4-6).
     #[allow(clippy::too_many_arguments)]
     async fn flush_stream_fragment_group(
         &self,
@@ -45263,11 +45550,67 @@ impl MeshNode {
              decision was bypassed"
         );
         let fragment_id = self.next_fragment_id();
+        let pieces = event.len().div_ceil(protocol::MAX_EVENT_SIZE);
+        // The group's wire bytes, charged once: the same per-packet
+        // overhead each piece would have been charged separately.
+        let mut group_bytes = 0u32;
         let mut offset = 0usize;
+        while offset < event.len() {
+            let end = (offset + protocol::MAX_EVENT_SIZE).min(event.len());
+            group_bytes = group_bytes.saturating_add(wire_bytes_for_payload(
+                EventFrame::LEN_SIZE + (end - offset),
+            ));
+            offset = end;
+        }
+
+        let mut delay = Duration::from_millis(5);
+        let cap = Duration::from_millis(200);
+        let stall_deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        let (guard, first_seq, boundary) = loop {
+            match session.try_admit_stream_send(
+                stream_id,
+                stream.session_id(),
+                stream.epoch(),
+                group_bytes,
+                pieces as u32,
+                flags.contains(PacketFlags::RELIABLE),
+            ) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => break (guard, first_seq, boundary),
+                TxSendAdmit::WindowFull => {
+                    // Before the first commit of the CALL this is a
+                    // safe whole-slice replay; after it, waiting is
+                    // the only option that does not duplicate the
+                    // committed prefix. Either way no piece of this
+                    // group exists yet, so the group is whole in
+                    // both outcomes (#19).
+                    if *committed_any {
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
+                    }
+                    return Err(StreamError::Backpressure);
+                }
+                TxSendAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                TxSendAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+            }
+        };
+
+        let mut offset = 0usize;
+        let mut sent = 0usize;
+        let mut delivered_bytes = 0u32;
         while offset < event.len() {
             let end = (offset + protocol::MAX_EVENT_SIZE).min(event.len());
             let last = end == event.len();
             let piece = event.slice(offset..end);
+            let seq = first_seq + sent as u64;
+            let piece_flags = if boundary == Some(seq) {
+                flags.with(PacketFlags::MODE_BOUNDARY)
+            } else {
+                flags
+            };
             let stamp = net_wire::reliability::FragmentStamp {
                 fragment_id,
                 // The ceiling and `MAX_FRAGMENTS_PER_GROUP` are
@@ -45277,22 +45620,77 @@ impl MeshNode {
                 fragment_offset: offset as u16,
                 frag_flags: FRAG_FRAGMENTED | if last { FRAG_LAST } else { 0 },
             };
-            self.flush_stream_batch(
-                session,
-                builder,
-                stream,
-                stream_id,
-                peer_addr,
-                scheduled,
-                flags,
-                std::slice::from_ref(&piece),
-                EventFrame::LEN_SIZE + piece.len(),
-                Some(stamp),
-                committed_any,
-            )
-            .await?;
+            let batch = std::slice::from_ref(&piece);
+            let piece_bytes = wire_bytes_for_payload(EventFrame::LEN_SIZE + piece.len());
+            loop {
+                // The stamp is one-shot: `build` consumes it, so it
+                // is set on every attempt.
+                builder.set_fragment(stamp.fragment_id, stamp.fragment_offset, stamp.frag_flags);
+                let packet = builder.build(stream_id, seq, batch, piece_flags);
+                match self
+                    .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                    .await
+                {
+                    Ok(()) => {
+                        Self::register_retransmit(
+                            session,
+                            stream_id,
+                            stream.epoch(),
+                            seq,
+                            batch,
+                            piece_flags,
+                            Some(stamp),
+                        );
+                        *committed_any = true;
+                        delivered_bytes = delivered_bytes.saturating_add(piece_bytes);
+                        break;
+                    }
+                    // The group's sequence range is already reserved,
+                    // so this piece cannot be retried under a fresh
+                    // sequence without leaving a hole the receiver
+                    // would hold the group's successor behind. The
+                    // packet is not on the wire, so retrying the SAME
+                    // sequence is exactly right — and bounded by the
+                    // same stall budget every committed flush uses.
+                    Err(StreamError::Backpressure) => {
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        // The group is broken: the delivered prefix
+                        // is on the wire and owns its bytes, the rest
+                        // never existed. Commit what was delivered,
+                        // refund the tail, and reclaim the unused
+                        // sequences from the TOP so the receiver is
+                        // left no hole it would NACK forever (the
+                        // reclaim is a CAS per sequence, so a
+                        // concurrent send that raced ahead simply
+                        // leaves them consumed, exactly as one
+                        // rolled-back packet always could).
+                        let unused = group_bytes.saturating_sub(delivered_bytes);
+                        guard.commit();
+                        if unused > 0 {
+                            if let Some(state) = session.try_stream(stream_id) {
+                                if state.epoch() == stream.epoch() {
+                                    state.refund_tx_credit(unused);
+                                }
+                            }
+                        }
+                        for back in (sent..pieces).rev() {
+                            session.try_rollback_tx_seq(
+                                stream_id,
+                                stream.epoch(),
+                                first_seq + back as u64,
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            sent += 1;
             offset = end;
         }
+        guard.commit();
         Ok(())
     }
 

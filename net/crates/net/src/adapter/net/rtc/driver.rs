@@ -221,6 +221,33 @@ pub struct RtcTestHooks {
     /// Fragments the offset-targeted injector actually dropped,
     /// counted since it was armed.
     ingress_frag_dropped: std::sync::atomic::AtomicU64,
+    /// Drop the inbound Net packet carrying this exact stream
+    /// sequence, stored as **sequence + 1** so `0` is "disabled"
+    /// (sequence 0 is a legitimate target — it is where a stream
+    /// starts — so it cannot double as the sentinel). Paired with
+    /// [`Self::ingress_drop_seq_stream`], which names the stream it
+    /// belongs to.
+    ///
+    /// # Why this exists beside the other two
+    ///
+    /// Same reason as [`Self::ingress_drop_frag_offset`], one layer
+    /// up: a mode-boundary witness means "the reliable packet the
+    /// producer stated its boundary on", which is a SEQUENCE, not an
+    /// arrival ordinal. Credit grants, ACKs and the peer's own
+    /// traffic share the channel, so an ordinal names that packet on
+    /// one machine and a grant on another. This names it by its own
+    /// identity.
+    ///
+    /// **Fires exactly once, then disarms**, for the same reason:
+    /// a retransmission carries the same sequence, and an injector
+    /// that stayed armed would eat the recovery the witness is
+    /// about.
+    ingress_drop_seq: std::sync::atomic::AtomicU64,
+    /// The stream id [`Self::ingress_drop_seq`] applies to.
+    ingress_drop_seq_stream: std::sync::atomic::AtomicU64,
+    /// Packets the sequence-targeted injector actually dropped,
+    /// counted since it was armed.
+    ingress_seq_dropped: std::sync::atomic::AtomicU64,
     /// Drop the Nth RAW outbound datagram carrying DTLS
     /// application data — i.e. below SCTP (0 = disabled).
     ///
@@ -362,6 +389,36 @@ impl RtcTestHooks {
         self.ingress_frag_dropped.load(Ordering::Acquire)
     }
 
+    /// Arm the ingress injector on a packet's OWN stream identity:
+    /// drop the inbound Net packet carrying `(stream_id, sequence)`.
+    /// `None` disables it. Fires exactly once, then disarms.
+    ///
+    /// Prefer this to [`Self::set_ingress_drop_at`] whenever the
+    /// witness means "that packet of that stream" — a mode-boundary
+    /// or reliable-head witness does — for the reason spelled out on
+    /// [`Self::set_ingress_drop_fragment_offset`]: an ordinal is
+    /// only the intended packet if nothing else shares the channel,
+    /// and grants, ACKs and the peer's traffic do.
+    pub fn set_ingress_drop_stream_seq(&self, target: Option<(u64, u64)>) {
+        self.ingress_seq_dropped.store(0, Ordering::Release);
+        match target {
+            Some((stream_id, seq)) => {
+                self.ingress_drop_seq_stream
+                    .store(stream_id, Ordering::Release);
+                self.ingress_drop_seq
+                    .store(seq.saturating_add(1), Ordering::Release);
+            }
+            None => self.ingress_drop_seq.store(0, Ordering::Release),
+        }
+    }
+
+    /// Packets dropped by [`Self::set_ingress_drop_stream_seq`]
+    /// since it was armed, so a witness can assert the loss HAPPENED
+    /// rather than that it was requested.
+    pub fn ingress_stream_seq_dropped(&self) -> u64 {
+        self.ingress_seq_dropped.load(Ordering::Acquire)
+    }
+
     /// Arm the PRE-SCTP injector: drop the `nth` outbound datagram
     /// that carries DTLS application data, counting from this call.
     /// `0` disables and resets the counter.
@@ -469,6 +526,28 @@ impl RtcTestHooks {
                         .is_ok()
                 {
                     self.ingress_frag_dropped.fetch_add(1, Ordering::Relaxed);
+                    drop = true;
+                }
+            }
+        }
+        // Targeted by the packet's own stream identity, and it fires
+        // ONCE, for the same reasons as the offset form above. The
+        // header is plaintext (it is the AAD the payload is sealed
+        // against), so this reads the stream id and sequence without
+        // touching the ciphertext.
+        let armed_seq = self.ingress_drop_seq.load(Ordering::Acquire);
+        if armed_seq != 0 {
+            let want_seq = armed_seq - 1;
+            let want_stream = self.ingress_drop_seq_stream.load(Ordering::Acquire);
+            if let Some(header) = net_wire::protocol::NetHeader::from_bytes(data) {
+                if header.stream_id == want_stream
+                    && header.sequence == want_seq
+                    && self
+                        .ingress_drop_seq
+                        .compare_exchange(armed_seq, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    self.ingress_seq_dropped.fetch_add(1, Ordering::Relaxed);
                     drop = true;
                 }
             }

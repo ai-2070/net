@@ -1,0 +1,481 @@
+diff --git a/net/crates/net/tests/rtc_repairs.rs b/net/crates/net/tests/rtc_repairs.rs
+index 091c889a9..7bfaa1fb5 100644
+--- a/net/crates/net/tests/rtc_repairs.rs
++++ b/net/crates/net/tests/rtc_repairs.rs
+@@ -2810,7 +2810,31 @@ fn leaf_fragment(
+ ) -> Vec<u8> {
+     use net_wire::protocol::PacketFlags;
+ 
+-    let (fragment_id, offset, flags) = frag;
++    leaf_fragment_with_flags(
++        from,
++        to_node,
++        stream_id,
++        frag,
++        channel_hash,
++        payload,
++        PacketFlags::RELIABLE,
++    )
++}
++
++/// [`leaf_fragment`] with the packet's reliability chosen by the
++/// caller, for the witnesses that need a FIRE-AND-FORGET group: its
++/// provenance carries `reliable: false`, which is what the
++/// disposition policy keys on (R4-6).
++fn leaf_fragment_with_flags(
++    from: &Arc<MeshNode>,
++    to_node: u64,
++    stream_id: u64,
++    frag: (u16, u16, u8),
++    channel_hash: u16,
++    payload: &[u8],
++    flags: net_wire::protocol::PacketFlags,
++) -> Vec<u8> {
++    let (fragment_id, offset, frag_flags) = frag;
+     let session = from
+         .peer_session_for_test(to_node)
+         .expect("a session to the peer")
+@@ -2819,18 +2843,20 @@ fn leaf_fragment(
+     let mut builder = session.thread_local_pool().get();
+     builder.set_channel_hash(channel_hash);
+     builder.set_origin_hash(from.node_id());
+-    builder.set_fragment(fragment_id, offset, flags);
++    builder.set_fragment(fragment_id, offset, frag_flags);
+     builder
+         .build_subprotocol(
+             stream_id,
+             seq,
+             &[Bytes::copy_from_slice(payload)],
+-            // RELIABLE: a fragment's sequence has to be RECORDED by
+-            // the receiver for the piece to be acknowledged at all,
+-            // and "the receiver acknowledged it" is the premise that
+-            // makes an abandoned group a loss rather than a dropped
+-            // datagram. A fire-and-forget stream tracks no sequence.
+-            PacketFlags::RELIABLE,
++            // RELIABLE by default (see [`leaf_fragment`]): a
++            // fragment's sequence has to be RECORDED by the receiver
++            // for the piece to be acknowledged at all, and "the
++            // receiver acknowledged it" is the premise that makes an
++            // abandoned group a loss rather than a dropped datagram.
++            // A fire-and-forget stream tracks no sequence, which is
++            // why its loss is a permitted one (R4-6).
++            flags,
+             0,
+         )
+         .to_vec()
+@@ -3308,17 +3334,24 @@ async fn a_swept_dead_peers_partial_fragment_group_is_retired() {
+ /// datagram: the head's sequence is RECORDED before reassembly sees
+ /// it, so B is entitled to discard its retransmit descriptor. This
+ /// witness therefore requires the loss to become an event on the
+-/// conversation: A's receive lifetime for the stream is ended (its
++/// conversation: A's receive lifetime for the stream is ended — its
+ /// cumulative cursor drops back to zero, so B's restarted sequences
+-/// are admitted rather than dropped below a stale frontier) and a
+-/// reset is owed to B.
++/// are admitted rather than dropped below a stale frontier.
++///
++/// **R4-6:** and nothing is owed to B. This used to also queue
++/// `note_receive_terminal`, whose `StreamReset` means "my SEND half
++/// gave up" and makes its receiver clear its own RX — so A's
++/// receive-side loss reset B's healthy reverse direction. The
++/// settlement is local now; the directional pair is
++/// `a_reassembly_loss_settles_its_own_half_not_the_reverse_direction`.
+ ///
+ /// Inverses: delete the `dispose_abandoned_rtc_groups` call from
+ /// `reassemble_rtc_fragments` — `abandoned_total` still reaches 1
+ /// and the cursor stays at 1, which is exactly the "replaced a
+ /// silent drop with a log the caller never receives" shape; or
+-/// delete `session.note_receive_terminal(...)` from the drain — the
+-/// cursor resets but nothing is ever owed to the peer.
++/// delete `session.reset_rx_stream(...)` from the drain — the loss
++/// is reported but the receive lifetime never ends, so a peer
++/// reopening the id from zero is refused below a stale frontier.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+ async fn an_abandoned_fragment_group_ends_the_streams_receive_half() {
+     use net::adapter::net::rtc::GROUP_TTL;
+@@ -3400,15 +3433,15 @@ async fn an_abandoned_fragment_group_ends_the_streams_receive_half() {
+          cursor is dropped, so a peer that reopens the id from sequence \
+          zero is admitted instead of being refused below a stale frontier"
+     );
+-    // And the peer is owed exactly one reset for it. The retransmit
+-    // tick is the drainer, so the terminal is either still queued or
+-    // already on the wire; both are the obligation being honoured,
+-    // and "never recorded at all" is the failure this excludes.
+-    let owed = a_to_b.take_receive_terminals();
+-    assert!(
+-        owed.is_empty() || owed == vec![STREAM],
+-        "the only receive-half terminal this session may owe is the stream \
+-         that lost the bytes, got {owed:?}"
++    // And nothing is owed to the peer for it (**R4-6**): a
++    // receive-half loss is settled locally, because the only frame
++    // that could carry it announces a SEND half giving up and its
++    // receiver answers by clearing its own RX — resetting B's
++    // healthy reverse direction over A's receive-side failure.
++    assert_eq!(
++        a_to_b.take_receive_terminals(),
++        Vec::<u64>::new(),
++        "a receive-side reassembly loss owes the peer no `StreamReset`"
+     );
+     let delivered = collect_tagged(&a, b"NR2", 1, Duration::from_millis(500)).await;
+     assert!(
+@@ -5213,3 +5246,360 @@ async fn a_peer_without_the_reassembly_tag_still_gets_event_too_large() {
+         delivered.iter().map(|e| e.len()).collect::<Vec<_>>()
+     );
+ }
++
++/// **R4-5.** One normal expiry pass retains EVERY distinct terminal
++/// owner — Kyra's fourth-review native mechanism
++/// (`spikes/kyra/kyra_5_round4_native_terminal_wrapper.rs`), landed as
++/// a pinned test with her property, her counts and her assertion
++/// message. Her wrapper compiled the candidate `rtc/fragment.rs` by
++/// `#[path]` from a detached worktree because it ran outside the
++/// crate; inside it the module is reachable through its public
++/// re-exports, so the `#[path]` trick is dropped and nothing else is.
++///
++/// Her eight-session control passed (64 owed / 64 retained) and her
++/// nine-session counterexample failed (72 owed / **64** retained / 8
++/// lost): `RtcReassembly::record_abandoned` bounded the AUTHORITATIVE
++/// terminal queue with `pop_front()`, so eight receive halves that had
++/// acknowledged bytes were never told inside ONE producer call — no
++/// consumer had had an opportunity to drain. Both counts run here, in
++/// one test, because the bound is only demonstrated by the pair.
++///
++/// Inverse: replace the admission charge + per-owner coalescing in
++/// `record_abandoned` with the old `if terminals.len() >=
++/// MAX_ABANDONMENT_RECORDS { terminals.pop_front(); }` — the
++/// nine-session pass drops back to 64 retained and this test fails on
++/// her message.
++#[test]
++fn one_expiry_pass_retains_every_distinct_terminal_owner() {
++    use net::adapter::net::rtc::{
++        FragmentOutcome, FragmentPiece, FragmentProvenance, RtcReassembly, GROUP_TTL,
++    };
++    use net_wire::protocol::FRAG_FRAGMENTED;
++    use std::collections::HashSet;
++
++    fn batch(sessions: u64) {
++        let r = RtcReassembly::new();
++        let now = std::time::Instant::now();
++        let mut expected = HashSet::new();
++        for session_id in 1..=sessions {
++            for fragment_id in 1..=8u16 {
++                let stream_id = u64::from(fragment_id);
++                expected.insert((session_id, stream_id));
++                let part = FragmentPiece {
++                    session_id,
++                    fragment_id,
++                    offset: 0,
++                    flags: FRAG_FRAGMENTED,
++                    sequence: 0,
++                    provenance: FragmentProvenance {
++                        stream_id,
++                        origin_hash: 1,
++                        channel_hash: 1,
++                        subprotocol_id: 0,
++                        reliable: true,
++                    },
++                    data: Bytes::from_static(b"head"),
++                };
++                assert_eq!(r.accept(part, now), Err(FragmentOutcome::Buffered));
++            }
++        }
++        r.expire(now + GROUP_TTL + Duration::from_millis(1));
++        let actual: HashSet<_> = r
++            .take_terminals()
++            .into_iter()
++            .map(|g| (g.session_id, g.provenance.stream_id))
++            .collect();
++        println!(
++            "sessions={sessions} owed={} actual={} missing={}",
++            expected.len(),
++            actual.len(),
++            expected.difference(&actual).count()
++        );
++        assert_eq!(
++            actual, expected,
++            "one normal expiry pass must retain every distinct terminal owner"
++        );
++    }
++
++    // Her control: eight sessions × eight groups = 64 owners.
++    batch(8);
++    // Her counterexample: nine sessions × eight groups = 72 owners.
++    batch(9);
++}
++
++/// **R4-6.** A reassembly loss settles the RECEIVE half that lost
++/// the bytes and leaves the REVERSE direction's progress alone.
++///
++/// The native disposal used to add
++/// `NetSession::note_receive_terminal`, which the retransmit tick
++/// drains as a `StreamReset` — the frame that means "my SEND half
++/// gave up". Its receiver answers by clearing its own receive state
++/// (`mesh.rs`'s `SUBPROTOCOL_STREAM_RESET` arm resets `rx`;
++/// `leaf/src/node.rs` does the same). So A losing a B→A group made B
++/// throw away its healthy A→B receive cursor: the direction that
++/// failed was not the direction that was reset, and B's send half —
++/// the one that actually lost data — was told nothing.
++///
++/// One stream id, both directions, so the two halves are the same
++/// conversation: A→B carries real reliable payloads, B→A loses an
++/// incomplete reliable group on that id. Afterwards A's receive half
++/// is ended (it lost the bytes), A's send half is untouched, and B's
++/// receive cursor for the id is exactly where it was — proved by the
++/// next A→B payload still being DELIVERED rather than held below a
++/// cursor that went back to zero.
++///
++/// Inverse: put `session.note_receive_terminal(stream_id)` back in
++/// `dispose_abandoned_rtc_groups` — B's cursor drops to 0 and the
++/// third payload never reaches B's subscriber.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_reassembly_loss_settles_its_own_half_not_the_reverse_direction() {
++    use net::adapter::net::rtc::GROUP_TTL;
++    use net_wire::protocol::FRAG_FRAGMENTED;
++
++    const STREAM: u64 = 0x07A6;
++    const GROUP: u16 = 61;
++    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
++    let (a_id, b_id) = (a.node_id(), b.node_id());
++    let a_session_id = a.peer_session_id(b_id).expect("an installed session");
++
++    // ---- healthy A→B progress on the id ------------------------
++    let a_to_b_stream = a
++        .open_stream(b_id, STREAM, reliable_config())
++        .expect("open_stream");
++    for payload in tagged_payloads(b"R46AB", 2) {
++        a.send_on_stream(&a_to_b_stream, std::slice::from_ref(&payload))
++            .await
++            .expect("A's ordinary reliable send");
++    }
++    assert_eq!(
++        collect_tagged(&b, b"R46AB", 2, Duration::from_secs(20))
++            .await
++            .len(),
++        2,
++        "premise: B is receiving A's stream normally"
++    );
++    let b_to_a = b
++        .peer_session_for_test(a_id)
++        .expect("B's session to A")
++        .clone();
++    let b_progress = b_to_a
++        .get_or_create_stream(STREAM)
++        .with_reliability(|r| r.rx_ack_seq());
++    assert!(
++        b_progress > 0,
++        "premise: B's receive half of the id has real progress to lose, \
++         got {b_progress}"
++    );
++    let a_tx_before = tx_seq_of(&a, b_id, STREAM);
++
++    // ---- B→A loses an incomplete reliable group on that id -----
++    let a_to_b = a
++        .peer_session_for_test(b_id)
++        .expect("A's session to B")
++        .clone();
++    let a_rx_before = a_to_b
++        .get_or_create_stream(STREAM)
++        .with_reliability(|r| r.rx_ack_seq());
++    let head = leaf_fragment(
++        &b,
++        a_id,
++        STREAM,
++        (GROUP, 0, FRAG_FRAGMENTED),
++        0,
++        b"R46-head--",
++    );
++    b.send_built_packet_for_test(a_id, &head)
++        .await
++        .expect("the head leaves B");
++    assert!(
++        wait_for(
++            || a.rtc_reassembly().held_bytes(a_session_id) == 10,
++            Duration::from_secs(5)
++        )
++        .await,
++        "the head must be buffered at A, or nothing is lost here"
++    );
++    assert!(
++        a_to_b
++            .get_or_create_stream(STREAM)
++            .with_reliability(|r| r.rx_ack_seq())
++            > a_rx_before,
++        "and its sequence must be ACKNOWLEDGED: that is what makes the \
++         abandonment below a loss rather than a dropped datagram"
++    );
++    // The deadline, reaped and disposed of by the production tick.
++    tokio::time::sleep(GROUP_TTL + Duration::from_millis(300)).await;
++    assert!(
++        wait_for(
++            || a.rtc_reassembly().abandoned_total() == 1,
++            Duration::from_secs(10)
++        )
++        .await,
++        "the reaped group held acknowledged bytes, so it must be reported"
++    );
++
++    // ---- the losing owner, and only it --------------------------
++    assert!(
++        wait_for(
++            || a_to_b
++                .try_stream(STREAM)
++                .is_some_and(|s| s.with_reliability(|r| r.rx_ack_seq()) == 0),
++            Duration::from_secs(10)
++        )
++        .await,
++        "A's own receive half of the id must END — it is the half that lost \
++         acknowledged bytes"
++    );
++    assert_eq!(
++        tx_seq_of(&a, b_id, STREAM),
++        a_tx_before,
++        "and A's SEND half on the same id is untouched: a receive-side \
++         failure is not a send-side one"
++    );
++    assert!(
++        a_to_b.take_receive_terminals().is_empty(),
++        "and A owes its peer NO `StreamReset` over it: that frame announces \
++         a send half giving up, and B's send half has not"
++    );
++    assert_eq!(
++        b_to_a
++            .get_or_create_stream(STREAM)
++            .with_reliability(|r| r.rx_ack_seq()),
++        b_progress,
++        "**R4-6**: B's receive cursor for the id must be exactly where it \
++         was. A's receive-side loss is not B's send half giving up, and the \
++         frame that says so resets the wrong direction"
++    );
++    let third = tagged_payloads(b"R46CD", 1);
++    a.send_on_stream(&a_to_b_stream, &third)
++        .await
++        .expect("A keeps sending on its untouched send half");
++    assert_eq!(
++        collect_tagged(&b, b"R46CD", 1, Duration::from_secs(20))
++            .await
++            .len(),
++        1,
++        "and the reverse direction still DELIVERS: a cursor reset back to \
++         zero would hold this payload out of order forever"
++    );
++}
++
++/// **R4-6, the other mode.** A FIRE-AND-FORGET group's loss is a
++/// permitted loss, not a terminal.
++///
++/// Its sequences were never retransmittable, so no acknowledgement
++/// took anything away and an incomplete group is precisely the
++/// outcome the mode allows — which is the leaf's ruled policy (R3-4,
++/// `dispose_abandoned_groups`' reliable guard). The native disposal
++/// applied complete-or-terminal to every group regardless of
++/// reliability, so one expected fragment loss ended the receive half
++/// of the id and (pre-R4-6) reset the peer's healthy reverse
++/// direction over it.
++///
++/// The stream carries real reliable B→A progress first, so "the
++/// receive half was not ended" is observable: the cursor the FAF
++/// loss must NOT move.
++///
++/// Inverse: drop the `!group.provenance.reliable` arm in
++/// `dispose_abandoned_rtc_groups` — the cursor drops back to zero.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn a_fire_and_forget_reassembly_loss_is_a_permitted_loss() {
++    use net::adapter::net::rtc::GROUP_TTL;
++    use net_wire::protocol::{PacketFlags, FRAG_FRAGMENTED};
++
++    const STREAM: u64 = 0x07A7;
++    const GROUP: u16 = 62;
++    let (a, b, _, _) = pair_with(rtc_config(), rtc_config()).await;
++    let (a_id, b_id) = (a.node_id(), b.node_id());
++    let a_session_id = a.peer_session_id(b_id).expect("an installed session");
++
++    // Real reliable B→A progress on the id, so the cursor the FAF
++    // loss must not move has something in it.
++    let b_to_a_stream = b
++        .open_stream(a_id, STREAM, reliable_config())
++        .expect("open_stream");
++    for payload in tagged_payloads(b"R46FF", 2) {
++        b.send_on_stream(&b_to_a_stream, std::slice::from_ref(&payload))
++            .await
++            .expect("B's ordinary reliable send");
++    }
++    assert_eq!(
++        collect_tagged(&a, b"R46FF", 2, Duration::from_secs(20))
++            .await
++            .len(),
++        2,
++        "premise: A is receiving B's stream normally"
++    );
++    let a_to_b = a
++        .peer_session_for_test(b_id)
++        .expect("A's session to B")
++        .clone();
++    let before_head = a_to_b
++        .get_or_create_stream(STREAM)
++        .with_reliability(|r| r.rx_ack_seq());
++    assert!(
++        before_head > 0,
++        "premise: A's cursor has progress, {before_head}"
++    );
++
++    // A fire-and-forget group that never completes.
++    let head = leaf_fragment_with_flags(
++        &b,
++        a_id,
++        STREAM,
++        (GROUP, 0, FRAG_FRAGMENTED),
++        0,
++        b"R46-faf---",
++        PacketFlags::NONE,
++    );
++    b.send_built_packet_for_test(a_id, &head)
++        .await
++        .expect("the FAF head leaves B");
++    assert!(
++        wait_for(
++            || a.rtc_reassembly().held_bytes(a_session_id) == 10,
++            Duration::from_secs(5)
++        )
++        .await,
++        "the FAF head must be buffered, or this witness reaps nothing"
++    );
++    // The piece's own sequence is acknowledged too — the stream is
++    // in reliable mode, so it records every arrival on it. That is
++    // the cursor a terminal disposition would throw away, and the
++    // group's DECLARED mode is what decides whether it may.
++    let progress = a_to_b
++        .get_or_create_stream(STREAM)
++        .with_reliability(|r| r.rx_ack_seq());
++    assert!(
++        progress > before_head,
++        "premise: the FAF piece advanced the cursor, {progress} vs \
++         {before_head}"
++    );
++    tokio::time::sleep(GROUP_TTL + Duration::from_millis(300)).await;
++    assert!(
++        wait_for(
++            || a.rtc_reassembly().abandoned_total() == 1,
++            Duration::from_secs(10)
++        )
++        .await,
++        "premise: the group IS reaped and reported — the mode decides its \
++         disposition, not whether it is noticed"
++    );
++    // Settle long enough that a terminal disposition would have run.
++    tokio::time::sleep(Duration::from_millis(600)).await;
++    assert_eq!(
++        a_to_b
++            .get_or_create_stream(STREAM)
++            .with_reliability(|r| r.rx_ack_seq()),
++        progress,
++        "**R4-6**: a fire-and-forget group's loss must not end the receive \
++         half of the id. Its sequences were never retransmittable, so \
++         nothing was acknowledged away"
++    );
++    assert!(
++        a_to_b.take_receive_terminals().is_empty(),
++        "and A owes its peer nothing over it: a receive-side disposition is \
++         not a `StreamReset`, and a permitted loss is not a disposition at \
++         all"
++    );
++}

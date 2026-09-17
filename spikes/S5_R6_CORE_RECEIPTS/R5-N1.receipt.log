@@ -1,0 +1,51 @@
+=== R5-N1 — inverse receipt ===
+--- repaired identity
+3fdacc684c3f8260e1ab1b4d8e6c0211b755f235861d64f32db17bffe3edfac0 *src/adapter/net/mesh.rs
+eb2acfb4120f64d7df3a873af689cf7e56fd00e527ff630408eaec472e4f2102 *src/adapter/net/rtc/fragment.rs
+apply R5-N1 ok
+--- INVERSE APPLIED; command:
+$ CARGO_INCREMENTAL=0 cargo test --test rtc_repairs --features "net webrtc fixtures" sequence_ownership
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 01s
+     Running tests\rtc_repairs.rs (target\debug\deps\rtc_repairs-ab2ae437d8444f07.exe)
+
+running 1 test
+test concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership ... FAILED
+
+failures:
+
+---- concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership stdout ----
+
+thread 'concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership' (107424) panicked at tests\rtc_repairs.rs:5981:5:
+assertion `left == right` failed: **R5-N1**: both sends must arrive — the fragmented event exactly once and whole even though another send on the same stream interleaved with it — got [40000]
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 55 filtered out; finished in 30.25s
+
+error: test failed, to rerun pass `--test rtc_repairs`
+EXIT=101
+restore R5-N1 ok
+--- RESTORED identity (must equal the repaired identity above)
+3fdacc684c3f8260e1ab1b4d8e6c0211b755f235861d64f32db17bffe3edfac0 *src/adapter/net/mesh.rs
+eb2acfb4120f64d7df3a873af689cf7e56fd00e527ff630408eaec472e4f2102 *src/adapter/net/rtc/fragment.rs
+--- GREEN rerun, same command:
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 02s
+     Running tests\rtc_repairs.rs (target\debug\deps\rtc_repairs-ab2ae437d8444f07.exe)
+
+running 1 test
+test concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.27s
+
+EXIT=0
