@@ -33,6 +33,7 @@
 //! | `template_hash` | the announced terms the caller is asking to be quoted under |
 //! | `issued_at_ns` / `expires_at_ns` | freshness — a captured request stops working |
 //! | `nonce` | replay identity within the freshness window |
+//! | `input_hash` (when present) | the exact invocation the price is being asked for — a request for one unit of work cannot be replayed as a request for another |
 //!
 //! The signature covers the canonical bytes with the `signature` key
 //! absent, exactly like every other envelope here, so the `object` tag is
@@ -89,6 +90,26 @@ pub struct QuoteRequest {
     pub expires_at_ns: u64,
     /// Replay identity within the freshness window.
     pub nonce: String,
+    /// blake3 hex of the invocation input the quote must price, when the
+    /// caller is buying one exact unit of work rather than a capability
+    /// call in general.
+    ///
+    /// Optional, and skipped when absent, so a request that does not bind
+    /// an input serializes to **byte-identical** canonical bytes to a
+    /// pre-`input_hash` build — the signature transcript of every existing
+    /// caller is unchanged.
+    ///
+    /// Present, it rides inside the signed transcript (canonical bytes
+    /// cover every field but `signature`) and the provider carries it into
+    /// [`PaymentQuote::input_hash`], where it participates in `terms_hash`
+    /// and therefore in the quote id. That is the whole chain the native
+    /// A2A admission path relies on: the caller's binding signature over
+    /// `quote_id ‖ tool_id` transitively proves the payer authorized *this
+    /// purchase of this work*.
+    ///
+    /// [`PaymentQuote::input_hash`]: crate::core::quote::PaymentQuote::input_hash
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<SignatureHex>,
     #[serde(flatten)]
@@ -157,9 +178,19 @@ impl QuoteRequest {
             issued_at_ns,
             expires_at_ns: issued_at_ns.saturating_add(ttl_ns.min(MAX_REQUEST_LIFETIME_NS)),
             nonce: nonce.into(),
+            input_hash: None,
             signature: None,
             extra: ExtraFields::new(),
         }
+    }
+
+    /// Bind this request to one exact invocation input (blake3 hex).
+    ///
+    /// The provider stamps it onto the issued quote, so the quote id
+    /// itself commits to the work being bought.
+    pub fn with_input_hash(mut self, input_hash: impl Into<String>) -> Self {
+        self.input_hash = Some(input_hash.into());
+        self
     }
 
     /// Derive a nonce for this request.
@@ -588,6 +619,17 @@ mod tests {
     const NOW: u64 = 1_000_000_000_000_000;
     const TEMPLATE: &[u8] = b"{\"scheme\":\"mock\"}";
     const CAPABILITY: &str = "prov/tool";
+    /// The canonical encoding of the fixture request below, as produced
+    /// before `input_hash` existed: sorted keys, compact, and no
+    /// `input_hash` key at all.
+    const PRE_INPUT_HASH_CANONICAL: &str = concat!(
+        r#"{"caller":"2222222222222222222222222222222222222222222222222222222222222222","#,
+        r#""capability":"prov/tool","expires_at_ns":1000030000000000,"#,
+        r#""issued_at_ns":1000000000000000,"nonce":"fixed-nonce","#,
+        r#""object":"net.payment.quote_request@1","#,
+        r#""provider":"1111111111111111111111111111111111111111111111111111111111111111","#,
+        r#""template_hash":"5467ee0eb32d077021be29622616b3db6be8e1468e8bfb55964602e773aad452"}"#,
+    );
 
     fn signed(caller: &EntityKeypair, provider: &EntityId) -> Vec<u8> {
         let nonce = QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW, 0);
@@ -602,6 +644,93 @@ mod tests {
         );
         req.sign_with(caller).expect("sign");
         canonical_bytes(&req).expect("canonical")
+    }
+
+    /// A request that binds no input must serialize to **exactly** the
+    /// bytes it did before `input_hash` existed — otherwise every caller
+    /// that upgrades re-derives a different signed transcript than its
+    /// pre-upgrade self, and a golden vector, a replay-guard nonce, and a
+    /// pinned cross-language fixture all move at once.
+    ///
+    /// Pinned as the literal canonical encoding rather than compared
+    /// against a re-encode, because a re-encode is produced by the same
+    /// code that would be wrong. Fixed identities so the bytes are
+    /// reproducible.
+    #[test]
+    fn an_unbound_request_encodes_to_the_bytes_it_always_did() {
+        let request = QuoteRequest::new(
+            EntityId::from_bytes([0x11; 32]),
+            EntityId::from_bytes([0x22; 32]),
+            CAPABILITY,
+            TEMPLATE,
+            NOW,
+            30_000_000_000,
+            "fixed-nonce",
+        );
+        assert_eq!(request.input_hash, None);
+        assert_eq!(
+            String::from_utf8(canonical_bytes(&request).expect("canonical")).expect("utf8"),
+            PRE_INPUT_HASH_CANONICAL,
+        );
+
+        // ...and the field appears only when it is actually bound, which
+        // is what makes the line above a statement about absence rather
+        // than about this particular value.
+        let bound = request.clone().with_input_hash("ab".repeat(32));
+        let bound_bytes =
+            String::from_utf8(canonical_bytes(&bound).expect("canonical")).expect("utf8");
+        assert!(
+            bound_bytes.contains(r#""input_hash":"#),
+            "a bound request must carry the field: {bound_bytes}"
+        );
+        assert_ne!(bound_bytes, PRE_INPUT_HASH_CANONICAL);
+    }
+
+    /// The input binding is worthless unless the signature covers it: a
+    /// relay that could rewrite the hash could point a caller's payment
+    /// at work the caller never agreed to buy.
+    #[test]
+    fn a_bound_requests_input_hash_is_inside_the_signature() {
+        let caller = EntityKeypair::generate();
+        let provider = EntityKeypair::generate().entity_id().clone();
+        let nonce = QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW, 0);
+        let mut req = QuoteRequest::new(
+            provider.clone(),
+            caller.entity_id().clone(),
+            CAPABILITY,
+            TEMPLATE,
+            NOW,
+            30_000_000_000,
+            nonce,
+        )
+        .with_input_hash("aa".repeat(32));
+        req.sign_with(&caller).expect("sign");
+        let bytes = canonical_bytes(&req).expect("canonical");
+
+        // Control: as sent, it verifies and the provider sees the hash.
+        let ok = QuoteRequest::verify(&bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0)
+            .expect("verify");
+        assert_eq!(ok.input_hash.as_deref(), Some("aa".repeat(32).as_str()));
+
+        // Rewrite the hash, keep the signature: refused.
+        let mut tampered = req.clone();
+        tampered.input_hash = Some("bb".repeat(32));
+        let tampered_bytes = canonical_bytes(&tampered).expect("canonical");
+        assert!(matches!(
+            QuoteRequest::verify(&tampered_bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0),
+            Err(QuoteRequestError::Envelope(EnvelopeError::BadSignature))
+        ));
+
+        // Strip it entirely, keep the signature: also refused — dropping
+        // the binding must not silently downgrade the request to an
+        // unbound one.
+        let mut stripped = req.clone();
+        stripped.input_hash = None;
+        let stripped_bytes = canonical_bytes(&stripped).expect("canonical");
+        assert!(matches!(
+            QuoteRequest::verify(&stripped_bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0),
+            Err(QuoteRequestError::Envelope(EnvelopeError::BadSignature))
+        ));
     }
 
     #[test]

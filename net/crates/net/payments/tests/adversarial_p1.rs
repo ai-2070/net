@@ -118,6 +118,7 @@ impl World {
                 self.caller.entity_id().clone(),
                 CAPABILITY,
                 requirements(),
+                None,
                 issued,
                 60_000_000_000,
             )
@@ -239,6 +240,7 @@ async fn an_unverified_attempt_holds_a_quote_without_claiming_it_was_paid() {
             w.caller.entity_id().clone(),
             CAPABILITY,
             requirements(),
+            None,
             NOW,
             60_000_000_000,
         )
@@ -419,6 +421,7 @@ async fn same_quote_retries_still_idempotent_under_the_transaction_guard() {
             w.caller.entity_id().clone(),
             CAPABILITY,
             requirements(),
+            None,
             NOW,
             60_000_000_000,
         )

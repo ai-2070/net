@@ -114,7 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("held for approval ({policy_reason}): {quote_id}\n{approve_hint}");
         }
         CallerDecision::Denied { policy_reason } => println!("denied: {policy_reason}"),
-        CallerDecision::Failed { message, retryable } => {
+        CallerDecision::Failed {
+            message, retryable, ..
+        } => {
             println!("failed (retryable={retryable}): {message}")
         }
     }

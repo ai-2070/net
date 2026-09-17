@@ -6346,6 +6346,18 @@ pub enum ServeError {
          attach terms to the descriptor, or serve it free via Mesh::serve_tool"
     )]
     MissingPricingTerms(String),
+    /// A configured paid A2A service could not be served as
+    /// configured: no admission gate, or an admission journal that is
+    /// missing, unreadable, or already owned by another live holder.
+    /// Refused at serve time because the alternative is worse — a
+    /// service whose catalog announces a price would otherwise come up
+    /// serving that work for free, or with two writers over one set of
+    /// admissions.
+    #[error(
+        "paid A2A service is misconfigured and must not degrade to free: {0} — \
+         fix the configuration, or publish the service as free"
+    )]
+    A2aPaidMisconfigured(String),
     /// A protected (`serve_rpc_protected`) registration was attempted with no
     /// installed node authority (E1.1). Org admission needs the provider's
     /// proven owner org + revocation store; without them the handler could

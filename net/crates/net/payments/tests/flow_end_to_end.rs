@@ -387,6 +387,7 @@ impl ProviderChannel for GreedyProvider {
         _provider: &net::adapter::net::identity::EntityId,
         capability: &str,
         _template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
     ) -> Result<Vec<u8>, net_payments::flow::ChannelError> {
         // Quote 10x the announced price (validly signed!).
         let inflated = X402Carry::author(&PaymentRequirements {
@@ -408,6 +409,7 @@ impl ProviderChannel for GreedyProvider {
                 caller.clone(),
                 capability,
                 inflated,
+                input_hash,
                 self.clock.now_ns(),
                 60_000_000_000,
             )

@@ -31,6 +31,14 @@
 //! bound to this tool, never redeemed before — at-most-once under the
 //! engine's store lock); tests script it.
 //!
+//! [`a2a_payment`](crate::a2a_payment) is this module's twin one step
+//! further from the money: the same headers, the same [`ERR_PAYMENT`],
+//! the same [`GateDenial`], but admitting a long-running **task** —
+//! where the binding is mandatory and the gate additionally checks that
+//! the quote committed to the exact reservation being submitted
+//! against. Its handler-authored reasons share the vocabulary and the
+//! table below.
+//!
 //! (`Mesh::serve_tool_paid` / `Mesh::serve_tool` /
 //! `ServeError::UnenforceablePricing` are named as plain spans, not
 //! intra-doc links: they live behind the `net`/`cortex` features, and
@@ -203,9 +211,34 @@ pub struct Recovery {
 /// | `wrong_tool_binding` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown | — |
 /// | `already_redeemed` | redeem | new_quote_required | caller_agent | false | false | true | yes | consumed | `request_new_quote` |
 /// | `engine_unavailable` | redeem | provider_configuration_error | provider_operator | true | true | true | unknown | unknown | `retry_later` |
+/// | `admission_revoked` | admission | non_recoverable | provider_operator | false | false | false | unknown | unknown | `contact_provider_operator` |
+/// | `no_reservation` | admission | non_recoverable | caller_operator | false | false | false | unknown | unknown | `contact_provider_operator` |
+/// | `journal_unavailable` | admission | provider_configuration_error | provider_operator | true | true | true | unknown | unknown | `retry_later` |
+/// | `input_binding_mismatch` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown | — |
 ///
-/// A `—` in `next_action` is `None` on the wire (the security and
-/// non-recoverable rows advise no next step). Binding-failure rows are
+/// The last four are the paid-A2A rows. The first three are authored by
+/// the configured A2A serving path (`a2a_payment`), the fourth by the
+/// engine beside `wrong_tool_binding`, whose posture it shares exactly:
+/// a proof that does not match the purchase it is presented for is a
+/// mismatch to report, not something to retry or re-buy.
+///
+/// Their `unknown`/`unknown` money facts are load-bearing, not caution:
+/// `admission_revoked` fires *after* a payment the provider then could
+/// not honor, and `no_reservation` fires where the provider has no
+/// record at all — which is exactly the state a caller who paid and
+/// submitted after the reservation's retention window arrives in. A
+/// provider that has no record cannot claim no money moved; the
+/// caller's own purchase record is the reconciliation evidence, and
+/// `contact_provider_operator` is the exit. `journal_unavailable` is
+/// the one retryable row of the four: the durable admission store
+/// refused a write, nothing ran, and the *same* proof resubmitted
+/// succeeds once the store recovers.
+///
+/// A `—` in `next_action` is `None` on the wire: the security rows, and
+/// the non-recoverable row whose only honest advice is "nothing here
+/// helps", advise no next step — the two non-recoverable A2A rows do
+/// carry one, because a human reconciliation *is* the step.
+/// Binding-failure rows are
 /// deliberately `unknown`/`unknown`: a failed possession proof learns
 /// nothing about payment state.
 ///

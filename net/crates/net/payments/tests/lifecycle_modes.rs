@@ -108,6 +108,7 @@ impl Harness {
                 self.caller.entity_id().clone(),
                 CAPABILITY,
                 requirements(amount),
+                None,
                 issued_ns,
                 TTL,
             )
@@ -744,6 +745,7 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -806,6 +808,7 @@ async fn overpayment_retry_via_re_verify_never_auto_bills() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -960,6 +963,7 @@ async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1054,6 +1058,7 @@ async fn a_lost_billing_append_is_recovered_on_retry() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1115,6 +1120,7 @@ async fn a_denied_caller_is_never_quoted() {
             h.caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1174,6 +1180,7 @@ async fn revoking_a_caller_does_not_invalidate_their_outstanding_quote() {
             h.caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1200,9 +1207,8 @@ async fn revoking_a_caller_does_not_invalidate_their_outstanding_quote() {
         .redeem_for_invocation(tool, &quote.quote_id, None)
         .await
         .expect("engine");
-    assert_eq!(
-        redeemed,
-        RedeemDecision::Admitted,
+    assert!(
+        matches!(redeemed, RedeemDecision::Admitted { .. }),
         "the paid invocation must survive revocation of the payer"
     );
 }
@@ -1222,7 +1228,14 @@ async fn an_unregistered_asset_is_never_quoted() {
     .unwrap();
     let err = h
         .engine
-        .issue_quote(h.caller.entity_id().clone(), CAPABILITY, bad, NOW, TTL)
+        .issue_quote(
+            h.caller.entity_id().clone(),
+            CAPABILITY,
+            bad,
+            None,
+            NOW,
+            TTL,
+        )
         .unwrap_err();
     assert!(err.to_string().contains("not in registry"), "got: {err}");
 }
@@ -1280,13 +1293,13 @@ async fn redemption_admits_a_paid_quote_exactly_once() {
     }
 
     // The one paid invocation.
-    assert_eq!(
+    assert!(matches!(
         h.engine
             .redeem_for_invocation("fixture-tool", &quote.quote_id, None)
             .await
             .unwrap(),
-        RedeemDecision::Admitted
-    );
+        RedeemDecision::Admitted { .. }
+    ));
 
     // One payment, one serve — the second redemption bounces.
     let again = h
@@ -1421,13 +1434,13 @@ async fn a_signed_binding_must_verify_against_the_paying_identity() {
     // The paying identity's signature over the right transcript admits —
     // and the failed attempts above consumed nothing.
     let good = h.caller.try_sign(&transcript).unwrap().to_bytes();
-    assert_eq!(
+    assert!(matches!(
         h.engine
             .redeem_for_invocation("fixture-tool", &quote.quote_id, Some(&good))
             .await
             .unwrap(),
-        RedeemDecision::Admitted
-    );
+        RedeemDecision::Admitted { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1530,6 +1543,7 @@ async fn requiring_the_binding_refuses_bearer_redemption() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1581,7 +1595,7 @@ async fn requiring_the_binding_refuses_bearer_redemption() {
         .redeem_for_invocation(tool, &quote.quote_id, Some(&good.to_bytes()))
         .await
         .expect("engine");
-    assert_eq!(admitted, RedeemDecision::Admitted);
+    assert!(matches!(admitted, RedeemDecision::Admitted { .. }));
 }
 
 /// The requirement is **on by default**: a freshly-constructed engine
@@ -1611,6 +1625,7 @@ async fn the_binding_requirement_is_on_by_default() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -1638,13 +1653,13 @@ async fn the_binding_requirement_is_on_by_default() {
     let sig = caller
         .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
         .expect("sign");
-    assert_eq!(
+    assert!(matches!(
         engine
             .redeem_for_invocation(tool, &quote.quote_id, Some(&sig.to_bytes()))
             .await
             .expect("engine"),
-        RedeemDecision::Admitted
-    );
+        RedeemDecision::Admitted { .. }
+    ));
 }
 
 /// The requirement can be turned off for a deployment whose callers
@@ -1661,12 +1676,14 @@ async fn the_binding_requirement_can_be_disabled() {
         .expect("engine");
 
     let tool = CAPABILITY.split_once('/').expect("capability").1;
-    assert_eq!(
-        h.engine
-            .redeem_for_invocation(tool, &quote.quote_id, None)
-            .await
-            .expect("engine"),
-        RedeemDecision::Admitted,
+    assert!(
+        matches!(
+            h.engine
+                .redeem_for_invocation(tool, &quote.quote_id, None)
+                .await
+                .expect("engine"),
+            RedeemDecision::Admitted { .. }
+        ),
         "the opt-out must still admit a bearer redemption"
     );
 }

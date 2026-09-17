@@ -162,6 +162,24 @@ pub enum ApprovalState {
     Approved,
 }
 
+/// What the store says about one quote's approval, **including its
+/// absence** — the third observable an operator decision produces.
+///
+/// [`ApprovalState`] cannot express "rejected": the operator verb
+/// removes the record, so a caller parked on an approval has to be able
+/// to tell "still waiting" from "the human said no". A purchase that
+/// reads `Gone` has proof no money moved on that quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// Approved and still held — the purchase it authorizes may proceed.
+    Approved,
+    /// Recorded and waiting for a human.
+    Pending,
+    /// No record: rejected by the operator, cleared, or already
+    /// consumed by the payment it authorized.
+    Gone,
+}
+
 /// One held quote awaiting (or granted) approval. The record carries the
 /// quote's canonical bytes so a retry after approval redeems **the same
 /// provider-signed quote** the human saw — approval of quote X never
@@ -728,6 +746,22 @@ impl SpendPolicyEngine {
             .filter(|(_, v)| v.state == ApprovalState::Pending)
             .map(|(k, _)| k.clone())
             .collect())
+    }
+
+    /// Where one specific quote's approval stands — including
+    /// [`ApprovalOutcome::Gone`], which is how a parked purchase learns
+    /// the operator rejected it rather than has not answered yet.
+    ///
+    /// Keyed by quote id, not capability: an approval is for one exact
+    /// purchase, so "is there an approval for this capability" is the
+    /// wrong question for a caller resuming a specific attempt.
+    pub async fn approval_state(&self, quote_id: &str) -> Result<ApprovalOutcome, SpendError> {
+        let state: SpendPolicyFile = load_json(&self.path).await?;
+        Ok(match state.approvals.get(quote_id).map(|r| r.state) {
+            Some(ApprovalState::Approved) => ApprovalOutcome::Approved,
+            Some(ApprovalState::Pending) => ApprovalOutcome::Pending,
+            None => ApprovalOutcome::Gone,
+        })
     }
 
     /// An approved-but-unredeemed held quote for `capability`, if any:

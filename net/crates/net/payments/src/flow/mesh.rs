@@ -181,6 +181,10 @@ pub fn serve_payments(
                         provider.provider_id(),
                         &verified.capability,
                         &template,
+                        // The hash rides inside the signed request, so a
+                        // relay cannot add, drop, or rewrite the input a
+                        // quote is bound to.
+                        verified.input_hash.as_deref(),
                     )
                     .await;
                 let quote_bytes = match issued {
@@ -292,7 +296,7 @@ impl MeshPaymentChannel {
         }
     }
 
-    fn provider_node(capability: &str) -> Result<u64, ChannelError> {
+    pub(crate) fn provider_node(capability: &str) -> Result<u64, ChannelError> {
         let provider = capability.split('/').next().unwrap_or_default();
         let parsed = if let Some(hex_part) = provider.strip_prefix("0x") {
             u64::from_str_radix(hex_part, 16).ok()
@@ -325,6 +329,7 @@ impl ProviderChannel for MeshPaymentChannel {
         provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
     ) -> Result<Vec<u8>, ChannelError> {
         // The flow's caller and this channel's signing identity must be
         // the same, or the request would name one identity and be signed
@@ -354,6 +359,9 @@ impl ProviderChannel for MeshPaymentChannel {
             QUOTE_REQUEST_TTL_NS,
             nonce,
         );
+        if let Some(input_hash) = input_hash {
+            request = request.with_input_hash(input_hash);
+        }
         request.sign_with(&self.caller).map_err(|e| ChannelError {
             message: format!("signing the quote request: {e}"),
             retryable: false,
@@ -443,5 +451,38 @@ impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
         // Single-sourced with the MCP gate (`mcp_gate::EnginePaymentAdmission`)
         // so the fail-closed mapping cannot drift — see `flow::redeem_via_engine`.
         crate::flow::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
+    }
+}
+
+/// The provider-side gate for **paid A2A tasks**
+/// ([`net_sdk::a2a_payment::TaskAdmissionGate`], consumed by the
+/// configured A2A serving path): the submission's quote is redeemed
+/// against the [`crate::PaymentEngine`] — settled, billed, unfrozen,
+/// bound to this task id, and bound to the **purchase hash of the
+/// reservation the submission arrived against**, at-most-once per
+/// purchase under the store lock.
+///
+/// The task twin of [`EngineToolPaymentGate`], one step further from the
+/// money: a paid task is admitted before it runs, and one payment admits
+/// exactly one reservation of exactly one brief.
+pub struct EngineTaskAdmissionGate {
+    engine: Arc<crate::engine::PaymentEngine>,
+}
+
+impl EngineTaskAdmissionGate {
+    pub fn new(engine: Arc<crate::engine::PaymentEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait::async_trait]
+impl net_sdk::a2a_payment::TaskAdmissionGate for EngineTaskAdmissionGate {
+    async fn redeem(
+        &self,
+        claim: net_sdk::a2a_payment::TaskPaymentClaim<'_>,
+    ) -> Result<net_sdk::a2a_payment::TaskPaymentEvidence, net_sdk::tool_payment::GateDenial> {
+        // Single denial-render site, shared with the tool gate's mapping
+        // — see `flow::redeem_task_via_engine`.
+        crate::flow::redeem_task_via_engine(&self.engine, claim).await
     }
 }

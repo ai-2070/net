@@ -219,6 +219,17 @@ pub enum RedeemDenialReason {
     /// which is a client-configuration gap, not an attack signal.
     #[error("this provider requires the invocation binding — no possession proof was presented")]
     BindingRequired,
+    /// The quote does not commit to the input the provider is being asked
+    /// to admit. Task-path only ([`PaymentEngine::redeem_for_task`]):
+    /// admission there names one reservation of one owner's one unit of
+    /// work, so a proof minted under a different reservation — or under
+    /// none — computes a different expected hash here and is refused
+    /// before the redeemed/idempotency arm is ever reached.
+    #[error(
+        "quote does not bind the input being admitted — this payment authorizes a different \
+         unit of work"
+    )]
+    InputBindingMismatch,
 }
 
 impl RedeemDenialReason {
@@ -236,6 +247,7 @@ impl RedeemDenialReason {
             Self::WrongToolBinding { .. } => "wrong_tool_binding",
             Self::AlreadyRedeemed => "already_redeemed",
             Self::BindingRequired => "binding_required",
+            Self::InputBindingMismatch => "input_binding_mismatch",
         }
     }
 
@@ -263,7 +275,14 @@ impl RedeemDenialReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeemDecision {
     /// The quote's one invocation is admitted (and now consumed).
-    Admitted,
+    ///
+    /// `payer` is the identity that paid for this quote, decoded from the
+    /// record's `caller_hex` — i.e. `PaymentQuote::caller`, the identity
+    /// the provider admitted at issuance, signed into the quote, and
+    /// billed. It is the same key the invocation binding was verified
+    /// against, so on the binding-present path it is a proven payer and
+    /// not merely a recorded one.
+    Admitted { payer: EntityId },
     /// Fail-closed rejection; the typed reason renders the human
     /// message (its `Display`) that travels to the caller.
     Denied { reason: RedeemDenialReason },
@@ -333,12 +352,29 @@ struct QuoteRecord {
     in_flight_since_ns: Option<u64>,
     frozen: Option<String>,
     served: bool,
+    /// The quote's input commitment (`PaymentQuote::input_hash`), carried
+    /// onto the record so the task-admission gate can compare a presented
+    /// purchase hash against what the payer actually bought. `None` for
+    /// every capability-level quote (the P0 static-pricing shape) and for
+    /// every record written before the field existed.
+    #[serde(default)]
+    input_hash: Option<String>,
     /// Whether the paid invocation was executed against this quote —
     /// set (at most once) by [`PaymentEngine::redeem_for_invocation`],
     /// the provider-side gate's check. Additive: pre-existing records
     /// default to unredeemed.
     #[serde(default)]
     redeemed: bool,
+    /// *Which* admission consumed this quote, for the task path only:
+    /// the `expected_input_hash` [`PaymentEngine::redeem_for_task`]
+    /// admitted. It is what makes that path idempotent per purchase
+    /// rather than strictly at-most-once — a provider that crashed
+    /// between the engine write and its own journal write reconciles on
+    /// retry instead of being told `already_redeemed`. `None` on a record
+    /// redeemed through [`PaymentEngine::redeem_for_invocation`] (which
+    /// stays strictly at-most-once) and on every legacy record.
+    #[serde(default)]
+    redeemed_for: Option<String>,
     #[serde(default)]
     chain: Vec<VerificationEvent>,
     #[serde(default)]
@@ -789,11 +825,21 @@ impl PaymentEngine {
     /// Issue a signed quote. Provider policy runs **here**, before any
     /// value can be accepted; the registry check is the pre-sign
     /// hard-reject.
+    ///
+    /// `input_hash` binds the quote to one exact unit of work: it feeds
+    /// `terms_hash` and therefore the quote id, so two purchases of two
+    /// different inputs can never share a quote, and
+    /// [`Self::redeem_for_task`] can refuse a proof presented for work
+    /// other than the work that was bought. `None` is the capability-level
+    /// (static pricing) shape and produces exactly the quote earlier
+    /// builds issued.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_quote(
         &self,
         caller: EntityId,
         capability: &str,
         requirements: X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
         now_ns: u64,
         ttl_ns: u64,
     ) -> Result<PaymentQuote, EngineError> {
@@ -805,7 +851,7 @@ impl PaymentEngine {
             self.provider.entity_id().clone(),
             caller,
             capability,
-            None,
+            input_hash.map(str::to_string),
             requirements,
             self.registry_ref.clone(),
             now_ns,
@@ -1023,7 +1069,9 @@ impl PaymentEngine {
                         in_flight_since_ns: Some(now_ns),
                         frozen: None,
                         served: false,
+                        input_hash: quote.input_hash.clone(),
                         redeemed: false,
+                        redeemed_for: None,
                         chain: Vec::new(),
                         billing: None,
                         billing_published: false,
@@ -2053,79 +2101,16 @@ impl PaymentEngine {
                     false,
                 );
             };
-            if let Some(sig) = &binding {
-                let Ok(sig_bytes) = <&[u8; 64]>::try_from(sig.as_slice()) else {
-                    return (
-                        RedeemDecision::Denied {
-                            reason: RedeemDenialReason::BindingMalformed,
-                        },
-                        false,
-                    );
+            let payer =
+                match Self::redeem_preconditions(rec, &quote_id, &tool_id, binding.as_deref()) {
+                    Ok(payer) => payer,
+                    Err(reason) => return (RedeemDecision::Denied { reason }, false),
                 };
-                let payer = hex::decode(&rec.caller_hex)
-                    .ok()
-                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                    .map(EntityId::from_bytes);
-                let Some(payer) = payer else {
-                    return (
-                        RedeemDecision::Denied {
-                            reason: RedeemDenialReason::PayerRecordCorrupt,
-                        },
-                        false,
-                    );
-                };
-                let transcript = invocation_binding_transcript(&quote_id, &tool_id);
-                if payer.verify_bytes(&transcript, sig_bytes).is_err() {
-                    return (
-                        RedeemDecision::Denied {
-                            reason: RedeemDenialReason::BindingRejected,
-                        },
-                        false,
-                    );
-                }
-            }
-            if let Some(reason) = &rec.frozen {
-                return (
-                    RedeemDecision::Denied {
-                        reason: RedeemDenialReason::QuoteFrozen {
-                            freeze_reason: reason.clone(),
-                        },
-                    },
-                    false,
-                );
-            }
-            if rec.billing.is_none() {
-                // "Never paid" and "paid, awaiting confidence" route
-                // differently: an empty event chain means no settlement
-                // was ever recorded; a non-empty one means the payment
-                // exists but hasn't completed to billing (pending tier /
-                // re-verify, or held as an exception).
-                let reason = if rec.chain.is_empty() {
-                    RedeemDenialReason::NotSettled
-                } else {
-                    RedeemDenialReason::SettlementPending
-                };
-                return (RedeemDecision::Denied { reason }, false);
-            }
-            // The capability binds `provider/tool`; the tool segment is
-            // everything after the first `/` (tool ids may themselves
-            // contain `/`).
-            let bound_tool = rec
-                .capability
-                .split_once('/')
-                .map(|(_, tool)| tool)
-                .unwrap_or(rec.capability.as_str());
-            if bound_tool != tool_id {
-                return (
-                    RedeemDecision::Denied {
-                        reason: RedeemDenialReason::WrongToolBinding {
-                            capability: rec.capability.clone(),
-                            tool_id: tool_id.clone(),
-                        },
-                    },
-                    false,
-                );
-            }
+            // Strictly at-most-once. Unlike [`Self::redeem_for_task`] there
+            // is no purchase identity here to be idempotent *on*: a second
+            // redemption of the same quote for the same tool is a second
+            // serve, and the caller's at-most-once retry contract is the
+            // whole reason this gate exists.
             if rec.redeemed {
                 return (
                     RedeemDecision::Denied {
@@ -2135,10 +2120,181 @@ impl PaymentEngine {
                 );
             }
             rec.redeemed = true;
-            (RedeemDecision::Admitted, true)
+            (RedeemDecision::Admitted { payer }, true)
         })
         .await?;
         Ok(decision)
+    }
+
+    /// The task-admission gate: redeem a paid quote for one **purchase**
+    /// of one unit of work, named by `expected_input_hash`.
+    ///
+    /// Shares every precondition with
+    /// [`Self::redeem_for_invocation`] — see
+    /// `Self::redeem_preconditions`, the one place they are written —
+    /// and differs in exactly three ways, each of which is a consequence
+    /// of admitting a *purchase* rather than an *invocation*:
+    ///
+    /// 1. **The binding is mandatory.** `binding` is `&[u8]`, not
+    ///    `Option`, and `with_require_invocation_binding(false)` does not
+    ///    reach this path. A bearer task admission would let anyone who
+    ///    saw a quote id claim someone else's purchased work; the tool
+    ///    path keeps bearer mode for pre-binding callers, this one never
+    ///    had any.
+    /// 2. **The quote must commit to this purchase.** After the tool
+    ///    binding check, `rec.input_hash` must equal
+    ///    `expected_input_hash` or the answer is
+    ///    [`RedeemDenialReason::InputBindingMismatch`] — *before* the
+    ///    redeemed arm, and with no durable write. Because the expected
+    ///    hash names one provider-minted reservation of one owner's one
+    ///    task, a proof replayed under another owner or another
+    ///    reservation computes a different hash and dies here rather than
+    ///    consuming the quote.
+    /// 3. **Admission is idempotent per purchase hash.** A record already
+    ///    redeemed *for this same hash* re-admits with no write; a record
+    ///    redeemed for anything else (including through
+    ///    [`Self::redeem_for_invocation`], which records no hash) is
+    ///    [`RedeemDenialReason::AlreadyRedeemed`].
+    ///
+    /// That third point is safe because at-most-once **execution** is not
+    /// owned here. The hash is idempotent on one reservation of one
+    /// owner's one task, and the provider's own launch claim and ledger
+    /// decide whether that task runs. Idempotent redemption exists only
+    /// so a provider that crashed between this write and its journal
+    /// write reconciles on retry instead of failing `already_redeemed` or
+    /// charging a second time.
+    pub async fn redeem_for_task(
+        &self,
+        tool_id: &str,
+        quote_id: &str,
+        binding: &[u8],
+        expected_input_hash: &str,
+    ) -> Result<RedeemDecision, EngineError> {
+        let binding = binding.to_vec();
+        let tool_id = tool_id.to_string();
+        let quote_id = quote_id.to_string();
+        let expected = expected_input_hash.to_string();
+        // Same write discipline as the invocation gate: the only dirty arm
+        // is the one that first consumes the quote. The mismatch arm and
+        // the idempotent re-admission arm are both read-only, so a caller
+        // presenting wrong hashes cannot force an fsync per attempt.
+        let decision = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+            let Some(rec) = s.quotes.get_mut(&quote_id) else {
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::UnknownQuote,
+                    },
+                    false,
+                );
+            };
+            let payer = match Self::redeem_preconditions(rec, &quote_id, &tool_id, Some(&binding)) {
+                Ok(payer) => payer,
+                Err(reason) => return (RedeemDecision::Denied { reason }, false),
+            };
+            // Before the redeemed arm, deliberately: a proof for another
+            // purchase must never be able to consume this one, and must
+            // never learn from the answer whether this quote had been
+            // redeemed.
+            if rec.input_hash.as_deref() != Some(expected.as_str()) {
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::InputBindingMismatch,
+                    },
+                    false,
+                );
+            }
+            if rec.redeemed {
+                if rec.redeemed_for.as_deref() == Some(expected.as_str()) {
+                    // The same purchase, admitted again: the provider is
+                    // reconciling a crash, not buying a second time. No
+                    // write — the record already says exactly this.
+                    return (RedeemDecision::Admitted { payer }, false);
+                }
+                return (
+                    RedeemDecision::Denied {
+                        reason: RedeemDenialReason::AlreadyRedeemed,
+                    },
+                    false,
+                );
+            }
+            rec.redeemed = true;
+            rec.redeemed_for = Some(expected.clone());
+            (RedeemDecision::Admitted { payer }, true)
+        })
+        .await?;
+        Ok(decision)
+    }
+
+    /// Everything both redemption gates check, in the one order both use:
+    /// binding shape → payer identity → binding signature → frozen →
+    /// settled and billed → tool binding. Returns the payer on success so
+    /// the caller can hand it to [`RedeemDecision::Admitted`].
+    ///
+    /// Pure and read-only: it takes `&QuoteRecord` precisely so no arm of
+    /// it can leave a dirty store behind. What each gate does with the
+    /// `redeemed` state afterwards is the only place they differ.
+    fn redeem_preconditions(
+        rec: &QuoteRecord,
+        quote_id: &str,
+        tool_id: &str,
+        binding: Option<&[u8]>,
+    ) -> Result<EntityId, RedeemDenialReason> {
+        // Shape before identity: a binding that is not a signature at all
+        // is a client bug, and saying so does not depend on the record.
+        let sig_bytes = match binding {
+            Some(sig) => {
+                Some(<&[u8; 64]>::try_from(sig).map_err(|_| RedeemDenialReason::BindingMalformed)?)
+            }
+            None => None,
+        };
+        // Decoded unconditionally, because an admission has to name its
+        // payer whether or not a binding was presented. On the bearer path
+        // this is the only new way to be denied, and it fires solely on a
+        // record whose `caller_hex` is not 32 hex-encoded bytes — which
+        // the engine never writes.
+        let payer = hex::decode(&rec.caller_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(EntityId::from_bytes)
+            .ok_or(RedeemDenialReason::PayerRecordCorrupt)?;
+        if let Some(sig_bytes) = sig_bytes {
+            let transcript = invocation_binding_transcript(quote_id, tool_id);
+            if payer.verify_bytes(&transcript, sig_bytes).is_err() {
+                return Err(RedeemDenialReason::BindingRejected);
+            }
+        }
+        if let Some(reason) = &rec.frozen {
+            return Err(RedeemDenialReason::QuoteFrozen {
+                freeze_reason: reason.clone(),
+            });
+        }
+        if rec.billing.is_none() {
+            // "Never paid" and "paid, awaiting confidence" route
+            // differently: an empty event chain means no settlement
+            // was ever recorded; a non-empty one means the payment
+            // exists but hasn't completed to billing (pending tier /
+            // re-verify, or held as an exception).
+            return Err(if rec.chain.is_empty() {
+                RedeemDenialReason::NotSettled
+            } else {
+                RedeemDenialReason::SettlementPending
+            });
+        }
+        // The capability binds `provider/tool`; the tool segment is
+        // everything after the first `/` (tool ids may themselves
+        // contain `/`).
+        let bound_tool = rec
+            .capability
+            .split_once('/')
+            .map(|(_, tool)| tool)
+            .unwrap_or(rec.capability.as_str());
+        if bound_tool != tool_id {
+            return Err(RedeemDenialReason::WrongToolBinding {
+                capability: rec.capability.clone(),
+                tool_id: tool_id.to_string(),
+            });
+        }
+        Ok(payer)
     }
 
     /// Run the retention sweep on demand, returning how many terminal
@@ -2387,5 +2543,137 @@ impl PaymentEngine {
         )?;
         AtomicAmount::parse(&requirements.view().amount)
             .map_err(|e| EngineError::State(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod store_compat_tests {
+    use super::*;
+
+    /// A `payment-engine.json` exactly as a build **before**
+    /// `input_hash` / `redeemed_for` existed wrote it: one settled,
+    /// billed, redeemed quote with its payload-replay and
+    /// settlement-replay entries. Captured from that build's own output,
+    /// not hand-approximated — the point of the fixture is that it is the
+    /// bytes an operator already has on disk.
+    const PRE_CHANGE_STORE: &str = r#"{
+  "consumed": {
+    "cfec1dd25fde9d1d90faada90f75dc4ca893feb0fa6fcee64249128d13367270": "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c"
+  },
+  "consumed_transactions": {
+    "mock:net|mock:4bc88bcf1d22a08a0bec88fa939408c7": "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c"
+  },
+  "quotes": {
+    "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c": {
+      "billing": {
+        "amount": "2500",
+        "asset": "musd",
+        "billing_event_id": "c5487284229b4215e25139cf953278a55a2cddedec6a4e8ab0b457f550e89300",
+        "capability": "fixture-provider/fixture-tool",
+        "idempotency_key": "459eaef6ff5115ce69983d756960090f23a81fb36ebaac9a478653f2eb121837",
+        "network": "mock:net",
+        "object": "net.billing.event@1",
+        "occurred_at_ns": 1000000000000001,
+        "payee": "0e75bc30c35e647831ba21555a646bee038177270885f12850947804429bbaf9",
+        "payer": "aa38250e253a301d9ed1905ed33a743267568697d8567b37904f708b83c17b0e",
+        "quote_id": "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c",
+        "signature": "b8d91a0ad6247492f4131f203c37df4233ac9859b173f16eb4b692e36279a3cbfac20a101ff26e52a3524b22d9345de733a44b0bb581d54dde757965e9aabc0e",
+        "transaction": "mock:4bc88bcf1d22a08a0bec88fa939408c7",
+        "verification_ref": "d9d24f8203e80a4cb1c24100176e37011ded9d8e71e9c80bcbe5988e33714415"
+      },
+      "billing_published": false,
+      "caller_hex": "aa38250e253a301d9ed1905ed33a743267568697d8567b37904f708b83c17b0e",
+      "capability": "fixture-provider/fixture-tool",
+      "chain": [
+        {
+          "checked_at_ns": 1000000000000001,
+          "object": "net.payment.verification@1",
+          "quote_id": "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c",
+          "signature": "4aa65b0a1153f819cfba1b2c119ed7be1fd2183ff269ba0c644f5a5135cf664c0d97404c061d667a5a4b015db1e83d9ff4d65b06f63cccad01708bd01beadf0c",
+          "signer": "0e75bc30c35e647831ba21555a646bee038177270885f12850947804429bbaf9",
+          "status": "verified",
+          "tier": "observed",
+          "transaction": "mock:4bc88bcf1d22a08a0bec88fa939408c7",
+          "verifier": {
+            "endpoint": "mock"
+          }
+        }
+      ],
+      "expires_at_ns": 1000060000000000,
+      "frozen": null,
+      "idempotency_key": "459eaef6ff5115ce69983d756960090f23a81fb36ebaac9a478653f2eb121837",
+      "in_flight": false,
+      "in_flight_since_ns": 1000000000000001,
+      "payload_b64": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoibW9jayIsIm5ldHdvcmsiOiJtb2NrOm5ldCIsImFtb3VudCI6IjI1MDAiLCJhc3NldCI6Im11c2QiLCJwYXlUbyI6Im1vY2stcHJvdmlkZXItc2V0dGxlLWFkZHIiLCJtYXhUaW1lb3V0U2Vjb25kcyI6NjB9LCJwYXlsb2FkIjp7Im1vY2tfYXV0aG9yaXphdGlvbiI6InBheWVyLTEifX0=",
+      "payload_hash": "cfec1dd25fde9d1d90faada90f75dc4ca893feb0fa6fcee64249128d13367270",
+      "redeemed": true,
+      "requirements_b64": "eyJzY2hlbWUiOiJtb2NrIiwibmV0d29yayI6Im1vY2s6bmV0IiwiYW1vdW50IjoiMjUwMCIsImFzc2V0IjoibXVzZCIsInBheVRvIjoibW9jay1wcm92aWRlci1zZXR0bGUtYWRkciIsIm1heFRpbWVvdXRTZWNvbmRzIjo2MH0=",
+      "served": true
+    }
+  }
+}"#;
+
+    const FIXTURE_QUOTE_ID: &str =
+        "487dbe1038dfbc5aafda31d8e5ae4b822e12a59804eb78f33175787ed5e36c8c";
+
+    /// Every scalar/array reachable in `expected` must be present and
+    /// equal at the same path in `actual`. Additive keys in `actual` are
+    /// fine; a dropped or altered one is not.
+    fn assert_preserved(expected: &serde_json::Value, actual: &serde_json::Value, path: &str) {
+        match expected {
+            serde_json::Value::Object(fields) => {
+                let actual = actual
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{path}: expected an object, got {actual}"));
+                for (key, value) in fields {
+                    let found = actual
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{path}/{key}: dropped by the round trip"));
+                    assert_preserved(value, found, &format!("{path}/{key}"));
+                }
+            }
+            other => assert_eq!(other, actual, "{path}: value changed across the round trip"),
+        }
+    }
+
+    /// A store written before `QuoteRecord` grew `input_hash` and
+    /// `redeemed_for` must still load, must still mean what it meant, and
+    /// must not lose anything on the next write.
+    ///
+    /// The failure this guards is not hypothetical: a new field without
+    /// `#[serde(default)]` makes the whole file `StoreError::Corrupt`, and
+    /// every quote an operator already sold becomes unredeemable at once.
+    #[test]
+    fn a_pre_change_engine_store_loads_and_round_trips_without_losing_fields() {
+        let state: EngineState =
+            serde_json::from_str(PRE_CHANGE_STORE).expect("a pre-change store still deserializes");
+
+        let rec = state
+            .quotes
+            .get(FIXTURE_QUOTE_ID)
+            .expect("the quote record survived the load");
+        // The record still says what it said: paid, billed, and consumed.
+        assert!(rec.redeemed, "the legacy record is still redeemed");
+        assert!(rec.billing.is_some(), "the legacy billing event survived");
+        assert_eq!(rec.chain.len(), 1, "the legacy verification chain survived");
+        assert_eq!(rec.capability, "fixture-provider/fixture-tool");
+        assert_eq!(rec.expires_at_ns, Some(1_000_060_000_000_000));
+        // ...and the new fields read as "this record predates purchases",
+        // which is what makes a legacy quote unusable for task admission
+        // (`redeem_for_task` demands a matching `input_hash`) while
+        // remaining redeemable exactly as before for invocations.
+        assert_eq!(rec.input_hash, None);
+        assert_eq!(rec.redeemed_for, None);
+        assert_eq!(state.consumed.len(), 1, "the payload replay index survived");
+        assert_eq!(
+            state.consumed_transactions.len(),
+            1,
+            "the settlement replay index survived"
+        );
+
+        let before: serde_json::Value =
+            serde_json::from_str(PRE_CHANGE_STORE).expect("fixture is json");
+        let after = serde_json::to_value(&state).expect("re-serialize");
+        assert_preserved(&before, &after, "");
     }
 }

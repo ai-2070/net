@@ -295,6 +295,7 @@ pub fn issue(fx: &EngineFixture, amount: &str, issued_ns: u64) -> PaymentQuote {
             fx.caller.entity_id().clone(),
             CAPABILITY,
             mock_requirements(amount),
+            None,
             issued_ns,
             TTL_NS,
         )

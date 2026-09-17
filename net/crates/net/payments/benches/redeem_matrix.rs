@@ -84,7 +84,7 @@ async fn run_cell(
                 .expect("redeem_for_invocation");
             let elapsed = t.elapsed().as_nanos() as u64;
             drop(permit);
-            (elapsed, matches!(decision, RedeemDecision::Admitted))
+            (elapsed, matches!(decision, RedeemDecision::Admitted { .. }))
         }));
     }
     let mut hist = new_hist();
@@ -126,7 +126,7 @@ fn main() {
         let victim = quotes[0].quote_id.clone();
         let consumed = rt.block_on(engine.redeem_for_invocation(TOOL_ID, &victim, None));
         assert!(
-            matches!(consumed, Ok(RedeemDecision::Admitted)),
+            matches!(consumed, Ok(RedeemDecision::Admitted { .. })),
             "victim quote must admit once before the already-redeemed row"
         );
 

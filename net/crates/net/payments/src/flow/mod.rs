@@ -31,11 +31,13 @@ use crate::core::registry::AssetRegistry;
 use crate::core::terms::PricingTerms;
 use crate::core::verification::VerificationTier;
 use crate::engine::{PaymentDecision, PaymentEngine};
-use crate::policy::spend::{SpendDecision, SpendPolicyEngine};
+use crate::policy::spend::{ApprovalOutcome, SpendDecision, SpendError, SpendPolicyEngine};
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::{X402Carry, X402_VERSION};
 
+#[cfg(feature = "mesh")]
+pub mod a2a;
 #[cfg(feature = "http-facilitator")]
 pub mod http402;
 #[cfg(feature = "mcp-gate")]
@@ -119,7 +121,14 @@ fn denial_for(
         // redeeming against the WRONG tool that a real, paid quote
         // exists for some other capability. The conservative `unknown`
         // withholds that — grouping it with the binding-failure rows.
-        R::BindingRejected | R::WrongToolBinding { .. } => (
+        //
+        // `InputBindingMismatch` joins them for the same reason and with
+        // the same posture: the presented proof authorizes a different
+        // unit of work, and whether *that* other purchase was paid is
+        // none of this caller's business — `unknown` withholds it. There
+        // is nothing to advise: a fresh quote for the same wrong input
+        // would mismatch identically, so `safe_to_requote` is false too.
+        R::BindingRejected | R::WrongToolBinding { .. } | R::InputBindingMismatch => (
             v::CLASS_SECURITY_VIOLATION,
             v::ACTOR_CALLER_OPERATOR,
             false,
@@ -286,7 +295,7 @@ pub(crate) async fn redeem_via_engine(
         .redeem_for_invocation(tool_id, quote_id, binding)
         .await
     {
-        Ok(RedeemDecision::Admitted) => Ok(()),
+        Ok(RedeemDecision::Admitted { .. }) => Ok(()),
         Ok(RedeemDecision::Denied { reason }) => {
             let denial = denial_for(&reason, tool_id, quote_id);
             // Typed fields at the emission point: operators grep
@@ -309,6 +318,72 @@ pub(crate) async fn redeem_via_engine(
             // sees the error).
             tracing::error!(error = %e, "payment engine unavailable (fail-closed)");
             Err(engine_unavailable_denial(tool_id, quote_id))
+        }
+    }
+}
+
+/// Redeem a paid quote against the engine for one **task admission** and
+/// map the outcome to the A2A gate's vocabulary:
+/// `Ok(TaskPaymentEvidence)` admits the reservation the submission
+/// arrived against, `Err(denial)` refuses it.
+///
+/// The task twin of [`redeem_via_engine`], and the **single** denial
+/// render site for the A2A seam — it shares `denial_for`, so the task
+/// path cannot grow a second spelling of `input_binding_mismatch` (or of
+/// any other reason) that drifts from the tool path's.
+///
+/// Three differences from the tool path, all of them the engine's:
+/// `binding` is mandatory (a paid task is a long-running side effect, so
+/// bearer presentation is never enough), the quote must have been issued
+/// for `expected_input_hash` (the provider's own purchase hash, never a
+/// value read off the request), and redemption is idempotent *for that
+/// same purchase hash* so a provider that crashed between the engine
+/// write and its journal write reconciles instead of charging twice.
+///
+/// `payer` travels out on the evidence: a serving path with a verified
+/// end-to-end principal matches it against the admitted caller, so one
+/// entity's payment cannot admit another's task.
+//
+// `result_large_err`: as `redeem_via_engine` — `GateDenial` is the
+// refusal type of the SDK's public `TaskAdmissionGate`, and the only
+// caller is a thin impl of that trait, so boxing here would be unboxed
+// one frame up. Cold refusal path.
+#[cfg(feature = "mesh")]
+#[allow(clippy::result_large_err)]
+pub(crate) async fn redeem_task_via_engine(
+    engine: &PaymentEngine,
+    claim: net_sdk::a2a_payment::TaskPaymentClaim<'_>,
+) -> Result<net_sdk::a2a_payment::TaskPaymentEvidence, net_sdk::tool_payment::GateDenial> {
+    use crate::engine::RedeemDecision;
+    match engine
+        .redeem_for_task(
+            claim.tool_id,
+            claim.quote_id,
+            claim.binding,
+            claim.expected_input_hash,
+        )
+        .await
+    {
+        Ok(RedeemDecision::Admitted { payer }) => Ok(net_sdk::a2a_payment::TaskPaymentEvidence {
+            quote_id: claim.quote_id.to_string(),
+            payer: *payer.as_bytes(),
+        }),
+        Ok(RedeemDecision::Denied { reason }) => {
+            let denial = denial_for(&reason, claim.tool_id, claim.quote_id);
+            tracing::info!(
+                reason = %denial.schematic.reason,
+                stage = %denial.schematic.stage,
+                recovery_class = %denial.schematic.recovery.class,
+                tool_id = claim.tool_id,
+                "task admission redemption denied"
+            );
+            Err(denial)
+        }
+        Err(e) => {
+            // Fail-closed, and the raw `EngineError` never reaches the
+            // caller — same scrub as the invocation gate.
+            tracing::error!(error = %e, "payment engine unavailable (fail-closed)");
+            Err(engine_unavailable_denial(claim.tool_id, claim.quote_id))
         }
     }
 }
@@ -467,12 +542,21 @@ pub trait ProviderChannel: Send + Sync {
     /// the announced pricing terms. It is not decoration: the mesh
     /// channel binds it into the signed quote request, which is what
     /// stops a captured request being replayed to a different provider.
+    ///
+    /// `input_hash` binds the quote to one exact unit of work (blake3
+    /// hex). It travels inside the caller-signed quote request, lands on
+    /// the issued quote, and therefore in `terms_hash` → `quote_id` — so
+    /// the caller's later invocation binding transitively proves *which*
+    /// purchase was authorized. `None` is the capability-level shape and
+    /// produces exactly the quote this trait issued before the parameter
+    /// existed.
     async fn quote(
         &self,
         caller: &EntityId,
         provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
     ) -> Result<Vec<u8>, ChannelError>;
 
     async fn pay(
@@ -535,6 +619,7 @@ impl ProviderChannel for InProcessProvider {
         provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
     ) -> Result<Vec<u8>, ChannelError> {
         // In-process there is no wire, so no signed request and nothing to
         // forge — the caller identity is passed by the same process that
@@ -556,6 +641,7 @@ impl ProviderChannel for InProcessProvider {
                 caller.clone(),
                 capability,
                 template.clone(),
+                input_hash,
                 self.clock.now_ns(),
                 self.ttl_ns,
             )
@@ -615,9 +701,38 @@ pub enum CallerDecision {
         policy_reason: String,
     },
     Failed {
+        /// The quote this attempt was about, when one existed.
+        ///
+        /// `None` only before a quote could be obtained at all (bad
+        /// terms, a channel error on the quote call). Once there is a
+        /// quote id, a failure is *ambiguous about that specific
+        /// purchase* — the payment may have landed — and a caller that
+        /// wants to resume rather than re-quote needs the id to do it.
+        quote_id: Option<String>,
         message: String,
         retryable: bool,
     },
+}
+
+/// A provider-signed quote the caller has verified against the announced
+/// terms, plus everything needed to resume the purchase later.
+///
+/// The bytes are kept beside the decoded quote deliberately: they are the
+/// exact canonical envelope the provider signed, they are what
+/// [`CallerPaymentFlow::pay_exact`] must present back, and re-encoding a
+/// decoded quote is the one thing byte-preservation discipline forbids.
+/// A caller that persists a purchase across a restart persists
+/// [`Self::quote_bytes`] (and the authored payload bytes), never a
+/// re-serialization.
+#[derive(Debug, Clone)]
+pub struct BoundQuote {
+    /// The decoded, verified quote.
+    pub quote: PaymentQuote,
+    /// Its canonical envelope bytes, exactly as the provider signed them.
+    pub quote_bytes: Vec<u8>,
+    /// The approval hold this quote was resumed from, if any. A
+    /// successful payment consumes it; nothing else should.
+    pub approval_id: Option<String>,
 }
 
 /// The caller-side payment flow: one per caller identity + policy store.
@@ -666,145 +781,21 @@ impl CallerPaymentFlow {
 
     /// Run the paid lifecycle for `capability` (display form,
     /// `provider/capability`) against its announced `pricing_terms`.
+    ///
+    /// A composition of the four staged verbs —
+    /// [`quote_bound`](Self::quote_bound) → [`reserve_spend`](Self::reserve_spend)
+    /// → [`author`](Self::author) → [`pay_exact`](Self::pay_exact) — and
+    /// nothing else. Callers that must survive a crash between authoring
+    /// and paying drive the stages themselves and persist the bytes in
+    /// between; callers that do not, use this.
     pub async fn run(&self, capability: &str, pricing_terms: &str) -> CallerDecision {
-        // -- [1] parse the announced terms; pick the first accepts[]
-        //    entry this caller can *settle*: the mock network always, a
-        //    real network only when its namespace has a configured
-        //    settlement signer. (Whether policy *permits* the spend is
-        //    [3]'s job — settleability is about capability, not
-        //    authorization.)
-        let terms = match PricingTerms::from_json_bytes(pricing_terms.as_bytes()) {
-            Ok(t) => t,
-            Err(e) => {
-                return CallerDecision::Denied {
-                    policy_reason: format!("announced pricing terms are invalid: {e}"),
-                }
-            }
+        let bound = match self.quote_bound(capability, pricing_terms, None).await {
+            Ok(bound) => bound,
+            Err(decision) => return decision,
         };
-        let Some(template) = terms.accepts.iter().find(|t| self.can_settle(t.view())) else {
-            let offered: Vec<String> = terms
-                .accepts
-                .iter()
-                .map(|t| format!("({}, {})", t.view().scheme, t.view().network))
-                .collect();
-            return CallerDecision::Denied {
-                policy_reason: format!(
-                    "no settleable accepts[] entry: terms offer {offered:?}; this caller \
-                     settles mock:* always and exact/eip155 when a signer is configured"
-                ),
-            };
-        };
+        let quote_id = bound.quote.quote_id.clone();
 
-        // -- [2] the quote: an approved held quote first (the human's
-        //    approval applies to the exact quote they saw — this is the
-        //    retry-after-approval path), else a fresh provider-signed one.
-        let mut redeeming_approval: Option<String> = None;
-        let quote_bytes = match self.spend.approved_quote(capability).await {
-            Ok(Some((held_id, held_bytes))) => {
-                match PaymentQuote::from_json_bytes(&held_bytes) {
-                    Ok(held) if !held.is_expired_at(self.clock.now_ns()) => {
-                        redeeming_approval = Some(held_id);
-                        held_bytes
-                    }
-                    // Expired or unparseable hold: drop it and fall
-                    // through to a fresh quote (which will hold again if
-                    // policy still objects — a new approval for a new
-                    // quote, never a silent carry-over).
-                    _ => {
-                        let _ = self.spend.clear_approval(&held_id).await;
-                        match self
-                            .provider
-                            .quote(
-                                self.caller.entity_id(),
-                                &terms.provider,
-                                capability,
-                                template,
-                            )
-                            .await
-                        {
-                            Ok(b) => b,
-                            Err(e) => {
-                                return CallerDecision::Failed {
-                                    message: e.message,
-                                    retryable: e.retryable,
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => {
-                match self
-                    .provider
-                    .quote(
-                        self.caller.entity_id(),
-                        &terms.provider,
-                        capability,
-                        template,
-                    )
-                    .await
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return CallerDecision::Failed {
-                            message: e.message,
-                            retryable: e.retryable,
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                return CallerDecision::Failed {
-                    message: e.to_string(),
-                    retryable: false,
-                }
-            }
-        };
-        let quote = match PaymentQuote::from_json_bytes(&quote_bytes) {
-            Ok(q) => q,
-            Err(e) => {
-                return CallerDecision::Denied {
-                    policy_reason: format!("provider quote failed verification: {e}"),
-                }
-            }
-        };
-        if quote.caller != *self.caller.entity_id() {
-            return CallerDecision::Denied {
-                policy_reason: "quote was issued to a different caller".to_string(),
-            };
-        }
-        if quote.capability != capability {
-            return CallerDecision::Denied {
-                policy_reason: "quote binds a different capability".to_string(),
-            };
-        }
-        if quote.provider != terms.provider {
-            return CallerDecision::Denied {
-                policy_reason: "quote provider does not match the announced terms provider"
-                    .to_string(),
-            };
-        }
-        if quote.requirements.bytes() != template.bytes() {
-            return CallerDecision::Denied {
-                policy_reason: "quote deviates from the announced terms — never pay more \
-                                than discovery showed"
-                    .to_string(),
-            };
-        }
-        let now_ns = self.clock.now_ns();
-        if quote.is_expired_at(now_ns) {
-            return CallerDecision::Failed {
-                message: "provider quote arrived already expired".to_string(),
-                retryable: true,
-            };
-        }
-
-        // -- [3] caller spend policy: check + reserve, one locked RMW.
-        match self
-            .spend
-            .check_and_reserve(&quote, &self.registry, now_ns)
-            .await
-        {
+        match self.reserve_spend(&bound.quote).await {
             Ok(SpendDecision::Allowed) => {}
             Ok(SpendDecision::RequiresPaymentApproval {
                 quote_id,
@@ -822,161 +813,282 @@ impl CallerPaymentFlow {
             }
             Err(e) => {
                 return CallerDecision::Failed {
+                    quote_id: Some(quote_id),
                     message: e.to_string(),
                     retryable: false,
                 }
             }
         }
 
-        // -- [4] author the x402 payload for the quoted scheme. Nonces
-        //    derive from the quote id, so a same-quote retry reuses the
-        //    same payload (idempotent) while distinct quotes never
-        //    collide.
-        let payload = match self.author_payload(&quote).await {
+        let payload = match self.author(&bound.quote).await {
             Ok(p) => p,
             Err(message) => {
-                self.release(&quote, now_ns).await;
+                // Nothing was exposed: the payload never left this
+                // process, so the reservation goes back.
+                self.release(&bound.quote, self.clock.now_ns()).await;
                 return CallerDecision::Failed {
+                    quote_id: Some(quote_id),
                     message,
                     retryable: false,
                 };
             }
         };
 
-        // -- [5] deliver; map the provider's decision. Terminal failures
-        //    release the spend reservation — the money never moved.
-        match self.provider.pay(&quote_bytes, &payload).await {
-            Ok(PayResponse::Served { billing_event, transaction }) => {
-                // A redeemed approval is consumed by the successful pay.
-                if let Some(held_id) = redeeming_approval {
+        let decision = self.pay_exact(&bound.quote_bytes, payload.bytes()).await;
+        // A redeemed approval is consumed by the successful pay, and only
+        // by that: an ambiguous or refused outcome leaves the human's
+        // approval in place for the resume.
+        if matches!(decision, CallerDecision::Paid { .. }) {
+            if let Some(held_id) = bound.approval_id {
+                let _ = self.spend.clear_approval(&held_id).await;
+            }
+        }
+        decision
+    }
+
+    /// Stage 1 — obtain a provider-signed quote for `capability` under
+    /// its announced `pricing_terms`, bound to `input_hash` when the
+    /// caller is buying one exact unit of work.
+    ///
+    /// Picks the first announced `accepts[]` entry this caller can
+    /// *settle* (the mock network always; a real network only when its
+    /// CAIP-2 namespace has a configured signer — whether policy
+    /// *permits* the spend is [`reserve_spend`](Self::reserve_spend)'s
+    /// job), prefers an operator-approved held quote over a fresh one,
+    /// and verifies whatever it gets against the announced terms before
+    /// returning it. **No money moves and no budget is reserved here**,
+    /// which is what makes it safe to call merely to display a price.
+    ///
+    /// The held-quote path is per-purchase: an approval is for the exact
+    /// quote a human saw, so a hold whose `input_hash` is not the one
+    /// being resumed is left alone (it is still valid for *its* purchase)
+    /// and this call quotes fresh. Only an expired or unparseable hold is
+    /// cleared.
+    ///
+    /// `Err` carries the terminal [`CallerDecision`] the flow would
+    /// return, so `run` composes by `?`-shaped early exit and the two can
+    /// never disagree about how a quote failure reads.
+    pub async fn quote_bound(
+        &self,
+        capability: &str,
+        pricing_terms: &str,
+        input_hash: Option<&str>,
+    ) -> Result<BoundQuote, CallerDecision> {
+        // -- [1] parse the announced terms; pick the first accepts[]
+        //    entry this caller can *settle*: the mock network always, a
+        //    real network only when its namespace has a configured
+        //    settlement signer. (Whether policy *permits* the spend is
+        //    [3]'s job — settleability is about capability, not
+        //    authorization.)
+        let terms = match PricingTerms::from_json_bytes(pricing_terms.as_bytes()) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(CallerDecision::Denied {
+                    policy_reason: format!("announced pricing terms are invalid: {e}"),
+                })
+            }
+        };
+        let Some(template) = terms.accepts.iter().find(|t| self.can_settle(t.view())) else {
+            let offered: Vec<String> = terms
+                .accepts
+                .iter()
+                .map(|t| format!("({}, {})", t.view().scheme, t.view().network))
+                .collect();
+            return Err(CallerDecision::Denied {
+                policy_reason: format!(
+                    "no settleable accepts[] entry: terms offer {offered:?}; this caller \
+                     settles mock:* always and exact/eip155 when a signer is configured"
+                ),
+            });
+        };
+
+        // -- [2] the quote: an approved held quote first (the human's
+        //    approval applies to the exact quote they saw — this is the
+        //    retry-after-approval path), else a fresh provider-signed one.
+        let held = match self.spend.approved_quote(capability).await {
+            Ok(held) => held,
+            Err(e) => {
+                return Err(CallerDecision::Failed {
+                    quote_id: None,
+                    message: e.to_string(),
+                    retryable: false,
+                })
+            }
+        };
+        let mut approval_id = None;
+        let mut resumed: Option<Vec<u8>> = None;
+        if let Some((held_id, held_bytes)) = held {
+            match PaymentQuote::from_json_bytes(&held_bytes) {
+                Ok(held_quote) if !held_quote.is_expired_at(self.clock.now_ns()) => {
+                    // An approval authorizes ONE purchase. A live hold for
+                    // a different input is somebody else's approved work:
+                    // leave it on file and quote fresh for this one.
+                    if held_quote.input_hash.as_deref() == input_hash {
+                        approval_id = Some(held_id);
+                        resumed = Some(held_bytes);
+                    }
+                }
+                // Expired or unparseable hold: drop it and fall
+                // through to a fresh quote (which will hold again if
+                // policy still objects — a new approval for a new
+                // quote, never a silent carry-over).
+                _ => {
                     let _ = self.spend.clear_approval(&held_id).await;
                 }
-                // Verify the provider-supplied billing event before recording
-                // it as dispute/audit evidence: from_json_bytes checks tag +
-                // id-derivation + scope + signature, and we additionally
-                // require it to bind THIS quote, caller, and provider. The
-                // payment already served (money moved), so a bad evidence blob
-                // is not a fund loss — but it must not be recorded as
-                // trustworthy: drop it from the proof and warn.
-                let verified_billing = match BillingEvent::from_json_bytes(billing_event.as_bytes())
-                {
-                    Ok(ev)
-                        if ev.quote_id == quote.quote_id
-                            && ev.payer == *self.caller.entity_id()
-                            && ev.payee == quote.provider =>
-                    {
-                        serde_json::Value::String(billing_event)
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            quote_ref = %quote_ref(&quote.quote_id),
-                            "provider billing event does not bind this quote/caller/provider — dropped from proof"
-                        );
-                        serde_json::Value::Null
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            quote_ref = %quote_ref(&quote.quote_id),
-                            error = %e,
-                            "provider billing event failed verification — dropped from proof"
-                        );
-                        serde_json::Value::Null
-                    }
-                };
-                // Sign the invocation binding: the provider's gate can
-                // then require that the invoker IS the payer. A public-
-                // only caller identity degrades to bearer mode.
-                let tool = capability.split_once('/').map(|(_, t)| t).unwrap_or(capability);
-                let binding_sig = self
-                    .caller
-                    .try_sign(&crate::engine::invocation_binding_transcript(
-                        &quote.quote_id,
-                        tool,
-                    ))
-                    .ok()
-                    .map(|sig| sig.to_bytes().to_vec());
-                CallerDecision::Paid {
-                    quote_id: quote.quote_id.clone(),
-                    binding_sig,
-                    proof: serde_json::json!({
-                        "quote_id": quote.quote_id,
-                        "transaction": transaction,
-                        "billing_event": verified_billing,
-                    }),
-                }
             }
-            Ok(PayResponse::PendingTier { reached, required }) => CallerDecision::Failed {
-                message: format!(
-                    "settled but confidence pending (reached {reached}, provider requires {required})"
-                ),
-                retryable: true,
-            },
-            Ok(PayResponse::InProgress) => CallerDecision::Failed {
-                message: "another attempt on this quote is in flight".to_string(),
-                retryable: true,
-            },
-            Ok(PayResponse::Rejected { reason }) => {
-                // A provider holding a self-contained bearer authorization
-                // (exact/EIP-3009, exact/SPL) can claim "rejected" while
-                // still settling it — its claim is not proof the money
-                // stayed put. Keep the reservation for such schemes
-                // (fail-closed accounting, as on transport ambiguity);
-                // releasing it would reset the per-day counter every cycle
-                // and defeat `max_per_day` as a loss bound.
-                if reject_releases_reservation(&quote) {
-                    self.release(&quote, now_ns).await;
+        }
+        let quote_bytes = match resumed {
+            Some(bytes) => bytes,
+            None => match self
+                .provider
+                .quote(
+                    self.caller.entity_id(),
+                    &terms.provider,
+                    capability,
+                    template,
+                    input_hash,
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(CallerDecision::Failed {
+                        quote_id: None,
+                        message: e.message,
+                        retryable: e.retryable,
+                    })
                 }
-                CallerDecision::Denied {
-                    policy_reason: format!("provider rejected the payment: {reason}"),
-                }
-            }
-            Ok(PayResponse::Invalidated { reason }) => CallerDecision::Failed {
-                message: format!("payment invalidated: {reason}"),
-                retryable: false,
             },
-            Ok(PayResponse::Exception { kind }) => CallerDecision::Failed {
-                message: format!("verification exception ({kind}) — provider policy handles manually"),
-                retryable: false,
-            },
-            Ok(PayResponse::Failure { retryable, message }) => {
-                // Same bearer-authorization reasoning as `Rejected`: a
-                // claimed failure from a provider that holds the signed
-                // pull authorization is not proof of non-settlement.
-                if reject_releases_reservation(&quote) {
-                    self.release(&quote, now_ns).await;
-                }
-                CallerDecision::Failed { message, retryable }
-            }
+        };
+        let quote = match PaymentQuote::from_json_bytes(&quote_bytes) {
+            Ok(q) => q,
             Err(e) => {
-                // Transport ambiguity: the payment MAY have landed. Keep
-                // the reservation (fail-closed accounting) and retry the
-                // same quote — the provider side is idempotent.
-                CallerDecision::Failed { message: e.message, retryable: e.retryable }
+                return Err(CallerDecision::Denied {
+                    policy_reason: format!("provider quote failed verification: {e}"),
+                })
             }
+        };
+        if quote.caller != *self.caller.entity_id() {
+            return Err(CallerDecision::Denied {
+                policy_reason: "quote was issued to a different caller".to_string(),
+            });
+        }
+        if quote.capability != capability {
+            return Err(CallerDecision::Denied {
+                policy_reason: "quote binds a different capability".to_string(),
+            });
+        }
+        if quote.provider != terms.provider {
+            return Err(CallerDecision::Denied {
+                policy_reason: "quote provider does not match the announced terms provider"
+                    .to_string(),
+            });
+        }
+        if quote.requirements.bytes() != template.bytes() {
+            return Err(CallerDecision::Denied {
+                policy_reason: "quote deviates from the announced terms — never pay more \
+                                than discovery showed"
+                    .to_string(),
+            });
+        }
+        if quote.is_expired_at(self.clock.now_ns()) {
+            return Err(CallerDecision::Failed {
+                quote_id: Some(quote.quote_id.clone()),
+                message: "provider quote arrived already expired".to_string(),
+                retryable: true,
+            });
+        }
+
+        Ok(BoundQuote {
+            quote,
+            quote_bytes,
+            approval_id,
+        })
+    }
+
+    /// Stage 2 — caller spend policy: check + reserve, one locked RMW.
+    ///
+    /// The verdict is the spend engine's own, unmapped: a staged caller
+    /// has to tell `RequiresPaymentApproval` (park the purchase, wait for
+    /// a human) from `Denied` (never going to happen) from a store error
+    /// (retry the read), and collapsing those into one enum here would
+    /// only make it guess.
+    pub async fn reserve_spend(&self, quote: &PaymentQuote) -> Result<SpendDecision, SpendError> {
+        self.spend
+            .check_and_reserve(quote, &self.registry, self.clock.now_ns())
+            .await
+    }
+
+    /// Give back a reservation this flow took but will not spend.
+    ///
+    /// The counterpart to [`reserve_spend`](Self::reserve_spend) for a
+    /// staged caller: [`run`](Self::run) releases internally on the paths
+    /// where nothing was exposed, but a caller driving the stages itself
+    /// can lose a race *after* reserving (two attempts on one purchase,
+    /// one of which never authors) and must hand its holder back or the
+    /// day counter keeps budget nobody is spending.
+    ///
+    /// Refcounted and owner-checked by the spend engine: the claim is
+    /// only returned to the counter when the last holder releases.
+    pub async fn release_spend(&self, quote: &PaymentQuote) {
+        self.release(quote, self.clock.now_ns()).await;
+    }
+
+    /// Does this caller still hold a spend reservation for `quote_id`?
+    ///
+    /// An *observation*, for a staged caller that has to record whether a
+    /// refusal left the budget claimed: [`pay_exact`](Self::pay_exact)
+    /// decides that per scheme (see `reject_releases_reservation`), and
+    /// reading the store back is the difference between recording what
+    /// happened and re-deriving what should have.
+    pub async fn spend_reservation_held(&self, quote_id: &str) -> Result<bool, SpendError> {
+        Ok(self.spend.reservation(quote_id).await?.is_some())
+    }
+
+    /// Where the operator approval for `quote_id` stands.
+    ///
+    /// A staged caller parked on an approval needs the three-way answer
+    /// (see [`ApprovalOutcome`]): `Gone` is a *rejection*, which is
+    /// proof no money moved on that quote, and re-running
+    /// [`reserve_spend`](Self::reserve_spend) would instead record a new
+    /// pending hold and hide it.
+    pub async fn approval_state(&self, quote_id: &str) -> Result<ApprovalOutcome, SpendError> {
+        self.spend.approval_state(quote_id).await
+    }
+
+    /// Drop the approval hold on `quote_id`.
+    ///
+    /// Best-effort by design, and called on exactly two occasions: the
+    /// payment the human approved has landed (the hold is spent), or the
+    /// quote it was for is being replaced (a new quote needs a new
+    /// approval). A failure leaves a stale hold that
+    /// [`quote_bound`](Self::quote_bound) discards on sight, so it
+    /// cannot authorize anything.
+    pub async fn clear_approval(&self, quote_id: &str) {
+        if let Err(e) = self.spend.clear_approval(quote_id).await {
+            tracing::warn!(quote_ref = %quote_ref(quote_id), error = %e, "clearing the approval hold failed");
         }
     }
 
-    /// Can this caller author a payment for these requirements? The
-    /// mock network always; a real network's `exact` entry when its
-    /// CAIP-2 namespace (`eip155`, `solana`) has a registered signer.
-    fn can_settle(&self, requirements: &PaymentRequirements) -> bool {
-        if requirements.network.starts_with("mock:") {
-            return true;
-        }
-        let namespace = requirements.network.split(':').next().unwrap_or_default();
-        requirements.scheme == "exact"
-            && (namespace == "eip155" || OPAQUE_BLOB_NAMESPACES.contains(&namespace))
-            && self.signers.contains_key(namespace)
+    /// The identity this flow pays as — what a caller-side purchase
+    /// record is keyed by (one authoritative attempt per caller, provider
+    /// and task).
+    pub fn caller(&self) -> &EntityId {
+        self.caller.entity_id()
     }
 
-    /// Author the scheme payload for a quote. Dispatches on the quoted
-    /// scheme/network; the selection guard ([`Self::can_settle`]) makes
-    /// the fall-through unreachable in practice, and it fails closed
-    /// anyway.
-    async fn author_payload(
-        &self,
-        quote: &PaymentQuote,
-    ) -> Result<X402Carry<PaymentPayload>, String> {
+    /// Stage 3 — author the x402 payload for the quoted scheme.
+    ///
+    /// Nonces derive from the quote id, so a same-quote retry re-authors
+    /// the *same* payload (idempotent at the provider) while distinct
+    /// quotes never collide. The returned carry's
+    /// [`bytes`](X402Carry::bytes) are what a resumable caller persists
+    /// and later hands back to [`pay_exact`](Self::pay_exact) unchanged.
+    ///
+    /// Dispatches on the quoted scheme/network; the selection guard in
+    /// [`quote_bound`](Self::quote_bound) makes the fall-through
+    /// unreachable in practice, and it fails closed anyway.
+    pub async fn author(&self, quote: &PaymentQuote) -> Result<X402Carry<PaymentPayload>, String> {
         let requirements = quote.requirements.view();
         let payload_object = if requirements.network.starts_with("mock:") {
             let nonce = {
@@ -1037,6 +1149,174 @@ impl CallerPaymentFlow {
             extensions: None,
         })
         .map_err(|e| e.to_string())
+    }
+
+    /// Stage 4 — deliver exactly these bytes and map the provider's
+    /// answer, including what it means for the spend reservation.
+    ///
+    /// Takes bytes rather than typed values on purpose: this is the verb
+    /// a caller re-enters after a lost reply or a restart, and the
+    /// contract is that it re-sends the **identical** payload. The
+    /// provider's acceptance is payload-idempotent, so a repeat resolves
+    /// to the original verdict rather than paying twice — which only
+    /// holds if the bytes are the ones that were sent, not a
+    /// re-serialization of them.
+    ///
+    /// **Reservation discipline lives here.** A terminal refusal releases
+    /// the caller's spend reservation only for a scheme whose claimed
+    /// non-settlement is trustworthy (see
+    /// `reject_releases_reservation`); every real scheme authors a
+    /// self-contained bearer pull authorization the counterparty could
+    /// settle regardless of what it reports back, so its "rejected" is
+    /// not proof and the reservation stands — exactly as on transport
+    /// ambiguity.
+    pub async fn pay_exact(&self, quote_bytes: &[u8], payload_bytes: &[u8]) -> CallerDecision {
+        let quote = match PaymentQuote::from_json_bytes(quote_bytes) {
+            Ok(q) => q,
+            Err(e) => {
+                return CallerDecision::Failed {
+                    quote_id: None,
+                    message: format!("stored quote failed verification: {e}"),
+                    retryable: false,
+                }
+            }
+        };
+        let payload: X402Carry<PaymentPayload> = match X402Carry::from_bytes(payload_bytes.to_vec())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return CallerDecision::Failed {
+                    quote_id: Some(quote.quote_id.clone()),
+                    message: format!("stored payment payload is not a valid x402 payload: {e}"),
+                    retryable: false,
+                }
+            }
+        };
+        let quote_id = quote.quote_id.clone();
+
+        match self.provider.pay(quote_bytes, &payload).await {
+            Ok(PayResponse::Served { billing_event, transaction }) => {
+                // Verify the provider-supplied billing event before recording
+                // it as dispute/audit evidence: from_json_bytes checks tag +
+                // id-derivation + scope + signature, and we additionally
+                // require it to bind THIS quote, caller, and provider. The
+                // payment already served (money moved), so a bad evidence blob
+                // is not a fund loss — but it must not be recorded as
+                // trustworthy: drop it from the proof and warn.
+                let verified_billing = match BillingEvent::from_json_bytes(billing_event.as_bytes())
+                {
+                    Ok(ev)
+                        if ev.quote_id == quote.quote_id
+                            && ev.payer == *self.caller.entity_id()
+                            && ev.payee == quote.provider =>
+                    {
+                        serde_json::Value::String(billing_event)
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            quote_ref = %quote_ref(&quote.quote_id),
+                            "provider billing event does not bind this quote/caller/provider — dropped from proof"
+                        );
+                        serde_json::Value::Null
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            quote_ref = %quote_ref(&quote.quote_id),
+                            error = %e,
+                            "provider billing event failed verification — dropped from proof"
+                        );
+                        serde_json::Value::Null
+                    }
+                };
+                // Sign the invocation binding: the provider's gate can
+                // then require that the invoker IS the payer. A public-
+                // only caller identity degrades to bearer mode.
+                let capability = quote.capability.as_str();
+                let tool = capability.split_once('/').map(|(_, t)| t).unwrap_or(capability);
+                let binding_sig = self
+                    .caller
+                    .try_sign(&crate::engine::invocation_binding_transcript(
+                        &quote.quote_id,
+                        tool,
+                    ))
+                    .ok()
+                    .map(|sig| sig.to_bytes().to_vec());
+                CallerDecision::Paid {
+                    quote_id,
+                    binding_sig,
+                    proof: serde_json::json!({
+                        "quote_id": quote.quote_id,
+                        "transaction": transaction,
+                        "billing_event": verified_billing,
+                    }),
+                }
+            }
+            Ok(PayResponse::PendingTier { reached, required }) => CallerDecision::Failed {
+                quote_id: Some(quote_id),
+                message: format!(
+                    "settled but confidence pending (reached {reached}, provider requires {required})"
+                ),
+                retryable: true,
+            },
+            Ok(PayResponse::InProgress) => CallerDecision::Failed {
+                quote_id: Some(quote_id),
+                message: "another attempt on this quote is in flight".to_string(),
+                retryable: true,
+            },
+            Ok(PayResponse::Rejected { reason }) => {
+                // A provider holding a self-contained bearer authorization
+                // (exact/EIP-3009, exact/SPL) can claim "rejected" while
+                // still settling it — its claim is not proof the money
+                // stayed put. Keep the reservation for such schemes
+                // (fail-closed accounting, as on transport ambiguity);
+                // releasing it would reset the per-day counter every cycle
+                // and defeat `max_per_day` as a loss bound.
+                if reject_releases_reservation(&quote) {
+                    self.release(&quote, self.clock.now_ns()).await;
+                }
+                CallerDecision::Denied {
+                    policy_reason: format!("provider rejected the payment: {reason}"),
+                }
+            }
+            Ok(PayResponse::Invalidated { reason }) => CallerDecision::Failed {
+                quote_id: Some(quote_id),
+                message: format!("payment invalidated: {reason}"),
+                retryable: false,
+            },
+            Ok(PayResponse::Exception { kind }) => CallerDecision::Failed {
+                quote_id: Some(quote_id),
+                message: format!("verification exception ({kind}) — provider policy handles manually"),
+                retryable: false,
+            },
+            Ok(PayResponse::Failure { retryable, message }) => {
+                // Same bearer-authorization reasoning as `Rejected`: a
+                // claimed failure from a provider that holds the signed
+                // pull authorization is not proof of non-settlement.
+                if reject_releases_reservation(&quote) {
+                    self.release(&quote, self.clock.now_ns()).await;
+                }
+                CallerDecision::Failed { quote_id: Some(quote_id), message, retryable }
+            }
+            Err(e) => {
+                // Transport ambiguity: the payment MAY have landed. Keep
+                // the reservation (fail-closed accounting) and retry the
+                // same quote — the provider side is idempotent.
+                CallerDecision::Failed { quote_id: Some(quote_id), message: e.message, retryable: e.retryable }
+            }
+        }
+    }
+
+    /// Can this caller author a payment for these requirements? The
+    /// mock network always; a real network's `exact` entry when its
+    /// CAIP-2 namespace (`eip155`, `solana`) has a registered signer.
+    fn can_settle(&self, requirements: &PaymentRequirements) -> bool {
+        if requirements.network.starts_with("mock:") {
+            return true;
+        }
+        let namespace = requirements.network.split(':').next().unwrap_or_default();
+        requirements.scheme == "exact"
+            && (namespace == "eip155" || OPAQUE_BLOB_NAMESPACES.contains(&namespace))
+            && self.signers.contains_key(namespace)
     }
 
     /// Release the spend reservation after a terminal failure where value
@@ -1177,6 +1457,7 @@ mod denial_render_tests {
                 tool_id: "another-tool-with-a-longish-name".into(),
             },
             R::AlreadyRedeemed,
+            R::InputBindingMismatch,
         ]
     }
 
@@ -1216,6 +1497,7 @@ mod denial_render_tests {
                 capability: "p/a".into(),
                 tool_id: "b".into(),
             },
+            R::InputBindingMismatch,
         ];
         for reason in rows {
             let d = denial_for(&reason, "b", "q");
@@ -1225,6 +1507,43 @@ mod denial_render_tests {
             assert!(!d.schematic.recovery.safe_to_requote);
             assert!(d.schematic.recovery.next_action.is_none());
         }
+    }
+
+    /// The A2A row, pinned field by field against the contract the SDK's
+    /// `FailureSchematic` doc table publishes: `input_binding_mismatch`
+    /// is the `wrong_tool_binding` posture verbatim.
+    ///
+    /// It withholds the instrument facts deliberately. Telling a caller
+    /// redeeming against the wrong purchase that funds *did* move would
+    /// confirm that someone else's paid quote exists; `unknown` says only
+    /// what this caller is entitled to know.
+    #[test]
+    fn input_binding_mismatch_renders_the_wrong_tool_binding_posture() {
+        let d = denial_for(&R::InputBindingMismatch, "net.a2a.task/summarize", "q");
+        let reference = denial_for(
+            &R::WrongToolBinding {
+                capability: "7/net.a2a.task/summarize".into(),
+                tool_id: "net.a2a.task/summarize".into(),
+            },
+            "net.a2a.task/summarize",
+            "q",
+        );
+        assert_eq!(d.schematic.reason, "input_binding_mismatch");
+        assert_eq!(d.schematic.stage, "redeem");
+        assert_eq!(d.schematic.recovery.class, "security_violation");
+        assert_eq!(d.schematic.recovery.actor, "caller_operator");
+        assert!(!d.schematic.retryable);
+        assert!(!d.schematic.recovery.safe_to_retry);
+        assert!(!d.schematic.recovery.safe_to_requote);
+        assert!(d.schematic.recovery.next_action.is_none());
+        assert_eq!(d.schematic.funds_moved, "unknown");
+        assert_eq!(d.schematic.prior_payment, "unknown");
+        // Same posture as the row it was grouped with, differing only in
+        // the token and the human message.
+        assert_eq!(d.schematic.recovery, reference.schematic.recovery);
+        assert_eq!(d.schematic.funds_moved, reference.schematic.funds_moved);
+        assert_eq!(d.schematic.prior_payment, reference.schematic.prior_payment);
+        assert_ne!(d.schematic.reason, reference.schematic.reason);
     }
 
     /// `binding_required` is a caller-configuration row, not a security

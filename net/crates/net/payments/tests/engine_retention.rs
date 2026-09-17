@@ -176,6 +176,7 @@ async fn terminal_quote(f: &Fixture, amount: &str, nonce: &str) -> (PaymentQuote
             f.caller.entity_id().clone(),
             CAP,
             mock_reqs(amount),
+            None,
             NOW,
             TTL,
         )
@@ -204,13 +205,13 @@ async fn terminal_quote(f: &Fixture, amount: &str, nonce: &str) -> (PaymentQuote
         .last()
         .and_then(|e| e.transaction.clone())
         .expect("a settled quote has a transaction");
-    assert_eq!(
+    assert!(matches!(
         f.engine
             .redeem_for_invocation(TOOL, &quote.quote_id, None)
             .await
             .unwrap(),
-        RedeemDecision::Admitted
-    );
+        RedeemDecision::Admitted { .. }
+    ));
     (quote, transaction)
 }
 
@@ -265,6 +266,7 @@ async fn an_unredeemed_record_is_never_pruned() {
             f.caller.entity_id().clone(),
             CAP,
             mock_reqs("2500"),
+            None,
             NOW,
             TTL,
         )
@@ -526,6 +528,7 @@ async fn a_retired_settlement_transaction_is_still_rejected_later() {
             f.caller.entity_id().clone(),
             CAP,
             mock_reqs("2500"),
+            None,
             later,
             TTL,
         )
@@ -905,6 +908,7 @@ async fn accepting_a_payment_sweeps_eligible_records() {
             f.caller.entity_id().clone(),
             CAP,
             mock_reqs("2500"),
+            None,
             later,
             TTL,
         )
@@ -1008,6 +1012,7 @@ fn crossing_the_store_size_threshold_warns_exactly_once() {
                         f.caller.entity_id().clone(),
                         CAP,
                         mock_reqs(amount),
+                        None,
                         NOW,
                         TTL,
                     )
