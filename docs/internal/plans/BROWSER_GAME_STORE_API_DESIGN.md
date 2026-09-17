@@ -393,7 +393,10 @@ waiters. No aborted promise can later resolve from a snapshot callback.
 
 - Authenticate the transport caller first, validate its message, then call
   `authorize` with that identity. Never trust a `peer` field in application
-  JSON or equate a channel hash with an authority. Read access is checked on
+  JSON, never equate a channel hash with an authority, and never accept an
+  announcement lookup as the authentication — see
+  [Identity: an announcement lookup is not authentication](#identity-an-announcement-lookup-is-not-authentication),
+  which is where "that identity" has to come from. Read access is checked on
   join and audience change, and before each subsequent projected emission;
   action/input access is checked on every invocation. A denied read closes
   that subscription and clears its local projection; it cannot erase data a
@@ -514,22 +517,121 @@ per handle, 32 audience labels per handle; 10 s join/action/audience deadline.
 The authoritative host independently enforces its limits; callers cannot
 raise them remotely.
 
-**Store chunking and transport fragmentation are separate layers**
-(reviewer disposition, 2026-09-17). A large snapshot necessarily needs
-bounded chunking at *this* layer; it does **not** follow that each chunk
-must then rely on transport fragmentation. A store that chunks to at or
-below the leaf's payload limit never invokes fragmentation at all, and that
-is a legitimate design choice. The implementation brief names which path it
-chose, and its witnesses test **that** path — chunk boundaries, loss,
-duplication, reordering and reconnect, with no partial-state publication.
-Whichever path is chosen, the existing fragmentation regressions are
-preserved unweakened; the store's choice is not licence to touch them.
+**Chunking, decided: stay below the unfragmented transport limit**
+(reviewer disposition, 2026-09-17). Store chunking and transport
+fragmentation are separate layers, and v1 takes the lower one: bounded
+application chunks whose **complete encoded transport payload** — envelope
+overhead included — fits the *effective* unfragmented limit.
+
+Two things that follow, and both have been got wrong before:
+
+- `MAX_PAYLOAD_SIZE` (8 108) is **not** available data bytes. It is the
+  packet cap minus header and tag, and an event carries its own length
+  prefix inside it. The chunk budget is derived from the effective limit at
+  the layer actually used, not from that constant.
+- The number is **not** baked into the public API. It is an internal bound;
+  a store message size in the public `limits` is a caller-facing ceiling, not
+  a transport fact.
+
+Acceptance path this buys: reliable delivery of individually bounded chunks;
+bounded whole-snapshot assembly; **no publication until the complete
+validated snapshot and its live-update boundary are both ready**; and
+duplicate, missing, stale-generation and oversized chunks each tested
+explicitly.
+
+What it does **not** buy: it removes large-frame fragmentation from the
+snapshot's *necessary* path, and nothing more. It does not waive
+fragmentation regressions elsewhere, and it does not prove independence from
+the shared reliability/reassembly code the chunks still ride. **Trace the
+actual path before narrowing any gate on the strength of this decision.**
 
 Keep latest inputs at one pending slot per declared input per caller and
 expire disconnected subscribers within a bounded lease. Owner-wide limits
 for subscribers, buffered bytes and action ledgers must be explicit internal
 constants exercised at the boundary before shipping. The four public limit
 knobs are sufficient for v1; no arbitrary queue configuration framework.
+
+### The store protocol, decided: small and versioned, not a framework
+
+Reviewer disposition, 2026-09-17. The approach is settled; the **exact field
+schema and malformed-input rules are still owed by the revised brief**, and
+nothing here pretends that schema exists.
+
+- **UTF-8 JSON** for validated state and for typed messages.
+- **Explicit message kinds**: join, snapshot chunk, delta, action, action
+  result, latest input, leave, refusal. Named kinds, not a generic envelope
+  with a free-form body.
+- **Bound to context**: store incarnation, admitted handle and subscription
+  generation, wherever each applies. A message that does not name the
+  incarnation it belongs to cannot be refused as stale.
+- **Reliable deltas carry a base and a next projected-view revision.** The
+  pair is what makes a gap detectable. Changes elsewhere in the owner's state
+  that the viewer cannot see must not surface as unexplained revision gaps —
+  the revisions are of the *projected view*, not of the owner's whole state.
+- **Patch operations are `replace` / `remove`** over bounded arrays of
+  property-name segments. Arrays are replaced whole in v1. No JSON Pointer
+  escaping machinery, and no arbitrary or executable operations.
+- **Apply atomically**: validate the complete patch, then commit one
+  revision, preserving unchanged subtree references. A half-applied patch is
+  never published.
+
+### Identity: an announcement lookup is not authentication
+
+Reviewer disposition, 2026-09-17, correcting a proposal to resolve the
+originator from an origin-hash → node-id map. The distinction:
+
+- An **origin-hash → node-id lookup identifies a candidate.**
+- A **verified announcement binds that candidate to advertised identity
+  material** — its Noise static key and its signing key.
+- **Neither proves this particular application message came from that
+  candidate.** Only the accepted end-to-end establishment and its
+  authenticated receive path do.
+
+The leaf already has that path, and it is worth reading rather than
+re-deriving (`leaf/src/node.rs`, the §9 step-2 witnesses around `:3483`):
+the relay carries the exchange blind; the destination resolves the proposed
+originating peer from the announcement **it verified itself**, never from the
+carrier; and the responder then stays **provisional** — `has_session` is
+false, `provisional_attempt` is `Some`, `DropReason::EstablishmentUnproven`
+is the counter — because message 1 proves the domain PSK and the responder's
+own static key and nothing about who built the handshake. The initiator's
+establishment proof over that handshake's transcript is what promotes it
+(`take_verified_admissions`).
+
+Consequences for the store, and they are binding:
+
+- **Prefer peer-addressed streams over the authenticated A↔B session**,
+  direct or routed. A frame on an established session has a proven peer; an
+  **anchor-addressed** stream's session peer is the *anchor*, and a generic
+  channel event carries an origin hash, not a proven identity.
+- **Do not substitute an announcement-map lookup for missing authentication
+  on generic channel events**, and do not invent a new identity-mapping
+  mechanism before tracing the existing end-to-end session path.
+- The current identity repair **still needs independent verification**. The
+  source reading above is orientation, not closure.
+
+### Peer-dialog ownership, decided: proxy the primitives, one TS driver
+
+Reviewer disposition, 2026-09-17. `connectPeer` / `acceptPeer` are proxied by
+forwarding the **required primitives**, and the existing TypeScript
+drive/classification logic is **shared** between `BrowserNode` and
+`MeshSession`. A second Rust implementation of that loop is prohibited — two
+implementations of one contract is what this repository refuses elsewhere.
+
+Ownership the proxied form must carry:
+
+- The operation is identified by **requesting tab, leader generation, peer
+  and exact dialog**. Not by peer alone.
+- A stale request is **rejected before it mutates a replacement attempt**,
+  not classified as superseded after the fact.
+- **Leader loss terminates pending operations**, and a late reply cannot
+  restore success.
+- **One tab's cancellation cannot cancel another tab's replacement attempt.**
+
+On cost: "four round trips" is wrong and should not be repeated.
+`peer_candidate` is **polled**, and accepting an offer **may retry**, so the
+proxy traffic per attempt is variable. Measure it; do not promise a fixed
+attempt cost.
 
 ## 6. Existing implementation and the narrow missing work
 
@@ -540,9 +642,9 @@ reasons to revive broad Stage 7 parity:
 |---|---|
 | `browser-ts/src/leader/session.ts`: `openSession`, `MeshSession`, `call`, `subscribe`, `publish`, `openStream`, lifecycle events | Use the origin-safe session as the public constructor input. It remains caller-owned. |
 | `browser-ts/src/node.ts`: `connectPeer` / `acceptPeer`; `stream.ts`: `OpenStreamOptions.peer` | Direct-peer primitives exist on `BrowserNode`; stream handles are fenced across routed/direct replacement. The store owns reopening/resynchronizing, never asks game code to catch stale stream handles. |
-| `MeshSession` lacks those direct-peer methods; `stream.ts` explicitly documents peer streams as unsupported on its proxy path | Required browser dependency: leader/follower-safe peer connection and addressed streams. Do not silently make the store anchor-only or require a second node identity per tab. |
-| `BrowserNode.subscribe` / `MeshSession.subscribe` are channel-name-only, with no public unsubscribe; `leaf/src/channel.rs` has an unsubscribe payload codec | Required browser dependency: owned membership lifecycle, peer targeting and effective subscription acknowledgement. A resolved enqueue is not the store's readiness witness. Last local consumer releases the actual remote membership; another store/tab's subscription survives. |
-| `ChannelMessageEvent` carries channel/origin hashes; `StreamDataEvent` carries peer/session provenance | Prove authenticated owner-to-store dispatch. Hash/name coincidence alone cannot establish ownership. Extend only the browser dispatch metadata actually required. |
+| `MeshSession` lacked those direct-peer methods; `stream.ts` documented peer streams as unsupported on its proxy path | **Addressed streams: done** (`688e4f08a`) — `LeaderRequest::StreamOpen` carries `peer`, so a follower addresses a peer as the leader tab does, and `require_anchor_addressed` is deleted. **`connectPeer` / `acceptPeer`: still leader-only**, to be proxied per [Peer-dialog ownership](#peer-dialog-ownership-decided-proxy-the-primitives-one-ts-driver). Do not silently make the store anchor-only or require a second node identity per tab. |
+| `BrowserNode.subscribe` / `MeshSession.subscribe` were channel-name-only with no public unsubscribe; `leaf/src/channel.rs` had an unsubscribe payload codec nothing called | **Done** (`557fb84d4`, `42d32640a`): `LeafNode::unsubscribe` through the production encoder, `MeshSession.unsubscribe`, and the last-consumer decision where both this tab's `declared` and its followers' declarations are visible. Last local consumer releases the remote membership; another tab's subscription survives. Still owed: effective subscription acknowledgement as the readiness witness — a resolved enqueue is not one. |
+| `ChannelMessageEvent` carries channel/origin hashes; `StreamDataEvent` carries peer/session provenance | Prove authenticated owner-to-store dispatch. Hash/name coincidence cannot establish ownership, **and neither can an origin-hash → node-id lookup**: that identifies a candidate, a verified announcement binds it to identity material, and only the end-to-end establishment's authenticated receive path proves *this message* came from it. Hence the store prefers peer-addressed streams on an established session over generic channel events. Extend only the dispatch metadata actually required. |
 | `MeshSession.call` is client-facing; no public browser store hosting/handler registration exists | New store provider dispatch belongs to this feature. Implement its bounded request/reply protocol on existing Net channels/streams, not by pretending a current browser nRPC server API exists. |
 
 The provider must use existing mesh membership/fan-out machinery, including
@@ -607,12 +709,26 @@ authenticated *originating* caller — never a claimed JSON identity and never
 merely the adjacent relay; snapshot delivery must survive chunking, loss,
 duplication and reconnect with no partial-state publication; and
 `MeshSession` must carry the real direct-peer and subscription lifecycle,
-follower tabs and last-consumer cleanup included. Slices 1 and 2 above are
-local/type work and may proceed. **Slices 3–5 — the real multiplayer
-acceptance — require independent closure of those gates against the
-CURRENT implementation head.** A historical HOLD is not proof that the
-repaired head still fails, and repeating an old red claim is not closure;
-equally, green CI is not reviewer acceptance.
+follower tabs and last-consumer cleanup included.
+
+What each blocker does and does not stop (reviewer disposition, 2026-09-17):
+
+- **The superseded brief is not dispatch authority.** Pin the reviewed
+  implementation base and write the bounded replacement brief.
+- **The gates block end-to-end *acceptance*, not local implementation and
+  not the writing of adversarial witnesses.** Slices 3–5's acceptance
+  requires independent closure against the CURRENT head; the code and the
+  hostile tests for them can be built before that. A historical HOLD is not
+  proof that the repaired head still fails, repeating an old red claim is
+  not closure, and green CI is not reviewer acceptance.
+- **Linux netns evidence is CI-only on this host — browser execution is
+  not.** Keep the distinction: a Chromium/Firefox run needs no netns. And if
+  Firefox is absent from the actual demo harness (`browser-demo` is
+  Chromium-only), adding and executing that leg is **work**, not inherited
+  coverage.
+- **Do not build `authorize` on unverified attribution** — and equally, do
+  not invent a new identity-mapping mechanism before tracing the existing
+  end-to-end session path.
 
 For each slice, write the failing witness before implementation, run the
 narrow test family, then the relevant existing gates. `npm test` and
