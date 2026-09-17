@@ -827,6 +827,96 @@ impl NetSession {
         }
         false
     }
+
+    /// Admit ONE stream send on ONE exact lifetime: its byte credit,
+    /// a run of `seqs` CONSECUTIVE sequences, and — when this is the
+    /// stream's first reliable send — the reliable-mode boundary
+    /// claim, all under the single map lookup that finds the state.
+    ///
+    /// **Why the whole group, and why here.** A multi-piece message
+    /// that takes one sequence per piece through separate
+    /// admissions does not own a contiguous range: a small
+    /// concurrent send on the same stream can take a sequence
+    /// between two pieces. Both sends succeed, and both receivers
+    /// then refuse the group, because a fragment group is defined
+    /// by consecutive sequences. Nothing the sender does afterwards
+    /// repairs it — retransmission preserves the interleaving. The
+    /// sequence space belongs to this state, so the reservation
+    /// that makes the range indivisible belongs here too, and it is
+    /// one `fetch_add` rather than a lock held across the caller's
+    /// awaits (there is no await inside this call, and the map ref
+    /// is released before the guard is built).
+    ///
+    /// **Why the boundary claim is in the same call.** The claim
+    /// names the first reliable sequence on the stream, and the
+    /// receiver concedes everything below it. Claiming it AFTER the
+    /// allocation lets two concurrent first-reliable sends claim
+    /// out of order — the send that took sequence 6 can win the
+    /// claim over the one that took 5 — and the receiver then
+    /// concedes reliable 5. Claiming under the allocating lookup
+    /// makes the claim the lowest reliable sequence by
+    /// construction: whoever allocates first claims first, and the
+    /// loser's `promote_tx_at` compare-exchange fails.
+    ///
+    /// `boundary` is `Some(first_seq)` exactly when this call won
+    /// the claim, which is at most once per stream lifetime; the
+    /// caller stamps [`crate::protocol::PacketFlags::MODE_BOUNDARY`]
+    /// on that packet and nothing else has to infer the split.
+    ///
+    /// A refusal consumes NOTHING: no credit, no sequence, no
+    /// boundary claim. `seqs` is clamped to at least one, so a
+    /// zero-piece send allocates one sequence rather than adding a
+    /// failure mode. `bytes` is charged once for the whole group
+    /// and held by the returned guard — commit it after the last
+    /// piece reaches the wire, refund an undelivered tail with
+    /// [`StreamState::refund_tx_credit`], and reclaim unused
+    /// sequences from the top with [`Self::try_rollback_tx_seq`].
+    pub fn try_admit_stream_send(
+        self: &Arc<Self>,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+        bytes: u32,
+        seqs: u32,
+        reliable: bool,
+    ) -> TxSendAdmit {
+        if session_id != self.session_id {
+            return TxSendAdmit::SessionSuperseded;
+        }
+        let seqs = seqs.max(1);
+        // One lookup for the epoch check, the credit, the sequence
+        // range and the boundary claim — see
+        // `try_acquire_tx_credit_inner` for why splitting them
+        // cross-contaminates lifetimes. The ref is released before
+        // the guard is constructed so the guard's Drop cannot
+        // deadlock re-acquiring it.
+        let (epoch, first_seq, boundary) = match self.streams.get(&stream_id) {
+            None => return TxSendAdmit::StreamClosed,
+            Some(state) => {
+                let epoch = state.epoch();
+                if epoch != expected_epoch {
+                    return TxSendAdmit::StreamClosed;
+                }
+                if !state.try_acquire_tx_credit(bytes) {
+                    return TxSendAdmit::WindowFull;
+                }
+                let first_seq = state.reserve_tx_seq_range(seqs);
+                let boundary = (reliable && state.promote_tx_at(first_seq)).then_some(first_seq);
+                (epoch, first_seq, boundary)
+            }
+        };
+        TxSendAdmit::Admitted {
+            guard: TxSlotGuard {
+                session: Arc::clone(self),
+                stream_id,
+                epoch,
+                bytes,
+                active: true,
+            },
+            first_seq,
+            boundary,
+        }
+    }
 }
 
 /// Outcome of [`NetSession::close_stream_for_lifetime`].
@@ -888,6 +978,40 @@ pub enum TxAdmit {
     /// replaced. Never retryable with the same handle — the stream
     /// id may be open on the successor, but it is a different
     /// lifetime with its own credit, sequence space and config.
+    SessionSuperseded,
+}
+
+/// Outcome of [`NetSession::try_admit_stream_send`].
+///
+/// The three refusals are deliberately distinct facts and a caller
+/// must not collapse them: [`Self::WindowFull`] is the only one a
+/// retry can clear, [`Self::StreamClosed`] says this lifetime is
+/// over (retrying needs a new handle, and the id may belong to a
+/// successor), and [`Self::SessionSuperseded`] says the whole
+/// session incarnation the caller addressed has been replaced —
+/// its credit, sequence space and config are gone, so a retry
+/// against the same handle can only ever address the wrong stream.
+#[derive(Debug)]
+pub enum TxSendAdmit {
+    /// Admission succeeded. The guard holds the group's byte credit,
+    /// `first_seq..first_seq + seqs` are this send's and no other's,
+    /// and `boundary` is `Some(first_seq)` when this call also won
+    /// the stream's reliable-mode boundary claim.
+    Admitted {
+        /// RAII credit holder for the whole group.
+        guard: TxSlotGuard,
+        /// First of the reserved consecutive sequences.
+        first_seq: u64,
+        /// The reliable-mode boundary this send claimed, if any.
+        boundary: Option<u64>,
+    },
+    /// `tx_credit_remaining` was below the requested bytes. Nothing
+    /// was reserved. `backpressure_events` was incremented.
+    WindowFull,
+    /// No stream is open under that id on this session, or the live
+    /// one is a different lifetime than `expected_epoch`.
+    StreamClosed,
+    /// The caller addressed a session incarnation this is not.
     SessionSuperseded,
 }
 
@@ -1311,15 +1435,19 @@ impl NetSession {
     ///
     /// Resetting the receive tracking is what the reset is *for*: the
     /// gap will never be filled, and the peer may reopen the id from
-    /// sequence 0. The receive-credit ledger stays as it is —
-    /// cumulative-consumed is monotonic by contract, and a reopened
-    /// sender clamps our grants to its own send watermark.
+    /// sequence 0. That is a whole receive LIFETIME ending, so the
+    /// receive-boundary authority goes with the cursors — see
+    /// [`StreamState::reset_rx_lifetime`] — and the next lifetime's
+    /// `MODE_BOUNDARY` statement is the one that governs. The
+    /// receive-credit ledger stays as it is — cumulative-consumed is
+    /// monotonic by contract, and a reopened sender clamps our
+    /// grants to its own send watermark.
     ///
     /// Idempotent; a no-op for a stream that does not exist.
     pub fn reset_rx_stream(&self, stream_id: u64) {
         if let Some(state) = self.streams.get(&stream_id) {
             state.reset_rx_seq();
-            state.with_reliability(|r| r.reset_rx());
+            state.reset_rx_lifetime();
             // The gap those frames are queued behind is the gap the
             // peer just gave up on, so it never fills. Releasing
             // them now would be delivery out of order; keeping them
@@ -1466,18 +1594,35 @@ impl NetSession {
     /// the oldest if still over cap. Returns the number of streams
     /// evicted. Called from the session owner's heartbeat loop.
     ///
-    /// **NR4: an eviction that discards ACK-owned data is terminal.**
-    /// A gapped reliable stream can be holding arrivals this receiver
-    /// has already acknowledged — after which the sender has dropped
-    /// its only copy — so dropping the `StreamState` destroys data
-    /// nothing can rebuild. Pre-fix both removal branches did exactly
-    /// that behind an eviction log, and left the session's
-    /// `inorder_held` fast-path count counting frames that no longer
-    /// existed. Now the hold is released through the one path allowed
-    /// to discard it (so the count stays true) and the stream's
-    /// receive half ends typed: the peer gets a `StreamReset` and
-    /// fails its pending read instead of waiting out a timeout for
-    /// bytes this node threw away.
+    /// **NR4 / R4-9: an eviction that discards ACCEPTED data is
+    /// terminal.** A gapped reliable stream can be holding arrivals
+    /// this receiver has already acknowledged — after which the
+    /// sender has dropped its only copy — so dropping the
+    /// `StreamState` destroys data nothing can rebuild. Pre-fix both
+    /// removal branches did exactly that behind an eviction log, and
+    /// left the session's `inorder_held` fast-path count counting
+    /// frames that no longer existed. Now the hold is released
+    /// through the one path allowed to discard it (so the count
+    /// stays true) and the stream's receive half ends typed: the
+    /// peer gets a `StreamReset` and fails its pending read instead
+    /// of waiting out a timeout for bytes this node threw away.
+    ///
+    /// **The obligation is acceptance, not buffering.** An arrival
+    /// is accepted by the reliability mode (which records it in the
+    /// range index the SACK is built from) BEFORE it reaches the
+    /// in-order hold, and the ingress releases its map guard in
+    /// between. An eviction landing in that interval finds an empty
+    /// hold and a range index that already says "I have sequence n"
+    /// — and the feedback tick may already have told the sender so,
+    /// which is the moment its descriptor goes away. Keying the
+    /// terminal on the discarded hold ALONE therefore lost exactly
+    /// the frames whose loss cannot be recovered: positively
+    /// acknowledged, never delivered, no terminal, and
+    /// `hold_in_order_frame` then refusing the absent stream with
+    /// nothing but a log. Both branches now ask
+    /// [`ReliabilityMode::rx_accepted_undelivered`] as well, so the
+    /// receive half ends typed for accepted bytes whether or not
+    /// they had reached the buffer yet.
     pub fn evict_idle_streams(
         &self,
         max_idle: Duration,
@@ -1501,14 +1646,16 @@ impl NetSession {
                 self.recently_closed.insert(sid, SystemClock::now());
                 evicted += 1;
                 let discarded = self.forget_in_order_hold(&state);
-                if discarded > 0 {
+                let accepted_undelivered = state.with_reliability(|r| r.rx_accepted_undelivered());
+                if discarded > 0 || accepted_undelivered {
                     self.note_receive_terminal(sid);
                     tracing::warn!(
                         stream_id = format!("{:#x}", sid),
                         reason = reason_tag,
                         discarded,
-                        "stream evicted: idle timeout discarded acknowledged \
-                         arrivals held in order, so its receive half ends typed"
+                        accepted_undelivered,
+                        "stream evicted: idle timeout discarded arrivals this \
+                         receiver had accepted, so its receive half ends typed"
                     );
                 } else {
                     tracing::debug!(
@@ -1553,9 +1700,15 @@ impl NetSession {
                             // NR4: the cap branch is the sharper half
                             // — it can take a gapped stream that is
                             // still owed recovery, not merely one the
-                            // sender has given up on.
+                            // sender has given up on. R4-9: and it is
+                            // the branch that fires with an EMPTY
+                            // hold, because the frame whose
+                            // acceptance opened the gap is still on
+                            // its way to `hold_in_order_frame`.
                             let discarded = self.forget_in_order_hold(&state);
-                            if discarded > 0 {
+                            let accepted_undelivered =
+                                state.with_reliability(|r| r.rx_accepted_undelivered());
+                            if discarded > 0 || accepted_undelivered {
                                 self.note_receive_terminal(sid);
                             }
                             tracing::warn!(
@@ -1564,6 +1717,7 @@ impl NetSession {
                                 total_streams = self.streams.len(),
                                 max_streams = max_streams,
                                 discarded,
+                                accepted_undelivered,
                                 "stream evicted: max_streams cap"
                             );
                         }
@@ -2371,9 +2525,20 @@ impl StreamState {
         // the sender's if it stated one, and otherwise the
         // contiguous frontier — the only sequence this receiver can
         // name without claiming receipt of something it never got.
+        //
+        // R4-1: that "otherwise" used to be the previous mode's
+        // HIGH-WATER mark plus one, which claims receipt of every
+        // hole below it. A producer taking reliability per handle
+        // puts reliable sequences between fire-and-forget ones on
+        // one shared space, so the hole can be reliable — held by a
+        // sender that would have rebuilt it — and conceding it is a
+        // false ACK for data nobody now owns.
+        // `ReliabilityMode::rx_resume_point` answers with the
+        // frontier instead, so the hole is NACKed and a stated
+        // boundary is still free to raise the concession later.
         let boundary = match signalled {
             Some(boundary) => boundary,
-            None => guard.rx_accepted_high_water().map_or(0, |seen| seen + 1),
+            None => guard.rx_resume_point().unwrap_or(0),
         };
         let mut upgraded =
             create_reliability_mode(true, ReliableStream::max_pending_for_window(self.tx_window));
@@ -2945,6 +3110,23 @@ impl StreamState {
         self.tx_seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Reserve `count` CONSECUTIVE send sequences and return the
+    /// first. `count == 0` reserves one.
+    ///
+    /// The indivisible form of [`Self::next_tx_seq`], for a message
+    /// whose pieces are only a message if their sequences are
+    /// consecutive. Taking them one at a time lets a concurrent
+    /// send on the same stream land inside the run, which every
+    /// receiver refuses and no retransmission repairs. One
+    /// `fetch_add`, so the reservation is atomic without any lock
+    /// the caller could hold across an await.
+    #[inline]
+    pub fn reserve_tx_seq_range(&self, count: u32) -> u64 {
+        self.touch();
+        self.tx_seq
+            .fetch_add(u64::from(count.max(1)), Ordering::Relaxed)
+    }
+
     /// Get the current TX sequence number
     #[inline]
     pub fn current_tx_seq(&self) -> u64 {
@@ -2972,6 +3154,52 @@ impl StreamState {
     pub fn reset_rx_seq(&self) {
         self.touch();
         self.rx_seq.store(0, Ordering::Relaxed);
+    }
+
+    /// End the RECEIVE lifetime this stream has been tracking: drop
+    /// the mode's receive cursor AND the receive-boundary authority,
+    /// so the next lifetime's own statement governs.
+    ///
+    /// **The boundary is part of the receive lifetime, not of the
+    /// stream id.** `rx_mode_boundary`/`rx_boundary_signalled` name
+    /// where the PEER's send half became reliable, and the first
+    /// stated boundary is final *within one lifetime* — that is what
+    /// stops a peer conceding reliable sequences this receiver is
+    /// already holding. A reset says the lifetime those sequences
+    /// belonged to is over and the peer may reopen the id from zero,
+    /// so keeping its boundary latched made `promote_rx` treat the
+    /// NEXT lifetime's `MODE_BOUNDARY` as that forbidden second
+    /// statement and ignore it: cursors restarted at zero while the
+    /// feedback half still answered to the previous statement, and a
+    /// fresh consumer that accepted the new boundary got an ACK
+    /// stream that never conceded the new lifetime's
+    /// fire-and-forget prefix.
+    ///
+    /// The SEND half is untouched — `reliable_mode` (which owns the
+    /// retransmit window), `tx_seq` and `tx_mode_boundary` all
+    /// belong to what THIS side sends, and a peer's reset is not a
+    /// statement about them. The boundary returns to the unstated
+    /// value for the mode the receive half is in, exactly as
+    /// [`NetSession::implicit_stream_state`] starts it, so a
+    /// reliable stream keeps a coherent `rx_stream_mode` (assumed
+    /// boundary 0 against a cursor at 0) instead of claiming to be
+    /// fire-and-forget while reliable machinery tracks it.
+    ///
+    /// Taken under the reliability lock together with the cursor
+    /// reset: an arrival that promotes concurrently then sees both
+    /// halves of one lifetime, never a new cursor against an old
+    /// boundary.
+    pub fn reset_rx_lifetime(&self) {
+        let mut guard = self.reliability.lock();
+        guard.reset_rx();
+        let unstated = if self.reliable_mode.load(Ordering::Acquire) {
+            0
+        } else {
+            u64::MAX
+        };
+        self.rx_mode_boundary.store(unstated, Ordering::Release);
+        self.rx_boundary_signalled.store(false, Ordering::Release);
+        drop(guard);
     }
 
     /// Access the reliability mode
@@ -5048,5 +5276,399 @@ mod tests {
         let unbounded = StreamState::new_full(false, 1, 0);
         unbounded.note_tx_bytes_sent(1234);
         assert_eq!(unbounded.tx_bytes_sent(), 0);
+    }
+
+    /// R4-2: the receive boundary is part of the receive LIFETIME.
+    ///
+    /// Her schedule: a lifetime that stated "reliable from 0" ends
+    /// with `reset_rx_stream`, and the peer's next lifetime states
+    /// "reliable from 1" after losing its fire-and-forget 0. The
+    /// second statement is the one that governs, and the send half
+    /// — sequence counter and unacknowledged descriptors — is not a
+    /// party to any of it.
+    ///
+    /// Inverse: drop `state.reset_rx_lifetime()` back to a bare
+    /// `with_reliability(|r| r.reset_rx())` and the latched
+    /// `rx_boundary_signalled` makes `promote_rx` discard the new
+    /// statement as a forbidden second one — the cursor restarts at
+    /// 0 while feedback still answers to boundary 0, so the ACK
+    /// never concedes the new lifetime's fire-and-forget prefix
+    /// (ACK 0 where 2 is owed).
+    #[test]
+    fn a_reset_receive_lifetime_answers_to_the_next_boundary_statement() {
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9104".parse().unwrap()),
+            4,
+            false,
+        );
+        const ID: u64 = 73;
+
+        // Lifetime 1: the peer stated reliable-from-0 and we took it.
+        session.get_or_create_stream_for_packet(ID, true, Some(0));
+        {
+            let old = session.try_stream(ID).expect("stream");
+            assert!(old.with_reliability(|r| r.on_receive(0)));
+            assert_eq!(
+                old.rx_stream_mode(),
+                StreamMode::Reliable {
+                    boundary: 0,
+                    signalled: true
+                }
+            );
+            // One unacknowledged packet of OUR OWN on the send half.
+            old.with_reliability(|r| {
+                r.on_send(Arc::new(RetransmitDescriptor {
+                    seq: 0,
+                    stream_id: ID,
+                    events: vec![Bytes::from_static(b"ours")],
+                    flags: crate::protocol::PacketFlags::RELIABLE,
+                    fragment: None,
+                }))
+            });
+            assert_eq!(old.next_tx_seq(), 0);
+        }
+
+        session.reset_rx_stream(ID);
+
+        // Lifetime 2: reliable from 1, its 0 lost as fire-and-forget.
+        session.get_or_create_stream_for_packet(ID, true, Some(1));
+        let new = session.try_stream(ID).expect("stream");
+        assert_eq!(
+            new.rx_stream_mode(),
+            StreamMode::Reliable {
+                boundary: 1,
+                signalled: true
+            },
+            "the boundary that governs is the one this receive lifetime \
+             was told, not the one its predecessor was"
+        );
+        assert!(new.with_reliability(|r| r.on_receive(1)));
+        assert_eq!(
+            new.with_reliability(|r| r.rx_ack_seq()),
+            2,
+            "sequence 1 arrived in order above a conceded fire-and-forget 0"
+        );
+        assert!(
+            new.with_reliability(|r| r.build_nack()).is_none(),
+            "a conceded fire-and-forget prefix is not a reliable gap to NACK"
+        );
+
+        // And the send half never moved.
+        assert_eq!(
+            new.current_tx_seq(),
+            1,
+            "a peer's receive reset does not rewind our sequence counter"
+        );
+        assert!(
+            new.with_reliability(|r| r.has_pending()),
+            "nor does it discard descriptors the peer is still owed"
+        );
+    }
+
+    /// R4-9: a positively SACKed arrival keeps delivery-or-terminal
+    /// ownership across eviction-before-hold.
+    ///
+    /// The production interval: ingress accepts out-of-order
+    /// reliable 1 under this lifetime and releases the state guard,
+    /// so the frame is in flight to `hold_in_order_frame` and the
+    /// reorder hold is still EMPTY. The feedback tick emits the
+    /// positive SACK for it, which is DELIVERED to the sender here —
+    /// that is the moment the sender's copy goes away, and it is
+    /// what makes the loss unrecoverable rather than merely local.
+    /// Cap eviction then removes the stream. Pre-fix the terminal
+    /// was keyed on the discarded hold alone, which is zero in this
+    /// interval, so nothing was owed: the sender had released
+    /// sequence 1, the consumer never got it, and
+    /// `hold_in_order_frame` refused the absent stream with a log.
+    ///
+    /// Inverse: remove `accepted_undelivered` from either eviction
+    /// branch's condition and the terminal disappears while the
+    /// SACK still leaves the sender with nothing to resend.
+    #[test]
+    fn a_sacked_arrival_evicted_before_its_hold_still_owes_a_terminal() {
+        let receiver = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9105".parse().unwrap()),
+            4,
+            false,
+        );
+        let sender = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9106".parse().unwrap()),
+            4,
+            false,
+        ));
+        const GAPPED: u64 = 73;
+        const CLEAN: u64 = 74;
+
+        // Receiver: reliable 0 is lost in flight, reliable 1 is
+        // accepted out of order. Nothing is in the hold yet.
+        receiver.get_or_create_stream_for_packet(GAPPED, true, Some(0));
+        assert!(receiver
+            .try_stream(GAPPED)
+            .expect("stream")
+            .with_reliability(|r| r.on_receive(1)));
+        assert!(
+            !receiver.holds_in_order(GAPPED),
+            "the defect's interval is exactly the one where acceptance has \
+             happened and insertion has not"
+        );
+        // Control: a stream whose every arrival was delivered in
+        // order owes nothing when it is evicted.
+        receiver.get_or_create_stream_for_packet(CLEAN, true, Some(0));
+        assert!(receiver
+            .try_stream(CLEAN)
+            .expect("stream")
+            .with_reliability(|r| r.on_receive(0)));
+
+        // Sender: both sequences are still in its retransmit window.
+        sender.open_stream_full(GAPPED, true, 1, 4096);
+        for seq in [0u64, 1] {
+            sender
+                .try_stream(GAPPED)
+                .expect("stream")
+                .with_reliability(|r| {
+                    r.on_send(Arc::new(RetransmitDescriptor {
+                        seq,
+                        stream_id: GAPPED,
+                        events: vec![Bytes::from_static(b"payload")],
+                        flags: crate::protocol::PacketFlags::RELIABLE,
+                        fragment: None,
+                    }))
+                });
+        }
+
+        // DELIVER THE SACK: the receiver's own feedback build, applied
+        // through the sender's own ack path.
+        let reports = receiver.collect_gap_reports(true, 8);
+        let report = reports
+            .iter()
+            .find(|r| r.stream_id == GAPPED)
+            .expect("a gapped stream reports its gap");
+        assert_eq!(report.ack_seq, 0, "nothing is contiguously received yet");
+        assert_eq!(
+            report.ranges,
+            vec![(1, 2)],
+            "sequence 1 is positively acknowledged to its sender"
+        );
+        sender
+            .try_stream(GAPPED)
+            .expect("stream")
+            .with_reliability(|r| r.on_ack_ranges(report.ack_seq, &report.ranges));
+
+        // The sender's recovery surface now holds 0 and only 0.
+        let recoverable: Vec<u64> =
+            sender
+                .try_stream(GAPPED)
+                .expect("stream")
+                .with_reliability(|r| {
+                    r.on_nack(&crate::protocol::NackPayload {
+                        next_expected: 0,
+                        missing_bitmap: 0b1,
+                    })
+                    .iter()
+                    .map(|d| d.seq)
+                    .collect()
+                });
+        assert_eq!(
+            recoverable,
+            vec![0],
+            "the SACK released sequence 1: no later NACK can bring it back"
+        );
+
+        // Cap eviction takes both streams, both with empty holds.
+        assert_eq!(
+            receiver.evict_idle_streams(Duration::from_secs(3600), 0, "cap_witness"),
+            2
+        );
+        assert_eq!(
+            receiver.take_receive_terminals(),
+            vec![GAPPED],
+            "an eviction that throws away an arrival this receiver had \
+             accepted — and told its sender it had — ends that stream's \
+             receive half typed; the stream that delivered everything it \
+             accepted owes nothing"
+        );
+    }
+
+    /// R4-1 (wire half): an UNSIGNALLED promotion concedes only the
+    /// prefix it can prove arrived.
+    ///
+    /// Her schedule is a producer that takes reliability per handle
+    /// on one shared sequence space: fire-and-forget 0, reliable 1
+    /// LOST, fire-and-forget 2, then reliable 3, and no sender
+    /// states a boundary anywhere. Conceding the high-water mark
+    /// acknowledges sequence 1 — whose sender is still holding a
+    /// descriptor for it — and the stream then runs on with a
+    /// reliable record silently missing. The conservative frontier
+    /// NACKs it instead, so the hole is the sender's to rebuild.
+    ///
+    /// Sequence 2 is named missing as well, and that is the honest
+    /// answer rather than a second defect: nothing in this mode
+    /// retains the runs that would prove 2 arrived, and a producer
+    /// that states its boundary raises the concession over both
+    /// (the control below, and `ensure_reliable_at`). What a
+    /// receiver may not do is claim receipt to make the bookkeeping
+    /// tidy.
+    ///
+    /// Inverse: make `FireAndForget::on_receive` advance its
+    /// frontier to `seq + 1` for any `seq` at or above it — the
+    /// high-water behaviour — and the ACK jumps to 4 with reliable
+    /// 1 never received.
+    #[test]
+    fn an_unsignalled_promotion_never_concedes_a_hole_it_cannot_prove_arrived() {
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9107".parse().unwrap()),
+            4,
+            false,
+        );
+        const MIXED: u64 = 73;
+        const CONTIGUOUS: u64 = 74;
+
+        for (seq, reliable) in [(0u64, false), (2, false), (3, true)] {
+            session.get_or_create_stream_for_packet(MIXED, reliable, None);
+            let state = session.try_stream(MIXED).expect("stream");
+            assert!(state.with_reliability(|r| r.on_receive(seq)));
+            state.update_rx_seq(seq);
+        }
+        let state = session.try_stream(MIXED).expect("stream");
+        assert_eq!(
+            state.with_reliability(|r| r.rx_ack_seq()),
+            1,
+            "sequence 1 was never received, so nothing may acknowledge it"
+        );
+        let missing: Vec<u64> = state
+            .with_reliability(|r| r.build_nack())
+            .expect("the hole is reported")
+            .missing_sequences()
+            .collect();
+        assert!(
+            missing.contains(&1),
+            "the hole is NACKed, which is what lets its sender rebuild it: \
+             {missing:?}"
+        );
+        drop(state);
+
+        // Control: an unbroken fire-and-forget history promotes
+        // exactly where it always did — the frontier and the
+        // high-water mark agree when nothing was lost, so the
+        // conceded prefix is the whole of it and there is no gap to
+        // report.
+        for (seq, reliable) in [(0u64, false), (1, false), (2, false), (3, true)] {
+            session.get_or_create_stream_for_packet(CONTIGUOUS, reliable, None);
+            let state = session.try_stream(CONTIGUOUS).expect("stream");
+            assert!(state.with_reliability(|r| r.on_receive(seq)));
+        }
+        let state = session.try_stream(CONTIGUOUS).expect("stream");
+        assert_eq!(state.with_reliability(|r| r.rx_ack_seq()), 4);
+        assert!(
+            state.with_reliability(|r| r.build_nack()).is_none(),
+            "a fire-and-forget prefix that arrived whole is not a gap"
+        );
+    }
+
+    /// R5-N1 / R4-1 (send side): one send owns a CONTIGUOUS
+    /// sequence range, and the reliable boundary is claimed by the
+    /// lowest reliable sequence because the claim happens under the
+    /// allocating lookup.
+    ///
+    /// Inverse: allocate with `next_tx_seq()` per piece, or claim
+    /// the boundary after the allocation returns, and a concurrent
+    /// send can take a sequence inside the group / win the claim
+    /// with a higher sequence than the one it is meant to name.
+    #[test]
+    fn a_group_admission_reserves_its_whole_range_and_the_lowest_boundary() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9108".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let epoch = session.open_stream_full(11, true, 1, 64);
+
+        // Every refusal is its own fact, and none of them consumes
+        // credit, a sequence, or the boundary claim.
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid ^ 1, epoch, 1, 3, true),
+            TxSendAdmit::SessionSuperseded
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid, epoch + 1, 1, 3, true),
+            TxSendAdmit::StreamClosed
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(404, sid, epoch, 1, 3, true),
+            TxSendAdmit::StreamClosed
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid, epoch, 65, 1, true),
+            TxSendAdmit::WindowFull
+        ));
+        {
+            let state = session.try_stream(11).expect("stream");
+            assert_eq!(state.current_tx_seq(), 0, "no refusal burned a sequence");
+            assert_eq!(state.tx_credit_remaining(), 64);
+            assert!(!state.tx_promoted(), "no refusal claimed the boundary");
+        }
+
+        let (group, first_seq, boundary) =
+            match session.try_admit_stream_send(11, sid, epoch, 30, 3, true) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                other => panic!("expected admission, got {other:?}"),
+            };
+        assert_eq!(first_seq, 0);
+        assert_eq!(
+            boundary,
+            Some(0),
+            "the first reliable send on the stream states the boundary"
+        );
+        assert_eq!(
+            session
+                .try_stream(11)
+                .expect("stream")
+                .tx_credit_remaining(),
+            34,
+            "the whole group's bytes are charged once"
+        );
+
+        // The next send starts past the WHOLE group — a concurrent
+        // single-packet send cannot land between pieces 0 and 2 —
+        // and it cannot restate a boundary already claimed.
+        let (second, second_seq, second_boundary) =
+            match session.try_admit_stream_send(11, sid, epoch, 10, 2, true) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                other => panic!("expected admission, got {other:?}"),
+            };
+        assert_eq!(
+            second_seq, 3,
+            "sequences 0, 1 and 2 belong to the first group and nothing else"
+        );
+        assert_eq!(
+            second_boundary, None,
+            "the boundary is claimed once per lifetime, by the lowest \
+             reliable sequence"
+        );
+
+        // Neither group reached the wire, so both refund.
+        drop(group);
+        drop(second);
+        assert_eq!(
+            session
+                .try_stream(11)
+                .expect("stream")
+                .tx_credit_remaining(),
+            64
+        );
     }
 }

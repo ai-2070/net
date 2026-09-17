@@ -6,7 +6,6 @@
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -299,15 +298,33 @@ pub trait ReliabilityMode: Send + Sync {
     /// Default no-op (fire-and-forget tracks no receive state).
     fn reset_rx(&mut self) {}
 
-    /// Receiver-side: the highest sequence this mode has accepted on
-    /// this stream, or `None` when it has accepted none.
+    /// Receiver-side: the receive cursor a REPLACEMENT mode must
+    /// resume at — the first sequence this mode cannot prove
+    /// arrived. `None` when nothing has arrived at all.
     ///
-    /// Read by `StreamState::ensure_reliable` so a reliable mode
-    /// replacing a fire-and-forget one resumes at the sequence the
-    /// peer is actually sending. Default `None` — "nothing accepted"
-    /// is the safe answer for a mode that tracks no receive state,
-    /// because it leaves the replacement's cursor at zero.
-    fn rx_accepted_high_water(&self) -> Option<u64> {
+    /// Read by `StreamState::ensure_reliable` when a reliable
+    /// arrival lands on a stream whose sender never signalled
+    /// [`crate::protocol::PacketFlags::MODE_BOUNDARY`]. Everything
+    /// below the answer is treated as a conceded fire-and-forget
+    /// prefix, which is a claim of receipt: it is never NACKed and
+    /// the cumulative ack passes over it. So the answer must be a
+    /// CONTIGUOUS frontier and never a high-water mark.
+    ///
+    /// **R4-1: a high-water mark here is a false ACK.** A producer
+    /// that takes reliability per handle can put reliable 1 between
+    /// fire-and-forget 0 and 2 on one shared sequence space. If 1
+    /// is lost, answering "2 arrived, so resume at 3" concedes a
+    /// reliable sequence whose sender is still holding a descriptor
+    /// for it and would have rebuilt it on the first NACK.
+    /// Answering "1 is the first I cannot prove" NACKs exactly the
+    /// hole, and a conforming producer's later stated boundary
+    /// still raises the concession to where it belongs
+    /// ([`Self::concede_rx_below`]).
+    ///
+    /// Default `None` — "nothing accepted" is the safe answer for
+    /// a mode that tracks no receive state, because it leaves the
+    /// replacement's cursor at zero.
+    fn rx_resume_point(&self) -> Option<u64> {
         None
     }
 
@@ -339,6 +356,30 @@ pub trait ReliabilityMode: Send + Sync {
         false
     }
 
+    /// Receiver-side: whether this mode is still holding receive
+    /// obligations for sequences it has already ACCEPTED — the
+    /// out-of-order runs above its cumulative frontier.
+    ///
+    /// **R4-9: acceptance, not buffering, is what creates the
+    /// obligation.** An accepted out-of-order sequence is reported
+    /// to its sender as positively received — cumulatively by
+    /// [`Self::rx_ack_seq`] and by range through
+    /// [`Self::build_ack_ranges`] — and once that SACK lands the
+    /// sender drops the only copy. Between acceptance here and the
+    /// frame's insertion into the session's in-order hold there is
+    /// an interval where the bytes are owned by neither: the hold
+    /// is empty, so "is anything buffered" answers no, while the
+    /// range index already says "I have it". Anything that destroys
+    /// the receive half in that interval — eviction, closure —
+    /// must read THIS, or it discards acknowledged data and leaves
+    /// the peer waiting on a delivery nothing will ever make.
+    ///
+    /// Default `false`: a mode that tracks no receive ranges
+    /// acknowledges nothing positively, so it owes nothing.
+    fn rx_accepted_undelivered(&self) -> bool {
+        false
+    }
+
     /// Get the name of this reliability mode
     fn name(&self) -> &'static str;
 }
@@ -353,13 +394,27 @@ pub trait ReliabilityMode: Send + Sync {
 /// - Metrics/telemetry
 #[derive(Debug, Default)]
 pub struct FireAndForget {
-    /// Highest sequence received, and whether any has been. Read by
-    /// the fire-and-forget → reliable upgrade
-    /// ([`crate::session::StreamState::ensure_reliable`]) to place
-    /// the replacement's receive cursor: sequence 0 having arrived
-    /// and nothing having arrived are different facts, so the
-    /// high-water mark alone cannot carry it.
-    last_seq: AtomicU64,
+    /// The first sequence this receiver cannot prove arrived: the
+    /// CONTIGUOUS frontier of what the peer has sent on this
+    /// stream, and the cursor a reliable replacement resumes at
+    /// ([`ReliabilityMode::rx_resume_point`]).
+    ///
+    /// A high-water mark is the wrong fact for that handoff: it
+    /// cannot tell "0, 1 and 2 all arrived" from "0 and 2 arrived
+    /// and 1 was lost", and the replacement treats everything
+    /// below its cursor as received. One counter answers both
+    /// questions this mode is asked — whether anything arrived
+    /// (`received`) and how far the arrivals are unbroken — for
+    /// one compare and one increment per packet, which is what a
+    /// mode whose contract is "no receive bookkeeping" can afford.
+    /// Out-of-order arrivals above the frontier are accepted and
+    /// delivered exactly as before; they simply do not advance it,
+    /// because nothing here retains the runs that would prove the
+    /// hole was filled.
+    next_contiguous: u64,
+    /// Whether anything has arrived. Sequence 0 having arrived and
+    /// nothing having arrived are different facts, and a frontier
+    /// of 0 is both.
     received: bool,
 }
 
@@ -378,14 +433,25 @@ impl ReliabilityMode for FireAndForget {
 
     #[inline]
     fn on_receive(&mut self, seq: u64) -> bool {
-        self.last_seq.fetch_max(seq, Ordering::Relaxed);
         self.received = true;
+        if seq == self.next_contiguous {
+            self.next_contiguous += 1;
+        }
         true // Always accept
     }
 
     #[inline]
-    fn rx_accepted_high_water(&self) -> Option<u64> {
-        self.received.then(|| self.last_seq.load(Ordering::Relaxed))
+    fn rx_resume_point(&self) -> Option<u64> {
+        self.received.then_some(self.next_contiguous)
+    }
+
+    /// The peer gave up on its send half and may reopen this id
+    /// from sequence 0, so the frontier the next lifetime is
+    /// measured against is a fresh one.
+    #[inline]
+    fn reset_rx(&mut self) {
+        self.next_contiguous = 0;
+        self.received = false;
     }
 
     #[inline]
@@ -1503,6 +1569,15 @@ impl ReliabilityMode for ReliableStream {
         !self.pending.is_empty()
     }
 
+    /// The accepted-but-undelivered set is exactly the out-of-order
+    /// range index: every run in it was accepted above the
+    /// cumulative frontier, is reported by `build_ack_ranges`, and
+    /// has not been handed on in order.
+    #[inline]
+    fn rx_accepted_undelivered(&self) -> bool {
+        self.has_gaps()
+    }
+
     /// Only the receive half: `pending`, the RTO/cwnd estimators and
     /// the give-up flag all describe what WE sent, and the peer's
     /// reset says nothing about that.
@@ -1511,12 +1586,12 @@ impl ReliabilityMode for ReliableStream {
         self.received_ranges.clear();
     }
 
-    /// The contiguous frontier: everything below `next_expected` is
-    /// received, so the highest accepted contiguous sequence is one
-    /// below it. `None` before anything arrives.
+    /// `next_expected` already IS the contiguous frontier: the
+    /// range index holds everything accepted above it, so the first
+    /// sequence this mode cannot prove arrived is exactly it.
     #[inline]
-    fn rx_accepted_high_water(&self) -> Option<u64> {
-        self.next_expected.checked_sub(1)
+    fn rx_resume_point(&self) -> Option<u64> {
+        Some(self.next_expected)
     }
 
     fn resume_rx_at(&mut self, next_expected: u64) {
