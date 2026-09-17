@@ -4780,7 +4780,7 @@ jobs:
             --junit "$RUNNER_TEMP/rtc-junit.xml" --multi \
             --floor rtc_loopback=5 \
             --floor rtc_backpressure=7 \
-            --floor rtc_repairs=49 \
+            --floor rtc_repairs=56 \
             --floor rtc_ice_telemetry=6 \
             --floor rtc_routed_restore=5 \
             --floor rtc_install_race=8 \
@@ -4828,6 +4828,13 @@ jobs:
           rtc_repairs:the_rtc_prefilter_admits_exactly_what_dispatch_accepts
           rtc_repairs:a_reliable_stream_delivers_every_value_and_reorders_by_seq
           rtc_repairs:a_locally_deactivated_session_still_receives_its_peers_frames
+          rtc_repairs:one_expiry_pass_retains_every_distinct_terminal_owner
+          rtc_repairs:a_reassembly_loss_settles_its_own_half_not_the_reverse_direction
+          rtc_repairs:a_fire_and_forget_reassembly_loss_is_a_permitted_loss
+          rtc_repairs:a_predecessor_fragment_group_cannot_destroy_its_successor
+          rtc_repairs:a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits
+          rtc_repairs:concurrent_sends_cannot_break_a_fragment_groups_sequence_ownership
+          rtc_repairs:an_oversized_send_is_refused_rather_than_evicting_a_descriptor
           rtc_repairs:a_fire_and_forget_stream_loses_packets_and_never_retransmits
           rtc_repairs:the_advisory_refreshes_for_a_queued_peer_the_pump_never_touches
           rtc_repairs:the_advisory_decays_for_an_idle_peer_with_an_empty_queue
@@ -5146,8 +5153,8 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          if [ "$total" -lt 266 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 266 — \
+          if [ "$total" -lt 308 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 308 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
