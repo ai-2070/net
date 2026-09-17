@@ -1,0 +1,22 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+    Blocking waiting for file lock on build directory
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+error[E0026]: variant `LeafEvent::StreamData` does not have a field named `peer_node`
+   --> src\node.rs:226:17
+    |
+226 |                 peer_node,
+    |                 ^^^^^^^^^ variant `LeafEvent::StreamData` does not have this field
+
+error[E0559]: variant `LeafEvent::StreamData` has no field named `peer_node`
+    --> src\node.rs:2664:21
+     |
+2664 |                     peer_node: peer,
+     |                     ^^^^^^^^^ `LeafEvent::StreamData` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+Some errors have detailed explanations: E0026, E0559.
+For more information about an error, try `rustc --explain E0026`.
+error: could not compile `net-mesh-leaf` (lib) due to 2 previous errors
+EXIT=101

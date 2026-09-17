@@ -1,0 +1,11 @@
+--- /c/Users/chief/orca/workspaces/net/.r6leaf-receipts/node.rs.pristine	2026-09-17 10:58:45.542580900 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-17 11:01:58.816029700 +0200
+@@ -93,8 +93,6 @@
+     /// the packet was opened on; what was missing was carrying it
+     /// this far.
+     StreamData {
+-        /// The peer whose session delivered this.
+-        peer_node: NodeId,
+         /// That session's incarnation.
+         ///
+         /// Provenance, not part of any filter key: a consumer can

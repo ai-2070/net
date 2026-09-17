@@ -1,0 +1,16 @@
+--- /c/Users/chief/orca/workspaces/net/.r6leaf-receipts/node.rs.pristine	2026-09-17 10:58:45.542580900 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-17 10:59:21.851227500 +0200
+@@ -1796,13 +1796,6 @@
+         // and nothing recorded yet, so this is a refusal before
+         // success rather than a rollback.
+         let carrier = route_stream_id(key.1);
+-        if self.stream_kinds.get(&(peer, carrier)) == Some(&StreamKind::Stream) {
+-            return Err(LeafError::Session(format!(
+-                "the reply carrier for {service:?} on the session with {peer:#x} is stream \
+-                 {carrier:#x}, which this leaf already opened as an application stream; \
+-                 close that stream or call a service whose reply channel does not collide"
+-            )));
+-        }
+         self.subscribe(peer, reply.as_str())?;
+         // Recorded only after the frame is queued: a refused
+         // subscribe must not mark the channel as subscribed, or

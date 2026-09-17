@@ -1,0 +1,91 @@
+# R6Leaf inverse receipts — exact commands, in order, per item.
+#
+# Outputs are RETAINED VERBATIM in the sibling files named on each
+# line; nothing here is an excerpt or a paraphrase. All runs were on
+# Windows with CARGO_INCREMENTAL=0, cwd net/crates/net/leaf unless a
+# line says otherwise. Browser runs used the repo's own driver,
+# CHROMEDRIVER=.tools/cd/chromedriver-win64/chromedriver.exe
+# (ChromeDriver 152.0.7977.82) and
+# CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner.
+#
+# Mutations were applied with `sed -i '<lines>d'` / `sed -i
+# '<line>s/.../.../'` and NOT with Python: these files are CRLF and a
+# Python text round-trip rewrites every line ending, which turns a
+# one-line mutation into a whole-file diff. One such attempt was made,
+# detected, and the file restored from its pre-window copy before any
+# capture was taken.
+
+## R4-3 — a duplicate of a completed fragmented message
+subject                 net/crates/net/leaf/src/frame.rs
+pristine identity       R4-3.identity.txt   (sha256, pre-fmt)
+applied inverse diff    R4-3.inverse.diff   (deletes the completed-group consult in accept_inner)
+command                 cargo test --features mock-control-plane --test kyra_round4_parent -- kyra_completed_fragment
+RED output + exit       R4-3.RED.txt        (exit 101)
+restoration             cp <pristine> frame.rs; sha256 re-verified equal to R4-3.identity.txt
+GREEN output + exit     R4-3.GREEN.txt      (exit 0)
+post-fmt note           R4-3.post-fmt-normalisation.diff — `cargo fmt -p net-mesh-leaf` later added two
+                        trailing commas in the new TEST code only; final identity is in
+                        final-identities.sha256 and the behaviour is re-proven by final-native-suite.txt.
+
+## R4-4 — an admitted application stream shadowed by RPC ownership (her order)
+subject                 net/crates/net/leaf/src/node.rs
+pristine identity       R4-4.identity.txt
+applied inverse diff    R4-4.inverse.diff   (deletes the rpc_reply_carriers reservation in open_stream)
+command                 cargo test --features mock-control-plane --test kyra_round4_parent -- carrier
+RED output + exit       R4-4.RED.txt        (exit 101)
+restoration             cp <pristine> node.rs; sha256 re-verified equal to R4-4.identity.txt
+GREEN output + exit     R4-4.GREEN.txt      (exit 0)
+
+## R4-4, the reverse order — a call taking a carrier the application owns
+subject                 net/crates/net/leaf/src/node.rs
+pristine identity       R4-4b.identity.txt  (same pristine file as R4-4)
+applied inverse diff    R4-4b.inverse.diff  (deletes the application-owner check in ensure_reply_subscription)
+command                 cargo test --features mock-control-plane --lib -- a_call_cannot_take_a_carrier
+RED output + exit       R4-4b.RED.txt       (exit 101)
+restoration             cp <pristine> node.rs; sha256 re-verified
+GREEN output + exit     R4-4b.GREEN.txt     (exit 0)
+
+## R4-10 — the peer-blind wrapper filter (the actual misdelivery), real browser
+subject                 net/crates/net/leaf/src/wasm.rs
+pristine identity       R4-10.identity.txt
+applied inverse diff    R4-10.inverse.diff  (drops the peer term from the on_message filter)
+command                 cargo test --target wasm32-unknown-unknown --features mock-control-plane --lib -- two_streams_under_one_label
+RED output + exit       R4-10.RED.txt       (exit 1; the first peer's inbox holds BOTH peers' nonces)
+restoration             cp <pristine> wasm.rs; sha256 re-verified equal to R4-10.identity.txt
+GREEN output + exit     R4-10.GREEN.txt     (exit 0)
+
+## R4-10 — the core attribution field itself
+subject                 net/crates/net/leaf/src/node.rs
+pristine identity       R4-10-core.identity.txt
+applied inverse diff    R4-10-core.inverse.diff (deletes `peer_node: NodeId` from LeafEvent::StreamData)
+command                 cargo test --features mock-control-plane --no-run
+RED output + exit       R4-10-core.RED.txt  (exit 101; E0026 at node.rs:226 to_json, E0559 at node.rs:2664 the emission)
+                        The attribution is load-bearing rather than decorative: with the field gone the
+                        crate does not build, so neither witness is expressible without it.
+restoration             cp <pristine> node.rs; sha256 re-verified
+GREEN output + exit     R4-10-core.GREEN.txt (exit 0)
+
+## R5-L2 — retained callbacks, real browser
+subject                 net/crates/net/leaf/src/wasm.rs
+pristine identity       R5-L2.identity.txt  (same pristine file as R4-10)
+applied inverse diff    R5-L2.inverse.diff  (deletes the subscription release in LeafStream::close)
+command                 cargo test --target wasm32-unknown-unknown --features mock-control-plane --lib -- repeated_stream_open_and_close
+RED output + exit       R5-L2.RED.txt       (exit 1; listener count 2 where 0 is required after close)
+restoration             cp <pristine> wasm.rs; sha256 re-verified equal to R5-L2.identity.txt
+GREEN output + exit     R5-L2.GREEN.txt     (exit 0)
+
+## Preservation
+frozen-round4-vs-516a45c33.diff
+    `git diff 516a45c33 -- net/crates/net/leaf/tests/kyra_round4_parent.rs` — the file is new at that
+    commit, so the diff is the whole landed probe.
+    `git diff --numstat 516a45c33` for the four earlier reviewer suites is 12 insertions / 0 deletions
+    each: the S6-01 pair() helper hunk and nothing else.
+    `git diff HEAD` for all five suites is EMPTY — byte-identical to the committed copies.
+    `git status --porcelain spikes/kyra` is EMPTY.
+
+## Final state
+final-identities.sha256     sha256 of every file this lane changed
+final-native-suite.txt      cargo test --features mock-control-plane --no-fail-fast  (exit 0)
+final-wasm-check.txt        cargo check --target wasm32-unknown-unknown --features mock-control-plane --all-targets  (exit 0)
+final-wasm-witnesses.txt    cargo test --target wasm32-unknown-unknown --features mock-control-plane --lib  (exit 0)
+applied-repair.diff         the whole applied repair for this lane

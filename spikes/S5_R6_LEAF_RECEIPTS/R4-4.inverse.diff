@@ -1,0 +1,21 @@
+--- /c/Users/chief/orca/workspaces/net/.r6leaf-receipts/node.rs.pristine	2026-09-17 10:58:45.542580900 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-17 10:58:53.805674700 +0200
+@@ -1568,18 +1568,6 @@
+                  (incarnation {incarnation}); reconnect or use another stream id"
+             )));
+         }
+-        // The nRPC reply plane's reservation. Checked before the
+-        // stream registry is written, so a refused open leaves no
+-        // classification behind and the carrier keeps exactly one
+-        // owner.
+-        if self.rpc_reply_carriers.contains(&(peer, stream_id)) {
+-            return Err(LeafError::Session(format!(
+-                "stream {stream_id:#x} on the session with {peer:#x} is reserved by this \
+-                 leaf's nRPC reply plane (it is a reply carrier this leaf subscribed to for \
+-                 its own calls, so a frame arriving there is dispatched as a reply and an \
+-                 application payload would be refused as UnknownCall); use another stream id"
+-            )));
+-        }
+         // The registry is what the receive path classifies on: an
+         // id this leaf opened as a stream is a stream, whatever
+         // bits its hash happens to carry.

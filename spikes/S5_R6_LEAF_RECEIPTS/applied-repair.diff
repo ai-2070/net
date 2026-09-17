@@ -1,0 +1,1585 @@
+# Applied repair diff, R6Leaf lane (R4-3, R4-4, R4-10 leaf half, R5-L2)
+# HEAD at capture: c7963c6deb2a979c989faf384a515c9325ac880a
+
+diff --git a/net/crates/net/leaf/src/frame.rs b/net/crates/net/leaf/src/frame.rs
+index 9d6eebd0c..7526ef4f0 100644
+--- a/net/crates/net/leaf/src/frame.rs
++++ b/net/crates/net/leaf/src/frame.rs
+@@ -96,6 +96,30 @@ pub const MAX_OUTSTANDING_REASSEMBLIES: usize = 8;
+ /// a lost tail does not hold the slot against live traffic.
+ pub const REASSEMBLY_TTL_MS: u64 = 2_000;
+ 
++/// Completed groups remembered long enough to recognise their own
++/// retransmissions.
++///
++/// A sender rebuilds every unacknowledged fragment with a fresh AEAD
++/// counter whenever its acknowledgement is lost, and it cannot know
++/// the group already completed here — the acknowledgement that would
++/// have told it is the one that went missing. Without a record of
++/// what completed, the rebuilt head is indistinguishable from the
++/// first piece of a brand-new group: a fresh partial opens, nothing
++/// ever arrives to finish it because the peer's remaining pieces
++/// were already delivered, and the reassembly deadline then reports
++/// an abandoned reliable group for a message this leaf had **already
++/// handed to its consumer**. That is a terminal invented out of a
++/// successful delivery.
++///
++/// So a completed group leaves its name behind. The memory is
++/// bounded the same two ways the open groups are — a count and the
++/// same deadline — and holds no payload: a key, the sequence span
++/// the group consumed, and when it finished. Sized to
++/// [`MAX_OUTSTANDING_REASSEMBLIES`] because that is how many groups
++/// a peer can have had in flight, and therefore how many
++/// retransmitted heads one recovery burst can bring back.
++pub const MAX_COMPLETED_GROUPS: usize = MAX_OUTSTANDING_REASSEMBLIES;
++
+ /// One piece of an outbound payload, ready to become one packet.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Fragment {
+@@ -301,10 +325,52 @@ fn note_abandoned(abandoned: &mut Vec<Abandoned>, scope: u64, partial: &Partial)
+     }
+ }
+ 
++/// A group that **completed**, remembered by name alone.
++///
++/// Enough to recognise the sender's own rebuilt pieces and nothing
++/// more: no payload, no offsets, no held bytes. The sequence span is
++/// what makes the recognition exact rather than approximate — a
++/// fragment id is only unique within a session's counter, so the
++/// question a rebuilt head must answer is not "was this id ever
++/// used" but "is this one of the sequences that group already
++/// delivered". A piece outside the span is a different group that
++/// happens to reuse the id, and it opens normally.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct Completed {
++    /// The stream the group's sequences belonged to.
++    stream_id: u64,
++    /// Lowest sequence the group consumed.
++    first: u64,
++    /// Highest sequence the group consumed.
++    last: u64,
++    /// Whether the group owned stream sequences at all. The
++    /// sequence-less control path has no span to compare, so its
++    /// recognition is by id and deadline.
++    sequenced: bool,
++    /// When it completed, for the same deadline sweep the partials
++    /// get.
++    at: Instant,
++}
++
++impl Completed {
++    /// Whether a piece arriving on `sequence` is one this group
++    /// already delivered.
++    fn already_delivered(&self, sequence: u64, sequenced: bool) -> bool {
++        if self.sequenced != sequenced {
++            return false;
++        }
++        !sequenced || (sequence >= self.first && sequence <= self.last)
++    }
++}
++
+ /// Inbound reassembly, bounded in both directions.
+ #[derive(Debug, Default)]
+ pub struct Reassembler {
+     groups: HashMap<(u64, u16), Partial>,
++    /// Groups that finished, kept only long enough to tell their own
++    /// retransmissions from a new group's first piece. See
++    /// [`MAX_COMPLETED_GROUPS`].
++    completed: HashMap<(u64, u16), Completed>,
+     abandoned: Vec<Abandoned>,
+ }
+ 
+@@ -329,6 +395,12 @@ impl Reassembler {
+     /// is what keeps a re-handshake from mixing them.
+     pub fn retire(&mut self, scope: u64) {
+         self.groups.retain(|(s, _), _| *s != scope);
++        // The completed-group memory goes with them. It exists to
++        // recognise one session's own retransmissions, and the
++        // successor's fragment counter restarts at 1 — so a name
++        // kept across the replacement could swallow the successor's
++        // first group instead.
++        self.completed.retain(|(s, _), _| *s != scope);
+     }
+ 
+     /// Drop every group of one stream's receive lifetime.
+@@ -346,6 +418,12 @@ impl Reassembler {
+         let before = self.groups.len();
+         self.groups
+             .retain(|(s, _), p| *s != scope || !p.sequenced || p.first.stream_id != stream_id);
++        // The names of groups that completed on the lifetime being
++        // ended go too: the peer may restart the id from sequence
++        // zero, and a remembered span from before the reset would
++        // then overlap the fresh lifetime's own sequences.
++        self.completed
++            .retain(|(s, _), c| *s != scope || !c.sequenced || c.stream_id != stream_id);
+         for _ in 0..(before - self.groups.len()) {
+             counters.drop_for(DropReason::StreamFailed);
+         }
+@@ -448,10 +526,14 @@ impl Reassembler {
+     /// capacity pressure becomes backpressure rather than silent
+     /// loss.
+     ///
+-    /// `true` for anything that is not a fragment, and for a group
+-    /// that is already open: an open group is never blocked by the
+-    /// bound. A refusal is counted here, so the caller reports it by
+-    /// returning rather than by inventing a second reason.
++    /// `true` for anything that is not a fragment, for a group that
++    /// is already open, and for a group this leaf remembers
++    /// completing: an open group is never blocked by the bound, and
++    /// a rebuilt piece of a finished group must be acknowledgeable
++    /// or the peer retransmits it forever while the bound is under
++    /// pressure from unrelated traffic. A refusal is counted here,
++    /// so the caller reports it by returning rather than by
++    /// inventing a second reason.
+     pub fn admits(
+         &mut self,
+         scope: u64,
+@@ -470,6 +552,7 @@ impl Reassembler {
+         // very next step.
+         self.expire(now, counters);
+         if self.groups.contains_key(&(scope, fragment_id))
++            || self.completed.contains_key(&(scope, fragment_id))
+             || self.groups.len() < MAX_OUTSTANDING_REASSEMBLIES
+         {
+             return true;
+@@ -521,6 +604,33 @@ impl Reassembler {
+         // tail arriving arbitrarily late could still complete it.
+         self.expire(now, counters);
+ 
++        // **A group that already completed owns no new obligation.**
++        // The sender rebuilds unacknowledged pieces with a fresh
++        // AEAD counter when its acknowledgement is lost, so a
++        // delivered group's head can arrive again long after the
++        // payload reached the consumer. Opening a fresh partial for
++        // it is what turned a successful delivery into a pending
++        // one: nothing else of the group is ever coming — the peer's
++        // other pieces were consumed — so the deadline reaped it and
++        // reported an abandoned reliable group, ending a stream that
++        // had lost nothing at all.
++        //
++        // Only when no group is open under the key: an open group is
++        // the live one and its own duplicate handling below is
++        // exact. Counted as the duplicate it is, and the caller has
++        // already repeated the acknowledgement the peer is missing.
++        let sequenced = meta.is_some();
++        let arriving = meta.map_or(0, |m| m.sequence);
++        if !self.groups.contains_key(&key)
++            && self
++                .completed
++                .get(&key)
++                .is_some_and(|done| done.already_delivered(arriving, sequenced))
++        {
++            counters.drop_for(DropReason::ReassemblyDuplicate);
++            return None;
++        }
++
+         if !self.groups.contains_key(&key) {
+             if self.groups.len() >= MAX_OUTSTANDING_REASSEMBLIES {
+                 counters.drop_for(DropReason::ReassemblyRefused);
+@@ -563,7 +673,7 @@ impl Reassembler {
+             return None;
+         }
+ 
+-        let sequence = meta.map_or(0, |m| m.sequence);
++        let sequence = arriving;
+ 
+         // A legitimate retransmission: the same offset, the same
+         // sequence, the same bytes. The sender rebuilds an
+@@ -673,6 +783,13 @@ impl Reassembler {
+             1
+         };
+ 
++        // The group is complete and about to be delivered, so its
++        // name is remembered: from here a rebuilt piece of it is a
++        // duplicate, not the head of something new. Recorded before
++        // the payload is handed back, because the caller's next act
++        // is to deliver it.
++        self.remember_completed(key, now, partial.sequenced, partial.first, span);
++
+         let mut out = BytesMut::with_capacity(total);
+         for piece in &partial.pieces {
+             out.extend_from_slice(&piece.data);
+@@ -701,6 +818,50 @@ impl Reassembler {
+         for _ in 0..(before - self.groups.len()) {
+             counters.drop_for(DropReason::ReassemblyExpired);
+         }
++        // The completed names age out on the same deadline the
++        // partials do, and nothing is reported for one: a group that
++        // completed delivered its bytes, so forgetting its name
++        // surrenders no ownership. The deadline is the right one
++        // because it is the window a retransmission can still arrive
++        // in — past it the peer has given up on the sequence itself.
++        self.completed
++            .retain(|_, c| now.saturating_duration_since(c.at) < ttl);
++    }
++
++    /// Remember that `key` completed, evicting the oldest name when
++    /// the bound is reached.
++    ///
++    /// Oldest rather than arbitrary: the names exist to cover the
++    /// retransmission window, and the one closest to the end of its
++    /// own window is the one least likely to be needed again.
++    fn remember_completed(
++        &mut self,
++        key: (u64, u16),
++        now: Instant,
++        sequenced: bool,
++        first: PieceMeta,
++        span: u64,
++    ) {
++        if self.completed.len() >= MAX_COMPLETED_GROUPS && !self.completed.contains_key(&key) {
++            if let Some(oldest) = self
++                .completed
++                .iter()
++                .min_by_key(|(_, c)| c.at)
++                .map(|(k, _)| *k)
++            {
++                self.completed.remove(&oldest);
++            }
++        }
++        self.completed.insert(
++            key,
++            Completed {
++                stream_id: first.stream_id,
++                first: first.sequence,
++                last: first.sequence.saturating_add(span.saturating_sub(1)),
++                sequenced,
++                at: now,
++            },
++        );
+     }
+ }
+ 
+@@ -1324,4 +1485,205 @@ mod tests {
+         r.retire_stream(2, 4, &c);
+         assert_eq!(r.outstanding(), 2, "another scope's stream 4 is not ours");
+     }
++
++    /// **R4-3.** A completed group's rebuilt head owns nothing.
++    ///
++    /// The sender rebuilds unacknowledged pieces with a fresh AEAD
++    /// counter whenever its acknowledgement is lost, and it cannot
++    /// know the group already completed — the acknowledgement that
++    /// would have told it is the one that went missing. So the head
++    /// of a delivered group arrives again. Before the completed-group
++    /// memory it opened a fresh partial that nothing could finish,
++    /// and the deadline then reported an abandoned RELIABLE group
++    /// for a payload this leaf had already handed to its consumer:
++    /// a terminal manufactured out of a successful delivery.
++    #[test]
++    fn a_rebuilt_head_of_a_delivered_group_reports_no_abandonment() {
++        let c = LeafCounters::new();
++        let mut r = Reassembler::new();
++        let t0 = now();
++        assert!(r
++            .accept_piece(
++                1,
++                provenance(0),
++                7,
++                0,
++                FRAG_FRAGMENTED,
++                Bytes::from_static(b"head"),
++                t0,
++                &c
++            )
++            .is_none());
++        let done = r
++            .accept_piece(
++                1,
++                provenance(1),
++                7,
++                4,
++                FRAG_FRAGMENTED | FRAG_LAST,
++                Bytes::from_static(b"tail"),
++                t0,
++                &c,
++            )
++            .expect("the group completes");
++        assert_eq!(&done.data[..], b"headtail");
++        assert_eq!(r.outstanding(), 0);
++
++        // The rebuilt head, on its own sequence, after delivery.
++        assert!(
++            r.accept_piece(
++                1,
++                provenance(0),
++                7,
++                0,
++                FRAG_FRAGMENTED,
++                Bytes::from_static(b"head"),
++                t0,
++                &c
++            )
++            .is_none(),
++            "a piece of a delivered group assembles nothing new"
++        );
++        assert_eq!(
++            r.outstanding(),
++            0,
++            "and it must not open a partial: there is no second message here"
++        );
++        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 1);
++
++        // The deadline, long past. Nothing is owed, because nothing
++        // was ever outstanding.
++        r.expire(
++            t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS + 1),
++            &c,
++        );
++        assert!(
++            r.take_abandoned().is_empty(),
++            "a duplicate of a completed message creates no abandonment obligation"
++        );
++        assert_eq!(c.drops(DropReason::ReassemblyExpired), 0);
++    }
++
++    /// The discrimination the memory has to make, and the reason it
++    /// records a sequence span rather than only a name.
++    ///
++    /// A fragment id is unique only within its session's counter, so
++    /// "this id completed once" cannot be the rule: a genuinely new
++    /// group that reuses the id after the counter wraps would be
++    /// swallowed whole, which is worse than the phantom terminal it
++    /// was meant to prevent. The sequences decide — the peer's
++    /// sequence space never rewinds within a receive lifetime.
++    #[test]
++    fn a_new_group_reusing_a_completed_fragment_id_still_opens() {
++        let c = LeafCounters::new();
++        let mut r = Reassembler::new();
++        let t0 = now();
++        r.accept_piece(
++            1,
++            provenance(0),
++            7,
++            0,
++            FRAG_FRAGMENTED,
++            Bytes::from_static(b"head"),
++            t0,
++            &c,
++        );
++        assert!(r
++            .accept_piece(
++                1,
++                provenance(1),
++                7,
++                4,
++                FRAG_FRAGMENTED | FRAG_LAST,
++                Bytes::from_static(b"tail"),
++                t0,
++                &c
++            )
++            .is_some());
++
++        // Same fragment id, sequences beyond the delivered span.
++        assert!(r
++            .accept_piece(
++                1,
++                provenance(2),
++                7,
++                0,
++                FRAG_FRAGMENTED,
++                Bytes::from_static(b"next"),
++                t0,
++                &c
++            )
++            .is_none());
++        let second = r
++            .accept_piece(
++                1,
++                provenance(3),
++                7,
++                4,
++                FRAG_FRAGMENTED | FRAG_LAST,
++                Bytes::from_static(b"body"),
++                t0,
++                &c,
++            )
++            .expect("a new group on the same id must still assemble");
++        assert_eq!(&second.data[..], b"nextbody");
++        assert_eq!(second.span, 2);
++        assert_eq!(
++            c.drops(DropReason::ReassemblyDuplicate),
++            0,
++            "nothing here is a duplicate"
++        );
++    }
++
++    /// The memory is bounded and it ages out on the reassembly
++    /// deadline, which is the window a retransmission can arrive in.
++    /// Past it the peer has given up on the sequence itself, so a
++    /// piece claiming those sequences is a new group's.
++    #[test]
++    fn the_completed_group_memory_expires_with_the_deadline() {
++        let c = LeafCounters::new();
++        let mut r = Reassembler::new();
++        let t0 = now();
++        r.accept_piece(
++            1,
++            provenance(0),
++            7,
++            0,
++            FRAG_FRAGMENTED,
++            Bytes::from_static(b"head"),
++            t0,
++            &c,
++        );
++        assert!(r
++            .accept_piece(
++                1,
++                provenance(1),
++                7,
++                4,
++                FRAG_FRAGMENTED | FRAG_LAST,
++                Bytes::from_static(b"tail"),
++                t0,
++                &c
++            )
++            .is_some());
++        let late = t0 + core::time::Duration::from_millis(REASSEMBLY_TTL_MS + 1);
++        assert!(r
++            .accept_piece(
++                1,
++                provenance(0),
++                7,
++                0,
++                FRAG_FRAGMENTED,
++                Bytes::from_static(b"head"),
++                late,
++                &c
++            )
++            .is_none());
++        assert_eq!(
++            r.outstanding(),
++            1,
++            "past the retransmission window the name is forgotten and a group opens"
++        );
++        assert_eq!(c.drops(DropReason::ReassemblyDuplicate), 0);
++    }
+ }
+diff --git a/net/crates/net/leaf/src/node.rs b/net/crates/net/leaf/src/node.rs
+index 99161ae8b..98d427cad 100644
+--- a/net/crates/net/leaf/src/node.rs
++++ b/net/crates/net/leaf/src/node.rs
+@@ -79,7 +79,32 @@ pub enum LeafEvent {
+         payload: Bytes,
+     },
+     /// Data on an application stream, already reordered.
++    ///
++    /// **A stream id is not an address.** It is derived from a
++    /// label, or supplied outright to match a publish contract, and
++    /// neither derivation involves the peer — so one label opened
++    /// to two peers is one id on two sessions, which is a supported
++    /// composition and not a collision. Without the peer on the
++    /// event, every consumer that filters the node-wide event
++    /// stream by id alone accepts whichever peer's payload arrived,
++    /// and two wrappers under one label both receive one peer's
++    /// bytes while the other peer's are delivered to the wrong
++    /// application inbox. The peer is authenticated by the session
++    /// the packet was opened on; what was missing was carrying it
++    /// this far.
+     StreamData {
++        /// The peer whose session delivered this.
++        peer_node: NodeId,
++        /// That session's incarnation.
++        ///
++        /// Provenance, not part of any filter key: a consumer can
++        /// attribute a payload to an exact establishment rather
++        /// than to a peer id that may have been re-handshaked. The
++        /// receive path already cannot deliver under a retired
++        /// incarnation — replacement retires the predecessor's
++        /// cursors and partial reassemblies — so nothing needs to
++        /// reject on it.
++        incarnation: u64,
+         /// The stream.
+         stream_id: u64,
+         /// The sequence this batch arrived under.
+@@ -200,11 +225,13 @@ impl LeafEvent {
+                 base64(payload)
+             ),
+             Self::StreamData {
++                peer_node,
++                incarnation,
+                 stream_id,
+                 seq,
+                 payload,
+             } => format!(
+-                "{{\"type\":\"stream_data\",\"stream_id\":\"{stream_id}\",\"seq\":\"{seq}\",\"payload\":\"{}\"}}",
++                "{{\"type\":\"stream_data\",\"peer_node\":\"{peer_node}\",\"incarnation\":\"{incarnation}\",\"stream_id\":\"{stream_id}\",\"seq\":\"{seq}\",\"payload\":\"{}\"}}",
+                 base64(payload)
+             ),
+             Self::StreamFailed {
+@@ -1509,6 +1536,20 @@ impl LeafNode {
+     /// this session — its sequence space cannot rewind to meet the
+     /// peer's reset receive cursor, so a handle for it would be a
+     /// handle onto a stream that cannot deliver.
++    ///
++    /// **Refuses an id the nRPC plane already owns on this peer.**
++    /// A reply carrier is a reservation, and the receive path
++    /// resolves a frame's plane by that reservation before it looks
++    /// at any byte of the payload — so an application stream
++    /// admitted on a reserved id was admitted onto a carrier it
++    /// could never be delivered on. Its first ordinary payload came
++    /// back `Dropped { UnknownCall }`, which is the RPC plane
++    /// correctly refusing a frame that is not a reply, on a stream
++    /// the caller had been told it owned. Contradictory owners are
++    /// therefore resolved **here**, at registration, where the
++    /// caller can still pick another id, rather than silently at
++    /// dispatch where it cannot. The conflict names the owning
++    /// plane and the recovery.
+     pub fn open_stream(
+         &mut self,
+         peer: NodeId,
+@@ -1527,6 +1568,18 @@ impl LeafNode {
+                  (incarnation {incarnation}); reconnect or use another stream id"
+             )));
+         }
++        // The nRPC reply plane's reservation. Checked before the
++        // stream registry is written, so a refused open leaves no
++        // classification behind and the carrier keeps exactly one
++        // owner.
++        if self.rpc_reply_carriers.contains(&(peer, stream_id)) {
++            return Err(LeafError::Session(format!(
++                "stream {stream_id:#x} on the session with {peer:#x} is reserved by this \
++                 leaf's nRPC reply plane (it is a reply carrier this leaf subscribed to for \
++                 its own calls, so a frame arriving there is dispatched as a reply and an \
++                 application payload would be refused as UnknownCall); use another stream id"
++            )));
++        }
+         // The registry is what the receive path classifies on: an
+         // id this leaf opened as a stream is a stream, whatever
+         // bits its hash happens to carry.
+@@ -1719,12 +1772,37 @@ impl LeafNode {
+     /// Idempotent per `(peer, service)`. Returns whether a
+     /// membership frame was queued, so a test can assert the
+     /// cadence rather than infer it from packet counts.
++    ///
++    /// **The other half of the reservation.** A carrier has exactly
++    /// one owner, and registration is where that is settled — so
++    /// this refuses a reply carrier the application already holds
++    /// an open stream on, exactly as [`Self::open_stream`] refuses
++    /// an id the RPC plane already reserved. Without it the
++    /// conflict merely changed order: open the stream first, call
++    /// afterwards, and the RPC plane would take a carrier whose
++    /// application owner had been admitted and was already
++    /// receiving on it — that owner's next payload becoming
++    /// `Dropped { UnknownCall }` with no refusal anywhere.
++    /// Refusing before the membership frame is queued means a
++    /// refused call leaves no reservation and no subscription
++    /// behind.
+     pub fn ensure_reply_subscription(&mut self, peer: NodeId, service: &str) -> Result<bool> {
+         let reply = reply_channel(service, self.identity.origin_hash())?;
+         let key = (peer, net_wire::channel::name::channel_hash(reply.as_str()));
+         if self.reply_subscriptions.contains(&key) {
+             return Ok(false);
+         }
++        // The application's registration. Nothing has been queued
++        // and nothing recorded yet, so this is a refusal before
++        // success rather than a rollback.
++        let carrier = route_stream_id(key.1);
++        if self.stream_kinds.get(&(peer, carrier)) == Some(&StreamKind::Stream) {
++            return Err(LeafError::Session(format!(
++                "the reply carrier for {service:?} on the session with {peer:#x} is stream \
++                 {carrier:#x}, which this leaf already opened as an application stream; \
++                 close that stream or call a service whose reply channel does not collide"
++            )));
++        }
+         self.subscribe(peer, reply.as_str())?;
+         // Recorded only after the frame is queued: a refused
+         // subscribe must not mark the channel as subscribed, or
+@@ -1737,8 +1815,7 @@ impl LeafNode {
+         // canonical hash, and `route_stream_id` is the derivation
+         // both its publisher and `call`'s
+         // `CallOwner::carrier_stream_id` use.
+-        self.rpc_reply_carriers
+-            .insert((peer, route_stream_id(key.1)));
++        self.rpc_reply_carriers.insert((peer, carrier));
+         Ok(true)
+     }
+ 
+@@ -2214,7 +2291,7 @@ impl LeafNode {
+                 continue;
+             }
+             for payload in record.payloads.clone() {
+-                self.handle_event(peer, &record, payload, now);
++                self.handle_event(peer, incarnation, &record, payload, now);
+             }
+         }
+         // Whatever this arrival's reassembly gave up on is disposed
+@@ -2415,7 +2492,14 @@ impl LeafNode {
+     /// subprotocol rather than the arriving packet's: a record
+     /// released from the reorder buffer was put there by a
+     /// different frame than the one that unblocked it.
+-    fn handle_event(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes, now: Instant) {
++    fn handle_event(
++        &mut self,
++        peer: NodeId,
++        incarnation: u64,
++        record: &StreamRecord,
++        payload: Bytes,
++        now: Instant,
++    ) {
+         let Some(decoded) =
+             dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters)
+         else {
+@@ -2425,7 +2509,9 @@ impl LeafNode {
+             return;
+         };
+         match decoded {
+-            Decoded::Event(payload) => self.handle_event_plane(peer, record, payload),
++            Decoded::Event(payload) => {
++                self.handle_event_plane(peer, incarnation, record, payload);
++            }
+             Decoded::Announcement(bytes) | Decoded::Fold(bytes) => {
+                 self.ingest_announcement(&bytes);
+             }
+@@ -2564,13 +2650,21 @@ impl LeafNode {
+     /// for the frames that genuinely are RPC: plane ownership says
+     /// which plane a frame belongs to, those checks say which *call*
+     /// within it. This replaces the sniffing; it relaxes no fencing.
+-    fn handle_event_plane(&mut self, peer: NodeId, record: &StreamRecord, payload: Bytes) {
++    fn handle_event_plane(
++        &mut self,
++        peer: NodeId,
++        incarnation: u64,
++        record: &StreamRecord,
++        payload: Bytes,
++    ) {
+         if !self.rpc_reply_carriers.contains(&(peer, record.stream_id)) {
+             // No RPC plane owns this carrier, so these are
+             // application bytes — and which surface they belong to
+             // is the stream's business, not the payload's.
+             match self.classify(peer, record.stream_id) {
+                 StreamKind::Stream => self.events.push(LeafEvent::StreamData {
++                    peer_node: peer,
++                    incarnation,
+                     stream_id: record.stream_id,
+                     seq: record.seq,
+                     payload,
+@@ -2631,10 +2725,12 @@ impl LeafNode {
+         // nobody is watching, and a post-acknowledgement discard
+         // the consumer cannot observe is precisely how the loss
+         // above stayed invisible for three rounds.
+-        let Some(incarnation) = self.sessions.get(peer).map(|s| s.incarnation()) else {
+-            self.drop_counted(DropReason::UnknownCall);
+-            return;
+-        };
++        // The incarnation is the arriving packet's own, handed in by
++        // the caller: it is the session the packet was opened on,
++        // which is the only session this frame can be a reply
++        // within. Re-reading the table here would answer the same
++        // question twice and give the wrong answer if it ever
++        // stopped agreeing.
+         if !self.calls.deliver(
+             frame,
+             CallOwner {
+@@ -3974,11 +4070,21 @@ mod tests {
+     #[test]
+     fn the_event_json_keeps_every_u64_as_a_decimal_string() {
+         let event = LeafEvent::StreamData {
++            peer_node: u64::MAX - 1,
++            incarnation: 9_007_199_254_740_995,
+             stream_id: u64::MAX,
+             seq: 9_007_199_254_740_993,
+             payload: Bytes::from_static(b"\x00\xFF"),
+         };
+         let json = event.to_json();
++        assert!(
++            json.contains(&format!("\"peer_node\":\"{}\"", u64::MAX - 1)),
++            "{json}"
++        );
++        assert!(
++            json.contains("\"incarnation\":\"9007199254740995\""),
++            "{json}"
++        );
+         assert!(
+             json.contains(&format!("\"stream_id\":\"{}\"", u64::MAX)),
+             "{json}"
+@@ -5439,4 +5545,194 @@ mod tests {
+              prefix, so the completed reliable message is delivered"
+         );
+     }
++
++    /// **R4-10, the owner's ruling (b).** A stream record names the
++    /// peer whose session delivered it.
++    ///
++    /// One label opened to two peers is **one stream id on two
++    /// sessions**: `stream_id_from_label` hashes the label and
++    /// nothing else, and an explicit id matches a publish contract,
++    /// so neither derivation involves the peer. That composition is
++    /// supported. What was missing was the attribution — the event
++    /// carried `stream_id`, `seq` and `payload` and no peer at all,
++    /// so every consumer that filters the node-wide event stream by
++    /// id had no way to tell one session's payload from another's,
++    /// and two wrappers under one label both accepted whichever
++    /// peer's record arrived.
++    ///
++    /// The assertion is **nonce correlation, not counts**: each
++    /// peer's own payload must be attributed to that peer and the
++    /// other's must not. A count-based check passes in exactly the
++    /// broken case, where one peer's payload is delivered twice.
++    #[test]
++    fn stream_records_name_the_peer_whose_session_delivered_them() {
++        let (mut a, mut b) = pair();
++        let (aid, bid) = (a.node_id(), b.node_id());
++
++        // A third leaf, established with b through the same real
++        // discovery-then-proof sequence `pair` uses.
++        let mut c = LeafNode::new(identity(0x63), 3);
++        let cid = c.node_id();
++        let from_b = b.build_announcement(&["pair".to_string()]).expect("b");
++        let from_c = c.build_announcement(&["pair".to_string()]).expect("c");
++        assert!(c.ingest_announcement(&from_b));
++        assert!(b.ingest_announcement(&from_c));
++        let msg1 = c
++            .begin_handshake(bid, &PSK, b.identity().noise().public_key(), 11)
++            .expect("msg1");
++        let msg2 = b.accept_handshake(cid, &PSK, &msg1, 11).expect("msg2");
++        c.complete_handshake(bid, &msg2).expect("install");
++        assert_eq!(pump(&mut c, &mut b), 1, "c's establishment proof crossed");
++        assert_eq!(b.take_verified_admissions(), vec![cid]);
++        b.drain_events();
++
++        // ONE label. b holds a stream to each peer under it, and the
++        // two ids are the same number — that is the premise, not an
++        // accident, and it is asserted rather than assumed.
++        let label = "inbox";
++        let to_a = b
++            .open_stream(aid, label, Reliability::Reliable, None, None)
++            .expect("b opens its stream to a");
++        let to_c = b
++            .open_stream(cid, label, Reliability::Reliable, None, None)
++            .expect("b opens its stream to c");
++        assert_eq!(
++            to_a.stream_id, to_c.stream_id,
++            "one label is one id: the derivation does not involve the peer"
++        );
++        assert_eq!(to_a.stream_id, crate::stream::stream_id_from_label(label));
++
++        // Each peer sends its own nonce on that id.
++        let nonce_a = b"nonce-from-a";
++        let nonce_c = b"nonce-from-c";
++        let from_a_stream = a
++            .open_stream(bid, label, Reliability::Reliable, None, None)
++            .expect("a opens its half");
++        let from_c_stream = c
++            .open_stream(bid, label, Reliability::Reliable, None, None)
++            .expect("c opens its half");
++        a.stream_send(from_a_stream, nonce_a).expect("a sends");
++        c.stream_send(from_c_stream, nonce_c).expect("c sends");
++        assert_eq!(pump(&mut a, &mut b), 1);
++        assert_eq!(pump(&mut c, &mut b), 1);
++
++        let attributed: Vec<(NodeId, u64, Vec<u8>)> = b
++            .drain_events()
++            .into_iter()
++            .filter_map(|e| match e {
++                LeafEvent::StreamData {
++                    peer_node,
++                    stream_id,
++                    payload,
++                    ..
++                } => Some((peer_node, stream_id, payload.to_vec())),
++                _ => None,
++            })
++            .collect();
++
++        assert_eq!(
++            attributed,
++            vec![
++                (aid, to_a.stream_id, nonce_a.to_vec()),
++                (cid, to_c.stream_id, nonce_c.to_vec()),
++            ],
++            "each peer's nonce must be attributed to that peer on the shared id"
++        );
++    }
++
++    /// The same `StreamData` carries the incarnation of the session
++    /// that delivered it, so a consumer can attribute a payload to
++    /// an exact establishment rather than to a peer id that may have
++    /// been re-handshaked since.
++    #[test]
++    fn a_stream_record_carries_its_session_incarnation() {
++        let (mut a, mut b) = pair();
++        let bid = b.node_id();
++        let incarnation = b
++            .sessions
++            .get(a.node_id())
++            .expect("the session b admitted")
++            .incarnation();
++        let handle = a
++            .open_stream(bid, "provenance", Reliability::Reliable, None, None)
++            .expect("open");
++        a.stream_send(handle, b"x").expect("send");
++        pump(&mut a, &mut b);
++        let seen: Vec<u64> = b
++            .drain_events()
++            .into_iter()
++            .filter_map(|e| match e {
++                LeafEvent::StreamData {
++                    incarnation: seen, ..
++                } => Some(seen),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(seen, vec![incarnation]);
++    }
++
++    /// **R4-4, the other order.** A call whose reply carrier the
++    /// application already owns is refused before anything is
++    /// queued.
++    ///
++    /// Her probe drives the order that reaches `open_stream` second.
++    /// Fixing only that one would have left the conflict intact
++    /// under the reverse schedule: open the application stream
++    /// first, call afterwards, and the RPC plane would take a
++    /// carrier whose application owner had already been admitted and
++    /// was already receiving on it — that owner's next payload
++    /// becoming `Dropped { UnknownCall }` with no refusal anywhere.
++    /// A carrier has exactly one owner, and registration is where
++    /// that is settled, in both directions.
++    #[test]
++    fn a_call_cannot_take_a_carrier_an_application_stream_already_owns() {
++        let (mut a, mut b) = pair();
++        let aid = a.node_id();
++        let service = "reverse.ownership";
++        let name = b.reply_channel_for(service).expect("a reply channel");
++        let route = crate::Channel::new(&name).expect("canonical").canonical();
++        let carrier = crate::channel::publish_stream_id(route);
++
++        // The application registers first, and succeeds.
++        b.open_stream(
++            aid,
++            "application",
++            Reliability::Reliable,
++            Some(carrier),
++            Some(route as u16),
++        )
++        .expect("an unreserved carrier admits an application stream");
++
++        let refused = b
++            .call(aid, service, b"q", Some(1))
++            .expect_err("the call must be refused, not silently shadow the admitted owner");
++        match &refused {
++            LeafError::Session(message) => {
++                assert!(
++                    message.contains("already opened as an application stream"),
++                    "the refusal must name the conflict: {message}"
++                );
++            }
++            other => panic!("expected a typed session refusal, got {other:?}"),
++        }
++        assert!(
++            b.take_outbound().is_empty(),
++            "a refused call queues nothing: no membership frame, no request"
++        );
++
++        // And the application's ownership survived the refusal: its
++        // payload is delivered, not classified as an nRPC reply.
++        let send = a
++            .open_stream(
++                b.node_id(),
++                "application",
++                Reliability::Reliable,
++                Some(carrier),
++                Some(route as u16),
++            )
++            .expect("a's half");
++        a.stream_send(send, b"opaque").expect("send");
++        pump(&mut a, &mut b);
++        assert_eq!(delivered(&mut b), vec![b"opaque".to_vec()]);
++    }
+ }
+diff --git a/net/crates/net/leaf/src/wasm.rs b/net/crates/net/leaf/src/wasm.rs
+index 1fbb4e4fb..ed714be42 100644
+--- a/net/crates/net/leaf/src/wasm.rs
++++ b/net/crates/net/leaf/src/wasm.rs
+@@ -377,6 +377,19 @@ type RetryTrigger = (crate::retry::TriggerSource, Option<NodeId>);
+ /// which does not detach anything.
+ type RetryListener = (&'static str, Closure<dyn FnMut(JsValue)>);
+ 
++/// One registered event callback, under the token that cancels it.
++///
++/// A pair rather than a map: a node has a handful of listeners, the
++/// dispatch loop walks them in registration order, and a linear
++/// scan over a `Vec` beats hashing at that size while keeping the
++/// order the arrival contract promises.
++struct Subscription {
++    /// The token handed to whoever registered the callback.
++    id: u64,
++    /// The callback itself.
++    callback: js_sys::Function,
++}
++
+ /// The shared interior. One per node; the transport's inbound
+ /// closure holds a `Weak` to it, so a closed node's callbacks cannot
+ /// resurrect it.
+@@ -476,7 +489,23 @@ struct Inner {
+     /// The inner call leaves them in the outbox and the outer loop
+     /// picks them up, so order is arrival order either way.
+     dispatching: bool,
+-    listeners: Vec<js_sys::Function>,
++    /// Every callback registered on this node, each under the token
++    /// its registrar can cancel it with.
++    ///
++    /// **A registration is owned, not forgotten.** `LeafStream`'s
++    /// `on_message` appends a filter closure here and the closure
++    /// captures the consumer's wrapper, so before the token existed
++    /// a page that opened and closed streams for the life of the
++    /// node accumulated one permanently-retained closure per open —
++    /// each still invoked for every event the node produced, each
++    /// still holding its wrapper alive. Closing the stream removed
++    /// nothing, because nothing named the registration.
++    listeners: Vec<Subscription>,
++    /// The next token. Process-monotonic within the node, never
++    /// reused: a token is the right to remove exactly one
++    /// registration, and a reused one would let a closed stream's
++    /// stale token cancel a live stream's callback.
++    next_listener_id: u64,
+     closed: bool,
+     // ───────── the network-change re-attempt owner (slice 3) ─────────
+     /// The one owner of the network-change re-attempt.
+@@ -911,6 +940,23 @@ impl Inner {
+             .extend(events.iter().map(crate::node::LeafEvent::to_json));
+     }
+ 
++    /// Register `callback`, returning the token that removes it.
++    fn add_listener(&mut self, callback: js_sys::Function) -> u64 {
++        let id = self.next_listener_id;
++        self.next_listener_id = self.next_listener_id.wrapping_add(1);
++        self.listeners.push(Subscription { id, callback });
++        id
++    }
++
++    /// Remove the registration `id` names. `false` when it is
++    /// already gone — which is the outcome a second cancellation
++    /// wanted, so it is not an error.
++    fn remove_listener(&mut self, id: u64) -> bool {
++        let before = self.listeners.len();
++        self.listeners.retain(|s| s.id != id);
++        self.listeners.len() != before
++    }
++
+     /// File one verified envelope where the §9 drive loop will find
+     /// it.
+     ///
+@@ -1348,7 +1394,19 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
+                 return;
+             }
+             guard.dispatching = true;
+-            (core::mem::take(&mut guard.outbox), guard.listeners.clone())
++            // The callbacks only: a snapshot is what makes a
++            // listener free to cancel its own subscription (or
++            // close its stream) from inside the call without
++            // mutating the list being walked. This turn still
++            // delivers to it; the next one does not.
++            (
++                core::mem::take(&mut guard.outbox),
++                guard
++                    .listeners
++                    .iter()
++                    .map(|s| s.callback.clone())
++                    .collect::<Vec<_>>(),
++            )
+         };
+         for json in events {
+             let value = JsValue::from_str(&json);
+@@ -1506,6 +1564,7 @@ impl LeafNode {
+             outbox: Vec::new(),
+             dispatching: false,
+             listeners: Vec::new(),
++            next_listener_id: 1,
+             closed: false,
+             // One window for the episode and for the re-attempt it
+             // starts: the same number a peer attempt's own ICE
+@@ -1942,6 +2001,7 @@ impl LeafNode {
+         Ok(LeafStream {
+             inner: Rc::clone(&self.inner),
+             handle,
++            subscriptions: RefCell::new(Vec::new()),
+         })
+     }
+ 
+@@ -2799,8 +2859,39 @@ impl LeafNode {
+ 
+     /// Register an event listener. Each receives one JSON string per
+     /// event.
+-    pub fn on_event(&self, callback: js_sys::Function) {
+-        self.inner.borrow_mut().listeners.push(callback);
++    ///
++    /// Returns the token that cancels it, the same currency
++    /// [`LeafStream::on_message`] hands back. A node-wide listener
++    /// lives as long as the node by default, which is what a page
++    /// registering one at startup wants; a harness or a component
++    /// that registers per episode needs to be able to give it back.
++    pub fn on_event(&self, callback: js_sys::Function) -> String {
++        self.inner.borrow_mut().add_listener(callback).to_string()
++    }
++
++    /// Cancel the registration `token` names.
++    ///
++    /// `false` when it is already gone, which is the outcome a
++    /// second cancellation wanted. An unparseable token is also
++    /// `false`: it names no registration, and throwing for it would
++    /// make a double-close harder to write than a leak.
++    pub fn remove_listener(&self, token: &str) -> bool {
++        token
++            .parse::<u64>()
++            .is_ok_and(|id| self.inner.borrow_mut().remove_listener(id))
++    }
++
++    /// How many callbacks are registered on this node right now.
++    ///
++    /// **Observable so the bound can be asserted rather than
++    /// inferred**, exactly as `Reassembler::outstanding` is. The
++    /// property that matters is that repeated stream open/close
++    /// leaves this flat: a registration that close does not remove
++    /// is retained for the life of the node, keeps being invoked
++    /// for every event, and keeps its captured consumer wrapper
++    /// alive. A number nobody can read is a bound nobody can test.
++    pub fn listener_count(&self) -> usize {
++        self.inner.borrow().listeners.len()
+     }
+ 
+     /// Run the enrollment exchange against the anchor.
+@@ -3251,6 +3342,14 @@ impl LeafNode {
+ pub struct LeafStream {
+     inner: Rc<RefCell<Inner>>,
+     handle: StreamHandle,
++    /// The node-wide registrations this stream owns.
++    ///
++    /// Interior mutability because `on_message` and `close` are both
++    /// `&self` across the `wasm_bindgen` boundary, and because the
++    /// ownership is the point: the registrations are on the *node*,
++    /// so without a list naming them the stream has nothing to give
++    /// back when it closes.
++    subscriptions: RefCell<Vec<u64>>,
+ }
+ 
+ #[wasm_bindgen]
+@@ -3260,6 +3359,31 @@ impl LeafStream {
+         format!("{:016x}", self.handle.stream_id)
+     }
+ 
++    /// The peer this stream is with, 16 lowercase hex digits.
++    ///
++    /// **Spelled exactly like [`Self::stream_id_hex`], deliberately.**
++    /// A stream is addressed by `(peer, stream_id)` and both halves
++    /// of that key are read through the same accessor shape and
++    /// reconciled against the event's decimal field by the same
++    /// `BigInt` conversion, so a consumer has one idiom to get right
++    /// rather than two. A peer-blind filter is the R4-10 defect: one
++    /// label opened to two peers is one id on two sessions, and
++    /// filtering the node-wide event stream by the id alone hands
++    /// each wrapper whichever peer's payload arrived.
++    pub fn peer_node_hex(&self) -> String {
++        format!("{:016x}", self.handle.peer)
++    }
++
++    /// The incarnation of the session this stream was opened on,
++    /// decimal — the spelling the event carries, so there is no
++    /// conversion to get wrong.
++    ///
++    /// Provenance, not part of the filter key: see
++    /// [`crate::node::LeafEvent::StreamData`].
++    pub fn incarnation(&self) -> String {
++        self.handle.incarnation.to_string()
++    }
++
+     /// Whether this stream retransmits.
+     pub fn is_reliable(&self) -> bool {
+         self.handle.reliability.is_reliable()
+@@ -3288,42 +3412,88 @@ impl LeafStream {
+     /// **The callback receives the node's `stream_data` event JSON
+     /// string**, not bytes — the same string
+     /// [`LeafNode::on_event`] delivers, filtered to this stream's
+-    /// id:
++    /// **peer and** id:
+     ///
+     /// ```text
+-    /// {"type":"stream_data","stream_id":"9","seq":"1","payload":"AQI="}
++    /// {"type":"stream_data","peer_node":"200","incarnation":"1","stream_id":"9","seq":"1","payload":"AQI="}
+     /// ```
+     ///
+-    /// `stream_id` and `seq` are decimal `u64` strings and `payload`
+-    /// is standard padded base64. One contract, one direction: the
+-    /// leaf emits its canonical event JSON and the consumer decodes
+-    /// it. Emitting bytes here instead would mean a second encoding
+-    /// of an event that already exists, and would throw away `seq`
+-    /// and the rest of the event's provenance at the boundary.
++    /// Every `u64` is a decimal string and `payload` is standard
++    /// padded base64. One contract, one direction: the leaf emits
++    /// its canonical event JSON and the consumer decodes it.
++    /// Emitting bytes here instead would mean a second encoding of
++    /// an event that already exists, and would throw away `seq` and
++    /// the rest of the event's provenance at the boundary.
+     /// `@net-mesh/browser`'s `LeafStream` does that decode, which is
+     /// why its `onMessage` and its async iterator yield
+     /// `Uint8Array`; a host wiring this callback itself must parse
+     /// the same way.
+     ///
++    /// **The peer is half of the key, not decoration.** A stream id
++    /// comes from a label or from a publish contract and neither
++    /// involves the peer, so one label opened to two peers is one id
++    /// on two sessions — a supported composition. Filtering the
++    /// node-wide event stream by the id alone made both wrappers
++    /// accept whichever peer's payload arrived, delivering one
++    /// peer's bytes into the other peer's inbox; a page that echoes
++    /// then amplifies it. The incarnation rides the event as
++    /// provenance and is deliberately **not** part of this key: see
++    /// [`crate::node::LeafEvent::StreamData`].
++    ///
+     /// The callback runs with **no** borrow of the node held, so it
+     /// may call straight back in: [`Self::send`], [`LeafNode::close`]
+     /// and the rest are all reachable from here. That was not true
+     /// before — the event was emitted from inside `flush`'s `&mut
+     /// self` — so the advertised echo trapped instead of sending.
+-    pub fn on_message(&self, callback: js_sys::Function) {
+-        let wanted = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
++    ///
++    /// **Returns the token that cancels the registration**, decimal.
++    /// The closure is registered on the node and captures the
++    /// consumer's callback, so a registration nothing names is
++    /// retained for the node's whole life and keeps being invoked
++    /// for every event it produces — which is what repeated
++    /// open/close accumulated before the token existed.
++    /// [`Self::close`] gives back every token this stream took, so
++    /// an ordinary consumer never has to; [`Self::remove_listener`]
++    /// is for one that wants to stop listening without closing.
++    pub fn on_message(&self, callback: js_sys::Function) -> String {
++        // Both halves of the key, and the event's own spelling of
++        // each: decimal, exactly as `to_json` writes them.
++        let peer = format!("\"peer_node\":\"{}\"", self.handle.peer);
++        let stream = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
+         let filter = Closure::wrap(Box::new(move |json: JsValue| {
+-            if json
+-                .as_string()
+-                .is_some_and(|text| text.contains(&wanted) && text.contains("\"stream_data\""))
+-            {
++            if json.as_string().is_some_and(|text| {
++                text.contains("\"stream_data\"") && text.contains(&peer) && text.contains(&stream)
++            }) {
+                 let _ = callback.call1(&JsValue::NULL, &json);
+             }
+         }) as Box<dyn FnMut(JsValue)>);
+         let function: js_sys::Function =
+             filter.as_ref().unchecked_ref::<js_sys::Function>().clone();
+         filter.forget();
+-        self.inner.borrow_mut().listeners.push(function);
++        let id = self.inner.borrow_mut().add_listener(function);
++        self.subscriptions.borrow_mut().push(id);
++        id.to_string()
++    }
++
++    /// Cancel one registration [`Self::on_message`] returned.
++    ///
++    /// `false` when the token names no live registration of this
++    /// stream — already cancelled, already closed, or never ours.
++    /// Scoped to this stream on purpose: a token is the right to
++    /// remove one subscription, and one stream must not be able to
++    /// silence another's consumer by guessing a number.
++    pub fn remove_listener(&self, token: &str) -> bool {
++        let Ok(id) = token.parse::<u64>() else {
++            return false;
++        };
++        let mut owned = self.subscriptions.borrow_mut();
++        let before = owned.len();
++        owned.retain(|held| *held != id);
++        if owned.len() == before {
++            return false;
++        }
++        drop(owned);
++        self.inner.borrow_mut().remove_listener(id)
+     }
+ 
+     /// Stop using the stream. The session stays; a stream is
+@@ -3339,11 +3509,30 @@ impl LeafStream {
+     /// stream: a page that closed and reopened the same id got the
+     /// old cursor.
+     ///
++    /// **Every registration this stream took is given back**, so
++    /// repeated open/close leaves [`LeafNode::listener_count`] flat.
++    /// A callback registered through [`Self::on_message`] lives on
++    /// the node, not on this object, and it captures the consumer's
++    /// own callback — so a close that removed only the node's stream
++    /// state left the closure attached, still invoked for every
++    /// event the node produced and still holding its consumer
++    /// alive, for as long as the node lived.
++    ///
+     /// A refusal here is reported rather than returned: the handle is
+     /// being discarded either way, and `close` is the one operation
+     /// for which "it was already gone" is the outcome the caller
+     /// wanted.
+     pub fn close(&self) {
++        // The subscriptions first, and unconditionally: they are
++        // this object's own bookkeeping, and a stale handle whose
++        // `close_stream` is refused must still stop listening.
++        let owned = core::mem::take(&mut *self.subscriptions.borrow_mut());
++        {
++            let mut guard = self.inner.borrow_mut();
++            for id in owned {
++                guard.remove_listener(id);
++            }
++        }
+         with_node(&self.inner, |guard| {
+             if let Err(e) = guard.node.close_stream(self.handle) {
+                 console_error(&format!("net-mesh-leaf: stream close: {e}"));
+diff --git a/net/crates/net/leaf/src/wasm_witnesses.rs b/net/crates/net/leaf/src/wasm_witnesses.rs
+index af33621d6..4628c0b7b 100644
+--- a/net/crates/net/leaf/src/wasm_witnesses.rs
++++ b/net/crates/net/leaf/src/wasm_witnesses.rs
+@@ -177,6 +177,7 @@ fn pair() -> Pair {
+         outbox: Vec::new(),
+         dispatching: false,
+         listeners: Vec::new(),
++        next_listener_id: 1,
+         closed: false,
+         retry: crate::retry::RetryPolicy::new(PEER_ICE_DEADLINE_MS),
+         retry_listeners: Vec::new(),
+@@ -1354,3 +1355,267 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
+     p.leaf.close();
+     q.leaf.close();
+ }
++
++// ───────── R4-10 / R5-L2: per-peer stream identity, owned subscriptions ─────────
++
++/// A second real peer for this leaf, discovered and established the
++/// way [`Pair`]'s first one is.
++///
++/// Two peers is the whole point: a stream id comes from a label or a
++/// publish contract and neither involves the peer, so one label
++/// opened to two peers is one id on two sessions. That is the
++/// composition R4-10 is about, and it cannot be witnessed with one
++/// peer.
++fn second_peer(p: &Pair) -> (crate::node::LeafNode, NodeId) {
++    let identity = LeafIdentity::generate().expect("a second peer identity");
++    let peer_id = identity.node_id();
++    let mut peer = crate::node::LeafNode::new(identity, 0x5003);
++    let theirs = peer
++        .build_announcement(&["chat".to_string()])
++        .expect("the second peer signs its own announcement");
++    let ours = with_node(&p.leaf.inner, |guard| {
++        assert!(
++            guard.node.ingest_announcement(&theirs),
++            "the second peer's announcement must verify on its own"
++        );
++        guard
++            .node
++            .build_announcement(&["chat".to_string()])
++            .expect("this leaf signs its own")
++    });
++    assert!(peer.ingest_announcement(&ours));
++
++    let noise = *peer.identity().noise().public_key();
++    let msg1 = with_node(&p.leaf.inner, |guard| {
++        let slot = guard.transport.next_slot();
++        guard
++            .node
++            .begin_handshake(peer_id, &PSK, &noise, slot)
++            .expect("message 1")
++    });
++    let msg2 = peer
++        .accept_handshake(p.us, &PSK, &msg1, 0)
++        .expect("message 2");
++    with_node(&p.leaf.inner, |guard| {
++        guard
++            .node
++            .complete_handshake(peer_id, &msg2)
++            .expect("the initiator installs on message 2");
++    });
++    (peer, peer_id)
++}
++
++/// Carry every packet this leaf has queued for `peer_id` to `peer`.
++///
++/// There is no anchor and no channel in these witnesses, so the
++/// establishment PROOF the responder is waiting for has to be
++/// carried. It is a real packet the peer really verifies: without it
++/// the peer holds keys and no attributed session, and nothing it
++/// sends would be accepted.
++fn carry_to(p: &Pair, peer_id: NodeId, peer: &mut crate::node::LeafNode) {
++    let queued = with_node(&p.leaf.inner, |guard| guard.node.take_outbound());
++    let now = clock::now();
++    for out in queued {
++        if out.peer == peer_id {
++            peer.on_datagram(p.us, out.packet, now);
++        }
++    }
++    peer.tick(now);
++    assert_eq!(
++        peer.take_verified_admissions(),
++        vec![p.us],
++        "the proof is what makes this leaf's session real at the peer"
++    );
++    peer.drain_events();
++}
++
++/// Put everything `peer` has queued through this leaf's real inbound
++/// path — the queue its transport closure feeds — and pump.
++fn carry_from(p: &Pair, peer_id: NodeId, peer: &mut crate::node::LeafNode) {
++    let queued = peer.take_outbound();
++    with_node(&p.leaf.inner, |guard| {
++        for out in queued {
++            guard.inbox.push_back((peer_id, out.packet));
++        }
++        guard.pump();
++    });
++}
++
++/// A stream options object as a page would pass one.
++fn stream_opts(peer: NodeId, label: &str) -> JsValue {
++    js_sys::JSON::parse(&format!(
++        "{{\"label\":\"{label}\",\"peer\":\"{peer:016x}\",\"reliability\":\"reliable\"}}"
++    ))
++    .expect("a stream options object")
++}
++
++/// A callback that records the event JSON it is handed.
++fn recorder(into: &Rc<RefCell<Vec<String>>>) -> js_sys::Function {
++    let sink = Rc::clone(into);
++    let closure = Closure::wrap(Box::new(move |json: JsValue| {
++        sink.borrow_mut()
++            .push(json.as_string().expect("the event JSON string"));
++    }) as Box<dyn FnMut(JsValue)>);
++    let function: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
++    closure.forget();
++    function
++}
++
++/// **R4-10.** Two wrappers under ONE label on distinct peers each
++/// receive their own peer's payload, and not the other's.
++///
++/// The subject is the production `LeafStream::on_message` filter,
++/// registered on a real bindgen node with two real established
++/// sessions, fed real packets two real peer nodes produced. Before
++/// the peer rode on `StreamData` the filter had only the numeric
++/// stream id to work with — and one label is one id — so both
++/// wrappers matched both arrivals and one peer's bytes were
++/// delivered into the other peer's inbox.
++///
++/// The assertion is **exact nonce correlation**, per inbox, against
++/// the event the production encoder emits. Counts cannot carry this
++/// property: in the broken case each inbox holds exactly one entry
++/// too, and both hold the same peer's nonce.
++#[wasm_bindgen_test]
++fn two_streams_under_one_label_do_not_cross_peers() {
++    const NONCE_A: &[u8] = b"nonce-for-the-first-peer";
++    const NONCE_B: &[u8] = b"nonce-for-the-second-peer";
++    const LABEL: &str = "inbox";
++
++    let p = pair();
++    p.install_session();
++    let mut first = p.peer.borrow_mut();
++    carry_to(&p, p.peer_id, &mut first);
++    drop(first);
++    let (mut second, second_id) = second_peer(&p);
++    carry_to(&p, second_id, &mut second);
++
++    // One label, two peers, and the ids really are the same number.
++    let to_first = p
++        .leaf
++        .open_stream(stream_opts(p.peer_id, LABEL))
++        .expect("a stream to the first peer");
++    let to_second = p
++        .leaf
++        .open_stream(stream_opts(second_id, LABEL))
++        .expect("a stream to the second peer");
++    assert_eq!(
++        to_first.stream_id_hex(),
++        to_second.stream_id_hex(),
++        "one label is one id: the derivation does not involve the peer"
++    );
++    assert_ne!(to_first.peer_node_hex(), to_second.peer_node_hex());
++    assert_eq!(to_first.peer_node_hex(), format!("{:016x}", p.peer_id));
++    assert_eq!(to_second.peer_node_hex(), format!("{second_id:016x}"));
++
++    let first_inbox: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
++    let second_inbox: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
++    to_first.on_message(recorder(&first_inbox));
++    to_second.on_message(recorder(&second_inbox));
++
++    // Each peer sends its own nonce on the shared id.
++    let stream_id = u64::from_str_radix(&to_first.stream_id_hex(), 16).expect("hex");
++    for (peer, peer_id, nonce) in [
++        (&mut *p.peer.borrow_mut(), p.peer_id, NONCE_A),
++        (&mut second, second_id, NONCE_B),
++    ] {
++        let handle = peer
++            .open_stream(
++                p.us,
++                LABEL,
++                crate::stream::Reliability::Reliable,
++                Some(stream_id),
++                None,
++            )
++            .expect("the peer's own half");
++        peer.stream_send(handle, nonce).expect("the peer sends");
++        carry_from(&p, peer_id, peer);
++    }
++
++    let expected = |peer_node: NodeId, incarnation: &str, payload: &'static [u8]| {
++        LeafEvent::StreamData {
++            peer_node,
++            incarnation: incarnation.parse().expect("a decimal incarnation"),
++            stream_id,
++            seq: 0,
++            payload: Bytes::from_static(payload),
++        }
++        .to_json()
++    };
++    assert_eq!(
++        *first_inbox.borrow(),
++        vec![expected(p.peer_id, &to_first.incarnation(), NONCE_A)],
++        "the first peer's wrapper must hold the first peer's nonce and nothing else"
++    );
++    assert_eq!(
++        *second_inbox.borrow(),
++        vec![expected(second_id, &to_second.incarnation(), NONCE_B)],
++        "the second peer's wrapper must hold the second peer's nonce and nothing else"
++    );
++
++    p.leaf.close();
++}
++
++/// **R5-L2.** A stream's subscription is owned: close gives it back.
++///
++/// `on_message` registers a filter closure on the NODE and the
++/// closure captures the consumer's callback, so a close that removed
++/// only the node's per-stream state left the registration attached —
++/// still invoked for every event the node produced, still holding
++/// its consumer alive, for as long as the node lived. Repeated
++/// open/close therefore accumulated one permanent closure per open.
++///
++/// The witness is the count, flat across churn. No heap measurement:
++/// the retention is the registration, and the registration is
++/// countable.
++#[wasm_bindgen_test]
++fn repeated_stream_open_and_close_leaves_the_listener_count_flat() {
++    let p = pair();
++    p.install_session();
++    let baseline = p.leaf.listener_count();
++
++    let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
++    for _ in 0..8 {
++        let stream = p
++            .leaf
++            .open_stream(stream_opts(p.peer_id, "churn"))
++            .expect("open");
++        stream.on_message(recorder(&seen));
++        stream.on_message(recorder(&seen));
++        assert_eq!(
++            p.leaf.listener_count(),
++            baseline + 2,
++            "each registration is one listener on the node"
++        );
++        stream.close();
++        assert_eq!(
++            p.leaf.listener_count(),
++            baseline,
++            "close must give back every registration the stream took"
++        );
++    }
++    assert_eq!(p.leaf.listener_count(), baseline);
++
++    // And the token cancels one registration on its own, once.
++    let stream = p
++        .leaf
++        .open_stream(stream_opts(p.peer_id, "churn"))
++        .expect("open");
++    let token = stream.on_message(recorder(&seen));
++    let other = stream.on_message(recorder(&seen));
++    assert_ne!(token, other, "a token names exactly one registration");
++    assert!(stream.remove_listener(&token));
++    assert_eq!(p.leaf.listener_count(), baseline + 1);
++    assert!(
++        !stream.remove_listener(&token),
++        "a second cancellation is already-gone, not a second removal"
++    );
++    assert!(
++        !stream.remove_listener("not-a-token"),
++        "an unparseable token names no registration"
++    );
++    stream.close();
++    assert_eq!(p.leaf.listener_count(), baseline);
++
++    p.leaf.close();
++}
+diff --git a/net/crates/net/leaf/tests/ts_abi_fixture.rs b/net/crates/net/leaf/tests/ts_abi_fixture.rs
+index 0f99ad698..dbfaee1a5 100644
+--- a/net/crates/net/leaf/tests/ts_abi_fixture.rs
++++ b/net/crates/net/leaf/tests/ts_abi_fixture.rs
+@@ -47,6 +47,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
+             // this pin are the same bytes.
+             "two bytes",
+             LeafEvent::StreamData {
++                peer_node: 200,
++                incarnation: 1,
+                 stream_id: 9,
+                 seq: 1,
+                 payload: Bytes::from_static(&[1, 2]),
+@@ -58,6 +60,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
+             // stream ids as BigInt rather than Number.
+             "u64 ids beyond the JS safe integer",
+             LeafEvent::StreamData {
++                peer_node: u64::MAX,
++                incarnation: 9_007_199_254_740_995,
+                 stream_id: u64::MAX,
+                 seq: 9_007_199_254_740_993,
+                 payload: Bytes::from_static(b"\x00\xff"),
+@@ -68,6 +72,8 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
+             // "no event".
+             "empty payload",
+             LeafEvent::StreamData {
++                peer_node: 0x0102_0304_0506_0708,
++                incarnation: 2,
+                 stream_id: 255,
+                 seq: 0,
+                 payload: Bytes::new(),
+@@ -78,11 +84,30 @@ fn vectors() -> Vec<(&'static str, LeafEvent)> {
+             // padding are all exercised by the decoder.
+             "all 256 byte values",
+             LeafEvent::StreamData {
++                peer_node: 11_696_303_054_639_710_820,
++                incarnation: 3,
+                 stream_id: 0x0102_0304_0506_0708,
+                 seq: 42,
+                 payload: Bytes::from_iter((0..=255u8).collect::<Vec<_>>()),
+             },
+         ),
++        (
++            // **The R4-10 vector.** One label opened to two peers is
++            // one stream id on two sessions, and this is the second
++            // of the pair: same `streamId`, different `peerNode`. A
++            // decoder that filters on the id alone accepts both, so
++            // the TypeScript side's `(peer, streamId)` filter is
++            // exactly what this vector distinguishes — the two
++            // strings differ in nothing else.
++            "same stream id, a different peer",
++            LeafEvent::StreamData {
++                peer_node: 300,
++                incarnation: 1,
++                stream_id: 9,
++                seq: 1,
++                payload: Bytes::from_static(&[1, 2]),
++            },
++        ),
+     ]
+ }
+ 
+@@ -96,6 +121,8 @@ fn the_typescript_fixture_is_exactly_what_the_leaf_emits() {
+         .into_iter()
+         .map(|(note, event)| {
+             let LeafEvent::StreamData {
++                peer_node,
++                incarnation,
+                 stream_id,
+                 seq,
+                 payload,
+@@ -105,6 +132,8 @@ fn the_typescript_fixture_is_exactly_what_the_leaf_emits() {
+             };
+             json!({
+                 "note": note,
++                "peerNode": peer_node.to_string(),
++                "incarnation": incarnation.to_string(),
+                 "streamId": stream_id.to_string(),
+                 "seq": seq.to_string(),
+                 "payloadHex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),

@@ -1,0 +1,20 @@
+--- /c/Users/chief/orca/workspaces/net/.r6leaf-receipts/frame.rs.pristine	2026-09-17 10:57:16.043632400 +0200
++++ net/crates/net/leaf/src/frame.rs	2026-09-17 11:02:21.452512000 +0200
+@@ -1523,7 +1523,7 @@
+                 FRAG_FRAGMENTED | FRAG_LAST,
+                 Bytes::from_static(b"tail"),
+                 t0,
+-                &c
++                &c,
+             )
+             .expect("the group completes");
+         assert_eq!(&done.data[..], b"headtail");
+@@ -1623,7 +1623,7 @@
+                 FRAG_FRAGMENTED | FRAG_LAST,
+                 Bytes::from_static(b"body"),
+                 t0,
+-                &c
++                &c,
+             )
+             .expect("a new group on the same id must still assemble");
+         assert_eq!(&second.data[..], b"nextbody");
