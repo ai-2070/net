@@ -389,13 +389,13 @@ function receive(r: Replica, m: Message): Replica {
       // including the generation watermark, since generations are
       // monotone per handle — and rejoins.
       if (m.code === 'closed') {
-        const q = `j-re-${m.q ?? 'x'}`;
-        return {
+        // Discard the handle and **all** its generation state:
+        // generations are monotone per handle, so keeping a watermark
+        // across would fail `g > retired` against the next handle's
+        // generation 1.
+        const discarded: Replica = {
           ...r,
           handle: null,
-          state: 'joining',
-          slot: q,
-          waiters: Math.max(r.waiters, 1),
           installed: null,
           revision: null,
           assembling: null,
@@ -404,6 +404,23 @@ function receive(r: Replica, m: Message): Replica {
           behind: false,
           published: false,
           stale: false,
+          out: [],
+        };
+        // Rejoining is automatic only while the caller still wants the
+        // subscription. `fenced` means they cancelled it: the fence is
+        // theirs to lift, and an expiry notice is not consent any more
+        // than an owner refresh was (§1.7a). The handle is gone either
+        // way, and their next request issues the `join` — because with
+        // no handle learned, that is the only request it can issue.
+        if (r.state === 'fenced') {
+          return { ...discarded, state: 'fenced', slot: null, waiters: 0 };
+        }
+        const q = `j-re-${m.q ?? 'x'}`;
+        return {
+          ...discarded,
+          state: 'joining',
+          slot: q,
+          waiters: Math.max(r.waiters, 1),
           out: [{ k: 'join', q, aud: r.desired }],
         };
       }
@@ -573,6 +590,69 @@ function install(o: Owner, h: string, q: string | null, aud: readonly string[]):
   };
 }
 
+/**
+ * The **single admission point for every owner-initiated replacement**:
+ * an explicit refresh, an overflow detected while advancing, and an
+ * overflow whose queue drains later all arrive here, so the caller's
+ * precedence and the projection-availability rule cannot be satisfied
+ * on one path and bypassed on another.
+ *
+ * Returns the owner unchanged (`out: []`) when the replacement is not
+ * admissible *now*; `keepPending` says whether the need survives for a
+ * later attempt, which is true for overflow recovery and false for an
+ * explicit refresh (the caller retries that one itself).
+ */
+function replace(o: Owner, h: string, keepPending: boolean): Owner {
+  const rec = o.handles[h];
+  if (rec === undefined || !rec.live || rec.g === 0) return { ...o, out: [] };
+
+  // A pending **solicited** installation subsumes the recovery need: it
+  // will take a fresh projection at the current revision, which is
+  // strictly more than the replacement would have carried. Overwriting
+  // it would discard the caller's request and its desired audience.
+  if (rec.deferred !== null) {
+    return {
+      ...o,
+      handles: { ...o.handles, [h]: { ...rec, replaceWhenDrained: false } },
+      out: [],
+    };
+  }
+
+  // Not while this handle's own emission is outstanding: the replica
+  // refuses unsolicited manifests mid-transition, so both generations
+  // would stall until a deadline. The need is kept for the drain.
+  if (rec.queue.length > 0) {
+    return {
+      ...o,
+      handles: { ...o.handles, [h]: { ...rec, replaceWhenDrained: keepPending } },
+      out: [],
+    };
+  }
+
+  // Not while a projection cannot be taken: a manifest the owner cannot
+  // follow with chunks is worse than no manifest. Recovery becomes this
+  // handle's pending projection, so availability restoration completes
+  // it through the same path a caller's request would take.
+  if (!o.canProject) {
+    return {
+      ...o,
+      handles: {
+        ...o.handles,
+        [h]: keepPending
+          ? { ...rec, replaceWhenDrained: false, deferred: { q: null, aud: rec.aud } }
+          : { ...rec, replaceWhenDrained: false },
+      },
+      out: [],
+    };
+  }
+
+  const cleared: Owner = {
+    ...o,
+    handles: { ...o.handles, [h]: { ...rec, replaceWhenDrained: false } },
+  };
+  return install(cleared, h, null, rec.aud);
+}
+
 export function ownerStep(o: Owner, e: OwnerEvent): Owner {
   switch (e.t) {
     case 'projectable': {
@@ -686,6 +766,7 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
       const r = o.r + 1;
       const handles: Record<string, OwnerHandle> = { ...o.handles };
       const out: Message[] = [];
+      const overflowed: string[] = [];
       let retiredDeltas = o.retiredDeltas;
       for (const [h, rec] of Object.entries(o.handles)) {
         if (!rec.live || rec.g === 0) continue;
@@ -705,35 +786,37 @@ export function ownerStep(o: Owner, e: OwnerEvent): Owner {
         }
         if (rec.queue.length >= QUEUE_MAX) {
           // Bounded pending work: incremental catch-up is abandoned and
-          // the installation is replaced once the queue drains. The
-          // queued deltas are retired rather than accumulated.
+          // the installation is replaced instead. The queued deltas are
+          // retired rather than accumulated.
+          //
+          // Retiring them can empty the queue — a delta-only queue
+          // overflowing is exactly that case — and then there is no
+          // later dequeue to trigger anything. So the replacement is
+          // **scheduled here**, and `replace` decides whether it can run
+          // now or must wait for a drain. Nothing about convergence may
+          // depend on another message arriving.
           const kept = rec.queue.filter((m) => m.k !== 'delta');
           retiredDeltas += rec.queue.length - kept.length;
           handles[h] = { ...rec, queue: kept, sent: r, replaceWhenDrained: true };
+          overflowed.push(h);
           continue;
         }
         handles[h] = { ...rec, queue: [...rec.queue, delta], sent: r };
       }
-      return { ...o, r, handles, retiredDeltas, out };
+      let advanced: Owner = { ...o, r, handles, retiredDeltas, out: [] };
+      for (const h of overflowed) {
+        advanced = replace(advanced, h, true);
+        out.push(...advanced.out);
+      }
+      return { ...advanced, out };
     }
 
     case 'refresh': {
-      const rec = o.handles[e.h];
-      if (rec === undefined || !rec.live || rec.g === 0) return { ...o, out: [] };
-      // **An owner refresh never takes the caller's turn.**
-      // - Not while a projection cannot be taken: it would emit a
-      //   manifest the owner cannot follow with chunks.
-      // - Not while a solicited transition is pending: `install` clears
-      //   `deferred`, so refreshing here would silently discard the
-      //   caller's request and its desired audience, leaving
-      //   availability restoration with nothing to complete.
-      // - Not while this handle's own emission is outstanding: the
-      //   replica refuses unsolicited manifests mid-transition, so both
-      //   generations would stall until a deadline.
-      if (!o.canProject || rec.deferred !== null || rec.queue.length > 0) {
-        return { ...o, out: [] };
-      }
-      return install(o, e.h, null, rec.aud);
+      // An owner-initiated replacement, through the one admission point
+      // (`replace`). `keepPending: false`: an explicit refresh that is
+      // not admissible now is simply refused — the caller retries it,
+      // and nothing is left armed behind their back.
+      return replace(o, e.h, false);
     }
 
     case 'stall': {
@@ -773,22 +856,10 @@ export function emitNext(o: Owner, handle?: string): { owner: Owner; message: Me
     out: [],
   };
   if (queue.length === 0 && rec.replaceWhenDrained) {
-    const drained = next.handles[h];
-    if (drained !== undefined) {
-      const cleared: Owner = {
-        ...next,
-        handles: { ...next.handles, [h]: { ...drained, replaceWhenDrained: false } },
-      };
-      next = next.canProject
-        ? install(cleared, h, null, drained.aud)
-        : {
-            ...cleared,
-            handles: {
-              ...cleared.handles,
-              [h]: { ...drained, replaceWhenDrained: false, deferred: { q: null, aud: drained.aud } },
-            },
-          };
-    }
+    // The first moment nothing of the old installation is outstanding —
+    // and the same admission point every other replacement goes
+    // through, so a caller's pending request still wins here.
+    next = replace(next, h, true);
   }
   return { owner: next, message };
 }

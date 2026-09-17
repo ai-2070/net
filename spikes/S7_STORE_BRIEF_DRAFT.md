@@ -243,7 +243,7 @@ already carries what is needed, so no code is added:
 
 | Code | Scope | Replica disposition |
 |---|---|---|
-| `closed` | the handle is unusable: unknown, expired, fenced by the owner, or bound to another peer | **terminal for the handle** and for every action in flight on it — nothing replayed, no outcome inferred (§1.10) — and **recoverable for the subscription**: discard all handle-scoped state and `join` afresh, under bounded backoff |
+| `closed` | the handle is unusable: unknown, expired, fenced by the owner, or bound to another peer | **terminal for the handle** and for every action in flight on it — nothing replayed, no outcome inferred (§1.10) — and **recoverable for the subscription**: discard all handle-scoped state and `join` afresh, under bounded backoff, **while the caller's subscription intent is still active**. A locally cancelled (`fenced`) or left (`closed`) store discards the handle and stays where it is: automatic recovery must not undo a local decision |
 | `owner-lost` | the store incarnation that held the document is gone | terminal: there is nothing to rejoin |
 | anything else (`forbidden`, `capacity`, `invalid-data`, `not-ready`, `timeout`, `aborted`, `action-rejected`, `indeterminate`, `result-expired`, `version-mismatch`) | the **request** was refused | the handle survives; the request's waiters reject with the code |
 
@@ -470,7 +470,8 @@ caller-initiated request (`aud`, `resync`, `resume`).
 | `ready` | reconnect | `installing` | status `reconnecting`/`stale`; **the last snapshot is retained, not cleared** (§1.6 — the audience has not changed); one `resume`, its `q` the slot |
 | `joining`/`installing`, **handle learned** | reconnect | `installing` | **the lost session's assembly is retired**; one `resume` whose `aud` is the **latest desired audience**, never the owner's older one; a published view is retained and marked stale |
 | `joining`, **no handle learned yet** | reconnect | `joining` | a fresh **`join`**, not a `resume`: only `join` creates a handle, and the replica has none to resume (§2) |
-| any live | `no {closed}` (correlated, or the unsolicited expiry notice) | `joining` | the handle and **all** its generation state are discarded, the view cleared, and **one fresh `join`** issued — the only path that can produce a handle. Nothing is replayed (§1.10) |
+| `joining`/`installing`/`ready` | `no {closed}` (correlated, or the unsolicited expiry notice) | `joining` | the handle and **all** its generation state are discarded, the view cleared, and **one fresh `join`** issued — the only path that can produce a handle. Nothing is replayed (§1.10) |
+| `fenced` | `no {closed}` | `fenced` | the handle and its generation state are discarded, but **the fence is not lifted**: the caller cancelled this subscription, and an expiry notice is no more their consent than an owner refresh was. Their next request issues the `join`, because with no handle learned that is the only request it can issue |
 | any live | `no {owner-lost}` | `closed` | terminal: the incarnation that held the document is gone, so there is nothing to rejoin |
 | any live | any other `no` for the slot's `q` | `fenced` | the **request** was refused, not the subscription: the handle survives |
 | any | a message naming a handle other than the learned one | unchanged | dropped and counted (`foreign-handle`) |
@@ -553,13 +554,26 @@ owner instead of the handle:
   dead one with a **delivered** `no {closed}` — so the caller rejoins
   instead of waiting out its deadline. Refusal never recreates
   admission: only `join` does that.
-- **An owner refresh never takes the caller's turn.** It is refused at
-  the source when a projection cannot be taken, when a solicited
-  transition is already pending for that handle, or while that handle's
-  own emission is outstanding (§1.9a). Installing clears `deferred`, so
-  a refresh in the second case would silently discard the caller's
-  request and its desired audience and leave availability restoration
-  with nothing to complete.
+- **No owner-initiated replacement takes the caller's turn**, and
+  there is **one admission point** for all of them — an explicit
+  refresh, an overflow detected while advancing, and an overflow whose
+  queue drains later — because a rule satisfied on one path and
+  bypassed on another is not a rule. A replacement is refused when a
+  projection cannot be taken, when a solicited transition is already
+  pending for that handle, or while that handle's own emission is
+  outstanding (§1.9a). Installing clears `deferred`, so a replacement
+  in the second case would silently discard the caller's request and
+  its desired audience and leave availability restoration with nothing
+  to complete.
+- **A pending solicited installation subsumes the recovery need.** It
+  takes a fresh projection at the current revision, which is strictly
+  more than the replacement would have carried, so the recovery is
+  dropped rather than the request. The two differ in what the caller
+  sees: the request carries the audience they asked for.
+- The paths differ only in whether the need **survives** a refusal.
+  Overflow recovery is the owner's own and is retained for the drain;
+  an explicit refresh is the caller's and is simply refused, so nothing
+  is left armed behind them.
 
 ### 1.7b Control admission is not gameplay readiness
 
@@ -758,11 +772,19 @@ replica — the ordering is established before the bytes leave.
 
 **Pending work is bounded.** A handle's queue has a ceiling. Reaching
 it means incremental catch-up has failed for that subscription, so the
-queued deltas are retired and the installation is **replaced** once the
-queue drains — the same disposition §1.9 gives a single over-budget
-delta, applied to queue depth. A replica is therefore never asked to
-hold unbounded work, and never has to ask for a recovery the owner
-could see coming.
+queued deltas are retired and the installation is **replaced** — the
+same disposition §1.9 gives a single over-budget delta, applied to
+queue depth. A replica is therefore never asked to hold unbounded work,
+and never has to ask for a recovery the owner could see coming.
+
+**The replacement is scheduled at the moment of overflow, not at the
+next dequeue.** Retiring the queued deltas can *empty* the queue — a
+delta-only queue overflowing is exactly that case — and a recovery that
+waits for "the next message handed over" then waits for ever, which is
+silent divergence whenever the overflow-causing update is the last one.
+So overflow schedules the replacement immediately and the admission
+rules below decide whether it runs now or at the drain. Nothing about
+convergence may depend on further traffic arriving.
 
 Two rules keep that assumption from becoming load-bearing for
 **silence** as well as for liveness — a broken assumption must produce
@@ -1245,7 +1267,7 @@ owner reducer, and a harness in `browser-ts/test/store/lifecycle.test.ts`
 that delivers in per-direction FIFO order, routes by handle to either
 of two replicas, stalls the owner, expires handles, breaks sessions,
 and (only for the §1.9a witnesses) injects out-of-order delivery.
-**58 witnesses**, plus a **37-inverse** campaign.
+**66 witnesses**, plus a **39-inverse** campaign.
 
 It is test-only by construction: no production export, no transport, no
 new protocol subsystem, no `src/` change, bundle unchanged. It is not
@@ -1290,13 +1312,16 @@ not transition traces.
 | the emitter establishes the snapshot/live boundary | "an advance during emission is queued behind the chunks it depends on"; "several advances during one emission all land, in order" | hand the delta over ahead of unsent chunks → **3 failed** |
 | pending work is bounded | "pending work is bounded: catch-up gives way to a replacement" | unbounded queue → **1 failed**; drained queue never replaces → **1 failed** |
 | an owner refresh never takes the caller's turn | "does not replace a deferred caller transition"; "does not emit a manifest it cannot follow with chunks"; "does not replace a pending transition even when it could project" (whitebox) | ignore availability → **1 failed**; replace a pending transition → **1 failed**; ignore its own emission → **2 failed** |
+| overflow recovery is scheduled, not hoped for | "a delta-only queue that overflows still converges"; "overflow with chunks still outstanding waits for the drain"; "overflow while a projection is unavailable recovers on restoration"; "a pending caller request subsumes the overflow recovery" | overflow not scheduled → **2 failed**; scheduling bypasses the admission point → **2 failed**; drained queue never replaces → **2 failed** |
+| one admission point for every owner replacement | the three "an owner refresh never takes the caller's turn" witnesses, plus the overflow ones above | overwrite a pending transition → **2 failed**; ignore availability → **2 failed**; pre-empt its own emission → **4 failed**; explicit refresh arms the flag → **2 failed** |
+| handle loss preserves local intent | "an expiry notice does not reopen a cancelled subscription"; "the caller's own next request rejoins after a fenced expiry"; with the active-subscription and local-leave controls | expiry reopens a cancelled subscription → **2 failed** |
 | one recoverable handle-loss disposition | "`closed` discards the handle and rejoins, replaying nothing"; "an unsolicited `closed` notice recovers the subscription"; "`owner-lost` is terminal"; "a local leave is terminal"; "any other refusal fences without rejoining" | `closed` terminal → **6 failed**; `owner-lost` rejoins → **1 failed**; any refusal discards the subscription → **1 failed** |
 
 Four inverses are controls on the model itself, so that strictness
-cannot be mistaken for correctness: **drop every arrival** → 57 failed,
-0 passed; **never hand over queued work** → 55 failed; **reuse one
-handle id for every join** → 10 failed; **never allocate a generation**
-→ 55 failed. A drop-everything implementation fails every positive
+cannot be mistaken for correctness: **drop every arrival** → 66 failed,
+0 passed; **never hand over queued work** → 64 failed; **reuse one
+handle id for every join** → 11 failed; **never allocate a generation**
+→ 64 failed. A drop-everything implementation fails every positive
 control and every `converged()` assertion in the file.
 
 The inverse ledger is **implementer-run**: the mutation campaign is
@@ -1368,6 +1393,28 @@ Round 6, from the reviewer's probes:
   the subscription rejoins; `owner-lost` is the terminal case. A
   distinguishable `unknown-handle` was rejected because it re-opens the
   handle-existence disclosure channel §2 closes deliberately.
+
+Round 7, from the reviewer's probes:
+
+- **Overflow could empty the queue without scheduling its
+  replacement.** The replacement was triggered by a later dequeue, and
+  retiring the queued deltas had already emptied the queue, so when the
+  overflow-causing update was the last one nothing ever ran: the
+  replica sat at revision 100 against an owner at 107, with an empty
+  queue, the flag set, and no pending recovery on either side. Overflow
+  now schedules its replacement itself.
+- **Overflow completion reached installation through a second path**
+  that did not carry the caller-precedence and availability rules the
+  explicit refresh had just been given, so draining the old chunks
+  overwrote a deferred `aud` request with an unsolicited replacement
+  for the *old* audience. All three paths now share one admission
+  point.
+- **An expiry notice reopened a cancelled subscription.** Automatic
+  rejoin fired from `fenced`, undoing the caller's own cancellation —
+  the same class of defect as round 3's "an empty slot is not consent",
+  arriving by a different door. Handle loss now discards the handle and
+  its generation state from every state, and rejoins only where
+  subscription intent is still active.
 
 Two round-5 inverses came back **green** on first run, and both were
 untested paths rather than redundant rules: a control admitted on an

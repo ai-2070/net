@@ -1369,3 +1369,172 @@ describe('the refusal taxonomy', () => {
     expect(s.replica.handle).toBe('h1');
   });
 });
+
+describe('overflow recovery is scheduled, not hoped for', () => {
+  it('a delta-only queue that overflows still converges', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+
+    // A replacement's chunks are queued, and updates pile up behind
+    // them …
+    s = owner(s, { t: 'refresh', h });
+    for (let i = 0; i < 3; i += 1) s = owner(s, { t: 'advance' });
+    expect(s.owner.handles[h]?.queue.map((m) => m.k)).toEqual([
+      'snap', 'snap', 'delta', 'delta', 'delta',
+    ]);
+
+    // … then only the chunks are handed over, leaving a delta-only
+    // queue.
+    s = emit(s, h);
+    s = emit(s, h);
+    while (s.wire.length > 0) s = pump(s);
+    expect(s.owner.handles[h]?.queue.every((m) => m.k === 'delta')).toBe(true);
+
+    // Overflow it. The advance that overflows retires every queued
+    // delta, so the queue is empty and nothing further will be
+    // dequeued — there is no later message to piggyback recovery on.
+    for (let i = 0; i < 4; i += 1) s = owner(s, { t: 'advance' });
+    expect(s.owner.retiredDeltas).toBeGreaterThan(0);
+    expect(s.owner.handles[h]?.replaceWhenDrained).toBe(false);
+
+    s = settle(s);
+
+    // Convergence must not depend on another message arriving, and the
+    // replica must not have had to ask.
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(s.pending.filter((q) => q.k === 'resync')).toHaveLength(0);
+    expect(converged(s)).toBe(true);
+    expect(stillLive(s)).toBe(true);
+  });
+
+  it('overflow with chunks still outstanding waits for the drain (control)', () => {
+    let s = joined(4);
+
+    s = owner(s, { t: 'refresh', h: handleOf(s) });
+    for (let i = 0; i < 8; i += 1) s = owner(s, { t: 'advance' });
+    // The replacement may not pre-empt its own outstanding emission.
+    expect(unsentOf(s)).toBeGreaterThan(0);
+    expect(s.owner.handles[handleOf(s)]?.replaceWhenDrained).toBe(true);
+
+    s = settle(s);
+
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('overflow while a projection is unavailable recovers on restoration', () => {
+    let s = joined(2);
+    const h = handleOf(s);
+
+    s = owner(s, { t: 'refresh', h });
+    for (let i = 0; i < 3; i += 1) s = owner(s, { t: 'advance' });
+    s = emit(s, h);
+    s = emit(s, h);
+    while (s.wire.length > 0) s = pump(s);
+
+    s = owner(s, { t: 'projectable', can: false });
+    for (let i = 0; i < 4; i += 1) s = owner(s, { t: 'advance' });
+
+    // It cannot emit a manifest it could not follow with chunks, so the
+    // recovery becomes this handle's pending projection …
+    expect(s.wire).toHaveLength(0);
+    expect(deferredOf(s, h)).not.toBeNull();
+    expect(deferredOf(s, h)?.q).toBeNull();
+
+    // … and restoration completes it through the same path a caller's
+    // own request would take.
+    s = settle(owner(s, { t: 'projectable', can: true }));
+    expect(s.replica.revision).toBe(s.owner.r);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('a pending caller request subsumes the overflow recovery', () => {
+    let s = joined(4);
+
+    // Overflow while chunks are still outstanding.
+    s = owner(s, { t: 'refresh', h: handleOf(s) });
+    for (let i = 0; i < 8; i += 1) s = owner(s, { t: 'advance' });
+    expect(s.owner.handles[handleOf(s)]?.replaceWhenDrained).toBe(true);
+
+    // The caller asks for a different audience; the owner defers it.
+    s = owner(s, { t: 'projectable', can: false });
+    s = local(s, { t: 'setAudience', q: 'desired-deck', aud: ['deck'] });
+    const taken = take(s);
+    s = serve(taken.rest, taken.req);
+    expect(deferredOf(s)?.q).toBe('desired-deck');
+
+    // Draining the old chunks must not overwrite it with an
+    // unsolicited replacement for the OLD audience.
+    while (emitting(s.owner).length > 0) s = pump(emit(s));
+    expect(deferredOf(s)?.q).toBe('desired-deck');
+    expect(deferredOf(s)?.aud).toEqual(['deck']);
+
+    s = settle(owner(s, { t: 'projectable', can: true }));
+
+    expect(audOf(s)).toEqual(['deck']);
+    expect(s.replica.desired).toEqual(['deck']);
+    expect(converged(s)).toBe(true);
+    expect(stillLive(s)).toBe(true);
+  });
+});
+
+describe('handle loss preserves local intent', () => {
+  it('an expiry notice does not reopen a cancelled subscription', () => {
+    let s = joined(2);
+
+    s = local(s, { t: 'setAudience', q: 'a-b', aud: ['deck'] });
+    s = { ...s, pending: [] };
+    s = local(s, { t: 'cancel' });
+    expect(s.replica.state).toBe('fenced');
+
+    // The handle expires while the caller is fenced.
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: null, code: 'closed' }] });
+
+    // The handle and its generation state are gone …
+    expect(s.replica.handle).toBeNull();
+    expect(s.replica.retired).toBe(0);
+    expect(s.replica.installed).toBeNull();
+    // … but the fence the caller set is still theirs to lift.
+    expect(s.replica.state).toBe('fenced');
+    expect(s.pending).toHaveLength(0);
+  });
+
+  it('the caller’s own next request rejoins after a fenced expiry', () => {
+    let s = joined(2);
+    s = local(s, { t: 'setAudience', q: 'a-b', aud: ['deck'] });
+    s = { ...s, pending: [] };
+    s = local(s, { t: 'cancel' });
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: null, code: 'closed' }] });
+
+    // With no handle learned, the only request it can issue is a join.
+    s = local(s, { t: 'setAudience', q: 'a-c', aud: ['bridge'] });
+    expect(s.pending[0]?.k).toBe('join');
+
+    s = settle(s);
+    expect(s.replica.handle).toBe('h2');
+    expect(audOf(s, 'h2')).toEqual(['bridge']);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('an active subscription still rejoins on expiry (control)', () => {
+    let s = joined(2);
+
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: null, code: 'closed' }] });
+
+    expect(s.replica.state).toBe('joining');
+    expect(s.pending[0]?.k).toBe('join');
+
+    s = settle(s);
+    expect(converged(s)).toBe(true);
+  });
+
+  it('a local leave stays terminal through an expiry notice (control)', () => {
+    let s = joined(2);
+    s = local(s, { t: 'leave' });
+
+    s = pump({ ...s, wire: [{ k: 'no', h: 'h1', q: null, code: 'closed' }] });
+
+    expect(s.replica.state).toBe('closed');
+    expect(s.pending).toHaveLength(0);
+  });
+});
