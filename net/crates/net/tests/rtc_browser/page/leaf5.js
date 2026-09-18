@@ -2020,6 +2020,23 @@ async function execute(step) {
 
     // The host writes. Returns once the frames the commit produced
     // have been handed to the transport.
+    case 'node_counters': {
+      // The leaf's RAW counter ledger, both sides of a pair: which
+      // one is silent about a loss is the whole diagnosis.
+      const node = nodes.get(step.session) || state.node;
+      if (!node) return { ok: false, error: 'no node for session ' + step.session };
+      let counters = null;
+      try {
+        counters =
+          node.inner && typeof node.inner.counters_json === 'function'
+            ? node.inner.counters_json()
+            : JSON.stringify(node.counters());
+      } catch (e) {
+        counters = 'ERROR ' + ((e && (e.message || String(e))) || 'unknown');
+      }
+      return { ok: true, stats: { counters } };
+    }
+
     case 'store_commit': {
       const host = hosts.get(step.handle);
       if (!host) return { ok: false, error: 'no such hosted store ' + step.handle };

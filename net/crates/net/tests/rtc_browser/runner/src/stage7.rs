@@ -18,11 +18,43 @@
 //! them by name.
 //!
 //! Local status at the time of writing (Chromium, `--stage7`): 1, 2,
-//! 4 and 5 PASS; 3 does not — the join does not complete while the
-//! host's channel is dropping, even at one in seven, and it DID
-//! complete in an earlier run where all three stores shared one
-//! label. That is a lead, not a diagnosis, and the witness stays
-//! failing rather than being softened until someone follows it.
+//! 4 and 5 PASS; 3 does not, and is left failing rather than
+//! softened.
+//!
+//! What witness 3 has established, which is more than "it fails":
+//! ONE dropped datagram on the host's channel stalls the join past
+//! 30 s. Not a pattern of loss — one packet, out of the seven or so
+//! the join costs. A store-level `resync` cannot repair that,
+//! because a reliable stream with a wire gap holds everything behind
+//! it, so recovery has to come from the transport.
+//!
+//! Four candidate explanations, and where each stands:
+//!
+//! 1. *The harness's offer budget refuses the attempt.* REFUTED —
+//!    raised 200 → 2000 per IP per minute, no change.
+//! 2. *Nothing drives the replica's assembly deadline, so no resync
+//!    is ever sent.* TRUE, and fixed (`join.ts` now drives
+//!    `replica.tick()`, with its own red/green witness in
+//!    `test/store/hosted.test.ts`) — but NOT the cause here: the
+//!    browser behaves identically with the clock driven, which is
+//!    what point 3 explains.
+//! 3. *Retransmission needs traffic.* OPEN. `LeafNode::tick` →
+//!    `drive_reliability` is what emits NACKs and due retransmits,
+//!    and it runs only from `pump()` — an API call or an inbound
+//!    packet. There is no periodic tick in the WASM leaf. An
+//!    attempt to test this by keeping the host committing failed to
+//!    test anything: with no installed replica there is no audience,
+//!    so the commits sent nothing. Needs a driver that does not
+//!    depend on the join having succeeded.
+//! 4. *The anchor does not forward reliability control packets.*
+//!    REFUTED from source — the relay path is header-only routing
+//!    and type-agnostic (`mesh.rs`, the `dest_id != local` arm);
+//!    only signalling is classified, and only to choose a counter.
+//!
+//! Both leaves' raw counter ledgers are printed on failure
+//! (`Step5::NodeCounters`) because which side is silent about the
+//! loss is the diagnosis; at the time of writing neither reports a
+//! `stream_failed`, so nothing has given up — it is waiting.
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. it still installs through injected loss **and** reorder;
@@ -427,6 +459,36 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         .await;
     let joined_lossy = script.run(tab_player, join_store("lossy", 0, 0, 0)).await;
     let faults = script.run(tab_host, Step5::StoreFaultsReport { id: 0 }).await;
+    if !joined_lossy.ok {
+        // The failing leg's own evidence, both sides. Printed only
+        // when it fails, because on a pass it is noise, and printed
+        // at all because the next person to pick this up should not
+        // have to re-instrument it.
+        let host_counters = script
+            .run(
+                tab_host,
+                Step5::NodeCounters {
+                    id: 0,
+                    session: session.clone(),
+                },
+            )
+            .await;
+        let player_counters = script
+            .run(
+                tab_player,
+                Step5::NodeCounters {
+                    id: 0,
+                    session: session.clone(),
+                },
+            )
+            .await;
+        println!(
+            "[stage7] lossy join ok=false err={:?} host faults={:?}",
+            joined_lossy.error, faults.stats
+        );
+        println!("[stage7] lossy host counters {:?}", host_counters.stats);
+        println!("[stage7] lossy player counters {:?}", player_counters.stats);
+    }
     let dropped = stat_u64(&faults, "dropped").unwrap_or(0);
     let swapped = stat_u64(&faults, "swapped").unwrap_or(0);
     let lossy_digest = stat_str(&joined_lossy, "digest");

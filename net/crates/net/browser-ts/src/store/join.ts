@@ -43,6 +43,15 @@ export const ALIVE_INTERVAL_MS = 20_000;
 /** How long a request waits before it is a typed timeout (§2). */
 export const REQUEST_DEADLINE_MS = 10_000;
 
+/**
+ * How often the replica's own clock is driven.
+ *
+ * The assembly deadline is 10 s (`assembly.ts`), so a second is fine
+ * resolution and cheap: the tick does nothing at all unless an
+ * assembly is open and overdue.
+ */
+export const TICK_INTERVAL_MS = 1_000;
+
 /** Outstanding correlations per caller (§2). */
 export const MAX_OUTSTANDING = 64;
 
@@ -297,6 +306,26 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     }
   }, REQUEST_DEADLINE_MS);
 
+  /**
+   * Drive the replica's own clock.
+   *
+   * Nothing else does, and without it the assembly deadline never
+   * fires: a snapshot that loses one chunk waits for a chunk that is
+   * not coming, no `resync` is ever sent, and the caller's `ready()`
+   * simply times out. That is the shape a real browser produced — one
+   * dropped datagram, a 30-second wait — and it is why the deadline
+   * `assembly.ts` implements needs a hand here rather than a comment
+   * saying it exists.
+   *
+   * The interval is the assembly deadline's own resolution: checking
+   * more often would not make an abandoned assembly recover sooner,
+   * and checking less often would let it sit past its deadline.
+   */
+  const stopTick = schedule(() => {
+    if (closed) return;
+    dispatch(framesOf(replica.tick()));
+  }, TICK_INTERVAL_MS);
+
   dispatch(framesOf([replica.join()]));
 
   function correlate<T>(q: Hex): Promise<T> {
@@ -402,6 +431,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       closed = true;
       stopAlive();
       stopDeadlines();
+      stopTick();
       const h = replica.handle;
       if (h !== null) {
         try {

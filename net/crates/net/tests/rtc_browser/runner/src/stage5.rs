@@ -739,6 +739,11 @@ pub enum Step5 {
         handle: String,
     },
     /// The host writes, optionally duplicating what the commit sends.
+    /// The leaf's raw counter ledger.
+    NodeCounters {
+        id: u64,
+        session: String,
+    },
     StoreCommit {
         id: u64,
         handle: String,
@@ -795,6 +800,7 @@ impl Step5 {
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }
+            | Self::NodeCounters { id, .. }
             | Self::StoreCommit { id, .. }
             | Self::StoreAct { id, .. }
             | Self::StoreClose { id, .. }
@@ -845,6 +851,7 @@ impl Step5 {
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }
+            | Self::NodeCounters { id, .. }
             | Self::StoreCommit { id, .. }
             | Self::StoreAct { id, .. }
             | Self::StoreClose { id, .. }
@@ -3857,7 +3864,6 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
         // text — all of which lose the answer to the question a page
         // asks next, which is *which* leader it lost.
         let pending_kind = pending_outcome.kind.clone().unwrap_or_default();
-        let pending_message = pending_outcome.message.clone().unwrap_or_default();
         // EXACT equality against the predecessor's generation, read
         // from the failure's own STRUCTURED field (the browser
         // package's `RpcError.failure.generation`), not asked of the

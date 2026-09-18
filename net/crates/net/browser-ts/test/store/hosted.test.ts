@@ -101,10 +101,25 @@ function mesh() {
   const delivered: { to: string; from: string; bytes: Uint8Array }[] = [];
   let partitioned = false;
   const silenced = new Set<string>();
+  /** Drop the Nth frame a node sends, once. */
+  const drops = new Map<string, number>();
+  const seen = new Map<string, number>();
+  let dropCount = 0;
   let identify: (sender: string) => string | null = sender => sender;
 
   function deliver(to: string, from: string, bytes: Uint8Array, streamId: string): void {
     if (partitioned || silenced.has(from)) return;
+    const nth = drops.get(from);
+    if (nth !== undefined) {
+      const count = (seen.get(from) ?? 0) + 1;
+      seen.set(from, count);
+      if (count === nth) {
+        // Lost on the wire, exactly like a dropped datagram: the
+        // sender believes it sent it.
+        dropCount += 1;
+        return;
+      }
+    }
     delivered.push({ to, from, bytes });
     for (const handler of handlers.get(to) ?? []) {
       // Both fields in the spelling the REAL event carries: exact
@@ -210,6 +225,12 @@ function mesh() {
     partition: (value: boolean) => {
       partitioned = value;
     },
+    /** Lose the Nth frame this node sends. */
+    dropNth: (node: string, nth: number) => {
+      drops.set(node, nth);
+      seen.set(node, 0);
+    },
+    dropped: () => dropCount,
     /** Drop one direction: this node's frames stop arriving. */
     silence: (node: string) => {
       silenced.add(node);
@@ -878,6 +899,65 @@ describe('audience and recovery over the transport', () => {
 
     expect(joined.getState()).toBe(installed);
     expect(joined.getStatus()).toMatchObject({ phase: 'reconnecting', stale: true });
+  });
+});
+
+describe('a snapshot that loses a chunk recovers by itself', () => {
+  it('abandons the stalled assembly, asks again, and installs', async () => {
+    // The shape a real browser produced: ONE dropped datagram and a
+    // 30-second wait. Nothing was driving the replica's clock, so the
+    // assembly deadline never fired, no `resync` was ever sent, and
+    // the caller simply timed out — the deadline existed and did
+    // nothing.
+    const crew: Record<string, number> = {};
+    for (let i = 0; i < 700; i += 1) crew[`crew${String(i)}`] = i;
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: { ...FULL, crew },
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    // Armed BEFORE the joiner exists, or the snapshot is already
+    // installed by the time anything could be lost: drop the third
+    // frame the host sends, which is a chunk mid-assembly.
+    net.dropNth(HOST_NODE, 3);
+
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'lossy',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    const ready = joined.ready();
+    await flush(40);
+    // The snapshot is several chunks and each send is a promise, so
+    // the loss lands a few turns in.
+    expect(net.dropped()).toBe(1);
+
+    // Past the assembly deadline, with the clock driven.
+    for (let i = 0; i < 14; i += 1) {
+      time.advance(1_000);
+      await flush(20);
+    }
+    await ready;
+
+    expect(Object.keys(joined.getState().crew)).toHaveLength(700);
+    expect(net.kinds(HOST_NODE)).toContain('resync');
+    await joined.close();
+    await host.close();
   });
 });
 
