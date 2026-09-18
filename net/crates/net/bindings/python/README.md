@@ -111,6 +111,14 @@ policy. Full install options in
 | Security — identity, delegable tokens, subnets | [Identity](https://ai2070.net/docs/concepts/identity), [Security model](https://ai2070.net/docs/concepts/security-model) |
 | Errors — the full exception hierarchy | [Errors](https://ai2070.net/docs/sdk/python/errors) |
 
+## Links
+
+[Quickstart](https://ai2070.net/docs/sdk/python/quickstart) — documents the
+[`net_sdk`](https://pypi.org/project/net-mesh-sdk/) wrapper ·
+[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) ·
+[Production deployment](https://ai2070.net/docs/guides/production-deployment) ·
+[Errors](https://ai2070.net/docs/sdk/python/errors)
+
 ## License
 
 MIT OR Apache-2.0

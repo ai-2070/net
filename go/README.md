@@ -14,7 +14,9 @@ leave the node that holds them: the machine with the secret runs the work.
 ```go
 // Find something that can do the job, then do it — no registry, no config.
 nodes, _ := node.FindNodes(net.CapabilityFilter{RequireTags: []string{"gpu"}})
-resp, _ := net.CallTool[Req, Resp](ctx, rpc, "summarize", Req{Text: text})
+raw, _ := net.NewMeshRpc(node)
+defer raw.Close()
+resp, _ := net.CallTool[Req, Resp](ctx, net.NewTypedMeshRpc(raw), "summarize", Req{Text: text})
 ```
 
 ## Why this instead of a queue
@@ -139,8 +141,11 @@ err = node.AnnounceCapabilities(net.CapabilitySet{
 nodes, err := node.FindNodes(net.CapabilityFilter{RequireTags: []string{"gpu"}})
 // nodes is []uint64 — the node ids that match, right now.
 
-rpc, err := net.NewMeshRpc(node)
-tools, err := rpc.ListTools()
+raw, err := net.NewMeshRpc(node)
+tools, err := raw.ListTools()
+
+// CallTool / CallToolStreaming take the typed wrapper, not the raw handle.
+rpc := net.NewTypedMeshRpc(raw)
 ```
 
 **Invoke** — generic over request and response types:

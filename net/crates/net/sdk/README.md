@@ -89,15 +89,15 @@ let _handle = web_search_register(&host)?;      // unregisters on drop
 host.announce_capabilities(Default::default()).await?;
 ```
 
-**Discover.** From any peer that has handshaked with the host:
+**Discover.** Once peers have handshaked, walk the local capability fold:
 
 ```rust
-for t in agent.list_tools(None) {
+for t in host.list_tools(None) {
     println!("{} v{}  tags={:?}", t.tool_id, t.version, t.tags);
 }
 
 // Or react to the mesh changing, rather than polling it.
-let mut watch = agent.watch_tools(None, None);
+let mut watch = host.watch_tools(None, None);
 while let Some(change) = watch.next().await {
     println!("{change:?}");        // added / removed / publisher-count change
 }
@@ -106,7 +106,7 @@ while let Some(change) = watch.next().await {
 **Invoke.** Typed in, typed out:
 
 ```rust
-let resp: WebSearchResp = agent
+let resp: WebSearchResp = host
     .call_tool("web_search", &WebSearchReq { query: "capability folds".into() })
     .await?;
 ```
@@ -217,12 +217,14 @@ cargo run --example hello
 | `stream.rs` | Multi-peer streaming with backpressure |
 | `backpressure.rs` | What drops look like, and how to see them |
 
-## Links
+## Where to go next
 
-[Docs](https://ai2070.net/docs) ·
-[Quickstart](https://ai2070.net/docs/sdk/rust/quickstart) ·
-[API reference](https://docs.rs/net-mesh-sdk) ·
-[Concepts](https://ai2070.net/docs/concepts/architecture) ·
+1. [Quickstart](https://ai2070.net/docs/sdk/rust/quickstart) — a mesh node, a tool, and a call.
+2. [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) — announce a capability and reach it from a peer.
+3. [Gang scheduler](https://ai2070.net/docs/guides/gang-scheduler) and [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle) — atomic claims and workflow state when work is placed.
+4. [Production deployment](https://ai2070.net/docs/guides/production-deployment) — run the mesh beyond a single host.
+5. [Errors](https://ai2070.net/docs/sdk/rust/errors) — the `SdkError` taxonomy, then the [API reference](https://docs.rs/net-mesh-sdk).
+
 [GitHub](https://github.com/ai-2070/net)
 
 ## License

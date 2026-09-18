@@ -1,9 +1,9 @@
 # `docs/data` — public product metadata
 
 **This directory is public product truth, not internal notes.** It is a sibling of
-`docs/internal/`, not part of it. `docs/` happens to have contained only
-`internal/` until now, so that has to be said explicitly rather than inferred from
-the parent.
+`docs/internal/`, not part of it. The parent `docs/` also holds internal material
+(`docs/internal/`, `docs/misc/`), so that has to be said explicitly rather than
+inferred from the parent.
 
 Everything here is **authored once and consumed several times**. The rule that
 makes it worth having:
@@ -17,6 +17,7 @@ different answers to "does Go support this" and no way to tell which is current.
 | File | Is the record for | Consumed by |
 |---|---|---|
 | `capabilities/<domain>.yaml` | which binding supports which operation, and why not when it does not | the docs' support badges and absence states, each skill's `bindings/coverage.md`, later a public parity page |
+| `spine-symbols.yaml` | the API symbols the composed SDK spine names, per page and lens, at evidence level `source-match` | `check-spine-symbols.py`, which resolves each symbol in its own binding's tree |
 | `examples.yaml` | which examples exist, where their source lives, and what CI proves about each | the docs' transcluded snippets, `check-skill-examples.sh`, `run-skill-examples.sh` |
 | `tiers.yaml` | every docs page's migration state, plus the `adaptive_pending` allowlist | the polyglot-lens checkers, the information-model table in the plan |
 

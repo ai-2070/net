@@ -28,19 +28,26 @@ net-mesh --help
 | `version`     | SDK version + build metadata.                                                   |
 | `identity`    | Generate / inspect / fingerprint operator identity files.                       |
 | `admin`       | Signed admin-chain commits — drain, cordon, maintenance, drop-replicas, etc.    |
-| `ice`         | Break-glass ICE — simulate then commit force-drain / evict / restart / cutover. |
-| `snapshot`    | One-shot `MeshOsSnapshot` reads (and `--watch` for streaming).                  |
+| `ice`         | Break-glass ICE — simulate then commit freeze-cluster / thaw-cluster / flush-avoid-lists / force-evict-replica / force-restart-daemon / force-cutover / kill-migration. |
+| `snapshot`    | One-shot substrate reads, both requiring `--local`: `get` prints the `MeshOsSnapshot`; `status` prints the typed `StatusSummary`. |
 | `audit`       | Read-only queries against the RedEX-committed audit ledger.                     |
-| `log tail`    | Substrate log stream (`--follow`, `--daemon`, `--level`).                       |
+| `log tail`    | Substrate log stream (`--follow`, `--daemon`, `--min-level`).                   |
 | `failures tail` | Substrate failure stream — same shape as `log tail`.                          |
 | `cap`         | Capability advertisement + discovery.                                           |
-| `peer`        | Peer + NAT-traversal helpers.                                                   |
+| `peer`        | Peer + NAT-traversal helpers (`peer ls` today; reflex/NAT in Phase 2).          |
 | `daemon`      | Per-daemon listing from the local snapshot.                                     |
 | `netdb`       | NetDB local KV adapter — Cortex-backed tasks + memories.                        |
+| `org`         | Organization root authority authoring (keygen / issue-cert / issue-floors).     |
+| `node`        | Node ownership provisioning (`adopt`).                                          |
 | `subnet`      | Hierarchical subnet inspection (`show`, `ls`, `tree`).                          |
 | `gateway`     | `SubnetGateway` stats + export-table operator surface.                          |
 | `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
 | `aggregator`  | `AggregatorDaemon` inspection + remote query.                                   |
+| `transfer`    | Blob + directory transfer (`recv-blob` / `send-blob` / `recv-dir` / `send-dir` / `ls` / `status` / `cancel`). |
+| `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
+| `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
+| `forwarding`  | Caller-side credential/header forwarding policy + audit (deny-by-default).      |
+| `typegen`     | Generate typed language bindings from discovered tool descriptors.              |
 | `completion`  | Emit a shell-completion script (`bash` / `zsh` / `fish` / `powershell`).        |
 | `man`         | Emit the troff(1) man page on stdout.                                           |
 
@@ -50,6 +57,7 @@ Applied to every subcommand; environment-variable fallbacks in brackets:
 
 - `--config <path>` `[NET_MESH_CONFIG]` — profile file (default `$XDG_CONFIG_HOME/net-mesh/config.toml`).
 - `--profile <name>` `[NET_MESH_PROFILE]` — named profile within the config file.
+- `--insecure-config-permissions` `[NET_MESH_INSECURE_CONFIG_PERMISSIONS]` — read the profile even when it is group/world-accessible or owned by another user.
 - `--output (json|yaml|ndjson|table|text)` — auto-detects `table`/`text` on TTY and `json`/`ndjson` off-TTY.
 - `--quiet` / `-q` — suppress stderr diagnostics.
 - `--verbose` / `-v` — `-v` info, `-vv` debug, `-vvv` trace. `NET_MESH_LOG=` env-filter overrides.
@@ -80,12 +88,20 @@ Operator identity files are authored by `net-mesh identity generate` — ed25519
 Typed via `ExitCodeKind`. Scripts can match on the discriminator:
 
 - `0` — success
-- `2` — usage / parse error
-- `3` — config / identity load failure
-- `4` — substrate refused the action (auth, ICE threshold, etc.)
-- `5` — timeout
-- `6` — transport error
+- `1` — generic error
+- `2` — invalid arguments / parse error
+- `3` — SDK error
+- `4` — ICE simulation blocked
+- `5` — operator-policy reject
+- `6` — connection failure
+- `7` — timeout
+- `8` — confirmation refused
+- `10` — `daemon`: factory id not registered
+- `11` — `db`: query JSON failed to parse
+- `12` — `db`: predicate DSL (`--where` / `--filter`) failed to parse
+- `13` — `ice`: a supplied operator signature failed verification
+- `14` — `typegen diff --exit-code`: a breaking schema change was detected
 
 ## License
 
-Apache-2.0.
+MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

@@ -26,11 +26,9 @@ The five feature flags that gate the storage / query / OS surfaces on this bindi
 
 | Feature | Surface enabled in the napi module |
 |---|---|
-| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` |
-| `redex-disk` | Disk-backed RedEX persistence — the `persistentDir` ctor option and `persistent: true` on `openFile`. Without it the persistent path rejects with `RedexError`. |
-| `netdb` | `NetDb` composition (requires `cortex`); the `net_netdb_*` FFI entry points ship with this feature. |
-| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`, plus the `libnet_meshdb` cdylib. |
-| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`, plus the `libnet_meshos` cdylib. |
+| `cortex` | `Redex`, `RedexFile`, `TasksAdapter`, `MemoriesAdapter`, `NetDb`, `Task`, `Memory`, watch iterators, `RedexError`, `CortexError`, `NetDbError` — disk-backed persistence (`persistentDir`; `persistent: true` on `openFile`) is part of this feature |
+| `meshdb` | `MeshQuery`, `MeshQueryRunner`, `QueryBuilder`, `Predicate`, `InMemoryChainReader`. |
+| `meshos` | `MeshOsDaemonSdk`, `MeshOsDaemonHandle`. |
 | `consent` | `CapabilityId`, `ConsentPolicy`, `PinStore` — the local consent / pin surface (no mesh dep). In the default features. |
 | `mcp` | `classifyMcpServer`, `lowerMcpTool` — the MCP bridge pure helpers. In the default features. |
 
@@ -38,11 +36,11 @@ Enable at build time (`consent` + `mcp` are on by default — add them explicitl
 if you build with `--no-default-features`):
 
 ```bash
-napi build --platform --release --features "cortex netdb redex-disk meshdb meshos"
+napi build --platform --release --features "cortex meshdb meshos"
 ```
 
-The repo's `npm run build` script already passes a superset of these flags (`redis,net,cortex,compute,groups,meshos,deck,meshdb`) — see `package.json -> scripts.build` for the exact invocation. Slim the list by editing that script or invoking `napi build` directly with the features you actually need.
+The repo's `npm run build` script already passes a superset of these flags (`redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,delegation,a2a,org`) — see `package.json -> scripts.build` for the exact invocation. Slim the list by editing that script or invoking `napi build` directly with the features you actually need.
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
