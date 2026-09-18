@@ -106,6 +106,20 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
   #behind = false;
   /** The desired-transition slot: one `q` per shared transition. */
   #slot: Hex | null = null;
+  /**
+   * Bumped by every caller-initiated transition.
+   *
+   * The replica calls APPLICATION code in two places inside an
+   * installation — the definition's validator, from the assembler, and
+   * a subscriber, from the publication — and either may cancel or
+   * change audience re-entrantly. Comparing the epoch across those
+   * calls is what stops an installation that was cancelled halfway
+   * from finishing and reporting `ready`: without it, a cancellation
+   * from a validator was simply overwritten, and one from a
+   * subscriber left the caller `ready` and not stale over the empty
+   * view `cancel` had just published.
+   */
+  #epoch = 0;
   #assembly: Assembly | null = null;
   /** The caller's latest desired audience. Survives every transition. */
   #desired: readonly string[];
@@ -173,6 +187,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (this.#state === 'closed') {
       throw new StoreError('closed', 'a closed replica cannot join again');
     }
+    this.#epoch += 1;
     this.#waiters = 1;
     // A join is a FRESH SUBSCRIPTION with a new handle, and §1.7a
     // restarts that handle's generations at 1 — so every value scoped
@@ -220,6 +235,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (this.#state === 'closed') {
       throw new StoreError('closed', 'a closed replica cannot change audience');
     }
+    this.#epoch += 1;
     const next = [...names];
     if (this.#state === 'installing' && sameAudience(next, this.#desired)) {
       // The same transition, already in flight. One wire request, one
@@ -267,6 +283,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (this.#state === 'closed') {
       throw new StoreError('closed', 'a closed replica cannot reconnect');
     }
+    this.#epoch += 1;
     const h = this.#handle;
     // The lost session's assembly cannot be completed on the new one.
     this.#retireAssembly();
@@ -349,6 +366,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
   /** The caller gives up this subscription. Fences it; no view. */
   cancel(): void {
     if (this.#state === 'closed') return;
+    this.#epoch += 1;
     this.#retireAssembly();
     this.#slot = null;
     this.#state = 'fenced';
@@ -450,11 +468,19 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     // `assembling` holds — so identity is the assembler's property
     // (slice B1) and a second comparison here would be a claim that
     // cannot fail rather than a check that can.
+    const epoch = this.#epoch;
     const outcome = assembly.accept(
       { h: message.h, g: message.g, r: message.r, n: message.n, i: message.i, d: message.d },
       raw => this.deps.definition.state(raw),
       this.deps.now(),
     );
+    // No epoch check here, and not for want of trying: a
+    // cancellation from the VALIDATOR is caught by the one in
+    // `#install` — the epoch it compares moved for the validator's
+    // cancellation exactly as it does for a subscriber's — and I
+    // could not construct an observable the two answer differently,
+    // including the notification count. An inverse that goes green is
+    // a guard that is not there, so it is not there.
     if (!outcome.ok) {
       // A fatal refusal has destroyed the assembly; a non-fatal one
       // (a duplicate) leaves it open and is only counted.
@@ -463,10 +489,10 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     }
     if (!outcome.done) return { out: [], dropped: null };
 
-    return this.#install(outcome.document, message.g, message.r);
+    return this.#install(outcome.document, message.g, message.r, epoch);
   }
 
-  #install(document: unknown, g: Decimal, r: Decimal): Received {
+  #install(document: unknown, g: Decimal, r: Decimal, epoch: number): Received {
     // Reached only from a completed assembly, which the assembler
     // opened for this generation and which every supersession path
     // retires — so `g` is `assembling` by construction and there is
@@ -474,11 +500,21 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     // witnessed on each path that supersedes ("publishes nothing after
     // cancellation mid-assembly"), not a comparison at the end.
     this.deps.core.applySnapshot(document);
-    this.#installed = decimalValue(g);
-    this.#revision = decimalValue(r);
     this.#assembling = null;
     this.#assembly = null;
     this.#assemblies.reclaim(this.#handle as Hex, g);
+    if (this.#epoch !== epoch) {
+      // A SUBSCRIBER cancelled while this document was being
+      // published. Its `cancel` already cleared the view; saying
+      // `ready` over that is the worst of both — an empty world
+      // reported as current.
+      this.#installed = null;
+      this.#revision = null;
+      this.#clearView('failed');
+      return this.#drop('superseded-installation');
+    }
+    this.#installed = decimalValue(g);
+    this.#revision = decimalValue(r);
     this.#slot = null;
     this.#state = 'ready';
     this.deps.core.setStatus({ phase: 'ready', stale: false, error: null });

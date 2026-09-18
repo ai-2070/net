@@ -24,7 +24,7 @@
 
 import { StoreCore } from './core.js';
 import { StoreError } from './errors.js';
-import type { TransportFrame, TransportStream, StoreTransport } from './host.js';
+import { peerHexOf, samePeer, type StoreTransport, type TransportFrame, type TransportStream } from './host.js';
 import { StoreReplica, type Request } from './replica.js';
 import type {
   ActionSpec,
@@ -141,11 +141,21 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   async function stream(): Promise<TransportStream> {
     if (upstream !== null) return upstream;
     if (opening !== null) return opening;
+    const addressable = peerHexOf(options.host);
+    if (addressable === null) {
+      return Promise.reject(
+        new StoreError('invalid-data', `the host id is not a node id: ${options.host}`),
+      );
+    }
+    // `label`, never `streamId`: see {@link StoreTransport.openStream}.
+    // A textual id is refused by the wasm option reader, which is why
+    // this used to fail before a single byte was sent — and an
+    // arbitrary numeric one would lose the discriminator bit that makes
+    // the far end classify an unsolicited arrival as stream data.
     opening = Promise.resolve(
       options.transport.openStream({
         reliability: 'reliable',
-        peer: options.host,
-        streamId,
+        peer: addressable,
         label: streamId,
       }),
     ).then(open => {
@@ -163,6 +173,31 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       const open = await stream();
       await open.send(encoder.encode(frame));
     }
+  }
+
+  /**
+   * Fail everything waiting, because the transport could not carry it.
+   *
+   * The fire-and-forget sends were `void`ed, so a rejected `openStream`
+   * became an unhandled rejection and `ready()` stayed pending for
+   * ever — the page waited out its own deadline with the real reason
+   * on the floor. Every path that cannot send now ends here.
+   */
+  function fail(error: unknown): void {
+    const reason =
+      error instanceof StoreError
+        ? error
+        : new StoreError('indeterminate', `the transport could not carry a store frame: ${String(error)}`);
+    for (const waiter of readyWaiters.splice(0, readyWaiters.length)) waiter.reject(reason);
+    for (const [q, waiter] of [...outstanding]) {
+      outstanding.delete(q);
+      waiter.reject(reason);
+    }
+  }
+
+  /** Send, and report a failure to whoever is waiting. */
+  function dispatch(frames: readonly string[]): void {
+    void send(frames).catch(fail);
   }
 
   const framesOf = (requests: readonly Request[]): readonly string[] =>
@@ -191,11 +226,15 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
 
   const unsubscribe = options.transport.onEvent((event: TransportFrame) => {
     if (closed || event.type !== 'stream_data') return;
-    if (event.streamId !== undefined && event.streamId !== streamId) return;
-    // The host's identity is checked here for the same reason the host
-    // checks the caller's: a frame from another peer on a stream with
-    // this label is not this store's traffic.
-    if (event.peerNode !== options.host) return;
+    // The stream id is NOT compared against the label: the event
+    // carries the leaf's DERIVED numeric id, so comparing it with the
+    // text it was derived from is never equal — this line dropped
+    // every frame the host ever sent. The host's peer plus the codec
+    // is what identifies this store's traffic.
+    // The host's identity, compared as a NUMBER: the event carries an
+    // exact decimal and `options.host` is hex, so `!==` on the strings
+    // rejected every frame the host ever sent.
+    if (typeof event.peerNode !== 'string' || !samePeer(event.peerNode, options.host)) return;
     const payload = event.payload;
     if (payload === undefined) return;
 
@@ -223,7 +262,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       refusal = new StoreError(decoded.message.code, `the store refused: ${decoded.message.code}`);
     }
     const received = replica.receive(text);
-    void send(framesOf(received.out));
+    dispatch(framesOf(received.out));
     settleReady(refusal);
   });
 
@@ -234,7 +273,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     // terminal paths (`no {closed}`, `no {owner-lost}`) discard it, so
     // a second `state === 'closed'` test here could not fire.
     if (h === null) return;
-    void send([encodeMessage({ k: 'alive', q: randomHex(8) as Hex, h })]);
+    dispatch([encodeMessage({ k: 'alive', q: randomHex(8) as Hex, h })]);
   }, ALIVE_INTERVAL_MS);
 
   const stopDeadlines = schedule(() => {
@@ -249,7 +288,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     }
   }, REQUEST_DEADLINE_MS);
 
-  void send(framesOf([replica.join()]));
+  dispatch(framesOf([replica.join()]));
 
   function correlate<T>(q: Hex): Promise<T> {
     if (outstanding.size >= MAX_OUTSTANDING) {
@@ -318,7 +357,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         name,
         in: value as never,
       });
-      void send([frame]);
+      dispatch([frame]);
       return { type: next === 1n ? 'queued' : 'replaced' };
     },
     setAudience: async names => {

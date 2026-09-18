@@ -2,7 +2,7 @@
 # The merged browser runner — Stage 4b + Stage 5, one command.
 #
 #   net/crates/net/tests/rtc_browser/run.sh [--engine chromium|firefox|webkit] \
-#        [--browser-path <exe>] [--no-stage5]
+#        [--browser-path <exe>] [--no-stage5] [--stage7]
 #
 # The runner does everything else: it builds the Stage 4b wasm leaf
 # against `net-mesh-wire`, issues a CA + `localhost` leaf, installs the

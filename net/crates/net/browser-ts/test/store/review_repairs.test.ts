@@ -24,7 +24,7 @@ import { defineStore } from '../../src/store/definition.js';
 import { StoreOwner } from '../../src/store/owner.js';
 import { StoreReplica } from '../../src/store/replica.js';
 import { decodeMessage, encodeMessage, type Hex } from '../../src/store/wire.js';
-import type { AccessRequest } from '../../src/store/types.js';
+import type { AccessRequest, StoreDefinition } from '../../src/store/types.js';
 
 const MAX_EVENT_BYTES = 8104;
 const PEER = '00000000000000aa';
@@ -401,5 +401,259 @@ describe('the chunker and the table agree', () => {
       0,
     );
     expect('accept' in second).toBe(false);
+  });
+});
+
+/**
+ * A host and a replica sharing one definition, for the cancellation
+ * rows: the replica installs a one-chunk snapshot the owner emits, and
+ * the cancellation happens inside application code the replica calls.
+ */
+function cancelRig(definition: StoreDefinition<Doc, Record<string, never>, Record<string, never>>) {
+  let handles = 0;
+  let qs = 0;
+  const owner = new StoreOwner({
+    definition,
+    authorize: () => true,
+    project: (state: Doc) => state,
+    maxEventBytes: MAX_EVENT_BYTES,
+    now: () => 0,
+    newHandle: () => {
+      handles += 1;
+      return handles.toString(16).padStart(32, '0') as Hex;
+    },
+    newIncarnation: () => 'abcdef0123456789' as Hex,
+    canProject: () => true,
+    actions: {},
+    inputs: {},
+  });
+  owner.commit({ tick: 5 });
+  const core = new StoreCore({ definition, initialState: definition.empty() });
+  const replica = new StoreReplica({
+    definition,
+    core,
+    maxEventBytes: MAX_EVENT_BYTES,
+    now: () => 0,
+    newQ: () => {
+      qs += 1;
+      return qs.toString(16).padStart(16, '0') as Hex;
+    },
+    audience: [],
+    key: 'k',
+  });
+  const deliver = () => {
+    for (const frame of owner.receive(replica.join().frame, PEER).out) replica.receive(frame.frame);
+  };
+  return { owner, core, replica, deliver };
+}
+
+/**
+ * The reviewer's second round: four executed counterexamples against
+ * unchanged production modules, and the adapter boundary that stopped
+ * a real browser join before a byte was sent.
+ */
+describe('an action is refused before it commits, never after', () => {
+  interface Doc2 {
+    readonly tick: number;
+  }
+  type Acts = {
+    stage: { input: Record<string, never>; output: { readonly tick: number } };
+    big: { input: Record<string, never>; output: { readonly pad: string } };
+  };
+
+  function rig2(options: { output?: (value: unknown) => { readonly tick: number } } = {}) {
+    let handles = 0;
+    const owner = new StoreOwner<Doc2, Acts, Record<string, never>>({
+      definition: defineStore<Doc2, Acts, Record<string, never>>({
+        id: 'commit',
+        version: 1,
+        state: value => ({ tick: Number((value as { tick?: unknown }).tick ?? 0) }),
+        empty: () => ({ tick: 0 }),
+        actions: {
+          stage: {
+            input: () => ({}),
+            output:
+              options.output ??
+              (value => ({ tick: Number((value as { tick?: unknown }).tick) })),
+          },
+          big: { input: () => ({}), output: value => ({ pad: String((value as { pad?: unknown }).pad) }) },
+        },
+        inputs: {},
+      }),
+      authorize: () => true,
+      project: state => state,
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: () => 0,
+      newHandle: () => {
+        handles += 1;
+        return handles.toString(16).padStart(32, '0') as Hex;
+      },
+      newIncarnation: () => 'abcdef0123456789' as Hex,
+      canProject: () => true,
+      actions: {
+        stage: (_input, context) => {
+          context.setState({ tick: 99 });
+          return { tick: 99 };
+        },
+        // A result far past the 8104-byte budget.
+        big: (_input, context) => {
+          context.setState({ tick: 7 });
+          return { pad: 'x'.repeat(9000) } as never;
+        },
+      },
+      inputs: {},
+    });
+    owner.commit({ tick: 0 });
+    return owner;
+  }
+
+  function joinedHandle(owner: StoreOwner<Doc2, Acts, Record<string, never>>): Hex {
+    const out = owner.receive(
+      encodeMessage({ k: 'join', q: '1'.repeat(16) as Hex, def: 'commit', ver: 1, key: 'k', aud: [] }),
+      PEER,
+    ).out;
+    const decoded = decodeMessage(out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    if (!decoded.ok || decoded.message.k !== 'man') throw new Error('no manifest');
+    return decoded.message.h;
+  }
+
+  it('discards the writes of an action whose RESULT the definition refuses', () => {
+    // The validator ran after the transaction had already committed,
+    // so a handler whose output the definition rejects moved the
+    // document, bumped the revision and shipped a delta — and then
+    // answered `action-rejected` for a change that had happened.
+    const owner = rig2({
+      output: () => {
+        throw new Error('the definition refuses this result');
+      },
+    });
+    const h = joinedHandle(owner);
+    const revisionBefore = owner.currentRevision;
+
+    const rejected = owner.receive(
+      encodeMessage({ k: 'act', q: '2'.repeat(16) as Hex, h, s: '1', name: 'stage', in: {} }),
+      PEER,
+    );
+
+    const kinds = rejected.out.map(frame => {
+      const decoded = decodeMessage(frame.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+      return decoded.ok ? decoded.message.k : 'undecodable';
+    });
+    expect(kinds).toEqual(['no']);
+    expect(owner.getState().tick).toBe(0);
+    expect(owner.currentRevision).toBe(revisionBefore);
+  });
+
+  it('discards the writes of an action whose result does not fit the budget', () => {
+    const owner = rig2();
+    const h = joinedHandle(owner);
+    const revisionBefore = owner.currentRevision;
+
+    const refused = owner.receive(
+      encodeMessage({ k: 'act', q: '3'.repeat(16) as Hex, h, s: '1', name: 'big', in: {} }),
+      PEER,
+    );
+
+    const reply = decodeMessage(refused.out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    // `capacity`, not `action-rejected`: the request was well-formed
+    // and the ANSWER is what does not fit.
+    expect(reply.ok && reply.message.k === 'no' && reply.message.code).toBe('capacity');
+    expect(owner.getState().tick).toBe(0);
+    expect(owner.currentRevision).toBe(revisionBefore);
+    expect(refused.out).toHaveLength(1);
+  });
+});
+
+describe('a validator runs once per document', () => {
+  it('publishes exactly what `applyDelta` returned', () => {
+    // The commit path validated again, and a validator is not
+    // required to be idempotent: a parser that derives a field
+    // applied its transformation twice, so the outcome the caller
+    // read and the document its subscribers saw were different.
+    const derived = defineStore<{ readonly tick: number }, Record<string, never>, Record<string, never>>({
+      id: 'derive',
+      version: 1,
+      state: value => ({ tick: Number((value as { tick?: unknown }).tick ?? 0) + 1 }),
+      empty: () => ({ tick: 0 }),
+      actions: {},
+      inputs: {},
+    });
+    const core = new StoreCore({ definition: derived, initialState: { tick: 0 } });
+
+    const outcome = core.applyDelta([{ o: 'r', p: ['tick'], val: 10 }]);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.next.tick).toBe(11);
+    expect(core.getState().tick).toBe(11);
+  });
+});
+
+describe('a cancellation during an installation is not overwritten', () => {
+  it('stays fenced when the definition cancels while validating', () => {
+    const latched = { done: false };
+    const cancelled = { replica: null as StoreReplica<Doc, Record<string, never>, Record<string, never>> | null };
+    const definition = defineStore<Doc, Record<string, never>, Record<string, never>>({
+      id: 'cancel.validator',
+      version: 1,
+      state: value => {
+        // Application code the replica calls INSIDE the assembly —
+        // ONCE, latched: `cancel` publishes `empty()` through the
+        // core, which validates, which would re-enter this validator
+        // for ever.
+        // Latched, and only once the replica exists: the core
+        // validates its own initial state at construction, which
+        // would otherwise consume the latch before there was
+        // anything to cancel.
+        if (!latched.done && cancelled.replica !== null) {
+          latched.done = true;
+          cancelled.replica.cancel();
+        }
+        return { tick: Number((value as { tick?: unknown }).tick ?? 0) };
+      },
+      empty: () => ({ tick: 0 }),
+      actions: {},
+      inputs: {},
+    });
+    const pair = cancelRig(definition);
+    cancelled.replica = pair.replica;
+    const seen: number[] = [];
+    pair.core.subscribe(state => seen.push(state.tick));
+
+    pair.deliver();
+
+    // NOT ONE notification: the installation is abandoned where the
+    // cancellation is noticed — before the document is published.
+    // Publishing it and clearing it afterwards would hand every
+    // subscriber a world the caller had already cancelled, and the
+    // state assertions below cannot see that.
+    expect(seen).toEqual([]);
+    expect(pair.replica.state).toBe('fenced');
+    expect(pair.replica.installed).toBe(null);
+    expect(pair.core.getStatus().phase).not.toBe('ready');
+    expect(pair.core.getState()).toEqual({ tick: 0 });
+  });
+
+  it('does not report `ready` over the view a subscriber’s cancellation cleared', () => {
+    const definition = defineStore<Doc, Record<string, never>, Record<string, never>>({
+      id: 'cancel.subscriber',
+      version: 1,
+      state: value => ({ tick: Number((value as { tick?: unknown }).tick ?? 0) }),
+      empty: () => ({ tick: 0 }),
+      actions: {},
+      inputs: {},
+    });
+    const pair = cancelRig(definition);
+    // Application code the replica calls DURING the publication.
+    pair.core.subscribe(() => {
+      pair.replica.cancel();
+    });
+
+    pair.deliver();
+
+    expect(pair.replica.state).toBe('fenced');
+    expect(pair.core.getStatus().phase).not.toBe('ready');
+    expect(pair.core.getStatus().stale).toBe(false);
+    expect(pair.core.getState()).toEqual({ tick: 0 });
   });
 });

@@ -596,12 +596,40 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     try {
       const input = spec.input(message.in);
       const handler = this.deps.actions[message.name as keyof A];
-      const produced = this.core.transact(context => handler(input, context), peer);
-      outcome = { kind: 'result', out: spec.output(produced) as JsonObject };
-    } catch {
-      // A handler that throws rejected the action, and the transaction
-      // discarded its writes. Retained as the refusal it is.
-      outcome = { kind: 'refusal', code: 'action-rejected' };
+      // Everything that can REFUSE this action happens inside the
+      // transaction, because a throw inside it discards the staged
+      // writes and a throw after it does not. Validating the output
+      // afterwards let a handler whose result the definition refuses
+      // commit its writes and ship a delta, answering
+      // `action-rejected` for a change that had already happened —
+      // and the same for a result too large to send, which left the
+      // caller with a document it could not be told about.
+      const produced = this.core.transact(context => {
+        const out = spec.output(handler(input, context)) as JsonObject;
+        const frame = encodeMessage({
+          k: 'res',
+          q: message.q,
+          h: bound.h,
+          s: message.s,
+          out,
+        });
+        if (utf8Length(frame) > this.deps.maxEventBytes) {
+          throw new StoreError('capacity', 'the result does not fit the message budget');
+        }
+        return out;
+      }, peer);
+      outcome = { kind: 'result', out: produced };
+    } catch (error) {
+      // A handler that threw rejected the action, and the transaction
+      // discarded its writes. So did a result the definition refused
+      // or one that does not fit — and a result that cannot be sent
+      // is `capacity`, not `action-rejected`: the caller needs to know
+      // its request was well-formed and the ANSWER was not.
+      outcome = {
+        kind: 'refusal',
+        code:
+          error instanceof StoreError && error.code === 'capacity' ? 'capacity' : 'action-rejected',
+      };
     }
 
     ledger.retain(s, binding, outcome, now);

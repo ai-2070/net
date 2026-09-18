@@ -259,7 +259,14 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
   applyDelta(ops: readonly WireOp[]): PatchOutcome<S> {
     this.#refuseWhenClosed();
     const outcome = applyPatch(this.#state, ops, raw => this.#validate(raw));
-    if (outcome.ok && outcome.changed) this.#commit(outcome.next);
+    // `applyPatch` has ALREADY run the validator on the patched
+    // document — that is what it was handed one for. Committing
+    // through the validating path ran it a second time, and a
+    // validator is not required to be idempotent: a parser that
+    // derives or normalizes a field applied its transformation twice,
+    // so the outcome this returns and the document a subscriber sees
+    // were different values. One validation per document.
+    if (outcome.ok && outcome.changed) this.#publish(outcome.next);
     return outcome;
   }
 
@@ -316,7 +323,17 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
   }
 
   #commit(candidate: S): void {
-    const validated = this.#validate(candidate);
+    this.#publish(this.#validate(candidate));
+  }
+
+  /**
+   * Reconcile and publish a document that has ALREADY been validated.
+   *
+   * Split from {@link #commit} so a caller that validated can say so
+   * instead of validating again. Everything below this line is
+   * reconciliation, revision and notification — never validation.
+   */
+  #publish(validated: S): void {
     const next = reconcile(this.#state, validated);
     if (Object.is(next, this.#state)) return;
 

@@ -107,7 +107,17 @@ function mesh() {
     if (partitioned || silenced.has(from)) return;
     delivered.push({ to, from, bytes });
     for (const handler of handlers.get(to) ?? []) {
-      handler({ type: 'stream_data', streamId, peerNode: identify(from), payload: bytes });
+      // Both fields in the spelling the REAL event carries: exact
+      // DECIMAL. The peer arrives as decimal and `openStream` wants
+      // hex, and that mismatch is a cross-peer defect rather than a
+      // formatting one, so the double must present the decimal.
+      const attributed = identify(from);
+      handler({
+        type: 'stream_data',
+        streamId,
+        peerNode: attributed === null ? null : BigInt(`0x${attributed}`).toString(10),
+        payload: bytes,
+      });
     }
   }
 
@@ -115,8 +125,26 @@ function mesh() {
     return {
       nodeIdHex: () => self,
       openStream: options => {
+        // The double enforces what the WASM option reader enforces,
+        // and it did not before — which is exactly why the in-process
+        // suite was green while the real join was rejected before a
+        // byte left the page:
+        //
+        //   * `peer` must be 16 lowercase hex. A decimal string is
+        //     refused, and a 16-DIGIT decimal would otherwise name a
+        //     different node when read as hex.
+        //   * there is no textual stream id. The id is DERIVED from
+        //     the label, and the derivation sets the discriminator bit
+        //     that makes an unsolicited arrival classify as stream
+        //     data at the far end.
         const target = options.peer ?? '';
-        const streamId = options.streamId ?? '';
+        if (!/^[0-9a-f]{16}$/.test(target)) {
+          throw new Error(`openStream: peer must be 16 lowercase hex, got ${target}`);
+        }
+        if ((options as { streamId?: unknown }).streamId !== undefined) {
+          throw new Error('openStream: a stream id is derived from the label, never passed');
+        }
+        const streamId = derivedStreamId(options.label ?? '');
         const stream: TransportStream = {
           send: bytes => {
             deliver(target, self, bytes, streamId);
@@ -141,7 +169,7 @@ function mesh() {
     delivered,
     /** A frame from an arbitrary sender, on this store's label. */
     inject: (to: string, from: string, frame: string) => {
-      deliver(to, from, new TextEncoder().encode(frame), 'store/ship');
+      deliver(to, from, new TextEncoder().encode(frame), derivedStreamId('store/ship'));
     },
     /** A frame on a different label entirely. */
     injectLabelled: (to: string, from: string, streamId: string, frame: string) => {
@@ -191,6 +219,19 @@ function mesh() {
       identify = fn;
     },
   };
+}
+
+/**
+ * The id a label derives, with the leaf's discriminator bit.
+ *
+ * Not the leaf's hash — the VALUE does not matter here, only that it
+ * is a decimal `u64` with bit 49 set, because that is what the store
+ * has to reconcile against and what a textual id could never be.
+ */
+function derivedStreamId(label: string): string {
+  let hash = 0n;
+  for (const character of label) hash = (hash * 131n + BigInt(character.codePointAt(0) ?? 0)) % (1n << 46n);
+  return (0x0002_0000_0000_0000n | hash).toString(10);
 }
 
 /** A manual clock and scheduler, so nothing here waits on real time. */
@@ -356,7 +397,13 @@ describe('a joiner installs the host’s world', () => {
     expect(net.joins(HOST_NODE)).toHaveLength(1);
   });
 
-  it('does not dispatch a frame addressed to another store’s label', async () => {
+  it('drops a frame that arrives on another stream', async () => {
+    // The label cannot be compared against an event — the event
+    // carries the id the LEAF derived from it, and that derivation
+    // lives in Rust. So the host LEARNS the id from the first store
+    // frame and pins it. This asserts the pinned behaviour; the
+    // one-frame window before it is pinned is asserted below, named
+    // rather than hidden.
     const { net, host, joined } = wired();
     await joined.ready();
     const hull = host.getState().hull;
@@ -364,15 +411,47 @@ describe('a joiner installs the host’s world', () => {
     net.injectLabelled(
       HOST_NODE,
       OTHER_NODE,
-      'store/other',
+      derivedStreamId('store/other'),
       encodeMessage({ k: 'join', q: '5'.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] }),
     );
     await flush();
 
     expect(host.getState().hull).toBe(hull);
-    // No second handle: a join on another store's label is not this
-    // store's traffic.
     expect(host.counts().handles).toBe(1);
+    expect(host.counters()['foreign-stream']).toBe(1);
+  });
+
+  it('admits the first frame before any stream is pinned, and only that one', async () => {
+    // The honest bound on the window above: before a single store
+    // frame has arrived the host has no id to compare against, so the
+    // FIRST one is admitted whatever stream it rode. What limits the
+    // damage is everything that does not depend on the id — the peer
+    // is the transport's, and a join must name this definition.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    const join = (q: string) =>
+      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] });
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('1'));
+    await flush();
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/second'), join('2'));
+    await flush();
+
+    expect(host.counts().handles).toBe(1);
+    expect(host.counters()['foreign-stream']).toBe(1);
+    await host.close();
   });
 
   it('serves two callers their own projections', async () => {
@@ -405,6 +484,72 @@ describe('a joiner installs the host’s world', () => {
     expect(first.getState().secrets).toEqual({});
     expect(second.getState().secrets).toEqual({ plan: 7 });
     expect(second.getState().crew).toEqual({});
+  });
+
+  it('joins a host named in decimal, the spelling an event carries', async () => {
+    // A page that read its host id off a `stream_data` event has a
+    // DECIMAL string, and `openStream` takes 16 hex. Handing it
+    // through unconverted is refused by the transport — so the store
+    // converts, and this is the row that says so.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: (state, audience) => ({
+        hull: state.hull,
+        crew: audience.includes('crew') ? state.crew : {},
+        secrets: {},
+      }),
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: BigInt(`0x${HOST_NODE}`).toString(10),
+      audience: ['crew'],
+      key: 'decimal',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    await joined.ready();
+
+    expect(joined.getState().crew).toEqual({ ada: 1 });
+    await joined.close();
+    await host.close();
+  });
+
+  it('rejects `ready()` when the transport cannot open a stream at all', async () => {
+    // The sends were fire-and-forget, so a rejected `openStream`
+    // became an unhandled rejection and `ready()` stayed pending for
+    // ever: the page waited out its own deadline with the real reason
+    // on the floor.
+    const net = mesh();
+    const time = timeline();
+    const refusing: StoreTransport = {
+      ...net.node(CALLER_NODE),
+      openStream: () => Promise.reject(new Error('no stream for you')),
+    };
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: refusing,
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'refused',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    await expect(joined.ready()).rejects.toMatchObject({ code: 'indeterminate' });
   });
 
   it('refuses a join the policy denies, and publishes nothing', async () => {

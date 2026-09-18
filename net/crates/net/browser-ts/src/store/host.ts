@@ -26,6 +26,7 @@
  * established, and nothing here claims it is.
  */
 
+import { StoreError } from './errors.js';
 import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
 import type { ActionSpec, Cancel, InputSpec } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
@@ -60,13 +61,54 @@ export interface TransportFrame {
 export interface StoreTransport {
   /** This node's id — the authority a replica is talking to. */
   nodeIdHex(): string | null;
+  /**
+   * Open a stream to a peer.
+   *
+   * **`label`, never `streamId`.** A stream id is a `u64` the leaf
+   * DERIVES from the label, and it sets a discriminator bit that makes
+   * an unsolicited arrival classify as stream data at the far end
+   * rather than as a channel message. Passing a textual id is refused
+   * by the wasm option reader outright, and passing an arbitrary
+   * number loses the discriminator — so the label is the only correct
+   * input and both ends derive the same id from it without exchanging
+   * one.
+   */
   openStream(options: {
     reliability: 'reliable' | 'fireAndForget';
     peer?: string;
-    streamId?: string;
     label?: string;
   }): TransportStream | Promise<TransportStream>;
   onEvent(handler: (event: TransportFrame) => void): Cancel;
+}
+
+/**
+ * A peer id in the spelling `openStream` takes: 16 lowercase hex.
+ *
+ * Events carry the authenticated peer as an EXACT DECIMAL string, and
+ * `openStream({ peer })` requires 16 hex digits. Handing the decimal
+ * straight back is rejected for a short id and — worse — names a
+ * DIFFERENT peer for a 16-digit decimal one, which is a cross-peer
+ * defect wearing the shape of a formatting bug. `LeafStream` already
+ * reconciles the two spellings through `BigInt`; this is the same
+ * reconciliation for the store's own seam.
+ */
+export function peerHexOf(peer: string): string | null {
+  const decimal = /^\d+$/.test(peer);
+  const hex = /^(0x)?[0-9a-f]{1,16}$/i.test(peer);
+  try {
+    if (decimal) return BigInt(peer).toString(16).padStart(16, '0');
+    if (hex) return BigInt(peer.startsWith('0x') ? peer : `0x${peer}`).toString(16).padStart(16, '0');
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** Whether two peer spellings name the same node. */
+export function samePeer(left: string, right: string): boolean {
+  const a = peerHexOf(left);
+  const b = peerHexOf(right);
+  return a !== null && a === b;
 }
 
 /** What a host needs beyond the owner's own dependencies. */
@@ -137,6 +179,22 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
   owner.commit(options.initialState);
 
   const replies = new Map<string, TransportStream>();
+  /**
+   * The derived stream id this store's traffic arrives on, once one
+   * frame has established it.
+   *
+   * The label cannot be compared against an event: the event carries
+   * the id the leaf DERIVED from it. And the derivation lives in Rust
+   * (`stream_id_from_label`), so this side cannot compute it without
+   * duplicating that hash and inviting drift. What it can do is learn
+   * it: the first store frame fixes the id, and every later frame must
+   * match. The window is exactly one frame wide and it is bounded by
+   * the checks that do not depend on the id at all — the peer is
+   * authenticated by the transport, a `join` must name this
+   * definition and version, and every other kind must name a handle
+   * this owner issued.
+   */
+  let arrivesOn: string | null = null;
   const pendingReplies = new Map<string, Promise<TransportStream>>();
   const dropped: Record<string, number> = {};
   let closed = false;
@@ -148,8 +206,12 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     if (inFlight !== undefined) return inFlight;
     // One reply stream per peer, opened lazily: a store that never
     // answers a peer never opens one.
+    // `peer` is the owner's, and the owner is only ever given the
+    // normalized 16-hex form (see the dispatch below), so there is no
+    // second conversion here — a conversion that cannot change its
+    // input is a claim.
     const opening = Promise.resolve(
-      options.transport.openStream({ reliability: 'reliable', peer, streamId, label: streamId }),
+      options.transport.openStream({ reliability: 'reliable', peer, label: streamId }),
     ).then(stream => {
       replies.set(peer, stream);
       pendingReplies.delete(peer);
@@ -181,7 +243,14 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     // the mechanism is witnessed instead ("stops serving once
     // closed").
     if (event.type !== 'stream_data') return;
-    if (event.streamId !== undefined && event.streamId !== streamId) return;
+    // NOT compared against the label: the event carries the leaf's
+    // DERIVED numeric id, and comparing a decimal wire id with the
+    // label it was derived from is never equal, so this filter used to
+    // drop every store frame. What identifies this store's traffic is
+    // the frame itself — `decodeMessage` refuses anything that is not
+    // a caller message, `join` must name this definition and version,
+    // and every other kind must name a handle THIS owner issued. The
+    // stream id is a route; the peer is the identity.
     const peer = event.peerNode;
     if (typeof peer !== 'string' || peer.length === 0) {
       // No authenticated peer, no dispatch. There is no second source
@@ -195,6 +264,12 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['no-payload'] = (dropped['no-payload'] ?? 0) + 1;
       return;
     }
+    const arrived = event.streamId;
+    if (arrivesOn !== null && arrived !== undefined && arrived !== arrivesOn) {
+      // Another stream on this session. Not this store's traffic.
+      dropped['foreign-stream'] = (dropped['foreign-stream'] ?? 0) + 1;
+      return;
+    }
     let text: string;
     try {
       text = decoder.decode(payload);
@@ -202,7 +277,17 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['undecodable-frame'] = (dropped['undecodable-frame'] ?? 0) + 1;
       return;
     }
-    dispatched(owner.receive(text, peer));
+    // The peer in the spelling the store's contract documents — 16
+    // lowercase hex — because `AccessRequest.peer` and
+    // `ActionContext.peer` say so and a policy comparing against a
+    // node id it printed itself must not be handed a decimal.
+    const authenticated = peerHexOf(peer);
+    if (authenticated === null) {
+      dropped['unusable-peer'] = (dropped['unusable-peer'] ?? 0) + 1;
+      return;
+    }
+    if (arrived !== undefined) arrivesOn = arrived;
+    dispatched(owner.receive(text, authenticated));
   });
 
   const schedule = options.schedule ?? ((run, ms) => {

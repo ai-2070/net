@@ -11,7 +11,11 @@
 //!
 //! So these five witnesses put the store on the transport the rest of
 //! this harness exercises, in two isolated browsing contexts of a real
-//! engine, and CI runs them on Chromium **and** Firefox:
+//! engine. **CI does not run them yet** — they are behind `--stage7`,
+//! which neither engine's job passes, and they are in no floor. The
+//! earlier version of this header said CI ran them on both engines,
+//! which was simply untrue: the harness's own default run excludes
+//! them by name.
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. it still installs through injected loss **and** reorder;
@@ -50,7 +54,7 @@
 use net::adapter::net::MeshNode;
 
 use crate::stage5::{Script5, Step5};
-use crate::stage6::{leaf_of, routing_id, Leaf};
+use crate::stage6::{discover, leaf_of, routing_id, Leaf};
 use crate::{Ledger, StepResult};
 
 /// Entries in the hosted document.
@@ -82,6 +86,11 @@ const PAGE_HOST: &str = "stage7-host";
 const PAGE_PLAYER: &str = "stage7-player";
 const CTX_HOST: &str = "stage7-ctx-host";
 const CTX_PLAYER: &str = "stage7-ctx-player";
+
+/// One capability tag, so each leaf can discover the other's signed
+/// announcement — which is what installs the relayed session the
+/// store's `openStream({peer})` needs.
+const STORE_TAG: &str = "stage7.store";
 
 const SECRET_HOST_ENTITY: &str =
     "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6";
@@ -198,7 +207,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         entity_secret_hex: Some(entity.to_string()),
         noise_secret_hex: Some(noise.to_string()),
         use_session: false,
-        capabilities: Vec::new(),
+        capabilities: vec![STORE_TAG.to_string()],
         subscriptions: Vec::new(),
         lock_scope: None,
         expect_failure: false,
@@ -239,12 +248,48 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         }
     };
 
-    // No announce, and no discovery: the store addresses a peer by
-    // node id and the anchor relays for a pair it already serves, so
-    // nothing here needs either. A stage that DID need them could not
-    // have them — an announcement is not replayed to a context that
-    // arrives later, which is what the first version of this module
-    // discovered the expensive way.
+    // Announce and discover, because the store CANNOT address a peer
+    // without them — and that is the correction to the previous
+    // version of this comment, which asserted the opposite. What the
+    // repaired `joinStore` reports is the reason:
+    //
+    //   the transport could not carry a store frame:
+    //   session: no session with 0x<host>
+    //
+    // `openStream({peer})` needs a session with that peer, and a
+    // relayed one is installed by the discovery path
+    // (`ensure_relayed_session`). So discovery is a precondition of
+    // the store, not an incidental step — and the earlier "nothing
+    // here needs either" was an assumption that the transport double
+    // could not contradict.
+    for tab in [tab_host, tab_player] {
+        let announced = script
+            .run(
+                tab,
+                Step5::Announce {
+                    id: 0,
+                    session: session.clone(),
+                    capabilities: vec![STORE_TAG.to_string()],
+                },
+            )
+            .await;
+        if !announced.ok {
+            println!("[stage7] {tab} could not announce: {}", why(&announced));
+        }
+    }
+    let found_player = discover(&mut script, tab_host, &player.node_hex, &session, STORE_TAG).await;
+    let found_host = discover(&mut script, tab_player, &host.node_hex, &session, STORE_TAG).await;
+    if found_player.is_none() || found_host.is_none() {
+        let detail = format!(
+            "the leaves did not discover each other, so neither has a session with the \
+             other and `openStream({{peer}})` cannot be issued: host's view of the \
+             player = {found_player:?}, player's view of the host = {found_host:?}"
+        );
+        for name in WITNESSES {
+            ledger.record(name, false, detail.clone());
+        }
+        return Ok(());
+    }
 
     let host_store = |handle: &str| Step5::StoreHost {
         id: 0,
@@ -306,9 +351,26 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // of its own: if this passes, the transport's reliability is what
     // carried it.
     let hosted_lossy = script.run(tab_host, host_store("lossy")).await;
-    let joined_lossy = script.run(tab_player, join_store("lossy", 3, 4, 0)).await;
-    let dropped = stat_u64(&joined_lossy, "dropped").unwrap_or(0);
-    let swapped = stat_u64(&joined_lossy, "swapped").unwrap_or(0);
+    // Armed on the HOST, because the snapshot is the host's outbound
+    // traffic. Arming the joining page faulted its requests and
+    // acknowledgements instead, so a non-zero drop count there said
+    // nothing about a chunk — the reviewer's third finding, and the
+    // reason this is its own step.
+    let _ = script
+        .run(
+            tab_host,
+            Step5::StoreFaults {
+                id: 0,
+                drop_every: 3,
+                reorder_every: 4,
+                duplicate_every: 0,
+            },
+        )
+        .await;
+    let joined_lossy = script.run(tab_player, join_store("lossy", 0, 0, 0)).await;
+    let faults = script.run(tab_host, Step5::StoreFaultsReport { id: 0 }).await;
+    let dropped = stat_u64(&faults, "dropped").unwrap_or(0);
+    let swapped = stat_u64(&faults, "swapped").unwrap_or(0);
     let lossy_digest = stat_str(&joined_lossy, "digest");
     let survived = joined_lossy.ok
         && lossy_digest.is_some()
@@ -387,6 +449,22 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let _hosted_dup = script.run(tab_host, host_store("dup")).await;
     let joined_dup = script.run(tab_player, join_store("dup", 0, 0, 0)).await;
     let before_tick = stat_u64(&joined_dup, "tick").unwrap_or(0);
+    // The joined replica's publication count BEFORE the commit, so
+    // the witness can say the view moved ONCE rather than that it
+    // ended at 41. An absolute assignment converges to 41 whether it
+    // is applied once, twice, or recovered to — which is precisely
+    // what the reviewer's second finding says the old oracle could
+    // not tell apart.
+    let before_state = script
+        .run(
+            tab_player,
+            Step5::StoreState {
+                id: 0,
+                handle: "dup".to_string(),
+            },
+        )
+        .await;
+    let applications_before = stat_u64(&before_state, "applications").unwrap_or(0);
     let committed = script
         .run(
             tab_host,
@@ -411,25 +489,31 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         .await;
     let duplicated = stat_u64(&committed, "duplicated").unwrap_or(0);
     let replica_tick = stat_u64(&after, "tick");
+    let applications_after = stat_u64(&after, "applications").unwrap_or(0);
+    let moves = applications_after.saturating_sub(applications_before);
     let once = joined_dup.ok
         && committed.ok
         && after.ok
         && duplicated > 0
         && replica_tick == Some(41)
-        && before_tick != 41;
+        && before_tick != 41
+        && moves == 1;
     ledger.record(
         WITNESSES[3],
         once,
         format!(
-            "A DUPLICATED FRAME MOVES THE VIEW ONCE. Every outbound message of the \
-             host's commit was sent TWICE (duplicated={duplicated}, asserted non-zero so \
-             an inert hook cannot pass this). The commit set the tick to 41 from \
-             {before_tick}; the replica reads {replica_tick:?}. Applying a delta twice \
-             would have moved it past 41, and a store that treated the second copy as a \
-             gap would have gone back for a resynchronization instead. What makes this \
-             work is two things composed: the leaf delivers a retransmitted duplicate \
-             once (`leaf/src/stream.rs`), and the assembler treats a byte-identical \
-             chunk as idempotent. {} {}",
+            "A DUPLICATED FRAME MOVES THE VIEW ONCE — counted, not inferred. Every \
+             outbound message of the host's commit was sent TWICE (duplicated={duplicated}, \
+             asserted non-zero so an inert hook cannot pass this). The oracle is the \
+             number of PUBLICATIONS the replica made: {applications_before} → \
+             {applications_after}, so exactly {moves}. The final value cannot carry this \
+             property — the commit ASSIGNS tick 41, so applying the delta twice, or \
+             recovering to the same document, both end at 41 as well, and the earlier \
+             version of this witness could not tell any of the three apart. Value read \
+             back: {replica_tick:?} from {before_tick}. What makes one publication the \
+             right answer is two things composed: the leaf delivers a retransmitted \
+             duplicate once (`leaf/src/stream.rs`), and the assembler treats a \
+             byte-identical chunk as idempotent. {} {}",
             why(&committed),
             why(&after)
         ),

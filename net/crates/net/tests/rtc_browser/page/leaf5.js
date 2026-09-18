@@ -93,6 +93,8 @@ const streams = new Map();
 /// The stores this page hosts and joins, by runner-chosen handle.
 const hosts = new Map();
 const joins = new Map();
+/// Per joined store: how many times a document was PUBLISHED to it.
+const applied = new Map();
 
 /// The store surface, from the package's own exports.
 ///
@@ -1822,6 +1824,42 @@ async function execute(step) {
     // the install span several real frames and the assembler's job
     // real.
     // ================================================================
+    // Arm the loss / reorder / duplication hooks on THIS page's
+    // outbound DataChannel, and report what they did.
+    //
+    // A separate step because the snapshot travels host → player: the
+    // chunks are the HOST's outbound traffic, so arming the player's
+    // hook faults its requests and acknowledgements and never a
+    // chunk. Arming has to happen on the sending side, and only the
+    // runner knows which side that is for the property it is after.
+    case 'store_faults': {
+      loss.dropEvery = step.drop_every || 0;
+      loss.seen = 0;
+      loss.dropped = 0;
+      reorder.every = step.reorder_every || 0;
+      reorder.seen = 0;
+      reorder.swapped = 0;
+      reorder.held = null;
+      dup.every = step.duplicate_every || 0;
+      dup.seen = 0;
+      dup.duplicated = 0;
+      return { ok: true, stats: { armed: true } };
+    }
+
+    // Disarm, flush anything held, and report the totals.
+    case 'store_faults_report': {
+      flushHeld();
+      const report = {
+        dropped: loss.dropped,
+        swapped: reorder.swapped,
+        duplicated: dup.duplicated,
+      };
+      loss.dropEvery = 0;
+      reorder.every = 0;
+      dup.every = 0;
+      return { ok: true, stats: report };
+    }
+
     case 'store_host': {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
@@ -1861,6 +1899,11 @@ async function execute(step) {
           authority: host.authority,
           node: node.nodeIdHex(),
           entries: Object.keys(host.getState().entries).length,
+          // The digest the runner compares the replica's against. It
+          // was missing, which made both snapshot witnesses
+          // unsatisfiable: they required a host digest to equal, and
+          // there was none to equal.
+          digest: digestOf(host.getState()),
           counts: host.counts(),
         },
       };
@@ -1899,6 +1942,17 @@ async function execute(step) {
           maxEventBytes: step.max_event_bytes || 8104,
         });
         joins.set(step.handle, joined);
+        // Every published revision, counted. A duplicated delta that
+        // was applied twice notifies twice even when the value it
+        // assigns is the same, and a resynchronization back to the
+        // same document notifies too — which is what distinguishes
+        // "moved once" from "converged".
+        const applications = { count: 0, revisions: [] };
+        applied.set(step.handle, applications);
+        joined.subscribe(state => {
+          applications.count += 1;
+          applications.revisions.push(state.tick);
+        });
         await withTimeout(joined.ready(), step.timeout_ms || 20000, 'store ready');
       } catch (e) {
         flushHeld();
@@ -1942,6 +1996,7 @@ async function execute(step) {
       const joined = joins.get(step.handle);
       if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
       const state = joined.getState();
+      const applications = applied.get(step.handle) || { count: 0, revisions: [] };
       return {
         ok: true,
         stats: {
@@ -1949,6 +2004,10 @@ async function execute(step) {
           digest: digestOf(state),
           tick: state.tick,
           status: joined.getStatus(),
+          // The count and the sequence of published revisions, so a
+          // witness can say "moved ONCE" rather than "ended here".
+          applications: applications.count,
+          revisions: applications.revisions.slice(-8),
         },
       };
     }

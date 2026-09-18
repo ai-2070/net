@@ -2,6 +2,7 @@
 #
 #   pwsh -File net/crates/net/tests/rtc_browser/run.ps1 `
 #        [-Engine chromium|firefox|webkit] [-BrowserPath <exe>] [-NoStage5] `
+#        [-Stage7] `
 #        [-UseRoutableInterface]
 #
 # The runner does everything else: it builds the Stage 4b wasm leaf
@@ -34,6 +35,9 @@ param(
   [string]$Engine = "chromium",
   [string]$BrowserPath = "",
   [switch]$NoStage5,
+  # Opt in to the Stage 7 store witnesses. Off by default because
+  # they are not in any floor yet; see `runner/src/stage7.rs`.
+  [switch]$Stage7,
   [switch]$UseRoutableInterface
 )
 
@@ -44,6 +48,7 @@ $harnessArgs = @("run", "--release", "--manifest-path", (Join-Path $root "runner
 $harnessArgs += @("--engine", $Engine)
 if ($BrowserPath) { $harnessArgs += @("--browser-path", $BrowserPath) }
 if ($NoStage5) { $harnessArgs += @("--no-stage5") }
+if ($Stage7) { $harnessArgs += @("--stage7") }
 if ($UseRoutableInterface) { $harnessArgs += @("--use-routable-interface") }
 
 & cargo @harnessArgs

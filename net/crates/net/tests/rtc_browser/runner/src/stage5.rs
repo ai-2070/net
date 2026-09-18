@@ -699,6 +699,22 @@ pub enum Step5 {
         entries: u32,
         max_event_bytes: u32,
     },
+    /// Arm the loss / reorder / duplication hooks on ONE page.
+    ///
+    /// Separate from the join because the snapshot travels host →
+    /// player: the chunks are the HOST's outbound traffic, so arming
+    /// the joining page faults its requests and acknowledgements and
+    /// never a chunk.
+    StoreFaults {
+        id: u64,
+        drop_every: u32,
+        reorder_every: u32,
+        duplicate_every: u32,
+    },
+    /// Disarm, flush anything held, and report what the hooks did.
+    StoreFaultsReport {
+        id: u64,
+    },
     /// `joinStore(...)` and await `ready()`, with the hooks armed.
     StoreJoin {
         id: u64,
@@ -770,6 +786,8 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::StoreFaults { id, .. }
+            | Self::StoreFaultsReport { id, .. }
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }
@@ -818,6 +836,8 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::StoreFaults { id, .. }
+            | Self::StoreFaultsReport { id, .. }
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }
