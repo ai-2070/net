@@ -56,47 +56,50 @@ and local-first collaboration. Built end to end:
 
 ## One system, end to end
 
-A document-processing capability lives on a machine that holds an internal docs-API credential.
-The credential must not travel, so the provider keeps it and the caller never sees it.
+An intersection has no line of sight: a building hides the cross traffic from the vehicle
+approaching it. A second vehicle, coming the other way, can see. Neither can hand over its
+sensors — the raw frames belong to the machine that produced them — but the observation can
+travel.
 
-**The provider** serves the capability under its own authority — announced privately to its
-organization, executed where the credential lives:
+**The vehicle that can see** serves the view under its own authority:
 
 ```rust
 use net_sdk::mesh::MeshBuilder;
 
 #[derive(JsonSchema, Deserialize, Serialize)]
-struct SummarizeReq { doc_id: String }
+struct ObserveReq { intersection: String }
 #[derive(JsonSchema, Deserialize, Serialize)]
-struct SummarizeResp { summary: String }
+struct CornerView { objects: Vec<Observation>, confidence: f32 }
 
-let provider = MeshBuilder::new("0.0.0.0:7700", &PSK)?.build().await?;
+let seeing = MeshBuilder::new("0.0.0.0:7700", &PSK)?.build().await?;
 
-// Serve to this org only. `OrgAccess::Granted` admits a cross-org caller holding a
-// capability grant. The handler receives the caller's verified identity and authority.
-provider.serve_org("summarize.document", OrgAccess::SameOrg, |caller: OrgCaller, req: SummarizeReq| async move {
-    let summary = summarize_with(&internal_docs_credential(), &req.doc_id).await?;  // app code: secret stays here
-    Ok(SummarizeResp { summary })
+// Serve to this fleet only. `OrgAccess::Granted` admits another operator's vehicle
+// holding a capability grant. The handler receives the caller's verified identity.
+seeing.serve_org("intersection.observe", OrgAccess::SameOrg, |caller: OrgCaller, req: ObserveReq| async move {
+    // App code: the raw frames and the perception model never leave this vehicle.
+    Ok(perceive_corner(&onboard_sensors(), &req.intersection).await?)
 })?;
 ```
 
-**The caller** binds its organization once, then invokes by capability — no host was configured:
+**The vehicle in the blind spot** asks by capability — no peer was configured in advance:
 
 ```rust
-let org = caller.org(credentials)?;                          // sees only what this org may see
-let resp: SummarizeResp = org.call("summarize.document", &req).await?;
+let org = blind_spot.org(credentials)?;                    // sees only what this fleet may see
+let view: CornerView = org
+    .call("intersection.observe", &ObserveReq { intersection: "5th & Main".into() })
+    .await?;
+// The blind spot closes on a derived observation, not on a camera feed.
 ```
 
-A caller whose organization holds no grant is not shown the capability at all: the private
-announcement is opaque without the audience, so discovery finds nothing and the call refuses
-locally, before anything is sent. That is resource-owner control, enforced by the provider.
+Two sensors addressed each other; neither owned the other's hardware, and neither handed over its
+data. The seeing vehicle keeps its frames and its model, and the caller receives exactly what it
+asked for and nothing more. A vehicle whose operator holds no grant is not shown the capability at
+all — the private announcement is opaque without the audience, so discovery finds nothing and the
+call refuses locally, before anything is sent.
 [Private capabilities](https://ai2070.net/docs/guides/private-capabilities),
-[Security model](https://ai2070.net/docs/concepts/security-model). Larger results travel as
-content-addressed artifacts: [Dataforts](https://ai2070.net/docs/guides/dataforts).
-
-Tools are the same shape without the org gate — declare one with `#[tool]`, register it, and call
-it by name. A runnable two-node version is in
-[`sdk/examples/tool_calling.rs`](net/crates/net/sdk/examples/tool_calling.rs).
+[Security model](https://ai2070.net/docs/concepts/security-model). When the caller needs more than
+the typed view — a clip, an occupancy grid — it travels as a content-addressed artifact:
+[Dataforts](https://ai2070.net/docs/guides/dataforts).
 
 ## Install
 
