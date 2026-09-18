@@ -660,7 +660,18 @@ pub enum PurchaseError {
 /// operator closing the archive row would close the live charge).
 /// Separating the classes structurally is what makes the two
 /// unreachable from each other; see `RecordClass`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// **A store written before the split still loads, and its archives
+/// stay addressable.** The previous writer kept retained evidence in
+/// `attempts` under a decorated id, so such a document has no
+/// `superseded` map at all; deserializing it as an ordinary store would
+/// accept it and list its rows while making every one of those charges
+/// unreachable through the key-and-incarnation exit that closes them.
+/// [`A2aPurchaseFile`]'s `Deserialize` therefore classifies what it
+/// reads by each record's **own embedded `key` and `generation`** — a
+/// live record is the one whose map id *is* `key.id()` — never by a
+/// suffix on the map id, which a legitimate task id can spell.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct A2aPurchaseFile {
     #[serde(default)]
     pub attempts: BTreeMap<String, PurchaseAttempt>,
@@ -670,6 +681,61 @@ pub struct A2aPurchaseFile {
     /// unresolved.
     #[serde(default)]
     pub superseded: BTreeMap<String, PurchaseAttempt>,
+}
+
+impl<'de> Deserialize<'de> for A2aPurchaseFile {
+    /// Read the document, then place every record in the class its own
+    /// identity says it belongs to.
+    ///
+    /// The migration is a pure function of the record's embedded fields:
+    /// an `attempts` entry filed under anything other than its own
+    /// `key.id()` is not the live purchase of that key — it is the
+    /// previous writer's retained evidence — so it moves to the archive
+    /// under `superseded_record_id` of the key and generation it
+    /// carries, and merges by `merge_retained` if that incarnation is
+    /// already archived. Nothing is inferred from the shape of the map
+    /// id, so a live task whose id spells the old decoration stays live.
+    ///
+    /// Applied on every read, and persisted by the next write that
+    /// changes the file — so a prior-format store is exactly addressable
+    /// from the first reopen, without a migration pass an operator has
+    /// to remember to run.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Document {
+            #[serde(default)]
+            attempts: BTreeMap<String, PurchaseAttempt>,
+            #[serde(default)]
+            superseded: BTreeMap<String, PurchaseAttempt>,
+        }
+        let Document {
+            attempts,
+            superseded,
+        } = Document::deserialize(deserializer)?;
+        let mut file = Self {
+            attempts: BTreeMap::new(),
+            superseded,
+        };
+        for (id, record) in attempts {
+            if id == record.key.id() {
+                file.attempts.insert(id, record);
+                continue;
+            }
+            let archived = superseded_record_id(&record.key, &record.generation);
+            match file.superseded.get_mut(&archived) {
+                Some(existing) => {
+                    merge_retained(existing, record);
+                }
+                None => {
+                    file.superseded.insert(archived, record);
+                }
+            }
+        }
+        Ok(file)
+    }
 }
 
 /// Which of the file's two record classes a store verb addresses.
@@ -1177,6 +1243,17 @@ impl A2aPurchaseStore {
     /// so a retry of one decision never mints a second record of one
     /// payment.
     ///
+    /// **The disposition that wins is the one belonging to this exact
+    /// incarnation, whichever map holds it.** An operator can close a
+    /// charge while it is still the live record under its key — that is
+    /// the ordinary exit for an exposed refusal — and a settlement of
+    /// *that same incarnation* landing afterwards must not become a
+    /// second, unresolved reconciliation item for one charge an operator
+    /// already accounted for. So the archive entry this verb creates is
+    /// seeded from that live disposition and the late evidence merged
+    /// into it by the same precedence an archive-resident disposition
+    /// obeys; the live record is never touched from here.
+    ///
     /// Returns the record as the archive now holds it — which is not
     /// necessarily the state just offered.
     pub async fn retain_superseded(
@@ -1190,14 +1267,38 @@ impl A2aPurchaseStore {
         incoming.state = state;
         incoming.updated_at_ns = now_ns;
         let id_owned = id.clone();
+        let live_id = attempt.key.id();
+        let incarnation = attempt.generation.clone();
         let stored = mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
+            // Read out before the archive is borrowed mutably: the
+            // disposition of this exact incarnation, when it is the
+            // live record under the key rather than an archived one.
+            let disposition = file
+                .attempts
+                .get(&live_id)
+                .filter(|live| {
+                    live.generation == incarnation && live.state.tag() == StateTag::Resolved
+                })
+                .cloned();
             let archive = RecordClass::Retained.map(file);
             if let Some(existing) = archive.get_mut(&id_owned) {
                 let changed = merge_retained(existing, incoming);
                 return (existing.clone(), changed);
             }
-            let stored = incoming.clone();
-            archive.insert(id_owned, incoming);
+            let Some(disposition) = disposition else {
+                let stored = incoming.clone();
+                archive.insert(id_owned, incoming);
+                return (stored, true);
+            };
+            let mut retained = disposition;
+            if !merge_retained(&mut retained, incoming) {
+                // This outcome knows nothing the disposition has not
+                // already accounted for: nothing to retain, and no
+                // second row to mint.
+                return (retained, false);
+            }
+            let stored = retained.clone();
+            archive.insert(id_owned, retained);
             (stored, true)
         })
         .await?;
@@ -1378,25 +1479,61 @@ fn late_settlement_evidence(attempt: &PurchaseAttempt) -> Option<serde_json::Val
     }))
 }
 
-/// Put late settlement evidence beside what an operator recorded,
-/// without touching it: an object gains the `late_settlement` key, and
-/// anything else is nested under `operator_evidence` rather than
-/// replaced.
+/// The schema tag of the envelope a resolution's evidence grows when a
+/// settlement lands after the disposition.
+///
+/// Versioned and namespaced because it is a read contract: a
+/// reconciliation tool looks for exactly this key to find the charge an
+/// operator never saw.
+const LATE_SETTLEMENT_ENVELOPE: &str = "net.payments.a2a.late_settlement@1";
+
+/// Is `needle` somewhere inside `haystack`, as an exact value?
+///
+/// The only question `with_late_settlement` needs to ask about a
+/// document it must not otherwise interpret: has this settlement
+/// already been retained here? Structural, so it finds the evidence at
+/// whatever envelope depth a previous merge put it.
+fn json_retains(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    match haystack {
+        serde_json::Value::Object(fields) => fields.values().any(|v| json_retains(v, needle)),
+        serde_json::Value::Array(items) => items.iter().any(|v| json_retains(v, needle)),
+        _ => false,
+    }
+}
+
+/// Put late settlement evidence *beside* what an operator recorded, in
+/// an outer envelope that preserves their document byte for byte.
+///
+/// Operator evidence is unrestricted JSON, so there is no field this
+/// function may reserve inside it: a document that already spells
+/// `late_settlement` — or the envelope's own shape — owns that value,
+/// and writing the generated one over it destroys the only copy of
+/// something a human recorded on purpose. The operator's document is
+/// therefore never inspected or edited; it moves whole into
+/// `operator_evidence` beneath the envelope tag, and the generated
+/// facts go beside it.
+///
+/// Idempotent without interpreting the document: if this exact
+/// settlement value is already retained anywhere inside the evidence,
+/// there is nothing to add and the evidence is returned unchanged — so
+/// a re-published decision neither grows the envelope nor is mistaken
+/// for new evidence.
 fn with_late_settlement(
     evidence: &serde_json::Value,
     late: serde_json::Value,
 ) -> serde_json::Value {
-    match evidence {
-        serde_json::Value::Object(fields) => {
-            let mut fields = fields.clone();
-            fields.insert("late_settlement".to_string(), late);
-            serde_json::Value::Object(fields)
-        }
-        other => serde_json::json!({
-            "operator_evidence": other,
-            "late_settlement": late,
-        }),
+    if json_retains(evidence, &late) {
+        return evidence.clone();
     }
+    serde_json::json!({
+        LATE_SETTLEMENT_ENVELOPE: {
+            "operator_evidence": evidence,
+            "late_settlement": late,
+        }
+    })
 }
 
 /// Merge one outcome into the archived record of the same incarnation,

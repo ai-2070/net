@@ -1615,6 +1615,11 @@ async fn a_live_task_that_spells_an_archive_id_cannot_overwrite_the_retained_cha
 /// carries proof and billing, the two facts reconciliation cannot
 /// rebuild from the caller's store), and resolved-first/ambiguity-second
 /// (which knows strictly less than the disposition and is dropped).
+///
+/// The operator's document is a colliding one — it spells
+/// `late_settlement` itself — because the generated evidence must be
+/// retained *beside* an opaque document, never written into it: the
+/// caller-side store reserves no field inside what a human recorded.
 #[tokio::test]
 async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
     let w = world(false, false).await;
@@ -1643,6 +1648,15 @@ async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
         )
         .await
         .expect("retain the exposed refusal");
+    // Operator evidence is unrestricted JSON, and this document
+    // already spells the property the generated evidence is named by.
+    // Staged that way on purpose: it is the case where reserving a
+    // field inside the operator's document destroys the only copy of
+    // something a human recorded deliberately.
+    let recorded = serde_json::json!({
+        "ticket": "OPS-77",
+        "late_settlement": "reconciled by hand against invoice 41",
+    });
     let closed = w
         .flow
         .resolve_superseded_attempt(
@@ -1651,7 +1665,7 @@ async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
             &charged.generation,
             AttemptResolution::Closed {
                 outcome: "written off".to_string(),
-                evidence: serde_json::json!({ "ticket": "OPS-77" }),
+                evidence: recorded.clone(),
             },
         )
         .await
@@ -1671,13 +1685,16 @@ async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
         );
     };
     assert_eq!(outcome, "written off", "nothing reopened it");
+    let preserved = evidence
+        .pointer("/net.payments.a2a.late_settlement@1/operator_evidence")
+        .expect("the operator's document is kept whole under the envelope");
     assert_eq!(
-        evidence.get("ticket").and_then(|t| t.as_str()),
-        Some("OPS-77"),
-        "and what the operator recorded is untouched"
+        preserved, &recorded,
+        "what the operator recorded is preserved byte for byte, including the \
+         property the generated evidence shares a name with: {evidence}"
     );
     let late = evidence
-        .get("late_settlement")
+        .pointer("/net.payments.a2a.late_settlement@1/late_settlement")
         .expect("the late charge is retained beside the disposition");
     assert_eq!(
         late.pointer("/proof/quote_id").and_then(|q| q.as_str()),
