@@ -141,8 +141,8 @@ examples:
     files:
       rust: objectstore.rs
       typescript: objectstore.ts
+      python: objectstore.py
     absent:
-      python: "the standard Python wheel is built without the `dataforts` feature, so `BlobRef`, `blob_publish` and `MeshBlobAdapter` are not in `net` at all. Rust, TypeScript and C carry the blob surface."
 
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
