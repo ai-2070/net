@@ -3946,6 +3946,18 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         // wrapper module on top of these classes.
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
         m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
+        // The sync streaming handles. `net/mesh_rpc.py` imports these six by
+        // name in one `from net._net import (...)`; before they were registered
+        // here, that single import failed and the module's `except ImportError`
+        // left `_RawMeshRpc = None`, so `TypedMeshRpc.from_mesh` raised
+        // "MeshRpc unavailable" for every caller — under a wheel built WITH
+        // `cortex`. Registering the async counterparts alone was not enough.
+        m.add_class::<mesh_rpc::PyClientStreamCall>()?;
+        m.add_class::<mesh_rpc::PyDuplexCall>()?;
+        m.add_class::<mesh_rpc::PyDuplexSink>()?;
+        m.add_class::<mesh_rpc::PyDuplexStream>()?;
+        m.add_class::<mesh_rpc::PyRequestStreamRecv>()?;
+        m.add_class::<mesh_rpc::PyResponseSinkSend>()?;
         m.add_class::<mesh_rpc::PyAsyncRpcStream>()?;
         m.add_class::<mesh_rpc::PyAsyncClientStreamCall>()?;
         m.add_class::<mesh_rpc::PyAsyncDuplexCall>()?;

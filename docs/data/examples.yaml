@@ -123,8 +123,8 @@ examples:
     files:
       rust: jobqueue.rs
       typescript: jobqueue.ts
+      python: jobqueue.py
     absent:
-      python: "nRPC is not reachable from the shipped Python wheel: `net/mesh_rpc.py` imports six streaming classes (`ClientStreamCall`, `DuplexCall`, `DuplexSink`, `DuplexStream`, `RequestStreamRecv`, `ResponseSinkSend`) that `bindings/python/src/lib.rs` never registers, so the import shim falls back and `TypedMeshRpc.from_mesh` always raises `MeshRpc unavailable`. Rust and TypeScript pass."
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
