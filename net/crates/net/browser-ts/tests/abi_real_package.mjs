@@ -157,7 +157,7 @@ function payloadOf(vector) {
  * that spells none. The corresponding REAL exercises are the Stage 5
  * browser witnesses named in the header.
  */
-function packageStream(streamIdHex, proxied, peerHex) {
+function packageStream(streamIdHex, proxied, peerHex, identity = 'required') {
   let emit;
   const inner = {
     send: proxied ? async () => undefined : () => undefined,
@@ -172,7 +172,7 @@ function packageStream(streamIdHex, proxied, peerHex) {
     inner.peer_node_hex = () => peerHex;
     inner.incarnation = () => '1';
   }
-  const stream = new LeafStream(inner);
+  const stream = new LeafStream(inner, undefined, identity);
   return { stream, emit: (event) => emit(event) };
 }
 
@@ -210,18 +210,18 @@ await probe('real_package_decodes_the_same_events_on_a_proxied_stream', async ()
 });
 
 await probe('real_package_matches_hex_handle_ids_against_decimal_event_ids', async () => {
-  const rig = packageStream('000000000000002a', false);
+  const rig = packageStream('000000000000002a', false, '00000000000000aa');
   const next = rig.stream[Symbol.asyncIterator]().next();
-  rig.emit('{"type":"stream_data","stream_id":"42","seq":"1","payload":"AQ=="}');
+  rig.emit('{"type":"stream_data","peer_node":"170","stream_id":"42","seq":"1","payload":"AQ=="}');
   const { value } = await next;
   eq([...value], [1], 'stream 0x2a did not accept its own decimal id 42');
 });
 
 await probe('real_package_drops_another_streams_event', async () => {
-  const rig = packageStream('0000000000000009', false);
+  const rig = packageStream('0000000000000009', false, '00000000000000aa');
   const seen = [];
   rig.stream.onMessage((payload) => seen.push(payload));
-  rig.emit('{"type":"stream_data","stream_id":"19","seq":"1","payload":"AQ=="}');
+  rig.emit('{"type":"stream_data","peer_node":"170","stream_id":"19","seq":"1","payload":"AQ=="}');
   eq(seen.length, 0, 'an event for stream 19 reached stream 9');
 });
 
@@ -256,15 +256,36 @@ await probe('real_package_keys_a_stream_on_its_peer_as_well_as_its_id', async ()
   }
 });
 
-// And the host-supplied wrapper that spells no peer keeps the id-only
-// behaviour: a filter that cannot be evaluated must not become one
-// that drops everything.
-await probe('real_package_keeps_delivering_to_a_wrapper_that_spells_no_peer', async () => {
-  const rig = packageStream('0000000000000009', false);
+// A stream this package builds MUST be able to name its peer, and a
+// wrapper that cannot is refused rather than falling back to the
+// id-only filter. This probe previously asserted the fallback; the
+// fallback was the cross-peer admixture on every proxied handle, so
+// the probe is re-aimed at the disposition that replaced it rather
+// than re-pinned to it.
+await probe('real_package_refuses_a_built_in_stream_that_spells_no_peer', async () => {
+  let refused = null;
+  try {
+    packageStream('0000000000000009', false);
+  } catch (error) {
+    refused = error;
+  }
+  if (refused === null) {
+    throw new Error('a stream with no readable peer must not be constructed');
+  }
+  if (!/readable peer/.test(String(refused && refused.message))) {
+    throw new Error(`the refusal must name the identity: ${refused}`);
+  }
+});
+
+// The explicit opt-out still exists for a host-supplied wrapper with
+// no peer to report, and it still filters on the id alone — which is
+// what makes the requirement above a decision rather than a blanket.
+await probe('real_package_keeps_id_only_delivery_for_an_explicitly_peerless_wrapper', async () => {
+  const rig = packageStream('0000000000000009', false, undefined, 'optional');
   const seen = [];
   rig.stream.onMessage((payload) => seen.push(payload));
   rig.emit('{"type":"stream_data","stream_id":"9","seq":"1","payload":"AQ=="}');
-  eq([...(seen[0] ?? [])], [1], 'a peerless wrapper received its own id');
+  eq([...(seen[0] ?? [])], [1], 'an explicitly peerless wrapper received its own id');
 });
 
 // ───────────────────── the wasm option readers ──────────────────────
@@ -501,6 +522,10 @@ function packageDirectNode(throwOnClose = []) {
         on_message() {},
         is_reliable: () => true,
         stream_id_hex: () => '00000000000000ff',
+        // A real handle always reports these; a stub that does not is
+        // refused at construction now.
+        peer_node_hex: () => '00000000000000aa',
+        incarnation: () => '1',
         close() {
           teardown.push('stream');
           if (throwOnClose.includes(ordinal)) throw new Error(`injected close failure ${ordinal}`);

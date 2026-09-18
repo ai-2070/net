@@ -5120,6 +5120,17 @@ jobs:
             kyra_completed_fragment_no_duplicate_control
             kyra_rpc_carrier_cannot_silently_shadow_admitted_stream
             kyra_unowned_carrier_application_control
+            an_impostor_with_the_domain_psk_is_refused_the_identity_it_claims
+            the_honest_initiator_is_installed_after_its_establishment_proof
+            a_wrong_domain_psk_is_still_refused_before_any_admission
+            a_proof_from_another_establishment_cannot_promote_this_one
+            a_proof_arriving_after_the_attempt_expired_installs_nothing
+            the_periodic_sweep_retires_an_abandoned_attempt
+            a_superseded_attempt_loses_its_right_to_install
+            closing_the_peer_revokes_an_unproven_establishment
+            the_direct_path_demands_the_same_proof_as_the_routed_one
+            retiring_the_attempt_revokes_an_unproven_establishment
+            application_bytes_on_an_unproven_establishment_are_never_delivered
           "
           set -o pipefail
           # A pin that names nothing can never be satisfied and reads
@@ -5132,6 +5143,7 @@ jobs:
             --source tests/kyra_round2_review.rs \
             --source tests/kyra_round3_review.rs \
             --source tests/kyra_round4_parent.rs \
+            --source tests/establishment_identity.rs \
             $REQUIRED
           # No `--test` form: the integration-test pin guard
           # inventories the root crate's `tests/`, and the leaf is
@@ -5145,7 +5157,7 @@ jobs:
             grep -q "^test $required \.\.\. ok$" /tmp/kyra-review.log || {
               echo "::error::Kyra's probe $required did not run and pass"; exit 1; }
           done
-          echo "Kyra's Stage 5 probes: 52/52"
+          echo "Kyra's Stage 5 probes and the S6-01 establishment-identity witnesses: 63/63"
 
       - name: Native tests (the sans-IO half)
         run: |

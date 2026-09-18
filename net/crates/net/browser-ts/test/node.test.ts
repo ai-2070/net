@@ -575,6 +575,10 @@ describe('direct close with a failing child', () => {
         const id = ++count;
         return {
           stream_id_hex: () => id.toString(16).padStart(16, '0'),
+          // A real stream always reports its peer; a stub that does
+          // not is refused at construction now.
+          peer_node_hex: () => '00000000000000aa',
+          incarnation: () => '1',
           on_message: () => {},
           is_reliable: () => true,
           send: () => {},

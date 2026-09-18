@@ -165,7 +165,12 @@ impl LeaderBackend for TestBackend {
             LeaderRequest::Call { .. } => reply.bytes(Bytes::from_static(b"pong")),
             LeaderRequest::Query { .. } | LeaderRequest::Counters => reply.text("[]".into()),
             LeaderRequest::IsEnrolled => reply.flag(true),
-            LeaderRequest::StreamOpen { stream_id, .. } => reply.stream(stream_id.unwrap_or(9)),
+            LeaderRequest::StreamOpen {
+                stream_id, peer, ..
+            } => {
+                let id = stream_id.unwrap_or(9);
+                reply.stream(id, id, peer.unwrap_or(0xfeed), 1)
+            }
             _ => reply.bytes(Bytes::new()),
         }
     }
@@ -455,9 +460,12 @@ struct RealNode {
     /// lifecycle, so a synchronous arm can deliver a real node event
     /// exactly where production's `StreamSend` delivers one.
     sink: Rc<RefCell<Option<EventSink>>>,
-    /// Stream handles the backend opened, by wire id — production
-    /// `NodeBackend` keeps the same table.
+    /// Stream handles the backend opened, **by owning handle** —
+    /// production `NodeBackend` keeps the same table, and keys it the
+    /// same way, because two peers under one label share the wire id.
     streams: Rc<RefCell<HashMap<u64, StreamHandle>>>,
+    /// The next owning handle, monotone and never reused.
+    next_handle: Rc<Cell<u64>>,
     /// How many reliability sweeps a synchronous send's pump runs,
     /// and how far each one moves the node's clock argument. Zero for
     /// every test but the one whose subject is a retransmit budget
@@ -603,11 +611,13 @@ impl LeaderBackend for RealNodeBackend {
                 );
                 match opened {
                     Ok(handle) => {
-                        handles
-                            .streams
-                            .borrow_mut()
-                            .insert(handle.stream_id, handle);
-                        reply.stream(handle.stream_id);
+                        // Keyed by an owning handle, like production:
+                        // two peers under one label share the wire id,
+                        // so the id cannot name an open.
+                        let owner = handles.next_handle.get() + 1;
+                        handles.next_handle.set(owner);
+                        handles.streams.borrow_mut().insert(owner, handle);
+                        reply.stream(owner, handle.stream_id, handle.peer, handle.incarnation);
                     }
                     Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
                 }
@@ -620,11 +630,14 @@ impl LeaderBackend for RealNodeBackend {
             // `Shared.server` borrow its caller is holding. So this
             // arm pumps and delivers to the production sink in the
             // same frame, rather than spawning.
-            LeaderRequest::StreamSend { stream_id, payload } => {
-                let handle = handles.streams.borrow().get(&stream_id).copied();
+            LeaderRequest::StreamSend {
+                handle: owner,
+                payload,
+            } => {
+                let handle = handles.streams.borrow().get(&owner).copied();
                 let Some(handle) = handle else {
                     reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
-                        "no open stream {stream_id:#018x}"
+                        "no open stream for handle {owner}"
                     ))));
                     return;
                 };
@@ -797,12 +810,43 @@ fn real_pair() -> (RealNode, net_leaf::LeafNode) {
             barrier: Rc::new(RefCell::new(None)),
             dispatched: Rc::new(Cell::new(0)),
             sink: Rc::new(RefCell::new(None)),
+            next_handle: Rc::new(Cell::new(0)),
             streams: Rc::new(RefCell::new(HashMap::new())),
             sweeps: Rc::new(Cell::new(0)),
             transport: Rc::new(RefCell::new(None)),
         },
         peer,
     )
+}
+
+/// A second authenticated peer session on the same leader node.
+///
+/// Returns the peer's node id. Two sessions on one node is what makes
+/// "one label, two peers, one wire id" reachable at all — the shape
+/// [`crate::node::LeafEvent::StreamData`] documents as ordinary.
+fn add_peer(handles: &RealNode) -> (net_leaf::LeafNode, u64) {
+    let mut peer = net_leaf::LeafNode::new(LeafIdentity::generate().expect("identity"), 11);
+    let mut psk = [0u8; 32];
+    getrandom::fill(&mut psk).expect("browser CSPRNG");
+    let peer_id = peer.node_id();
+    let one = handles
+        .node
+        .borrow_mut()
+        .begin_handshake(peer_id, &psk, peer.identity().noise().public_key(), 1)
+        .expect("msg1");
+    let leader_id = handles.node.borrow().node_id();
+    let two = peer
+        .accept_handshake(leader_id, &psk, &one, 1)
+        .expect("msg2");
+    handles
+        .node
+        .borrow_mut()
+        .complete_handshake(peer_id, &two)
+        .expect("session");
+    handles.node.borrow_mut().drain_events();
+    peer.drain_events();
+    handles.node.borrow_mut().take_outbound();
+    (peer, peer_id)
 }
 
 fn real_factory(handles: RealNode) -> BackendFactory {
@@ -2820,7 +2864,7 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
     // X: reliable, sent once, never acknowledged. Its retransmit
     // budget starts running now, against the wall clock the
     // reliability layer reads for itself.
-    leader
+    let opened_x = leader
         .request(LeaderRequest::StreamOpen {
             label: "doomed".into(),
             reliability: Reliability::Reliable,
@@ -2830,14 +2874,17 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
         })
         .await
         .expect("open X");
+    let ProxyValue::Stream { handle: x, .. } = opened_x else {
+        panic!("open X did not answer with a stream: {opened_x:?}");
+    };
     leader
         .request(LeaderRequest::StreamSend {
-            stream_id: 17,
+            handle: x,
             payload: Bytes::from_static(b"unacknowledged"),
         })
         .await
         .expect("send on X");
-    leader
+    let opened_y = leader
         .request(LeaderRequest::StreamOpen {
             label: "healthy".into(),
             reliability: Reliability::Reliable,
@@ -2847,6 +2894,9 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
         })
         .await
         .expect("open Y");
+    let ProxyValue::Stream { handle: y, .. } = opened_y else {
+        panic!("open Y did not answer with a stream: {opened_y:?}");
+    };
 
     // One sweep per attempt outside any server borrow spends X's
     // retry budget. Attempts are paced by the wire's backed-off RTO
@@ -2885,7 +2935,7 @@ async fn a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_pan
     handles.sweeps.set(1);
     let sent = leader
         .request(LeaderRequest::StreamSend {
-            stream_id: 34,
+            handle: y,
             payload: Bytes::from_static(b"healthy"),
         })
         .await;
@@ -3355,4 +3405,143 @@ fn now_ms() -> f64 {
     web_sys::window()
         .and_then(|window| window.performance())
         .map_or(0.0, |performance| performance.now())
+}
+
+/// Two authenticated peers, one wire stream id, on the **leader's own**
+/// `MeshSession` — which wraps the same `ProxyStream` a follower's
+/// does, so this is not a follower-only property.
+///
+/// Before the ownership repair the backend keyed its open-stream table
+/// by the wire id, so the second open overwrote the first's slot: the
+/// first handle's `send` reached the second peer's stream and its
+/// `close` closed it. And `ProxyStream::on_message` filtered the
+/// session's event vector by the id alone, so each consumer received
+/// whichever peer's payload arrived. That is R4-10 on the proxied
+/// path, and it needed all four operations fixed, not an accessor.
+#[wasm_bindgen_test]
+async fn two_peers_under_one_wire_id_own_their_streams_independently() {
+    let db = unique("stream-own-db");
+    let scope = unique("stream-own-scope");
+    let (handles, _peer_a) = real_pair();
+    let peer_a = handles.peer;
+    let (_peer_b_node, peer_b) = add_peer(&handles);
+
+    let leader = Lifecycle::open(opts(&db, &scope, &[], &[]), real_factory(handles.clone()))
+        .await
+        .expect("leader");
+    settle().await;
+    assert_eq!(leader.role(), Role::Leader);
+
+    // One label, one explicit wire id, two peers.
+    let open = |peer: u64| {
+        let o = Object::new();
+        put(&o, "reliability", &JsValue::from_str("reliable"));
+        put(&o, "streamId", &JsValue::from_str("9"));
+        put(&o, "peer", &JsValue::from_str(&format!("{peer:016x}")));
+        o
+    };
+    let a = leader
+        .open_stream(&open(peer_a).into())
+        .await
+        .expect("open to peer A");
+    let b = leader
+        .open_stream(&open(peer_b).into())
+        .await
+        .expect("open to peer B");
+
+    // Same wire id — the ordinary case, and the reason the id cannot
+    // be the owner.
+    assert_eq!(a.stream_id_hex(), b.stream_id_hex());
+    // Different resolved peers, each read off the stream the node
+    // actually opened.
+    assert_eq!(a.peer_node_hex(), format!("{peer_a:016x}"));
+    assert_eq!(b.peer_node_hex(), format!("{peer_b:016x}"));
+    assert_ne!(a.peer_node_hex(), b.peer_node_hex());
+
+    // Reception is isolated. Both consumers listen, and the session's
+    // event vector carries both peers' frames.
+    let to_a = Rc::new(Cell::new(0usize));
+    let to_b = Rc::new(Cell::new(0usize));
+    for (stream, counter) in [(&a, to_a.clone()), (&b, to_b.clone())] {
+        let counting = counter;
+        let callback = Closure::wrap(Box::new(move |_json: JsValue| {
+            counting.set(counting.get() + 1);
+        }) as Box<dyn FnMut(JsValue)>);
+        stream.on_message(
+            callback
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        );
+        callback.forget();
+    }
+    let sink = handles.sink.borrow().clone().expect("the production sink");
+    let stream_id_decimal = u64::from_str_radix(&a.stream_id_hex(), 16).expect("hex");
+    for peer in [peer_a, peer_b] {
+        sink(&format!(
+            "{{\"type\":\"stream_data\",\"peer_node\":\"{peer}\",\
+             \"incarnation\":\"1\",\"stream_id\":\"{stream_id_decimal}\",\
+             \"seq\":\"1\",\"payload\":\"AQI=\"}}"
+        ));
+    }
+    settle().await;
+    assert_eq!(
+        to_a.get(),
+        1,
+        "peer A's consumer takes exactly its own frame"
+    );
+    assert_eq!(
+        to_b.get(),
+        1,
+        "peer B's consumer takes exactly its own frame"
+    );
+
+    // Sends reach the right peer. The double's arm pumps the real node,
+    // so the destination is observable on the wire.
+    handles.node.borrow_mut().take_outbound();
+    a.send(Uint8Array::from(&b"for-a"[..]))
+        .await
+        .expect("send on A");
+    let addressed: Vec<u64> = handles
+        .node
+        .borrow_mut()
+        .take_outbound()
+        .into_iter()
+        .map(|out| out.peer)
+        .collect();
+    assert!(
+        !addressed.is_empty() && addressed.iter().all(|to| *to == peer_a),
+        "A's payload must go to peer A alone, got {addressed:?}"
+    );
+
+    // Closing A leaves B usable: the backend removed one entry, not
+    // the slot they would have shared.
+    a.close();
+    settle().await;
+    handles.node.borrow_mut().take_outbound();
+    b.send(Uint8Array::from(&b"for-b"[..]))
+        .await
+        .expect("B must still send after A closed");
+    let addressed: Vec<u64> = handles
+        .node
+        .borrow_mut()
+        .take_outbound()
+        .into_iter()
+        .map(|out| out.peer)
+        .collect();
+    assert!(
+        !addressed.is_empty() && addressed.iter().all(|to| *to == peer_b),
+        "B's payload must go to peer B alone, got {addressed:?}"
+    );
+    to_b.set(0);
+    sink(&format!(
+        "{{\"type\":\"stream_data\",\"peer_node\":\"{peer_b}\",\
+         \"incarnation\":\"1\",\"stream_id\":\"{stream_id_decimal}\",\
+         \"seq\":\"2\",\"payload\":\"AQI=\"}}"
+    ));
+    settle().await;
+    assert_eq!(to_b.get(), 1, "B still receives after A closed");
+
+    leader.close();
+    settle().await;
 }

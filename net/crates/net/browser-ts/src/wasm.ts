@@ -124,13 +124,14 @@ export interface LeafWasmStream {
    * the NODE-WIDE event vector, so without the peer a wrapper's
    * filter admits the other peer's payload (R4-10).
    *
-   * Optional because this interface is public and a host-supplied
-   * wrapper is allowed not to spell a peer. A wrapper that cannot
-   * read one filters on the id alone — the same disposition an
-   * unreadable id gets, since a filter that cannot be evaluated must
-   * not become one that drops everything.
+   * **Required**, on both this and the proxied handle: the leaf
+   * implements it on both, so a consumer never has to know which kind
+   * of stream it holds to filter by peer. A host-supplied wrapper
+   * that genuinely has no peer to report is handled by the wrapper's
+   * own `identity: 'optional'` construction (`stream.ts`), not by
+   * making the boundary lie about what the leaf exposes.
    */
-  peer_node_hex?(): string;
+  peer_node_hex(): string;
   /**
    * Which incarnation of that peer's session this stream belongs to,
    * exact decimal — the event JSON's `incarnation`, same spelling.
@@ -141,7 +142,7 @@ export interface LeafWasmStream {
    * wrapper under a dead incarnation. Declared because this file is
    * the record of the boundary the leaf actually exposes.
    */
-  incarnation?(): string;
+  incarnation(): string;
   close(): void;
 }
 
@@ -168,10 +169,19 @@ export interface LeafWasmProxyStream {
   on_message(callback: (event: StreamCallbackPayload) => void): void;
   is_reliable(): boolean;
   stream_id_hex(): string;
-  /** As {@link LeafWasmStream.peer_node_hex}. */
-  peer_node_hex?(): string;
+  /**
+   * As {@link LeafWasmStream.peer_node_hex}, and **required**.
+   *
+   * It was optional, and `ProxyStream` did not implement it, so a
+   * proxied stream's peer filter went inert and admitted any peer's
+   * frame under a matching id. The declaration is required now
+   * because the implementation exists on both handles; a consumer
+   * must not have to know which kind of stream it holds to filter by
+   * peer.
+   */
+  peer_node_hex(): string;
   /** As {@link LeafWasmStream.incarnation}. */
-  incarnation?(): string;
+  incarnation(): string;
   close(): void;
 }
 

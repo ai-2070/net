@@ -807,12 +807,21 @@ impl Lifecycle {
                 peer: options.peer,
             })
             .await?;
-        let ProxyValue::Stream { stream_id } = value else {
+        let ProxyValue::Stream {
+            handle,
+            stream_id,
+            peer,
+            incarnation,
+        } = value
+        else {
             return Err(JsError::new("open_stream did not answer with a stream"));
         };
         Ok(ProxyStream {
             lifecycle: self.clone(),
+            handle,
             stream_id,
+            peer,
+            incarnation,
             reliable,
             generation,
         })
@@ -1849,11 +1858,30 @@ pub fn spawn_fenced(
 struct NodeBackend {
     node: Rc<crate::wasm::LeafNode>,
     node_id: u64,
+    /// Open streams **by backend handle**, never by wire stream id.
+    ///
+    /// The wire id does not identify an open: it is derived from a
+    /// label and the peer is no part of that derivation, so two peers
+    /// under one label share it. Keying by it let the second open
+    /// overwrite the first's slot, after which the first caller's
+    /// `send` reached — and its `close` closed — the second peer's
+    /// stream.
     streams: Rc<RefCell<HashMap<u64, crate::wasm::LeafStream>>>,
+    /// The next handle to hand out: monotone, never reused within a
+    /// backend, so a handle cannot come to name a different open.
+    next_handle: Rc<Cell<u64>>,
     /// The fence this backend's operations are admitted under — the
     /// same lease the server stamps its replies with.
     lease: GenerationLease,
     ops: Rc<OpRegistry>,
+}
+
+impl NodeBackend {
+    fn next_stream_handle(&self) -> u64 {
+        let next = self.next_handle.get().saturating_add(1);
+        self.next_handle.set(next);
+        next
+    }
 }
 
 impl LeaderBackend for NodeBackend {
@@ -2042,27 +2070,52 @@ impl LeaderBackend for NodeBackend {
                 }
                 match node.open_stream(opts.into()) {
                     Ok(stream) => {
-                        let id = u64::from_str_radix(&stream.stream_id_hex(), 16).unwrap_or(0);
-                        self.streams.borrow_mut().insert(id, stream);
-                        reply.stream(id);
+                        // Read the identity back off the stream the
+                        // node actually opened, never off the request:
+                        // the options are what a follower *asked* for,
+                        // and a handle that filtered on those would be
+                        // trusting the asker.
+                        let resolved = (
+                            u64::from_str_radix(&stream.stream_id_hex(), 16),
+                            u64::from_str_radix(&stream.peer_node_hex(), 16),
+                            stream.incarnation().parse::<u64>(),
+                        );
+                        let (Ok(wire_id), Ok(resolved_peer), Ok(incarnation)) = resolved else {
+                            // Fail closed. A stream whose identity
+                            // cannot be read is not handed over with
+                            // the peer left unknown — that is exactly
+                            // the silently-permissive fallback this
+                            // repair exists to remove.
+                            stream.close();
+                            reply.fail(ProxyFailure::Typed(LeafError::Session(
+                                "opened stream did not report a readable identity".into(),
+                            )));
+                            return;
+                        };
+                        let handle = self.next_stream_handle();
+                        self.streams.borrow_mut().insert(handle, stream);
+                        reply.stream(handle, wire_id, resolved_peer, incarnation);
                     }
                     Err(error) => reply.fail(reported(error)),
                 }
             }
-            LeaderRequest::StreamSend { stream_id, payload } => {
+            LeaderRequest::StreamSend { handle, payload } => {
                 let streams = self.streams.borrow();
-                match streams.get(&stream_id) {
+                match streams.get(&handle) {
                     Some(stream) => match stream.send(Uint8Array::from(&payload[..])) {
                         Ok(()) => reply.bytes(Bytes::new()),
                         Err(error) => reply.fail(reported(error)),
                     },
+                    // The handle names one open, so this is "your
+                    // stream is closed", never "some other peer's
+                    // stream under the same wire id".
                     None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
-                        "no open stream {stream_id:#018x}"
+                        "no open stream for handle {handle}"
                     )))),
                 }
             }
-            LeaderRequest::StreamClose { stream_id } => {
-                if let Some(stream) = self.streams.borrow_mut().remove(&stream_id) {
+            LeaderRequest::StreamClose { handle } => {
+                if let Some(stream) = self.streams.borrow_mut().remove(&handle) {
                     stream.close();
                 }
                 reply.bytes(Bytes::new());
@@ -2095,6 +2148,7 @@ fn node_factory() -> BackendFactory {
                 node: Rc::new(node),
                 node_id,
                 streams: Rc::new(RefCell::new(HashMap::new())),
+                next_handle: Rc::new(Cell::new(0)),
                 lease,
                 ops: Rc::new(OpRegistry::default()),
             });
@@ -2447,10 +2501,26 @@ impl MeshSession {
 /// generation makes the handle refuse instead, and the refusal is
 /// typed, because "the leader changed" is an answer a page can act on
 /// and silence is not.
+///
+/// # Why it remembers a handle *and* an id
+///
+/// The same argument one level down. Two opens to two peers under one
+/// label share a wire stream id, so the id does not name an open
+/// either: addressing the backend by it let one handle's `send` reach
+/// another peer's stream. The `handle` names the open; the
+/// `stream_id` is what the application filters on; and
+/// [`Self::peer_node_hex`] is what makes that filter a peer filter
+/// rather than a peer-blind one.
 #[wasm_bindgen]
 pub struct ProxyStream {
     lifecycle: Lifecycle,
+    /// The backend's owning handle for this open.
+    handle: u64,
     stream_id: u64,
+    /// The authenticated peer the leader's node resolved, not the one
+    /// the caller asked for.
+    peer: u64,
+    incarnation: u64,
     reliable: bool,
     generation: u64,
 }
@@ -2460,6 +2530,24 @@ impl ProxyStream {
     /// The stream id, 16 lowercase hex digits.
     pub fn stream_id_hex(&self) -> String {
         format!("{:016x}", self.stream_id)
+    }
+
+    /// The peer this stream is with, 16 lowercase hex digits.
+    ///
+    /// **Spelled exactly like [`crate::wasm::LeafStream::peer_node_hex`]**
+    /// because a consumer must not need to know whether its stream is
+    /// direct or proxied to filter by peer. Its absence here was the
+    /// R4-10 cross-peer admixture, still open on every proxied handle
+    /// — including the leader tab's own `MeshSession`, which wraps the
+    /// same `ProxyStream`.
+    pub fn peer_node_hex(&self) -> String {
+        format!("{:016x}", self.peer)
+    }
+
+    /// The incarnation of the session this stream was opened on,
+    /// decimal — the spelling the event carries.
+    pub fn incarnation(&self) -> String {
+        self.incarnation.to_string()
     }
 
     /// Whether this stream retransmits.
@@ -2508,7 +2596,9 @@ impl ProxyStream {
         self.still_ours()?;
         self.lifecycle
             .request(LeaderRequest::StreamSend {
-                stream_id: self.stream_id,
+                // The owning handle, not the wire id: the id is shared
+                // with any other peer's stream under the same label.
+                handle: self.handle,
                 payload: Bytes::from(payload.to_vec()),
             })
             .await?;
@@ -2517,23 +2607,35 @@ impl ProxyStream {
 
     /// Listen for inbound payloads on this stream.
     ///
-    /// Filtered from the session's event stream by stream id, which is
-    /// the same mechanism a leader-local stream uses — so a follower's
-    /// stream and a leader's deliver through one path — **and** by the
-    /// generation that opened it, so a stale handle's consumer stops
-    /// receiving rather than starts receiving a successor's bytes.
+    /// Filtered from the session's event stream by **both halves of
+    /// the key** — the peer and the stream id — which is the same
+    /// mechanism and the same event spelling a leader-local stream
+    /// uses ([`crate::wasm::LeafStream::on_message`]), so a
+    /// follower's stream and a leader's deliver through one path;
+    /// **and** by the generation that opened it, so a stale handle's
+    /// consumer stops receiving rather than starts receiving a
+    /// successor's bytes.
+    ///
+    /// The peer half was missing here, and the id alone is not the
+    /// identity of a stream: two peers under one label share it, so a
+    /// proxied consumer received whichever peer's payload arrived.
+    /// That is R4-10, on the proxied path.
     pub fn on_message(&self, callback: Function) {
-        let wanted = format!("\"stream_id\":\"{}\"", self.stream_id);
+        // The event's own spelling of each half: decimal, exactly as
+        // `to_json` writes them.
+        let wanted_peer = format!("\"peer_node\":\"{}\"", self.peer);
+        let wanted_stream = format!("\"stream_id\":\"{}\"", self.stream_id);
         let lifecycle = self.lifecycle.clone();
         let generation = self.generation;
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
             if lifecycle.generation() != generation {
                 return;
             }
-            if json
-                .as_string()
-                .is_some_and(|text| text.contains(&wanted) && text.contains("\"stream_data\""))
-            {
+            if json.as_string().is_some_and(|text| {
+                text.contains("\"stream_data\"")
+                    && text.contains(&wanted_peer)
+                    && text.contains(&wanted_stream)
+            }) {
                 let _ = callback.call1(&JsValue::NULL, &json);
             }
         }) as Box<dyn FnMut(JsValue)>);
@@ -2563,14 +2665,14 @@ impl ProxyStream {
             return;
         }
         let lifecycle = self.lifecycle.clone();
-        let stream_id = self.stream_id;
+        let handle = self.handle;
         let generation = self.generation;
         spawn_local(async move {
             if lifecycle.generation() != generation {
                 return;
             }
             let _ = lifecycle
-                .request(LeaderRequest::StreamClose { stream_id })
+                .request(LeaderRequest::StreamClose { handle })
                 .await;
         });
     }

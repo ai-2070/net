@@ -8,6 +8,30 @@ import { fromWasmError, SessionError } from './errors.js';
 import { parseEvent } from './events.js';
 import type { LeafWasmStreamLike, StreamCallbackPayload, StreamReliability } from './wasm.js';
 
+/**
+ * Whether a stream must be able to name its peer.
+ *
+ * `'required'` for every stream this package builds — both the direct
+ * and the proxied wasm handle report one. `'optional'` exists for a
+ * host-supplied wrapper in a test or an embedding that has no peer to
+ * report, and it keeps the pre-repair id-only behaviour, which is why
+ * nothing in `src/` passes it.
+ */
+export type StreamIdentity = 'required' | 'optional';
+
+/**
+ * A stream could not name its peer, so its frames are unattributable.
+ *
+ * Thrown at construction rather than tolerated: a stream that cannot
+ * filter by peer admits any peer's frame carrying a matching id.
+ */
+export class StreamIdentityError extends SessionError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamIdentityError';
+  }
+}
+
 /** Options for {@link BrowserNode.openStream}. */
 export interface OpenStreamOptions {
   /**
@@ -127,10 +151,27 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   constructor(
     private readonly inner: LeafWasmStreamLike,
     private readonly onClosed?: () => void,
+    identity: StreamIdentity = 'required',
   ) {
     this.wireId = u64FromHex(() => inner.stream_id_hex());
-    this.peerId = u64FromHex(() => inner.peer_node_hex?.());
+    this.peerId = u64FromHex(() => inner.peer_node_hex());
+    if (identity === 'required' && this.peerId === null) {
+      // **Fail closed.** Every stream this package builds comes from
+      // its own wasm, where both the direct and the proxied handle
+      // report a peer, so an unreadable one is a broken build or a
+      // substituted object — not a stream with no peer. Admitting it
+      // would restore the id-only filter below, which is the R4-10
+      // cross-peer admixture, and it would do so silently.
+      throw new StreamIdentityError(
+        'the stream did not report a readable peer, so its frames cannot be attributed',
+      );
+    }
     inner.on_message((event) => this.receive(event));
+  }
+
+  /** The authenticated peer this stream is with, 16 lowercase hex. */
+  get peerNode(): string {
+    return this.inner.peer_node_hex();
   }
 
   /**
@@ -247,9 +288,10 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
  * A `u64` the inner object spells in hex, as a number — or `null`
  * when it does not spell one.
  *
- * A host-supplied wrapper is allowed to omit either accessor, and a
- * value that cannot be read must not become a filter that drops
- * everything.
+ * A host-supplied wrapper (`identity: 'optional'`) may return
+ * something unreadable, and for that case a value that cannot be read
+ * must not become a filter that drops everything. For a stream this
+ * package built, the constructor has already refused.
  */
 function u64FromHex(read: () => string | undefined): bigint | null {
   let hex: string | undefined;

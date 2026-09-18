@@ -475,15 +475,28 @@ pub enum LeaderRequest {
     },
     /// Send on an open stream.
     StreamSend {
-        /// The stream.
-        stream_id: u64,
+        /// The **backend handle** for this open, not the wire stream
+        /// id.
+        ///
+        /// Two opens can legitimately share one wire stream id — the
+        /// id is derived from a label and the peer is not part of that
+        /// derivation, so one label opened to two peers is one id on
+        /// two sessions (the supported composition
+        /// [`crate::node::LeafEvent::StreamData`] describes). Keying
+        /// the backend's open-stream table by the wire id therefore
+        /// let the second open overwrite the first's slot, and this
+        /// request could then send through *another peer's* stream.
+        /// The handle names one open.
+        handle: u64,
         /// The payload.
         payload: Bytes,
     },
     /// Close an open stream.
     StreamClose {
-        /// The stream.
-        stream_id: u64,
+        /// The **backend handle** for this open — see
+        /// [`Self::StreamSend`]. Closing by wire id could close a
+        /// different peer's stream.
+        handle: u64,
     },
     /// Sign and send a session-independent signalling envelope.
     Signal {
@@ -563,10 +576,26 @@ pub enum ProxyValue {
     Text(String),
     /// A yes-or-no answer (`is_enrolled`).
     Flag(bool),
-    /// A stream was opened, with the wire id it got.
+    /// A stream was opened.
+    ///
+    /// Carries the **resolved** identity of the stream the leader's
+    /// node actually opened, read back off that stream rather than
+    /// echoed from the request's options: a follower asking for a
+    /// peer it may not get, or asking for none at all, must still
+    /// learn which authenticated peer its bytes will come from and go
+    /// to. Without this a proxied handle cannot filter by peer, and a
+    /// peer-blind filter is the R4-10 defect.
     Stream {
-        /// The wire stream id.
+        /// The backend handle that owns this open
+        /// ([`LeaderRequest::StreamSend`]).
+        handle: u64,
+        /// The wire stream id, which is what the application filters
+        /// on and which two peers may share.
         stream_id: u64,
+        /// The authenticated peer this stream is with.
+        peer: u64,
+        /// The incarnation of the session it was opened on.
+        incarnation: u64,
     },
 }
 
@@ -959,11 +988,17 @@ impl Replier {
         });
     }
 
-    /// Answer with an opened stream's wire id.
-    pub fn stream(mut self, stream_id: u64) {
+    /// Answer with an opened stream: its owning handle, its wire id,
+    /// and the authenticated identity it resolved to.
+    pub fn stream(mut self, handle: u64, stream_id: u64, peer: u64, incarnation: u64) {
         self.send(ProxyBody::Reply {
             correlation: self.correlation,
-            value: ProxyValue::Stream { stream_id },
+            value: ProxyValue::Stream {
+                handle,
+                stream_id,
+                peer,
+                incarnation,
+            },
         });
     }
 
@@ -1975,14 +2010,14 @@ fn encode_request(request: &LeaderRequest) -> Value {
                 },
             );
         }
-        LeaderRequest::StreamSend { stream_id, payload } => {
+        LeaderRequest::StreamSend { handle, payload } => {
             map.insert("op".into(), Value::from("stream_send"));
-            map.insert("stream_id".into(), Value::from(stream_id.to_string()));
+            map.insert("handle".into(), Value::from(handle.to_string()));
             map.insert("payload".into(), b64(payload));
         }
-        LeaderRequest::StreamClose { stream_id } => {
+        LeaderRequest::StreamClose { handle } => {
             map.insert("op".into(), Value::from("stream_close"));
-            map.insert("stream_id".into(), Value::from(stream_id.to_string()));
+            map.insert("handle".into(), Value::from(handle.to_string()));
         }
         LeaderRequest::Signal {
             peer,
@@ -2082,11 +2117,11 @@ fn decode_request(value: &Value) -> Result<LeaderRequest> {
             },
         },
         "stream_send" => LeaderRequest::StreamSend {
-            stream_id: u64_field(value, "stream_id")?,
+            handle: u64_field(value, "handle")?,
             payload: unb64(value, "payload")?,
         },
         "stream_close" => LeaderRequest::StreamClose {
-            stream_id: u64_field(value, "stream_id")?,
+            handle: u64_field(value, "handle")?,
         },
         "signal" => LeaderRequest::Signal {
             peer: u64_field(value, "peer")?,
@@ -2134,9 +2169,17 @@ fn encode_value(value: &ProxyValue) -> Value {
             map.insert("result".into(), Value::from("flag"));
             map.insert("flag".into(), Value::from(*flag));
         }
-        ProxyValue::Stream { stream_id } => {
+        ProxyValue::Stream {
+            handle,
+            stream_id,
+            peer,
+            incarnation,
+        } => {
             map.insert("result".into(), Value::from("stream"));
+            map.insert("handle".into(), Value::from(handle.to_string()));
             map.insert("stream_id".into(), Value::from(stream_id.to_string()));
+            map.insert("peer".into(), Value::from(peer.to_string()));
+            map.insert("incarnation".into(), Value::from(incarnation.to_string()));
         }
     }
     Value::Object(map)
@@ -2148,7 +2191,13 @@ fn decode_value(value: &Value) -> Result<ProxyValue> {
         "text" => ProxyValue::Text(str_field(value, "text")?.to_string()),
         "flag" => ProxyValue::Flag(bool_field(value, "flag")?),
         "stream" => ProxyValue::Stream {
+            handle: u64_field(value, "handle")?,
             stream_id: u64_field(value, "stream_id")?,
+            // Absent or unreadable identity is a decode failure, not a
+            // stream with no peer: a proxied handle that cannot name
+            // its peer cannot filter by it.
+            peer: u64_field(value, "peer")?,
+            incarnation: u64_field(value, "incarnation")?,
         },
         other => {
             return Err(LeafError::ControlPlane(format!(
@@ -2482,7 +2531,9 @@ mod tests {
                     LeaderRequest::Query { .. } | LeaderRequest::Counters => {
                         reply.text("[]".into())
                     }
-                    LeaderRequest::StreamOpen { .. } => reply.stream(0x0102_0304_0506_0708),
+                    LeaderRequest::StreamOpen { .. } => {
+                        reply.stream(7, 0x0102_0304_0506_0708, 0x00aa, 3)
+                    }
                     LeaderRequest::Call { .. } => reply.bytes(Bytes::from_static(b"pong")),
                     _ => reply.bytes(Bytes::new()),
                 }
@@ -2658,7 +2709,7 @@ mod tests {
             ProxyBody::Request {
                 correlation: big,
                 request: LeaderRequest::StreamSend {
-                    stream_id: big,
+                    handle: big,
                     payload: Bytes::from_static(b"x"),
                 },
             },
@@ -2756,7 +2807,7 @@ mod tests {
             },
             ProxyBody::Request {
                 correlation: 17,
-                request: LeaderRequest::StreamClose { stream_id: 5 },
+                request: LeaderRequest::StreamClose { handle: 5 },
             },
             ProxyBody::Request {
                 correlation: 18,
@@ -2807,7 +2858,12 @@ mod tests {
             },
             ProxyBody::Reply {
                 correlation: 22,
-                value: ProxyValue::Stream { stream_id: 31 },
+                value: ProxyValue::Stream {
+                    handle: 4,
+                    stream_id: 31,
+                    peer: 0x00bb,
+                    incarnation: 9,
+                },
             },
             ProxyBody::Restored {
                 channel: "chan".into(),
