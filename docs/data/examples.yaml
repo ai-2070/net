@@ -167,3 +167,44 @@ examples:
       expect: "RESULT ok subscribers=2 applied=2 version=2"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------------------ wave 2
+  # Two more routes, both portable to every binding without a caveat: a local
+  # append-only log with a consumer-owned offset, and a channel whose access
+  # boundary is a scoped credential rather than an open roster.
+
+  - id: event-log
+    skill: net-event-bus
+    title: The event log you no longer run
+    route: append records to a local log · replay them all · a consumer checkpoint · replay from the offset
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: eventlog.rs
+      typescript: eventlog.ts
+      python: eventlog.py
+      go: eventlog.go
+      c: eventlog.c
+    absent: {}
+    run:
+      expect: "RESULT ok records=8 replayed=8 resumed=3"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: token-channel
+    skill: net-event-bus
+    title: Scoped credentials, not an open channel
+    route: a channel gated on token roots · a subscribe-only token bound to one entity · refused bare, admitted with it
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: tokenchannel.rs
+      typescript: tokenchannel.ts
+      python: tokenchannel.py
+      go: tokenchannel.go
+      c: tokenchannel.c
+    absent: {}
+    run:
+      expect: "RESULT ok granted=1 refused=1"
+      timeout_s: 120
+      not_wired: {}

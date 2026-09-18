@@ -77,6 +77,20 @@ Worth knowing before you build on them:
 - **Multi-hop propagation is deferred on the SDK `Mesh`.** Announcements reach directly-connected peers only, which is why the caller in `registry.rs` connects to every provider it wants to see rather than relying on a relay.
 - **One real binding gap was found and closed, one reported gap was not real.** `live-config` could not be ported at first because the TypeScript SDK `MeshNode` wrapped `registerChannel` / `subscribeChannel` / `publish` but none of the napi receive verbs — a subscriber could join a roster and never read a payload. `MeshNode` now forwards `recv` / `recvShard` / `numShards` / `shardForStream`, and `liveconfig.ts` reads its revisions through them. The `job-queue` nRPC report did **not** reproduce: a producer calling two workers over `TypedMeshRpc` succeeds with the caller as responder or as initiator, with the service registered before or after the handshake, and with a reply-channel ACL pinned to the caller's EntityId. What does bite in TypeScript is lifecycle, not admission — every `node.rpc()` handle must be closed (`rpc.raw.close()`) before `shutdown()`, and two nodes built from the same `identitySeed` share a node id, so calls to "the second worker" silently land on whichever peer entry won.
 
+### Wave 2 — logs and credentials
+
+Two more routes, both portable to **all five bindings** with no absent binding and no caveat.
+
+| File | Bindings | The service it replaces | Route | Expected line |
+|---|---|---|---|---|
+| `eventlog.*` | all five ✓ | Kafka + ZooKeeper/raft | append records to a local log · replay them all · a consumer checkpoint · replay from the offset | `RESULT ok records=8 replayed=8 resumed=3` |
+| `tokenchannel.*` | all five ✓ | an ACL file plus a sidecar auth service | a channel gated on token roots · a subscribe-only token bound to one entity · refused bare, admitted with it | `RESULT ok granted=1 refused=1` |
+
+Both are worth reading before building on them, for opposite reasons:
+
+- **A token-gated subscribe needs an announcement first.** A token's leaf binds to the subscribing peer's `EntityId`, and the publisher learns that `EntityId` *only* from a signature-verified capability announcement — so a subscriber that has announced nothing is refused as `Unauthorized` whatever it presents. This is not obvious from either the token or the channel API, and it cost real time to find. Every binding's route therefore announces on both nodes and polls the publisher's `find_nodes` until it names the subscriber before subscribing.
+- **Retention is Rust-only, so the log route proves replay and offsets instead.** `sweep_retention()` is not exposed in the TypeScript, Python, Go or C bindings, so `event-log` demonstrates the part every binding can do — append, full replay, a consumer-owned checkpoint, resume from it, and a stable second replay — rather than a retention sweep that only one language can show. The offset living in the consumer is the route's point anyway.
+
 ### Binding gaps found while porting
 
 - **`object-store` could not be written in C or Go — neither could mint a blob address, nor (Go) fetch one from a peer. Found; both halves fixed.** The ABI could `store`/`fetch` given an *encoded* ref and had no way to create one: `net_blob_publish` is declared in no shipped header and targets the external-hook adapter registry, not the substrate `MeshBlobAdapter` that `net_mesh_blob_adapter_*` uses. The C ABI gained `net_mesh_blob_adapter_publish` (BLAKE3 + store + encoded ref out) and `net_blob_ref_hash` (the 32-byte hash out of an encoded ref — the transport fetch addresses by hash, not by ref), declared in `net.go.h` and mirrored to `go/net.h`, with `NET_ERR_FEATURE_NOT_BUILT` stubs for builds without the `dataforts + netdb + redex-disk` triple; both feature configurations compile clean. The Go binding gained `MeshBlobAdapter.Publish`, `MeshNode.ServeBlobTransfer`, `MeshNode.FetchBlob`, `BlobRefHash`, a typed `ErrTransfer*` set, and the `net_transport.h` prototypes it was missing. `objectstore.c` and `objectstore.go` both run on them.
