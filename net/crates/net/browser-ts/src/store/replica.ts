@@ -51,8 +51,7 @@ import type { ActionSpec, InputSpec, StoreDefinition } from './types.js';
 
 /** A frame to hand to the transport. */
 export interface Request {
-  /** `join` or `resync` — the only two this slice issues. */
-  readonly kind: 'join' | 'resync';
+  readonly kind: 'join' | 'resync' | 'aud' | 'resume';
   readonly q: Hex;
   readonly frame: string;
 }
@@ -76,7 +75,12 @@ export interface ReplicaDeps<S extends object, A extends ActionSpec, I extends I
   /** A fresh correlation id per request. Its uniqueness is the caller's. */
   readonly newQ: () => Hex;
   readonly now: () => number;
-  /** The audience this caller wants. Survives every transition (§1.7). */
+  /**
+   * The audience this caller wants at the start.
+   *
+   * After a `setAudience` the DESIRED one is the replica's own, and it
+   * is what every later request states — never the owner's older one.
+   */
   readonly audience: readonly string[];
   /** The opaque join key the owner's policy reads. */
   readonly key: string;
@@ -103,10 +107,26 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
   /** The desired-transition slot: one `q` per shared transition. */
   #slot: Hex | null = null;
   #assembly: Assembly | null = null;
+  /** The caller's latest desired audience. Survives every transition. */
+  #desired: readonly string[];
+  /** Local waiters on the slot's transition, independently cancellable. */
+  #waiters = 0;
   readonly #assemblies = new AssemblyTable();
   readonly #dropped: Record<string, number> = {};
 
-  constructor(private readonly deps: ReplicaDeps<S, A, I>) {}
+  constructor(private readonly deps: ReplicaDeps<S, A, I>) {
+    this.#desired = [...deps.audience];
+  }
+
+  /** The caller's latest desired audience. */
+  get desired(): readonly string[] {
+    return [...this.#desired];
+  }
+
+  /** Local waiters on the transition in flight. */
+  get waiters(): number {
+    return this.#waiters;
+  }
 
   get state(): ReplicaState {
     return this.#state;
@@ -153,6 +173,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (this.#state === 'closed') {
       throw new StoreError('closed', 'a closed replica cannot join again');
     }
+    this.#waiters = 1;
     // A join is a FRESH SUBSCRIPTION with a new handle, and §1.7a
     // restarts that handle's generations at 1 — so every value scoped
     // to the old handle goes, `retired` included. Keeping the old
@@ -176,9 +197,109 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
         def: this.deps.definition.id,
         ver: this.deps.definition.version,
         key: this.deps.key,
-        aud: [...this.deps.audience],
+        aud: [...this.#desired],
       }),
     };
+  }
+
+  /**
+   * Change what this caller wants to see (§1.7).
+   *
+   * Three moments, deliberately separate: local intent is IMMEDIATE —
+   * the view is cleared to `empty()` and the status is `syncing`,
+   * before the owner has agreed to anything, because continuing to
+   * render the old audience is the disclosure this exists to stop.
+   * Owner acceptance allocates the generation, and installation
+   * publishes it.
+   *
+   * Equal pending requests share one wire request and one `q`, with a
+   * local waiter each: `q` is the transition's identity on the wire,
+   * not a waiter's.
+   */
+  setAudience(names: readonly string[]): readonly Request[] {
+    if (this.#state === 'closed') {
+      throw new StoreError('closed', 'a closed replica cannot change audience');
+    }
+    const next = [...names];
+    if (this.#state === 'installing' && sameAudience(next, this.#desired)) {
+      // The same transition, already in flight. One wire request, one
+      // slot, one more waiter.
+      this.#waiters += 1;
+      return [];
+    }
+
+    this.#desired = next;
+    const h = this.#handle;
+    // Immediately, whatever the owner later says.
+    this.#retireAssembly();
+    this.#installed = null;
+    this.#revision = null;
+    this.#skipped = null;
+    this.#behind = false;
+    this.deps.core.applySnapshot(this.deps.definition.empty());
+    this.deps.core.setStatus({ phase: 'syncing', stale: false, error: null });
+
+    if (h === null) {
+      // Nothing to change the audience OF: only `join` creates a
+      // handle, so the desired audience rides the join instead.
+      this.#waiters = 1;
+      return [this.join()];
+    }
+
+    // A newer transition rejects the previous waiters and takes the
+    // slot with a NEW `q`.
+    const q = this.deps.newQ();
+    this.#slot = q;
+    this.#waiters = 1;
+    this.#state = 'installing';
+    return [{ kind: 'aud', q, frame: encodeMessage({ k: 'aud', q, h, aud: next }) }];
+  }
+
+  /**
+   * The session was replaced (§1.6).
+   *
+   * A reconnect is not an audience change: the last snapshot is
+   * RETAINED and marked stale, because what the caller may see has not
+   * changed — only whether it is current. The request states the
+   * caller's latest desired audience, never the owner's older one.
+   */
+  reconnect(): readonly Request[] {
+    if (this.#state === 'closed') {
+      throw new StoreError('closed', 'a closed replica cannot reconnect');
+    }
+    const h = this.#handle;
+    // The lost session's assembly cannot be completed on the new one.
+    this.#retireAssembly();
+
+    if (h === null) {
+      // No handle learned, so there is nothing to resume: a forged `h`
+      // is exactly what `resume` must never be allowed to mint, so the
+      // only honest request is a fresh `join`.
+      return [this.join()];
+    }
+
+    const q = this.deps.newQ();
+    this.#slot = q;
+    this.#state = 'installing';
+    this.deps.core.setStatus({ phase: 'reconnecting', stale: this.#published() });
+    return [
+      { kind: 'resume', q, frame: encodeMessage({ k: 'resume', q, h, aud: [...this.#desired] }) },
+    ];
+  }
+
+  /**
+   * One local waiter gives up.
+   *
+   * Cancellation is per waiter; the wire request is not. Cancelling the
+   * last one fences the subscription — the view was invalidated at
+   * request time and is NOT restored, because the caller asked for a
+   * different one.
+   */
+  cancelWaiter(): void {
+    if (this.#waiters > 0) this.#waiters -= 1;
+    if (this.#waiters > 0) return;
+    if (this.#state !== 'installing') return;
+    this.cancel();
   }
 
   /** One decoded arrival from the owner. */
@@ -231,14 +352,15 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     this.#retireAssembly();
     this.#slot = null;
     this.#state = 'fenced';
-    // Recovery knowledge is NOT cleared here, and not because it does
-    // not matter: a skip from a cancelled epoch must never make the
-    // next installation ask for work the caller cancelled. It is
-    // cleared at the only exit a fenced replica has in this slice —
-    // `join`, through `#reset` — so clearing it twice would be a
-    // second claim about the same invariant. Slice F adds `aud` and
-    // `resume` as exits that keep the handle; each must decide this
-    // for itself rather than inherit an assumption from here.
+    // Recovery knowledge from a cancelled epoch must never make the
+    // next installation ask for work the caller cancelled. `join`
+    // clears it through `#reset`; `setAudience` clears it itself,
+    // because it keeps the handle and so does not reset; and `resume`
+    // deliberately does NOT, because a reconnect resumes the same
+    // subscription and a skip recorded before the session was lost is
+    // still news the owner has moved on.
+    this.#skipped = null;
+    this.#behind = false;
     this.#clearView('failed');
   }
 
@@ -537,4 +659,8 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
 
 function max(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
+}
+
+function sameAudience(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((label, index) => label === b[index]);
 }

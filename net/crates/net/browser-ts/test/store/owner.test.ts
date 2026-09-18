@@ -89,6 +89,7 @@ function rig(
         return handles.toString(16).padStart(32, '0');
       },
       newIncarnation: () => 'f'.repeat(16),
+      canProject: () => true,
       actions: {},
       inputs: {},
     }),
@@ -445,23 +446,6 @@ describe('the projection is the definition’s, or it is absence', () => {
 });
 
 describe('kinds this slice does not implement are refused, not half-served', () => {
-  it('refuses the controls it does not implement, never as `not-ready`', () => {
-    const r = rig();
-    const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
-
-    for (const frame of [
-      encodeMessage({ k: 'aud', q: q(), h, aud: ['deck'] }),
-      encodeMessage({ k: 'resume', q: q(), h, aud: ['crew'] }),
-    ]) {
-      const refused = r.owner.receive(frame, PEER_A);
-
-      expect(refused.refused).toMatch(/^unimplemented-kind:/);
-      // A control is NEVER answered `not-ready` (§1.7b), even when the
-      // reason is "not implemented".
-      expect(refusalCode(refused.out)).not.toBe('not-ready');
-    }
-  });
-
   it('accepts `leave` and gives up the handle', () => {
     const r = rig();
     const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);

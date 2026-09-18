@@ -65,6 +65,7 @@ function owner(options: {
         return handles.toString(16).padStart(32, '0') as Hex;
       }),
     newIncarnation: options.newIncarnation ?? (() => 'abcdef0123456789' as Hex),
+    canProject: () => true,
     actions: {},
     inputs: {},
   });

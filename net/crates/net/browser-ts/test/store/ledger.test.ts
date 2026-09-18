@@ -98,6 +98,7 @@ function rig(
       return handles.toString(16).padStart(32, '0') as Hex;
     },
     newIncarnation: () => 'abcdef0123456789' as Hex,
+    canProject: () => true,
     actions: {
       fire:
         options.fire ??

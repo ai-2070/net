@@ -60,7 +60,6 @@ import {
   encodeMessage,
   HANDLE_HEX_LENGTH,
   INCARNATION_HEX_LENGTH,
-  MAX_AUDIENCE_LABELS,
   type CallerMessage,
   type Hex,
 } from './wire.js';
@@ -96,6 +95,14 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
   newHandle(): Hex;
   /** 16 lowercase hex, one per owner incarnation. */
   newIncarnation(): Hex;
+  /**
+   * Whether a projection can be taken right now.
+   *
+   * A host that is mid-frame, or whose world is being rebuilt, answers
+   * `false` and the control is DEFERRED rather than refused (§1.8) — a
+   * control is never answered `not-ready`.
+   */
+  canProject(): boolean;
   /**
    * The action handlers, one per declared action.
    *
@@ -191,8 +198,13 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   /** Digest computations in flight, against the pending bound (§2). */
   private pending = 0;
   private readonly ledgers = new LedgerTable();
-  /** Assemblies are the replica's concern; the owner keeps the type. */
-  readonly assemblies = new AssemblyTable();
+  /**
+   * One pending projection per handle (§1.8).
+   *
+   * A newer control REPLACES the pending one rather than queueing
+   * behind it, which is what keeps this a bound rather than a buffer.
+   */
+  private readonly deferred = new Map<Hex, { readonly q: Hex; readonly peer: string }>();
 
   constructor(private readonly deps: OwnerDeps<S, A, I>) {
     // Fail fast rather than discover the numbers on the first
@@ -316,14 +328,63 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         return this.accept(frames);
       }
       case 'aud':
-      case 'resume':
-        // Audience transitions and reconnection are slice F. A control
-        // is never answered `not-ready` (§1.7b), so this is the honest
-        // refusal for "this owner does not implement it yet".
-        return this.refuse(
-          `unimplemented-kind:${message.k}`,
-          [this.no(peer, bound.h, 'invalid-data', message.q)]
-        );
+      case 'resume': {
+        // §1.7/§1.6. Both state the caller's DESIRED audience and both
+        // are reads, so both are authorized for that audience before
+        // any projection is taken — an audience the caller may not
+        // read is refused, never narrowed to one it may.
+        //
+        // `resume` differs from `resync` exactly here: a reconnecting
+        // caller must not be re-shown whatever audience the owner
+        // happened to hold last, because that audience may be wider
+        // than what the caller now wants.
+        // No audience-bound check here: the parser refuses
+        // `audience-too-many` at rung 6 (wire.ts, witnessed in
+        // wire.test.ts), so a frame carrying more than the bound never
+        // reaches dispatch. Re-checking it would be a claim.
+        if (!this.permitsRead(peer, message.aud)) {
+          return this.refuse(
+            `${message.k}-forbidden`,
+            [this.no(peer, bound.h, 'forbidden', message.q)]
+          );
+        }
+
+        // The audience is rebound BEFORE the projection, so the
+        // projection can only ever be of the audience just authorized.
+        const rebound: OwnerHandle = {
+          ...bound,
+          audience: [...message.aud],
+          lastSeen: now,
+        };
+        this.handles.set(rebound.h, rebound);
+
+        // A caller control supersedes an in-flight emission (§1.7b).
+        // There is nothing to retire on THIS side: an emission is
+        // built complete and handed to the transport in one return, so
+        // the owner holds no unsent remainder. What enforces the rule
+        // is the replica refusing the superseded generation's chunks,
+        // and the new generation this allocates — the superseded one
+        // stays consumed either way.
+
+        if (!this.deps.canProject()) {
+          // §1.8's one disposition: DEFER, never refuse. A control is
+          // never answered `not-ready`, and holding one pending
+          // projection per handle is what lets the caller's own
+          // deadline be the bound.
+          this.deferred.set(rebound.h, { q: message.q, peer });
+          return this.accept([]);
+        }
+
+        const frames = this.install(rebound, message.q);
+        if (frames === null) {
+          this.forget(rebound.h);
+          return this.refuse(
+            `${message.k}-projection-capacity`,
+            [this.no(peer, rebound.h, 'capacity', message.q)]
+          );
+        }
+        return this.accept(frames);
+      }
       default:
         return this.refuse('unreachable-kind');
     }
@@ -563,8 +624,47 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   private forget(h: Hex): void {
     this.handles.delete(h);
-    this.assemblies.reclaimHandle(h);
     this.ledgers.forget(h);
+    // §1.8: expiry retires any projection already pending, and a dead
+    // handle never acquires one.
+    this.deferred.delete(h);
+  }
+
+  /**
+   * Emit the projections that were deferred, now that one can be
+   * taken.
+   *
+   * Completion **revalidates**: a handle can die between the deferral
+   * and the availability, and an expired one never acquires a pending
+   * projection in the first place (§1.8).
+   */
+  resumeDeferred(now: number = this.deps.now()): Dispatched {
+    if (!this.deps.canProject()) return this.accept([]);
+    const out: Outbound[] = [];
+    for (const [h, pending] of [...this.deferred]) {
+      this.deferred.delete(h);
+      const bound = this.bind(h, pending.peer, now);
+      if (typeof bound === 'string') {
+        // The handle went while the projection was unavailable. The
+        // caller's own deadline covers this; nothing is emitted to a
+        // handle that no longer exists.
+        this.counters[`deferred-${bound}`] = (this.counters[`deferred-${bound}`] ?? 0) + 1;
+        continue;
+      }
+      const frames = this.install(bound, pending.q);
+      if (frames === null) {
+        this.forget(h);
+        out.push(this.no(pending.peer, h, 'capacity', pending.q));
+        continue;
+      }
+      out.push(...frames);
+    }
+    return this.accept(out);
+  }
+
+  /** Projections waiting on availability, for a host's bounds report. */
+  get deferredCount(): number {
+    return this.deferred.size;
   }
 
   /** Ledgers held, for a host's own bounds reporting (§2). */
@@ -607,9 +707,6 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     }
     if (message.ver !== this.deps.definition.version) {
       return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)]);
-    }
-    if (message.aud.length > MAX_AUDIENCE_LABELS) {
-      return this.refuse('join-audience-bound', [this.no(peer, null, 'capacity', message.q)]);
     }
     if (this.handles.size >= MAX_HANDLES) {
       return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
@@ -793,4 +890,5 @@ function requestOf(message: CallerMessage): Hex | null {
 
 /** Re-exported so a host can hold assemblies without another import. */
 export { Assembly, AssemblyTable };
+
 export type { Parse };

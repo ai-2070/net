@@ -743,6 +743,101 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_narrows_the_audience_before_the_owner_agrees', async () => {
+  // Slice F against the SHIPPED build: the narrowing is local and
+  // immediate, the owner authorizes the REQUESTED audience, and a
+  // reconnect states what the caller wants now rather than what the
+  // owner last held.
+  const ownerModule = await import(new URL('store/owner.js', dist).href);
+  const replicaModule = await import(new URL('store/replica.js', dist).href);
+  const coreModule = await import(new URL('store/core.js', dist).href);
+  const definitionModule = await import(new URL('store/definition.js', dist).href);
+  const codec = await import(new URL('store/wire.js', dist).href);
+
+  const numbers = value => {
+    const out = {};
+    for (const [key, entry] of Object.entries(value ?? {})) out[key] = Number(entry);
+    return out;
+  };
+  const world = definitionModule.defineStore({
+    id: 'probe.aud',
+    version: 1,
+    state: raw => ({ crew: numbers(raw.crew), deck: numbers(raw.deck) }),
+    empty: () => ({ crew: {}, deck: {} }),
+    actions: {},
+    inputs: {},
+  });
+
+  const audiences = [];
+  let handles = 0;
+  let qs = 0;
+  const owner = new ownerModule.StoreOwner({
+    definition: world,
+    authorize: request => {
+      if (request.type === 'read') audiences.push([...request.audience]);
+      return true;
+    },
+    project: (state, audience) => ({
+      crew: audience.includes('crew') ? state.crew : {},
+      deck: audience.includes('deck') ? state.deck : {},
+    }),
+    maxEventBytes: 8104,
+    now: () => 0,
+    newHandle: () => {
+      handles += 1;
+      return handles.toString(16).padStart(32, '0');
+    },
+    newIncarnation: () => 'abcdef0123456789',
+    canProject: () => true,
+    actions: {},
+    inputs: {},
+  });
+  owner.commit({ crew: { ada: 1 }, deck: { hoist: 2 } });
+
+  const core = new coreModule.StoreCore({ definition: world, initialState: world.empty() });
+  const replica = new replicaModule.StoreReplica({
+    definition: world,
+    core,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newQ: () => {
+      qs += 1;
+      return qs.toString(16).padStart(16, '0');
+    },
+    audience: ['crew'],
+    key: 'probe',
+  });
+
+  const settle = requests => {
+    for (const request of requests) {
+      for (const frame of owner.receive(request.frame, '00000000000000aa').out) {
+        replica.receive(frame.frame);
+      }
+    }
+  };
+
+  settle([replica.join()]);
+  eq(core.getState(), { crew: { ada: 1 }, deck: {} }, 'the joined view');
+
+  // Local intent, before anything is sent.
+  const requested = replica.setAudience(['deck']);
+  eq(core.getState(), { crew: {}, deck: {} }, 'the view during the narrowing');
+  eq(core.getStatus().phase, 'syncing', 'the status during the narrowing');
+  eq(replica.installed, null, 'the installed generation during the narrowing');
+
+  settle(requested);
+  eq(core.getState(), { crew: {}, deck: { hoist: 2 } }, 'the narrowed view');
+  eq(audiences, [['crew'], ['deck']], 'the audiences the policy ruled on');
+
+  // A reconnect retains the view, marks it stale, and asks with the
+  // audience the caller wants NOW.
+  const resumed = replica.reconnect();
+  eq(core.getStatus().stale, true, 'the retained view is stale');
+  const decoded = codec.decodeMessage(resumed[0].frame, { maxBytes: 8104, as: 'owner' });
+  eq(decoded.ok && decoded.message.k, 'resume', 'the recovery request');
+  eq(decoded.ok && decoded.message.aud, ['deck'], 'its audience');
+});
+
 await probe('real_package_action_executes_once_and_replays_its_outcome', async () => {
   // Slice E against the SHIPPED build: one execution, one retained
   // outcome, a conflicting request refused, and a rejection that stays
