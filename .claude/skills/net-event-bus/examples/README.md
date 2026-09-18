@@ -2,8 +2,9 @@
 
 Each file in this directory is a **minimal, runnable** example. Use these as the first thing a developer runs after `npm install` / `pip install` / `cargo add` — before they write any application code.
 
-All examples use the **memory transport** (no network, no peers needed) and run
-in a single process.
+The two install-check routes (`hello.*`, `observe.*`) use the **memory
+transport** — no network, no peers needed — and run in a single process. The
+third route, `a2a_paid.*`, does not: see below.
 
 **Memory transport does not deliver events, and that is by design.** It selects
 the Noop adapter, which counts batches and discards them — `adapter/noop.rs`
@@ -19,7 +20,8 @@ without needing a broker or a second host. To actually receive events you need
 an adapter that retains them: Redis, JetStream, or the mesh transport between
 two nodes. See `mesh.md`.
 
-Two routes, each in all five bindings.
+Three routes. The first two are in all five bindings; the third is in the two
+that have the surface at all.
 
 **`hello.*` — construct · publish · subscribe · shutdown.** The install check.
 
@@ -44,6 +46,26 @@ where they differ most:
 | `observe.py` | `events_ingested` / `events_dropped` only; no batch counter |
 | `observe.go` | Go-cased fields, and `BatchesDispathed` is misspelled in the shipped module |
 | `observe.c` | `net_stats_ex`, and why `net.h` cannot be combined with `net.go.h` |
+
+**`a2a_paid.*` — prepare · unpaid submit refused · purchase · submit.** Not an
+install check, and the one example here that is not memory-transport: it
+stands up two live mesh nodes over loopback UDP, a provider with one
+`PaymentEngine` behind both the quote/pay wire and the admission gate plus a
+durable admission journal on disk, and a caller with a spend policy and a
+durable purchase store. It asserts the two properties the paid path exists
+for, read out of production artifacts rather than inferred from a state label:
+the executor's own run counter is exactly 1, and the provider's billing log
+holds exactly one charge.
+
+It is **mock-settled**. The lifecycle is real; no value moves. A runnable
+example cannot settle on a real rail without funded keys and a testnet, so
+this one says so instead of implying otherwise.
+
+| Binding | Status |
+|---|---|
+| `a2a_paid.rs` | the full surface: `serve_a2a_configured` + `A2aCallerFlow` |
+| `a2a_paid.py` | the same flow through `PaymentProvider` / `CapabilityGateway` |
+| TypeScript, Go, C | no paid A2A surface exists to exercise — Go and C have no A2A at all, and Node's paid serving is an explicit non-goal. `docs/data/examples.yaml` records the reason per binding. |
 
 **The Rust and Python packages publish under a different name than they import.** `cargo add net-mesh-sdk` then `use net_sdk::…`; `pip install net-mesh-sdk` then `from net_sdk import …`. There is no package called `net-sdk` — don't install one.
 

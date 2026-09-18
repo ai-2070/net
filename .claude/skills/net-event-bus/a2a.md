@@ -166,6 +166,13 @@ print(ack["status"], ack["task_id"])         # accepted | retry | unexecutable
 
 Then poll `mesh.task_status(provider_node_id, ack["task_id"])` as usual.
 
+The snippet above is the caller half against an already-running provider. For
+a complete, **runnable** version that stands up both sides — provider with a
+real engine, gate and journal; caller with a spend policy and purchase store —
+see `examples/a2a_paid.py` (and `examples/a2a_paid.rs` for the Rust surface).
+CI executes both on every pull request and matches their output, so they
+cannot rot into something that merely compiles.
+
 **Four traps.**
 
 - **Never re-quote an unresolved attempt.** `purchase_task` re-sends the
