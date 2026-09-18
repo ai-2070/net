@@ -1338,11 +1338,13 @@ impl A2aAdmissionJournal {
         use tokio::io::AsyncWriteExt;
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
+        // `tokio::fs::OpenOptions::mode` is tokio's own unix-gated
+        // inherent method — importing `std::os::unix::fs::OpenOptionsExt`
+        // to reach it is redundant, and the unused import is a hard error
+        // under the strict lint profile on every unix job. `pins.rs` is
+        // the precedent: same call, no import.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+        opts.mode(0o600);
         let mut f = opts.open(&tmp).await.map_err(io_err)?;
         let written: Result<(), A2aJournalError> = async {
             f.write_all(&bytes).await.map_err(io_err)?;

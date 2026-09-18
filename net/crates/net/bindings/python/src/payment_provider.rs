@@ -691,19 +691,21 @@ mod provider {
         /// arguments: ``async (task_id, prompt, context_refs, tags, *,
         /// service, revision) -> str``.
         ///
-        /// ``services`` maps a service id to its offer::
+        /// ``services`` maps a service id to its offer:
         ///
-        ///     {"summarize": {
-        ///         "revision": "r1",
-        ///         "pricing_terms": provider.pricing_terms(
-        ///             "net.a2a.task/summarize", requirements_json),
-        ///         "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8,
-        ///                    "max_tags": 8, "max_tag_bytes": 64,
-        ///                    "max_in_flight": 4},
-        ///         "reservation_ttl_secs": 300,
-        ///         "reservation_retention_secs": 86400,
-        ///         "retention_secs": 3600,
-        ///         "description": "summarize a document"}}
+        /// ```python
+        /// {"summarize": {
+        ///     "revision": "r1",
+        ///     "pricing_terms": provider.pricing_terms(
+        ///         "net.a2a.task/summarize", requirements_json),
+        ///     "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8,
+        ///                "max_tags": 8, "max_tag_bytes": 64,
+        ///                "max_in_flight": 4},
+        ///     "reservation_ttl_secs": 300,
+        ///     "reservation_retention_secs": 86400,
+        ///     "retention_secs": 3600,
+        ///     "description": "summarize a document"}}
+        /// ```
         ///
         /// ``pricing_terms`` is the free/paid selector: present prices the
         /// service, ``None`` (or absent) serves it for nothing. A paid

@@ -1289,11 +1289,13 @@ impl PyCapabilityGateway {
     /// ``denied`` with ``funds_ambiguous``, or ``unexecutable``. Returns
     /// ``None``.
     ///
-    /// ``outcome_json`` is one of::
+    /// ``outcome_json`` is one of:
     ///
-    ///     {"resolution": "paid", "proof": {...}, "billing": {...}}
-    ///     {"resolution": "not_paid", "reason": "..."}
-    ///     {"resolution": "closed", "outcome": "refunded", "evidence": {...}}
+    /// ```python
+    /// {"resolution": "paid", "proof": {...}, "billing": {...}}
+    /// {"resolution": "not_paid", "reason": "..."}
+    /// {"resolution": "closed", "outcome": "refunded", "evidence": {...}}
+    /// ```
     ///
     /// ``paid`` / ``not_paid`` resolve an ``unknown`` attempt from evidence
     /// the operator established out of band — ``not_paid`` re-opens the key
