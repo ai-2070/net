@@ -105,8 +105,8 @@ examples:
       typescript: registry.ts
       python: registry.py
       go: registry.go
+      c: registry.c
     absent:
-      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       # Asserted on the last line's fields, not a transcript: node ids are
       # nondeterministic, the counts are the contract.
@@ -125,8 +125,8 @@ examples:
       typescript: jobqueue.ts
       python: jobqueue.py
       go: jobqueue.go
+      c: jobqueue.c
     absent:
-      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       expect: "RESULT ok jobs=6 done=6 retried=1 duplicates=0"
       timeout_s: 120
@@ -162,8 +162,8 @@ examples:
       typescript: liveconfig.ts
       python: liveconfig.py
       go: liveconfig.go
+      c: liveconfig.c
     absent:
-      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       expect: "RESULT ok subscribers=2 applied=2 version=2"
       timeout_s: 120
