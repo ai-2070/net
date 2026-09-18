@@ -135,7 +135,7 @@ Eight C examples ship in `../examples/`:
 | `../examples/scheduler.c` | Task-lifecycle workflow plus gang-claim island reserve / release |
 | `../examples/meshos.c` | MeshOS daemon-author vtable lifecycle |
 | `../examples/deck.c` | Deck operator workflow — snapshot, status, maintenance commit, stream |
-| `../examples/transport.c` | Blob + directory transfer between a holder and a fetcher |
+| `../examples/transport.c` | Transport API walkthrough — `net_store_dir` / `net_fetch_dir` call shapes with node bring-up shown in outline; prints that outline and does not transfer |
 
 ## Claude Code Skill
 

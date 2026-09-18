@@ -113,6 +113,19 @@ impl PyAsyncFooIter {
             }
         })
     }
+
+    /// Stop the iterator. Idempotent. Subsequent `__anext__` calls
+    /// raise `StopAsyncIteration`.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Async alias for :meth:`close` so users can write
+    /// ``await iter.aclose()``.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
 }
 ```
 
@@ -125,13 +138,28 @@ Key rules:
    shared state behind the mutex.
 3. **`StopAsyncIteration` for clean EOF.** Don't return `None` or
    a sentinel from `__anext__`.
-4. **Thread the construction-time token — do not call
-   `await_with_cancel` on the per-chunk pull.** The `cancel_token`
-   was reserved by the call that opened the stream and is stored
-   on the handle; passing it to `await_with_existing_token` means
-   a task cancel fires `Mesh::cancel(token)`, and the substrate's
-   `arm_stream_cancel` watcher terminates the whole stream rather
-   than dropping one pull.
+4. **Thread the construction-time token — nRPC streams only.** Do
+   not call `await_with_cancel` on the per-chunk pull. For an
+   nRPC stream the `cancel_token` was reserved by the call that
+   opened the stream and is stored on the handle; passing it to
+   `await_with_existing_token` means a task cancel fires
+   `Mesh::cancel(token)`, and the substrate's `arm_stream_cancel`
+   watcher terminates the whole stream rather than dropping one
+   pull.
+5. **Non-nRPC iterators (`AsyncRedexTailIter`, the cortex
+   `*WatchIter`s) carry no substrate cancel-token.** Give them a
+   local shutdown guard instead: an `Arc<tokio::sync::Notify>` plus
+   an `AtomicBool`, `select!` the pull against
+   `shutdown.notified()`, and have `close()` store the flag and call
+   `notify_waiters()`. A `Drop` guard on the wrapper future trips
+   the same notify when asyncio cancels the pull, so a cancelled
+   `__anext__` ends the iterator rather than leaking it. See
+   `await_with_notify` in `async_bridge.rs`.
+6. **Ship both `close()` and `aclose()`.** Shipped iterators expose
+   a sync `close()` (idempotent; trips the shutdown flag) and an
+   async `aclose()` that calls it and resolves immediately, so a
+   caller can write either `iter.close()` or `await iter.aclose()`.
+   Leaving one out is a gap the type stub will flag.
 
 ## Migration template: sync → async sibling
 
@@ -206,8 +234,14 @@ When the diff lands a new `Async*` method, the reviewer checks:
 - [ ] **No `block_on` in the `Async*` path.** Grep the diff for
       `block_on` / `py.detach`. If either appears under the
       `Async*` impl, something is wrong.
-- [ ] **Same error mapping as the sync sibling.**
-      `rpc_error_to_pyerr` — the shared converter, never
-      duplicated.
+- [ ] **Same error mapping as the sync sibling; pick the converter
+      for the domain.** `rpc_error_to_pyerr` handles the nRPC family
+      (`RpcNoRouteError` / `RpcTimeoutError` / `RpcServerError` /
+      `RpcError`); it is nRPC-only. Other surfaces use their own
+      exception classes — `RedexError` for raw RedEX file ops,
+      `CortexError` for the adapter fold/task/memory surface,
+      `NetDbError` for the NetDB handle. Never funnel a non-nRPC
+      `Inner*Error` through `rpc_error_to_pyerr` and never duplicate
+      the mapping the sync sibling already has.
 - [ ] **Module re-export.** `bindings/python/python/net/__init__.py`
       lists `AsyncFoo` in `__all__` alongside `Foo`.

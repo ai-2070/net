@@ -43,9 +43,8 @@ not documentation.
 
 ## Features
 
-By default the crate enables the same stack the Python wheel and Node package ship:
-`net`, `nat-traversal`, `cortex`, `meshdb`, `meshos`, and `dataforts`. Everything else is
-opt-in.
+By default the crate enables `net`, `nat-traversal`, `cortex`, `meshdb`, `meshos`, and
+`dataforts`. Everything else is opt-in.
 
 | Feature | Flag | Dependencies |
 |---|---|---|
@@ -103,7 +102,7 @@ Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write
 integration code that runs and is quietly wrong. Install the skills first — see
 the root README's [Claude Code Skill](../../../README.md#claude-code-skill)
-section for the install and update commands.
+section for the install command.
 
 ## Links
 

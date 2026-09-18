@@ -61,10 +61,12 @@ Every admin action propagates as a signed event on the admin chain via RedEX:
 Before an ICE action commits, Deck runs a **blast-radius** simulation —
 *"This action affects 4 nodes, 12 replicas, and 2 daemons. Continue?"* — then signs with the operator key loaded from the maintenance node.
 
+Operator signatures are verified against an `AdminVerifier` `OperatorRegistry` — the built-in runtime (the single-node default and the `--features demo` cluster) wires a single operator keypair at threshold 1. Multi-operator M-of-N verification requires a populated registry and a raised threshold.
+
 ## Bookmarks (multi-cluster)
 
 Saved cluster contexts live at `$XDG_CONFIG_HOME/net-deck/bookmarks.toml` (or the platform equivalent — see [`dirs`](https://docs.rs/dirs)). First-run with no config dir yields an empty store; a corrupt file is renamed aside (`<path>.corrupt-<ms>`) and an empty store returned.
 
 ## License
 
-MIT OR Apache-2.0. See [`LICENSE-MIT`](../../../../../LICENSE-MIT) and [`LICENSE-APACHE`](../../../../../LICENSE-APACHE).
+MIT OR Apache-2.0. See [`LICENSE-MIT`](https://github.com/ai-2070/net/blob/master/LICENSE-MIT) and [`LICENSE-APACHE`](https://github.com/ai-2070/net/blob/master/LICENSE-APACHE).

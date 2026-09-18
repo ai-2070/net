@@ -16,6 +16,7 @@ leave the node that holds them: the machine with the secret runs the work.
 const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
 const rpc = node.rpc();
 const resp = await callTool(rpc, 'summarize', { text });
+rpc.raw.close();   // release the handle before node.shutdown()
 ```
 
 ## Why this instead of a queue
@@ -112,6 +113,7 @@ import { callTool } from '@net-mesh/sdk';
 
 const rpc = node.rpc();
 const resp = await callTool(rpc, 'web_search', { query: 'how does the fold work' });
+rpc.raw.close();   // release before node.shutdown()
 ```
 
 For services rather than tools, nRPC gives you the same shape with deadlines,
@@ -229,8 +231,11 @@ The bus surface — `NetNode`, `EventStream`, capabilities, identity, predicates
 
 ```bash
 cd net/crates/net/bindings/node
-napi build --platform --release --features "cortex meshdb meshos"
+napi build --platform --release --no-default-features --features "cortex meshdb meshos"
 ```
+
+`--no-default-features` is load-bearing: without it the crate's full default
+set stays on and nothing is slimmed.
 
 ## What's in the box
 

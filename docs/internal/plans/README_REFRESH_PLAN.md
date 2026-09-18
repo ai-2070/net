@@ -1,11 +1,12 @@
 # README Refresh Plan
 
-**Status:** EXECUTED (2026-09-18). Stage 0 (root `README.md`) landed. Stages 1–4 applied
-across the accuracy workstream's files — the 27 non-root READMEs minus the two audited clean,
-plus `sdk-py/pyproject.toml`.
-Stage 5 verification is green: 69 relative links resolve, 0 residual overclaims/banned strings,
-license uniform, CLI/Deck sibling blocks byte-identical, and 55 docs-site URLs return 200.
-**D2 remains open** — the checker was run throwaway and is not committed or wired into CI.
+**Status:** EXECUTED (2026-09-18) — Stages 0–4. Stage 0 (root `README.md`) landed; Stages 1–4
+applied across the accuracy workstream's files — the 27 non-root READMEs minus the two audited
+clean, plus `sdk-py/pyproject.toml`. Stage 5 is **partial**: the checker is committed at
+`.github/scripts/check-readmes.py` and passes (29 files, offline checks), but it is **not wired
+into CI** while D2 stays open, so the verification goal is not yet closed. The one-shot run
+reported 69 relative links resolving, 0 residual overclaims, license uniform, CLI/Deck sibling
+blocks byte-identical, and 55 docs-site URLs returning 200.
 
 This plan covers the `README.md` layer of the documentation surface — the files rendered as
 package landing pages on crates.io, npm, PyPI and pkg.go.dev, and read from the repository
@@ -70,7 +71,7 @@ standpoint*, with six changes. All are applied:
 
 ## Non-goals
 
-- **`web/`.** The site, its content pages, and its 18 content READMEs are out of scope. This
+- **`web/`.** The site, its content pages, and its 14 content READMEs are out of scope. This
   plan links *to* those pages; it does not edit them.
 - **Non-README files.** Two adjacent defects surfaced and are filed separately (end of plan).
 - **Restructuring non-root READMEs.** Stage 0 restructures the root front door only. The other
@@ -153,7 +154,8 @@ either way.
 **Output:** a restructured `README.md` front door that leads with federation, shows one working
 system, and scopes its claims where they first appear.
 
-**Evidence the rewrite is answering** (line refs are on the current root README):
+**Evidence the rewrite is answering** (line refs are on the **pre-refresh** root README —
+baseline commit `49abe7203`; the rewrite has since renumbered the file):
 
 | Current material | Positioning consequence |
 |---|---|
@@ -229,7 +231,7 @@ it?* but *does it help someone understand, evaluate, or start using Net?*
 **Acceptance.** A cold reader understands what Net enables and why they might need it; one
 working example demonstrates the central value; no performance or recovery claim appears before
 its scope; no passage demands wholesale replacement of an existing stack; the brand and mesh
-identity are intact; `## Contents` anchors are re-synced after the restructure.
+identity are intact.
 
 **Risk.** Medium — this is judgment work, not a lookup, and it touches the repository's most
 public file. Mitigation: one review pass with the same reviewer before merge, and the accuracy
@@ -400,7 +402,8 @@ README is a link dump; the two relative-path defects are fixed.
 ## Stage 5 — Verification harness
 
 **Cost:** ½ day.
-**Output:** a script (throwaway, or promoted to CI per D2) that fails loudly on drift.
+**Output:** the committed checker at `.github/scripts/check-readmes.py` (CI wiring per D2) that
+fails loudly on drift.
 
 **Checks:**
 
@@ -437,7 +440,8 @@ nothing (AGENTS.md's no-silent-skip culture).
 | 4 | one PR, curated routes and path fixes | revert the PR |
 | 5 | scripts + optional CI job (D2) | drop the job / the scripts |
 
-Budget: **3½–4½ person-days** across six stages. Stage 0 is the positioning deliverable and can
+Budget: **4–5 person-days** across six stages (Stage 5 included). Stage 0 is the positioning
+deliverable and can
 land first (it is `README.md`-only); Stages 1–5 are the accuracy workstream and can proceed in
 parallel with its review. Stage 1 is independently valuable (wrong-license and broken-link
 surface, no judgment calls); Stage 2 is the bulk; Stages 3–4 are bounded; Stage 5 is the ratchet.

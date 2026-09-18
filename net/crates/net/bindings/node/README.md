@@ -43,4 +43,4 @@ The repo's `npm run build` script already passes a superset of these flags (`red
 
 ## License
 
-MIT OR Apache-2.0. See [`LICENSE-MIT`](../../../../../LICENSE-MIT) and [`LICENSE-APACHE`](../../../../../LICENSE-APACHE).
+MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

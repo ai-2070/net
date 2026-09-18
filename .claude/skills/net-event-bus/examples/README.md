@@ -28,7 +28,7 @@ Two routes, each in all five bindings.
 | `hello.ts` | `@net-mesh/sdk` | `@net-mesh/sdk` | `npx tsx hello.ts` |
 | `hello.py` | `net-mesh-sdk` | `net_sdk` | `python hello.py` |
 | `hello.rs` | `net-mesh-sdk` | `net_sdk` | `cargo run --example hello` (drop into a crate's `examples/` dir) |
-| `hello.go` | `github.com/ai-2070/net/go` | `net` | `go run hello.go` — no `go.mod` ships here, so run it in a module whose `go.mod` has `replace github.com/ai-2070/net/go => …` |
+| `hello.go` | `github.com/ai-2070/net/go` | `net` | `go run hello.go` — no `go.mod` ships here: run it in a module whose `go.mod` has `replace github.com/ai-2070/net/go => …`, build `libnet` first (`cargo build --release -p net-ffi`), and put its directory on the loader path (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH` on macOS, `PATH` on Windows) |
 | `hello.c` | — | `net.h` | `gcc hello.c -lnet -lpthread -ldl -lm && ./a.out` |
 
 **`observe.*` — ingest under backpressure · read stats · handle one failure.**

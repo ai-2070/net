@@ -15,6 +15,7 @@ leave the node that holds them: the machine with the secret runs the work.
 // Find something that can do the job, then do it — no registry, no config.
 nodes, _ := node.FindNodes(net.CapabilityFilter{RequireTags: []string{"gpu"}})
 raw, _ := net.NewMeshRpc(node)
+defer raw.Close()
 resp, _ := net.CallTool[Req, Resp](ctx, net.NewTypedMeshRpc(raw), "summarize", Req{Text: text})
 ```
 

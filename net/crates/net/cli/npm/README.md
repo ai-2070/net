@@ -29,7 +29,7 @@ net-mesh --help
 | `identity`    | Generate / inspect / fingerprint operator identity files.                       |
 | `admin`       | Signed admin-chain commits — drain, cordon, maintenance, drop-replicas, etc.    |
 | `ice`         | Break-glass ICE — simulate then commit freeze-cluster / thaw-cluster / flush-avoid-lists / force-evict-replica / force-restart-daemon / force-cutover / kill-migration. |
-| `snapshot`    | One-shot `MeshOsSnapshot` reads (`get` / `status`).                             |
+| `snapshot`    | One-shot substrate reads, both requiring `--local`: `get` prints the `MeshOsSnapshot`; `status` prints the typed `StatusSummary`. |
 | `audit`       | Read-only queries against the RedEX-committed audit ledger.                     |
 | `log tail`    | Substrate log stream (`--follow`, `--daemon`, `--min-level`).                   |
 | `failures tail` | Substrate failure stream — same shape as `log tail`.                          |
@@ -43,7 +43,7 @@ net-mesh --help
 | `gateway`     | `SubnetGateway` stats + export-table operator surface.                          |
 | `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
 | `aggregator`  | `AggregatorDaemon` inspection + remote query.                                   |
-| `transfer`    | Blob + directory transfer (`recv` / `send` / `ls` / `status` / `cancel`).       |
+| `transfer`    | Blob + directory transfer (`recv-blob` / `send-blob` / `recv-dir` / `send-dir` / `ls` / `status` / `cancel`). |
 | `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
 | `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
 | `forwarding`  | Caller-side credential/header forwarding policy + audit (deny-by-default).      |
@@ -104,4 +104,4 @@ Typed via `ExitCodeKind`. Scripts can match on the discriminator:
 
 ## License
 
-MIT OR Apache-2.0. See [`LICENSE-MIT`](../../../../../LICENSE-MIT) and [`LICENSE-APACHE`](../../../../../LICENSE-APACHE).
+MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

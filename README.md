@@ -14,8 +14,9 @@ edge workloads.
 - **No broker, no registry, no coordinator.** Peers find each other by what they can do.
 - **Work runs where the resource lives.** A credential never leaves the machine that holds it;
   the caller invokes a capability, not a host.
-- **One identity and policy surface.** The key that names a node also signs what it advertises,
-  who may reach it, and which subnet that traffic belongs to.
+- **One identity, several authority planes.** A node is its keypair, and that identity signs what
+  it advertises. Who may reach a capability is decided by permission tokens and organization
+  grants issued under it; subnet membership is derived from the published tags.
 
 ## What it enables
 
@@ -65,18 +66,28 @@ travel.
 
 ```rust
 use net_sdk::mesh::MeshBuilder;
+use net_sdk::org::{OrgAccess, OrgCaller};
+use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+
+const PSK: [u8; 32] = [0x42; 32];
 
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct ObserveReq { intersection: String }
 #[derive(JsonSchema, Deserialize, Serialize)]
+struct Observation { class: String, distance_m: f32 }
+#[derive(JsonSchema, Deserialize, Serialize)]
 struct CornerView { objects: Vec<Observation>, confidence: f32 }
 
+// The node authority and the fleet credentials are provisioned out of band (see
+// "Private capabilities"); `onboard_sensors` / `perceive_corner` are application code.
 let seeing = MeshBuilder::new("0.0.0.0:7700", &PSK)?.build().await?;
 
 // Serve to this fleet only. `OrgAccess::Granted` admits another operator's vehicle
-// holding a capability grant. The handler receives the caller's verified identity.
-seeing.serve_org("intersection.observe", OrgAccess::SameOrg, |caller: OrgCaller, req: ObserveReq| async move {
-    // App code: the raw frames and the perception model never leave this vehicle.
+// holding a capability grant. Hold the handle for the provider's lifetime — dropping
+// it unregisters the service.
+let _serve = seeing.serve_org("intersection.observe", OrgAccess::SameOrg, |caller: OrgCaller, req: ObserveReq| async move {
+    // The raw frames and the perception model never leave this vehicle.
     Ok(perceive_corner(&onboard_sensors(), &req.intersection).await?)
 })?;
 ```
@@ -84,6 +95,11 @@ seeing.serve_org("intersection.observe", OrgAccess::SameOrg, |caller: OrgCaller,
 **The vehicle in the blind spot** asks by capability — no peer was configured in advance:
 
 ```rust
+// The blind-spot vehicle: same mesh and PSK; its fleet credentials are provisioned
+// out of band. Handshake with the seeing vehicle (accept on one side, connect on the
+// other, both start) before the call.
+let blind_spot = MeshBuilder::new("0.0.0.0:7700", &PSK)?.build().await?;
+
 let org = blind_spot.org(credentials)?;                    // sees only what this fleet may see
 let view: CornerView = org
     .call("intersection.observe", &ObserveReq { intersection: "5th & Main".into() })

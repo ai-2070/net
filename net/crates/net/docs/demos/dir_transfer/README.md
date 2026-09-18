@@ -22,8 +22,7 @@ real    0m12.4s
 
 The `atomic: true` field confirms the target was renamed into place from a
 sibling temp directory — on any failure the existing target is left
-untouched (see `../../cli/TRANSFER.md` §4 and
-`../../../../../../docs/internal/plans/FETCH_DIR_ATOMIC_PLAN.md`).
+untouched (see `../../cli/TRANSFER.md` §4).
 
 ## Runnable end-to-end proof
 

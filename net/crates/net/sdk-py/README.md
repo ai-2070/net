@@ -13,6 +13,7 @@ leave the node that holds them: the machine with the secret runs the work.
 
 ```python
 # Find something that can do the job, then do it — no registry, no config.
+# `rpc` is the TypedMeshRpc handle built in "The loop" below.
 resp = call_tool(rpc, "summarize", {"text": text})
 ```
 
@@ -50,7 +51,7 @@ Publishes as `net-mesh-sdk`, imports as `net_sdk`. The native binding
 **Announce** a tool, and it becomes discoverable across the mesh:
 
 ```python
-from net_sdk import MeshNode, serve_tool
+from net_sdk import MeshNode, add_tool_capabilities_to_announce, serve_tool
 from net.mesh_rpc import TypedMeshRpc
 
 node = MeshNode(bind_addr="127.0.0.1:0", psk="42" * 32)   # 32-byte hex string
@@ -65,6 +66,10 @@ handle = serve_tool(
     web_search,
 )
 # handle stays alive while the tool is served; close it to withdraw.
+# Announce the capability (the ai-tool:<tool_id> tag + tools[] entry) so
+# peers can discover it — registering the handler alone is not enough.
+caps = add_tool_capabilities_to_announce({}, [handle.descriptor])
+node.announce_capabilities(caps)
 ```
 
 **Discover** — react to the mesh changing rather than polling it:
