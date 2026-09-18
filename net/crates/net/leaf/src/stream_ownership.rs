@@ -121,14 +121,21 @@ pub trait StreamBackend {
 ///
 /// Every decision is here: the handle an operation addresses, the
 /// identity the open reply carries, and the refusal a closed handle
-/// gets. `None` is returned for a request this does not handle, so a
-/// caller's `match` keeps its other arms.
+/// gets.
+///
+/// **Returns `None` once it has answered**, and `Some((request,
+/// reply))` for a request it does not handle — the request **with its
+/// replier**, still live. Handing the operation back without its
+/// completion authority is not a hand-back: an unanswered `Replier`
+/// answers `SessionLost` when it drops, so a caller that received only
+/// the enum would find its consumer already told the call had failed,
+/// and would have nothing left to answer with.
 pub fn answer_stream_request<B: StreamBackend>(
     owned: &StreamOwnership<B::Stream>,
     backend: &B,
     request: crate::leader::LeaderRequest,
     reply: crate::leader::Replier,
-) -> Option<crate::leader::LeaderRequest> {
+) -> Option<(crate::leader::LeaderRequest, crate::leader::Replier)> {
     use crate::error::LeafError;
     use crate::leader::{LeaderRequest, ProxyFailure};
 
@@ -143,8 +150,13 @@ pub fn answer_stream_request<B: StreamBackend>(
             match backend.open(&label, reliability, stream_id, channel_hash, peer) {
                 Ok(stream) => match owned.adopt(stream) {
                     // The identity comes off the stream the node
-                    // opened. The requested `peer` is not in scope
-                    // here, so it cannot be answered with.
+                    // opened, not off the request. The requested
+                    // `peer` IS still in scope and `Option<u64>` is
+                    // `Copy`, so answering with it compiles — what
+                    // makes that a caught mistake rather than an
+                    // impossible one is that this construction is
+                    // shared and both browser witnesses discriminate
+                    // it.
                     Ok((handle, id)) => {
                         reply.stream(handle, id.wire_id, id.peer, id.incarnation);
                     }
@@ -182,7 +194,7 @@ pub fn answer_stream_request<B: StreamBackend>(
             reply.bytes(bytes::Bytes::new());
             None
         }
-        other => Some(other),
+        other => Some((other, reply)),
     }
 }
 
@@ -589,10 +601,10 @@ mod tests {
     }
 
     #[test]
-    fn a_request_this_dispatch_does_not_handle_is_returned() {
+    fn an_unhandled_request_is_returned_with_a_live_replier() {
         let owned: StreamOwnership<SpyStream> = StreamOwnership::default();
         let backend = spy(true);
-        let (reply, _rx) = crate::leader::Replier::local_for_test(1);
+        let (reply, mut rx) = crate::leader::Replier::local_for_test(1);
 
         let returned = answer_stream_request(
             &owned,
@@ -601,9 +613,30 @@ mod tests {
             reply,
         );
 
+        let Some((request, reply)) = returned else {
+            panic!("a caller's other arms must still see the request");
+        };
+        assert!(matches!(request, crate::leader::LeaderRequest::Counters));
+        // Nothing has answered yet. Returning the enum while dropping
+        // the replier would have already sent `SessionLost`, so the
+        // caller's own answer would be the second one and its consumer
+        // would have seen a failure it never suffered.
         assert!(
-            returned.is_some(),
-            "a caller's other arms must still see it"
+            rx.try_recv().expect("the channel is open").is_none(),
+            "an unhandled request must not already be answered"
+        );
+
+        // The handed-back token is what the caller completes with, and
+        // its answer is the only one.
+        reply.text("[]".into());
+        let outcome = rx
+            .try_recv()
+            .expect("the channel is open")
+            .expect("the caller's answer arrived");
+        assert!(matches!(outcome, Ok(crate::leader::ProxyValue::Text(text)) if text == "[]"));
+        assert!(
+            rx.try_recv().is_err() || rx.try_recv().map(|o| o.is_none()).unwrap_or(true),
+            "exactly one answer"
         );
     }
 

@@ -600,7 +600,19 @@ impl LeaderBackend for RealNodeBackend {
             | LeaderRequest::StreamSend { .. }
             | LeaderRequest::StreamClose { .. }) => {
                 let owned = handles.streams.clone();
-                answer_stream_request(&owned, self, other, reply);
+                // The match above admits only the three stream
+                // variants, so the hand-back is unreachable here.
+                // Asserted rather than ignored: a silent `let _`
+                // would drop a live replier if that ever changed.
+                // Evaluated unconditionally: a `debug_assert!`
+                // around the CALL would remove the dispatch from a
+                // release build entirely.
+                let unhandled = answer_stream_request(&owned, self, other, reply);
+                debug_assert!(
+                    unhandled.is_none(),
+                    "the stream arms prefilter, so nothing is handed back"
+                );
+                drop(unhandled);
             }
             _ => reply.bytes(Bytes::new()),
         }
