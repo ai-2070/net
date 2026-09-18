@@ -5453,7 +5453,12 @@ jobs:
             real_package_refuses_a_stream_on_the_closed_direct_node
             real_package_completes_teardown_when_a_child_close_throws
             real_package_keys_a_stream_on_its_peer_as_well_as_its_id
-            real_package_keeps_delivering_to_a_wrapper_that_spells_no_peer
+            real_package_refuses_a_built_in_stream_that_spells_no_peer
+            real_package_owner_serves_a_join_and_binds_the_caller
+            real_package_reconciles_an_own_proto_key_with_an_empty_value
+            real_package_owner_and_replica_complete_a_round_trip
+            real_package_resync_is_authorized_and_recovery_is_not_ready
+            real_package_action_executes_once_and_replays_its_outcome
           "
           # The roster is checked against the probe file before the
           # probes run: a pinned name the file does not contain can
@@ -5469,7 +5474,7 @@ jobs:
           if grep -q '"pass": false' /tmp/abi-real.log; then
             echo "::error::an ABI probe failed against the built package"; exit 1
           fi
-          echo "R11 ABI probes: 18/18 against the real package"
+          echo "R11 ABI probes: all pinned witnesses ran against the real package"
 
       # Kyra's JS probes, landed verbatim beside her leaf ones.
       - name: Browser-package review probes

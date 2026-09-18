@@ -2518,7 +2518,7 @@ impl LeafNode {
     /// tab after crossing a channel, so the attempt it was issued for
     /// may already have been replaced — and servicing a *replacement*
     /// under a stale request is a mutation, not a misclassification.
-    /// [`Self::attempt_for`] refuses first.
+    /// `attempt_for` refuses first.
     pub async fn peer_candidate_in(
         &self,
         peer_hex: String,

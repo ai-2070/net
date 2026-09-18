@@ -663,7 +663,7 @@ impl Lifecycle {
     /// On a leader the union is visible here: this tab's `declared`
     /// beside every follower's declarations. On a follower it is not,
     /// so the request goes to the leader, which parks it and answers
-    /// from [`serve_releases`] once it has both sets.
+    /// from `serve_releases` once it has both sets.
     pub async fn unsubscribe(&self, channel: String) -> ProxyOutcome {
         let is_leader = {
             let mut state = self.shared.state.borrow_mut();
