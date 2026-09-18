@@ -333,7 +333,7 @@ describe('bounds and the lease', () => {
     const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
 
     expect(r.owner.sweep(HANDLE_LEASE_MS - 1)).toEqual([]);
-    expect(r.owner.sweep(HANDLE_LEASE_MS)).toEqual([h]);
+    expect(r.owner.sweep(HANDLE_LEASE_MS)).toEqual([{ h, peer: PEER_A }]);
 
     const late = r.owner.receive(encodeMessage({ k: 'alive', q: q(), h }), PEER_A, HANDLE_LEASE_MS);
     expect(late.refused).toBe('handle-unknown');
@@ -361,7 +361,7 @@ describe('bounds and the lease', () => {
     // Accepted at t = lease/2, so the lease runs from there.
     expect(r.owner.receive(encodeMessage({ k: 'alive', q: q(), h }), PEER_A, HANDLE_LEASE_MS / 2).refused).toBeNull();
     expect(r.owner.sweep(HANDLE_LEASE_MS)).toEqual([]);
-    expect(r.owner.sweep(HANDLE_LEASE_MS * 2)).toEqual([h]);
+    expect(r.owner.sweep(HANDLE_LEASE_MS * 2)).toEqual([{ h, peer: PEER_A }]);
   });
 
   it('malformed traffic does not renew a lease', () => {
@@ -375,7 +375,7 @@ describe('bounds and the lease', () => {
     }
 
     // The handle still expires on schedule: a refusal is not activity.
-    expect(r.owner.sweep(HANDLE_LEASE_MS)).toEqual([h]);
+    expect(r.owner.sweep(HANDLE_LEASE_MS)).toEqual([{ h, peer: PEER_A }]);
   });
 
   it('refuses the wrong definition and the wrong version', () => {

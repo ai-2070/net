@@ -58,10 +58,12 @@ import {
   decimalValue,
   decodeMessage,
   encodeMessage,
+  utf8Length,
   HANDLE_HEX_LENGTH,
   INCARNATION_HEX_LENGTH,
   type CallerMessage,
   type Hex,
+  type WireOp,
 } from './wire.js';
 
 /** Actions in flight per owner, against the pending bound (§2). */
@@ -205,6 +207,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * behind it, which is what keeps this a bound rather than a buffer.
    */
   private readonly deferred = new Map<Hex, { readonly q: Hex; readonly peer: string }>();
+  /** The revision every installed view is at, before the commit. */
+  private revisionBeforeCommit = 0;
 
   constructor(private readonly deps: OwnerDeps<S, A, I>) {
     // Fail fast rather than discover the numbers on the first
@@ -233,8 +237,71 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /** Replace the authoritative state, as `setState` does. */
-  commit(next: S): void {
+  commit(next: S): Dispatched {
+    const previous = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
     this.core.applySnapshot(next);
+    const current = this.core.getState() as S;
+    if (Object.is(previous, current)) {
+      // An equivalent commit is not a change (§4): no revision moved,
+      // so there is nothing to tell anyone.
+      return this.accept([]);
+    }
+    return this.accept(this.propagate(previous, current));
+  }
+
+  /**
+   * Tell every installed handle what changed (§1.9).
+   *
+   * Per audience, because a delta of the raw state would ship what a
+   * projection exists to withhold: the previous and current
+   * projections are both taken and the difference between THOSE is
+   * what goes out. The previous one is recomputed from the previous
+   * state rather than retained per handle — one projection can be a
+   * megabyte, and keeping one per handle is 256 of them.
+   *
+   * When a delta would not fit the message budget the owner allocates
+   * a new generation instead and sends a manifest: an owner-initiated
+   * replacement, admissible at a `ready` replica (§1.8).
+   */
+  private propagate(previous: S, current: S): Outbound[] {
+    const out: Outbound[] = [];
+    const base = String(this.revisionBeforeCommit);
+    const r = String(this.core.revision);
+    for (const handle of [...this.handles.values()]) {
+      // No `generation === 0` test: a handle is created and installed
+      // in one synchronous `join`, and a join whose emission fails
+      // deletes it, so a live handle always has a generation. What
+      // does need testing is a handle whose NEXT projection is still
+      // pending — a delta against a view it has not installed would
+      // name a revision it never had, and it has already cleared the
+      // old one locally.
+      if (this.deferred.has(handle.h)) continue;
+
+      const before = this.project(handle.audience, previous);
+      const after = this.project(handle.audience, current);
+      if (before === null || after === null) continue;
+      const ops = shallowDiff(before as JsonObject, after as JsonObject);
+      if (ops.length === 0) continue;
+
+      const delta = encodeDeltaWithin(
+        { k: 'delta', h: handle.h, g: String(handle.generation), base, r, ops },
+        this.deps.maxEventBytes,
+      );
+      if (delta !== null) {
+        out.push({ peer: handle.peer, h: handle.h, frame: delta });
+        continue;
+      }
+      // Too large to carry as a patch: replace the whole view.
+      const frames = this.install(handle, null);
+      if (frames === null) {
+        this.forget(handle.h);
+        out.push(this.no(handle.peer, handle.h, 'capacity', null));
+        continue;
+      }
+      out.push(...frames);
+    }
+    return out;
   }
 
   /** The authoritative document, for a host's own reads. */
@@ -523,6 +590,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     }
 
     const spec = this.deps.definition.actions[message.name as keyof A];
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
     let outcome: Outcome;
     try {
       const input = spec.input(message.in);
@@ -537,7 +606,13 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
 
     ledger.retain(s, binding, outcome, now);
     this.renew(bound, now);
-    return this.accept([this.reply(bound, peer, message.q, s, outcome)]);
+    // The handler's writes are a change like any other: every
+    // installed handle is told, including this caller's — the `res`
+    // answers the request, the delta moves the view, and they are two
+    // different facts.
+    const after = this.core.getState() as S;
+    const propagated = Object.is(before, after) ? [] : this.propagate(before, after);
+    return this.accept([this.reply(bound, peer, message.q, s, outcome), ...propagated]);
   }
 
   /** One latest-value input (§1.11). Fire and forget: no reply, ever. */
@@ -558,6 +633,8 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     }
     if (!this.permitsInput(peer, name, message.in)) return this.refuse('in-forbidden');
 
+    const before = this.core.getState() as S;
+    this.revisionBeforeCommit = this.core.revision;
     try {
       const parse = this.deps.definition.inputs[name as keyof I];
       const input = parse(message.in);
@@ -567,7 +644,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       return this.refuse('in-rejected');
     }
     this.renew(bound, now);
-    return this.accept([]);
+    // An input has no reply of its own, but the change it made is
+    // still a change every installed handle is told about.
+    const after = this.core.getState() as S;
+    return this.accept(Object.is(before, after) ? [] : this.propagate(before, after));
   }
 
   /** A `res` for a result, a `no` for a retained refusal. */
@@ -677,16 +757,28 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     return { out, refused: null, deferred };
   }
 
-  /** Expire handles whose lease has run out (§2). */
-  sweep(now: number): Hex[] {
-    const expired: Hex[] = [];
+  /**
+   * Expire handles whose lease has run out (§2).
+   *
+   * Reports the PEER with the handle, because §1.6's expiry notice is
+   * addressed to a caller and the handle is gone by the time anyone
+   * could look it up. A host that cannot reach that peer sends
+   * nothing; no tombstone is retained to announce later.
+   */
+  sweep(now: number): readonly { readonly h: Hex; readonly peer: string }[] {
+    const expired: { h: Hex; peer: string }[] = [];
     for (const [h, handle] of [...this.handles]) {
       if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
         this.forget(h);
-        expired.push(h);
+        expired.push({ h, peer: handle.peer });
       }
     }
     return expired;
+  }
+
+  /** This owner's incarnation, which every manifest carries. */
+  get incarnationHex(): Hex {
+    return this.incarnation;
   }
 
   /**
@@ -821,9 +913,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * must not be shipped as a snapshot, so it becomes `empty()` — the
    * value that represents absence — rather than the full state.
    */
-  private project(audience: readonly string[]): S | null {
+  private project(audience: readonly string[], state: S = this.core.getState() as S): S | null {
     try {
-      return this.deps.definition.state(this.deps.project(this.core.getState() as S, audience));
+      return this.deps.definition.state(this.deps.project(state, audience));
     } catch {
       // `empty()` is application code as well, and it is reached
       // precisely when the application has already thrown once. A
@@ -881,6 +973,51 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     this.counters[reason] = (this.counters[reason] ?? 0) + 1;
     return { out, refused: reason, deferred: null };
   }
+}
+
+/**
+ * The root-level difference between two projections.
+ *
+ * Root level only, deliberately: §1.13's patch semantics replace a
+ * whole subtree at a path, and a deeper diff would buy smaller frames
+ * at the cost of a second traversal per handle per commit — the thing
+ * a 60 Hz loop cannot afford. A subtree that did not change is not
+ * emitted at all, which is where the saving actually is.
+ */
+function shallowDiff(before: JsonObject, after: JsonObject): WireOp[] {
+  const ops: WireOp[] = [];
+  for (const key of Object.keys(after)) {
+    const nextValue = after[key];
+    if (Object.prototype.hasOwnProperty.call(before, key) && Object.is(before[key], nextValue)) continue;
+    // Not `Object.is` alone: reconciliation shares unchanged subtrees,
+    // so identity IS the comparison for anything it touched, and a
+    // value it could not share is compared by its serialization.
+    if (
+      Object.prototype.hasOwnProperty.call(before, key) &&
+      JSON.stringify(before[key]) === JSON.stringify(nextValue)
+    ) {
+      continue;
+    }
+    ops.push({ o: 'r', p: [key], val: nextValue as JsonValue });
+  }
+  for (const key of Object.keys(before)) {
+    if (!Object.prototype.hasOwnProperty.call(after, key)) ops.push({ o: 'x', p: [key] });
+  }
+  return ops;
+}
+
+/** The delta frame, or null when it will not fit the budget (§1.9). */
+function encodeDeltaWithin(
+  message: Parameters<typeof encodeMessage>[0],
+  maxEventBytes: number,
+): string | null {
+  let frame: string;
+  try {
+    frame = encodeMessage(message);
+  } catch {
+    return null;
+  }
+  return utf8Length(frame) <= maxEventBytes ? frame : null;
 }
 
 /** The `q` a refusal for this message should carry, if any. */

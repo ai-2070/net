@@ -5460,6 +5460,7 @@ jobs:
             real_package_resync_is_authorized_and_recovery_is_not_ready
             real_package_action_executes_once_and_replays_its_outcome
             real_package_narrows_the_audience_before_the_owner_agrees
+            real_package_hosts_and_joins_a_store_over_a_transport
           "
           # The roster is checked against the probe file before the
           # probes run: a pinned name the file does not contain can

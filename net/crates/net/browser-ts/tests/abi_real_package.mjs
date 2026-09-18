@@ -743,6 +743,100 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_hosts_and_joins_a_store_over_a_transport', async () => {
+  // Slice G against the SHIPPED build: `hostStore` and `joinStore`
+  // talking through a transport that satisfies the same structural
+  // type `BrowserNode` and `MeshSession` satisfy. The authenticated
+  // peer is assigned by the transport on every event, which is the
+  // property the whole gate is about.
+  const storeModule = await import(new URL('store/index.js', dist).href);
+
+  const game = storeModule.defineStore({
+    id: 'probe.host',
+    version: 1,
+    state: raw => ({ hull: Number(raw.hull ?? 0) }),
+    empty: () => ({ hull: 0 }),
+    actions: {
+      fire: { input: value => ({ power: Number(value.power) }), output: value => ({ hull: Number(value.hull) }) },
+    },
+    inputs: {},
+  });
+
+  const handlers = new Map();
+  const deliver = (to, from, bytes, streamId) => {
+    for (const handler of handlers.get(to) ?? []) {
+      handler({ type: 'stream_data', streamId, peerNode: from, payload: bytes });
+    }
+  };
+  const node = self => ({
+    nodeIdHex: () => self,
+    openStream: options => ({
+      send: bytes => {
+        deliver(options.peer, self, bytes, options.streamId);
+      },
+      close: () => {},
+    }),
+    onEvent: handler => {
+      const list = handlers.get(self) ?? [];
+      list.push(handler);
+      handlers.set(self, list);
+      return () => {};
+    },
+  });
+
+  const jobs = [];
+  const schedule = (run, ms) => {
+    jobs.push({ run, every: ms });
+    return () => {};
+  };
+
+  const seen = [];
+  const host = storeModule.hostStore({
+    definition: game,
+    transport: node('00000000000000aa'),
+    initialState: { hull: 10 },
+    maxEventBytes: 8104,
+    authorize: request => {
+      seen.push(request.peer);
+      return true;
+    },
+    project: state => state,
+    actions: {
+      fire: (input, context) => {
+        const hull = context.getState().hull - input.power;
+        context.setState({ hull });
+        return { hull };
+      },
+    },
+    inputs: {},
+    now: () => 0,
+    schedule,
+  });
+
+  const joined = storeModule.joinStore({
+    definition: game,
+    transport: node('00000000000000bb'),
+    host: '00000000000000aa',
+    audience: ['crew'],
+    key: 'probe',
+    maxEventBytes: 8104,
+    now: () => 0,
+    schedule,
+  });
+
+  await joined.ready();
+  eq(joined.getState(), { hull: 10 }, 'the joined view');
+  eq(seen, ['00000000000000bb'], 'the peer the transport authenticated');
+
+  const result = await joined.act('fire', { power: 4 });
+  eq(result, { hull: 6 }, 'the action result');
+  eq([host.getState().hull, joined.getState().hull], [6, 6], 'both sides after the action');
+
+  await joined.close();
+  eq(host.counts().handles, 0, 'the handle after close');
+  await host.close();
+});
+
 await probe('real_package_narrows_the_audience_before_the_owner_agrees', async () => {
   // Slice F against the SHIPPED build: the narrowing is local and
   // immediate, the owner authorizes the REQUESTED audience, and a

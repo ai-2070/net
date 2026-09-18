@@ -146,15 +146,30 @@ function act(h: Hex, s: string, name: 'fire' | 'refit', input: object): string {
   return encodeMessage({ k: 'act', q: q(), h, s, name, in: input as never });
 }
 
-/** The single reply frame, decoded. */
+/**
+ * The correlated reply, decoded.
+ *
+ * An accepted action emits two different facts: the `res` that answers
+ * the request and the `delta` that moves every installed view. This
+ * picks out the first.
+ */
 function replyOf(dispatched: Dispatched) {
-  expect(dispatched.out).toHaveLength(1);
-  const decoded = decodeMessage((dispatched.out[0] as Outbound).frame, {
-    maxBytes: MAX_EVENT_BYTES,
-    as: 'replica',
+  const frames = dispatched.out.map((frame: Outbound) => {
+    const decoded = decodeMessage(frame.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    if (!decoded.ok) throw new Error(`undecodable reply: ${decoded.reason}`);
+    return decoded.message;
   });
-  if (!decoded.ok) throw new Error(`undecodable reply: ${decoded.reason}`);
-  return decoded.message;
+  const reply = frames.find(message => message.k === 'res' || message.k === 'ok' || message.k === 'no');
+  if (reply === undefined) throw new Error(`no correlated reply among ${String(frames.length)} frames`);
+  return reply;
+}
+
+/** The kinds an emission contained, in order. */
+function kindsOf(dispatched: Dispatched): string[] {
+  return dispatched.out.map((frame: Outbound) => {
+    const decoded = decodeMessage(frame.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    return decoded.ok ? decoded.message.k : 'undecodable';
+  });
 }
 
 describe('an action executes once and answers', () => {
@@ -169,6 +184,9 @@ describe('an action executes once and answers', () => {
     expect(owner.getState()).toEqual({ hull: 10, shots: 1 });
     const reply = replyOf(done);
     expect(reply.k === 'res' && reply).toMatchObject({ h, s: '1', out: { shot: 1 } });
+    // And the change itself: the `res` answers the request, the delta
+    // moves the view, and a caller needs both.
+    expect(kindsOf(done)).toEqual(['res', 'delta']);
   });
 
   it('hands the handler the authenticated caller, and one transaction', () => {
@@ -469,7 +487,7 @@ describe('the window, the floor and what `result-expired` does not say', () => {
     const second = joined(owner);
     owner.receive(act(second, '1', 'fire', { power: 1 }), PEER_A);
     clock.value = 60_000;
-    expect(owner.sweep(clock.value)).toEqual([second]);
+    expect(owner.sweep(clock.value)).toEqual([{ h: second, peer: PEER_A }]);
     expect([owner.ledgerCount, owner.handleCount]).toEqual([0, 0]);
   });
 
@@ -875,11 +893,12 @@ describe('the deferred contract', () => {
     send(large);
     if (large.deferred !== null) send(await large.deferred);
 
-    expect(sent).toHaveLength(2);
-    const sequences = sent.map(frame => {
-      const decoded = decodeMessage(frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
-      return decoded.ok && decoded.message.k === 'res' ? decoded.message.s : null;
-    });
+    // Both results reach the transport, in order, each beside the
+    // delta its execution produced.
+    const sequences = sent
+      .map(frame => decodeMessage(frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' }))
+      .filter(decoded => decoded.ok && decoded.message.k === 'res')
+      .map(decoded => (decoded.ok && decoded.message.k === 'res' ? decoded.message.s : null));
     expect(sequences).toEqual(['1', '2']);
   });
 });
@@ -924,8 +943,10 @@ describe('the transaction a handler runs in', () => {
     owner.receive(act(h, '1', 'fire', { power: 1 }), PEER_A);
     owner.receive(act(h, '2', 'fire', { power: 1 }), PEER_A);
     // A replay publishes nothing: it did not execute.
-    owner.receive(act(h, '1', 'fire', { power: 1 }), PEER_A);
+    const replayed = owner.receive(act(h, '1', 'fire', { power: 1 }), PEER_A);
 
     expect(listener).toHaveBeenCalledTimes(2);
+    // And it emits no delta either — nothing changed.
+    expect(kindsOf(replayed)).toEqual(['res']);
   });
 });
