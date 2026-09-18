@@ -4,7 +4,26 @@
 
 **The sentence:** an A2A service is *explicitly* free or paid by provider configuration; a paid task is **prepared** (validated, capacity-reserved, provider-minted admission id) before any money moves, **purchased** against that exact reservation with a durable caller-side attempt that is resumed rather than re-quoted, **submitted** with the evidence, and **launched once** under a lifetime-exclusive journal owner — and a crash anywhere between money and work leaves a recoverable record rather than a second charge or a second run.
 
-**Status (2026-09-17): IMPLEMENTED, revision 4.** Landed in two commits — WS-A/WS-B/WS-C in `101145315`, WS-D/WS-E/WS-F in `af0f28ad1`. Revision 1 was held for six architecture-level gaps; revision 2 for five state-machine/persistence contract gaps; revision 3 for two branch/table inconsistencies. §0.1 indexes each finding to the section and witness that closes it. Source-grounded against this worktree.
+**Status: IMPLEMENTED and under independent review, revision 4.** Every WS-A…WS-F
+box below is ticked, all 50 §4 acceptance witnesses exist in the tree, and the
+38 public surfaces this plan names resolve. Landed in `101145315` (WS-A/B/C) and
+`af0f28ad1` (WS-D/E/F), plus `047245bcf`; the two upstream gaps in `faf4ff29b` /
+`1ed757629`. Revision 1 was held for six architecture-level gaps; revision 2 for
+five state-machine/persistence contract gaps; revision 3 for two branch/table
+inconsistencies. §0.1 indexes each finding to the section and witness that closes
+it. Source-grounded against this worktree.
+
+**Review state (this is what is actually outstanding).** Two independent-reviewer
+HOLD packets have been worked: R1–R13 against `1ed7576` (closed, rounds 1–2,
+credited) and C1–C8 against `0743ca779` (repaired in `954eee853`). The current
+candidate is `687566524`, whose code-bearing head `84d178407` is green on
+exact-head CI — [46/46 jobs](https://github.com/ai-2070/net/actions/runs/35333578622),
+13/13 A2A enforced steps. **The reviewer has not yet accepted round 3**, so the
+HOLD stands. The per-blocker closure map is
+`docs/internal/reviews/A2A_C1_C8_CLOSURE_MAP.md`; it also carries the list of
+properties still unproven and explicitly not claimed (real settlement rails, the
+installed-wheel protected *paid* lifecycle, platform power-loss durability, the
+C5 Python caller half, a cross-process org-authority harness).
 
 **Deltas from the plan as written**, all deliberate and witnessed:
 
@@ -467,25 +486,25 @@ A and B are independent; C depends on A+B; D–F on C.
 
 ### WS-A — Registry and commitment (SDK `a2a.rs`)
 
-- [ ] `Admission::{Existing, Pending(watch::Receiver<Option<Result<String, String>>>), Reserved(AdmissionTicket)}`; `TaskRegistry::reserve`; `AdmissionTicket::{launch, release}` (`launch` = the current spawn body verbatim incl. `PanicGuard` + biased `select!`); `Drop` of an unconsumed ticket = release; `TaskRegistry::with_terminal_hook`.
-- [ ] `submit` = `reserve` + `launch`; `Pending` in the sync free path → `Ok(id)` (entry exists; only identical retransmits race today) — documented. Free wire byte-identical.
-- [ ] `TaskState::Interrupted { detail }`; `TaskOwner::Entity([u8; 32])`; `SubmitRejection::{UnknownService, StaleRevision{expected, got}, BoundsExceeded{field, limit}, NoReservation, Retired, Busy}`; `TaskBrief::{service, revision, with_service, with_task_id}`.
-- [ ] `A2aOffer`, `A2aBounds`, `AdmissionReservation`, `PreparedTask`; `task_commitment`, `purchase_hash`, `A2aOffer::hash()` — canonical typed JSON per D3.
-- [ ] Per-entry retention override used by eviction; global TTL remains the default.
-- [ ] Tests: `reserve_then_release_leaves_no_entry`, `a_dropped_ticket_releases_the_reservation`, `concurrent_identical_reserves_share_one_verdict`, `a_ticket_launches_exactly_once`, `interrupted_is_terminal_and_uncancellable`, `commitment_golden_vector` (fixed hex), `commitment_flips_for_every_bound_field`, `commitment_frames_array_boundaries` (the four negative vectors in D3), `purchase_hash_flips_with_admission_id`.
+- [x] `Admission::{Existing, Pending(watch::Receiver<Option<Result<String, String>>>), Reserved(AdmissionTicket)}`; `TaskRegistry::reserve`; `AdmissionTicket::{launch, release}` (`launch` = the current spawn body verbatim incl. `PanicGuard` + biased `select!`); `Drop` of an unconsumed ticket = release; `TaskRegistry::with_terminal_hook`.
+- [x] `submit` = `reserve` + `launch`; `Pending` in the sync free path → `Ok(id)` (entry exists; only identical retransmits race today) — documented. Free wire byte-identical.
+- [x] `TaskState::Interrupted { detail }`; `TaskOwner::Entity([u8; 32])`; `SubmitRejection::{UnknownService, StaleRevision{expected, got}, BoundsExceeded{field, limit}, NoReservation, Retired, Busy}`; `TaskBrief::{service, revision, with_service, with_task_id}`.
+- [x] `A2aOffer`, `A2aBounds`, `AdmissionReservation`, `PreparedTask`; `task_commitment`, `purchase_hash`, `A2aOffer::hash()` — canonical typed JSON per D3.
+- [x] Per-entry retention override used by eviction; global TTL remains the default.
+- [x] Tests: `reserve_then_release_leaves_no_entry`, `a_dropped_ticket_releases_the_reservation`, `concurrent_identical_reserves_share_one_verdict`, `a_ticket_launches_exactly_once`, `interrupted_is_terminal_and_uncancellable`, `commitment_golden_vector` (fixed hex), `commitment_flips_for_every_bound_field`, `commitment_frames_array_boundaries` (the four negative vectors in D3), `purchase_hash_flips_with_admission_id`.
 
 **Acceptance:** existing `a2a.rs` tests, `a2a_task_ownership.rs`, both binding suites unchanged and green; `submit` callers compile without edits.
 
 ### WS-B — Engine and caller flow (`net-payments`)
 
-- [ ] `QuoteRequest.input_hash` + `with_input_hash`; threading through `serve_payments` → `ProviderChannel::quote` → `InProcessProvider` → `issue_quote` → `PaymentQuote::new`.
-- [ ] `QuoteRecord.{input_hash, redeemed_for}`; fixture loads a pre-change `payment-engine.json` byte-for-byte.
-- [ ] `PaymentEngine::redeem_for_task`, `RedeemDenialReason::InputBindingMismatch` (`"input_binding_mismatch"`), `RedeemDecision::Admitted { payer }`; one private closure shared with `redeem_for_invocation`.
-- [ ] `flow::denial_for` row; SDK `tool_payment.rs` doc table + `failure_vocab` reasons (`input_binding_mismatch`, `admission_revoked`, `no_reservation`, `journal_unavailable`).
-- [ ] `CallerPaymentFlow` staged verbs (`quote_bound`, `reserve_spend`, `author`, `pay_exact`), `run` composed from them; `CallerDecision::Failed.quote_id`; approved-quote resume checks `input_hash`.
-- [ ] `flow/a2a.rs` (feature `mesh`): `PurchaseAttempt`/`PurchaseState` (incl. `Submitted`, `PaidUnexecutable`, `Resolved`)/`PurchaseKey` + `a2a-purchases.json` store with CAS transitions per the D4 table (`begin_prepare` lease insert, `transition(from, to)`, stale-lease takeover, `clear_approval` on re-prepare, per-key in-process `Notify`); `A2aCallerFlow::{prepare_task, purchase_task, submit_task, stored_attempt, attempts, resolve_attempt}`; `A2aPurchase`, `A2aSubmit`; `EngineTaskAdmissionGate: net_sdk::a2a_payment::TaskAdmissionGate`; `redeem_task_via_engine`.
-- [ ] Tests `payments/tests/a2a_task_redeem.rs` (mock facilitator): `a_quote_carries_the_purchase_hash_into_its_id`, `redeem_for_task_refuses_a_mismatched_purchase_hash` (funds untouched, `redeemed` false), `redeem_for_task_is_idempotent_for_the_same_purchase_hash`, `a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed`, `a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools`, `an_approved_quote_resumes_only_for_its_own_purchase_hash`.
-- [ ] Tests `payments/tests/a2a_caller_purchase.rs` (scripted `ProviderChannel` with fault injection and barriers):
+- [x] `QuoteRequest.input_hash` + `with_input_hash`; threading through `serve_payments` → `ProviderChannel::quote` → `InProcessProvider` → `issue_quote` → `PaymentQuote::new`.
+- [x] `QuoteRecord.{input_hash, redeemed_for}`; fixture loads a pre-change `payment-engine.json` byte-for-byte.
+- [x] `PaymentEngine::redeem_for_task`, `RedeemDenialReason::InputBindingMismatch` (`"input_binding_mismatch"`), `RedeemDecision::Admitted { payer }`; one private closure shared with `redeem_for_invocation`.
+- [x] `flow::denial_for` row; SDK `tool_payment.rs` doc table + `failure_vocab` reasons (`input_binding_mismatch`, `admission_revoked`, `no_reservation`, `journal_unavailable`).
+- [x] `CallerPaymentFlow` staged verbs (`quote_bound`, `reserve_spend`, `author`, `pay_exact`), `run` composed from them; `CallerDecision::Failed.quote_id`; approved-quote resume checks `input_hash`.
+- [x] `flow/a2a.rs` (feature `mesh`): `PurchaseAttempt`/`PurchaseState` (incl. `Submitted`, `PaidUnexecutable`, `Resolved`)/`PurchaseKey` + `a2a-purchases.json` store with CAS transitions per the D4 table (`begin_prepare` lease insert, `transition(from, to)`, stale-lease takeover, `clear_approval` on re-prepare, per-key in-process `Notify`); `A2aCallerFlow::{prepare_task, purchase_task, submit_task, stored_attempt, attempts, resolve_attempt}`; `A2aPurchase`, `A2aSubmit`; `EngineTaskAdmissionGate: net_sdk::a2a_payment::TaskAdmissionGate`; `redeem_task_via_engine`.
+- [x] Tests `payments/tests/a2a_task_redeem.rs` (mock facilitator): `a_quote_carries_the_purchase_hash_into_its_id`, `redeem_for_task_refuses_a_mismatched_purchase_hash` (funds untouched, `redeemed` false), `redeem_for_task_is_idempotent_for_the_same_purchase_hash`, `a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed`, `a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools`, `an_approved_quote_resumes_only_for_its_own_purchase_hash`.
+- [x] Tests `payments/tests/a2a_caller_purchase.rs` (scripted `ProviderChannel` with fault injection and barriers):
   - sequential recovery: `prepare_task_moves_no_money_and_reserves_no_spend`, `purchase_consumes_the_prepared_quote_not_a_fresh_one`, `a_lost_pay_reply_is_resumed_by_resending_the_identical_payload` (channel swallows the first reply; second `purchase_task` sends byte-identical payload; engine `consumed` map returns the original verdict; exactly one billing event), `a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid`, `a_caller_restart_mid_purchase_resumes_the_stored_attempt` (reopen the store from disk in `Paying`), `purchase_never_requotes_while_an_attempt_is_unresolved` (quote channel call count stays 1 across N retries), `an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id`
   - atomic attempt selection (finding r3-4): `concurrent_prepares_converge_on_one_quote` (N tasks barrier-released into `prepare_task`; quote channel called once; all receive the same `quote_id`), `concurrent_purchases_send_one_payload` (N `purchase_task` racing on `Quoted`; pay channel sees exactly one distinct payload; one billing event; all return the same proof), `a_conflicting_commitment_under_the_same_key_is_rejected`, `a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not`, `two_processes_share_one_attempt` (child process via `std::process::Command` re-exec on the same store path)
   - refusal classes (finding r3-5): `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous` (exact-EVM / exact-SVM quote; provider answers `Rejected`; `reject_releases_reservation == false` ⇒ reservation held, state `RefusedExposed`, `purchase_task` returns `Denied{funds_ambiguous: true}` and never re-quotes; `prepare_task` on it is `Conflict`-class refusal until `resolve_attempt`), `an_unexposed_refusal_releases_and_may_prepare_again` (spend `Denied` before authoring ⇒ `RefusedUnexposed`, reservation released; `prepare_task` mints a new quote under the same `admission_id`), `run_is_byte_for_byte_equivalent_after_the_split` (existing `a_solana_reject_keeps_the_reservation` and the `mcp_gate`/`http402` suites unchanged are the guard)
@@ -495,12 +514,12 @@ A and B are independent; C depends on A+B; D–F on C.
 
 ### WS-C — Configured serving path (SDK `mesh_a2a.rs`, `a2a_payment.rs`, `a2a_journal.rs`)
 
-- [ ] `a2a_payment.rs` (ungated): `TaskPaymentClaim`, `TaskPaymentEvidence`, `TaskAdmissionGate`, `TaskPaymentProof`, `A2A_PREPARE_SERVICE`, `A2A_DESCRIBE_SERVICE`.
-- [ ] `A2aServiceConfig`, `A2aServicePolicy`, `A2aPrincipal`, `TaskPreflight`; `ServeError::A2aPaidMisconfigured` in core.
-- [ ] `A2aAdmissionJournal` per D6: lifetime-exclusive `.owner` sidecar lock at `open` held by `Arc<JournalOwner>` (cloned into `ServeHandle`s, handlers, and every launched executor future) + per-write `.lock`; result table + ledger; CAS `reserve`/`transition`/`note`/`claim_launch` restricted to the D2 transition table; `unresolved`, `resolve` (operator), `prune` honoring the three retention classes; recovery pass at open; `#[cfg(feature = "testing")] fail_next_write()` fault hook.
-- [ ] `Mesh::serve_a2a_configured`: validation per D1; `PrepareHandler` (P1–P5), configured `SubmitHandler` (S1–S8), `StatusHandler` (registry → journal fallback → `null`), `CancelHandler`, `DescribeHandler`; `OrgAdmitted` registers through `serve_rpc_owner_scoped` / `serve_rpc_granted` and reads `ctx.org_admission`.
-- [ ] Requester: `Mesh::describe_a2a`, `Mesh::prepare_a2a(node, &brief) -> AdmissionReservation` (raw prepare; the payments `A2aCallerFlow` composes it), `Mesh::submit_task_paid(node, &PreparedTask, &TaskPaymentProof)`, `A2aFlowError::PaymentRefused`.
-- [ ] Integration tests `sdk/tests/a2a_paid_admission.rs` (`#![cfg(all(feature = "net", feature = "cortex", feature = "testing"))]`; scripted `RecordingTaskGate` and `ScriptedPreflight` in the `RecordingGate` idiom; executor with a run counter and a barrier):
+- [x] `a2a_payment.rs` (ungated): `TaskPaymentClaim`, `TaskPaymentEvidence`, `TaskAdmissionGate`, `TaskPaymentProof`, `A2A_PREPARE_SERVICE`, `A2A_DESCRIBE_SERVICE`.
+- [x] `A2aServiceConfig`, `A2aServicePolicy`, `A2aPrincipal`, `TaskPreflight`; `ServeError::A2aPaidMisconfigured` in core.
+- [x] `A2aAdmissionJournal` per D6: lifetime-exclusive `.owner` sidecar lock at `open` held by `Arc<JournalOwner>` (cloned into `ServeHandle`s, handlers, and every launched executor future) + per-write `.lock`; result table + ledger; CAS `reserve`/`transition`/`note`/`claim_launch` restricted to the D2 transition table; `unresolved`, `resolve` (operator), `prune` honoring the three retention classes; recovery pass at open; `#[cfg(feature = "testing")] fail_next_write()` fault hook.
+- [x] `Mesh::serve_a2a_configured`: validation per D1; `PrepareHandler` (P1–P5), configured `SubmitHandler` (S1–S8), `StatusHandler` (registry → journal fallback → `null`), `CancelHandler`, `DescribeHandler`; `OrgAdmitted` registers through `serve_rpc_owner_scoped` / `serve_rpc_granted` and reads `ctx.org_admission`.
+- [x] Requester: `Mesh::describe_a2a`, `Mesh::prepare_a2a(node, &brief) -> AdmissionReservation` (raw prepare; the payments `A2aCallerFlow` composes it), `Mesh::submit_task_paid(node, &PreparedTask, &TaskPaymentProof)`, `A2aFlowError::PaymentRefused`.
+- [x] Integration tests `sdk/tests/a2a_paid_admission.rs` (`#![cfg(all(feature = "net", feature = "cortex", feature = "testing"))]`; scripted `RecordingTaskGate` and `ScriptedPreflight` in the `RecordingGate` idiom; executor with a run counter and a barrier):
   - configuration: `a_free_configured_service_runs_without_a_gate_or_journal`, `a_paid_service_refuses_to_start_without_a_gate`, `..._without_a_journal`, `..._without_pricing`, `a_free_service_refuses_pricing`
   - free is not policy-free (r4): `a_free_service_without_a_journal_runs_preflight_on_direct_submit` (all-free catalog, `journal: None`, scripted preflight denies, submit **without** prepare → in-body rejection, run counter 0, in-memory store has no record), `a_free_service_without_a_journal_enforces_capacity_on_direct_submit` (`max_in_flight = 1`, second direct submit → `Busy`, frees on terminal), `a_free_direct_submit_that_passes_preflight_launches_once`, `a_free_prepared_reservation_is_deleted_when_preflight_fails_at_submit`
   - ownership lock (finding r3-1): `a_second_owner_is_excluded_after_a_journal_replacement` (owner A opens, performs a successful write — the file is replaced — then a **child process** (`std::process::Command` re-exec of the test binary with an env selector) attempts `open` and must get `OwnedElsewhere`; then A drops and the child succeeds), `a_second_open_in_the_same_process_is_refused`, `the_owner_outlives_a_running_executor` (drop the `ServeHandle`s while a task runs; the terminal hook still writes `Terminal`; a second `open` is refused until the task ends)
@@ -518,7 +537,7 @@ A and B are independent; C depends on A+B; D–F on C.
 
 ### WS-D — End-to-end with the real engine (`net-payments`, feature `mesh`)
 
-- [ ] `payments/tests/a2a_paid_end_to_end.rs`: provider = `PaymentEngine` + mock facilitator + `EngineTaskAdmissionGate` + journal (tempdir); requester = `A2aCallerFlow` over `MeshPaymentChannel` + `SpendPolicyEngine` + purchase store (tempdir). Tests: `prepare_then_purchase_then_submit_runs_the_task_once`, `a_pending_approval_resumes_after_approve_payment_for_the_same_purchase_only`, `a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge` (one billing event), `a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof`, `a_provider_restart_between_redeem_and_claim_reconciles_the_original_payment` (drop `ServeHandle`s + registry + journal owner; re-serve over the same `payment-engine.json` + journal path), `a_caller_restart_between_pay_and_submit_resumes_from_the_purchase_store`.
+- [x] `payments/tests/a2a_paid_end_to_end.rs`: provider = `PaymentEngine` + mock facilitator + `EngineTaskAdmissionGate` + journal (tempdir); requester = `A2aCallerFlow` over `MeshPaymentChannel` + `SpendPolicyEngine` + purchase store (tempdir). Tests: `prepare_then_purchase_then_submit_runs_the_task_once`, `a_pending_approval_resumes_after_approve_payment_for_the_same_purchase_only`, `a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge` (one billing event), `a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof`, `a_provider_restart_between_redeem_and_claim_reconciles_the_original_payment` (drop `ServeHandle`s + registry + journal owner; re-serve over the same `payment-engine.json` + journal path), `a_caller_restart_between_pay_and_submit_resumes_from_the_purchase_store`.
 
 ### WS-E — Python bindings (frozen contract) and Node parity where cheap
 
@@ -539,16 +558,16 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 | `CapabilityGateway.approve_payment / reject_payment / pending_payments` | unchanged | as today |
 | `CapabilityGateway(..., a2a_purchase_path=None)` | new ctor kwarg for the purchase store | — |
 
-- [ ] `_net.pyi` + `python/net/__init__.py` exports (`PaymentRefused`, `JournalOwnedElsewhere`); `bindings/python/tests/test_a2a_paid.py` mirrors WS-C/WS-D over the mock facilitator: free success, unpaid refusal with schematic, prepare-before-money (invalid brief rejected with no quote), paid runs once, retained-id identical retry, altered brief, cross-peer proof reuse, retry after retention, gate denial then valid retry, lost pay reply resume (fault-injected channel via a test-only flag), exposed bearer refusal stays ambiguous, second provider on the same journal refused (subprocess), unresolved records survive retention, provider restart ambiguity (re-created `PaymentProvider` over the same paths), caller restart (re-created gateway over the same purchase path).
-- [ ] Node: `submitTask` gains optional `taskId` (retained ids). Paid serving on Node **deferred** (no consumer; free behavior unchanged).
+- [x] `_net.pyi` + `python/net/__init__.py` exports (`PaymentRefused`, `JournalOwnedElsewhere`); `bindings/python/tests/test_a2a_paid.py` mirrors WS-C/WS-D over the mock facilitator: free success, unpaid refusal with schematic, prepare-before-money (invalid brief rejected with no quote), paid runs once, retained-id identical retry, altered brief, cross-peer proof reuse, retry after retention, gate denial then valid retry, lost pay reply resume (fault-injected channel via a test-only flag), exposed bearer refusal stays ambiguous, second provider on the same journal refused (subprocess), unresolved records survive retention, provider restart ambiguity (re-created `PaymentProvider` over the same paths), caller restart (re-created gateway over the same purchase path).
+- [x] Node: `submitTask` gains optional `taskId` (retained ids). Paid serving on Node **deferred** (no consumer; free behavior unchanged).
 
 ### WS-F — Docs, CI, release
 
-- [ ] `sdk/src/mesh_a2a.rs` / `a2a.rs` module docs (principal table; prepare/purchase/submit; wire addition `Interrupted`); `tool_payment.rs` header names the A2A twin; `a2a_journal.rs` documents the local-filesystem lock limit.
-- [ ] `web/src/content/docs/guides/agent-to-agent.md` ("paid services": prepare → purchase → submit, recovery table), `docs/data/capabilities/event-bus.yaml` A2A matrix, release note under `net/crates/net/docs/releases/` mirrored via `npm run sync:releases`, `SECURITY_DEFAULTS_0.35.md` §8 relay caveat cross-references `A2aPrincipal`.
-- [ ] `.claude/skills/net-event-bus` A2A section: Python prepare/purchase/submit example (CI executes skill examples — also a witness).
-- [ ] CI: SDK tests auto-discovered (`ci.yml:2267`) — add `testing` to that job's feature list if absent (needed for `fail_next_write`); confirm the `net-payments` job runs with `mesh`; `test_a2a_paid.py` auto-discovers under the existing maturin feature list (`ci.yml:2851-2863`). No new core `tests/*.rs` ⇒ no pin-guard change.
-- [ ] AGENTS.md pre-push checklist incl. `cargo doc -D warnings` for `net-payments`, `sdk`, `bindings/python`.
+- [x] `sdk/src/mesh_a2a.rs` / `a2a.rs` module docs (principal table; prepare/purchase/submit; wire addition `Interrupted`); `tool_payment.rs` header names the A2A twin; `a2a_journal.rs` documents the local-filesystem lock limit.
+- [x] `web/src/content/docs/guides/agent-to-agent.md` ("paid services": prepare → purchase → submit, recovery table), `docs/data/capabilities/event-bus.yaml` A2A matrix, release note under `net/crates/net/docs/releases/` mirrored via `npm run sync:releases`, `SECURITY_DEFAULTS_0.35.md` §8 relay caveat cross-references `A2aPrincipal`.
+- [x] `.claude/skills/net-event-bus` A2A section: Python prepare/purchase/submit example (CI executes skill examples — also a witness). **Delivered as prose + a Python prepare/purchase/submit example in `.claude/skills/net-event-bus/a2a.md` §"Paid A2A". The parenthetical is NOT satisfied: CI executes only `examples/*` via `docs/data/examples.yaml`, and `check-skill-snippets.py` compiles `rust` fences only (`lang != "rust": continue`), so no Python snippet in this skill is checked by anything. Making this one a witness needs an `examples/` entry driving a live provider plus the payments wheel — tracked as a gap, not claimed as done.**
+- [x] CI: SDK tests auto-discovered (`ci.yml:2267`) — add `testing` to that job's feature list if absent (needed for `fail_next_write`); confirm the `net-payments` job runs with `mesh`; `test_a2a_paid.py` auto-discovers under the existing maturin feature list (`ci.yml:2851-2863`). No new core `tests/*.rs` ⇒ no pin-guard change.
+- [x] AGENTS.md pre-push checklist incl. `cargo doc -D warnings` for `net-payments`, `sdk`, `bindings/python`.
 
 ---
 
