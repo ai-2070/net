@@ -57,12 +57,12 @@ Unlike `hello`/`observe`, these stand up **two to four real mesh nodes over loop
 
 | File | Bindings | The service it replaces | Route | Expected line |
 |---|---|---|---|---|
-| `registry.rs` / `registry.ts` | Rust ✓ · TS ✓ | Consul / etcd + a health poller | providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup | `RESULT ok providers=3 joined=1 best_moved=1` |
+| `registry.rs` / `registry.ts` / `registry.py` | Rust ✓ · TS ✓ · Py ✓ | Consul / etcd + a health poller | providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup | `RESULT ok providers=3 joined=1 best_moved=1` |
 | `jobqueue.rs` / `jobqueue.ts` | Rust ✓ · TS ✓ | Celery / SQS + Redis | append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log | `RESULT ok jobs=6 done=6 retried=1 duplicates=0` |
 | `objectstore.rs` / `objectstore.ts` | Rust ✓ · TS ✓ | S3 / MinIO | store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address | `RESULT ok dedup=1 readback=1 bytes=64` |
-| `liveconfig.rs` / `liveconfig.ts` | Rust ✓ · TS ✓ | LaunchDarkly / Consul KV | register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally | `RESULT ok subscribers=2 applied=2 version=2` |
+| `liveconfig.rs` / `liveconfig.ts` / `liveconfig.py` | Rust ✓ · TS ✓ · Py ✓ | LaunchDarkly / Consul KV | register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally | `RESULT ok subscribers=2 applied=2 version=2` |
 
-Rust and TypeScript are both **executed** in CI; the manifest carries a per-binding status, so a port that exists but is not proven cannot read as one that is.
+Rust, TypeScript and Python are all **executed** in CI; the manifest carries a per-binding status, so a port that exists but is not proven cannot read as one that is.
 
 ```bash
 cargo run --example registry
@@ -76,6 +76,12 @@ Worth knowing before you build on them:
 - **A capability announcement is not re-delivered on re-announce.** In the current SDK mesh path, only a node's *first* announcement reaches its directly-connected peers: re-announcing with a changed tag set was measured to leave peers' folds unchanged (added tags never appear, removed tags never clear). `registry.rs` therefore demonstrates membership growing, not a provider retiring. Verify this against your own version before designing a withdrawal-based scheme on it.
 - **Multi-hop propagation is deferred on the SDK `Mesh`.** Announcements reach directly-connected peers only, which is why the caller in `registry.rs` connects to every provider it wants to see rather than relying on a relay.
 - **One real binding gap was found and closed, one reported gap was not real.** `live-config` could not be ported at first because the TypeScript SDK `MeshNode` wrapped `registerChannel` / `subscribeChannel` / `publish` but none of the napi receive verbs — a subscriber could join a roster and never read a payload. `MeshNode` now forwards `recv` / `recvShard` / `numShards` / `shardForStream`, and `liveconfig.ts` reads its revisions through them. The `job-queue` nRPC report did **not** reproduce: a producer calling two workers over `TypedMeshRpc` succeeds with the caller as responder or as initiator, with the service registered before or after the handshake, and with a reply-channel ACL pinned to the caller's EntityId. What does bite in TypeScript is lifecycle, not admission — every `node.rpc()` handle must be closed (`rpc.raw.close()`) before `shutdown()`, and two nodes built from the same `identitySeed` share a node id, so calls to "the second worker" silently land on whichever peer entry won.
+
+### Two more binding gaps, both in Python
+
+- **nRPC is unreachable from the shipped Python wheel.** `jobqueue.py` cannot exist: `net/crates/net/bindings/python/python/net/mesh_rpc.py` imports six streaming classes (`ClientStreamCall`, `DuplexCall`, `DuplexSink`, `DuplexStream`, `RequestStreamRecv`, `ResponseSinkSend`) that `bindings/python/src/lib.rs` never registers, so the module's import shim falls back and `TypedMeshRpc.from_mesh` raises `MeshRpc unavailable` — under a wheel built with `cortex`. The Rust and TypeScript routes pass.
+- **Blobs are not in the standard Python build.** `objectstore.py` cannot exist: the binding's usual feature list omits `dataforts`, so `BlobRef`, `blob_publish` and `MeshBlobAdapter` are absent from `net` entirely. The Rust, TypeScript and C surfaces carry them.
+- **One typing stub was completed on the way.** `NetMesh.poll_shard` exists at runtime and is how `liveconfig.py` reads its revisions, but `net/crates/net/bindings/python/python/net/_net.pyi` did not declare it, so `mypy` rejected the example. The stub now declares it.
 
 ## What CI checks here
 

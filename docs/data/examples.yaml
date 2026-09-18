@@ -103,8 +103,8 @@ examples:
     files:
       rust: registry.rs
       typescript: registry.ts
+      python: registry.py
     absent:
-      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
@@ -124,7 +124,7 @@ examples:
       rust: jobqueue.rs
       typescript: jobqueue.ts
     absent:
-      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "nRPC is not reachable from the shipped Python wheel: `net/mesh_rpc.py` imports six streaming classes (`ClientStreamCall`, `DuplexCall`, `DuplexSink`, `DuplexStream`, `RequestStreamRecv`, `ResponseSinkSend`) that `bindings/python/src/lib.rs` never registers, so the import shim falls back and `TypedMeshRpc.from_mesh` always raises `MeshRpc unavailable`. Rust and TypeScript pass."
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
@@ -142,7 +142,8 @@ examples:
       rust: objectstore.rs
       typescript: objectstore.ts
     absent:
-      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "the standard Python wheel is built without the `dataforts` feature, so `BlobRef`, `blob_publish` and `MeshBlobAdapter` are not in `net` at all. Rust, TypeScript and C carry the blob surface."
+
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
@@ -159,8 +160,8 @@ examples:
     files:
       rust: liveconfig.rs
       typescript: liveconfig.ts
+      python: liveconfig.py
     absent:
-      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:

@@ -901,6 +901,14 @@ class NetMesh:
         `errors` is a list of `{node_id, message}`."""
         ...
 
+    def poll_shard(self, shard_id: int, limit: int) -> list[StoredEvent]:
+        """Drain one ingestion shard, up to `limit` events.
+
+        The receive half of the channel surface: a published event lands
+        on the shard derived from its stream id, so a consumer polls
+        every shard. `StoredEvent.raw` is the payload itself."""
+        ...
+
     def announce_capabilities(self, caps: dict) -> None:
         """Broadcast `caps` to every directly-connected peer and
         self-index so :meth:`find_nodes` matches. Multi-hop
