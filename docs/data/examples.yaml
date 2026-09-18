@@ -87,3 +87,83 @@ examples:
       expect: "loses events silently"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------------------ wave 1
+  # Four services a developer already runs — a registry, a broker-backed job
+  # queue, an object store, a config service — each rebuilt on the substrate in
+  # one file with no service process to deploy. Rust is the reference binding;
+  # the ports are tracked, not silently missing.
+
+  - id: service-registry
+    skill: net-event-bus
+    title: The service registry you no longer run
+    route: providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: registry.rs
+    absent:
+      typescript: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+    run:
+      # Asserted on the last line's fields, not a transcript: node ids are
+      # nondeterministic, the counts are the contract.
+      expect: "RESULT ok providers=3 joined=1 best_moved=1"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: job-queue
+    skill: net-event-bus
+    title: The job queue you no longer run
+    route: append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: jobqueue.rs
+    absent:
+      typescript: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+    run:
+      expect: "RESULT ok jobs=6 done=6 retried=1 duplicates=0"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: object-store
+    skill: net-event-bus
+    title: The object store you no longer run
+    route: store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: objectstore.rs
+    absent:
+      typescript: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+    run:
+      expect: "RESULT ok dedup=1 readback=1 bytes=64"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: live-config
+    skill: net-event-bus
+    title: The config service you no longer run
+    route: register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: liveconfig.rs
+    absent:
+      typescript: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+    run:
+      expect: "RESULT ok subscribers=2 applied=2 version=2"
+      timeout_s: 120
+      not_wired: {}

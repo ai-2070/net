@@ -49,6 +49,31 @@ where they differ most:
 
 `hello.*` prints one line reporting that the bus accepted the event. If you see it, the SDK is installed and wired up correctly.
 
+### Wave 1 — the services you no longer run
+
+Four routes that rebuild a service a developer already operates, on the substrate, in one file. Each is **Rust-first**; the other bindings are declared absent in the manifest rather than silently missing, and the ports are tracked.
+
+Unlike `hello`/`observe`, these stand up **two to four real mesh nodes over loopback UDP** and exchange events between them — no memory transport, no mocks. They are the first examples in this directory that prove a round trip.
+
+| File | The service it replaces | Route | Expected line |
+|---|---|---|---|
+| `registry.rs` | Consul / etcd + a health poller | providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup | `RESULT ok providers=3 joined=1 best_moved=1` |
+| `jobqueue.rs` | Celery / SQS + Redis | append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log | `RESULT ok jobs=6 done=6 retried=1 duplicates=0` |
+| `objectstore.rs` | S3 / MinIO | store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address | `RESULT ok dedup=1 readback=1 bytes=64` |
+| `liveconfig.rs` | LaunchDarkly / Consul KV | register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally | `RESULT ok subscribers=2 applied=2 version=2` |
+
+```bash
+cargo run --example registry
+cargo run --example jobqueue
+cargo run --example objectstore
+cargo run --example liveconfig
+```
+
+Two things these do **not** show, worth knowing before you build on them:
+
+- **A capability announcement is not re-delivered on re-announce.** In the current SDK mesh path, only a node's *first* announcement reaches its directly-connected peers: re-announcing with a changed tag set was measured to leave peers' folds unchanged (added tags never appear, removed tags never clear). `registry.rs` therefore demonstrates membership growing, not a provider retiring. Verify this against your own version before designing a withdrawal-based scheme on it.
+- **Multi-hop propagation is deferred on the SDK `Mesh`.** Announcements reach directly-connected peers only, which is why the caller in `registry.rs` connects to every provider it wants to see rather than relying on a relay.
+
 ## What CI checks here
 
 Every file here is **compiled or type-checked** on each pull request against the
