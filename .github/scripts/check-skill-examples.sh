@@ -221,16 +221,20 @@ fi
 # the example. Measured: identical invocation, exit 1 from the repo root and
 # exit 0 from a scratch dir.
 #
-# KNOWN GAP, deliberately not closed here. With the shadow gone `net` is
-# unresolved, so `--ignore-missing-imports` makes it `Any` and the binding's
-# API is not actually checked (net_sdk still is — it comes from MYPYPATH).
-# Pointing MYPYPATH at `bindings/python/python` would type-check against the
-# real `_net.pyi`, and that stub currently has six pre-existing defects of its
-# own (undefined `ServeHandle` / `WriteToken` / `MigrationPhasesIter`, a
-# method used as a type, and two overload implementations that are illegal in
-# a stub). Fixing those means deleting implementation signatures that carry
-# the user-facing docstrings — a real change with real risk, and not one to
-# smuggle in behind an example. Left named rather than silently claimed.
+# BOTH LAYERS ARE ON MYPYPATH: `sdk-py/src` for the `net_sdk` wrapper and
+# `bindings/python/python` for the low-level `net` binding, whose `_net.pyi`
+# is the real type surface. That second entry is what makes an example using
+# the binding actually type-checked rather than silently `Any` under
+# `--ignore-missing-imports` — which is all it was before, because `net` was
+# unresolvable once the shadow above was removed.
+#
+# It is only safe to point here because the stub is now complete and clean:
+# it had declared 174 of the module's 209 exports, three names were USED as
+# annotations while undefined (`ServeHandle`, `WriteToken`,
+# `MigrationPhasesIter`), `list`/`tuple` were shadowed by same-named methods
+# inside four classes, and two overload implementations were illegal in a
+# stub file. All fixed; `mypy _net.pyi` is zero errors. If you add a pyo3
+# export, declare it here too or this check starts reporting it.
 echo "==> Python — type check against the SDK source"
 PY_FILES=$(files_for python)
 if [ -z "$PY_FILES" ]; then
@@ -240,7 +244,7 @@ elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>
   mkdir -p "$WORK/mypy-cwd"
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
-    if ( cd "$WORK/mypy-cwd" && MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
+    if ( cd "$WORK/mypy-cwd" && MYPYPATH="$ROOT/net/crates/net/sdk-py/src:$ROOT/net/crates/net/bindings/python/python" $MYPY \
            --ignore-missing-imports --follow-imports=silent --no-error-summary \
            --cache-dir "$WORK/mypy-cache" "$ROOT/$path" ) >"$WORK/py-$id.log" 2>&1; then
       ok "$id: $(basename "$path")"
