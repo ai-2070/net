@@ -3529,8 +3529,11 @@ class CapabilityGateway:
         ...
 
     def a2a_attempts(self) -> str:
-        """Every stored purchase attempt, as a JSON array — the operator's
-        queue. Each row is ``{key: {caller_hex, provider_node, task_id},
+        """Every stored purchase attempt **this gateway's caller identity
+        owns**, as a JSON array — the operator's queue. Rows written to the
+        same store file by a different caller identity are not listed: an
+        operator must not be invited to resolve an attempt it could not have
+        paid for. Each row is ``{key: {caller_hex, provider_node, task_id},
         commitment, prepared?, quote_id?, quote_expires_at_ns?, state: {...},
         updated_at_ns}``. The financially unresolved states (``unknown``,
         ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
@@ -3538,7 +3541,22 @@ class CapabilityGateway:
         :meth:`a2a_resolve_attempt` closes them."""
         ...
 
-    def a2a_resolve_attempt(self, task_id: str, outcome_json: str) -> None:
+    def set_a2a_org_caller(self, org_client: Any | None = None) -> None:
+        """Install (or clear with ``None``) the organization identity the
+        paid-A2A lifecycle presents to a PROTECTED provider.
+
+        Required to reach a provider serving its catalog under
+        ``principal="same_org"`` / ``"granted"``: all five A2A services
+        register PROTECTED, so an ordinary session-peer call is never
+        admitted. Applies to :meth:`prepare_task`, :meth:`purchase_task` and
+        :meth:`submit_task` from the next call onward. Fail-loud: a target
+        that is not an authorized provider of the service raises rather than
+        silently downgrading to an unprotected call."""
+        ...
+
+    def a2a_resolve_attempt(
+        self, task_id: str, outcome_json: str, provider_node: int | None = None
+    ) -> None:
         """Close an attempt the automatic path cannot: ``unknown``, ``denied``
         with ``funds_ambiguous``, or ``unexecutable``.
 
@@ -3552,8 +3570,15 @@ class CapabilityGateway:
         the operator established out of band — ``not_paid`` re-opens the key
         for a fresh :meth:`prepare_task`. ``closed`` retires an ambiguous or
         unexecutable attempt (refunded, written off, executed elsewhere)
-        keeping its evidence. Raises ``ValueError`` if no attempt carries
-        ``task_id``, or if two providers do."""
+        keeping its evidence.
+
+        A purchase key is ``(caller, provider_node, task_id)``; the caller
+        half is this gateway's identity, so ``provider_node`` completes it and
+        the attempt is resolved with no search. Omit it and ``task_id`` is
+        resolved against this caller's own rows — unambiguous until the same
+        id names attempts on two providers, in which case the ``ValueError``
+        lists the provider node ids to pass here. Raises ``ValueError`` if no
+        attempt carries ``task_id``."""
         ...
 
     def __repr__(self) -> str: ...
@@ -3898,7 +3923,7 @@ class PaymentProvider:
                 "revision": "r1",
                 "pricing_terms": provider.pricing_terms(
                     "net.a2a.task/summarize", requirements_json),
-                "bounds": {"max_prompt_bytes": 4096, "max_context_refs": 8,
+                "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8,
                            "max_tags": 8, "max_tag_bytes": 64,
                            "max_in_flight": 4},
                 "reservation_ttl_secs": 300,

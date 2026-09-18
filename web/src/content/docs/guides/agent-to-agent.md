@@ -32,13 +32,32 @@ exist. Put the context in [Dataforts](/docs/guides/dataforts) and hand over the
 refs.
 
 And it is enforced, not merely advised: a brief is refused locally if its
-encoded form exceeds `A2A_MAX_BRIEF_BYTES` (~1.7 KB). That ceiling is far below
-the nRPC body cap because the A2A wire carries its payload inside a JSON
-array-of-bytes envelope, which costs up to four bytes per payload byte, and one
-mesh packet is 8 KiB. An over-large request is not refused by the far side — it
-overflows the packet and is never delivered at all — so the check happens before
-anything is sent, and a configured service may not even announce a
-`max_prompt_bytes` above the limit (`ServeError::A2aUndeliverableBounds`).
+encoded form exceeds `A2A_MAX_BRIEF_BYTES`. That ceiling is far below the nRPC
+body cap because the A2A wire carries a request inside a JSON array-of-bytes
+envelope, which costs up to four bytes per payload byte, and one mesh packet is
+8 KiB. It also reserves room for the `TaskRecord` a status reply carries the
+brief back inside, so a brief that crossed the wire can always be read back.
+
+The encoded brief is **one joint budget**: the task id, the service and revision
+names, every context ref, every tag, the JSON structure and JSON escaping all
+come out of it. A service's announced `max_prompt_bytes` is a per-field cap the
+provider enforces, and serve time guarantees it is *reachable* — but spending
+the budget on refs and tags can still overflow it, and the refusal names both
+numbers. Query `a2a_announceable_prompt_bytes()` rather than hardcoding a
+figure; the constants are derived from the transport and move with it.
+
+An over-large request is not refused by the far side — it overflows the packet
+and is never delivered at all — so the check happens before anything is sent,
+and a configured service may not announce a `max_prompt_bytes` above the
+reachable ceiling (`ServeError::A2aUndeliverableBounds`).
+
+**Replies are bounded too.** A catalog, a status record or a result that would
+overflow a packet answers `ERR_A2A_REPLY_TOO_LARGE` naming what overflowed,
+rather than returning a frame the transport drops and leaving the caller to time
+out on an answer the provider already computed. Discovery is paginated, so a
+large catalog is walked rather than truncated; provider-authored diagnostic
+prose is truncated with the cut marked, because a verdict is worth delivering
+even abbreviated, while an offer or a result never is.
 
 A long prompt is therefore a design signal: put the bulk in an artifact ref,
 which is what briefs carry refs for.

@@ -43,8 +43,8 @@ use net_sdk::a2a::{
 };
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_a2a::{
-    A2aFlowError, A2aServiceConfig, A2aServicePolicy, A2A_CALL_TIMEOUT, A2A_MAX_BRIEF_BYTES,
-    A2A_STATUS_SERVICE,
+    a2a_announceable_prompt_bytes, A2aFlowError, A2aServiceConfig, A2aServicePolicy,
+    A2A_CALL_TIMEOUT, A2A_MAX_BRIEF_BYTES, A2A_STATUS_SERVICE,
 };
 use net_sdk::mesh_rpc::{RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, ServeError};
 
@@ -114,6 +114,27 @@ fn brief_encoding_to(target: usize) -> TaskBrief {
         "the padding arithmetic is wrong; fix the test, not the limit"
     );
     brief
+}
+
+/// A free `summarize` offer announcing `max_prompt_bytes`. One shape, so
+/// every bounds row below differs only in the number under test.
+fn offer_with(max_prompt_bytes: u64) -> A2aOffer {
+    A2aOffer {
+        service_id: "summarize".to_string(),
+        revision: "r1".to_string(),
+        description: None,
+        pricing_terms: None,
+        bounds: A2aBounds {
+            max_prompt_bytes,
+            max_context_refs: 4,
+            max_tags: 4,
+            max_tag_bytes: 32,
+            max_in_flight: 2,
+        },
+        reservation_ttl_secs: 600,
+        reservation_retention_secs: 604_800,
+        retention_secs: 3600,
+    }
 }
 
 /// The positive control for the size limit: a brief of **exactly**
@@ -314,6 +335,16 @@ async fn prepare_refuses_an_over_limit_brief_before_reserving() {
 /// against, and the failure mode for exceeding it is a vanished request
 /// rather than a refusal — so the lie is refused at serve time, the same
 /// discipline as an unenforceable price.
+///
+/// **Retargeted, round 2.** This row used to place the boundary at
+/// `A2A_MAX_BRIEF_BYTES` itself — which is exactly the incoherence the
+/// reviewer found: a *raw* prompt at that ceiling cannot fit, because the
+/// task id, the service and revision names and the JSON structure come
+/// out of the same encoded budget. So the control was announcing a bound
+/// no caller could ever use, and the test attested to it. The property it
+/// pins is unchanged — an unusable announcement refuses, a usable one
+/// serves — but the boundary is now the real one the provider publishes,
+/// [`a2a_announceable_prompt_bytes`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve() {
     let host = mesh().await;
@@ -322,23 +353,6 @@ async fn a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve() {
         runs: Arc::clone(&runs),
     });
 
-    let offer_with = |max_prompt_bytes: u64| A2aOffer {
-        service_id: "summarize".to_string(),
-        revision: "r1".to_string(),
-        description: None,
-        pricing_terms: None,
-        bounds: A2aBounds {
-            max_prompt_bytes,
-            max_context_refs: 4,
-            max_tags: 4,
-            max_tag_bytes: 32,
-            max_in_flight: 2,
-        },
-        reservation_ttl_secs: 600,
-        reservation_retention_secs: 604_800,
-        retention_secs: 3600,
-    };
-
     let config_for = |max_prompt_bytes: u64| {
         A2aServiceConfig::new(BTreeMap::from([(
             "summarize".to_string(),
@@ -346,13 +360,20 @@ async fn a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve() {
         )]))
     };
 
+    let usable = a2a_announceable_prompt_bytes("summarize", "r1");
+    assert!(
+        usable > 0 && usable < A2A_MAX_BRIEF_BYTES as u64,
+        "the usable prompt ceiling must sit strictly below the encoded-brief limit: \
+         {usable} vs {A2A_MAX_BRIEF_BYTES}"
+    );
+
     let refusal = host.serve_a2a_configured(
         TaskRegistry::new(),
         Arc::clone(&executor),
-        config_for(A2A_MAX_BRIEF_BYTES as u64 + 1),
+        config_for(usable + 1),
     );
     let err = match refusal {
-        Ok(_) => panic!("an undeliverable prompt bound must refuse to serve"),
+        Ok(_) => panic!("an unusable prompt bound must refuse to serve"),
         Err(e) => e,
     };
     match err {
@@ -361,24 +382,444 @@ async fn a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve() {
                 msg.contains("summarize"),
                 "the refusal must name the offending service: {msg}"
             );
+            assert!(
+                msg.contains("max_prompt_bytes") && msg.contains(&usable.to_string()),
+                "the refusal must name the field and the ceiling to announce instead: {msg}"
+            );
         }
         other => panic!("expected A2aUndeliverableBounds, got {other:?}"),
     }
 
-    // Control: the same catalog with a deliverable bound serves. Without
-    // it, a serve path broken for any reason would satisfy the assertion
-    // above.
+    // Control: the same catalog with the largest USABLE bound serves.
+    // Without it, a serve path broken for any reason would satisfy the
+    // assertion above.
     let serving = host
-        .serve_a2a_configured(
-            TaskRegistry::new(),
-            executor,
-            config_for(A2A_MAX_BRIEF_BYTES as u64),
-        )
-        .expect("a deliverable bound serves");
+        .serve_a2a_configured(TaskRegistry::new(), executor, config_for(usable))
+        .expect("the largest usable bound serves");
     assert_eq!(
         serving.handles.len(),
         5,
         "the configured catalog serves five services"
+    );
+}
+
+/// The advertised ceiling is not merely *announceable* — it is
+/// **usable**: a prompt of exactly `max_prompt_bytes` reaches the
+/// provider over a real wire and is admitted.
+///
+/// This is the other half of the coherence the reviewer asked for. The
+/// row above proves an unusable announcement is refused; this one proves
+/// the largest accepted announcement can actually be spent, end to end,
+/// rather than being a number that merely survives validation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_announced_prompt_ceiling_is_usable_over_the_wire() {
+    let host = mesh().await;
+    let caller = mesh().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let usable = a2a_announceable_prompt_bytes("summarize", "r1");
+    let _serving = host
+        .serve_a2a_configured(
+            TaskRegistry::new(),
+            Arc::new(Counting {
+                runs: Arc::clone(&runs),
+            }),
+            A2aServiceConfig::new(BTreeMap::from([(
+                "summarize".to_string(),
+                A2aServicePolicy::Free(offer_with(usable)),
+            )])),
+        )
+        .expect("serve at the usable ceiling");
+    connect_all(&host, &[&caller]).await;
+    let target = host.inner().node_id();
+
+    // A prompt of exactly the advertised size, with the task id the
+    // deliverability contract reserves room for.
+    let brief = TaskBrief::new("x".repeat(usable as usize))
+        .with_task_id("t".repeat(128))
+        .with_service("summarize", "r1");
+    let reply = caller
+        .prepare_a2a(target, &brief)
+        .await
+        .expect("a prompt at the advertised ceiling must reach the provider");
+    assert!(
+        matches!(reply, net_sdk::a2a::PrepareReply::Reservation(_)),
+        "a prompt at the advertised ceiling must be admitted, got {reply:?}"
+    );
+}
+
+/// Every announced field bound can be satisfied and the brief still be
+/// undeliverable, because they share **one** encoded budget.
+///
+/// The refusal is local and names both numbers, and the control shows the
+/// documented remedy works: move the bulk into a context artifact ref.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brief_inside_every_field_bound_can_still_exceed_the_joint_budget() {
+    let caller = mesh().await;
+    let usable = a2a_announceable_prompt_bytes("summarize", "r1");
+
+    // Inside `max_prompt_bytes`, inside `max_context_refs`, inside
+    // `max_tags`, inside `max_tag_bytes` — and over the joint budget.
+    let greedy = TaskBrief::new("x".repeat(usable as usize))
+        .with_task_id("job-1")
+        .with_service("summarize", "r1")
+        .with_context_refs(vec!["blob://".to_string() + &"c".repeat(120); 4])
+        .with_tags(vec!["t".repeat(32); 4]);
+    let err = caller
+        .prepare_a2a(7, &greedy)
+        .await
+        .expect_err("the joint budget must refuse it");
+    match err {
+        A2aFlowError::BriefTooLarge { encoded, limit } => {
+            assert!(
+                encoded > limit && limit == A2A_MAX_BRIEF_BYTES,
+                "the refusal must name the encoded size and the limit: {encoded} / {limit}"
+            );
+        }
+        other => panic!("expected BriefTooLarge, got {other:?}"),
+    }
+
+    // Control: the same work with the bulk in a ref encodes small, so
+    // the refusal above is about the budget and not about refs or tags
+    // being present at all.
+    let lean = TaskBrief::new("summarize the attached document")
+        .with_task_id("job-1")
+        .with_service("summarize", "r1")
+        .with_context_refs(vec!["blob://".to_string() + &"c".repeat(120); 4])
+        .with_tags(vec!["t".repeat(32); 4]);
+    assert!(
+        lean.encode().len() <= A2A_MAX_BRIEF_BYTES,
+        "the documented remedy must produce a deliverable brief"
+    );
+}
+
+/// An offer whose own data cannot be **discovered** refuses to serve.
+///
+/// The reviewer's R8: a free service with a 4 KiB description started
+/// successfully and then `describe_a2a` timed out, because only the
+/// request brief was bounded. Descriptions now fit (the describe wire
+/// stopped paying the array-of-bytes envelope), so the refusal boundary
+/// sits at a genuinely undeliverable page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offer_too_large_to_discover_refuses_to_serve() {
+    let host = mesh().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let described = |description_len: usize| {
+        A2aServiceConfig::new(BTreeMap::from([(
+            "summarize".to_string(),
+            A2aServicePolicy::Free(A2aOffer {
+                description: Some("d".repeat(description_len)),
+                ..offer_with(512)
+            }),
+        )]))
+    };
+
+    let refused = host.serve_a2a_configured(
+        TaskRegistry::new(),
+        Arc::new(Counting {
+            runs: Arc::clone(&runs),
+        }),
+        described(16 * 1024),
+    );
+    match refused {
+        Ok(_) => panic!("an undiscoverable offer must refuse to serve"),
+        Err(ServeError::A2aUndeliverableBounds(msg)) => assert!(
+            msg.contains("summarize") && msg.contains("discovery page"),
+            "the refusal must name the service and the page it cannot fit: {msg}"
+        ),
+        Err(other) => panic!("expected A2aUndeliverableBounds, got {other:?}"),
+    }
+
+    // Control: the reviewer's own 4 KiB description now serves AND is
+    // discoverable — the repair moved the ceiling rather than widening a
+    // timeout.
+    let _serving = host
+        .serve_a2a_configured(
+            TaskRegistry::new(),
+            Arc::new(Counting { runs }),
+            described(4096),
+        )
+        .expect("a 4 KiB description serves");
+}
+
+/// A catalog larger than one packet is discovered **completely**, across
+/// pages.
+///
+/// Every offer here fits a page on its own; together they do not. Before
+/// pagination the reply was handed to the transport, dropped, and the
+/// caller burned its deadline — so this row fails as a `Timeout` (or as a
+/// short catalog) if paging regresses, not merely with a different error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalog_larger_than_one_packet_is_discovered_across_pages() {
+    let host = mesh().await;
+    let caller = mesh().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    // 12 offers × ~1.2 KiB of description ≈ 15 KiB, against a ~7 KiB
+    // page.
+    let mut services = BTreeMap::new();
+    for i in 0..12u32 {
+        let id = format!("svc-{i:02}");
+        services.insert(
+            id.clone(),
+            A2aServicePolicy::Free(A2aOffer {
+                service_id: id,
+                description: Some(format!("{i:02}").repeat(600)),
+                ..offer_with(512)
+            }),
+        );
+    }
+    let _serving = host
+        .serve_a2a_configured(
+            TaskRegistry::new(),
+            Arc::new(Counting { runs }),
+            A2aServiceConfig::new(services),
+        )
+        .expect("serve a multi-page catalog");
+    connect_all(&host, &[&caller]).await;
+    let target = host.inner().node_id();
+
+    let offers = caller
+        .describe_a2a(target)
+        .await
+        .expect("a multi-page catalog must be discoverable");
+    let ids: Vec<&str> = offers.iter().map(|o| o.service_id.as_str()).collect();
+    let expected: Vec<String> = (0..12u32).map(|i| format!("svc-{i:02}")).collect();
+    assert_eq!(
+        ids,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the walk must return every service exactly once, in catalog order"
+    );
+    for offer in &offers {
+        assert_eq!(
+            offer.description.as_ref().expect("description").len(),
+            1200,
+            "each page's offers must arrive intact"
+        );
+    }
+}
+
+/// A terminal outcome the status reply cannot carry is an **actionable
+/// bounded failure**, not a timeout.
+///
+/// The response side of the same defect: the provider computed a record,
+/// handed an over-large reply to the transport, and the caller waited out
+/// `A2A_CALL_TIMEOUT` for an answer that already existed. Now it learns
+/// the sizes immediately, and the provider's own record is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undeliverable_status_record_is_refused_with_its_sizes() {
+    /// Returns a result far past what a status reply can carry.
+    struct Huge;
+    #[async_trait::async_trait]
+    impl TaskExecutor for Huge {
+        async fn run(&self, brief: TaskBrief, _c: CancelToken) -> Result<String, String> {
+            if brief.prompt == "small" {
+                return Ok("artifact:ok".to_string());
+            }
+            Ok(format!("blob://{}", "r".repeat(4000)))
+        }
+    }
+
+    let host = mesh().await;
+    let caller = mesh().await;
+    let _h = host
+        .serve_a2a(TaskRegistry::new(), Arc::new(Huge))
+        .expect("serve");
+    connect_all(&host, &[&caller]).await;
+    let target = host.inner().node_id();
+
+    let ack = caller
+        .submit_task(target, &TaskBrief::new("produce a giant result"))
+        .await
+        .expect("submit");
+    assert!(ack.accepted);
+
+    let started = Instant::now();
+    let mut refusal = None;
+    for _ in 0..200 {
+        match caller.task_status(target, &ack.task_id).await {
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    match refusal.expect("the over-large record must be refused, not dropped") {
+        A2aFlowError::ReplyTooLarge(message) => {
+            assert!(
+                message.contains("status record") && message.contains("per-packet"),
+                "the refusal must name what overflowed and the limit: {message}"
+            );
+        }
+        other => panic!(
+            "expected ReplyTooLarge; a Timeout here means the reply was computed and \
+             dropped, which is the defect: {other:?}"
+        ),
+    }
+    assert!(
+        started.elapsed() < A2A_CALL_TIMEOUT,
+        "the caller burned its full deadline ({:?}) instead of being told",
+        started.elapsed()
+    );
+
+    // Control: the same host, the same status verb, a record that fits —
+    // so the refusal above is about the size and not a broken status
+    // path.
+    let small = caller
+        .submit_task(target, &TaskBrief::new("small"))
+        .await
+        .expect("submit small");
+    for _ in 0..200 {
+        if let Ok(Some(rec)) = caller.task_status(target, &small.task_id).await {
+            if rec.state.is_terminal() {
+                assert_eq!(
+                    rec.state,
+                    TaskState::Completed {
+                        result_ref: "artifact:ok".to_string()
+                    }
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the control record never became readable");
+}
+
+/// A payment proof whose header cannot ride the request is refused
+/// **locally, before the call is registered** — on every profile.
+///
+/// The header encoder asserts its 4096-byte bound only in debug and
+/// narrows an over-long value into a `u16` in a shipped profile, so an
+/// unvalidated proof from a binding is a debug panic and a release
+/// corrupted frame. A 4097-byte binding therefore has to be refused
+/// before it reaches the encoder, which is what this measures: the call
+/// returns immediately, with no target reachable at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_over_the_request_header_bound_is_refused_before_the_call() {
+    use net_sdk::a2a::{AdmissionReservation, PreparedTask};
+    use net_sdk::a2a_payment::TaskPaymentProof;
+
+    let caller = mesh().await;
+    let prepared = PreparedTask {
+        provider_node: 7,
+        brief: TaskBrief::new("work").with_task_id("job-1"),
+        offer_hash: "offer".to_string(),
+        reservation: AdmissionReservation {
+            task_id: "job-1".to_string(),
+            admission_id: "adm-1".to_string(),
+            commitment: "commit".to_string(),
+            purchase_hash: "purchase".to_string(),
+            capability: "7/net.a2a.task/summarize".to_string(),
+            pricing_terms: None,
+            expires_at: u64::MAX,
+        },
+    };
+    let proof = |binding: Vec<u8>| TaskPaymentProof {
+        quote_id: "quote-1".to_string(),
+        binding_sig: binding,
+    };
+
+    let started = Instant::now();
+    let err = caller
+        .submit_task_paid(&prepared, &proof(vec![0x5a; 4097]))
+        .await
+        .expect_err("a 4097-byte binding must be refused locally");
+    match err {
+        A2aFlowError::ProofUndeliverable(detail) => assert!(
+            detail.contains("4097") && detail.contains("4096"),
+            "the refusal must name the size and the limit: {detail}"
+        ),
+        other => panic!("expected ProofUndeliverable, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the refusal reached the network instead of refusing locally"
+    );
+
+    // Control: a well-shaped proof of the real signature size passes
+    // validation and fails on TRANSPORT instead — node 7 does not exist
+    // — so the refusals above are about the proof and not about
+    // `submit_task_paid` refusing everything.
+    let control = caller
+        .submit_task_paid(&prepared, &proof(vec![0x5a; 64]))
+        .await
+        .expect_err("node 7 is unreachable");
+    assert!(
+        matches!(control, A2aFlowError::Transport(_) | A2aFlowError::Timeout),
+        "a 64-byte binding must pass proof validation and fail on transport, got {control:?}"
+    );
+}
+
+/// An application refusal whose prose outgrows the packet is **bounded
+/// and delivered**, not dropped.
+///
+/// The verdict is the load-bearing part of a refusal; the tail of an
+/// application's essay is not. So provider-authored prose is truncated at
+/// one place with the cut marked, and the caller still learns it was
+/// rejected and why — where an unbounded reason produced a reply the
+/// transport discarded and a caller that waited out its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_long_refusal_reason_is_bounded_and_still_delivered() {
+    struct Verbose;
+    #[async_trait::async_trait]
+    impl net_sdk::mesh_a2a::TaskPreflight for Verbose {
+        async fn preflight(
+            &self,
+            _owner: net_sdk::a2a::TaskOwner,
+            _offer: &A2aOffer,
+            _brief: &TaskBrief,
+        ) -> Result<(), String> {
+            Err(format!("QUOTA EXHAUSTED: {}", "why ".repeat(5000)))
+        }
+    }
+
+    let host = mesh().await;
+    let caller = mesh().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = host
+        .serve_a2a_configured(
+            TaskRegistry::new(),
+            Arc::new(Counting { runs }),
+            A2aServiceConfig::new(BTreeMap::from([(
+                "summarize".to_string(),
+                A2aServicePolicy::Free(offer_with(512)),
+            )]))
+            .with_preflight(Arc::new(Verbose)),
+        )
+        .expect("serve");
+    connect_all(&host, &[&caller]).await;
+    let target = host.inner().node_id();
+
+    let brief = TaskBrief::new("work")
+        .with_task_id("job-1")
+        .with_service("summarize", "r1");
+    let started = Instant::now();
+    let reply = caller
+        .prepare_a2a(target, &brief)
+        .await
+        .expect("an over-long refusal must still be delivered");
+    match reply {
+        net_sdk::a2a::PrepareReply::Rejected { reason } => {
+            assert!(
+                reason.starts_with("QUOTA EXHAUSTED:"),
+                "the verdict must survive the truncation: {reason}"
+            );
+            assert!(
+                reason.contains("more bytes dropped"),
+                "the cut must be marked so a reader is not left guessing: {reason}"
+            );
+            assert!(
+                reason.len() < 600,
+                "the reason was not bounded: {} bytes",
+                reason.len()
+            );
+        }
+        other => panic!("expected a Rejected reply, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < A2A_CALL_TIMEOUT,
+        "the caller burned its deadline on an undeliverable refusal"
     );
 }
 

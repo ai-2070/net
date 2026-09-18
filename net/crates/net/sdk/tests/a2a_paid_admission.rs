@@ -968,6 +968,63 @@ async fn a_paid_service_refuses_to_start_without_pricing() {
         .expect("a priced paid service starts");
 }
 
+/// A **priced** offer is bounded by the same discovery budget its
+/// description is: the `net.pricing.terms@1` document rides every
+/// catalog page.
+///
+/// This is the paid half of the reviewer's R8. A paid service is the one
+/// whose offer carries two variable-size fields, and the terms document
+/// is the field an operator is most likely to grow — it is generated
+/// from a pricing model, not typed by hand — so an unbounded one was a
+/// way to publish a service no caller could discover *and be charged
+/// nothing for the privilege*, since describe is uncharged.
+#[tokio::test]
+async fn a_paid_service_refuses_to_start_with_undiscoverable_pricing_terms() {
+    let provider = mesh().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("admissions.json");
+    let exec = ExecProbe::new(false);
+
+    let priced_with = |terms: String| A2aOffer {
+        pricing_terms: Some(terms),
+        ..offer(true)
+    };
+    let terms_of = |filler: usize| {
+        format!(
+            r#"{{"object":"net.pricing.terms@1","note":"{}"}}"#,
+            "t".repeat(filler)
+        )
+    };
+
+    let config = A2aServiceConfig::new(catalog(vec![A2aServicePolicy::Paid(priced_with(
+        terms_of(16 * 1024),
+    ))]))
+    .with_payment(RecordingTaskGate::new() as Arc<dyn TaskAdmissionGate>)
+    .with_journal(A2aAdmissionJournal::open(&path).await.expect("open"));
+    let err = provider
+        .serve_a2a_configured(TaskRegistry::new(), exec.executor(), config)
+        .err()
+        .expect("pricing terms that cannot be discovered must refuse to start");
+    match &err {
+        ServeError::A2aUndeliverableBounds(msg) => assert!(
+            msg.contains(SERVICE) && msg.contains("pricing_terms"),
+            "the refusal must name the service and the field to shorten: {msg}"
+        ),
+        other => panic!("expected A2aUndeliverableBounds, got {other:?}"),
+    }
+
+    // Control: a realistic terms document on the same catalog serves, so
+    // the refusal is about the size and not about pricing at all.
+    let config = A2aServiceConfig::new(catalog(vec![A2aServicePolicy::Paid(priced_with(
+        terms_of(2048),
+    ))]))
+    .with_payment(RecordingTaskGate::new() as Arc<dyn TaskAdmissionGate>)
+    .with_journal(A2aAdmissionJournal::open(&path).await.expect("reopen"));
+    provider
+        .serve_a2a_configured(TaskRegistry::new(), exec.executor(), config)
+        .expect("a 2 KiB terms document is discoverable and serves");
+}
+
 #[tokio::test]
 async fn a_free_service_refuses_pricing() {
     let provider = mesh().await;

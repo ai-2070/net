@@ -487,6 +487,8 @@ impl MeshBuilder {
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
             tool_watch: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(all(feature = "net", feature = "cortex"))]
+            a2a_org_caller: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 }
@@ -553,6 +555,22 @@ pub struct Mesh {
     /// [`Mesh::serve_tool_watch`].
     #[cfg(feature = "tool")]
     pub(crate) tool_watch: Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
+    /// The organization identity every A2A verb on this mesh presents
+    /// (`A2A_PAID_ADMISSION_PLAN.md` §D5).
+    ///
+    /// Installed rather than passed per call because the paid A2A caller
+    /// is *composed*: `net-payments`' `A2aCallerFlow` drives prepare →
+    /// purchase → submit through this mesh's own verbs, so a per-call
+    /// argument would have to be threaded through a crate that has no
+    /// business holding organization credentials. A serving node
+    /// configures its principal once; a calling node configures its
+    /// identity once, the same way.
+    ///
+    /// `Mutex<Option<..>>` matching the lazy-serve slots above: reads
+    /// clone the `Arc` under a short lock, so an in-flight call keeps the
+    /// client alive even if it is cleared immediately after.
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    pub(crate) a2a_org_caller: Arc<parking_lot::Mutex<Option<Arc<crate::org::OrgClient>>>>,
 }
 
 impl Mesh {
@@ -1394,7 +1412,46 @@ impl Mesh {
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
             tool_watch: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(all(feature = "net", feature = "cortex"))]
+            a2a_org_caller: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Install (or clear with `None`) the organization identity every
+    /// A2A verb on this mesh presents (`A2A_PAID_ADMISSION_PLAN.md`
+    /// §D5).
+    ///
+    /// A node serving `A2aPrincipal::OrgAdmitted` registers its five A2A
+    /// services as PROTECTED, so a caller must present an
+    /// exact-provider organization admission proof or it cannot reach the
+    /// service at all. This is where a caller supplies the credentials to
+    /// mint one: describe, prepare, submit, status and cancel all mint a
+    /// fresh proof per call, bound to the exact target node.
+    ///
+    /// Installed rather than passed per call because the paid caller is
+    /// composed — `net-payments` drives the same verbs — so the identity
+    /// belongs to the mesh, beside its keypair, not to one call site.
+    ///
+    /// **Fail-loud, never a silent downgrade.** With an identity
+    /// installed, a verb that cannot mint a proof for its target returns
+    /// `A2aFlowError::OrgAdmission` and sends nothing; it does not fall
+    /// back to an ordinary session-peer call. A PROTECTED provider would
+    /// refuse that anyway, and turning a local credential problem into a
+    /// remote admission denial hides which side is broken. A node that
+    /// must reach both protected and public A2A providers clears the
+    /// identity around the public calls.
+    ///
+    /// Replaces any previously-installed client.
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    pub fn set_a2a_org_caller(&self, org: Option<Arc<crate::org::OrgClient>>) {
+        *self.a2a_org_caller.lock() = org;
+    }
+
+    /// The organization identity installed by
+    /// [`set_a2a_org_caller`](Self::set_a2a_org_caller), if any.
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    pub fn a2a_org_caller(&self) -> Option<Arc<crate::org::OrgClient>> {
+        self.a2a_org_caller.lock().clone()
     }
 
     /// The named subnet exports this mesh was built with

@@ -389,6 +389,61 @@ struct QuoteRecord {
     billing_published: bool,
 }
 
+/// What survives retention of a **redeemed** record: the minimum needed
+/// to answer one question truthfully forever — "was this quote paid, and
+/// which admission consumed it?"
+///
+/// Retention exists because a full `QuoteRecord` carries the preserved
+/// requirement/payload carries and the whole verification chain, and
+/// once the billing event is in the `BillingLog` that bulk is
+/// bookkeeping. But the record was *also* the redemption gate's memory,
+/// and the provider's admission write is a **second** durable step in a
+/// **different** file: `redeem_for_task` marks the quote consumed, then
+/// the provider journals `Paid`. A crash in between leaves a settled
+/// payment whose admission is not yet recorded anywhere, and the
+/// engine's own record became prunable the moment it was marked
+/// redeemed. Compacting it there answered the provider's retry
+/// `unknown_quote` — "no funds moved, buy another quote" — about a
+/// payment that had settled, been billed, and been consumed by exactly
+/// this admission. The offer's admission retention is measured in days;
+/// the engine's horizon in hours, so the window is real rather than
+/// theoretical.
+///
+/// Bounded on purpose: six small fields, no carries, no chain, no
+/// billing event. The charge itself lives in the `BillingLog` (which is
+/// *why* a record is allowed to retire at all), so this is not a second
+/// copy of the evidence — it is the redemption authority, kept so a
+/// compacted purchase can still be re-admitted for the admission that
+/// bought it and can never be described as "never paid".
+///
+/// Permanent, for the same reason `consumed_transactions` is: "this
+/// payment was made and this admission consumed it" does not stop being
+/// true, and there is no engine-level invariant that says when it is
+/// safe to forget. One entry per retired paid+redeemed quote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RedemptionTombstone {
+    /// The capability the payment bought — the tool-binding check, which
+    /// a compacted record must still apply.
+    capability: String,
+    /// The payer, lowercase hex. A presented invocation binding is
+    /// verified against it exactly as the live record did.
+    caller_hex: String,
+    /// The quote's input commitment, if it had one. Compared before the
+    /// consumed-by check, so a proof for other work learns nothing about
+    /// this purchase.
+    input_hash: Option<String>,
+    /// Which admission consumed the quote (`redeem_for_task`'s
+    /// `expected_input_hash`), or `None` when the strictly-at-most-once
+    /// bearer invocation gate consumed it.
+    redeemed_for: Option<String>,
+    /// The billing event id, so an operator handed this quote can find
+    /// the charge in the `BillingLog` the record was retired in favour
+    /// of.
+    billing_id: Option<String>,
+    /// When retention retired the record (engine time, ns).
+    retired_at_ns: u64,
+}
+
 /// Struct wrapper (not a bare map) so a schema-version field can land
 /// without a breaking format change — same rationale as the pin store.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -405,6 +460,61 @@ struct EngineState {
     /// quote_id → lifecycle record.
     #[serde(default)]
     quotes: BTreeMap<String, QuoteRecord>,
+    /// quote_id → the redemption authority left behind when retention
+    /// retires a redeemed record. Written only by `prune_terminal`, read
+    /// only by the two redemption gates.
+    #[serde(default)]
+    redemptions: BTreeMap<String, RedemptionTombstone>,
+}
+
+impl RedemptionTombstone {
+    /// [`PaymentEngine::redeem_preconditions`], restricted to the checks
+    /// a compacted record can still make — and it can still make every
+    /// one that could fail here.
+    ///
+    /// Binding shape, payer identity and binding signature are all
+    /// carried. The two remaining live-record gates are satisfied by
+    /// construction rather than skipped: `is_prunable_at` refuses to
+    /// retire a **frozen** record (so a tombstone never stands for one)
+    /// and requires `billing.is_some()` (so `NotSettled` and
+    /// `SettlementPending` are unreachable). The tool binding is
+    /// re-derived from the same capability string by the same rule.
+    fn preconditions(
+        &self,
+        quote_id: &str,
+        tool_id: &str,
+        binding: Option<&[u8]>,
+    ) -> Result<EntityId, RedeemDenialReason> {
+        let sig_bytes = match binding {
+            Some(sig) => {
+                Some(<&[u8; 64]>::try_from(sig).map_err(|_| RedeemDenialReason::BindingMalformed)?)
+            }
+            None => None,
+        };
+        let payer = hex::decode(&self.caller_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(EntityId::from_bytes)
+            .ok_or(RedeemDenialReason::PayerRecordCorrupt)?;
+        if let Some(sig_bytes) = sig_bytes {
+            let transcript = invocation_binding_transcript(quote_id, tool_id);
+            if payer.verify_bytes(&transcript, sig_bytes).is_err() {
+                return Err(RedeemDenialReason::BindingRejected);
+            }
+        }
+        let bound_tool = self
+            .capability
+            .split_once('/')
+            .map(|(_, tool)| tool)
+            .unwrap_or(self.capability.as_str());
+        if bound_tool != tool_id {
+            return Err(RedeemDenialReason::WrongToolBinding {
+                capability: self.capability.clone(),
+                tool_id: tool_id.to_string(),
+            });
+        }
+        Ok(payer)
+    }
 }
 
 impl QuoteRecord {
@@ -415,15 +525,22 @@ impl QuoteRecord {
     /// `BillingLog` (`billing_published`), which is the audit surface.
     /// The record itself is then engine bookkeeping, not evidence.
     ///
+    /// "Not evidence" is a claim about the *charge*, which the
+    /// `BillingLog` holds. It was never true of the **redemption
+    /// authority** the same record carried, so that part is retained
+    /// past the horizon instead of dying with it — see
+    /// [`RedemptionTombstone`].
+    ///
     /// The expiry floor is what keeps deletion from becoming
     /// resurrection. If a record were removed while its signed quote were
     /// still valid, re-presenting that quote would miss in `s.quotes` and
     /// mint a *fresh* record (`accept_payment`'s claim closure), and the
     /// lifecycle could eventually serve a second time — the replay maps
     /// do not carry the terminal/idempotency outcome, so they cannot
-    /// stand in for the record here. (`accept_payment` also rejects an
-    /// expired quote before the claim transaction, so this is the second
-    /// of two independent guards, not the only one.)
+    /// stand in for the record here. (`accept_payment` also refuses an
+    /// expired quote that has no authoritative outcome to recover —
+    /// `Claim::Expired`, decided inside the claim transaction — so this
+    /// is the second of two independent guards, not the only one.)
     ///
     /// **A frozen record is never terminal**, whatever else is set on it.
     /// Freezing is not confined to the pre-redemption lifecycle: a
@@ -456,7 +573,8 @@ impl QuoteRecord {
 }
 
 /// Retention sweep: drop terminal quote records past the horizon, plus the
-/// payload replay entry each one owns. Returns **how many records were
+/// payload replay entry each one owns, leaving a [`RedemptionTombstone`]
+/// behind for each. Returns **how many records were
 /// retired**, counted as they are removed rather than derived from a
 /// before/after size difference — the caller folds a non-zero count into
 /// its `dirty` flag, because a sweep is a real mutation and must persist
@@ -497,6 +615,22 @@ fn prune_terminal(
             continue;
         };
         retired += 1;
+        // The redemption authority outlives the record. `is_prunable_at`
+        // only retires a record that is settled, billed, published AND
+        // redeemed, so this always describes a real consumed payment —
+        // and the provider's own admission write is a separate durable
+        // step that may not have landed yet.
+        s.redemptions.insert(
+            quote_id.clone(),
+            RedemptionTombstone {
+                capability: rec.capability.clone(),
+                caller_hex: rec.caller_hex.clone(),
+                input_hash: rec.input_hash.clone(),
+                redeemed_for: rec.redeemed_for.clone(),
+                billing_id: rec.billing.as_ref().map(|b| b.billing_event_id.clone()),
+                retired_at_ns: now_ns,
+            },
+        );
         // Co-prune the payload guard this record owns — but only if it is
         // still *this* record's. If ownership has diverged (corruption, or
         // an unexpected migration state) the entry belongs to some other
@@ -546,6 +680,22 @@ enum Claim {
     Frozen(String),
     ReplayOtherQuote,
     QuoteAlreadyPaid,
+    /// The quote is past its authoritative expiry (plus tolerance) and
+    /// this record holds **no** authoritative outcome to recover — so
+    /// there is nothing to reconcile and a fresh settlement is refused.
+    ///
+    /// Decided inside the claim transaction rather than before it, and
+    /// strictly after the settled/billed arms, because the two questions
+    /// are not independent: "may this payload settle now" is about the
+    /// quote's validity window, while "what did this exact purchase
+    /// already do" is a fact the record already holds. Asking the first
+    /// one first answered a reconciliation of a completed purchase with
+    /// `QuoteExpired` — a statement that no money moved, about a payment
+    /// that had settled and billed.
+    ///
+    /// Read-only, like every other non-`Fresh` arm: an expired retry
+    /// mints no record.
+    Expired,
 }
 
 /// The best confidence this record has actually reached.
@@ -863,6 +1013,13 @@ impl PaymentEngine {
 
     /// Accept a payment against a quote: the full settle path, or the
     /// idempotent replay of an already-completed one.
+    ///
+    /// **Expiry is decided inside the claim transaction, not before it**
+    /// (the internal `Claim::Expired` outcome). Re-presenting the exact
+    /// payload of a purchase that already settled is authenticated
+    /// reconciliation of a fact this engine holds, and it has to answer
+    /// with that fact at any age; only a *fresh* payment is bounded by
+    /// the quote's validity window.
     pub async fn accept_payment(
         &self,
         quote: &PaymentQuote,
@@ -873,11 +1030,6 @@ impl PaymentEngine {
         // -- static checks: nothing here touches state or the network.
         if let Err(e) = self.check_quote(quote) {
             return Ok(PaymentDecision::Rejected { reason: e });
-        }
-        if now_ns >= quote.expires_at_ns.saturating_add(self.expiry_tolerance_ns) {
-            return Ok(PaymentDecision::Rejected {
-                reason: RejectReason::QuoteExpired,
-            });
         }
         if payload.view().accepted != *quote.requirements.view() {
             return Ok(PaymentDecision::Rejected {
@@ -903,6 +1055,10 @@ impl PaymentEngine {
         let in_flight_ttl_ns = self.in_flight_ttl_ns;
         let terminal_record_retention_ns = self.terminal_record_retention_ns;
         let expiry_tolerance_ns = self.expiry_tolerance_ns;
+        // Evaluated here, applied inside the claim block: the answer to
+        // "is this quote still open for a NEW payment" is needed only on
+        // the paths that would take one.
+        let expired = now_ns >= quote.expires_at_ns.saturating_add(expiry_tolerance_ns);
         let claim = {
             let payload_hash = payload_hash.clone();
             // Only the three `Claim::Fresh` paths mutate state (insert a new
@@ -910,13 +1066,13 @@ impl PaymentEngine {
             // in_flight); every other outcome is a read-only inspection.
             // `mutate_json_if_changed` therefore skips the durable write on
             // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
-            // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
-            // flag is `matches!(_, Fresh) || retired > 0`, each disjunct derived
-            // from the SAME branch that mutated — so it can never diverge from
-            // the mutation. The later writes (completion, `release_claim`,
-            // billing republish) are separate calls and remain unconditional,
-            // so a `verify_rejected` still persists both its claim (a Fresh
-            // here) and its release.
+            // / InProgress / AlreadySettled / ReplayOtherQuote / Expired). The
+            // dirty flag is `matches!(_, Fresh) || retired > 0`, each disjunct
+            // derived from the SAME branch that mutated — so it can never
+            // diverge from the mutation. The later writes (completion,
+            // `release_claim`, billing republish) are separate calls and remain
+            // unconditional, so a `verify_rejected` still persists both its
+            // claim (a Fresh here) and its release.
             mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
                 // Retention runs where records are minted, mirroring the spend
                 // engine's counter prune in `check_and_reserve`: the operation
@@ -926,8 +1082,10 @@ impl PaymentEngine {
                 //
                 // This cannot resurrect the quote being accepted: a record is
                 // only prunable well past its quote's authoritative expiry,
-                // and an expired quote was already rejected above, before this
-                // transaction. The two guards are independent.
+                // and a quote that far past it has no `Fresh` path out of the
+                // claim block below — `Claim::Expired` is the only outcome a
+                // pruned-and-re-presented quote can reach. The two guards are
+                // independent.
                 let retired =
                     prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
                 // Read before the `&mut` borrow below, which would
@@ -993,6 +1151,16 @@ impl PaymentEngine {
                             }
                             break 'claim Claim::AlreadySettled;
                         }
+                        // Past this line the record holds no authoritative
+                        // outcome, so every remaining arm would take (or wait
+                        // on) a NEW settlement — which is exactly what an
+                        // expired quote may not have. The two arms above are
+                        // deliberately upstream of it: they report what this
+                        // exact purchase already did, and that answer does not
+                        // decay.
+                        if expired {
+                            break 'claim Claim::Expired;
+                        }
                         if rec.in_flight {
                             // An attempt claimed this and has not finished:
                             // still running, or the process died before it
@@ -1039,6 +1207,13 @@ impl PaymentEngine {
                         rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
                         break 'claim Claim::Fresh;
+                    }
+                    // No record at all: nothing to reconcile, so an expired
+                    // quote cannot mint one. This is also what keeps retention
+                    // from becoming resurrection — a pruned record's quote is
+                    // by construction far past its expiry floor.
+                    if expired {
+                        break 'claim Claim::Expired;
                     }
                     if payload_consumed_elsewhere {
                         break 'claim Claim::ReplayOtherQuote;
@@ -1113,6 +1288,11 @@ impl PaymentEngine {
             Claim::Frozen(reason) => {
                 return Ok(PaymentDecision::Rejected {
                     reason: RejectReason::QuoteFrozen(reason),
+                })
+            }
+            Claim::Expired => {
+                return Ok(PaymentDecision::Rejected {
+                    reason: RejectReason::QuoteExpired,
                 })
             }
             Claim::QuoteAlreadyPaid => {
@@ -2094,12 +2274,26 @@ impl PaymentEngine {
         // `docs/internal/performance/payments-redeem-write-amplification.md`.
         let decision = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
             let Some(rec) = s.quotes.get_mut(&quote_id) else {
-                return (
-                    RedeemDecision::Denied {
-                        reason: RedeemDenialReason::UnknownQuote,
-                    },
-                    false,
-                );
+                // Retention may have compacted a paid, redeemed record.
+                // The quote is not unknown then — it was paid and already
+                // consumed, and saying `unknown_quote` would tell this
+                // caller that no funds moved and a new quote is safe,
+                // about a settlement that happened. This gate is strictly
+                // at-most-once, so the answer is the same one a live
+                // redeemed record gives: `already_redeemed`.
+                let Some(tomb) = s.redemptions.get(&quote_id) else {
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::UnknownQuote,
+                        },
+                        false,
+                    );
+                };
+                let reason = match tomb.preconditions(&quote_id, &tool_id, binding.as_deref()) {
+                    Ok(_) => RedeemDenialReason::AlreadyRedeemed,
+                    Err(reason) => reason,
+                };
+                return (RedeemDecision::Denied { reason }, false);
             };
             let payer =
                 match Self::redeem_preconditions(rec, &quote_id, &tool_id, binding.as_deref()) {
@@ -2163,6 +2357,16 @@ impl PaymentEngine {
     /// so a provider that crashed between this write and its journal
     /// write reconciles on retry instead of failing `already_redeemed` or
     /// charging a second time.
+    ///
+    /// **That window outlives the record.** Marking the quote redeemed is
+    /// what makes it eligible for ordinary retention, and the journal
+    /// write is a separate durable step — so the crash this idempotency
+    /// exists for is precisely the crash after which compaction can
+    /// remove the record. Every check above therefore also runs against
+    /// the retained redemption tombstone, in the same order, so a
+    /// compacted settled purchase re-admits for the admission that
+    /// bought it and is never answered `unknown_quote` — which would
+    /// claim no funds moved and recommend buying again.
     pub async fn redeem_for_task(
         &self,
         tool_id: &str,
@@ -2180,9 +2384,43 @@ impl PaymentEngine {
         // presenting wrong hashes cannot force an fsync per attempt.
         let decision = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
             let Some(rec) = s.quotes.get_mut(&quote_id) else {
+                // Retention may have compacted the record while the
+                // provider's own admission write was still outstanding —
+                // `redeem_for_task` marking the quote consumed is what
+                // makes it prunable, and the journal `Paid` write is a
+                // separate durable step in a separate file. The
+                // redemption authority is retained for exactly this, and
+                // resolves in the same order the live record does.
+                let Some(tomb) = s.redemptions.get(&quote_id) else {
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::UnknownQuote,
+                        },
+                        false,
+                    );
+                };
+                let payer = match tomb.preconditions(&quote_id, &tool_id, Some(&binding)) {
+                    Ok(payer) => payer,
+                    Err(reason) => return (RedeemDecision::Denied { reason }, false),
+                };
+                if tomb.input_hash.as_deref() != Some(expected.as_str()) {
+                    return (
+                        RedeemDecision::Denied {
+                            reason: RedeemDenialReason::InputBindingMismatch,
+                        },
+                        false,
+                    );
+                }
+                if tomb.redeemed_for.as_deref() == Some(expected.as_str()) {
+                    // The admission this payment bought, presented again.
+                    // Re-admitted with no write, exactly as the live
+                    // record would have — a compacted purchase is still a
+                    // purchase.
+                    return (RedeemDecision::Admitted { payer }, false);
+                }
                 return (
                     RedeemDecision::Denied {
-                        reason: RedeemDenialReason::UnknownQuote,
+                        reason: RedeemDenialReason::AlreadyRedeemed,
                     },
                     false,
                 );

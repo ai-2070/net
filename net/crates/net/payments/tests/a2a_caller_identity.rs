@@ -722,14 +722,31 @@ async fn a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliati
         "the payment is in flight under a persisted payload"
     );
 
-    // Retention removes the in-flight record (the classification defect
-    // this repair does not own), and a fresh prepare recreates the key.
-    // `prune` takes its clock as an argument, so the caller's clock does
-    // not move — which is what makes the replacement quote identical.
-    assert_eq!(
-        w.store.prune(w.clock.now_ns() + 1, 0).await.expect("prune"),
-        1,
-        "the in-flight attempt was pruned out from under the payment"
+    // The record is removed out of band, and a fresh prepare recreates
+    // the key. Round 1 staged this through `A2aPurchaseStore::prune`,
+    // which used to delete an in-flight `Paying` row — reviewer finding
+    // R5, now repaired, so retention keeps it and that route is gone.
+    // What replaces it is the same public recovery surface, used the way
+    // an operator tool or a restored-from-backup file reaches it: a
+    // locked mutation of `a2a-purchases.json` that drops this record.
+    // The staging is *verified* rather than assumed (the row is read
+    // back as absent), and the property under test is untouched: it is
+    // about what a decision taken against one incarnation may write to
+    // the next, not about how the key came to be recreated. No clock
+    // moves, which is what keeps the replacement quote identical.
+    let removed_id = superseded.key.id();
+    mutate_json::<A2aPurchaseFile, _, _>(w.store.path(), move |file| {
+        file.attempts.remove(&removed_id);
+    })
+    .await
+    .expect("remove the in-flight record out from under the payment");
+    assert!(
+        w.flow
+            .stored_attempt(NODE, "t-recreated")
+            .await
+            .expect("store read")
+            .is_none(),
+        "the in-flight attempt is gone, so the next prepare recreates the key"
     );
     w.flow
         .prepare_task(NODE, &w.offer, &brief("t-recreated"))
@@ -847,6 +864,113 @@ async fn a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliati
         .await
         .expect("operator resolution");
     assert_eq!(closed.state.tag(), StateTag::Resolved);
+}
+
+// ---------------------------------------------------------------------------
+// An exposed payment outlives the caller that sent it (finding R5)
+// ---------------------------------------------------------------------------
+
+/// A caller that dies with a payment in flight must still find **that
+/// exact purchase** afterwards, retention included — and must recover it
+/// through the stored payload rather than buying again.
+///
+/// Staged without a sleep and without a seeded state: the payment is
+/// parked **inside the facilitator**, so the engine has claimed the quote
+/// and the money is genuinely in motion, and then the task driving it is
+/// **aborted**. That is the caller-termination window — the payload is
+/// exposed, and no outcome is recorded in the caller's store, in the
+/// engine, or anywhere else. An aggressive sweep then runs (zero
+/// retention, a clock far past every lease window) and must keep the row:
+/// `Paying` is the state that holds the byte-exact payload, and
+/// re-sending it is the only way to learn what became of the charge.
+/// Deleting it would destroy that evidence *and* let the next prepare
+/// mint a second quote for work that may already be paid for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exposed_payment_survives_caller_death_and_retention() {
+    let w = world(true, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-died"))
+        .await
+        .expect("prepare");
+
+    let flow = w.flow.clone();
+    let paying = tokio::spawn(async move { flow.purchase_task(NODE, "t-died").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.settle_gate.await_entered(1),
+    )
+    .await
+    .expect("the payment reached the facilitator");
+    let exposed = w.attempt("t-died").await;
+    assert_eq!(
+        exposed.state.tag(),
+        StateTag::Paying,
+        "the claim is durable before the payment goes out"
+    );
+    let sent = exposed
+        .payload_bytes
+        .clone()
+        .expect("the exact payload is persisted before the send");
+    assert_eq!(
+        w.channel.pay_sends(),
+        1,
+        "the payload really did leave this caller"
+    );
+
+    // The caller dies here: the future holding the payment is dropped
+    // while the engine's claim is durable and nothing has been recorded.
+    paying.abort();
+    assert!(
+        paying
+            .await
+            .expect_err("the purchase was cancelled")
+            .is_cancelled(),
+        "the caller terminated mid-payment"
+    );
+
+    // Zero retention, and a clock well past every lease window: the most
+    // aggressive sweep the public API can be asked for.
+    assert_eq!(
+        w.store
+            .prune(w.clock.now_ns() + 10 * PREPARE_LEASE_NS, 0)
+            .await
+            .expect("prune"),
+        0,
+        "an exposed payment is not finished work and must not be swept"
+    );
+    let kept = w.attempt("t-died").await;
+    assert_eq!(kept.state.tag(), StateTag::Paying);
+    assert_eq!(
+        kept.payload_bytes.as_deref(),
+        Some(sent.as_slice()),
+        "the byte-exact payload survived, which is what makes recovery possible"
+    );
+    assert_eq!(
+        kept.generation, exposed.generation,
+        "and it is the same incarnation, not a replacement"
+    );
+
+    // Recovery: the parked settlement is let go, and the clock moves past
+    // the caller's lease window and the engine's in-flight TTL (both well
+    // inside the quote's own hour) so the abandoned claim is reclaimable.
+    w.settle_gate.release();
+    w.clock.advance(600_000_000_000);
+    let resumed = w.flow.purchase_task(NODE, "t-died").await;
+    assert!(
+        matches!(resumed, A2aPurchase::Paid { .. }),
+        "the exact purchase must recover after caller death and retention: {resumed:?}"
+    );
+    assert_eq!(
+        (w.channel.pay_sends(), w.channel.distinct_payloads()),
+        (2, 1),
+        "recovery re-sent the stored payload verbatim; it never authored a second one"
+    );
+    assert_eq!(
+        w.channel.quote_calls(),
+        1,
+        "and never bought a second quote"
+    );
+    assert_eq!(w.billed().await, 1, "the charge happened exactly once");
 }
 
 // ---------------------------------------------------------------------------

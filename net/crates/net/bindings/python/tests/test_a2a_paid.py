@@ -1154,3 +1154,147 @@ def test_submit_task_kwargs_are_validated_at_the_boundary(tmp_path):
             )
     finally:
         mesh.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Operator recovery: the key is (caller, provider node, task id) — R12
+# ---------------------------------------------------------------------------
+
+
+def test_one_task_id_on_two_providers_is_resolvable_by_naming_the_provider(tmp_path):
+    """A purchase key is ``(caller, provider_node, task_id)``. One retained id
+    on two providers is two purchases, and the operator must be able to close
+    exactly one of them.
+
+    Before the repair the id-only verb refused the collision and pointed at
+    "the provider-scoped records" — an API that was not exposed — so a
+    two-provider collision was a dead end with real money on both sides.
+    """
+    cmesh = _mesh()
+    pmesh_a, pmesh_b = _mesh(), _mesh()
+    _handshake(cmesh, pmesh_a)
+    _handshake(cmesh, pmesh_b)
+    pmesh_a.start()
+    pmesh_b.start()
+    cmesh.start()
+    prov_a = Provider(tmp_path, pmesh_a, name="pa")
+    prov_b = Provider(tmp_path, pmesh_b, name="pb")
+    caller = Caller(tmp_path, cmesh, prov_a, name="col")
+    try:
+        # The SAME task id, prepared and paid on both providers.
+        for prov in (prov_a, prov_b):
+            caller.provider_node = prov.mesh.node_id
+            prep = caller.prepare("summarize both", task_id="shared-1")
+            assert prep["status"] == "ok", prep
+            paid = caller.purchase(prep["prepared"])
+            assert paid["status"] == "paid", paid
+
+        nodes = sorted(a["key"]["provider_node"] for a in caller.attempts())
+        assert nodes == sorted([pmesh_a.node_id, pmesh_b.node_id]), nodes
+
+        closed = json.dumps(
+            {"resolution": "closed", "outcome": "written_off", "evidence": {}}
+        )
+
+        # id alone is ambiguous — and the refusal now hands the operator the
+        # exact provider node ids, every one of them a valid argument below.
+        with pytest.raises(ValueError) as ambiguous:
+            caller.gateway.a2a_resolve_attempt("shared-1", closed)
+        message = str(ambiguous.value)
+        assert "provider_node" in message, message
+        for node in nodes:
+            assert str(node) in message, message
+
+        # Naming the provider completes the key, and the verb reaches THAT
+        # purchase: a settled `paid` attempt is not the operator's to close,
+        # and the refusal names the exact store key it resolved to — which
+        # is the observable that distinguishes "selected the right record"
+        # from "selected any record".
+        for named, other in ((pmesh_a, pmesh_b), (pmesh_b, pmesh_a)):
+            with pytest.raises(RuntimeError) as reached:
+                caller.gateway.a2a_resolve_attempt(
+                    "shared-1", closed, provider_node=named.node_id
+                )
+            key = str(reached.value)
+            assert f"/{named.node_id}/shared-1" in key, key
+            assert f"/{other.node_id}/" not in key, key
+            assert "is `paid`" in key, key
+
+        # Both purchases are still on file and still `paid`: naming one
+        # provider changed nothing about the other, and nothing about
+        # either.
+        states = {
+            a["key"]["provider_node"]: a["state"]["state"] for a in caller.attempts()
+        }
+        assert states == {pmesh_a.node_id: "paid", pmesh_b.node_id: "paid"}, states
+    finally:
+        caller.close()
+        prov_a.close()
+        prov_b.close()
+
+
+def test_two_caller_identities_sharing_one_store_see_only_their_own(tmp_path):
+    """Two gateways over ONE purchase file are two paying entities. The
+    operator queue must show each only its own rows.
+
+    ``A2aCallerFlow::attempts`` returns every record in the file, so without
+    the caller-identity filter the queue invited an operator to resolve an
+    attempt this gateway could not possibly have paid for.
+    """
+    provider, (alice, bob) = _topology(
+        tmp_path, callers=(("alice", "dev_test"), ("bob", "dev_test"))
+    )
+    try:
+        # Bob's gateway is rebuilt over ALICE's purchase file: one store,
+        # two caller identities.
+        bob.purchase_path = alice.purchase_path
+        bob.restart_gateway()
+
+        prep = alice.prepare("summarize mine", task_id="alice-1")
+        assert prep["status"] == "ok", prep
+        assert alice.purchase(prep["prepared"])["status"] == "paid"
+
+        mine = alice.attempts()
+        assert [a["key"]["task_id"] for a in mine] == ["alice-1"], mine
+        alice_caller = mine[0]["key"]["caller_hex"]
+
+        assert bob.attempts() == [], (
+            "bob's queue must not list alice's purchase: " f"{bob.attempts()}"
+        )
+        with pytest.raises(ValueError) as refused:
+            bob.gateway.a2a_resolve_attempt(
+                "alice-1",
+                json.dumps({"resolution": "not_paid", "reason": "not mine"}),
+            )
+        assert "no purchase attempt" in str(refused.value), str(refused.value)
+
+        # Control: bob's OWN purchase, into the same file, is his to see and
+        # to resolve — so the filter is about identity, not about the store
+        # being unreadable.
+        prep = bob.prepare("summarize bob", task_id="bob-1")
+        assert prep["status"] == "ok", prep
+        assert bob.purchase(prep["prepared"])["status"] == "paid"
+        his = bob.attempts()
+        assert [a["key"]["task_id"] for a in his] == ["bob-1"], his
+        assert his[0]["key"]["caller_hex"] != alice_caller
+        # His id resolves to HIS key — a settled `paid` attempt is not the
+        # operator's to reopen, and the refusal names the key it reached.
+        with pytest.raises(RuntimeError) as reached:
+            bob.gateway.a2a_resolve_attempt(
+                "bob-1", json.dumps({"resolution": "not_paid", "reason": "mine"})
+            )
+        assert his[0]["key"]["caller_hex"] in str(reached.value), str(reached.value)
+        assert alice_caller not in str(reached.value), str(reached.value)
+
+        # Alice's row is untouched, and still reachable through her own
+        # gateway: a valid store key stays valid.
+        assert [a["key"]["task_id"] for a in alice.attempts()] == ["alice-1"]
+        with pytest.raises(RuntimeError) as hers:
+            alice.gateway.a2a_resolve_attempt(
+                "alice-1", json.dumps({"resolution": "not_paid", "reason": "mine"})
+            )
+        assert alice_caller in str(hers.value), str(hers.value)
+    finally:
+        bob.close()
+        alice.close()
+        provider.close()

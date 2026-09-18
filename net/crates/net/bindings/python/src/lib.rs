@@ -1219,6 +1219,16 @@ mod mesh_bindings {
         ///
         /// `Relaxed`: a fairness hint, not a synchronization point.
         recv_cursor: Arc<std::sync::atomic::AtomicU16>,
+        /// The organization identity the A2A requester verbs present
+        /// (`A2A_PAID_ADMISSION_PLAN.md` §D5), installed by
+        /// `set_a2a_org_caller`.
+        ///
+        /// A node serving `principal="same_org"` / `"granted"` registers
+        /// its A2A services as PROTECTED, so a caller without an
+        /// exact-provider admission proof cannot reach them at all. This
+        /// is where the credentials to mint one live.
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        a2a_org_caller: Arc<parking_lot::Mutex<Option<Arc<net_sdk::org::OrgClient>>>>,
     }
 
     /// Build the core `MatchCriteria` from flat Python kwargs (so callers
@@ -1545,6 +1555,55 @@ mod mesh_bindings {
                 subnet_exports: subnet_exports_map,
                 channel_configs,
                 recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+                #[cfg(all(feature = "a2a", feature = "org"))]
+                a2a_org_caller: Arc::new(parking_lot::Mutex::new(None)),
+            })
+        }
+
+        /// Install (or clear with ``None``) the organization identity
+        /// every A2A requester verb on this mesh presents.
+        ///
+        /// Required to reach a provider serving its A2A catalog under
+        /// ``principal="same_org"`` or ``"granted"``: those five services
+        /// register as PROTECTED, so an ordinary session-peer call is not
+        /// admitted. ``describe_a2a``, ``submit_task``, ``task_status``,
+        /// ``cancel_task`` and ``submit_task_paid`` each mint a fresh
+        /// exact-provider proof per call.
+        ///
+        /// **Fail-loud.** With an identity installed, a verb whose target
+        /// is not an authorized provider of that service in this caller's
+        /// own organization view raises rather than silently falling back
+        /// to an unprotected call. Clear it to call a public A2A provider
+        /// from the same mesh.
+        ///
+        /// Holds the client alive, so ``org_client.close()`` afterwards
+        /// does not tear a call in flight; install ``None`` before
+        /// ``mesh.shutdown()``.
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        #[pyo3(signature = (org_client=None))]
+        fn set_a2a_org_caller(&self, org_client: Option<&crate::org::PyOrgClient>) -> PyResult<()> {
+            let installed = match org_client {
+                Some(client) => Some(client.shared().ok_or_else(|| {
+                    PyValueError::new_err("org:credentials:closed: this OrgClient has been closed")
+                })?),
+                None => None,
+            };
+            *self.a2a_org_caller.lock() = installed;
+            Ok(())
+        }
+
+        /// The installed A2A organization identity, as the two ids it
+        /// acts under (``acting_org``, ``caller``), or ``None``.
+        ///
+        /// Enough for an operator to confirm *which* identity is
+        /// installed without handing back a live client.
+        #[cfg(all(feature = "a2a", feature = "org"))]
+        fn a2a_org_caller(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+            self.a2a_org_caller.lock().as_ref().map(|c| {
+                (
+                    c.acting_org().as_bytes().to_vec(),
+                    c.caller().as_bytes().to_vec(),
+                )
             })
         }
 
@@ -1825,6 +1884,7 @@ mod mesh_bindings {
                 task_id,
                 service,
                 revision,
+                self.a2a_org(),
             )
         }
 
@@ -1845,6 +1905,7 @@ mod mesh_bindings {
                 self.node_arc_clone()?,
                 self.runtime.clone(),
                 target_node_id,
+                self.a2a_org(),
             )
         }
 
@@ -1877,6 +1938,7 @@ mod mesh_bindings {
                 self.runtime.clone(),
                 prepared_json,
                 proof_json,
+                self.a2a_org(),
             )
         }
 
@@ -1896,6 +1958,7 @@ mod mesh_bindings {
                 self.runtime.clone(),
                 target_node_id,
                 task_id,
+                self.a2a_org(),
             )
         }
 
@@ -1915,6 +1978,7 @@ mod mesh_bindings {
                 self.runtime.clone(),
                 target_node_id,
                 task_id,
+                self.a2a_org(),
             )
         }
 
@@ -3202,6 +3266,19 @@ mod mesh_bindings {
             self.node
                 .as_deref()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// The identity the A2A requester verbs hand to their `Mesh`.
+        ///
+        /// Not a `#[pymethods]` entry: it returns the SDK client, which
+        /// has no Python projection and must not get one — installing an
+        /// identity is a verb, reading it back out is not.
+        #[cfg(feature = "a2a")]
+        pub(crate) fn a2a_org(&self) -> crate::a2a::A2aOrgCaller {
+            #[cfg(feature = "org")]
+            return crate::a2a::A2aOrgCaller::installed(self.a2a_org_caller.lock().clone());
+            #[cfg(not(feature = "org"))]
+            crate::a2a::A2aOrgCaller::default()
         }
 
         /// Shared projection for both poll paths.

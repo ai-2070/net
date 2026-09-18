@@ -176,6 +176,10 @@ struct ScriptedTasks {
     admissions: parking_lot::Mutex<std::collections::HashMap<String, String>>,
     prepare_gate: Gate,
     prepare_calls: AtomicUsize,
+    /// Canned prepare outcomes, popped before a reservation is minted —
+    /// how a provider (or a local bound check) refusal is staged.
+    prepare_replies:
+        parking_lot::Mutex<std::collections::VecDeque<Result<PrepareReply, A2aFlowError>>>,
     submit_calls: AtomicUsize,
     submit_replies: parking_lot::Mutex<std::collections::VecDeque<Result<TaskAck, A2aFlowError>>>,
 }
@@ -187,6 +191,7 @@ impl ScriptedTasks {
             admissions: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prepare_gate: Gate::wide_open(),
             prepare_calls: AtomicUsize::new(0),
+            prepare_replies: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             submit_calls: AtomicUsize::new(0),
             submit_replies: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         }
@@ -201,6 +206,10 @@ impl ScriptedTasks {
             .clone()
     }
 
+    fn push_prepare(&self, reply: Result<PrepareReply, A2aFlowError>) {
+        self.prepare_replies.lock().push_back(reply);
+    }
+
     fn push_submit(&self, reply: Result<TaskAck, A2aFlowError>) {
         self.submit_replies.lock().push_back(reply);
     }
@@ -211,6 +220,9 @@ impl A2aProviderChannel for ScriptedTasks {
     async fn prepare(&self, node: u64, brief: &TaskBrief) -> Result<PrepareReply, A2aFlowError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         self.prepare_gate.pass().await;
+        if let Some(reply) = self.prepare_replies.lock().pop_front() {
+            return reply;
+        }
         // The provider computes the commitment from its OWN offer copy
         // and mints the admission id; the purchase hash is what those
         // two imply. Nothing here is read off the request.
@@ -1259,6 +1271,58 @@ async fn a_conflicting_commitment_under_the_same_key_is_rejected() {
         w.attempt("t-conflict").await.commitment,
         task_commitment(&w.offer, &brief("t-conflict")),
         "the original attempt is untouched"
+    );
+}
+
+/// A brief the wire cannot carry is a **permanent local** refusal, and
+/// must not be presented as a retryable transport failure.
+///
+/// The distinction is the whole value of the error type: the two arms
+/// are rendered to callers (and to the Python gateway) as
+/// `retryable: false` / `retryable: true`, so folding a bound check into
+/// `Transport` told every layer above to retry a brief that can never
+/// fit — forever, at one round trip per attempt. The size check itself
+/// belongs to the SDK and is pinned in `a2a_call_bounds`; what this
+/// witness holds is the classification.
+#[tokio::test]
+async fn an_oversize_brief_is_a_permanent_local_refusal_not_a_transport_retry() {
+    let w = world().await;
+    w.tasks.push_prepare(Err(A2aFlowError::BriefTooLarge {
+        encoded: net_sdk::mesh_a2a::A2A_MAX_BRIEF_BYTES + 1,
+        limit: net_sdk::mesh_a2a::A2A_MAX_BRIEF_BYTES,
+    }));
+
+    let refused = w
+        .flow
+        .prepare_task(NODE, &w.offer, &brief("t-too-large"))
+        .await
+        .expect_err("an oversize brief must be refused");
+    match &refused {
+        A2aPrepareError::BriefTooLarge { encoded, limit } => assert_eq!(
+            (*encoded, *limit),
+            (
+                net_sdk::mesh_a2a::A2A_MAX_BRIEF_BYTES + 1,
+                net_sdk::mesh_a2a::A2A_MAX_BRIEF_BYTES
+            ),
+            "the refusal carries the numbers a caller needs to shrink the brief"
+        ),
+        other => panic!(
+            "a local bound refusal must be its own permanent arm, not a retryable \
+             transport failure: {other:?}"
+        ),
+    }
+
+    // Nothing was quoted, nothing was charged, and no half-attempt was
+    // left behind: a rebuilt brief starts clean under the same key.
+    assert_eq!(w.channel.quote_calls(), 0);
+    assert_eq!(w.billed().await, 0);
+    assert!(
+        w.flow
+            .stored_attempt(NODE, "t-too-large")
+            .await
+            .expect("store read")
+            .is_none(),
+        "a prepare that never reached the wire leaves no record"
     );
 }
 

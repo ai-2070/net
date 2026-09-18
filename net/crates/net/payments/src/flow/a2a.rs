@@ -349,14 +349,28 @@ mod b64_bytes {
 impl PurchaseAttempt {
     /// Is this attempt exempt from ordinary retention?
     ///
-    /// `Unknown`, `RefusedExposed`, `PaidUnexecutable` and a `Paid`
-    /// attempt that was never submitted all describe money whose fate is
-    /// unresolved; pruning them would delete the caller's only evidence.
-    /// They leave only through an operator decision.
+    /// `Paying`, `Unknown`, `RefusedExposed`, `PaidUnexecutable` and a
+    /// `Paid` attempt that was never submitted all describe money whose
+    /// fate is unresolved; pruning them would delete the caller's only
+    /// evidence. They leave only through a resolved disposition.
+    ///
+    /// `Paying` is in this class because it is the **exposed** state, not
+    /// merely the busy one: the CAS that writes it persists the authored
+    /// payload in the same transaction, and from that moment the bytes
+    /// that authorize the charge may be on the wire. A row whose reply
+    /// was lost is indistinguishable from one whose payment settled, and
+    /// it holds the byte-exact payload that is the only way to ask the
+    /// provider which. Deleting it destroys that evidence *and* lets
+    /// `begin_prepare` mint a second quote for work that may already be
+    /// paid for. The disposition is always reachable — resuming the
+    /// stored payload resolves it to `Paid`, `Unknown` or
+    /// `RefusedExposed`, and `Unknown` has the operator exit — so this
+    /// retains an in-flight attempt, never an immortal one.
     pub fn is_unresolved_financial(&self) -> bool {
         matches!(
             self.state,
-            PurchaseState::Unknown { .. }
+            PurchaseState::Paying { .. }
+                | PurchaseState::Unknown { .. }
                 | PurchaseState::RefusedExposed { .. }
                 | PurchaseState::PaidUnexecutable { .. }
                 | PurchaseState::Paid { .. }
@@ -396,6 +410,9 @@ pub enum PurchaseState {
     /// The payload is authored and persisted; a pay request may be in
     /// flight. Any caller may re-send the stored payload; only the lease
     /// holder (or a taker-over after [`PREPARE_LEASE_NS`]) may author.
+    /// **Exposed**, therefore unresolved-financial: the authorizing
+    /// bytes exist and may have reached the provider, so the row is
+    /// never pruned (see [`PurchaseAttempt::is_unresolved_financial`]).
     Paying { lease_id: String, since_ns: u64 },
     /// Paid. `billing` is the payment proof (settlement ref + signed
     /// billing event) the caller keeps as its own evidence.
@@ -1121,10 +1138,12 @@ impl A2aPurchaseStore {
     ///
     /// Only `Submitted`, `Resolved`, `RefusedUnexposed`, and an
     /// abandoned `Preparing` lease follow ordinary retention. The
-    /// unresolved-financial classes — `Unknown`, `RefusedExposed`,
-    /// `PaidUnexecutable`, and a `Paid` attempt that was never submitted
-    /// — are **never** pruned: they are the caller's only record that
-    /// money may have moved. Returns how many were removed.
+    /// unresolved-financial classes — `Paying`, `Unknown`,
+    /// `RefusedExposed`, `PaidUnexecutable`, and a `Paid` attempt that
+    /// was never submitted — are **never** pruned: they are the caller's
+    /// only record that money may have moved, and `Paying` is the state
+    /// that holds the exact payload the provider was (or is being) asked
+    /// to charge. Returns how many were removed.
     pub async fn prune(&self, now_ns: u64, retention_ns: u64) -> Result<usize, StoreError> {
         mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
             let before = file.attempts.len();
@@ -1284,14 +1303,37 @@ impl A2aProviderChannel for MeshA2aChannel {
 ///
 /// Every arm is a distinct thing to do next, which is why they are not
 /// one string: `Busy` and `InFlight` are retries, `Existing` and
-/// `Reconciliation` are status reads, `Retired` and `Rejected` are dead
-/// ends, and `Conflict` needs an operator.
+/// `Reconciliation` are status reads, `Retired`, `Rejected` and
+/// `BriefTooLarge` are dead ends, and `Conflict` needs an operator.
 #[derive(Debug, thiserror::Error)]
 pub enum A2aPrepareError {
     /// Transport or decode failure talking to the provider. Nothing was
     /// reserved and nothing was quoted.
+    ///
+    /// **Ambiguous by nature and therefore retryable** — which is why a
+    /// local validation refusal must never be folded in here (see
+    /// [`Self::BriefTooLarge`]).
     #[error("a2a prepare transport failed: {0}")]
     Transport(String),
+    /// The brief exceeds the A2A envelope bound and was refused
+    /// **locally**: no packet left this process, nothing was reserved,
+    /// nothing was quoted.
+    ///
+    /// Its own arm rather than [`Self::Transport`] because the two have
+    /// opposite recovery postures and a caller (or a binding) can only
+    /// tell them apart by type. This is a permanent local validation
+    /// error: the same brief will be refused identically forever, so it
+    /// is neither retryable nor re-quotable — the work has to be moved
+    /// into a context artifact ref and the brief rebuilt.
+    #[error(
+        "brief is {encoded} bytes, over the {limit}-byte A2A envelope bound — refused locally"
+    )]
+    BriefTooLarge {
+        /// `TaskBrief::encode().len()`.
+        encoded: usize,
+        /// `net_sdk::mesh_a2a::A2A_MAX_BRIEF_BYTES`.
+        limit: usize,
+    },
     /// The provider refused the brief before reserving anything: unknown
     /// service, stale revision, a bound exceeded, an application
     /// preflight refusal, or this id already naming different work.
@@ -1629,7 +1671,15 @@ impl A2aCallerFlow {
             .tasks
             .prepare(provider_node, brief)
             .await
-            .map_err(|e| A2aPrepareError::Transport(e.to_string()))?;
+            // A local bound refusal is not a transport outcome: nothing
+            // was sent, and calling it `Transport` told every caller
+            // above this one to retry a brief that can never fit.
+            .map_err(|e| match e {
+                A2aFlowError::BriefTooLarge { encoded, limit } => {
+                    A2aPrepareError::BriefTooLarge { encoded, limit }
+                }
+                other => A2aPrepareError::Transport(other.to_string()),
+            })?;
         let reservation = match reply {
             PrepareReply::Reservation(reservation) => reservation,
             PrepareReply::Existing { task_id } => {

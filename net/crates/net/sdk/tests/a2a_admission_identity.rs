@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
 use net_sdk::a2a::{
     purchase_hash, task_commitment, A2aBounds, A2aOffer, AdmissionReservation, CancelToken,
     PrepareReply, PreparedTask, TaskBrief, TaskExecutor, TaskOwner, TaskRegistry, TaskState,
@@ -47,10 +49,16 @@ use net_sdk::a2a_journal::{
 use net_sdk::a2a_payment::{
     TaskAdmissionGate, TaskPaymentClaim, TaskPaymentEvidence, TaskPaymentProof,
 };
+use net_sdk::identity::Identity;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_a2a::{
-    A2aFlowError, A2aServiceConfig, A2aServicePolicy, A2aServing, TaskPreflight,
+    A2aFlowError, A2aPrincipal, A2aServiceConfig, A2aServicePolicy, A2aServing, TaskPreflight,
 };
+use net_sdk::org::types::{
+    DispatcherScope, NodeAuthority, OrgDispatcherGrant, OrgKeypair, OrgMembershipCert,
+    OwnerAudienceCredential,
+};
+use net_sdk::org::{OrgAccess, OrgCredentials};
 use net_sdk::tool_payment::{
     failure_vocab, FailureSchematic, GateDenial, Recovery, TAG_PAYMENT_FAILURE,
 };
@@ -1419,4 +1427,353 @@ async fn a_decision_opens_only_on_the_incarnation_it_names() {
         ),
         "a closed decision must release its slot"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R11 — a protected catalog is reachable by an authorized caller
+// ---------------------------------------------------------------------------
+
+/// A mesh with an adopted node authority owned by `owner`, announcing
+/// fast enough for a test to converge.
+///
+/// Built through `MeshNode::new` + `Mesh::from_node_arc` rather than
+/// `MeshBuilder` for exactly one reason: the default
+/// `min_announce_interval` is 10 s, and owner-scoped discovery ships on
+/// the announce path. `shared_audience` models the out-of-band
+/// pre-staging owner-scoped discovery requires — it is keyed on ONE
+/// per-organization audience, so two independently adopted nodes each
+/// minting their own could never open each other's envelopes.
+async fn org_mesh(
+    tag: &str,
+    owner: &OrgKeypair,
+    shared_audience: Option<&OwnerAudienceCredential>,
+) -> (Mesh, Identity, std::path::PathBuf) {
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    let node = Arc::new(node);
+
+    let entity = identity.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(owner, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-a2a-org-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    let authority = match shared_audience {
+        None => authority,
+        Some(shared) => NodeAuthority {
+            config: authority.config.clone(),
+            audience: OwnerAudienceCredential::decode_config(&shared.encode_config())
+                .expect("decode shared owner audience"),
+            revocation: authority.revocation.clone(),
+        },
+    };
+    node.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    node.set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+
+    (
+        Mesh::from_node_arc(node, channel_configs, Some(identity.clone())),
+        identity,
+        dir,
+    )
+}
+
+/// Handshake `caller` to `provider`, start both, and wait for entity
+/// pins in both directions — the core refuses to publish an admission
+/// proof to a target it cannot prove is the provider.
+async fn bring_up(caller: &Mesh, provider: &Mesh) {
+    let provider_pub = *provider.public_key();
+    let provider_addr = provider.local_addr();
+    let caller_id = caller.node_id();
+    let p = provider.node_arc();
+    let accept = tokio::spawn(async move { p.accept(caller_id).await });
+    caller
+        .connect(
+            &provider_addr.to_string(),
+            &provider_pub,
+            provider.node_id(),
+        )
+        .await
+        .expect("connect");
+    accept.await.expect("accept task").expect("accept");
+    caller.start();
+    provider.start();
+    for m in [caller, provider] {
+        m.inner()
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+    }
+    for _ in 0..200 {
+        if caller.inner().peer_entity_id(provider.node_id()).is_some()
+            && provider.inner().peer_entity_id(caller_id).is_some()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("entity pins were not established in both directions");
+}
+
+/// Membership + dispatcher for `member` acting for `org`.
+fn belonging_for(
+    org: &OrgKeypair,
+    member: net::adapter::net::identity::EntityId,
+) -> (OrgMembershipCert, OrgDispatcherGrant) {
+    let cert = OrgMembershipCert::try_issue(org, member.clone(), 1, 3600).expect("cert");
+    let grant =
+        OrgDispatcherGrant::try_issue(org, member, DispatcherScope::Any, 3600).expect("dispatcher");
+    (cert, grant)
+}
+
+/// Completes with the shared `RESULT`, counting runs with multiplicity.
+struct CountingExecutor {
+    runs: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for CountingExecutor {
+    async fn run(&self, _brief: TaskBrief, _cancel: CancelToken) -> Result<String, String> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(RESULT.to_string())
+    }
+}
+
+/// **R11.** A provider serving its catalog PROTECTED is reachable by an
+/// authorized organization caller, through the whole lifecycle.
+///
+/// The finding this closes is not an authorization bypass — it is the
+/// opposite. `A2aPrincipal::OrgAdmitted` registers all five services
+/// PROTECTED, and every A2A requester verb built its call options with a
+/// deadline and payment headers and **no proof intent**, while core
+/// defaults `org_proof_intent` to `None` and signs only when one is
+/// supplied. So an operator could configure a protected principal and
+/// then have no native way to call it: correctly refused, permanently.
+///
+/// The pre-state control runs first and is what makes the rest mean
+/// anything: the same caller, the same target, the same verb, with no
+/// identity installed, is **refused**. If the service were not really
+/// protected, that row would pass and the success below would prove
+/// nothing.
+///
+/// A registration-failure test does not prove invocation, so this drives
+/// describe → prepare → submit → status → cancel over a real two-node
+/// wire and reads the provider's own record back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installed_org_identity_reaches_a_protected_a2a_lifecycle() {
+    let org = OrgKeypair::from_bytes([0xA1u8; 32]);
+    let (provider, _p_identity, p_dir) = org_mesh("prov", &org, None).await;
+    // The out-of-band pre-staging step: one owner audience per
+    // organization, so the caller can open the provider's scoped
+    // announcement at all.
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .inner()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("decode");
+    let (caller, c_identity, c_dir) = org_mesh("call", &org, Some(&shared)).await;
+
+    let runs = Arc::new(AtomicU64::new(0));
+    let serving = provider
+        .serve_a2a_configured(
+            TaskRegistry::new(),
+            Arc::new(CountingExecutor {
+                runs: Arc::clone(&runs),
+            }),
+            A2aServiceConfig::new(BTreeMap::from([(
+                SERVICE.to_string(),
+                A2aServicePolicy::Free(offer(false)),
+            )]))
+            .with_principal(A2aPrincipal::OrgAdmitted(OrgAccess::SameOrg)),
+        )
+        .expect("a protected free catalog serves");
+    bring_up(&caller, &provider).await;
+    let target = provider.node_id();
+
+    // ---- pre-state control: PROTECTED really is protected ----
+    let unadmitted = caller
+        .describe_a2a(target)
+        .await
+        .expect_err("a session-peer call must not be admitted to a protected catalog");
+    assert!(
+        matches!(unadmitted, A2aFlowError::Transport(_)),
+        "expected the provider's admission denial, got {unadmitted:?}"
+    );
+
+    // ---- install the identity ----
+    let (cert, dispatcher) = belonging_for(&org, c_identity.entity_id().clone());
+    let credentials =
+        OrgCredentials::new(cert, dispatcher, vec![], vec![]).expect("credentials assemble");
+    let org_client = Arc::new(caller.org(credentials).expect("bind"));
+    caller.set_a2a_org_caller(Some(Arc::clone(&org_client)));
+
+    // Owner-scoped discovery ships on the announce path, so converge by
+    // OUTCOME: re-announce and retry the verb until the caller's own
+    // authority view resolves the provider.
+    let mut offers = None;
+    for _ in 0..200 {
+        provider
+            .inner()
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .ok();
+        if let Ok(found) = caller.describe_a2a(target).await {
+            offers = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let offers = offers.expect("an authorized org caller must reach the protected catalog");
+    assert_eq!(offers.len(), 1, "{offers:?}");
+    assert_eq!(offers[0].service_id, SERVICE);
+
+    // ---- prepare ----
+    let b = brief("org-task-1");
+    let reply = caller
+        .prepare_a2a(target, &b)
+        .await
+        .expect("prepare over a protected service");
+    let reservation = match reply {
+        PrepareReply::Reservation(r) => r,
+        other => panic!("expected a reservation, got {other:?}"),
+    };
+    assert_eq!(reservation.task_id, "org-task-1");
+
+    // ---- submit (free catalog: no payment evidence) ----
+    let ack = caller
+        .submit_task(target, &b)
+        .await
+        .expect("submit over a protected service");
+    assert!(ack.accepted, "{ack:?}");
+
+    // ---- status: attributed to the ENTITY the proof names ----
+    let mut record = None;
+    for _ in 0..200 {
+        if let Ok(Some(found)) = caller.task_status(target, "org-task-1").await {
+            if found.state.is_terminal() {
+                record = Some(found);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let record = record.expect("the admitted caller reads its own task");
+    assert_eq!(
+        record.state,
+        TaskState::Completed {
+            result_ref: RESULT.to_string()
+        }
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the work ran exactly once");
+    // The durable record is keyed on the entity the admission proof
+    // names, never on the delivering peer — which is the whole point of
+    // the `OrgAdmitted` principal.
+    let stored = serving
+        .store
+        .lookup(
+            TaskOwner::Entity(*c_identity.entity_id().as_bytes()),
+            "org-task-1",
+        )
+        .await
+        .expect("lookup")
+        .expect("the admission is stored under the admitted entity");
+    assert_eq!(stored.task_id, "org-task-1");
+
+    // ---- cancel: reachable too, and terminal work answers false ----
+    let cancelled = caller
+        .cancel_task(target, "org-task-1")
+        .await
+        .expect("cancel over a protected service");
+    assert!(!cancelled, "a completed task has nothing to stop");
+
+    // ---- control: clearing the identity restores the refusal, so the
+    // success above was the identity and not a provider that opened up
+    // ----
+    caller.set_a2a_org_caller(None);
+    let cleared = caller
+        .describe_a2a(target)
+        .await
+        .expect_err("without an identity the protected catalog is unreachable again");
+    assert!(
+        matches!(cleared, A2aFlowError::Transport(_)),
+        "expected the provider's admission denial, got {cleared:?}"
+    );
+
+    drop(serving);
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+/// **R11, fail-loud.** With an identity installed, a target that is not
+/// an authorized provider of the service is a **local** refusal naming
+/// the organization problem — never a silent downgrade to a session-peer
+/// call.
+///
+/// The alternative would turn a credential problem into a remote
+/// admission denial (or, against a public provider, into an unprotected
+/// call the operator did not ask for). Nothing is sent: the assertion is
+/// that the verb returns before any round trip could complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installed_org_identity_refuses_an_unauthorized_target_locally() {
+    let org = OrgKeypair::from_bytes([0xA1u8; 32]);
+    let (caller, c_identity, c_dir) = org_mesh("solo", &org, None).await;
+    let (cert, dispatcher) = belonging_for(&org, c_identity.entity_id().clone());
+    let credentials = OrgCredentials::new(cert, dispatcher, vec![], vec![]).expect("credentials");
+    let org_client = Arc::new(caller.org(credentials).expect("bind"));
+    caller.set_a2a_org_caller(Some(Arc::clone(&org_client)));
+
+    // Node 7 is nobody: no pinned entity, no discovered capability.
+    let started = std::time::Instant::now();
+    let err = caller
+        .describe_a2a(7)
+        .await
+        .expect_err("an unauthorized target must be refused locally");
+    match err {
+        A2aFlowError::OrgAdmission(detail) => assert!(
+            detail.contains("no authorized provider"),
+            "the refusal must name the authority problem so an operator knows where to \
+             look: {detail}"
+        ),
+        other => panic!(
+            "expected a local OrgAdmission refusal; anything else means the call was \
+             issued as an ordinary session peer: {other:?}"
+        ),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the refusal waited on the network instead of refusing locally"
+    );
+
+    // Control: with the identity cleared, the SAME target fails as
+    // transport instead — so the arm above is about the missing
+    // authorization, not about node 7 being unreachable.
+    caller.set_a2a_org_caller(None);
+    let cleared = caller
+        .describe_a2a(7)
+        .await
+        .expect_err("node 7 is unreachable either way");
+    assert!(
+        matches!(cleared, A2aFlowError::Transport(_) | A2aFlowError::Timeout),
+        "expected a transport failure once the identity is cleared, got {cleared:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&c_dir);
 }

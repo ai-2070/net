@@ -439,9 +439,9 @@ async fn an_observed_tier_record_retires_on_the_same_clock_as_a_final_one() {
 // ============================================================================
 
 /// The load-bearing safety property: after a record is pruned, its own
-/// (now long-expired) quote cannot recreate lifecycle state. The expiry
-/// check in `accept_payment` runs before the claim transaction, so the
-/// pruned quote is refused outright rather than minting a fresh record.
+/// (now long-expired) quote cannot recreate lifecycle state. The claim
+/// transaction has no `Fresh` path for a quote past its expiry horizon,
+/// so the pruned quote is refused rather than minting a fresh record.
 #[tokio::test]
 async fn a_pruned_quote_cannot_recreate_lifecycle_state() {
     let f = fixture();
@@ -474,14 +474,27 @@ async fn a_pruned_quote_cannot_recreate_lifecycle_state() {
         "the refused attempt must not have minted a record"
     );
 
-    // And the gate still refuses to serve it.
+    // And the gate still refuses to serve it — but **not** as an unknown
+    // quote. This payment settled, billed and was redeemed; retention
+    // compacted the record, not the fact. `unknown_quote` renders as
+    // "no funds moved / request a new quote" (see `flow::denial_for`),
+    // which would tell a caller its paid invocation never happened.
+    // `already_redeemed` is what a live redeemed record answers and what
+    // the retained redemption authority answers after compaction: paid,
+    // consumed, and a new quote is needed for new work.
+    //
+    // Retargeted deliberately in the R7 repair: the assertion this
+    // replaces pinned the refusal's *reason token*, and that token was
+    // the defect. The property it was written for — a compacted record
+    // is never re-served through the at-most-once bearer gate — is
+    // unchanged and still asserted here.
     assert_eq!(
         f.engine
             .redeem_for_invocation(TOOL, &quote.quote_id, None)
             .await
             .unwrap(),
         RedeemDecision::Denied {
-            reason: net_payments::engine::RedeemDenialReason::UnknownQuote
+            reason: net_payments::engine::RedeemDenialReason::AlreadyRedeemed
         }
     );
 }

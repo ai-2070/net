@@ -92,11 +92,18 @@
 //! states it always saw.
 //!
 //! Where it does appear, the cost is stated rather than hidden:
-//! `TaskState` is a serde-tagged enum, so a **Rust requester built
-//! before this slice cannot decode a status reply carrying it** and
-//! gets [`A2aFlowError::Decode`] instead of a record. The Python and
-//! Node bindings hand the status back as a JSON string and pass the
-//! new tag through untouched, so they need no upgrade to read one.
+//! `TaskState` is a serde-tagged enum, so a **requester built before
+//! this slice cannot decode a status reply carrying it** and gets
+//! [`A2aFlowError::Decode`] instead of a record.
+//!
+//! That applies to **every language, not only Rust.** The Python and
+//! Node bindings return status as a JSON string, but the decode happens
+//! in this crate's `TaskState` *before* that string is produced — so a
+//! previously built wheel or addon fails exactly as a previously built
+//! Rust requester does. A native binding is not a thin JSON shim, and
+//! an earlier draft of this doc claimed transparent passthrough on that
+//! mistaken basis. Reading an `interrupted` status needs a binding built
+//! from this slice or later.
 //!
 //! Everything else here is additive and decodes on an old build:
 //! the two uncharged services ([`A2A_DESCRIBE_SERVICE`],
@@ -111,10 +118,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::a2a::{
-    await_admission_verdict, purchase_hash, random_id, task_commitment, A2aOffer, Admission,
-    AdmissionReservation, CancelToken, PrepareReply, PreparedTask, ReservationRefusal,
-    SubmitRejection, TaskAck, TaskBrief, TaskExecutor, TaskOwner, TaskRecord, TaskRegistry,
-    TerminalHook,
+    await_admission_verdict, purchase_hash, random_id, task_commitment, A2aCatalogPage,
+    A2aCatalogRequest, A2aOffer, Admission, AdmissionReservation, CancelToken, PrepareReply,
+    PreparedTask, ReservationRefusal, SubmitRejection, TaskAck, TaskBrief, TaskExecutor, TaskOwner,
+    TaskRecord, TaskRegistry, TerminalHook,
 };
 use crate::a2a_journal::{
     now_secs, A2aAdmissionJournal, A2aAdmissions, A2aJournalError, AdmissionRecord, AdmissionState,
@@ -128,7 +135,7 @@ use crate::mesh::Mesh;
 use crate::mesh_rpc::{
     CallOptions, CallOptionsExt, CallOptionsTyped, RpcContext, RpcError, RpcHandler,
     RpcHandlerError, RpcResponsePayload, RpcStatus, ServeError, ServeHandle,
-    NRPC_TYPED_HANDLER_ERROR,
+    NRPC_TYPED_BAD_REQUEST, NRPC_TYPED_HANDLER_ERROR,
 };
 use crate::org::OrgAccess;
 use crate::tool_payment::{
@@ -142,6 +149,19 @@ pub const A2A_TASK_SERVICE: &str = "net.a2a.task";
 pub const A2A_STATUS_SERVICE: &str = "net.a2a.status";
 /// The nRPC service an executor serves to cancel a task.
 pub const A2A_CANCEL_SERVICE: &str = "net.a2a.cancel";
+
+/// The application status an A2A handler answers when its reply cannot
+/// cross one packet.
+///
+/// In the application-defined band, beside
+/// [`ERR_PAYMENT`] `0x8006` and the
+/// shared `ERR_POLICY` (`0x8007`), so the A2A set never reuses a code
+/// with a different meaning. The requester maps it to
+/// [`A2aFlowError::ReplyTooLarge`]; every other status keeps its
+/// existing mapping.
+///
+/// [`ERR_PAYMENT`]: crate::tool_payment::ERR_PAYMENT
+pub const ERR_A2A_REPLY_TOO_LARGE: u16 = 0x8008;
 
 /// Hard deadline on every A2A round trip.
 ///
@@ -164,54 +184,138 @@ pub const A2A_CANCEL_SERVICE: &str = "net.a2a.cancel";
 /// is idempotent per `(owner, task id)`.
 pub const A2A_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The largest [`TaskBrief::encode`] output that can actually cross the
-/// wire, in bytes.
+/// The largest reply body — or request body — that can actually cross
+/// the A2A wire, in bytes.
 ///
-/// **Why a brief has a limit far below the nRPC body cap.** The A2A wire
-/// carries its payload inside a JSON *array-of-bytes* envelope (the
-/// `call_typed` shape with `Req = Resp = Vec<u8>`, spoken by the Node and
-/// Python bindings and by every peer on an older build). That encoding
-/// costs up to **four bytes per payload byte** — `255,` — so an encoded
-/// brief is quadrupled before it is framed. nRPC would accept 4 MiB, but
-/// one mesh packet is [`MAX_PACKET_SIZE`], and a request that does not
-/// fit is never delivered: before this limit existed, a brief with a
-/// ~2 KB prompt simply vanished and the caller — with no deadline — waited
-/// for a reply that could never come.
+/// One nRPC frame rides one mesh packet: the per-packet payload budget
+/// is [`MAX_PAYLOAD_SIZE`] (itself `MAX_PACKET_SIZE - HEADER_SIZE -
+/// TAG_SIZE`), and a frame that does not fit is **never delivered and
+/// never refused** — it simply disappears, which a caller cannot
+/// distinguish from a peer that never answers. Less
+/// `A2A_FRAMING_RESERVE` for everything that shares the packet with
+/// the body, this is what is left.
 ///
-/// Derived from the transport, not copied from it: the per-packet payload
-/// budget [`MAX_PAYLOAD_SIZE`] (itself `MAX_PACKET_SIZE - HEADER_SIZE -
-/// TAG_SIZE`), less a reserve for the nRPC request framing that shares
-/// the packet (service name, call id, and the payment headers a paid
-/// submit carries), divided by the envelope's worst-case expansion. A
-/// change to the packet budget therefore moves this limit at compile
-/// time rather than leaving a stale number behind — and
-/// `a_brief_at_the_wire_limit_round_trips` sends a brief of exactly this
-/// size over a real two-node wire, so the arithmetic is checked against
-/// the transport as well as against itself.
-///
-/// **A brief over this limit is refused locally**
-/// ([`A2aFlowError::BriefTooLarge`]) and a configured service may not
-/// announce a `max_prompt_bytes` above it
-/// (`ServeError::A2aUndeliverableBounds`). Work that needs more room
-/// belongs in a context artifact ref, which is what briefs carry refs
-/// for.
+/// Derived from the transport rather than copied from it, so a change to
+/// the packet budget moves every A2A bound at compile time instead of
+/// leaving a stale number behind.
 ///
 /// [`MAX_PACKET_SIZE`]: net::adapter::net::MAX_PACKET_SIZE
 /// [`MAX_PAYLOAD_SIZE`]: net::adapter::net::MAX_PAYLOAD_SIZE
-pub const A2A_MAX_BRIEF_BYTES: usize =
-    (net::adapter::net::MAX_PAYLOAD_SIZE - A2A_FRAMING_RESERVE) / JSON_BYTE_ARRAY_COST;
+pub const A2A_MAX_REPLY_BYTES: usize = net::adapter::net::MAX_PAYLOAD_SIZE - A2A_FRAMING_RESERVE;
+
+/// The largest payload the **array-of-bytes envelope** can carry.
+///
+/// The three legacy A2A verbs (submit, status, cancel) carry their
+/// payload inside a JSON array-of-bytes envelope — the `call_typed`
+/// shape with `Req = Resp = Vec<u8>`, spoken by the Node and Python
+/// bindings and by every peer on an older build. That encoding costs up
+/// to **four bytes per payload byte** (`255,`), so a payload is
+/// quadrupled before it is framed and the deliverable ceiling is a
+/// quarter of [`A2A_MAX_REPLY_BYTES`].
+///
+/// `net.a2a.describe` deliberately does **not** pay it: it is introduced
+/// by the paid-admission slice, it has no older speakers, and it carries
+/// the largest reply in the protocol — paying 4× there is what made an
+/// ordinary offer description undeliverable.
+const A2A_MAX_ENVELOPED_BYTES: usize = A2A_MAX_REPLY_BYTES / JSON_BYTE_ARRAY_COST;
+
+/// The largest [`TaskBrief::encode`] output that can cross the wire, in
+/// bytes.
+///
+/// Two envelopes bound a brief, and the tighter one wins. It travels
+/// *up* inside the array-of-bytes envelope (so
+/// `A2A_MAX_ENVELOPED_BYTES`), and it travels *back down* inside a
+/// [`TaskRecord`] whenever the caller reads status — so the record's own
+/// scaffolding and its terminal outcome come out of the same budget
+/// (`A2A_RECORD_RESERVE`). Subtracting it here is what makes **a brief
+/// that crossed the wire readable back**: before, a brief at the ceiling
+/// submitted fine and then every `task_status` call for it timed out.
+///
+/// **What shares this one budget.** The *encoded* brief, not the prompt:
+/// the task id, the service and revision names, every context ref, every
+/// tag, the JSON structure, and the escaping JSON spends on quotes,
+/// backslashes and control characters. A caller cannot evade the limit by
+/// splitting a long prompt across many refs, and a prompt inside the
+/// offer's `max_prompt_bytes` can still exceed this joint budget — which
+/// is refused **locally** as [`A2aFlowError::BriefTooLarge`], naming both
+/// numbers, before a packet is sent.
+///
+/// A configured service may not announce bounds this cannot honor
+/// (`ServeError::A2aUndeliverableBounds`): an announced
+/// `max_prompt_bytes` must be *reachable* — a brief carrying a prompt of
+/// exactly that many bytes must still encode within this limit — because
+/// an unreachable advertised ceiling is a promise a caller sizes real
+/// work against. `a_brief_at_the_wire_limit_round_trips` sends a brief of
+/// exactly this size over a real two-node wire, so the arithmetic is
+/// checked against the transport as well as against itself.
+///
+/// Work that needs more room belongs in a context artifact ref, which is
+/// what briefs carry refs for.
+pub const A2A_MAX_BRIEF_BYTES: usize = A2A_MAX_ENVELOPED_BYTES - A2A_RECORD_RESERVE;
+
+/// Budget held back from a brief for the [`TaskRecord`] that carries it
+/// back on a status reply: the record's own JSON scaffolding plus
+/// [`A2A_MAX_RESULT_BYTES`] for the terminal outcome.
+///
+/// `a_brief_at_the_ceiling_reads_back_within_the_reply_bound` encodes the
+/// maximal record and asserts it fits, so this reserve is verified rather
+/// than assumed.
+const A2A_RECORD_RESERVE: usize = 384;
+
+/// The terminal outcome a status reply is **guaranteed** to carry: the
+/// largest `Completed { result_ref }` or `Failed { error }` payload
+/// [`A2A_MAX_BRIEF_BYTES`] reserves room for.
+///
+/// A result is an artifact ref by design — the executor promotes the
+/// payload home and returns a handle — so this is generous for its
+/// purpose. An executor that returns more is not silently truncated and
+/// its record is not silently dropped: the status reply becomes
+/// [`A2aFlowError::ReplyTooLarge`], naming the sizes, and the provider's
+/// own record keeps the full value.
+pub const A2A_MAX_RESULT_BYTES: usize = 256;
+
+/// The largest provider-authored diagnostic text on any A2A reply: a
+/// prepare or submit refusal reason, a preflight message, a gate's
+/// human message.
+///
+/// Bounded by truncation with an explicit marker rather than by
+/// refusing the reply, because the *verdict* is the load-bearing part
+/// and the tail of the prose is not. Load-bearing payloads — offers,
+/// records, results — are never truncated; they get
+/// [`A2aFlowError::ReplyTooLarge`] instead.
+pub const A2A_MAX_REASON_BYTES: usize = 256;
 
 /// Worst-case bytes the array-of-bytes envelope spends per payload byte:
 /// three digits and a separator (`255,`).
 const JSON_BYTE_ARRAY_COST: usize = 4;
 
 /// Packet budget held back for everything that rides beside the body in
-/// one request: the nRPC frame's own fields, the longest A2A service
-/// name, and a paid submit's two payment headers (a quote id and a
-/// 64-byte signature). Generous on purpose — the cost of reserving too
+/// one request or reply: the nRPC frame's own fields, the longest A2A
+/// service name, and a paid submit's two payment headers (a quote id and
+/// a 64-byte signature). Generous on purpose — the cost of reserving too
 /// much is a slightly shorter prompt, and the cost of reserving too
-/// little is a request that disappears.
+/// little is a frame that disappears.
 const A2A_FRAMING_RESERVE: usize = 1024;
+
+/// Bytes the deliverability check assumes a caller spends on its own
+/// task id.
+///
+/// The id is caller-chosen and the protocol does not cap it separately —
+/// it comes out of the one encoded-brief budget like everything else. A
+/// caller that wants a longer id spends it out of its prompt, and the
+/// local [`A2aFlowError::BriefTooLarge`] says so; this number is only
+/// what serve-time reachability assumes when it asks whether an
+/// advertised `max_prompt_bytes` can be used.
+const A2A_TASK_ID_RESERVE: usize = 128;
+
+/// Most catalog pages [`Mesh::describe_a2a`] will follow before refusing.
+///
+/// A cursor that does not strictly advance is refused outright, so this
+/// bounds a *large* catalog rather than a looping one: at
+/// [`A2A_MAX_REPLY_BYTES`] per page it is far more room than any
+/// plausible service list, and it means a hostile provider cannot hold a
+/// caller in a paging loop forever.
+const A2A_MAX_CATALOG_PAGES: usize = 64;
 
 /// Errors from the requester-side A2A flow.
 #[derive(Debug, thiserror::Error)]
@@ -255,10 +359,11 @@ pub enum A2aFlowError {
     /// over-large request is not delivered and not refused, it simply
     /// disappears, which is indistinguishable from a peer that never
     /// answers. See [`A2A_MAX_BRIEF_BYTES`] for why the ceiling is what
-    /// it is.
+    /// it is, and for the complete list of what shares this one budget.
     #[error(
-        "a2a brief is {encoded} bytes encoded, over the {limit}-byte wire limit — \
-         shorten the prompt or move the bulk into a context artifact ref"
+        "a2a brief is {encoded} bytes encoded, over the {limit}-byte wire limit — the task \
+         id, the prompt, every context ref, every tag and JSON escaping share that one \
+         budget, so shorten the prompt or move the bulk into a context artifact ref"
     )]
     BriefTooLarge {
         /// `TaskBrief::encode().len()`.
@@ -266,6 +371,42 @@ pub enum A2aFlowError {
         /// [`A2A_MAX_BRIEF_BYTES`].
         limit: usize,
     },
+    /// The provider had an answer and it does not fit one packet, so it
+    /// said so instead of handing the transport a frame that would be
+    /// dropped.
+    ///
+    /// Always provider-authored, and always a *bounded* reply: the
+    /// message names what overflowed and by how much. This is the
+    /// response-side twin of
+    /// [`BriefTooLarge`](Self::BriefTooLarge) — the outcome a caller used
+    /// to get here was [`Timeout`](Self::Timeout) after
+    /// [`A2A_CALL_TIMEOUT`], indistinguishable from a wedged executor.
+    ///
+    /// Reachable for exactly one thing the protocol cannot bound in
+    /// advance: a terminal outcome over [`A2A_MAX_RESULT_BYTES`]. The
+    /// provider's own record still holds the full value, and the
+    /// configuration that could make a *catalog* unreadable is refused at
+    /// serve time instead.
+    #[error("a2a reply exceeded the deliverable size: {0}")]
+    ReplyTooLarge(String),
+    /// This mesh has an organization identity installed for A2A
+    /// ([`Mesh::set_a2a_org_caller`]) and no exact-provider proof could
+    /// be minted for the target, so **nothing was sent**.
+    ///
+    /// Fail-loud on purpose: the alternative is issuing the call as an
+    /// ordinary session peer, which a PROTECTED provider refuses anyway
+    /// and which would turn a credential problem into a remote admission
+    /// denial. Either the target is not an authorized provider of this
+    /// service in the caller's own org view, or a credential is out of
+    /// its window.
+    #[error("a2a org admission unavailable for this provider: {0}")]
+    OrgAdmission(String),
+    /// The payment proof cannot ride the request, refused **locally**
+    /// before the call was registered — so no pending call was created,
+    /// no packet was sent, and the purchase is untouched and still
+    /// presentable once the proof is right.
+    #[error("a2a payment proof is not presentable: {0}")]
+    ProofUndeliverable(String),
 }
 
 /// Encode a task id as a request body (a JSON string). One place so the status
@@ -275,30 +416,108 @@ fn task_ref_bytes(task_id: &str) -> Vec<u8> {
 }
 
 /// Typed call options carrying [`A2A_CALL_TIMEOUT`] as a hard deadline,
-/// stamped fresh per call. One place, so no A2A verb can be written
-/// without a bound by forgetting to add one.
-fn bounded_typed() -> CallOptionsTyped {
-    let mut opts = CallOptionsTyped::default();
-    opts.raw.deadline = Some(std::time::Instant::now() + A2A_CALL_TIMEOUT);
-    opts
+/// stamped fresh per call, plus the exact-provider organization proof
+/// this mesh's installed A2A identity mints for `target_node_id`.
+///
+/// One place, so no A2A verb can be written without a bound — or without
+/// its caller identity — by forgetting to add one. With no identity
+/// installed this is exactly the deadline it always was.
+fn bounded_typed(
+    mesh: &Mesh,
+    target_node_id: u64,
+    service: &str,
+) -> Result<CallOptionsTyped, A2aFlowError> {
+    Ok(CallOptionsTyped {
+        raw: bounded_raw(mesh, target_node_id, service)?,
+        ..CallOptionsTyped::default()
+    })
+}
+
+/// [`bounded_typed`]'s raw twin, for the one verb that needs reply
+/// headers.
+fn bounded_raw(
+    mesh: &Mesh,
+    target_node_id: u64,
+    service: &str,
+) -> Result<CallOptions, A2aFlowError> {
+    Ok(CallOptions {
+        deadline: Some(std::time::Instant::now() + A2A_CALL_TIMEOUT),
+        org_proof_intent: mesh.a2a_org_intent(target_node_id, service)?,
+        ..CallOptions::default()
+    })
 }
 
 /// Map a client-side RPC failure, keeping a timeout distinguishable from
 /// a hard transport error: the first leaves the outcome unknown and is
-/// safe to retry, the second does not.
+/// safe to retry, the second does not. A bounded-reply refusal is
+/// neither, and says so.
 fn map_call_err(e: RpcError) -> A2aFlowError {
     match e {
         RpcError::Timeout { .. } => A2aFlowError::Timeout,
+        RpcError::ServerError {
+            status, message, ..
+        } if status == ERR_A2A_REPLY_TOO_LARGE => A2aFlowError::ReplyTooLarge(message),
         other => A2aFlowError::Transport(format!("call: {other}")),
     }
 }
 
+/// Clamp provider-authored diagnostic prose to
+/// [`A2A_MAX_REASON_BYTES`], marking the cut so a reader is never left
+/// guessing whether a message ended or was trimmed.
+///
+/// The verdict a refusal carries is load-bearing; the tail of its prose
+/// is not. Truncating here is what keeps a refusal *deliverable* when an
+/// application preflight or a payment gate returns an essay.
+fn bounded_reason(reason: impl std::fmt::Display) -> String {
+    let text = reason.to_string();
+    if text.len() <= A2A_MAX_REASON_BYTES {
+        return text;
+    }
+    // Cut on a char boundary: a truncated UTF-8 sequence would make the
+    // reply undecodable, which is the failure this function prevents.
+    let mut end = A2A_MAX_REASON_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    format!("{}… [{dropped} more bytes dropped]", &text[..end])
+}
+
+/// The last gate every A2A reply passes.
+///
+/// A response body over [`A2A_MAX_REPLY_BYTES`] is not delivered and not
+/// refused by the transport — it disappears, and the caller waits out
+/// [`A2A_CALL_TIMEOUT`] for an answer that was already computed. So a
+/// handler that cannot fit its answer says so instead, in a reply that
+/// does fit: [`ERR_A2A_REPLY_TOO_LARGE`] naming what overflowed and by
+/// how much.
+fn deliverable(
+    what: &str,
+    reply: RpcResponsePayload,
+) -> Result<RpcResponsePayload, RpcHandlerError> {
+    if reply.body.len() > A2A_MAX_REPLY_BYTES {
+        return Err(RpcHandlerError::Application {
+            code: ERR_A2A_REPLY_TOO_LARGE,
+            message: format!(
+                "{what} is {} bytes on the wire, over the {A2A_MAX_REPLY_BYTES}-byte \
+                 per-packet limit; a reply that large is never delivered, so it is \
+                 refused instead",
+                reply.body.len()
+            ),
+        });
+    }
+    Ok(reply)
+}
+
 /// Refuse a brief that cannot cross the wire, before a packet is sent.
 ///
-/// The encoded brief — not the prompt — is what gets quadrupled by the
-/// array-of-bytes envelope, so the check is on `encode()`: context refs,
-/// tags and the service fields all count, and a caller cannot evade the
-/// limit by splitting a long prompt into many refs.
+/// The check is on `encode()`, never on the prompt: the task id, the
+/// service and revision names, every context ref, every tag, the JSON
+/// structure and JSON's own escaping all come out of the one budget
+/// [`A2A_MAX_BRIEF_BYTES`] describes, so a caller cannot evade the limit
+/// by splitting a long prompt into many refs — and a prompt that fits an
+/// offer's `max_prompt_bytes` can still fail here, which is why the
+/// error names both numbers.
 fn check_brief(brief: &TaskBrief) -> Result<Vec<u8>, A2aFlowError> {
     let encoded = brief.encode();
     if encoded.len() > A2A_MAX_BRIEF_BYTES {
@@ -308,6 +527,160 @@ fn check_brief(brief: &TaskBrief) -> Result<Vec<u8>, A2aFlowError> {
         });
     }
     Ok(encoded)
+}
+
+/// Fixed bytes the nRPC request frame spends beyond the body, the
+/// service name and the header values: the deadline, the flags, the
+/// counts, each header's own length prefix, and the event length prefix
+/// the frame rides in.
+const A2A_FRAME_FIXED: usize = 128;
+
+/// Refuse a payment proof that cannot ride the request, **before the
+/// call is registered**.
+///
+/// Two separate defects, both reachable from a binding that
+/// deserializes a caller-supplied proof document:
+///
+/// * A header value over `MAX_RPC_HEADER_VALUE_LEN` trips a
+///   `debug_assert` in the header encoder and, in a **shipped profile**,
+///   narrows the length into a `u16` — a corrupted frame rather than a
+///   refusal. So the bound is enforced here, on both profiles.
+/// Then the complete framed request — envelope, both headers, the
+/// service name and the frame's own fields — is measured against one
+/// packet, because a request that does not fit is never delivered and
+/// never refused.
+fn check_proof(proof: &TaskPaymentProof, body: usize) -> Result<(), A2aFlowError> {
+    let limit = net::adapter::net::cortex::MAX_RPC_HEADER_VALUE_LEN;
+    let undeliverable = |detail: String| Err(A2aFlowError::ProofUndeliverable(detail));
+    if proof.quote_id.len() > limit {
+        return undeliverable(format!(
+            "the quote id is {} bytes, over the {limit}-byte request-header limit",
+            proof.quote_id.len()
+        ));
+    }
+    if proof.binding_sig.len() > limit {
+        return undeliverable(format!(
+            "the binding signature is {} bytes, over the {limit}-byte request-header limit",
+            proof.binding_sig.len()
+        ));
+    }
+    let framed = body
+        + proof.quote_id.len()
+        + proof.binding_sig.len()
+        + HDR_PAYMENT_QUOTE.len()
+        + HDR_PAYMENT_BINDING.len()
+        + A2A_TASK_SERVICE.len()
+        + A2A_FRAME_FIXED;
+    let packet = net::adapter::net::MAX_PAYLOAD_SIZE;
+    if framed > packet {
+        return undeliverable(format!(
+            "the framed request is {framed} bytes with this proof on it, over the \
+             {packet}-byte per-packet limit — a request that large is never delivered"
+        ));
+    }
+    Ok(())
+}
+
+/// One offer's encoded length — what it costs on a catalog page.
+fn offer_bytes(offer: &A2aOffer) -> usize {
+    serde_json::to_vec(offer).unwrap_or_default().len()
+}
+
+/// The largest `max_prompt_bytes` a service named `service_id` at
+/// `revision` may announce and still have that ceiling be **usable**.
+///
+/// The announced bound is a promise a caller sizes real work against, so
+/// a brief carrying a prompt of exactly that many bytes has to fit
+/// [`A2A_MAX_BRIEF_BYTES`] — and the task id, the service and revision
+/// names and the JSON structure come out of the same budget. Comparing
+/// the raw field against the encoded-brief ceiling (what serve-time used
+/// to do) admitted an announcement no caller could ever use.
+///
+/// Measured, not estimated: the probe brief is encoded, so this can
+/// never drift from what `check_brief` enforces. `service_id` and
+/// `revision` are arguments because they ride every brief for this
+/// service and a long pair genuinely costs prompt room.
+///
+/// Refs and tags are deliberately *not* subtracted. They are per-field
+/// caps on one joint encoded budget rather than a joint promise: a
+/// caller that spends the budget on refs, on tags or on JSON escaping is
+/// refused locally by `check_brief` with both numbers named. Folding
+/// them in would refuse ordinary published bounds — a 1 KiB prompt with
+/// eight refs and eight tags — for a maximal combination no caller
+/// sends.
+pub fn a2a_announceable_prompt_bytes(service_id: &str, revision: &str) -> u64 {
+    let overhead = prompt_probe(service_id, revision, 0).encode().len();
+    A2A_MAX_BRIEF_BYTES.saturating_sub(overhead) as u64
+}
+
+/// The brief the reachability check measures: a prompt of `prompt`
+/// bytes, a task id of `A2A_TASK_ID_RESERVE`, this service's own names,
+/// and nothing else.
+fn prompt_probe(service_id: &str, revision: &str, prompt: usize) -> TaskBrief {
+    TaskBrief {
+        task_id: "t".repeat(A2A_TASK_ID_RESERVE),
+        prompt: "x".repeat(prompt),
+        context_refs: Vec::new(),
+        tags: Vec::new(),
+        service: Some(service_id.to_string()),
+        revision: Some(revision.to_string()),
+    }
+}
+
+/// Refuse a configured offer whose own data, or whose announced bounds,
+/// the wire cannot carry — **before** a single service is registered.
+///
+/// Two things must hold, and each one was a live way to publish an offer
+/// nobody could use:
+///
+/// 1. **It must be discoverable.** An offer alone on a catalog page must
+///    fit one reply. A description, a `net.pricing.terms@1` document and
+///    a bounds table all ride it, and an over-large page is not refused
+///    by the transport — it vanishes, and `describe_a2a` waits out its
+///    own deadline on a catalog the provider computed successfully.
+/// 2. **The advertised `max_prompt_bytes` must be reachable** —
+///    [`a2a_announceable_prompt_bytes`].
+///
+/// Reading a brief back is *not* checked per offer, and deliberately so:
+/// [`A2A_MAX_BRIEF_BYTES`] already reserves the record's room, so every
+/// brief that can cross the wire at all has a status reply that fits. A
+/// per-offer check would be a branch no configuration can reach.
+fn check_offer_deliverable(offer: &A2aOffer, services: usize) -> Result<(), String> {
+    let page = A2aCatalogPage {
+        offers: vec![offer.clone()],
+        next: Some(offer.service_id.clone()),
+        services,
+    };
+    let page_bytes = page.encode().len();
+    if page_bytes > A2A_MAX_REPLY_BYTES {
+        return Err(format!(
+            "its offer is {page_bytes} bytes on a discovery page, over the \
+             {A2A_MAX_REPLY_BYTES}-byte per-packet limit — a catalog that large is never \
+             delivered, so `describe_a2a` would time out instead of answering; shorten \
+             `description` or `pricing_terms`"
+        ));
+    }
+
+    let announceable = a2a_announceable_prompt_bytes(&offer.service_id, &offer.revision);
+    if offer.bounds.max_prompt_bytes > announceable {
+        return Err(format!(
+            "it announces max_prompt_bytes {} but a brief carrying a prompt that long \
+             encodes to {} bytes, over the {A2A_MAX_BRIEF_BYTES}-byte wire limit — the \
+             task id, the service and revision names and the JSON structure come out of \
+             the same budget, so the advertised ceiling could never be used and a caller \
+             sizing real work against it would send a request that is never delivered \
+             rather than one that is refused; announce at most {announceable}",
+            offer.bounds.max_prompt_bytes,
+            prompt_probe(
+                &offer.service_id,
+                &offer.revision,
+                offer.bounds.max_prompt_bytes as usize
+            )
+            .encode()
+            .len()
+        ));
+    }
+    Ok(())
 }
 
 /// The owner a request is attributed to.
@@ -343,6 +716,22 @@ fn json_ok(body: Vec<u8>) -> RpcResponsePayload {
         status: RpcStatus::Ok,
         headers: Vec::new(),
         body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+    }
+}
+
+/// An `Ok` response carrying `body` **raw** — no array-of-bytes
+/// envelope.
+///
+/// Only `net.a2a.describe` answers this way. It is introduced by the
+/// paid-admission slice, so it has no older speakers to keep compatible,
+/// and it carries the largest reply in the protocol: paying the
+/// envelope's 4× there cut the deliverable catalog to a quarter of a
+/// packet and made an ordinary offer description undeliverable.
+fn raw_ok(body: Vec<u8>) -> RpcResponsePayload {
+    RpcResponsePayload {
+        status: RpcStatus::Ok,
+        headers: Vec::new(),
+        body: bytes::Bytes::from(body),
     }
 }
 
@@ -393,17 +782,17 @@ impl RpcHandler for SubmitHandler {
                     Err(rejection) => TaskAck {
                         task_id: String::new(),
                         accepted: false,
-                        reason: Some(rejection.to_string()),
+                        reason: Some(bounded_reason(rejection)),
                     },
                 }
             }
             Err(e) => TaskAck {
                 task_id: String::new(),
                 accepted: false,
-                reason: Some(e.to_string()),
+                reason: Some(bounded_reason(e)),
             },
         };
-        Ok(json_ok(ack.encode()))
+        deliverable("submit ack", json_ok(ack.encode()))
     }
 }
 
@@ -422,7 +811,14 @@ impl RpcHandler for StatusHandler {
         // the full prompt and context refs, so "not yours" and "no such
         // task" must be indistinguishable.
         let record: Option<TaskRecord> = self.registry.record(owner_of(&ctx), &task_id);
-        Ok(json_ok(serde_json::to_vec(&record).unwrap_or_default()))
+        // The free path shares the response-side defect the configured
+        // one had: a record whose terminal outcome outgrows the envelope
+        // was handed to the transport and dropped, so `task_status`
+        // timed out on a record the provider had already produced.
+        deliverable(
+            "status record",
+            json_ok(serde_json::to_vec(&record).unwrap_or_default()),
+        )
     }
 }
 
@@ -437,7 +833,10 @@ impl RpcHandler for CancelHandler {
         let task_id: String =
             serde_json::from_slice(&typed_body(&ctx.payload.body)).unwrap_or_default();
         let cancelled = self.registry.cancel(owner_of(&ctx), &task_id);
-        Ok(json_ok(serde_json::to_vec(&cancelled).unwrap_or_default()))
+        deliverable(
+            "cancel reply",
+            json_ok(serde_json::to_vec(&cancelled).unwrap_or_default()),
+        )
     }
 }
 
@@ -500,7 +899,10 @@ impl A2aServicePolicy {
 #[async_trait::async_trait]
 pub trait TaskPreflight: Send + Sync {
     /// `Ok(())` admits; `Err(reason)` refuses, with `reason` travelling
-    /// to the caller verbatim.
+    /// to the caller — bounded to [`A2A_MAX_REASON_BYTES`] with the cut
+    /// marked, because a refusal whose prose outgrew the packet would not
+    /// be delivered at all and the verdict matters more than the tail of
+    /// the text.
     async fn preflight(
         &self,
         owner: TaskOwner,
@@ -662,7 +1064,11 @@ fn base_schematic(stage: &str, reason: &str, message: String, tool_id: &str) -> 
         code: failure_vocab::CODE_PAYMENT.to_string(),
         stage: stage.to_string(),
         reason: reason.to_string(),
-        message,
+        // Bounded here because a schematic's message is the body of the
+        // refusal reply AND rides its header: an unbounded gate or store
+        // diagnostic would be the one thing that makes a *refusal*
+        // undeliverable.
+        message: bounded_reason(message),
         retryable: false,
         recovery: Recovery {
             class: failure_vocab::CLASS_NON_RECOVERABLE.to_string(),
@@ -836,18 +1242,19 @@ fn refuse_payment(schematic: &FailureSchematic) -> ReservationRefusal {
     }
 }
 
-/// A gate denial, passed through untouched: the gate's own message and
-/// its own schematic.
+/// A gate denial, passed through: the gate's own message (bounded, so an
+/// unbounded diagnostic cannot make the refusal undeliverable) and its
+/// own schematic.
 fn refuse_gate(message: String, schematic: &FailureSchematic) -> ReservationRefusal {
     ReservationRefusal::Payment {
-        message,
+        message: bounded_reason(message),
         schematic: Box::new(schematic.clone()),
     }
 }
 
 /// A non-payment rejection, in-body exactly like the free path.
 fn refuse(reason: impl std::fmt::Display) -> ReservationRefusal {
-    ReservationRefusal::Rejected(reason.to_string())
+    ReservationRefusal::Rejected(bounded_reason(reason))
 }
 
 /// Render a verdict for the wire.
@@ -892,7 +1299,7 @@ fn ack_refused(reason: impl std::fmt::Display) -> RpcResponsePayload {
         TaskAck {
             task_id: String::new(),
             accepted: false,
-            reason: Some(reason.to_string()),
+            reason: Some(bounded_reason(reason)),
         }
         .encode(),
     )
@@ -940,9 +1347,63 @@ impl Catalog {
         Ok(offer)
     }
 
-    /// Every offer, in catalog order.
-    fn offers(&self) -> Vec<A2aOffer> {
-        self.services.values().map(|p| p.offer().clone()).collect()
+    /// One page of the catalog: every offer strictly after `after` that
+    /// fits one reply, plus the cursor to resume from.
+    ///
+    /// Greedy and exact — the estimate below decides how many offers to
+    /// take, and then the page's *real* encoding is measured and the page
+    /// shrinks until it fits. So a drift between the scaffolding estimate
+    /// and serde costs an extra encode, never an undeliverable reply.
+    /// A single-offer page is always returned even if it overflows:
+    /// serve-time validation refuses a catalog that could contain one, so
+    /// reaching that arm means the configuration invariant was bypassed
+    /// and the caller is owed [`ERR_A2A_REPLY_TOO_LARGE`] rather than
+    /// silence.
+    fn page(&self, after: Option<&str>) -> A2aCatalogPage {
+        let services = self.services.len();
+        let remaining: Vec<(&str, &A2aOffer)> = self
+            .services
+            .iter()
+            .filter(|(id, _)| match after {
+                Some(cursor) => id.as_str() > cursor,
+                None => true,
+            })
+            .map(|(id, policy)| (id.as_str(), policy.offer()))
+            .collect();
+        let page_of = |take: usize| A2aCatalogPage {
+            offers: remaining[..take]
+                .iter()
+                .map(|(_, offer)| (*offer).clone())
+                .collect(),
+            next: if take < remaining.len() {
+                Some(remaining[take - 1].0.to_string())
+            } else {
+                None
+            },
+            services,
+        };
+
+        // `{"offers":[..],"next":"<the longest id it could name>",
+        //   "services":<digits>}` plus one separator per offer.
+        let longest_id = remaining.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+        let mut used = 64 + longest_id + remaining.len();
+        let mut take = 0usize;
+        for (_, offer) in &remaining {
+            let grown = used + offer_bytes(offer);
+            if take > 0 && grown > A2A_MAX_REPLY_BYTES {
+                break;
+            }
+            used = grown;
+            take += 1;
+        }
+        while take > 1 {
+            let page = page_of(take);
+            if page.encode().len() <= A2A_MAX_REPLY_BYTES {
+                return page;
+            }
+            take -= 1;
+        }
+        page_of(take)
     }
 }
 
@@ -1094,7 +1555,7 @@ impl ConfiguredA2a {
         // nothing, which is the point of running it before a quote can
         // exist.
         if let Err(reason) = self.run_preflight(owner, &offer, &brief).await {
-            return PrepareReply::Rejected { reason };
+            return rejected(reason);
         }
 
         // P4 — resolve against the store. Nothing else mutates.
@@ -1703,7 +2164,7 @@ enum Admitted {
 /// A prepare refusal from anything that can render itself.
 fn rejected(reason: impl std::fmt::Display) -> PrepareReply {
     PrepareReply::Rejected {
-        reason: reason.to_string(),
+        reason: bounded_reason(reason),
     }
 }
 
@@ -1722,7 +2183,7 @@ impl RpcHandler for PrepareHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
         let owner = self.cfg.owner_of(&ctx)?;
         let reply = self.cfg.prepare(owner, &ctx.payload.body).await;
-        Ok(json_ok(reply.encode()))
+        deliverable("prepare reply", json_ok(reply.encode()))
     }
 }
 
@@ -1735,10 +2196,12 @@ struct ConfiguredSubmitHandler {
 impl RpcHandler for ConfiguredSubmitHandler {
     async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
         let owner = self.cfg.owner_of(&ctx)?;
-        Ok(self
-            .cfg
-            .submit(owner, &ctx.payload.body, &ctx.payload.headers)
-            .await)
+        deliverable(
+            "submit reply",
+            self.cfg
+                .submit(owner, &ctx.payload.body, &ctx.payload.headers)
+                .await,
+        )
     }
 }
 
@@ -1772,7 +2235,10 @@ impl RpcHandler for ConfiguredStatusHandler {
                 });
             }
         }
-        Ok(json_ok(serde_json::to_vec(&record).unwrap_or_default()))
+        deliverable(
+            "status record",
+            json_ok(serde_json::to_vec(&record).unwrap_or_default()),
+        )
     }
 }
 
@@ -1789,12 +2255,19 @@ impl RpcHandler for ConfiguredCancelHandler {
         let task_id: String =
             serde_json::from_slice(&typed_body(&ctx.payload.body)).unwrap_or_default();
         let cancelled = self.cfg.registry.cancel(owner, &task_id);
-        Ok(json_ok(serde_json::to_vec(&cancelled).unwrap_or_default()))
+        // A bool cannot overflow; the guard is here so every configured
+        // handler passes the same gate and a future reply shape cannot
+        // quietly become the one that is dropped.
+        deliverable(
+            "cancel reply",
+            json_ok(serde_json::to_vec(&cancelled).unwrap_or_default()),
+        )
     }
 }
 
 /// `net.a2a.describe` — uncharged discovery: every offer, with its
-/// bounds, its retention terms and (for a paid service) its pricing.
+/// bounds, its retention terms and (for a paid service) its pricing,
+/// one bounded page at a time.
 struct DescribeHandler {
     cfg: Arc<ConfiguredA2a>,
 }
@@ -1806,9 +2279,17 @@ impl RpcHandler for DescribeHandler {
         // `OrgAdmitted`), even though the answer is the same for every
         // caller: a catalog is not public data on a PROTECTED service.
         let _owner = self.cfg.owner_of(&ctx)?;
-        Ok(json_ok(
-            serde_json::to_vec(&self.cfg.catalog.offers()).unwrap_or_default(),
-        ))
+        // The raw body, not `typed_body`: describe is the one A2A verb
+        // that does not pay the array-of-bytes envelope, because it
+        // carries the largest reply in the protocol.
+        let request = A2aCatalogRequest::decode(&ctx.payload.body).map_err(|e| {
+            RpcHandlerError::Application {
+                code: NRPC_TYPED_BAD_REQUEST,
+                message: format!("net.a2a.describe request is not an A2aCatalogRequest: {e}"),
+            }
+        })?;
+        let page = self.cfg.catalog.page(request.after.as_deref());
+        deliverable("catalog page", raw_ok(page.encode()))
     }
 }
 
@@ -1832,6 +2313,30 @@ impl TaskExecutor for OwnedExecutor {
 }
 
 impl Mesh {
+    /// Mint the exact-provider organization admission proof this mesh's
+    /// installed A2A identity owes `target_node_id` for `service`, or
+    /// `None` when no identity is installed.
+    ///
+    /// Per call and per target, never cached: the proof is signed over
+    /// the finalized request and binds one `call_id`, and the SDK's
+    /// planner re-checks every credential's window and the node's
+    /// authority against one coherent capture before it mints. Bound to
+    /// the node the reservation lives on — a proof minted for the wrong
+    /// provider would disclose the credential to a peer that cannot use
+    /// it, which the core call path refuses anyway.
+    fn a2a_org_intent(
+        &self,
+        target_node_id: u64,
+        service: &str,
+    ) -> Result<Option<crate::mesh_rpc::OrgProofIntent>, A2aFlowError> {
+        let Some(org) = self.a2a_org_caller() else {
+            return Ok(None);
+        };
+        org.plan_for_node(service, target_node_id)
+            .map(Some)
+            .map_err(|e| A2aFlowError::OrgAdmission(e.to_string()))
+    }
+
     /// **Executor side.** Serve the three A2A services backed by `registry` +
     /// `executor`: accept briefs (spawning the executor), answer status, and
     /// cancel. Returns the [`ServeHandle`]s — hold them for as long as this
@@ -1943,13 +2448,9 @@ impl Mesh {
                 }
                 _ => {}
             }
-            if offer.bounds.max_prompt_bytes > A2A_MAX_BRIEF_BYTES as u64 {
+            if let Err(why) = check_offer_deliverable(offer, config.services.len()) {
                 return Err(ServeError::A2aUndeliverableBounds(format!(
-                    "service {id:?} announces max_prompt_bytes {} but a brief larger than \
-                     {A2A_MAX_BRIEF_BYTES} bytes encoded cannot cross the wire — a caller \
-                     sizing its work against that bound would send a request that is never \
-                     delivered rather than one that is refused",
-                    offer.bounds.max_prompt_bytes
+                    "service {id:?} cannot be served: {why}"
                 )));
             }
         }
@@ -2114,7 +2615,7 @@ impl Mesh {
                 target_node_id,
                 A2A_TASK_SERVICE,
                 &check_brief(brief)?,
-                bounded_typed(),
+                bounded_typed(self, target_node_id, A2A_TASK_SERVICE)?,
             )
             .await
             .map_err(map_call_err)?;
@@ -2134,7 +2635,7 @@ impl Mesh {
                 target_node_id,
                 A2A_STATUS_SERVICE,
                 &task_ref_bytes(task_id),
-                bounded_typed(),
+                bounded_typed(self, target_node_id, A2A_STATUS_SERVICE)?,
             )
             .await
             .map_err(map_call_err)?;
@@ -2155,7 +2656,7 @@ impl Mesh {
                 target_node_id,
                 A2A_CANCEL_SERVICE,
                 &task_ref_bytes(task_id),
-                bounded_typed(),
+                bounded_typed(self, target_node_id, A2A_CANCEL_SERVICE)?,
             )
             .await
             .map_err(map_call_err)?;
@@ -2173,17 +2674,57 @@ impl Mesh {
     /// offer it paid against. A node serving the legacy free path
     /// (`serve_a2a`) has no describe service and answers a transport
     /// error — free-by-omission is not an offer.
+    ///
+    /// **Paged.** A catalog is the largest reply in the protocol and one
+    /// reply must fit one packet, so this walks
+    /// [`A2aCatalogPage`]s until the provider stops offering a cursor and
+    /// returns the union. Three things make the walk safe against a
+    /// provider that answers nonsense: the cursor must strictly advance,
+    /// the walk is capped at `A2A_MAX_CATALOG_PAGES`, and the
+    /// collected count must equal the `services` the provider reported —
+    /// so a truncated walk is an error rather than a short catalog a
+    /// caller would act on.
     pub async fn describe_a2a(&self, target_node_id: u64) -> Result<Vec<A2aOffer>, A2aFlowError> {
-        let response: Vec<u8> = self
-            .call_typed(
-                target_node_id,
-                A2A_DESCRIBE_SERVICE,
-                &Vec::<u8>::new(),
-                bounded_typed(),
-            )
-            .await
-            .map_err(map_call_err)?;
-        serde_json::from_slice(&response).map_err(|e| A2aFlowError::Decode(e.to_string()))
+        let mut offers: Vec<A2aOffer> = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..A2A_MAX_CATALOG_PAGES {
+            let page: A2aCatalogPage = self
+                .call_typed(
+                    target_node_id,
+                    A2A_DESCRIBE_SERVICE,
+                    &A2aCatalogRequest {
+                        after: after.clone(),
+                    },
+                    bounded_typed(self, target_node_id, A2A_DESCRIBE_SERVICE)?,
+                )
+                .await
+                .map_err(map_call_err)?;
+            if let (Some(next), Some(prev)) = (page.next.as_ref(), after.as_ref()) {
+                if next <= prev {
+                    return Err(A2aFlowError::Decode(format!(
+                        "catalog cursor did not advance: {prev:?} -> {next:?}"
+                    )));
+                }
+            }
+            let services = page.services;
+            offers.extend(page.offers);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => {
+                    if offers.len() != services {
+                        return Err(A2aFlowError::Decode(format!(
+                            "catalog walk collected {} offers but the provider reports \
+                             {services} services",
+                            offers.len()
+                        )));
+                    }
+                    return Ok(offers);
+                }
+            }
+        }
+        Err(A2aFlowError::Transport(format!(
+            "catalog did not complete within {A2A_MAX_CATALOG_PAGES} pages"
+        )))
     }
 
     /// **Requester side.** Ask `target_node_id` to validate `brief` and
@@ -2213,7 +2754,7 @@ impl Mesh {
                 target_node_id,
                 A2A_PREPARE_SERVICE,
                 &check_brief(brief)?,
-                bounded_typed(),
+                bounded_typed(self, target_node_id, A2A_PREPARE_SERVICE)?,
             )
             .await
             .map_err(map_call_err)?;
@@ -2237,6 +2778,13 @@ impl Mesh {
     ///
     /// Uses the raw call path rather than `call_typed` because the
     /// schematic rides a **reply header**, which the typed helper drops.
+    ///
+    /// The proof's shape and the **complete** framed request are checked
+    /// here, before the call is registered: the header encoding asserts
+    /// its 4096-byte bound only in debug and narrows an over-long value
+    /// in release, so an unvalidated proof from a binding is a debug
+    /// panic and a shipped-profile corrupted frame. Both are refused
+    /// locally instead, on either profile.
     pub async fn submit_task_paid(
         &self,
         prepared: &PreparedTask,
@@ -2250,12 +2798,10 @@ impl Mesh {
         // envelope is applied here by hand.
         let body = serde_json::to_vec(&check_brief(&prepared.brief)?)
             .map_err(|e| A2aFlowError::Decode(format!("encode brief: {e}")))?;
-        let opts = CallOptions {
-            deadline: Some(std::time::Instant::now() + A2A_CALL_TIMEOUT),
-            ..CallOptions::default()
-        }
-        .with_request_header(HDR_PAYMENT_QUOTE, proof.quote_id.clone().into_bytes())
-        .with_request_header(HDR_PAYMENT_BINDING, proof.binding_sig.clone());
+        check_proof(proof, body.len())?;
+        let opts = bounded_raw(self, prepared.provider_node, A2A_TASK_SERVICE)?
+            .with_request_header(HDR_PAYMENT_QUOTE, proof.quote_id.clone().into_bytes())
+            .with_request_header(HDR_PAYMENT_BINDING, proof.binding_sig.clone());
         let reply = match self
             .call(
                 prepared.provider_node,

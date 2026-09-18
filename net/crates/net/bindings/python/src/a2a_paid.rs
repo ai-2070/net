@@ -585,7 +585,13 @@ fn prepare_error_json(e: A2aPrepareError) -> String {
         }
         A2aPrepareError::Rejected { .. }
         | A2aPrepareError::Unpriced { .. }
-        | A2aPrepareError::ReservationMismatch { .. } => {
+        | A2aPrepareError::ReservationMismatch { .. }
+        // A local size refusal: no packet was sent, nothing was
+        // reserved, and no retry or fresh quote can help. It used to
+        // fold into `Transport` and render as `busy`/retryable, which
+        // told an operator to keep re-sending a brief the wire can
+        // never carry.
+        | A2aPrepareError::BriefTooLarge { .. } => {
             json!({ "status": "rejected", "message": message, "retryable": false })
         }
         A2aPrepareError::Retired { task_id } => {
@@ -678,14 +684,36 @@ pub(crate) async fn do_submit(flow: &A2aCallerFlow, provider_node: u64, task_id:
     .to_string()
 }
 
-/// Every stored attempt — the operator's queue.
+/// Every stored attempt **this gateway's caller identity owns** — the
+/// operator's queue.
+///
+/// The purchase store is a file keyed by `(caller, provider node, task
+/// id)` and `A2aCallerFlow::attempts` returns every row in it, including
+/// rows written by a *different* caller identity sharing the same path
+/// (two gateways over one machine-shared store, or one operator rotating
+/// a delegated identity). Showing those on this gateway's queue invites
+/// an operator to resolve an attempt it cannot possibly have paid for, so
+/// the boundary filters to the identity whose money is at stake.
+///
+/// Filtered by comparing each row's own key against the key **this flow**
+/// would mint for that row's provider and task: the caller half is the
+/// only field that can differ, and the comparison never has to name it.
 pub(crate) async fn do_attempts(flow: &A2aCallerFlow) -> PyResult<String> {
+    let attempts = mine(flow).await?;
+    serde_json::to_string(&attempts)
+        .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempts: {e}")))
+}
+
+/// The stored attempts belonging to this flow's caller identity.
+async fn mine(flow: &A2aCallerFlow) -> PyResult<Vec<PurchaseAttempt>> {
     let attempts = flow
         .attempts()
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?;
-    serde_json::to_string(&attempts)
-        .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempts: {e}")))
+    Ok(attempts
+        .into_iter()
+        .filter(|a| a.key == flow.key(a.key.provider_node, &a.key.task_id))
+        .collect())
 }
 
 /// Parse the operator's `outcome_json` into an [`AttemptResolution`].
@@ -748,37 +776,51 @@ pub(crate) fn parse_resolution(outcome_json: &str) -> PyResult<AttemptResolution
     }
 }
 
-/// Resolve one attempt. `task_id` alone identifies it: a purchase key is
-/// `(caller, provider_node, task_id)`, the caller is this gateway's own
-/// identity, so only the provider is left to find — and an id naming
-/// attempts on two providers is an ambiguity the operator must
-/// disambiguate rather than one to guess at.
+/// Resolve one attempt.
+///
+/// A purchase key is `(caller, provider node, task id)`. The caller half
+/// is this gateway's own identity, so `provider_node` is the only part
+/// an operator has to supply — and when it is supplied the key is
+/// **complete** and the attempt is resolved directly, with no search.
+///
+/// `provider_node = None` is the convenience path: the id is resolved
+/// against this caller's own rows. It cannot be used when the same id
+/// names attempts on two providers, because guessing which purchase to
+/// close would close the wrong one — and the refusal now hands the
+/// operator the exact `provider_node` values to choose from, all of
+/// which are valid keys for *this* verb. The previous refusal pointed at
+/// "the provider-scoped records", an API that was not exposed, so a
+/// two-provider collision was a dead end.
 pub(crate) async fn do_resolve_attempt(
     flow: &A2aCallerFlow,
     task_id: &str,
+    provider_node: Option<u64>,
     resolution: AttemptResolution,
 ) -> PyResult<()> {
-    let attempts = flow
-        .attempts()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?;
-    let matching: Vec<&PurchaseAttempt> = attempts
-        .iter()
-        .filter(|a| a.key.task_id == task_id)
-        .collect();
-    let provider_node = match matching.as_slice() {
-        [one] => one.key.provider_node,
-        [] => {
-            return Err(PyValueError::new_err(format!(
-                "no purchase attempt for task {task_id:?}"
-            )))
-        }
-        many => {
-            let nodes: Vec<u64> = many.iter().map(|a| a.key.provider_node).collect();
-            return Err(PyValueError::new_err(format!(
-                "task {task_id:?} names attempts on providers {nodes:?}; resolve \
-                 them from the provider-scoped records rather than by id"
-            )));
+    let provider_node = match provider_node {
+        Some(node) => node,
+        None => {
+            let attempts = mine(flow).await?;
+            let matching: Vec<&PurchaseAttempt> = attempts
+                .iter()
+                .filter(|a| a.key.task_id == task_id)
+                .collect();
+            match matching.as_slice() {
+                [one] => one.key.provider_node,
+                [] => {
+                    return Err(PyValueError::new_err(format!(
+                        "no purchase attempt for task {task_id:?}"
+                    )))
+                }
+                many => {
+                    let mut nodes: Vec<u64> = many.iter().map(|a| a.key.provider_node).collect();
+                    nodes.sort_unstable();
+                    return Err(PyValueError::new_err(format!(
+                        "task {task_id:?} names attempts on providers {nodes:?}; pass \
+                         provider_node=<one of them> to name the purchase to resolve"
+                    )));
+                }
+            }
         }
     };
     flow.resolve_attempt(provider_node, task_id, resolution)

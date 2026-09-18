@@ -377,6 +377,73 @@ impl A2aOffer {
     }
 }
 
+/// One request for a page of a provider's catalog (`net.a2a.describe`).
+///
+/// Discovery is **paginated** because a catalog is the largest reply in
+/// the protocol and one reply must fit one packet: a description, a
+/// `net.pricing.terms@1` document and a bounds table ride it *per
+/// service*, so a catalog that a provider can legitimately configure can
+/// outgrow the wire. Before pagination it simply was not delivered, and
+/// the caller waited out its own deadline.
+///
+/// The cursor is the last `service_id` the previous page returned.
+/// Catalog order is the provider's `BTreeMap` order and is fixed for the
+/// lifetime of one serving handle, so following the cursor visits every
+/// service exactly once. An empty request body is the same thing as
+/// `after: None` — the first page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aCatalogRequest {
+    /// Resume strictly *after* this `service_id`. `None` starts at the
+    /// first service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+impl A2aCatalogRequest {
+    /// Canonical JSON bytes for the wire.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    /// Decode from JSON bytes. An **empty** slice decodes as the first
+    /// page, which is what a caller that wants the whole catalog sends.
+    pub fn decode(bytes: &[u8]) -> Result<Self, A2aError> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(bytes).map_err(|e| A2aError::Decode(e.to_string()))
+    }
+}
+
+/// One page of a provider's catalog.
+///
+/// A page always carries at least one offer unless the catalog is empty
+/// — a serving path refuses to start with an offer too large to page at
+/// all (`ServeError::A2aUndeliverableBounds`), so "too big for any page"
+/// is a configuration error rather than a runtime dead end.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aCatalogPage {
+    /// The offers on this page, in catalog order.
+    pub offers: Vec<A2aOffer>,
+    /// The cursor for the next page — the last `service_id` on *this*
+    /// one — or `None` when this page completes the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// How many services the whole catalog holds, so a caller can tell a
+    /// complete walk from a truncated one instead of assuming.
+    pub services: usize,
+}
+
+impl A2aCatalogPage {
+    /// Canonical JSON bytes for the wire.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    /// Decode from JSON bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, A2aError> {
+        serde_json::from_slice(bytes).map_err(|e| A2aError::Decode(e.to_string()))
+    }
+}
+
 /// A provider-minted reservation of one task: what the caller must pay
 /// for, and what proves the payment belongs to *this* reservation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

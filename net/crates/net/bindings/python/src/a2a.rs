@@ -86,10 +86,46 @@ impl TaskExecutor for PyTaskExecutor {
     }
 }
 
+/// The organization identity the requester verbs present.
+///
+/// A newtype rather than the client type directly, so the verb
+/// signatures below do not fork per build: without the `org` feature
+/// there is no `OrgClient` to carry and this is an empty struct. It is
+/// deliberately not a bare `()` in that arm — strict clippy reads
+/// passing a unit value to a function as a mistake, and it is right to.
+#[derive(Clone, Default)]
+pub(crate) struct A2aOrgCaller {
+    #[cfg(feature = "org")]
+    client: Option<Arc<net_sdk::org::OrgClient>>,
+}
+
+#[cfg(feature = "org")]
+impl A2aOrgCaller {
+    /// The identity installed on a mesh, if any.
+    pub(crate) fn installed(client: Option<Arc<net_sdk::org::OrgClient>>) -> Self {
+        Self { client }
+    }
+}
+
 /// Wrap a raw node in an SDK `Mesh` sharing the live node (fresh channel
 /// registry). Mirrors `enrollment::mesh_over` / `publish::mesh_over`.
 pub(crate) fn mesh_over(node: Arc<MeshNode>) -> Mesh {
     Mesh::from_node_arc(node, Arc::new(ChannelConfigRegistry::new()), None)
+}
+
+/// [`mesh_over`] carrying the caller's A2A organization identity.
+///
+/// Each requester verb builds its own `Mesh` over the shared live node,
+/// so the identity `NetMesh.set_a2a_org_caller` installed has to be
+/// applied per call rather than once — which is also what keeps a later
+/// `set_a2a_org_caller(None)` meaningful.
+fn mesh_over_as(node: Arc<MeshNode>, org: A2aOrgCaller) -> Mesh {
+    let mesh = mesh_over(node);
+    #[cfg(feature = "org")]
+    mesh.set_a2a_org_caller(org.client);
+    #[cfg(not(feature = "org"))]
+    let _ = org;
+    mesh
 }
 
 /// **Executor side.** Serve the A2A task lifecycle on the live `node`, backed by
@@ -126,8 +162,9 @@ pub(crate) fn mesh_submit_task(
     task_id: Option<String>,
     service: Option<String>,
     revision: Option<String>,
+    org: A2aOrgCaller,
 ) -> PyResult<String> {
-    let mesh = mesh_over(node);
+    let mesh = mesh_over_as(node, org);
     let brief = build_brief(prompt, context_refs, tags, task_id, service, revision)?;
     let ack = py
         .detach(move || runtime.block_on(mesh.submit_task(target_node_id, &brief)))
@@ -190,8 +227,9 @@ pub(crate) fn mesh_task_status(
     runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
     task_id: String,
+    org: A2aOrgCaller,
 ) -> PyResult<Option<String>> {
-    let mesh = mesh_over(node);
+    let mesh = mesh_over_as(node, org);
     let record = py
         .detach(move || runtime.block_on(mesh.task_status(target_node_id, &task_id)))
         .map_err(|e| PyRuntimeError::new_err(format!("task_status: {e}")))?;
@@ -213,8 +251,9 @@ pub(crate) fn mesh_cancel_task(
     runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
     task_id: String,
+    org: A2aOrgCaller,
 ) -> PyResult<bool> {
-    let mesh = mesh_over(node);
+    let mesh = mesh_over_as(node, org);
     py.detach(move || runtime.block_on(mesh.cancel_task(target_node_id, &task_id)))
         .map_err(|e| PyRuntimeError::new_err(format!("cancel_task: {e}")))
 }
@@ -231,8 +270,9 @@ pub(crate) fn mesh_describe_a2a(
     node: Arc<MeshNode>,
     runtime: Arc<GuardedRuntime>,
     target_node_id: u64,
+    org: A2aOrgCaller,
 ) -> PyResult<String> {
-    let mesh = mesh_over(node);
+    let mesh = mesh_over_as(node, org);
     let offers = py
         .detach(move || runtime.block_on(mesh.describe_a2a(target_node_id)))
         .map_err(|e| PyRuntimeError::new_err(format!("describe_a2a: {e}")))?;
@@ -254,8 +294,9 @@ pub(crate) fn mesh_submit_task_paid(
     runtime: Arc<GuardedRuntime>,
     prepared_json: &str,
     proof_json: &str,
+    org: A2aOrgCaller,
 ) -> PyResult<String> {
-    let mesh = mesh_over(node);
+    let mesh = mesh_over_as(node, org);
     let prepared: PreparedTask = serde_json::from_str(prepared_json).map_err(|e| {
         PyValueError::new_err(format!(
             "prepared_json is not a PreparedTask document (pass the `prepared` \
@@ -287,6 +328,13 @@ pub(crate) fn mesh_submit_task_paid(
 /// `net.payment.failure@1` schematic beside the human message — so it gets
 /// its own exception type with both on `args`, rather than a string a
 /// caller would have to parse.
+///
+/// The two **local** refusals are `ValueError`, because they are caller
+/// input this layer rejected before any packet: an undeliverable brief
+/// and a proof whose shape cannot ride a request header. Rendering them
+/// as `RuntimeError` beside genuine transport failures invited the retry
+/// loop that is exactly wrong for them — neither a retry nor a fresh
+/// quote can make an over-long proof presentable.
 fn flow_err(e: A2aFlowError) -> PyErr {
     match e {
         A2aFlowError::PaymentRefused { message, schematic } => {
@@ -301,6 +349,9 @@ fn flow_err(e: A2aFlowError) -> PyErr {
                 });
             }
             err
+        }
+        local @ (A2aFlowError::ProofUndeliverable(_) | A2aFlowError::BriefTooLarge { .. }) => {
+            PyValueError::new_err(format!("submit_task_paid: {local}"))
         }
         other => PyRuntimeError::new_err(format!("submit_task_paid: {other}")),
     }

@@ -1285,6 +1285,34 @@ impl PyCapabilityGateway {
         py.detach(move || runtime.block_on(crate::a2a_paid::do_attempts(&flow)))
     }
 
+    /// Install (or clear with ``None``) the organization identity the
+    /// paid-A2A lifecycle presents to a PROTECTED provider.
+    ///
+    /// A provider serving its catalog under ``principal="same_org"`` or
+    /// ``"granted"`` registers all five A2A services as PROTECTED, so an
+    /// ordinary session-peer call is never admitted — and the paid
+    /// lifecycle here is *composed* (prepare → purchase → submit each
+    /// reach the provider through this gateway's mesh), which is why the
+    /// identity is installed once rather than passed to every verb.
+    ///
+    /// Applies to :meth:`prepare_task`, :meth:`purchase_task` and
+    /// :meth:`submit_task` from the next call onward. Fail-loud: a target
+    /// that is not an authorized provider of the service in this caller's
+    /// own organization view raises rather than silently downgrading to
+    /// an unprotected call.
+    #[cfg(all(feature = "payments", feature = "a2a", feature = "org"))]
+    #[pyo3(signature = (org_client=None))]
+    fn set_a2a_org_caller(&self, org_client: Option<&crate::org::PyOrgClient>) -> PyResult<()> {
+        let installed = match org_client {
+            Some(client) => Some(client.shared().ok_or_else(|| {
+                PyValueError::new_err("org:credentials:closed: this OrgClient has been closed")
+            })?),
+            None => None,
+        };
+        self.state.mesh.set_a2a_org_caller(installed);
+        Ok(())
+    }
+
     /// Close an attempt the automatic path cannot: ``unknown``,
     /// ``denied`` with ``funds_ambiguous``, or ``unexecutable``. Returns
     /// ``None``.
@@ -1302,12 +1330,23 @@ impl PyCapabilityGateway {
     /// for a fresh :meth:`prepare_task`. ``closed`` retires an ambiguous or
     /// unexecutable attempt (refunded, written off, executed elsewhere)
     /// keeping its evidence.
+    ///
+    /// A purchase key is ``(caller, provider_node, task_id)``. The caller
+    /// half is this gateway's own identity, so ``provider_node`` completes
+    /// it: pass the value from the row in :meth:`a2a_attempts` and the
+    /// attempt is resolved with no search. Omit it and the id is resolved
+    /// against this caller's own rows, which is unambiguous until the same
+    /// id names attempts on two providers — then the refusal lists the
+    /// provider node ids to choose from, every one of them a valid
+    /// argument here.
     #[cfg(all(feature = "payments", feature = "a2a"))]
+    #[pyo3(signature = (task_id, outcome_json, provider_node=None))]
     fn a2a_resolve_attempt(
         &self,
         py: Python<'_>,
         task_id: &str,
         outcome_json: &str,
+        provider_node: Option<u64>,
     ) -> PyResult<()> {
         let flow = self.state.a2a_flow()?;
         let runtime = self.state.runtime.clone();
@@ -1315,7 +1354,10 @@ impl PyCapabilityGateway {
         let task_id = task_id.to_string();
         py.detach(move || {
             runtime.block_on(crate::a2a_paid::do_resolve_attempt(
-                &flow, &task_id, resolution,
+                &flow,
+                &task_id,
+                provider_node,
+                resolution,
             ))
         })
     }
