@@ -45,8 +45,8 @@ use net_sdk::org::OrgAccess;
 use net_payments::core::quote::PaymentQuote;
 use net_payments::engine::PaymentEngine;
 use net_payments::flow::a2a::{
-    A2aCallerFlow, A2aPrepareError, A2aPurchase, A2aPurchaseStore, A2aSubmit, AttemptResolution,
-    MeshA2aChannel, PurchaseAttempt,
+    A2aCallerFlow, A2aPrepareError, A2aPurchase, A2aPurchaseStore, A2aSubmit, AttemptGeneration,
+    AttemptResolution, MeshA2aChannel, PurchaseAttempt,
 };
 use net_payments::flow::mesh::EngineTaskAdmissionGate;
 use net_payments::flow::{CallerPaymentFlow, Clock};
@@ -441,6 +441,14 @@ pub(crate) fn unresolved_json(
 }
 
 /// Resolve one unresolved-financial admission to a terminal state.
+///
+/// `generation` names the **exact** incarnation, as it appears on the
+/// row in `a2a_unresolved()`. One `(owner, task id)` can carry two
+/// charges — a redemption retained against a superseded admission and
+/// the live replacement that took its place — and the store refuses a
+/// key-only resolution of such a key rather than closing one of them at
+/// random. Passing the generation off the row the operator is looking at
+/// closes that row and nothing else.
 pub(crate) fn resolve_admission(
     py: Python<'_>,
     runtime: Arc<GuardedRuntime>,
@@ -448,6 +456,7 @@ pub(crate) fn resolve_admission(
     owner_json: &str,
     task_id: String,
     state_json: &str,
+    generation: Option<u64>,
 ) -> PyResult<()> {
     let owner = owner_from_json(owner_json)?;
     let state: TaskState = serde_json::from_str(state_json).map_err(|e| {
@@ -457,8 +466,34 @@ pub(crate) fn resolve_admission(
              {{\"state\":\"failed\",\"error\":\"...\"}}): {e}"
         ))
     })?;
-    py.detach(move || runtime.block_on(store.resolve(owner, &task_id, state, now_secs())))
-        .map_err(journal_err)
+    let Some(generation) = generation else {
+        return py
+            .detach(move || runtime.block_on(store.resolve(owner, &task_id, state, now_secs())))
+            .map_err(journal_err);
+    };
+    py.detach(move || {
+        runtime.block_on(async move {
+            // The identity comes from the store's own row, never from
+            // Python: the admission id and the commitment are part of
+            // what a resolution re-presents, and an operator supplies
+            // the one field that distinguishes two incarnations.
+            let queue = store.unresolved().await.map_err(journal_err)?;
+            let found = queue
+                .into_iter()
+                .find(|r| r.owner == owner && r.task_id == task_id && r.generation == generation)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "no unresolved admission of task {task_id:?} has generation \
+                         {generation}; read the `generation` field off the row you mean in \
+                         a2a_unresolved()"
+                    ))
+                })?;
+            store
+                .resolve_exact(&found.identity(), state, now_secs())
+                .await
+                .map_err(journal_err)
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -698,9 +733,44 @@ pub(crate) async fn do_submit(flow: &A2aCallerFlow, provider_node: u64, task_id:
 /// Filtered by comparing each row's own key against the key **this flow**
 /// would mint for that row's provider and task: the caller half is the
 /// only field that can differ, and the comparison never has to name it.
+///
+/// Each row carries `"retained"`: a complete key can hold both the live
+/// attempt and the retained evidence of a superseded incarnation, and
+/// those two are closed by different arguments — the live one by the key
+/// alone, a retained one by passing its `generation`, which routes to
+/// the exit that writes only the archive. A queue whose rows cannot be
+/// told apart is a queue an operator cannot act on.
+///
+/// The label is the record's **class**, read from the archive listing —
+/// never inferred from the generation. A retained charge can share both
+/// the key *and* the incarnation with the live row: when a sibling
+/// publishes a terminal verdict on the live record and a settlement then
+/// lands, the settlement is retained under that same incarnation. A
+/// generation comparison would call both rows live and leave the
+/// archived charge unaddressable — the same defect one layer up.
 pub(crate) async fn do_attempts(flow: &A2aCallerFlow) -> PyResult<String> {
     let attempts = mine(flow).await?;
-    serde_json::to_string(&attempts)
+    let mut archive = flow
+        .retained_attempts()
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?;
+    let mut rows: Vec<Value> = Vec::with_capacity(attempts.len());
+    for attempt in &attempts {
+        // Matched by value and consumed, so two rows equal in every
+        // field still produce exactly as many `retained` labels as the
+        // archive holds.
+        let retained = archive.iter().position(|a| a == attempt);
+        if let Some(at) = retained {
+            archive.swap_remove(at);
+        }
+        let mut row = serde_json::to_value(attempt)
+            .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempt: {e}")))?;
+        if let Value::Object(fields) = &mut row {
+            fields.insert("retained".to_string(), Value::Bool(retained.is_some()));
+        }
+        rows.push(row);
+    }
+    serde_json::to_string(&rows)
         .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempts: {e}")))
 }
 
@@ -776,6 +846,25 @@ pub(crate) fn parse_resolution(outcome_json: &str) -> PyResult<AttemptResolution
     }
 }
 
+/// Parse the operator's `generation_json` into an
+/// [`AttemptGeneration`] — the `generation` object exactly as it appears
+/// on an `a2a_attempts()` row.
+///
+/// Both halves are load-bearing and neither is derivable from the other:
+/// `seq` restarts at 1 after a prune, and `incarnation` is unique per
+/// creation. So this takes the whole object rather than a number, and a
+/// partial one is refused rather than completed with a guess.
+pub(crate) fn parse_generation(generation_json: &str) -> PyResult<AttemptGeneration> {
+    let value: Value = serde_json::from_str(generation_json)
+        .map_err(|e| PyValueError::new_err(format!("generation is not a JSON document: {e}")))?;
+    serde_json::from_value(value).map_err(|e| {
+        PyValueError::new_err(format!(
+            "generation is not an attempt generation (the {{\"seq\": <int>, \
+             \"incarnation\": \"<hex>\"}} object on an a2a_attempts() row): {e}"
+        ))
+    })
+}
+
 /// Resolve one attempt.
 ///
 /// A purchase key is `(caller, provider node, task id)`. The caller half
@@ -785,44 +874,85 @@ pub(crate) fn parse_resolution(outcome_json: &str) -> PyResult<AttemptResolution
 ///
 /// `provider_node = None` is the convenience path: the id is resolved
 /// against this caller's own rows. It cannot be used when the same id
-/// names attempts on two providers, because guessing which purchase to
-/// close would close the wrong one — and the refusal now hands the
+/// names attempts on two **providers**, because guessing which purchase
+/// to close would close the wrong one — and the refusal hands the
 /// operator the exact `provider_node` values to choose from, all of
-/// which are valid keys for *this* verb. The previous refusal pointed at
-/// "the provider-scoped records", an API that was not exposed, so a
-/// two-provider collision was a dead end.
+/// which are valid keys for *this* verb.
+///
+/// Rows sharing one complete key are **not** such a collision, and must
+/// not be reported as one: a retained superseded incarnation sits beside
+/// its live replacement under the same `(provider_node, task_id)`, and
+/// listing that node twice tells an operator nothing. `generation`
+/// selects between them — absent it closes the live attempt, and
+/// supplied it closes exactly that retained incarnation through the
+/// generation-scoped exit, which writes only the archive. A key whose
+/// live attempt is gone and whose retained rows are the only ones left
+/// is refused with their generations named, because the key-only verb
+/// has nothing to close there.
 pub(crate) async fn do_resolve_attempt(
     flow: &A2aCallerFlow,
     task_id: &str,
     provider_node: Option<u64>,
+    generation: Option<AttemptGeneration>,
     resolution: AttemptResolution,
 ) -> PyResult<()> {
     let provider_node = match provider_node {
         Some(node) => node,
         None => {
             let attempts = mine(flow).await?;
-            let matching: Vec<&PurchaseAttempt> = attempts
+            let mut nodes: Vec<u64> = attempts
                 .iter()
                 .filter(|a| a.key.task_id == task_id)
+                .map(|a| a.key.provider_node)
                 .collect();
-            match matching.as_slice() {
-                [one] => one.key.provider_node,
+            nodes.sort_unstable();
+            nodes.dedup();
+            match nodes.as_slice() {
+                [one] => *one,
                 [] => {
                     return Err(PyValueError::new_err(format!(
                         "no purchase attempt for task {task_id:?}"
                     )))
                 }
                 many => {
-                    let mut nodes: Vec<u64> = many.iter().map(|a| a.key.provider_node).collect();
-                    nodes.sort_unstable();
                     return Err(PyValueError::new_err(format!(
-                        "task {task_id:?} names attempts on providers {nodes:?}; pass \
+                        "task {task_id:?} names attempts on providers {many:?}; pass \
                          provider_node=<one of them> to name the purchase to resolve"
                     )));
                 }
             }
         }
     };
+    if let Some(generation) = generation {
+        return flow
+            .resolve_superseded_attempt(provider_node, task_id, &generation, resolution)
+            .await
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(format!("resolve_superseded_attempt: {e}")));
+    }
+    if flow
+        .stored_attempt(provider_node, task_id)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?
+        .is_none()
+    {
+        let retained: Vec<String> = flow
+            .retained_attempts()
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?
+            .iter()
+            .filter(|a| a.key.provider_node == provider_node && a.key.task_id == task_id)
+            .map(|a| a.generation.to_string())
+            .collect();
+        if !retained.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "task {task_id:?} on provider {provider_node} has no live attempt; what is \
+                 left is retained evidence of superseded incarnations ({}) — pass the \
+                 `generation` object off the row you mean in a2a_attempts()",
+                retained.join(", ")
+            )));
+        }
+    }
     flow.resolve_attempt(provider_node, task_id, resolution)
         .await
         .map(|_| ())

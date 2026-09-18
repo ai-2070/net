@@ -417,6 +417,17 @@ fn schematic(reason: &str, safe_to_retry: bool, safe_to_requote: bool) -> Failur
 /// `park_settlement`: the facilitator holds every settlement until the
 /// test releases it. `park_submit`: the provider holds every submit.
 async fn world(park_settlement: bool, park_submit: bool) -> World {
+    world_with_quote_ttl(park_settlement, park_submit, QUOTE_TTL_NS).await
+}
+
+/// [`world`], with the provider's quote lifetime set by the caller — for
+/// the one schedule that needs a quote to lapse *inside* the engine's
+/// in-flight window rather than long past it.
+async fn world_with_quote_ttl(
+    park_settlement: bool,
+    park_submit: bool,
+    quote_ttl_ns: u64,
+) -> World {
     let dir = tempfile::tempdir().expect("tempdir");
     let clock = Arc::new(TestClock::new());
     let provider_keys = Arc::new(EntityKeypair::generate());
@@ -447,7 +458,7 @@ async fn world(park_settlement: bool, park_submit: bool) -> World {
         .with_billing_log(billing.clone()),
     );
     let channel = Arc::new(ScriptedChannel::new(
-        InProcessProvider::new(engine.clone(), clock.clone()).with_quote_ttl_ns(QUOTE_TTL_NS),
+        InProcessProvider::new(engine.clone(), clock.clone()).with_quote_ttl_ns(quote_ttl_ns),
     ));
     let offer = A2aOffer {
         service_id: SERVICE.to_string(),
@@ -1263,5 +1274,521 @@ async fn a_retired_paid_submit_is_terminal_with_its_evidence_kept() {
         w.billed().await,
         1,
         "still exactly one charge — a retired refusal must never buy again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An expired quote and a settlement that is still running
+// ---------------------------------------------------------------------------
+
+/// A quote that lapses while its settlement is **still inside the
+/// engine's in-flight window** is the sharp case of the claim order: the
+/// attempt holding the quote is demonstrably alive (its money is parked
+/// at the facilitator, and the record's claim is nowhere near the
+/// reclaim TTL), so a concurrent re-send of the identical payload must
+/// be told *ambiguity*, never `quote expired`. Expiry bounds taking a
+/// **new** settlement; it cannot retroactively describe one already
+/// admitted.
+///
+/// Staged by pricing the quote's life (60s) below the engine's in-flight
+/// window (300s), which is the only way a quote can expire while its
+/// claim is still fresh. The reviewer's own expiry probe advances far
+/// past both, so it exercises the lapsed-claim arm; this row is the
+/// live-claim one, and only the order of the two guards answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_quote_with_a_live_settlement_answers_ambiguity() {
+    let w = world_with_quote_ttl(true, false, 60_000_000_000).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-live-expiry"))
+        .await
+        .expect("prepare");
+    let flow = w.flow.clone();
+    let winner = tokio::spawn(async move { flow.purchase_task(NODE, "t-live-expiry").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.settle_gate.await_entered(1),
+    )
+    .await
+    .expect("the payment reached the facilitator");
+    assert_eq!(w.state("t-live-expiry").await, StateTag::Paying);
+
+    // Past the quote's expiry, well short of the in-flight reclaim TTL.
+    w.clock.advance(61_000_000_000);
+    let duplicate = w.flow.purchase_task(NODE, "t-live-expiry").await;
+    assert!(
+        matches!(duplicate, A2aPurchase::Unknown { .. }),
+        "a settlement already in flight is not proven unpaid by the clock: {duplicate:?}"
+    );
+    assert_eq!(
+        w.state("t-live-expiry").await,
+        StateTag::Unknown,
+        "the record keeps the payload and the reservation for recovery"
+    );
+
+    w.settle_gate.release();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), winner)
+        .await
+        .expect("the parked payment finished")
+        .expect("no panic");
+    assert!(
+        matches!(settled, A2aPurchase::Paid { .. }),
+        "and the real outcome still publishes over the ambiguity: {settled:?}"
+    );
+    assert_eq!(w.state("t-live-expiry").await, StateTag::Paid);
+    assert_eq!(w.billed().await, 1, "one charge, once");
+}
+
+// ---------------------------------------------------------------------------
+// Evidence precedence: what a late or weaker outcome may overwrite
+// ---------------------------------------------------------------------------
+
+/// The settlement evidence of one attempt, shaped the way the flow
+/// retains a charge whose intent key would not accept it.
+fn paid_evidence(attempt: &PurchaseAttempt) -> PurchaseState {
+    let PurchaseState::Paid { proof, billing } = &attempt.state else {
+        panic!("expected a paid attempt, got {:?}", attempt.state);
+    };
+    PurchaseState::PaidUnexecutable {
+        proof: proof.clone(),
+        billing: billing.clone(),
+        refusal: net_payments::flow::a2a::RefusalRecord {
+            at_ns: NOW,
+            message: "this purchase settled and its key moved on".to_string(),
+            reason: Some(SUPERSEDED_REFUSAL_REASON.to_string()),
+            safe_to_retry: false,
+            safe_to_requote: false,
+        },
+    }
+}
+
+/// A sibling's **terminal** verdict cannot make an authoritative
+/// settlement disappear.
+///
+/// The ambiguity case has its own row above (`Unknown` is in the success
+/// write's `from` set, so the success converges onto the live record).
+/// This is the harder one: the sibling published something the table has
+/// no transition out of, so the success write is refused — and a refused
+/// write used to hand the charge back inside a retryable error, leaving
+/// the only record of it in the provider's billing log.
+///
+/// Reachable in production whenever a concurrent re-send of the stored
+/// payload gets a terminal answer while the original settlement is still
+/// at the rail: a frozen quote, an `Invalidated` verdict, a
+/// non-retryable transport failure. Staged here through the same store
+/// verb `refuse_exposed` itself uses, under the *same* identity, so what
+/// is measured is the success write meeting that verdict — not a
+/// fabricated record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settlement_is_retained_over_a_siblings_exposed_refusal() {
+    let w = world(true, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-sibling-refusal"))
+        .await
+        .expect("prepare");
+    let quote_id = w
+        .attempt("t-sibling-refusal")
+        .await
+        .quote_id
+        .expect("quoted");
+    let flow = w.flow.clone();
+    let winner = tokio::spawn(async move { flow.purchase_task(NODE, "t-sibling-refusal").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.settle_gate.await_entered(1),
+    )
+    .await
+    .expect("the payment reached the facilitator");
+    let in_flight = w.attempt("t-sibling-refusal").await;
+    assert_eq!(
+        in_flight.state.tag(),
+        StateTag::Paying,
+        "the payment is in flight under a persisted payload"
+    );
+
+    w.store
+        .transition_exact(
+            &in_flight.key,
+            &[StateTag::Paying],
+            &in_flight.identity(),
+            PurchaseState::RefusedExposed {
+                reason: "provider rejected the payment: quote is frozen".to_string(),
+                reservation_kept: true,
+            },
+            w.clock.now_ns(),
+        )
+        .await
+        .expect("the sibling's exposed refusal lands on the record");
+
+    w.settle_gate.release();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), winner)
+        .await
+        .expect("the parked payment finished")
+        .expect("no panic");
+
+    // The sibling's verdict is not unmade — it was decided against this
+    // incarnation and an operator closes it — but it is not allowed to
+    // be the only thing the store remembers.
+    assert_eq!(
+        w.state("t-sibling-refusal").await,
+        StateTag::RefusedExposed,
+        "the live record keeps the verdict it was given"
+    );
+    assert!(
+        matches!(
+            settled,
+            A2aPurchase::Failed {
+                retryable: false,
+                ..
+            }
+        ),
+        "a settled payment whose record refused it is not a retryable failure: {settled:?}"
+    );
+    let retained = w
+        .flow
+        .superseded_attempt(NODE, "t-sibling-refusal", &in_flight.generation)
+        .await
+        .expect("store read")
+        .expect("the settlement is retained against the incarnation that bought it");
+    let PurchaseState::PaidUnexecutable {
+        proof,
+        billing,
+        refusal,
+    } = &retained.state
+    else {
+        panic!(
+            "expected retained settlement evidence, got {:?}",
+            retained.state
+        );
+    };
+    assert_eq!(
+        proof.quote_id, quote_id,
+        "the retained evidence names the quote that was paid"
+    );
+    assert!(
+        !billing.is_null(),
+        "with the billing proof, which is the half reconciliation cannot rebuild"
+    );
+    assert_eq!(refusal.reason.as_deref(), Some(SUPERSEDED_REFUSAL_REASON));
+    assert_eq!(w.billed().await, 1, "one charge happened, and only one");
+    assert_eq!(
+        w.store
+            .prune(w.clock.now_ns() + PREPARE_LEASE_NS, 0)
+            .await
+            .expect("prune"),
+        0,
+        "an aggressive sweep deletes neither class"
+    );
+}
+
+/// A live task id that *spells* an archive record id is a legitimate
+/// task id, and retaining a charge must not land on its purchase.
+///
+/// Both insertion orders are witnessed, because a shared namespace
+/// breaks in both directions: this one retains the archive row second
+/// (the write lands on an existing live record), the next buys the
+/// colliding task second (the live insert lands on an existing archive
+/// record). Neither may touch the other, and each keeps its own
+/// evidence.
+#[tokio::test]
+async fn retaining_a_charge_cannot_overwrite_a_live_task_that_spells_its_archive_id() {
+    let w = world(false, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-collide-late"))
+        .await
+        .expect("prepare the charge");
+    assert!(matches!(
+        w.flow.purchase_task(NODE, "t-collide-late").await,
+        A2aPurchase::Paid { .. }
+    ));
+    let charged = w.attempt("t-collide-late").await;
+    let colliding = format!(
+        "t-collide-late#superseded/{}-{}",
+        charged.generation.seq, charged.generation.incarnation
+    );
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief(&colliding))
+        .await
+        .expect("prepare the legitimate task whose id spells the archive key");
+    assert!(matches!(
+        w.flow.purchase_task(NODE, &colliding).await,
+        A2aPurchase::Paid { .. }
+    ));
+    let live_before = w.attempt(&colliding).await;
+    assert_ne!(
+        live_before.quote_id, charged.quote_id,
+        "the two purchases are genuinely different work"
+    );
+
+    w.store
+        .retain_superseded(&charged, paid_evidence(&charged), NOW + 1)
+        .await
+        .expect("retain the charge");
+
+    assert_eq!(
+        w.attempt(&colliding).await,
+        live_before,
+        "the live purchase is byte-identical after the archive write"
+    );
+    let retained = w
+        .flow
+        .superseded_attempt(NODE, "t-collide-late", &charged.generation)
+        .await
+        .expect("store read")
+        .expect("the charge is retained");
+    assert_eq!(
+        retained.state,
+        paid_evidence(&charged),
+        "and the archive holds the charge's own evidence, not the live purchase's"
+    );
+    assert_eq!(
+        retained.quote_id, charged.quote_id,
+        "addressed by the incarnation that paid it"
+    );
+}
+
+/// The other order: the archive row exists first, and a legitimate task
+/// whose id spells it is purchased afterwards.
+#[tokio::test]
+async fn a_live_task_that_spells_an_archive_id_cannot_overwrite_the_retained_charge() {
+    let w = world(false, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-collide-early"))
+        .await
+        .expect("prepare the charge");
+    assert!(matches!(
+        w.flow.purchase_task(NODE, "t-collide-early").await,
+        A2aPurchase::Paid { .. }
+    ));
+    let charged = w.attempt("t-collide-early").await;
+    let evidence = paid_evidence(&charged);
+    w.store
+        .retain_superseded(&charged, evidence.clone(), NOW + 1)
+        .await
+        .expect("retain the charge");
+
+    let colliding = format!(
+        "t-collide-early#superseded/{}-{}",
+        charged.generation.seq, charged.generation.incarnation
+    );
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief(&colliding))
+        .await
+        .expect("prepare the legitimate task whose id spells the archive key");
+    let bought = w.flow.purchase_task(NODE, &colliding).await;
+    assert!(
+        matches!(bought, A2aPurchase::Paid { .. }),
+        "a task id is not reserved by an archive record: {bought:?}"
+    );
+
+    let retained = w
+        .flow
+        .superseded_attempt(NODE, "t-collide-early", &charged.generation)
+        .await
+        .expect("store read")
+        .expect("the retained charge is still there");
+    assert_eq!(
+        retained.state, evidence,
+        "buying the colliding task did not overwrite the retained charge"
+    );
+    assert_eq!(
+        retained.quote_id, charged.quote_id,
+        "nor its identity: the archive row still names the payment it holds"
+    );
+    assert_eq!(
+        w.flow.attempts().await.expect("attempts").len(),
+        3,
+        "the queue shows two live purchases and one retained charge"
+    );
+    assert_eq!(
+        w.flow.retained_attempts().await.expect("retained").len(),
+        1,
+        "exactly one of them closes through the superseded exit"
+    );
+}
+
+/// An operator's disposition is not un-decided by a result that was
+/// already in flight when they decided it — and a settlement that
+/// arrives afterwards does not vanish either.
+///
+/// Two schedules, because the archive takes writes from both sides:
+/// resolved-first/settlement-second (the sharp one — the late outcome
+/// carries proof and billing, the two facts reconciliation cannot
+/// rebuild from the caller's store), and resolved-first/ambiguity-second
+/// (which knows strictly less than the disposition and is dropped).
+#[tokio::test]
+async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
+    let w = world(false, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-late-settlement"))
+        .await
+        .expect("prepare");
+    assert!(matches!(
+        w.flow.purchase_task(NODE, "t-late-settlement").await,
+        A2aPurchase::Paid { .. }
+    ));
+    let charged = w.attempt("t-late-settlement").await;
+    let quote_id = charged.quote_id.clone().expect("quoted");
+
+    // An exposed refusal was retained against this incarnation, and the
+    // operator closed it: as far as the books are concerned, this charge
+    // is accounted for.
+    w.store
+        .retain_superseded(
+            &charged,
+            PurchaseState::RefusedExposed {
+                reason: "the provider refused after the authorization was exposed".to_string(),
+                reservation_kept: true,
+            },
+            NOW + 1,
+        )
+        .await
+        .expect("retain the exposed refusal");
+    let closed = w
+        .flow
+        .resolve_superseded_attempt(
+            NODE,
+            "t-late-settlement",
+            &charged.generation,
+            AttemptResolution::Closed {
+                outcome: "written off".to_string(),
+                evidence: serde_json::json!({ "ticket": "OPS-77" }),
+            },
+        )
+        .await
+        .expect("operator resolution");
+    assert_eq!(closed.state.tag(), StateTag::Resolved);
+
+    // The settlement the operator never saw finally lands.
+    let after = w
+        .store
+        .retain_superseded(&charged, paid_evidence(&charged), NOW + 2)
+        .await
+        .expect("late settlement");
+    let PurchaseState::Resolved { outcome, evidence } = &after.state else {
+        panic!(
+            "the operator's disposition must stand, got {:?}",
+            after.state
+        );
+    };
+    assert_eq!(outcome, "written off", "nothing reopened it");
+    assert_eq!(
+        evidence.get("ticket").and_then(|t| t.as_str()),
+        Some("OPS-77"),
+        "and what the operator recorded is untouched"
+    );
+    let late = evidence
+        .get("late_settlement")
+        .expect("the late charge is retained beside the disposition");
+    assert_eq!(
+        late.pointer("/proof/quote_id").and_then(|q| q.as_str()),
+        Some(quote_id.as_str()),
+        "naming the quote that was actually paid"
+    );
+    assert!(
+        late.get("billing").is_some_and(|b| !b.is_null()),
+        "with the billing event: {late}"
+    );
+
+    // A weaker late outcome knows less than the disposition and is
+    // dropped rather than recorded as a second story.
+    let unchanged = w
+        .store
+        .retain_superseded(
+            &charged,
+            PurchaseState::Unknown {
+                last_error: "a sibling timed out long ago".to_string(),
+            },
+            NOW + 3,
+        )
+        .await
+        .expect("late ambiguity");
+    assert_eq!(
+        unchanged.state, after.state,
+        "a delayed ambiguity neither reopens the disposition nor displaces the late charge"
+    );
+}
+
+/// One key can hold both a live purchase and the retained evidence of an
+/// incarnation — and an operator must be able to close either without
+/// touching the other.
+///
+/// Staged at the hardest point: the two rows share the *same* key and
+/// the *same* generation, so nothing in the identity distinguishes them.
+/// Only the class does, and the class is a different map, not a decorated
+/// id — so the generation-addressed exit reaches exactly the historical
+/// row, and the key-only exit cannot reach it at all.
+#[tokio::test]
+async fn a_retained_charge_and_a_live_attempt_are_closed_independently() {
+    let w = world(false, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-two-classes"))
+        .await
+        .expect("prepare");
+    assert!(matches!(
+        w.flow.purchase_task(NODE, "t-two-classes").await,
+        A2aPurchase::Paid { .. }
+    ));
+    let live_before = w.attempt("t-two-classes").await;
+    w.store
+        .retain_superseded(&live_before, paid_evidence(&live_before), NOW + 1)
+        .await
+        .expect("retain a charge against this very incarnation");
+
+    // The queue lists both, and each row carries the pair that addresses
+    // it — which is what an operator (or a binding) reads back.
+    let queue = w.flow.attempts().await.expect("attempts");
+    assert_eq!(queue.len(), 2, "one live purchase, one retained charge");
+    assert!(
+        queue
+            .iter()
+            .all(|a| a.key == live_before.key && a.generation == live_before.generation),
+        "the two rows are indistinguishable by identity: {queue:?}"
+    );
+    let retained = w.flow.retained_attempts().await.expect("retained");
+    assert_eq!(retained.len(), 1, "and the classes are distinguishable");
+    assert_eq!(retained[0].state.tag(), StateTag::PaidUnexecutable);
+
+    let closed = w
+        .flow
+        .resolve_superseded_attempt(
+            NODE,
+            "t-two-classes",
+            &live_before.generation,
+            AttemptResolution::Closed {
+                outcome: "refunded".to_string(),
+                evidence: serde_json::json!({ "ticket": "OPS-91" }),
+            },
+        )
+        .await
+        .expect("the historical identity is addressable");
+    assert_eq!(closed.state.tag(), StateTag::Resolved);
+    assert_eq!(
+        w.attempt("t-two-classes").await,
+        live_before,
+        "closing the historical charge left the live purchase byte-identical"
+    );
+
+    // And the key-only exit cannot close the live charge in its place:
+    // a paid purchase is not an operator's to write off.
+    let refused = w
+        .flow
+        .resolve_attempt(
+            NODE,
+            "t-two-classes",
+            AttemptResolution::Closed {
+                outcome: "refunded".to_string(),
+                evidence: serde_json::json!({ "ticket": "OPS-91" }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(PurchaseError::Conflict {
+                found: StateTag::Paid,
+                ..
+            })
+        ),
+        "the live paid purchase must not be closable by the key-only verb: {refused:?}"
     );
 }

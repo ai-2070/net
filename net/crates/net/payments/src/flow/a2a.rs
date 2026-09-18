@@ -644,17 +644,78 @@ pub enum PurchaseError {
 // The durable store
 // ---------------------------------------------------------------------------
 
-/// The on-disk document of `a2a-purchases.json`: attempts by
-/// [`PurchaseKey::id`].
+/// The on-disk document of `a2a-purchases.json`: the **live** attempt
+/// per [`PurchaseKey::id`], and — in its own map — the retained
+/// evidence of incarnations the live key no longer holds.
 ///
 /// Public because it is the recovery surface — an operator tool (or a
 /// test) reads and seeds attempts through the same locked
 /// [`crate::policy::store`] helpers this module uses, rather than
 /// through a private shape it has to guess.
+///
+/// **Two maps, not one namespace with decorated ids.** A task id is
+/// unrestricted, so any archive id built by decorating a live key id is
+/// an id some legitimate task can also spell — and a retained charge
+/// written under it would land on that task's live purchase (and an
+/// operator closing the archive row would close the live charge).
+/// Separating the classes structurally is what makes the two
+/// unreachable from each other; see `RecordClass`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct A2aPurchaseFile {
     #[serde(default)]
     pub attempts: BTreeMap<String, PurchaseAttempt>,
+    /// Retained evidence of superseded incarnations, by
+    /// `superseded_record_id`. Never addressable by a live
+    /// [`PurchaseKey`], and never pruned while it is financially
+    /// unresolved.
+    #[serde(default)]
+    pub superseded: BTreeMap<String, PurchaseAttempt>,
+}
+
+/// Which of the file's two record classes a store verb addresses.
+///
+/// The live class is the current purchase under an intent key; the
+/// retained class is historical financial evidence, addressed by key
+/// *and* incarnation. A verb names its class, so no id a caller can
+/// influence decides which map a write reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordClass {
+    Live,
+    Retained,
+}
+
+impl RecordClass {
+    /// The only place a class becomes a map. Every verb goes through
+    /// here, so "live and historical are separate namespaces" is one
+    /// fact in one function rather than a convention each call site
+    /// re-implements.
+    fn records(self, file: &A2aPurchaseFile) -> &BTreeMap<String, PurchaseAttempt> {
+        match self {
+            Self::Live => &file.attempts,
+            Self::Retained => &file.superseded,
+        }
+    }
+
+    fn map(self, file: &mut A2aPurchaseFile) -> &mut BTreeMap<String, PurchaseAttempt> {
+        match self {
+            Self::Live => &mut file.attempts,
+            Self::Retained => &mut file.superseded,
+        }
+    }
+
+    /// Address one record in this class.
+    fn at(self, id: String) -> RecordRef {
+        RecordRef { class: self, id }
+    }
+}
+
+/// One addressed record: which class it lives in, and its id there.
+///
+/// The pair travels together because neither half addresses a record
+/// alone — an id without a class is the ambiguity C6 was.
+struct RecordRef {
+    class: RecordClass,
+    id: String,
 }
 
 /// The durable purchase store: one authoritative attempt per key, every
@@ -756,13 +817,32 @@ impl A2aPurchaseStore {
     /// The single attempt under `key`, if any.
     pub async fn attempt(&self, key: &PurchaseKey) -> Result<Option<PurchaseAttempt>, StoreError> {
         let file: A2aPurchaseFile = load_json(&self.path).await?;
-        Ok(file.attempts.get(&key.id()).cloned())
+        Ok(RecordClass::Live.records(&file).get(&key.id()).cloned())
     }
 
-    /// Every attempt on file — the operator's queue.
+    /// Every record on file — the operator's queue: the live attempts
+    /// and the retained evidence of superseded incarnations, each
+    /// carrying the `key` and `generation` that address it.
     pub async fn attempts(&self) -> Result<Vec<PurchaseAttempt>, StoreError> {
         let file: A2aPurchaseFile = load_json(&self.path).await?;
-        Ok(file.attempts.into_values().collect())
+        Ok(file
+            .attempts
+            .into_values()
+            .chain(file.superseded.into_values())
+            .collect())
+    }
+
+    /// Only the retained evidence of superseded incarnations — which
+    /// rows close through [`Self::transition_superseded`] rather than
+    /// [`Self::transition`]. A key can hold both classes at once, and
+    /// the two are closed by different verbs.
+    pub async fn retained_attempts(&self) -> Result<Vec<PurchaseAttempt>, StoreError> {
+        let file: A2aPurchaseFile = load_json(&self.path).await?;
+        Ok(RecordClass::Retained
+            .records(&file)
+            .values()
+            .cloned()
+            .collect())
     }
 
     /// Claim the right to prepare `key` for `commitment`, atomically.
@@ -981,15 +1061,24 @@ impl A2aPurchaseStore {
     where
         F: FnOnce(&mut PurchaseAttempt) + Send,
     {
-        self.cas_at(key.id(), from, guard, to, now_ns, patch).await
+        self.cas_at(
+            RecordClass::Live.at(key.id()),
+            from,
+            guard,
+            to,
+            now_ns,
+            patch,
+        )
+        .await
     }
 
-    /// [`Self::cas`] against an explicit record id, so a retained
-    /// superseded record (which lives beside the live attempt, under its
-    /// own id) is resolved through the same table and the same lock.
+    /// [`Self::cas`] against an explicitly addressed record, so a
+    /// retained superseded record — which lives in the archive map,
+    /// under its own id — is resolved through the same table and the
+    /// same lock, and no live record can be reached by addressing it.
     async fn cas_at<F>(
         &self,
-        record_id: String,
+        target: RecordRef,
         from: &[StateTag],
         guard: CasGuard<'_>,
         to: PurchaseState,
@@ -999,12 +1088,12 @@ impl A2aPurchaseStore {
     where
         F: FnOnce(&mut PurchaseAttempt) + Send,
     {
-        let id = record_id;
+        let RecordRef { class, id } = target;
         let wake_id = id.clone();
         let expected: Vec<StateTag> = from.to_vec();
         let guard = guard.owned();
         let updated = mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
-            let Some(attempt) = file.attempts.get_mut(&id) else {
+            let Some(attempt) = class.map(file).get_mut(&id) else {
                 return (Err(PurchaseError::Missing { key: id.clone() }), false);
             };
             // Identity before state: a write aimed at a record that no
@@ -1063,21 +1152,33 @@ impl A2aPurchaseStore {
         Ok(updated)
     }
 
-    /// Retain the financial outcome of a decision whose record was
-    /// replaced before the outcome could be published.
+    /// Retain the financial outcome of a decision whose record the live
+    /// key no longer accepts.
     ///
     /// Refusing a stale write protects the *replacement*; it does not
     /// unmake a payment. So when the awaited operation came back with
     /// something financial — a settled payment, or an exposed payload
-    /// whose fate is unknown — the evidence is written beside the live
-    /// attempt under the **original** incarnation's own record id, in the
-    /// unresolved-financial class, where `attempts()` shows it and
+    /// whose fate is unknown — the evidence is written into the archive
+    /// map under the **original** incarnation's own record id, in the
+    /// unresolved-financial class, where [`Self::attempts`] shows it and
     /// [`A2aCallerFlow::resolve_superseded_attempt`] closes it. The live
-    /// key is untouched.
+    /// key is untouched, and cannot be reached from here at all.
     ///
-    /// Insert-or-replace by design: re-publishing the same superseded
-    /// outcome (a retry of the same decision) must not mint a second
-    /// record of one payment.
+    /// **Merged under the lock by evidence precedence, never
+    /// last-write-wins** (see `evidence_rank`). Outcomes about one
+    /// incarnation arrive in whatever order the network and the operator
+    /// produce them: a sibling's delayed `Unknown`, its claimed refusal,
+    /// or a settlement that lost a race. A write that knows *less* than
+    /// what is already retained is dropped, so ambiguity cannot erase
+    /// settlement proof; a resolved disposition is never overwritten,
+    /// and a settlement arriving after one is retained *beside* it (an
+    /// operator's accounting decision stands, but a real charge it never
+    /// saw stays findable). Re-publishing the same outcome is a no-op,
+    /// so a retry of one decision never mints a second record of one
+    /// payment.
+    ///
+    /// Returns the record as the archive now holds it — which is not
+    /// necessarily the state just offered.
     pub async fn retain_superseded(
         &self,
         attempt: &PurchaseAttempt,
@@ -1085,18 +1186,23 @@ impl A2aPurchaseStore {
         now_ns: u64,
     ) -> Result<PurchaseAttempt, StoreError> {
         let id = superseded_record_id(&attempt.key, &attempt.generation);
-        let mut retained = attempt.clone();
-        retained.state = state;
-        retained.updated_at_ns = now_ns;
-        let stored = retained.clone();
+        let mut incoming = attempt.clone();
+        incoming.state = state;
+        incoming.updated_at_ns = now_ns;
         let id_owned = id.clone();
-        mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
-            file.attempts.insert(id_owned.clone(), stored.clone());
-            ((), true)
+        let stored = mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
+            let archive = RecordClass::Retained.map(file);
+            if let Some(existing) = archive.get_mut(&id_owned) {
+                let changed = merge_retained(existing, incoming);
+                return (existing.clone(), changed);
+            }
+            let stored = incoming.clone();
+            archive.insert(id_owned, incoming);
+            (stored, true)
         })
         .await?;
         self.wake(&id);
-        Ok(retained)
+        Ok(stored)
     }
 
     /// The retained superseded record for one incarnation of a key, if
@@ -1107,8 +1213,8 @@ impl A2aPurchaseStore {
         generation: &AttemptGeneration,
     ) -> Result<Option<PurchaseAttempt>, StoreError> {
         let file: A2aPurchaseFile = load_json(&self.path).await?;
-        Ok(file
-            .attempts
+        Ok(RecordClass::Retained
+            .records(&file)
             .get(&superseded_record_id(key, generation))
             .cloned())
     }
@@ -1124,7 +1230,7 @@ impl A2aPurchaseStore {
         now_ns: u64,
     ) -> Result<PurchaseAttempt, PurchaseError> {
         self.cas_at(
-            superseded_record_id(key, generation),
+            RecordClass::Retained.at(superseded_record_id(key, generation)),
             from,
             CasGuard::None,
             to,
@@ -1134,7 +1240,7 @@ impl A2aPurchaseStore {
         .await
     }
 
-    /// Drop attempts that have finished and aged out.
+    /// Drop records that have finished and aged out, in both classes.
     ///
     /// Only `Submitted`, `Resolved`, `RefusedUnexposed`, and an
     /// abandoned `Preparing` lease follow ordinary retention. The
@@ -1146,14 +1252,14 @@ impl A2aPurchaseStore {
     /// to charge. Returns how many were removed.
     pub async fn prune(&self, now_ns: u64, retention_ns: u64) -> Result<usize, StoreError> {
         mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
-            let before = file.attempts.len();
-            file.attempts.retain(|_, attempt| {
-                if attempt.is_unresolved_financial() {
-                    return true;
-                }
-                now_ns.saturating_sub(attempt.updated_at_ns) <= retention_ns
-            });
-            let removed = before - file.attempts.len();
+            let keep = |attempt: &PurchaseAttempt| {
+                attempt.is_unresolved_financial()
+                    || now_ns.saturating_sub(attempt.updated_at_ns) <= retention_ns
+            };
+            let before = file.attempts.len() + file.superseded.len();
+            file.attempts.retain(|_, attempt| keep(attempt));
+            file.superseded.retain(|_, attempt| keep(attempt));
+            let removed = before - file.attempts.len() - file.superseded.len();
             (removed, removed > 0)
         })
         .await
@@ -1197,14 +1303,21 @@ fn mint_generation(key_id: &str, now_ns: u64, seq: u64) -> AttemptGeneration {
     }
 }
 
-/// Where the retained evidence of one superseded incarnation lives.
+/// Where the retained evidence of one superseded incarnation lives
+/// **inside the archive map**.
 ///
 /// Beside the live attempt rather than inside it: the live record is the
 /// *current* purchase and must stay readable as such, while the
 /// superseded charge is its own reconciliation item. Keyed by the
-/// incarnation, so two supersessions of one key never overwrite each
-/// other. The `#` cannot collide with a [`PurchaseKey::id`] because a
-/// caller hex is fixed-width and a node id is decimal.
+/// incarnation as well as the key, so two supersessions of one key never
+/// overwrite each other, and unambiguously so: the incarnation is hex
+/// and `seq` is decimal, so the last `#` in the id is always the
+/// separator this function appended, whatever the task id spells.
+///
+/// It carries no isolation from the live class — an id is not a
+/// namespace when part of it is an unrestricted task id. That
+/// separation is [`RecordClass`]'s, and this id is only ever looked up
+/// in the archive map.
 fn superseded_record_id(key: &PurchaseKey, generation: &AttemptGeneration) -> String {
     format!(
         "{}#superseded/{}-{}",
@@ -1212,6 +1325,119 @@ fn superseded_record_id(key: &PurchaseKey, generation: &AttemptGeneration) -> St
         generation.seq,
         generation.incarnation
     )
+}
+
+/// How far one outcome settles the question "what happened to this
+/// money" — the precedence a merge into the retained-evidence archive
+/// obeys.
+///
+/// Not an ordering of the transition table: it ranks *evidence*, which
+/// is what a store has to compare when two answers about one
+/// incarnation arrive out of order. A retained outcome is only replaced
+/// by one that knows at least as much, so the three losses a
+/// last-write-wins insert allowed are closed at the same place: a
+/// sibling's ambiguity cannot erase settlement proof, a claimed refusal
+/// cannot erase it either, and an operator's disposition is not
+/// overwritten by a result that was already in flight when they decided.
+fn evidence_rank(tag: StateTag) -> u8 {
+    match tag {
+        // An operator decided how this charge is accounted for. Only
+        // another operator decision moves it.
+        StateTag::Resolved => 3,
+        // Settlement: a payment proof and a billing event exist.
+        StateTag::Paid | StateTag::PaidUnexecutable | StateTag::Submitted => 2,
+        // Exposed and unresolved: the authorization is out, and no
+        // authoritative answer came back.
+        StateTag::Paying | StateTag::Unknown | StateTag::RefusedExposed => 1,
+        // Nothing was ever exposed, so nothing is claimed about money.
+        StateTag::Preparing
+        | StateTag::Quoted
+        | StateTag::AwaitingApproval
+        | StateTag::RefusedUnexposed => 0,
+    }
+}
+
+/// The settlement evidence a late outcome carries, if it carries any.
+///
+/// `None` for an ambiguity or a refusal: those add nothing a
+/// disposition has not already accounted for. `Some` only for a
+/// payment proof and its billing event — the facts reconciliation
+/// cannot reconstruct from the caller's store if they are dropped.
+fn late_settlement_evidence(attempt: &PurchaseAttempt) -> Option<serde_json::Value> {
+    let (proof, billing) = match &attempt.state {
+        PurchaseState::Paid { proof, billing }
+        | PurchaseState::PaidUnexecutable { proof, billing, .. } => (proof, billing),
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "at_ns": attempt.updated_at_ns,
+        "generation": attempt.generation,
+        "quote_id": attempt.quote_id,
+        "proof": proof,
+        "billing": billing,
+    }))
+}
+
+/// Put late settlement evidence beside what an operator recorded,
+/// without touching it: an object gains the `late_settlement` key, and
+/// anything else is nested under `operator_evidence` rather than
+/// replaced.
+fn with_late_settlement(
+    evidence: &serde_json::Value,
+    late: serde_json::Value,
+) -> serde_json::Value {
+    match evidence {
+        serde_json::Value::Object(fields) => {
+            let mut fields = fields.clone();
+            fields.insert("late_settlement".to_string(), late);
+            serde_json::Value::Object(fields)
+        }
+        other => serde_json::json!({
+            "operator_evidence": other,
+            "late_settlement": late,
+        }),
+    }
+}
+
+/// Merge one outcome into the archived record of the same incarnation,
+/// under the store lock. Returns whether the file changed.
+///
+/// The whole point is that this is **not** an assignment. See
+/// [`evidence_rank`] for the precedence; the one case that is neither
+/// "replace" nor "drop" is a settlement that arrives after an operator
+/// has already resolved the record. The disposition stands — a later
+/// fact does not un-decide how a human chose to account for it — but
+/// the charge is real and stays findable, so the proof and billing are
+/// retained in the evidence the disposition carries.
+fn merge_retained(existing: &mut PurchaseAttempt, incoming: PurchaseAttempt) -> bool {
+    if existing.state.tag() == StateTag::Resolved {
+        let Some(late) = late_settlement_evidence(&incoming) else {
+            return false;
+        };
+        let changed = {
+            let PurchaseState::Resolved { evidence, .. } = &mut existing.state else {
+                unreachable!("the tag was just matched")
+            };
+            let merged = with_late_settlement(evidence, late);
+            if merged == *evidence {
+                false
+            } else {
+                *evidence = merged;
+                true
+            }
+        };
+        if changed {
+            existing.updated_at_ns = incoming.updated_at_ns;
+        }
+        return changed;
+    }
+    if evidence_rank(incoming.state.tag()) < evidence_rank(existing.state.tag())
+        || *existing == incoming
+    {
+        return false;
+    }
+    *existing = incoming;
+    true
 }
 
 /// Put the attempt back into `Preparing` under `lease_id`, clearing
@@ -1501,9 +1727,21 @@ impl A2aCallerFlow {
         self.store.attempt(&self.key(provider_node, task_id)).await
     }
 
-    /// Every stored attempt — the operator's queue.
+    /// Every stored record — the operator's queue: the live attempts and
+    /// the retained evidence of superseded incarnations. Each carries
+    /// the `key` and `generation` that address it, which is what an
+    /// operator (or a binding) reads back to name one exactly.
     pub async fn attempts(&self) -> Result<Vec<PurchaseAttempt>, StoreError> {
         self.store.attempts().await
+    }
+
+    /// Only the retained evidence of superseded incarnations — the rows
+    /// that close through [`Self::resolve_superseded_attempt`] rather
+    /// than [`Self::resolve_attempt`]. One key can hold both a live
+    /// attempt and retained charges; this is how a queue tells them
+    /// apart without guessing.
+    pub async fn retained_attempts(&self) -> Result<Vec<PurchaseAttempt>, StoreError> {
+        self.store.retained_attempts().await
     }
 
     /// **Read-only on the money side.** Validate the brief with the
@@ -2220,14 +2458,63 @@ impl A2aCallerFlow {
                             billing: proof,
                         }
                     }
-                    Err(e @ (PurchaseError::Superseded { .. } | PurchaseError::Missing { .. })) => {
-                        // Refusing a stale write protects the
-                        // replacement; it cannot unmake a charge. The
-                        // settled purchase is retained against the
-                        // incarnation that bought it, where an operator
-                        // can reconcile it — discarding it behind a
-                        // retryable error would be a lost payment.
+                    // A store I/O failure decided nothing: the record is
+                    // untouched and the stored payload still recovers
+                    // this purchase, so this is the one arm that stays a
+                    // retryable error.
+                    Err(PurchaseError::Store(e)) => A2aPurchase::Failed {
+                        quote_id: Some(quote_id),
+                        message: format!(
+                            "the payment landed but recording it failed ({e}); the stored \
+                             attempt is still resumable"
+                        ),
+                        retryable: true,
+                    },
+                    Err(e) => {
+                        // The live record will not accept this success:
+                        // the incarnation was replaced, the row is gone,
+                        // or a sibling published a verdict — an exposed
+                        // refusal, an operator's closure — that a
+                        // settlement is not a table transition from.
+                        // None of those unmakes a charge, and a weaker
+                        // sibling verdict does not outrank settlement,
+                        // so the proof is retained against the
+                        // incarnation that bought it instead of being
+                        // handed back inside a retryable error that
+                        // leaves it nowhere.
                         self.payments.clear_approval(&quote_id).await;
+                        // Unless the live record already holds this very
+                        // purchase's own outcome — same incarnation,
+                        // same quote, and the engine answers one payload
+                        // once — in which case the success is recorded
+                        // there and a retained copy would invent a
+                        // second reconciliation item for one payment.
+                        if let Ok(Some(live)) = self.store.attempt(key).await {
+                            if live.identity() == identity {
+                                match live.state {
+                                    PurchaseState::Paid { proof, billing } => {
+                                        return A2aPurchase::Paid {
+                                            task_id: key.task_id.clone(),
+                                            proof,
+                                            billing,
+                                        };
+                                    }
+                                    PurchaseState::Submitted { .. }
+                                    | PurchaseState::PaidUnexecutable { .. } => {
+                                        return A2aPurchase::Failed {
+                                            quote_id: Some(quote_id),
+                                            message: format!(
+                                                "this payment settled and its attempt has \
+                                                 already moved on ({})",
+                                                live.state.tag()
+                                            ),
+                                            retryable: false,
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         self.publish_superseded(
                             &attempt,
                             PurchaseState::PaidUnexecutable {
@@ -2236,8 +2523,8 @@ impl A2aCallerFlow {
                                 refusal: RefusalRecord {
                                     at_ns: now_ns,
                                     message: format!(
-                                        "this purchase settled and its intent key had already \
-                                         moved on ({e})"
+                                        "this purchase settled and the live attempt under its \
+                                         key did not accept the result ({e})"
                                     ),
                                     reason: Some(SUPERSEDED_REFUSAL_REASON.to_string()),
                                     safe_to_retry: false,
@@ -2249,14 +2536,6 @@ impl A2aCallerFlow {
                         )
                         .await
                     }
-                    Err(e) => A2aPurchase::Failed {
-                        quote_id: Some(quote_id),
-                        message: format!(
-                            "the payment landed but recording it failed ({e}); the stored \
-                             attempt is still resumable"
-                        ),
-                        retryable: true,
-                    },
                 }
             }
             CallerDecision::Failed {

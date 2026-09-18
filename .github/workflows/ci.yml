@@ -2676,9 +2676,54 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 12 ] \
-            || { echo "::error::expected at least 12 admission identity witnesses executed, saw $listed"; exit 1; }
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 admission identity witnesses executed, saw $listed"; exit 1; }
           echo "A2A admission identity: $listed executed, $pinned pinned by name, all green"
+
+      # The reviewer's SECOND HOLD packet (candidate 0743ca779): C2 stale-clock
+      # capacity reacquisition, C3 launch retargeting, C5 ambiguous operator
+      # resolution. Committed verbatim, red when they landed, green only
+      # because those repairs hold.
+      #
+      # `review_aborted_startup_writer_cannot_outlive_its_owner` (C4) is
+      # DELIBERATELY EXCLUDED and is not a gap in the gate. It only reaches its
+      # subject under the reviewer's scheduling overlay
+      # (docs/internal/reviews/startup-barrier.patch); run bare it fails its own
+      # precondition with "startup reached publication barrier", which she warns
+      # against mistaking for the ownership counterexample. Its acceptance is
+      # recorded in the round-3 commit: with the barrier alone and NO
+      # owner-control patch, it passes — verified by hand, since the production
+      # fix moved the patch's context lines. Wiring an overlay-dependent row
+      # into CI would mean committing review instrumentation into the product,
+      # which the packet explicitly forbids.
+      - name: A2A — reviewer repair probes (provider)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            review_pre_pin_stale_clock_cannot_reacquire_an_occupied_slot
+            review_operator_replacement_cannot_retarget_a_live_launch
+            review_provider_resolution_refuses_ambiguous_incarnations
+          "
+          SKIP='test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test review_repair_provider \
+                  -E "not $SKIP" 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer repair probe (provider) reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test review_repair_provider \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 reviewer provider repair rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer repair probes (provider): $listed executed, $pinned pinned by name, all green"
 
       # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
       # does inside a workspace dev build: it forwards core's own `fixtures`
@@ -2898,6 +2943,41 @@ jobs:
             || { echo "::error::expected at least 27 reviewer caller rows executed, saw $listed"; exit 1; }
           echo "A2A reviewer probes (caller): $listed executed, $pinned pinned by name, all green"
 
+      # The reviewer's SECOND HOLD packet, caller side: C1 an expired retry
+      # declaring a settlement-in-flight unpaid, C6 archive keys colliding with
+      # live task ids, C7 late ambiguity erasing retained settlement.
+      # `a_later_authoritative_success_survives_a_duplicates_ambiguity` is her
+      # control from round 1 — it passed before these repairs and is pinned so a
+      # C1 "fix" cannot break the ordinary Unknown-to-Paid convergence while
+      # satisfying the new rows.
+      - name: A2A — reviewer repair probes (caller)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            review_expired_in_flight_payment_is_not_proven_unpaid
+            review_superseded_key_cannot_overwrite_a_live_purchase
+            review_retained_success_cannot_be_downgraded_by_late_ambiguity
+            a_later_authoritative_success_survives_a_duplicates_ambiguity
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(review_repair_expiry)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer repair probe (caller) reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(review_repair_expiry) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 12 ] \
+            || { echo "::error::expected at least 12 reviewer caller repair rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer repair probes (caller): $listed executed, $pinned pinned by name, all green"
+
       # The caller half of the identity repair, plus the retention/recovery
       # witnesses the reviewer asked for by name (a real in-flight payment
       # surviving caller death and retention; a settled-but-superseded charge
@@ -2931,8 +3011,8 @@ jobs:
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
             pinned=$((pinned + 1))
           done
-          [ "$listed" -ge 9 ] \
-            || { echo "::error::expected at least 9 caller identity witnesses executed, saw $listed"; exit 1; }
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 caller identity witnesses executed, saw $listed"; exit 1; }
           echo "A2A caller identity: $listed executed, $pinned pinned by name, all green"
 
       # === A2A paid end to end (WS-D) ======================================

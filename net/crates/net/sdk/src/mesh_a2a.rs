@@ -133,8 +133,8 @@ use crate::a2a_payment::{
 };
 use crate::mesh::Mesh;
 use crate::mesh_rpc::{
-    CallOptions, CallOptionsExt, CallOptionsTyped, RpcContext, RpcError, RpcHandler,
-    RpcHandlerError, RpcResponsePayload, RpcStatus, ServeError, ServeHandle,
+    CallOptions, CallOptionsExt, CallOptionsTyped, CodecDirection, RpcContext, RpcError,
+    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus, ServeError, ServeHandle,
     NRPC_TYPED_BAD_REQUEST, NRPC_TYPED_HANDLER_ERROR,
 };
 use crate::org::OrgAccess;
@@ -401,10 +401,17 @@ pub enum A2aFlowError {
     /// its window.
     #[error("a2a org admission unavailable for this provider: {0}")]
     OrgAdmission(String),
-    /// The payment proof cannot ride the request, refused **locally**
-    /// before the call was registered — so no pending call was created,
-    /// no packet was sent, and the purchase is untouched and still
-    /// presentable once the proof is right.
+    /// A proof this request must carry cannot ride it, refused
+    /// **locally** before the call was registered — so no pending call
+    /// was created, no packet was sent, and the purchase is untouched
+    /// and still presentable once the request fits.
+    ///
+    /// Either the payment proof measured by `check_proof`, or the
+    /// finalized envelope once the transport has appended a protected
+    /// call's signed organization-admission header: a request the
+    /// payment bound accepted can still be pushed past one packet by
+    /// that addition, and a frame that does not fit is neither
+    /// delivered nor refused by the wire.
     #[error("a2a payment proof is not presentable: {0}")]
     ProofUndeliverable(String),
 }
@@ -451,12 +458,24 @@ fn bounded_raw(
 /// a hard transport error: the first leaves the outcome unknown and is
 /// safe to retry, the second does not. A bounded-reply refusal is
 /// neither, and says so.
+///
+/// An **encode-direction** codec failure is neither: it is raised while
+/// the request is being finalized, before the call is registered and
+/// before a packet is sent — which is where the organization admission
+/// proof is appended and the finalized frame is measured against one
+/// packet. Nothing left this process, so it is reported as the local
+/// refusal it is rather than as a transport failure whose outcome a
+/// caller has to treat as unknown.
 fn map_call_err(e: RpcError) -> A2aFlowError {
     match e {
         RpcError::Timeout { .. } => A2aFlowError::Timeout,
         RpcError::ServerError {
             status, message, ..
         } if status == ERR_A2A_REPLY_TOO_LARGE => A2aFlowError::ReplyTooLarge(message),
+        RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message,
+        } => A2aFlowError::ProofUndeliverable(message),
         other => A2aFlowError::Transport(format!("call: {other}")),
     }
 }
@@ -545,10 +564,18 @@ const A2A_FRAME_FIXED: usize = 128;
 ///   `debug_assert` in the header encoder and, in a **shipped profile**,
 ///   narrows the length into a `u16` — a corrupted frame rather than a
 ///   refusal. So the bound is enforced here, on both profiles.
-/// * Then the complete framed request — envelope, both headers, the
-///   service name and the frame's own fields — is measured against one
-///   packet, because a request that does not fit is never delivered and
-///   never refused.
+/// * Then the framed request this function can see — envelope, both
+///   payment headers, the service name and the frame's own fields — is
+///   measured against one packet, because a request that does not fit is
+///   never delivered and never refused.
+///
+/// It is **not** the last word on size, and must not be read as one: a
+/// protected call's signed organization-admission header is composed at
+/// the transport, after this runs, out of credentials this function
+/// never sees. The finalized frame — that header included — is measured
+/// where it exists, still before the pending call is registered, and a
+/// refusal from there arrives here as
+/// [`A2aFlowError::ProofUndeliverable`] through [`map_call_err`].
 fn check_proof(proof: &TaskPaymentProof, body: usize) -> Result<(), A2aFlowError> {
     let limit = net::adapter::net::cortex::MAX_RPC_HEADER_VALUE_LEN;
     let undeliverable = |detail: String| Err(A2aFlowError::ProofUndeliverable(detail));
@@ -1747,7 +1774,6 @@ impl ConfiguredA2a {
             Ok(Admission::Reserved(ticket)) => ticket,
         };
 
-        let now = now_secs();
         let sub = Submission {
             owner,
             task_id: &task_id,
@@ -1762,7 +1788,7 @@ impl ConfiguredA2a {
         // "held across the awaited preflight and redemption" bounded
         // rather than permanent.
         let mut deciding: Option<AdmissionRecord> = None;
-        let outcome = self.decide(&sub, &offer, &brief, now, &mut deciding).await;
+        let outcome = self.decide(&sub, &offer, &brief, &mut deciding).await;
         if !matches!(outcome, Ok(Admitted::Launch)) {
             if let Some(record) = deciding.as_ref() {
                 let _ = self.store.close_decision(record, now_secs()).await;
@@ -1794,12 +1820,18 @@ impl ConfiguredA2a {
     /// Returns the decision, never reply bytes — see
     /// [`submit`](Self::submit) for why. `deciding` is set to the record
     /// a capacity hold was opened on, so the caller can release it.
+    /// Every store call that decides or holds capacity samples the clock
+    /// **here**, immediately before that call, never once at entry: the
+    /// lookup, the preflight and the gate are all awaited, and a sample
+    /// taken before them can be older than a competitor's whole
+    /// reservation. The store carries a floor of its own for the sample
+    /// it is given, and this is the other half of the same rule — do not
+    /// hand it a stale one to begin with.
     async fn decide(
         &self,
         sub: &Submission<'_>,
         offer: &A2aOffer,
         brief: &TaskBrief,
-        now: u64,
         deciding: &mut Option<AdmissionRecord>,
     ) -> Result<Admitted, ReservationRefusal> {
         let (owner, task_id, tool_id) = (sub.owner, sub.task_id, sub.tool_id);
@@ -1883,7 +1915,7 @@ impl ConfiguredA2a {
         if let Some(current) = record.as_ref() {
             match self
                 .store
-                .open_decision(current, offer.bounds.max_in_flight, now)
+                .open_decision(current, offer.bounds.max_in_flight, now_secs())
                 .await
             {
                 Ok(DecisionOutcome::Open(open)) => {
@@ -1905,6 +1937,7 @@ impl ConfiguredA2a {
         // applies, for a caller that never prepared, and in the same one
         // transaction.
         if record.is_none() {
+            let now = now_secs();
             let inline = AdmissionRecord::reserved(
                 owner,
                 brief.clone(),
@@ -1915,12 +1948,12 @@ impl ConfiguredA2a {
                 commitment.clone(),
                 now,
             );
-            match self
+            let admitted = match self
                 .store
                 .admit_reserved(inline, offer.bounds.max_in_flight, now)
                 .await
             {
-                Ok(AdmitOutcome::Admitted(stored)) => record = Some(*stored),
+                Ok(AdmitOutcome::Admitted(stored)) => *stored,
                 Ok(AdmitOutcome::Busy) => return Err(refuse(SubmitRejection::Busy)),
                 // A prepare of the same task landed between the lookup
                 // and this insert. Its reservation is authoritative;
@@ -1929,7 +1962,7 @@ impl ConfiguredA2a {
                     if found.commitment == commitment
                         && matches!(found.state, AdmissionState::Reserved { .. }) =>
                 {
-                    record = Some(*found)
+                    *found
                 }
                 Ok(AdmitOutcome::Existing(found)) => {
                     return Err(refuse(format!(
@@ -1937,6 +1970,26 @@ impl ConfiguredA2a {
                         found.state.tag().as_str()
                     )))
                 }
+                Err(e) => return Err(unavailable(e.to_string())),
+            };
+            // The inline reservation holds its slot from here to the
+            // claim, in one continuous hold: without it the insert and
+            // the claim are two transactions with an awaited gap, and a
+            // TTL of a second or two is enough for the slot to lapse and
+            // be taken in between — so the claim would start work
+            // against a ceiling somebody else is already inside. A free
+            // service still needs no payment and no journal; this is the
+            // same hold the prepared path takes at S4b.
+            match self
+                .store
+                .open_decision(&admitted, offer.bounds.max_in_flight, now_secs())
+                .await
+            {
+                Ok(DecisionOutcome::Open(open)) => {
+                    *deciding = Some((*open).clone());
+                    record = Some(*open);
+                }
+                Ok(DecisionOutcome::Busy) => return Err(refuse(SubmitRejection::Busy)),
                 Err(e) => return Err(unavailable(e.to_string())),
             }
         }
@@ -1950,7 +2003,7 @@ impl ConfiguredA2a {
             };
             match &current.state {
                 AdmissionState::Reserved { .. } => {
-                    if let Some(refusal) = self.redeem(sub, current, now).await {
+                    if let Some(refusal) = self.redeem(sub, current, now_secs()).await {
                         return Err(refusal);
                     }
                 }
@@ -1985,8 +2038,22 @@ impl ConfiguredA2a {
         // S7 — the launch claim is durable BEFORE the spawn. A write
         // failure leaves the store exactly as it was and runs nothing;
         // the retry re-enters S4 with the same state.
+        //
+        // Identity-bound: the row under the key must still be the exact
+        // admission this decision was opened on. Concurrent operator
+        // maintenance can resolve and forget a deciding row, and a
+        // re-prepare can then land a *different* admission there — and
+        // launching that one would execute this brief while writing the
+        // replacement's identity into the never-pruned ledger.
+        let Some(admitted) = record.as_ref() else {
+            // Unreachable: S4/S5a leave a record on every path that
+            // reaches here. Fail closed rather than launch.
+            return Err(unavailable(
+                "no admission to claim a launch against".to_string(),
+            ));
+        };
         self.store
-            .claim_launch(owner, task_id, now)
+            .claim_launch_exact(admitted, now_secs())
             .await
             .map_err(|e| unavailable(e.to_string()))?;
         Ok(Admitted::Launch)

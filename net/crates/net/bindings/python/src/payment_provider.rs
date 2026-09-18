@@ -782,13 +782,25 @@ mod provider {
         /// Operator surface: it records what a human established out of
         /// band. It never relaunches the work, and the launch ledger still
         /// bars a second execution of the same admission afterwards.
+        ///
+        /// ``generation`` names the **exact** incarnation, taken from the
+        /// ``generation`` field of the row being closed. One
+        /// ``(owner, task_id)`` can carry two charges — a redemption
+        /// retained against a superseded admission, and the live
+        /// replacement that took its place — and a call that names only
+        /// the key is then refused, listing both generations, rather than
+        /// closing one of them at random. Pass the generation off the row
+        /// and that row is closed while the other charge is left exactly
+        /// as it was.
         #[cfg(feature = "a2a")]
+        #[pyo3(signature = (owner_json, task_id, state_json, *, generation=None))]
         fn a2a_resolve(
             &self,
             py: Python<'_>,
             owner_json: &str,
             task_id: String,
             state_json: &str,
+            generation: Option<u64>,
         ) -> PyResult<()> {
             crate::a2a_paid::resolve_admission(
                 py,
@@ -797,6 +809,7 @@ mod provider {
                 owner_json,
                 task_id,
                 state_json,
+                generation,
             )
         }
     }

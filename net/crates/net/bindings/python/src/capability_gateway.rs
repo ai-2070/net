@@ -1336,27 +1336,41 @@ impl PyCapabilityGateway {
     /// it: pass the value from the row in :meth:`a2a_attempts` and the
     /// attempt is resolved with no search. Omit it and the id is resolved
     /// against this caller's own rows, which is unambiguous until the same
-    /// id names attempts on two providers — then the refusal lists the
+    /// id names attempts on two **providers** — then the refusal lists the
     /// provider node ids to choose from, every one of them a valid
     /// argument here.
+    ///
+    /// ``generation`` names one incarnation *within* a complete key. A
+    /// retained superseded attempt sits beside the live replacement that
+    /// took its place, and the row's ``retained`` flag says which is
+    /// which: omit ``generation`` to close the live attempt, or pass the
+    /// row's own ``generation`` object — ``{"seq": ..., "incarnation":
+    /// ...}`` — to close exactly that retained incarnation. The
+    /// generation-scoped exit writes only the archive, so closing a
+    /// historical charge cannot touch the live one.
     #[cfg(all(feature = "payments", feature = "a2a"))]
-    #[pyo3(signature = (task_id, outcome_json, provider_node=None))]
+    #[pyo3(signature = (task_id, outcome_json, provider_node=None, generation=None))]
     fn a2a_resolve_attempt(
         &self,
         py: Python<'_>,
         task_id: &str,
         outcome_json: &str,
         provider_node: Option<u64>,
+        generation: Option<&str>,
     ) -> PyResult<()> {
         let flow = self.state.a2a_flow()?;
         let runtime = self.state.runtime.clone();
         let resolution = crate::a2a_paid::parse_resolution(outcome_json)?;
+        let generation = generation
+            .map(crate::a2a_paid::parse_generation)
+            .transpose()?;
         let task_id = task_id.to_string();
         py.detach(move || {
             runtime.block_on(crate::a2a_paid::do_resolve_attempt(
                 &flow,
                 &task_id,
                 provider_node,
+                generation,
                 resolution,
             ))
         })

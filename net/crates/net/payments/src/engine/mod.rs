@@ -129,7 +129,12 @@ pub enum PaymentDecision {
     /// A previously-verified payment was withdrawn (reorg &c). The quote
     /// is frozen; nothing further serves against it.
     Invalidated { reason: InvalidationReason },
-    /// Another attempt on the same key is mid-flight right now.
+    /// A settlement for this quote was **admitted and has not
+    /// resolved** — another attempt is mid-flight right now, or one
+    /// claimed it and never recorded an outcome. Retryable, and
+    /// deliberately not a statement about money: an authorization for
+    /// this quote is exposed, so the answer is ambiguity, never proven
+    /// non-payment.
     InProgress,
     /// Terminal rejection.
     Rejected { reason: RejectReason },
@@ -1187,11 +1192,26 @@ impl PaymentEngine {
                             if !stale {
                                 break 'claim Claim::InProgress;
                             }
-                            // Stale: taking the record over is a NEW
-                            // settlement, and that is precisely what an
-                            // expired quote may not have.
+                            // Stale: the attempt holding it is gone or
+                            // wedged, so the record may be taken over —
+                            // but taking it over is a NEW settlement,
+                            // which an expired quote may not have.
+                            //
+                            // `InProgress`, not `Expired`, is what that
+                            // answers with. An authorization for this
+                            // quote was admitted and no outcome was ever
+                            // recorded: that is ambiguity about money
+                            // that may already have moved at the rail,
+                            // and `QuoteExpired` would assert the
+                            // opposite — proven non-payment — on the
+                            // strength of a clock. The caller's exit is
+                            // the same one every unresolved exposure
+                            // takes: keep the reservation, keep the
+                            // exact payload, re-present it, and close
+                            // through an operator if the provider never
+                            // answers.
                             if expired {
-                                break 'claim Claim::Expired;
+                                break 'claim Claim::InProgress;
                             }
                             // Stale, so the attempt holding it is gone.
                             // Taking the record over with a different

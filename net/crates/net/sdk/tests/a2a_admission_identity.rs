@@ -1813,3 +1813,290 @@ async fn an_installed_org_identity_refuses_an_unauthorized_target_locally() {
 
     let _ = std::fs::remove_dir_all(&c_dir);
 }
+
+// ---------------------------------------------------------------------------
+// The free inline path, and exact historical identity
+// ---------------------------------------------------------------------------
+
+/// A free inline admission, as S5a builds one: no `admission_id`,
+/// because nothing can be purchased against a free offer.
+fn inline_candidate(task_id: &str, offer: &A2aOffer, now: u64) -> AdmissionRecord {
+    let b = brief(task_id);
+    AdmissionRecord::reserved(
+        owner(),
+        b.clone(),
+        offer,
+        None,
+        task_commitment(offer, &b),
+        now,
+    )
+}
+
+/// A free offer with one slot and a one-second reservation.
+fn narrow_free() -> A2aOffer {
+    let mut offer = offer(false);
+    offer.bounds.max_in_flight = 1;
+    offer.reservation_ttl_secs = 1;
+    offer
+}
+
+/// **A launch claim cannot use a pre-await clock on a slot somebody else
+/// now holds** — the free inline path's half of the reacquisition
+/// finding.
+///
+/// The submit path samples its clock, then awaits a lookup, a ledger
+/// read and the application preflight before it inserts the inline
+/// reservation and claims the launch. By the time the claim lands, that
+/// sample can be older than the whole reservation window it is arguing
+/// from — and a competitor can have taken the one slot in between. The
+/// claim checked `holds_capacity` against the sample it was given, so it
+/// started work on a slot it did not hold: two admissions inside a
+/// published ceiling of one.
+///
+/// Refused instead, and retryably: the store decides the slot against a
+/// floor of its own (no live row of this service can have been stamped
+/// in the future), so a stale sample can never revive a released
+/// window.
+///
+/// Inverse checked: with the claim deciding on the caller's raw sample
+/// again, the claim returns `Ok` and `in_flight` reads **2** against a
+/// ceiling of 1.
+#[tokio::test]
+async fn a_free_inline_claim_cannot_launch_on_a_slot_a_competitor_took() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = journal_at(&dir.path().join("inline.json")).await;
+    let free = narrow_free();
+    let t = now_secs();
+
+    // S5a, with the clock the submit sampled before its awaits.
+    let a = admit(&journal, inline_candidate("inline-A", &free, t), 1, t).await;
+    assert!(
+        a.admission_id.is_none(),
+        "a free inline admission mints none"
+    );
+
+    // Real time moved: A's window lapsed and the only slot went to a
+    // competitor, through the same transactional admission.
+    let b = admit(
+        &journal,
+        inline_candidate("inline-B", &free, t + 2),
+        1,
+        t + 2,
+    )
+    .await;
+    assert_eq!(
+        journal.in_flight(SERVICE, t + 2).await.expect("in flight"),
+        1,
+        "B holds the one slot"
+    );
+
+    let claimed = journal.claim_launch(owner(), "inline-A", t).await;
+    let err = claimed.expect_err("a claim on a slot B holds must be refused");
+    assert!(
+        matches!(&err, A2aJournalError::Conflict { reason, .. } if reason.contains("capacity slot")),
+        "the refusal must name the slot, so a retry knows it is retryable: {err:?}"
+    );
+    assert_eq!(
+        journal.in_flight(SERVICE, t + 2).await.expect("in flight"),
+        1,
+        "the ceiling of one still holds exactly one admission"
+    );
+    assert_eq!(
+        journal.lookup(owner(), "inline-A").await.expect("lookup"),
+        Some(a),
+        "a refused claim writes nothing: A is exactly as it was"
+    );
+    assert!(
+        !journal
+            .ledger_has(owner(), "inline-A")
+            .await
+            .expect("ledger"),
+        "and nothing entered the never-pruned launch ledger"
+    );
+    // B is untouched too, so the refusal was about the slot and not
+    // about this store refusing every claim.
+    assert_eq!(
+        journal
+            .claim_launch_exact(&b, t + 2)
+            .await
+            .expect("B may launch on the slot it holds")
+            .task_id,
+        "inline-B"
+    );
+}
+
+/// **The free inline admission holds its slot from insert to claim**,
+/// in one continuous hold rather than two transactions with a gap.
+///
+/// The same schedule as above, with the decision the submit path opens
+/// on the record it just inserted. The hold is what carries the slot, so
+/// the competitor is told `Busy` — nothing was written for it — and the
+/// claim lands even though the reservation clock lapsed underneath it.
+/// Either way exactly one admission is inside the ceiling; what changes
+/// is *which*, and that a caller is never handed a hold the service
+/// cannot honour.
+///
+/// Inverse checked: without the hold, the competitor is admitted (the
+/// first leg's schedule) and the ceiling depends on the claim refusing.
+#[tokio::test]
+async fn a_free_inline_hold_keeps_its_slot_from_insert_to_claim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = journal_at(&dir.path().join("inline-hold.json")).await;
+    let free = narrow_free();
+    let t = now_secs();
+
+    let a = admit(&journal, inline_candidate("inline-A", &free, t), 1, t).await;
+    let held = match journal.open_decision(&a, 1, t).await.expect("open") {
+        DecisionOutcome::Open(open) => *open,
+        DecisionOutcome::Busy => panic!("nothing else holds the slot"),
+    };
+    assert!(held.deciding, "the inline admission holds its own slot");
+
+    assert!(
+        matches!(
+            journal
+                .admit_reserved(inline_candidate("inline-B", &free, t + 2), 1, t + 2)
+                .await,
+            Ok(AdmitOutcome::Busy)
+        ),
+        "a lapsed reservation under an open decision still owns its slot"
+    );
+    assert_eq!(
+        journal.lookup(owner(), "inline-B").await.expect("lookup"),
+        None,
+        "a Busy admission writes nothing"
+    );
+
+    journal
+        .claim_launch_exact(&held, t)
+        .await
+        .expect("the hold carries the claim across the lapsed clock");
+    assert_eq!(
+        journal.in_flight(SERVICE, t + 2).await.expect("in flight"),
+        1,
+        "one launched admission, inside the ceiling of one"
+    );
+}
+
+/// **An operator resolution must name the incarnation it closes**, and a
+/// refusal must leave every charge exactly where it was.
+///
+/// One `(owner, task id)` can carry two financial records: a redemption
+/// retained against a superseded admission, and the live replacement
+/// that took its place. They are two charges. A call that names only the
+/// key cannot say which one the operator established an outcome for, and
+/// picking either one closes a charge nobody asked about — so it is
+/// refused, naming both candidates with their generations.
+///
+/// The exact selector is then the usable exit: the identity the
+/// unresolved queue reports for the **historical** record closes that
+/// record, and the live replacement is byte-identical afterwards.
+///
+/// Inverse checked: with the ambiguity refusal removed, the key-only
+/// call returns `Ok` and terminalizes the **live** row, quote and payer
+/// included.
+#[tokio::test]
+async fn an_ambiguous_key_resolves_only_the_incarnation_it_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = journal_at(&dir.path().join("resolve.json")).await;
+    let terms = offer(true);
+    let t = now_secs();
+
+    // A is paid, then its row ages out of reservation retention and is
+    // retained as detached evidence; B replaces it at the same key and
+    // is paid in its own right.
+    let a = admit(&journal, candidate("same-key", "adm-A", &terms, t), 4, t).await;
+    let retained = t + terms.reservation_retention_secs + 1;
+    assert_eq!(journal.prune(retained).await.expect("prune"), 1);
+    let b = admit(&journal, candidate("same-key", "adm-B", &terms, t), 4, t).await;
+    assert!(matches!(
+        journal.redeem(&a, "quote-A".into(), PAYER, t).await,
+        Err(A2aJournalError::Superseded { .. })
+    ));
+    journal
+        .redeem(&b, "quote-B".into(), PAYER, t)
+        .await
+        .expect("B is paid against its own admission");
+
+    let queue = journal.unresolved().await.expect("unresolved");
+    assert_eq!(queue.len(), 2, "both charges are on the operator's queue");
+    let live_before = journal
+        .lookup(owner(), "same-key")
+        .await
+        .expect("lookup")
+        .expect("the live replacement");
+
+    let refused = journal
+        .resolve(
+            owner(),
+            "same-key",
+            TaskState::Failed {
+                error: "refunded the quote-A charge".into(),
+            },
+            t,
+        )
+        .await
+        .expect_err("a key names two charges here");
+    let text = refused.to_string();
+    assert!(
+        text.contains("adm-A") && text.contains("adm-B"),
+        "the refusal must name both candidates so the operator can choose: {text}"
+    );
+    assert_eq!(
+        journal
+            .lookup(owner(), "same-key")
+            .await
+            .expect("lookup")
+            .as_ref(),
+        Some(&live_before),
+        "the refusal left the live charge byte-identical"
+    );
+    assert_eq!(
+        journal.unresolved().await.expect("unresolved").len(),
+        2,
+        "and closed neither"
+    );
+
+    // The historical incarnation, addressed by the identity the queue
+    // reported for it.
+    let historical = queue
+        .iter()
+        .find(|r| r.admission_id.as_deref() == Some("adm-A"))
+        .expect("A is on the queue");
+    journal
+        .resolve_exact(
+            &historical.identity(),
+            TaskState::Failed {
+                error: "refunded the quote-A charge".into(),
+            },
+            t,
+        )
+        .await
+        .expect("the exact historical charge closes");
+
+    assert_eq!(
+        journal
+            .lookup(owner(), "same-key")
+            .await
+            .expect("lookup")
+            .as_ref(),
+        Some(&live_before),
+        "closing the historical charge must not touch the live replacement"
+    );
+    let left = journal.unresolved().await.expect("unresolved");
+    assert_eq!(left.len(), 1, "exactly one charge was closed");
+    assert_eq!(
+        left[0].admission_id.as_deref(),
+        Some("adm-B"),
+        "and it was the one that was named"
+    );
+    // The same identity a second time is refused rather than rewriting
+    // an operator's own disposition.
+    assert!(
+        journal
+            .resolve_exact(&historical.identity(), TaskState::Cancelled, t)
+            .await
+            .is_err(),
+        "a resolved charge is not resolvable again"
+    );
+}

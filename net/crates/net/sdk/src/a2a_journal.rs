@@ -87,7 +87,7 @@
 //! admission as a detached record (see below) rather than dropped or
 //! attached to the replacement.
 //!
-//! # Capacity is held across the decision
+//! # Capacity is held across the decision, and decided on the store's clock
 //!
 //! [`AdmissionStore::admit_reserved`] counts what holds capacity and
 //! inserts (or re-acquires) the reservation **in one transaction**, so
@@ -100,11 +100,23 @@
 //! have its slot taken by a competitor and then land against a stale
 //! time sample.
 //!
+//! Every caller passes its own `now`, and a submit samples that clock
+//! *before* it awaits a lookup and a decision acquisition — so the
+//! sample can be older than a competitor's whole reservation by the time
+//! it is used. Each capacity/expiry decision therefore raises the given
+//! sample to a **floor the store can prove**: no live row of that
+//! service can have been stamped in the future, so the latest
+//! `updated_at` among them is a lower bound on the real clock. Whoever
+//! took a released slot stamped the row it took, which is exactly the
+//! evidence that the previous holder's window ended. Retention is left
+//! on the caller's clock, where a stale sample only ever keeps a record
+//! longer.
+//!
 //! The hold belongs to the owner that took it — liveness *is* the lock —
 //! so a successor clears every inherited hold at
 //! [`open`](A2aAdmissionJournal::open).
 //!
-//! # Detached admissions
+//! # Detached admissions, and naming one
 //!
 //! An admission whose row left its key — aged out of reservation
 //! retention, or replaced — is kept as a **detached** record when it was
@@ -112,16 +124,44 @@
 //! still be presented). A redemption that arrives for one is recorded
 //! *there*, in the unresolved-financial class: reported by
 //! [`AdmissionStore::unresolved`], never pruned automatically, and
-//! closable only by an operator [`AdmissionStore::resolve`].
+//! closable only by an operator.
+//!
+//! One key can therefore carry **two charges** — a retained redemption
+//! and the live replacement that took its place. So the exits come in
+//! pairs: [`AdmissionStore::resolve`] and
+//! [`AdmissionStore::claim_launch`] name a record by key and refuse the
+//! moment that key is ambiguous, while
+//! [`AdmissionStore::resolve_exact`] and
+//! [`AdmissionStore::claim_launch_exact`] name the
+//! [`identity`](AdmissionRecord::identity) the queue reported and touch
+//! nothing else. Being pinned against pruning is not the same as being
+//! unreplaceable: an operator's resolve-then-forget mid-decision, and a
+//! re-prepare landing after it, leave a different admission under that
+//! key — which is why the launch claim re-presents its incarnation
+//! rather than trusting the key.
 //!
 //! # Writes complete, then publish durably
 //!
-//! The whole publish — temp file, `sync_all`, rename, directory barrier —
-//! runs in a **cancellation-independent worker** that owns the
-//! transaction locks, so aborting a store-operation future cannot
-//! release a guard while filesystem work is still in flight, and a
-//! successor's write cannot reuse the temp path (created exclusively,
-//! named after the full destination filename) or race the rename.
+//! **Every** writer — the ordinary mutation and the recovery
+//! publication at [`open`](A2aAdmissionJournal::open), which are the
+//! only two in this file — runs its whole publish (temp file,
+//! `sync_all`, rename, directory barrier) in a
+//! **cancellation-independent worker that owns the serialization guard,
+//! the transaction lock and the ownership handle** until its I/O has
+//! actually completed. Aborting the future that started a write
+//! therefore cannot release a guard while filesystem work is still in
+//! flight, and a successor's write cannot reuse the temp path (created
+//! exclusively, named after the full destination filename) or race the
+//! rename.
+//!
+//! Holding the **owner** matters most for recovery, which publishes a
+//! whole snapshot: an abandoned one would otherwise land on top of
+//! everything a successor durably added in the meantime and read back as
+//! if that work had never happened. A unique temp name is no defence
+//! there, because the destination is the journal itself — so a
+//! successor's `open` is refused with
+//! [`OwnedElsewhere`](A2aJournalError::OwnedElsewhere) until the
+//! abandoned writer has finished.
 //!
 //! An [`A2aJournalError::Io`] leaves the file **untouched** (the rename
 //! is what publishes a write), which is what lets the serving path keep
@@ -944,27 +984,44 @@ pub trait AdmissionStore: Send + Sync {
     /// record — this is the decision ending — but never a sibling's.
     async fn delete_reservation(&self, admission: &AdmissionRecord) -> Result<(), A2aJournalError>;
 
-    /// Claim the launch: `Paid → Launched` (paid) or `Reserved →
-    /// Launched` (free), **and** the ledger entry, in one atomic
-    /// replace.
+    /// Claim the launch of exactly `admission`: `Paid → Launched` (paid)
+    /// or `Reserved → Launched` (free), **and** the ledger entry, in one
+    /// atomic replace.
     ///
     /// Either both land or neither does; there is no instant at which
     /// the store holds a launched admission with no ledger entry. The
     /// serving path spawns only after this returns `Ok`.
+    ///
+    /// Identity-bound, like every other post-await write: the row under
+    /// the key must still be the incarnation the decision was opened on,
+    /// or the claim is
+    /// [`Superseded`](A2aJournalError::Superseded) with nothing written.
+    /// Being excluded from pruning is *not* the same as being
+    /// unreplaceable — an operator's `resolve` + [`forget`](Self::forget)
+    /// mid-decision, and a re-prepare landing after them, leave a
+    /// different admission under that key. Launching it would run one
+    /// brief and write another's identity into the never-pruned ledger.
     ///
     /// Refuses a record that no longer holds capacity: a launch claim
     /// that arrives after its reservation lapsed would be running work
     /// whose slot may already belong to somebody else. A `Paid` record
     /// always holds capacity, and an open decision holds it for a free
     /// one, so this only ever refuses a claim nothing was holding open.
+    async fn claim_launch_exact(
+        &self,
+        admission: &AdmissionRecord,
+        now: u64,
+    ) -> Result<LaunchLedgerEntry, A2aJournalError>;
+
+    /// The same claim named by key alone, for an **operator or a
+    /// fixture** recording a launch it established out of band.
     ///
-    /// Identity is enforced by what can reach the claim rather than by a
-    /// parameter: `Paid` is written only by
-    /// [`redeem`](Self::redeem) (identity-bound) and cannot be pruned,
-    /// forgotten or deleted, and a free `Reserved` record under an open
-    /// decision is excluded from both pruning and
-    /// [`delete_reservation`](Self::delete_reservation) — so the row a
-    /// claim finds is the row its decision was opened on.
+    /// Identity-unbound, and bounded the same way
+    /// [`transition`](Self::transition) is: once the key is known to have
+    /// held a different purchasable admission, no launch presented
+    /// without an identity can be attributed to an incarnation, so it is
+    /// refused. The serving path uses
+    /// [`claim_launch_exact`](Self::claim_launch_exact) instead.
     async fn claim_launch(
         &self,
         owner: TaskOwner,
@@ -985,20 +1042,45 @@ pub trait AdmissionStore: Send + Sync {
         now: u64,
     ) -> Result<(), A2aJournalError>;
 
-    /// **Operator only**: resolve an unresolved financial record —
-    /// `Paid`, `Launched` or `Reconcile` → `Terminal`. The one exit from
-    /// the never-pruned class; after it, the resolved-result retention
-    /// rule applies.
+    /// **Operator only**: resolve the one unresolved financial record of
+    /// `(owner, task_id)` — `Paid`, `Launched` or `Reconcile` →
+    /// `Terminal`. The one exit from the never-pruned class; after it,
+    /// the resolved-result retention rule applies.
     ///
     /// Resolves the live row under the key when that row is unresolved;
-    /// otherwise the oldest unresolved **detached** admission of the
-    /// same key — a redemption retained by [`redeem`](Self::redeem)
-    /// after its admission was superseded has no other exit, and the
-    /// live row (a later incarnation) is not an operator's to close.
+    /// otherwise the unresolved **detached** admission of the same key —
+    /// a redemption retained by [`redeem`](Self::redeem) after its
+    /// admission was superseded has no other exit, and the live row (a
+    /// later incarnation) is not an operator's to close.
+    ///
+    /// **Refuses when the key carries more than one**: a retained
+    /// redemption and the live replacement that took its place are two
+    /// charges, and a call that names only the key cannot say which one
+    /// the operator meant. The refusal lists every candidate with its
+    /// generation, each of which
+    /// [`resolve_exact`](Self::resolve_exact) closes on its own.
     async fn resolve(
         &self,
         owner: TaskOwner,
         task_id: &str,
+        state: TaskState,
+        now: u64,
+    ) -> Result<(), A2aJournalError>;
+
+    /// **Operator only**: resolve the **exact** incarnation `identity`
+    /// names, live or retained.
+    ///
+    /// This is what makes [`unresolved`](Self::unresolved) a usable
+    /// queue: every row it reports carries its own
+    /// [`identity`](AdmissionRecord::identity), and handing that back
+    /// closes that record and nothing else — never a neighbour under the
+    /// same key, and never a live replacement while a historical charge
+    /// was the one being closed. A generation that is gone, or whose
+    /// admission id or commitment does not match, is
+    /// [`Superseded`](A2aJournalError::Superseded).
+    async fn resolve_exact(
+        &self,
+        identity: &AdmissionIdentity,
         state: TaskState,
         now: u64,
     ) -> Result<(), A2aJournalError>;
@@ -1142,6 +1224,33 @@ impl StoreState {
         Ok(InsertOutcome::Inserted)
     }
 
+    /// A floor under `now`, proved by the store's own durable rows.
+    ///
+    /// Every record of `service_id` was stamped at a moment the clock had
+    /// already reached its `updated_at`, and time does not run backwards,
+    /// so the latest of those stamps is a lower bound on the real clock.
+    ///
+    /// This is what makes a **pre-await** clock sample safe. A submit
+    /// samples `now`, then awaits a lookup and a decision acquisition;
+    /// by the time the decision is taken, the reservation that sample
+    /// called live may have lapsed and a competitor may already hold the
+    /// slot it released. Whoever acquired that slot stamped the row it
+    /// acquired it on — which is exactly the evidence that our window
+    /// ended — so a stale sample can never revive a released slot, and
+    /// the caller is told `Busy` (retryable) instead of being handed a
+    /// hold that puts the service over its published ceiling.
+    ///
+    /// Read **only** by the capacity/expiry decisions. Retention keeps
+    /// using the caller's own clock: a floor there would drop rows
+    /// earlier than the operator asked for, and a stale sample can only
+    /// ever keep a row longer, which is the safe direction.
+    fn slot_now(&self, service_id: &str, now: u64) -> u64 {
+        self.records
+            .values()
+            .filter(|r| r.service_id == service_id)
+            .fold(now, |floor, r| floor.max(r.updated_at))
+    }
+
     /// Capacity + write, one critical section. `exclude` is the key of a
     /// record the caller is about to change and whose own slot therefore
     /// must not count against it.
@@ -1167,6 +1276,11 @@ impl StoreState {
             )));
         }
         let k = key(candidate.owner, &candidate.task_id);
+        // Capacity is decided against the floor, never the raw sample:
+        // a prepare that sampled its clock before this transaction must
+        // not be able to call a lapsed reservation live, nor undercount
+        // the holders it is competing with.
+        let slot_now = self.slot_now(&candidate.service_id, now);
         let expires_at = match candidate.state {
             AdmissionState::Reserved { expires_at } => expires_at,
             // Guarded above.
@@ -1184,14 +1298,14 @@ impl StoreState {
             // Still holding its slot: idempotent, and deliberately NOT
             // refreshed — re-preparing must not be a way to hold capacity
             // indefinitely.
-            Some(found) if found.holds_capacity(now) => {
+            Some(found) if found.holds_capacity(slot_now) => {
                 Ok(AdmitOutcome::Existing(Box::new(found.clone())))
             }
             // Lapsed: re-acquire the slot in this same transaction,
             // keeping the incarnation and the admission id a quote may
             // already commit to.
             Some(_) => {
-                if self.at_capacity(&candidate.service_id, max_in_flight, now, &k) {
+                if self.at_capacity(&candidate.service_id, max_in_flight, slot_now, &k) {
                     return Ok(AdmitOutcome::Busy);
                 }
                 let found = self.record_mut(candidate.owner, &candidate.task_id)?;
@@ -1200,7 +1314,7 @@ impl StoreState {
                 Ok(AdmitOutcome::Admitted(Box::new(found.clone())))
             }
             None => {
-                if self.at_capacity(&candidate.service_id, max_in_flight, now, &k) {
+                if self.at_capacity(&candidate.service_id, max_in_flight, slot_now, &k) {
                     return Ok(AdmitOutcome::Busy);
                 }
                 let mut record = candidate;
@@ -1234,11 +1348,17 @@ impl StoreState {
     ) -> Result<DecisionOutcome, A2aJournalError> {
         let identity = admission.identity();
         let k = key(identity.owner, &identity.task_id);
+        // Whether this reservation still owns its slot is decided against
+        // the store's own floor, under the same lock as the acquisition
+        // below. The caller sampled `now` before it awaited its way here,
+        // and a released slot may already have been taken: a sample from
+        // before that must not be allowed to revive it.
+        let slot_now = self.slot_now(&admission.service_id, now);
         let lapsed = {
             let found = self.matching_mut(&identity)?;
             match &found.state {
                 AdmissionState::Reserved { .. } | AdmissionState::Paid { .. } => {
-                    !found.holds_capacity(now)
+                    !found.holds_capacity(slot_now)
                 }
                 other => {
                     return Err(conflict(format!(
@@ -1249,7 +1369,7 @@ impl StoreState {
                 }
             }
         };
-        if lapsed && self.at_capacity(&admission.service_id, max_in_flight, now, &k) {
+        if lapsed && self.at_capacity(&admission.service_id, max_in_flight, slot_now, &k) {
             return Ok(DecisionOutcome::Busy);
         }
         let found = self.matching_mut(&identity)?;
@@ -1289,6 +1409,10 @@ impl StoreState {
     ) -> Result<(), A2aJournalError> {
         let identity = admission.identity();
         let k = key(identity.owner, &identity.task_id);
+        // Same floor as the acquisition: a redemption that sampled its
+        // clock before the gate call must not record itself against a
+        // reservation whose slot somebody else now holds.
+        let slot_now = self.slot_now(&admission.service_id, now);
         let current = self.records.get(&k);
         if !current.is_some_and(|found| identity.matches(found)) {
             // The admission this payment was redeemed for is gone or
@@ -1306,7 +1430,7 @@ impl StoreState {
         }
         let found = self.matching_mut(&identity)?;
         match &found.state {
-            AdmissionState::Reserved { .. } if found.holds_capacity(now) => {
+            AdmissionState::Reserved { .. } if found.holds_capacity(slot_now) => {
                 found.state = AdmissionState::Paid { quote_id, payer };
                 found.updated_at = now;
                 found.deciding = false;
@@ -1417,7 +1541,65 @@ impl StoreState {
         Ok(())
     }
 
+    /// The launch claim bound to the incarnation whose decision reached
+    /// it: the row under the key must still be exactly `admission`, or
+    /// the claim is [`A2aJournalError::Superseded`] and nothing is
+    /// written.
+    ///
+    /// This is the verb the serving path claims with. Being pinned
+    /// against pruning is not the same as being unreplaceable: an
+    /// operator resolving and forgetting a row mid-decision, and a
+    /// re-prepare landing after it, leaves a *different* admission under
+    /// the key — and a key-only claim would then launch one brief while
+    /// writing another's identity into the never-pruned ledger.
+    fn claim_launch_exact(
+        &mut self,
+        admission: &AdmissionRecord,
+        now: u64,
+    ) -> Result<LaunchLedgerEntry, A2aJournalError> {
+        let identity = admission.identity();
+        // Re-presented under the same lock as the write, exactly like
+        // every other post-await write in this store.
+        self.matching_mut(&identity)?;
+        self.launch(identity.owner, &identity.task_id, now)
+    }
+
     fn claim_launch(
+        &mut self,
+        owner: TaskOwner,
+        task_id: &str,
+        now: u64,
+    ) -> Result<LaunchLedgerEntry, A2aJournalError> {
+        // Identity-unbound, for an operator or a fixture recording a
+        // launch by key — the same shape, and the same limit, as
+        // `transition`: once the key is known to have held a different
+        // purchasable admission, nothing here can attribute the launch to
+        // an incarnation, so it is refused rather than guessed.
+        if let Some(other) = self
+            .detached_of(owner, task_id)
+            .find(|d| d.purchasable())
+            .map(|d| (d.admission_id.clone(), d.generation))
+        {
+            let live = self
+                .records
+                .get(&key(owner, task_id))
+                .map(|r| r.admission_id.clone());
+            if live.as_ref() != Some(&other.0) {
+                return Err(conflict(format!(
+                    "task {task_id:?} previously held admission {:?} (generation {}), which is \
+                     retained and could still be paid; an unattributed launch is refused — use \
+                     the identity-bound claim, which re-presents the admission its decision was \
+                     opened on",
+                    other.0, other.1
+                )));
+            }
+        }
+        self.launch(owner, task_id, now)
+    }
+
+    /// `Paid → Launched` (paid) or `Reserved → Launched` (free), plus the
+    /// ledger entry, in one replace. The identity check is the caller's.
+    fn launch(
         &mut self,
         owner: TaskOwner,
         task_id: &str,
@@ -1429,12 +1611,19 @@ impl StoreState {
                 "task {task_id:?} already has a launch ledger entry; it is never launched twice"
             )));
         }
+        let slot_now = self
+            .records
+            .get(&k)
+            .map(|r| self.slot_now(&r.service_id, now))
+            .unwrap_or(now);
         let record = self.record_mut(owner, task_id)?;
-        if !record.holds_capacity(now) {
+        if !record.holds_capacity(slot_now) {
             // A claim whose slot lapsed with no decision holding it open
             // would be starting work against a ceiling somebody else may
-            // already be inside. Retryable: the retry re-acquires or is
-            // told the service is busy.
+            // already be inside. Decided against the store's own floor,
+            // so a clock sampled before the awaited preflight cannot
+            // claim a slot that has since been taken. Retryable: the
+            // retry re-acquires or is told the service is busy.
             return Err(conflict(format!(
                 "task {task_id:?} no longer holds its capacity slot and cannot claim a launch"
             )));
@@ -1504,17 +1693,47 @@ impl StoreState {
             .records
             .get(&key(owner, task_id))
             .is_some_and(|r| r.state.is_unresolved());
+        // One key can carry more than one financial record: a redemption
+        // retained against a superseded admission sits beside the live
+        // replacement that took its place. Closing "the" record of such a
+        // key means closing a charge nobody named — the operator meant
+        // one incarnation and would silently terminalize the other. So
+        // the key-only verb refuses, and names every candidate an
+        // identity-bound `resolve_exact` can close.
+        let ambiguous: Vec<(Option<String>, u64)> = self
+            .detached_of(owner, task_id)
+            .filter(|d| d.state.is_unresolved())
+            .map(|d| (d.admission_id.clone(), d.generation))
+            .collect();
+        if ambiguous.len() + usize::from(live_is_unresolved) > 1 {
+            let live = self
+                .records
+                .get(&key(owner, task_id))
+                .map(|r| (r.admission_id.clone(), r.generation))
+                .filter(|_| live_is_unresolved);
+            let named: Vec<String> = live
+                .into_iter()
+                .map(|(id, generation)| format!("live {id:?} (generation {generation})"))
+                .chain(
+                    ambiguous
+                        .iter()
+                        .map(|(id, g)| format!("retained {id:?} (generation {g})")),
+                )
+                .collect();
+            return Err(conflict(format!(
+                "task {task_id:?} has {} unresolved financial records — {}; a resolution that \
+                 names only the key would close one of them at random, so name the incarnation",
+                named.len(),
+                named.join(", ")
+            )));
+        }
         let record = if live_is_unresolved {
             self.record_mut(owner, task_id)?
         } else {
             // The live row is not an operator's to close (it may be a
-            // later incarnation of somebody else's work); the oldest
+            // later incarnation of somebody else's work); the one
             // retained detached admission is.
-            let generation = self
-                .detached_of(owner, task_id)
-                .find(|d| d.state.is_unresolved())
-                .map(|d| d.generation);
-            match generation {
+            match ambiguous.first().map(|(_, generation)| *generation) {
                 Some(generation) => self
                     .detached
                     .get_mut(&(key(owner, task_id), generation))
@@ -1528,6 +1747,54 @@ impl StoreState {
                 }
             }
         };
+        Self::terminalize(record, state, now);
+        Ok(())
+    }
+
+    /// Resolve the **exact** incarnation `identity` names — the live row
+    /// under the key when it is still that incarnation, otherwise the
+    /// retained detached record of that generation.
+    ///
+    /// What makes the unresolved queue usable: every row it reports
+    /// carries its own [`AdmissionRecord::identity`], and handing that
+    /// back closes that record and nothing else. A generation that is not
+    /// there, or whose admission id or commitment does not match, is
+    /// [`A2aJournalError::Superseded`] rather than a neighbouring charge.
+    fn resolve_exact(
+        &mut self,
+        identity: &AdmissionIdentity,
+        state: TaskState,
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        let k = key(identity.owner, &identity.task_id);
+        let live_matches = self
+            .records
+            .get(&k)
+            .is_some_and(|r| identity.matches(r) && r.state.is_unresolved());
+        let record = if live_matches {
+            self.record_mut(identity.owner, &identity.task_id)?
+        } else {
+            match self.detached.get_mut(&(k, identity.generation)) {
+                Some(found) if identity.matches(found) && found.state.is_unresolved() => found,
+                Some(found) if !identity.matches(found) => return Err(identity.superseded()),
+                Some(found) => {
+                    let tag = found.state.tag().as_str();
+                    return Err(conflict(format!(
+                        "the retained admission {:?} (generation {}) of task {:?} is {tag}, which \
+                         is not an unresolved financial record",
+                        identity.admission_id, identity.generation, identity.task_id
+                    )));
+                }
+                None => return Err(identity.superseded()),
+            }
+        };
+        Self::terminalize(record, state, now);
+        Ok(())
+    }
+
+    /// Write an operator's disposition over an unresolved financial
+    /// record, keeping the payment evidence it already carries.
+    fn terminalize(record: &mut AdmissionRecord, state: TaskState, now: u64) {
         let (quote_id, payer) = record.state.evidence();
         record.state = AdmissionState::Terminal {
             quote_id,
@@ -1536,7 +1803,6 @@ impl StoreState {
         };
         record.updated_at = now;
         record.deciding = false;
-        Ok(())
     }
 
     fn forget(&mut self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError> {
@@ -2111,6 +2377,7 @@ impl A2aAdmissionJournal {
         });
 
         let files = Arc::new(JournalFiles::new(path));
+        let write_mu = Arc::new(tokio::sync::Mutex::new(()));
         let mut state = {
             let files = Arc::clone(&files);
             blocking(move || files.load()).await?
@@ -2149,14 +2416,40 @@ impl A2aAdmissionJournal {
                     r.deciding = false;
                 }
             }
+            // Recovery publishes a WHOLE snapshot, which makes an
+            // abandoned one the most destructive write in this file: it
+            // would land on top of everything a successor has durably
+            // added since, and read back as if that work had never
+            // happened. So it runs under exactly the guards an ordinary
+            // mutation does — the serialization mutex, the `.lock`
+            // sidecar, and **the ownership handle** — all owned by the
+            // blocking worker and released only when its I/O has
+            // actually completed.
+            //
+            // Dropping this future (an aborted `open`, a `select!` that
+            // lost) therefore cannot release the `.owner` lock while the
+            // snapshot is still in flight: a successor's `open` is
+            // refused with `OwnedElsewhere` until the writer is done,
+            // which is the only answer that keeps "liveness is the lock"
+            // true. A unique temp name does not help here — the
+            // destination is the journal itself.
+            let serialized = Arc::clone(&write_mu).lock_owned().await;
+            let lock = WriteLock::acquire(&files.path).await?;
             let files = Arc::clone(&files);
-            blocking(move || files.publish(&state)).await?;
+            let owner = Arc::clone(&owner);
+            blocking(move || {
+                let _serialized = serialized;
+                let _lock = lock;
+                let _owner = owner;
+                files.publish(&state)
+            })
+            .await?;
         }
 
         Ok(Self {
             files,
             owner,
-            write_mu: Arc::new(tokio::sync::Mutex::new(())),
+            write_mu,
             recovered,
         })
     }
@@ -2486,6 +2779,19 @@ impl AdmissionStore for A2aAdmissionJournal {
             .await
     }
 
+    async fn claim_launch_exact(
+        &self,
+        admission: &AdmissionRecord,
+        now: u64,
+    ) -> Result<LaunchLedgerEntry, A2aJournalError> {
+        // ONE `mutate`, therefore one atomic replace: the `Launched`
+        // state and the ledger entry become visible together or not at
+        // all.
+        let admission = admission.clone();
+        self.mutate(move |state| state.claim_launch_exact(&admission, now))
+            .await
+    }
+
     async fn claim_launch(
         &self,
         owner: TaskOwner,
@@ -2521,6 +2827,17 @@ impl AdmissionStore for A2aAdmissionJournal {
     ) -> Result<(), A2aJournalError> {
         let task_id = task_id.to_string();
         self.mutate(move |s| s.resolve(owner, &task_id, state, now))
+            .await
+    }
+
+    async fn resolve_exact(
+        &self,
+        identity: &AdmissionIdentity,
+        state: TaskState,
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        let identity = identity.clone();
+        self.mutate(move |s| s.resolve_exact(&identity, state, now))
             .await
     }
 
@@ -2661,6 +2978,16 @@ impl AdmissionStore for A2aAdmissions {
         self.state.lock().delete_reservation(admission)
     }
 
+    async fn claim_launch_exact(
+        &self,
+        admission: &AdmissionRecord,
+        now: u64,
+    ) -> Result<LaunchLedgerEntry, A2aJournalError> {
+        // One critical section under the mutex: the same atomicity the
+        // journal gets from one atomic replace.
+        self.state.lock().claim_launch_exact(admission, now)
+    }
+
     async fn claim_launch(
         &self,
         owner: TaskOwner,
@@ -2692,6 +3019,15 @@ impl AdmissionStore for A2aAdmissions {
         now: u64,
     ) -> Result<(), A2aJournalError> {
         self.state.lock().resolve(owner, task_id, state, now)
+    }
+
+    async fn resolve_exact(
+        &self,
+        identity: &AdmissionIdentity,
+        state: TaskState,
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        self.state.lock().resolve_exact(identity, state, now)
     }
 
     async fn ledger_has(&self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError> {

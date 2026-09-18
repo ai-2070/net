@@ -1298,3 +1298,116 @@ def test_two_caller_identities_sharing_one_store_see_only_their_own(tmp_path):
         bob.close()
         alice.close()
         provider.close()
+
+
+def test_an_admission_is_resolvable_by_its_exact_generation(tmp_path):
+    """The provider's operator queue is addressable **by incarnation**.
+
+    Every row `a2a_unresolved()` reports carries the `generation` that
+    identifies it, and handing that back closes exactly that row. A
+    generation nothing on the queue carries is refused before any write,
+    naming the field to read — so an operator who mistypes one does not
+    close a charge they did not mean.
+
+    The ambiguous case itself (a retained charge beside its live
+    replacement at one key) needs a payment in flight across a
+    replacement, which no sequence of these Python verbs can produce; it
+    is witnessed in Rust. What is executed here is the exit the operator
+    reaches for once they are looking at such a queue.
+    """
+    calls = []
+
+    async def preflight(owner_json, offer_json, brief_json):
+        calls.append(json.loads(brief_json)["task_id"])
+        return None if len(calls) == 1 else "authority revoked before execution"
+
+    provider, (caller,) = _topology(tmp_path, preflight=preflight)
+    try:
+        prep = caller.prepare("summarize by generation", task_id="gen-1")
+        assert prep["status"] == "ok", prep
+        assert caller.purchase(prep["prepared"])["status"] == "paid"
+        assert caller.submit(prep["prepared"])["status"] == "unexecutable"
+
+        queue = provider.unresolved()
+        assert len(queue) == 1, queue
+        row = queue[0]
+        assert row["task_id"] == "gen-1"
+        generation = row["generation"]
+        assert isinstance(generation, int) and generation > 0, row
+
+        # A generation nothing carries: refused, and the queue is intact.
+        with pytest.raises(ValueError) as wrong:
+            provider.provider.a2a_resolve(
+                json.dumps(row["owner"]),
+                "gen-1",
+                json.dumps({"state": "failed", "error": "refunded"}),
+                generation=generation + 41,
+            )
+        assert "generation" in str(wrong.value), str(wrong.value)
+        assert provider.unresolved() == queue, "a refused resolution wrote nothing"
+
+        # The row's own generation closes exactly that row.
+        provider.provider.a2a_resolve(
+            json.dumps(row["owner"]),
+            "gen-1",
+            json.dumps({"state": "failed", "error": "refunded out of band"}),
+            generation=generation,
+        )
+        assert provider.unresolved() == []
+        status = json.loads(caller.mesh.task_status(caller.provider_node, "gen-1"))
+        assert status["state"] == {
+            "state": "failed",
+            "error": "refunded out of band",
+        }, status
+    finally:
+        caller.close()
+        provider.close()
+
+
+def test_a_generation_scoped_resolution_never_reaches_the_live_attempt(tmp_path):
+    """On the caller side the generation selects the **namespace**, not just
+    a row: with one supplied, the resolution goes to the exit that writes
+    only the retained archive, so it can never terminalize the live
+    purchase that occupies the same complete key.
+
+    Observable: a well-formed generation that names no retained
+    incarnation fails, and the live `paid` attempt is byte-identical
+    afterwards. Routed to the live resolver instead — the defect — the
+    same call would close that charge.
+
+    Each live row also says which exit closes it: `retained` is false for
+    a live attempt, and the archive listing is what that flag is read
+    from, never the generation (a retained charge can share both key and
+    incarnation with the live row).
+    """
+    provider, (caller,) = _topology(tmp_path)
+    try:
+        prep = caller.prepare("summarize retained-routing", task_id="route-1")
+        assert prep["status"] == "ok", prep
+        assert caller.purchase(prep["prepared"])["status"] == "paid"
+
+        before = caller.attempts()
+        assert len(before) == 1, before
+        assert before[0]["retained"] is False, before
+        assert before[0]["state"]["state"] == "paid", before
+
+        closed = json.dumps(
+            {"resolution": "closed", "outcome": "written_off", "evidence": {}}
+        )
+        # Malformed: refused at the boundary, naming the shape to pass.
+        with pytest.raises(ValueError) as shape:
+            caller.gateway.a2a_resolve_attempt("route-1", closed, generation="7")
+        assert "incarnation" in str(shape.value), str(shape.value)
+
+        # Well-formed, names no retained incarnation: the archive exit
+        # refuses and the live purchase is untouched.
+        unknown = json.dumps({"seq": 99, "incarnation": "ff" * 16})
+        with pytest.raises(RuntimeError) as missing:
+            caller.gateway.a2a_resolve_attempt(
+                "route-1", closed, generation=unknown
+            )
+        assert "superseded" in str(missing.value).lower(), str(missing.value)
+        assert caller.attempts() == before, "the live charge is exactly as it was"
+    finally:
+        caller.close()
+        provider.close()
