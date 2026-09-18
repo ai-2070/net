@@ -122,8 +122,8 @@ examples:
     level: run
     files:
       rust: jobqueue.rs
+      typescript: jobqueue.ts
     absent:
-      typescript: "nRPC reply-channel admission is not reachable in this TypeScript harness: after the caller pins its EntityId on both workers, a direct call still fails `nrpc:no_route … no session to publisher` for the second peer. The identical Rust file passes. Not shipped rather than shipped wrong."
       python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
@@ -158,8 +158,8 @@ examples:
     level: run
     files:
       rust: liveconfig.rs
+      typescript: liveconfig.ts
     absent:
-      typescript: "the SDK `MeshNode` exposes `registerChannel` / `subscribeChannel` / `publish` but no channel receive verb, so a TypeScript subscriber cannot read a payload. Rust and Python have a receive path; the wrapper does not."
       python: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
