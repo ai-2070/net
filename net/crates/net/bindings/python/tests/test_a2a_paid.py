@@ -675,10 +675,25 @@ def test_an_altered_brief_under_a_retained_id_is_refused(paid):
     assert attempts[0]["prepared"]["brief"]["prompt"] == "summarize the original"
 
 
-def test_a_lapsed_reservation_is_re_acquired_under_the_same_admission(tmp_path):
-    """A reservation whose TTL has lapsed stops holding capacity, and a later
-    prepare **re-acquires** it — same admission id, refreshed expiry — rather
-    than minting a second one a paid quote would not match."""
+def test_a_lapsed_reservation_keeps_its_admission_id_and_stays_purchasable(tmp_path):
+    """A reservation whose TTL has lapsed keeps its admission id and is still
+    purchasable and runnable — capacity lapsing is not the admission lapsing.
+
+    **What this row does NOT prove, and no longer claims to.** It was named
+    "...is_re_acquired..." and asserted ``expires_at >= expires_first``. The
+    reviewer is right that neither is reacquisition evidence: ``>=`` permits
+    equality, and nothing here observes the *provider* renewing anything — the
+    second ``prepare`` could be answered from the caller's own stored attempt
+    and this test would still pass.
+
+    Provider-observed reacquisition is covered by the Rust witnesses, which can
+    see the store directly:
+    ``a2a_paid_admission::prepare_reports_busy_at_max_in_flight_and_frees_on_expiry``
+    and ``a2a_admission_identity::a_decision_holds_its_capacity_slot_across_an_expiring_reservation``.
+    Claiming it from Python would need a provider-side prepare observation the
+    binding does not expose, and inventing one for a test is not a trade worth
+    making. Named as a gap instead of dressed up.
+    """
     provider, (caller,) = _topology(
         tmp_path,
         offers={
@@ -689,17 +704,16 @@ def test_a_lapsed_reservation_is_re_acquired_under_the_same_admission(tmp_path):
     try:
         first = caller.prepare("summarize", task_id="lapse-1")
         assert first["status"] == "ok", first
-        expires_first = first["prepared"]["reservation"]["expires_at"]
 
         # The TTL is zero, so this reservation holds no capacity from the
-        # moment it exists. Re-preparing must converge on it.
+        # moment it exists. Re-preparing must converge on the same admission
+        # rather than mint a second one a paid quote would not match.
         second = caller.prepare("summarize", task_id="lapse-1")
         assert second["status"] == "ok", second
         assert (
             second["prepared"]["reservation"]["admission_id"]
             == first["prepared"]["reservation"]["admission_id"]
-        ), "a lapsed reservation is re-acquired, never re-minted"
-        assert second["prepared"]["reservation"]["expires_at"] >= expires_first
+        ), "a lapsed reservation converges on its admission, never re-mints one"
 
         # And it is still purchasable + runnable: capacity lapsing is not the
         # admission lapsing.

@@ -937,12 +937,69 @@ async fn a_generation_is_never_reused_after_a_prune_and_a_restart() {
         a
     };
 
+    // Leave NOTHING on disk that could reconstruct the counter.
+    //
+    // The reviewer's qualification, and she is right: `prune` RETAINS a
+    // purchasable reservation as a detached record (round 1's C3
+    // repair), so a journal that rebuilt `next_generation` from the
+    // highest generation it could still see would pass this test while
+    // persisting nothing. Closing and pruning every retained row first
+    // is what isolates genuine counter persistence from
+    // max-retained-generation reconstruction.
+    {
+        let journal = journal_at(&path).await;
+        for row in journal.unresolved().await.expect("unresolved") {
+            journal
+                .resolve_exact(
+                    &row.identity(),
+                    TaskState::Failed {
+                        error: "closed so nothing retained can seed the counter".to_string(),
+                    },
+                    now,
+                )
+                .await
+                .expect("close the retained row");
+        }
+        journal
+            .prune(now + terms.retention_secs + terms.reservation_retention_secs + 1)
+            .await
+            .expect("prune the closed rows");
+        assert!(
+            journal.unresolved().await.expect("unresolved").is_empty(),
+            "the isolation failed: something unresolved is still on disk"
+        );
+        assert!(
+            journal.lookup(owner(), "gen").await.expect("lookup").is_none(),
+            "the isolation failed: the pruned key is still readable"
+        );
+    }
+    // Belt and braces, from outside the API: no record carrying a
+    // generation remains in the file the successor is about to read, so
+    // `into_state`'s `max(rows, persisted)` has nothing but the persisted
+    // counter to work from.
+    //
+    // Structural, not a substring search: `next_generation` is a small
+    // integer and the first draft of this check asserted on
+    // `!raw.contains("1")`, which the persisted counter itself matched.
+    // That would have failed a correct journal.
+    let raw = tokio::fs::read_to_string(&path).await.expect("read journal");
+    let file: serde_json::Value = serde_json::from_str(&raw).expect("journal is json");
+    for table in ["records", "detached"] {
+        assert_eq!(
+            file[table].as_array().map(Vec::len),
+            Some(0),
+            "the isolation failed: `{table}` still carries a row, so the successor \
+             could rebuild the counter from it instead of from the persisted value: {raw}"
+        );
+    }
+
     // A genuinely new owner of the same file.
     let journal = journal_at(&path).await;
     let second = admit(&journal, candidate("gen", "adm-B", &terms, now), 4, now).await;
     assert!(
         second.generation > first.generation,
-        "a restart rewound the incarnation counter: {} -> {}",
+        "a restart rewound the incarnation counter with nothing on disk to \
+         reconstruct it from: {} -> {}",
         first.generation,
         second.generation
     );
