@@ -18,6 +18,21 @@ edge workloads.
   it advertises. Who may reach a capability is decided by permission tokens and organization
   grants issued under it; subnet membership is derived from the published tags.
 
+## Install
+
+```bash
+cargo add net-mesh-sdk                        # Rust
+npm install @net-mesh/sdk @net-mesh/core      # TypeScript / Node
+pip install net-mesh-sdk                      # Python
+go get github.com/ai-2070/net/go              # Go
+```
+
+Published names and source imports differ on purpose: the crates/registries use
+`net-mesh*` / `@net-mesh/*`, while source imports are `net_sdk`, `@net-mesh/sdk`, and
+`from net_sdk import ...`. Lower-level bindings that skip the SDK ergonomics are in
+[SDKs](#sdks). Full per-language setup:
+[Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
+
 ## What it enables
 
 Capabilities, authority, and state on one substrate change what you can build:
@@ -116,21 +131,6 @@ call refuses locally, before anything is sent.
 [Security model](https://ai2070.net/docs/concepts/security-model). When the caller needs more than
 the typed view — a clip, an occupancy grid — it travels as a content-addressed artifact:
 [Dataforts](https://ai2070.net/docs/guides/dataforts).
-
-## Install
-
-```bash
-cargo add net-mesh-sdk                        # Rust
-npm install @net-mesh/sdk @net-mesh/core      # TypeScript / Node
-pip install net-mesh-sdk                      # Python
-go get github.com/ai-2070/net/go              # Go
-```
-
-Published names and source imports differ on purpose: the crates/registries use
-`net-mesh*` / `@net-mesh/*`, while source imports are `net_sdk`, `@net-mesh/sdk`, and
-`from net_sdk import ...`. Lower-level bindings that skip the SDK ergonomics are in
-[SDKs](#sdks). Full per-language setup:
-[Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
 
 ## Why the architecture works
 
