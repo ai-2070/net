@@ -1872,6 +1872,11 @@ async function execute(step) {
         host = pkg.hostStore({
           definition,
           transport: node,
+          // One label per store, not one per definition: the id the
+          // leaf derives from it is what separates two stores on one
+          // session, and three stores sharing `store/<definition>`
+          // read each other's frames.
+          streamId: step.label || undefined,
           initialState: initial,
           maxEventBytes: step.max_event_bytes || 8104,
           authorize: () => true,
@@ -1936,6 +1941,7 @@ async function execute(step) {
         joined = pkg.joinStore({
           definition: storeDefinition(pkg.defineStore),
           transport: node,
+          streamId: step.label || undefined,
           host: step.host_hex,
           audience: step.audience || ['crew'],
           key: step.key || 'harness',

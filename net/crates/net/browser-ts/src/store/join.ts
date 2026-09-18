@@ -152,13 +152,22 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     // this used to fail before a single byte was sent — and an
     // arbitrary numeric one would lose the discriminator bit that makes
     // the far end classify an unsolicited arrival as stream data.
-    opening = Promise.resolve(
-      options.transport.openStream({
-        reliability: 'reliable',
-        peer: addressable,
-        label: streamId,
-      }),
-    ).then(open => {
+    //
+    // And a session first, because `openStream` refuses a peer the
+    // node has no session with. A failed attempt is not fatal here:
+    // the relay is installed before the direct half is even tried, so
+    // the open below is the thing that decides, and its refusal is
+    // typed.
+    opening = Promise.resolve(options.transport.connectPeer?.(addressable))
+      .catch(() => undefined)
+      .then(() =>
+        options.transport.openStream({
+          reliability: 'reliable',
+          peer: addressable,
+          label: streamId,
+        }),
+      )
+      .then(open => {
       upstream = open;
       opening = null;
       return open;

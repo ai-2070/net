@@ -79,6 +79,23 @@ export interface StoreTransport {
     label?: string;
   }): TransportStream | Promise<TransportStream>;
   onEvent(handler: (event: TransportFrame) => void): Cancel;
+  /**
+   * Make sure there IS a session with this peer, if the transport can.
+   *
+   * `openStream({peer})` refuses a peer the node has no session with,
+   * and a session — even a relayed one — is installed by a peer
+   * ATTEMPT (§9 step 2, `ensure_relayed_session`), not by discovery.
+   * So a store that only discovered its host still could not send it
+   * anything: `session: no session with 0x…`, which is what the real
+   * browser harness reports.
+   *
+   * Optional, because a transport that needs no such step (an
+   * in-process one, or a page that already connected the peer itself)
+   * should not have to pretend to offer it. When it is absent, or it
+   * fails, the store still tries to open — and the typed refusal from
+   * `openStream` is the honest answer rather than a second guess.
+   */
+  connectPeer?(peerHex: string): Promise<unknown>;
 }
 
 /**

@@ -154,6 +154,10 @@ async function main() {
   say(`starting (${mode})…`);
   const world = mode === 'mesh' ? await startMesh(pkg) : await startLocal(pkg);
   const scene = createScene(canvas);
+  // The store drives the scene graph through
+  // `@net-mesh/browser/three`; this page only says what a ship LOOKS
+  // like, never when to add or remove one.
+  scene.attach(world.player, world.self);
   const keys = keyboard();
 
   function fit() {
@@ -195,7 +199,7 @@ async function main() {
       }
     }
 
-    scene.apply(world.player.getState(), world.self);
+    scene.apply(world.player.getState());
     scene.render();
     requestAnimationFrame(frame);
   }

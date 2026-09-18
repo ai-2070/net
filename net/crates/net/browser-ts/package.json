@@ -1,7 +1,7 @@
 {
   "name": "@net-mesh/browser",
   "version": "0.36.0",
-  "description": "Browser-native Net mesh leaf — idiomatic TypeScript over the net-mesh-leaf wasm node",
+  "description": "Browser-native Net mesh leaf \u2014 idiomatic TypeScript over the net-mesh-leaf wasm node",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,6 +13,10 @@
     "./bundle": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.bundle.js"
+    },
+    "./three": {
+      "types": "./dist/three/index.d.ts",
+      "default": "./dist/three/index.js"
     }
   },
   "sideEffects": false,

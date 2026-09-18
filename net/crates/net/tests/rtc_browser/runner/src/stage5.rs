@@ -696,6 +696,9 @@ pub enum Step5 {
         id: u64,
         session: String,
         handle: String,
+        /// The stream label. One per store: two stores sharing one
+        /// label share the id the leaf derives from it.
+        label: String,
         entries: u32,
         max_event_bytes: u32,
     },
@@ -720,6 +723,7 @@ pub enum Step5 {
         id: u64,
         session: String,
         handle: String,
+        label: String,
         host_hex: String,
         audience: Vec<String>,
         key: String,

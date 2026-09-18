@@ -9,6 +9,8 @@
 
 import * as THREE from 'three';
 
+import { bindEntities } from '../dist/three/index.js';
+
 import { ARENA } from './game.js';
 
 const HULL_COLOURS = [0x4fc3f7, 0xffb74d, 0x81c784, 0xe57373, 0xba68c8];
@@ -51,8 +53,17 @@ export function createScene(canvas) {
   waypoint.visible = false;
   scene.add(waypoint);
 
-  /** One group per ship, keyed by the peer that owns it. */
-  const fleet = new Map();
+  /**
+   * One group per ship, keyed by the peer that owns it.
+   *
+   * Held by `@net-mesh/browser/three` now, not by this file: the
+   * add/update/remove reconciliation was the same twenty lines every
+   * game writes, and the two things it is easy to get wrong —
+   * rebuilding a ship nobody moved, and leaking one that left — are
+   * the two the binding exists to stop.
+   */
+  let fleet = null;
+  let bound = null;
 
   function buildShip(colourIndex, mine) {
     const group = new THREE.Group();
@@ -99,24 +110,51 @@ export function createScene(canvas) {
    * that did not change a ship must not churn its mesh, which is the
    * same reason the store shares unchanged subtrees.
    */
-  function apply(state, self) {
-    for (const [id, ship] of Object.entries(state.ships)) {
-      let entry = fleet.get(id);
-      if (entry === undefined) {
-        entry = buildShip(ship.colour, id === self);
-        scene.add(entry.group);
-        fleet.set(id, entry);
-      }
-      entry.group.position.set(ship.x, 0, ship.z);
-      entry.group.rotation.y = ship.heading;
-      entry.hull.scale.x = Math.max(ship.hull, 0) / 100;
-      entry.hull.material.color.setHex(ship.hull > 50 ? 0x7cffb2 : 0xff7c7c);
-    }
-    for (const [id, entry] of [...fleet]) {
-      if (state.ships[id] !== undefined) continue;
-      scene.remove(entry.group);
-      fleet.delete(id);
-    }
+  /**
+   * Attach the scene to a store.
+   *
+   * `self` is this page's own node, so its ship gets the ring marker.
+   */
+  function attach(store, self) {
+    bound = bindEntities({
+      store,
+      // The graph is `THREE.Scene` itself: `add`/`remove` is the whole
+      // structural surface the binding asks for.
+      scene,
+      select: state => state.ships,
+      binding: {
+        create: (ship, id) => {
+          const entry = buildShip(ship.colour, id === self);
+          entry.group.name = id;
+          // The binding adds the returned object to the scene, so
+          // what it gets back is the group and the hull bar rides
+          // along on it.
+          entry.group.userData.hull = entry.hull;
+          return entry.group;
+        },
+        update: (group, ship) => {
+          group.position.set(ship.x, 0, ship.z);
+          group.rotation.y = ship.heading;
+          const hull = group.userData.hull;
+          hull.scale.x = Math.max(ship.hull, 0) / 100;
+          hull.material.color.setHex(ship.hull > 50 ? 0x7cffb2 : 0xff7c7c);
+        },
+        remove: group => {
+          // Ours to do: Three.js leaks geometries and materials, and
+          // only this file knows none of these are shared.
+          group.traverse(child => {
+            child.geometry?.dispose?.();
+            child.material?.dispose?.();
+          });
+        },
+      },
+    });
+    fleet = bound;
+    return bound;
+  }
+
+  /** The parts of the view that are not entities. */
+  function apply(state) {
     if (state.waypoint === null) {
       waypoint.visible = false;
     } else {
@@ -138,15 +176,32 @@ export function createScene(canvas) {
   /** What is on screen, for a check that does not need pixels. */
   function readback() {
     const ships = {};
-    for (const [id, entry] of fleet) {
-      ships[id] = {
-        x: Number(entry.group.position.x.toFixed(3)),
-        z: Number(entry.group.position.z.toFixed(3)),
-        hull: Number(entry.hull.scale.x.toFixed(3)),
+    for (const child of scene.children) {
+      const hull = child.userData?.hull;
+      if (hull === undefined) continue;
+      ships[child.name || child.uuid] = {
+        x: Number(child.position.x.toFixed(3)),
+        z: Number(child.position.z.toFixed(3)),
+        hull: Number(hull.scale.x.toFixed(3)),
       };
     }
-    return { ships, waypoint: waypoint.visible, drawn: renderer.info.render.frame };
+    return {
+      ships,
+      count: bound === null ? 0 : bound.size,
+      waypoint: waypoint.visible,
+      drawn: renderer.info.render.frame,
+    };
   }
 
-  return { apply, resize, render, readback, dispose: () => renderer.dispose() };
+  return {
+    attach,
+    apply,
+    resize,
+    render,
+    readback,
+    dispose: () => {
+      bound?.dispose();
+      renderer.dispose();
+    },
+  };
 }

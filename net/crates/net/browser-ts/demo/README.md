@@ -200,12 +200,42 @@ Those are transport properties, and `mode=mesh` is written but unrun.
 Until they are established, this is a working demonstration of the
 store — not a demonstration of the mesh.
 
+## The adapter is a package, not demo code
+
+The scene binding this demo grew is published as the
+`@net-mesh/browser/three` subpath:
+
+```js
+import { bindEntities } from '@net-mesh/browser/three';
+
+const binding = bindEntities({
+  store, scene, select: state => state.ships,
+  binding: {
+    create: (ship, id) => buildShip(ship, id),
+    update: (object, ship) => object.position.set(ship.x, 0, ship.z),
+    remove: object => object.traverse(disposeOf),
+  },
+});
+```
+
+It imports nothing from `three` — the scene graph is anything with
+`add` and `remove`, and the objects are whatever `create` returns — so
+the browser package gains no renderer dependency and the binding works
+with a test double as readily as with a `THREE.Scene`.
+
+What it is for: the store already shares the references of subtrees
+that did not change, and a render loop that iterates
+`Object.values(state.entities)` throws that away. `bindEntities` turns
+it into the thing you wanted from it — an entity whose reference is
+unchanged is not touched — and removes what left the world, which is
+the other half nobody writes.
+
 ## The files
 
 | File | What it is |
 |---|---|
 | `game.js` | the store definition, projection, handlers and policy — the only file that says what the game *is* |
-| `scene.js` | Three.js: state in, meshes out; reconciles rather than rebuilds |
+| `scene.js` | Three.js: what a ship LOOKS like. The add/update/remove reconciliation is `@net-mesh/browser/three`, not this file |
 | `main.js` | wiring: mode selection, the frame loop, keyboard → input/action |
 | `local-mesh.js` | the development bus for `mode=local`, and what it is not |
 | `serve.mjs` | a dependency-free static server; ES modules and importmaps need an origin |

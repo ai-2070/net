@@ -1962,7 +1962,15 @@ async fn run(
         tls.clone(),
         origin.clone(),
     );
-    cfg.offers_per_ip_per_minute = 200;
+    // Every context in this harness is one IP, and the halves add up:
+    // Stage 4b, Stage 5's tabs, Stage 6's three slices and — with
+    // `--stage7` — two more leaves. At 200 the last slice started
+    // being refused, which surfaces as "the leaves did not discover
+    // each other" three witnesses later rather than as a rate-limit
+    // error, so the number is raised well past what the harness can
+    // reach. Nothing here tests the limiter; the witnesses that care
+    // about admission test §12, which is a different gate.
+    cfg.offers_per_ip_per_minute = 2_000;
     let anchor_listener = serve_bootstrap(Arc::clone(&anchor), cfg.clone())
         .await
         .map_err(|e| format!("anchor listener: {e}"))?;
@@ -3672,6 +3680,45 @@ async fn run(
     let _ = driver.close_page("main").await;
 
     // ================================================================
+    // Stage 7 — the store, on the transport
+    //
+    // Two isolated contexts, the same anchor, the same ledger, and
+    // FIRST — which is the whole finding of the previous round.
+    //
+    // An announcement is flooded to the nodes connected when it is
+    // made and is never replayed to one that arrives later, and the
+    // store cannot address a peer it has not discovered:
+    // `openStream({peer})` needs a session, and the relayed one is
+    // installed by the discovery path. Running last, this stage
+    // discovered nothing — including, as the control, Stage 6's own
+    // tag. So it opens its pair before anyone else announces, and
+    // closes its contexts before Stage 5 begins, leaving the topology
+    // every other witness was recorded on unchanged.
+    // ================================================================
+    if stage5 && stage7 {
+        let cx7 = stage7::Cx7 {
+            driver: &driver,
+            anchor: &anchor,
+            credential: anchor_cred.clone(),
+            bootstrap_url: anchor_base.clone(),
+            origin: origin.clone(),
+            page_origin: origin.clone(),
+            stun: stun.clone(),
+            anchor_rtc_addr: anchor_rtc_addr.to_string(),
+            tabs: step5_tx.clone(),
+        };
+        stage7::run(cx7, ledger).await?;
+    } else {
+        for name in stage7::WITNESSES {
+            println!(
+                "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses; they are \
+                 not in any floor until the browser ↔ browser join is answered"
+            );
+        }
+    }
+
+
+    // ================================================================
     // Stage 5 — the leaf crate and the TypeScript wrapper
     //
     // Same browser, same anchor, same ledger. The bundle is a hard
@@ -3730,7 +3777,7 @@ async fn run(
             origin: origin.clone(),
             page_origin: origin.clone(),
             stun: stun.clone(),
-            tabs: step5_tx.clone(),
+            tabs: step5_tx,
             peer_tabs: step6_tx,
             anchor_rtc_addr: anchor_rtc_addr.to_string(),
         };
@@ -3738,35 +3785,6 @@ async fn run(
     } else {
         for name in stage6::WITNESSES {
             println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
-        }
-    }
-
-    // ================================================================
-    // Stage 7 — the store, on the transport
-    //
-    // Two more isolated contexts, the same anchor, the same ledger.
-    // Last, because it is the only half that needs the store exports
-    // out of the built package.
-    // ================================================================
-    if stage5 && stage7 {
-        let cx7 = stage7::Cx7 {
-            driver: &driver,
-            anchor: &anchor,
-            credential: anchor_cred.clone(),
-            bootstrap_url: anchor_base.clone(),
-            origin: origin.clone(),
-            page_origin: origin.clone(),
-            stun: stun.clone(),
-            anchor_rtc_addr: anchor_rtc_addr.to_string(),
-            tabs: step5_tx,
-        };
-        stage7::run(cx7, ledger).await?;
-    } else {
-        for name in stage7::WITNESSES {
-            println!(
-                "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses; they are \
-                 not in any floor until the browser ↔ browser join is answered"
-            );
         }
     }
 
