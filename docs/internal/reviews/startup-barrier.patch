@@ -1,0 +1,32 @@
+diff --git a/net/crates/net/sdk/src/a2a_journal.rs b/net/crates/net/sdk/src/a2a_journal.rs
+index 315c44001..fbafa472e 100644
+--- a/net/crates/net/sdk/src/a2a_journal.rs
++++ b/net/crates/net/sdk/src/a2a_journal.rs
+@@ -2150,7 +2150,26 @@ impl A2aAdmissionJournal {
+                 }
+             }
+             let files = Arc::clone(&files);
+-            blocking(move || files.publish(&state)).await?;
++            blocking(move || {
++                // REVIEW ONLY: hold this existing publication, without changing its data/guards.
++                #[cfg(feature = "testing")]
++                if let Some(dir) = std::env::var_os("NET_A2A_REVIEW_OPEN_BARRIER") {
++                    let dir = std::path::PathBuf::from(dir);
++                    std::fs::write(dir.join("entered"), b"entered").map_err(|e| files.io_err(e))?;
++                    let start = std::time::Instant::now();
++                    while !dir.join("release").exists()
++                        && start.elapsed() < std::time::Duration::from_secs(10)
++                    {
++                        std::thread::sleep(std::time::Duration::from_millis(5));
++                    }
++                    let result = files.publish(&state);
++                    std::fs::write(dir.join("finished"), b"finished")
++                        .map_err(|e| files.io_err(e))?;
++                    return result;
++                }
++                files.publish(&state)
++            })
++            .await?;
+         }
+ 
+         Ok(Self {
