@@ -244,6 +244,35 @@ export type WireOp =
   | { readonly o: 'r'; readonly p: readonly string[]; readonly val: JsonValue }
   | { readonly o: 'x'; readonly p: readonly string[] };
 
+/** Every kind a caller sends. What an **owner** can receive. */
+export type CallerMessage =
+  | JoinMessage
+  | ResumeMessage
+  | ResyncMessage
+  | AudienceMessage
+  | AliveMessage
+  | LeaveMessage
+  | ActMessage
+  | InputMessage;
+
+/** Every kind an owner sends. What a **replica** can receive. */
+export type OwnerMessage =
+  | ManifestMessage
+  | SnapMessage
+  | DeltaMessage
+  | ResultMessage
+  | OkMessage
+  | NoMessage;
+
+/**
+ * What a given side can receive.
+ *
+ * The direction rung (§1.12) is a type here as well as a check: an
+ * owner's decode cannot yield a `delta`, so a dispatcher does not need
+ * a dead branch to prove it.
+ */
+export type MessageFor<T extends Side> = T extends 'owner' ? CallerMessage : OwnerMessage;
+
 export type StoreMessage =
   | JoinMessage
   | ResumeMessage
@@ -278,9 +307,11 @@ export interface DecodeRefusal {
   readonly reason: string;
 }
 
-export type DecodeResult = { readonly ok: true; readonly message: StoreMessage } | DecodeRefusal;
+export type DecodeResult<T extends Side = Side> =
+  | { readonly ok: true; readonly message: MessageFor<T> }
+  | DecodeRefusal;
 
-export interface DecodeOptions {
+export interface DecodeOptions<T extends Side = Side> {
   /**
    * The admissible frame size, **derived at runtime** from the
    * transport (`LeafNode.maxEventBytes()` minus the kind's envelope
@@ -289,7 +320,7 @@ export interface DecodeOptions {
    */
   readonly maxBytes: number;
   /** The side reading the frame, for the direction rung. */
-  readonly as: Side;
+  readonly as: T;
 }
 
 const CALLER_SET: ReadonlySet<string> = new Set(CALLER_KINDS);
@@ -346,7 +377,10 @@ export function utf8Length(text: string): number {
  * dispatcher must count it and answer, and an exception path is how
  * "count it" gets skipped.
  */
-export function decodeMessage(frame: string, options: DecodeOptions): DecodeResult {
+export function decodeMessage<T extends Side>(
+  frame: string,
+  options: DecodeOptions<T>,
+): DecodeResult<T> {
   // Rung 1 — byte length, before any parse.
   const size = utf8Length(frame);
   if (size > options.maxBytes) {
@@ -389,7 +423,9 @@ export function decodeMessage(frame: string, options: DecodeOptions): DecodeResu
     if (!Object.prototype.hasOwnProperty.call(body, key)) return refuse('payload', 'missing-field');
   }
 
-  return buildMessage(k, body);
+  // The direction rung above has already established that `k` belongs
+  // to this side, which is exactly what `MessageFor<T>` says.
+  return buildMessage(k, body) as DecodeResult<T>;
 }
 
 function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {

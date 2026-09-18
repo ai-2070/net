@@ -743,6 +743,71 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_owner_serves_a_join_and_binds_the_caller', async () => {
+  const ownerModule = await import(new URL('store/owner.js', dist).href);
+  const codec2 = await import(new URL('store/wire.js', dist).href);
+  const assembly2 = await import(new URL('store/assembly.js', dist).href);
+
+  const seen = [];
+  let issued = 0;
+  const owner = new ownerModule.StoreOwner({
+    definition: {
+      id: 'probe.store',
+      version: 1,
+      state: raw => ({ n: Number(raw.n) }),
+      empty: () => ({ n: 0 }),
+      actions: {},
+      inputs: {},
+    },
+    authorize: request => {
+      seen.push(request);
+      return true;
+    },
+    project: state => state,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newHandle: () => {
+      issued += 1;
+      return issued.toString(16).padStart(32, '0');
+    },
+    newIncarnation: () => 'f'.repeat(16),
+  });
+  owner.commit({ n: 7 });
+
+  const join = codec2.encodeMessage({
+    k: 'join', q: '0'.repeat(16), def: 'probe.store', ver: 1, key: 'k', aud: ['crew'],
+  });
+  const served = owner.receive(join, '00000000000000aa');
+  if (served.refused !== null) throw new Error(`the join was refused: ${served.refused}`);
+
+  // `authorize` was handed the AUTHENTICATED peer, not anything from
+  // the frame.
+  eq(seen, [{ type: 'read', peer: '00000000000000aa', audience: ['crew'] }], 'the access request');
+
+  // And the frames assemble into the projection.
+  const table = new assembly2.AssemblyTable();
+  let open = null;
+  let document = null;
+  for (const emitted of served.out) {
+    const decoded = codec2.decodeMessage(emitted.frame, { maxBytes: 8104, as: 'replica' });
+    if (!decoded.ok) throw new Error(`undecodable frame: ${decoded.reason}`);
+    if (decoded.message.k === 'man') open = table.open(decoded.message, 0);
+    else if (decoded.message.k === 'snap') {
+      const outcome = open.accept(decoded.message, raw => raw, 0);
+      if (outcome.done) document = outcome.document;
+    }
+  }
+  eq(document, { n: 7 }, 'the assembled projection');
+
+  // A second peer cannot use that handle, and is refused
+  // indistinguishably from an unknown one.
+  const h = served.out[0].h;
+  const stolen = owner.receive(codec2.encodeMessage({ k: 'alive', q: '1'.repeat(16), h }), '00000000000000bb');
+  eq(stolen.refused, 'handle-foreign-peer', 'the binding is re-checked');
+  const refusal = codec2.decodeMessage(stolen.out[0].frame, { maxBytes: 8104, as: 'replica' });
+  eq(refusal.ok && refusal.message.code, 'closed', 'and does not disclose the handle');
+});
+
 await probe('real_package_exports_every_symbol_the_browser_harness_imports', async () => {
   const pagePath = fileURLToPath(
     new URL('../../tests/rtc_browser/page/leaf5.js', import.meta.url),
