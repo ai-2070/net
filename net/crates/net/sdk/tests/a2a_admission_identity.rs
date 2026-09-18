@@ -969,7 +969,11 @@ async fn a_generation_is_never_reused_after_a_prune_and_a_restart() {
             "the isolation failed: something unresolved is still on disk"
         );
         assert!(
-            journal.lookup(owner(), "gen").await.expect("lookup").is_none(),
+            journal
+                .lookup(owner(), "gen")
+                .await
+                .expect("lookup")
+                .is_none(),
             "the isolation failed: the pruned key is still readable"
         );
     }
@@ -982,7 +986,9 @@ async fn a_generation_is_never_reused_after_a_prune_and_a_restart() {
     // integer and the first draft of this check asserted on
     // `!raw.contains("1")`, which the persisted counter itself matched.
     // That would have failed a correct journal.
-    let raw = tokio::fs::read_to_string(&path).await.expect("read journal");
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .expect("read journal");
     let file: serde_json::Value = serde_json::from_str(&raw).expect("journal is json");
     for table in ["records", "detached"] {
         assert_eq!(
