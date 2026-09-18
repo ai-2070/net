@@ -684,6 +684,61 @@ pub enum Step5 {
         session: String,
         peer_hex: String,
     },
+    // --- Stage 7: the store over this session's real transport ----
+    //
+    // These ride the same DataChannel every step above uses, so the
+    // loss / reorder / duplication hooks apply to store frames
+    // unchanged. That composition is the point: the store's chunker
+    // has been exercised against a transport double in Node, and
+    // never against a transport that can lose, reorder or duplicate.
+    /// `hostStore(...)` on this session, with `entries` keys of state.
+    StoreHost {
+        id: u64,
+        session: String,
+        handle: String,
+        entries: u32,
+        max_event_bytes: u32,
+    },
+    /// `joinStore(...)` and await `ready()`, with the hooks armed.
+    StoreJoin {
+        id: u64,
+        session: String,
+        handle: String,
+        host_hex: String,
+        audience: Vec<String>,
+        key: String,
+        max_event_bytes: u32,
+        drop_every: u32,
+        reorder_every: u32,
+        duplicate_every: u32,
+        timeout_ms: u64,
+    },
+    /// What a joined replica believes now.
+    StoreState {
+        id: u64,
+        handle: String,
+    },
+    /// The host writes, optionally duplicating what the commit sends.
+    StoreCommit {
+        id: u64,
+        handle: String,
+        entries: Option<u32>,
+        tick: Option<i64>,
+        duplicate_every: u32,
+        settle_ms: u64,
+    },
+    /// One correlated action from a joined replica.
+    StoreAct {
+        id: u64,
+        handle: String,
+        by: i64,
+        settle_ms: u64,
+        timeout_ms: u64,
+    },
+    StoreClose {
+        id: u64,
+        handle: String,
+    },
     Close {
         id: u64,
         session: String,
@@ -715,6 +770,12 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::StoreHost { id, .. }
+            | Self::StoreJoin { id, .. }
+            | Self::StoreState { id, .. }
+            | Self::StoreCommit { id, .. }
+            | Self::StoreAct { id, .. }
+            | Self::StoreClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }
@@ -757,6 +818,12 @@ impl Step5 {
             | Self::StunProbe { id, .. }
             | Self::ArmReentry { id, .. }
             | Self::ReentryReport { id, .. }
+            | Self::StoreHost { id, .. }
+            | Self::StoreJoin { id, .. }
+            | Self::StoreState { id, .. }
+            | Self::StoreCommit { id, .. }
+            | Self::StoreAct { id, .. }
+            | Self::StoreClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
             | Self::PeerAttempt { id, .. }

@@ -173,6 +173,7 @@
 mod browser;
 mod stage5;
 mod stage6;
+mod stage7;
 mod udp_block;
 
 use std::collections::HashMap;
@@ -1420,6 +1421,7 @@ async fn main() {
     let mut engine = Engine::Chromium;
     let mut engine_arg_bad: Option<String> = None;
     let mut stage5 = true;
+    let mut stage7 = false;
     let mut inverse = String::new();
     // **Off by default on Windows.** Binding the host's routable
     // IPv4 — which the anchor's and the impostor's RTC sockets do
@@ -1448,6 +1450,14 @@ async fn main() {
             // so the ledger is never quietly short and the CI floor
             // (which counts `RTCB PASS`) still fails.
             "--no-stage5" => stage5 = false,
+            // Opt IN to the Stage 7 store witnesses. Off by default,
+            // and deliberately so: they are written and they run, but
+            // the join is not yet answered on a browser ↔ browser
+            // pair (see `stage7.rs`), so pinning them would make the
+            // gate red about a blocker rather than about a
+            // regression. A witness that cannot pass yet does not
+            // belong in a floor; it belongs behind a flag, named.
+            "--stage7" => stage7 = true,
             // Opt in to the routable-interface topology on Windows,
             // accepting the Windows Firewall prompt the non-loopback
             // binds raise. Needed for the mDNS
@@ -1516,6 +1526,7 @@ async fn main() {
         engine,
         browser_path,
         stage5,
+        stage7,
         &inverse,
         routable,
         &mut ledger,
@@ -1749,6 +1760,8 @@ async fn run(
     engine: Engine,
     browser_path: Option<String>,
     stage5: bool,
+    // Opt-in: the Stage 7 store witnesses (see `--stage7`).
+    stage7: bool,
     inverse: &str,
     routable: bool,
     ledger: &mut Ledger,
@@ -1898,7 +1911,11 @@ async fn run(
     // separate browsing contexts and must not consume the Stage 5
     // tabs' steps, and two pages long-polling one queue would
     // resolve each other's.
-    for tab in stage5::TABS.iter().chain(stage6::TABS.iter()) {
+    for tab in stage5::TABS
+        .iter()
+        .chain(stage6::TABS.iter())
+        .chain(stage7::TABS.iter())
+    {
         let (tx, rx) = mpsc::channel(4);
         step5_tx.insert((*tab).to_string(), tx);
         step5_rx.insert((*tab).to_string(), Arc::new(Mutex::new(rx)));
@@ -3713,7 +3730,7 @@ async fn run(
             origin: origin.clone(),
             page_origin: origin.clone(),
             stun: stun.clone(),
-            tabs: step5_tx,
+            tabs: step5_tx.clone(),
             peer_tabs: step6_tx,
             anchor_rtc_addr: anchor_rtc_addr.to_string(),
         };
@@ -3721,6 +3738,35 @@ async fn run(
     } else {
         for name in stage6::WITNESSES {
             println!("RTCB EXCLUDED {name} — --no-stage5 was passed");
+        }
+    }
+
+    // ================================================================
+    // Stage 7 — the store, on the transport
+    //
+    // Two more isolated contexts, the same anchor, the same ledger.
+    // Last, because it is the only half that needs the store exports
+    // out of the built package.
+    // ================================================================
+    if stage5 && stage7 {
+        let cx7 = stage7::Cx7 {
+            driver: &driver,
+            anchor: &anchor,
+            credential: anchor_cred.clone(),
+            bootstrap_url: anchor_base.clone(),
+            origin: origin.clone(),
+            page_origin: origin.clone(),
+            stun: stun.clone(),
+            anchor_rtc_addr: anchor_rtc_addr.to_string(),
+            tabs: step5_tx,
+        };
+        stage7::run(cx7, ledger).await?;
+    } else {
+        for name in stage7::WITNESSES {
+            println!(
+                "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses; they are \
+                 not in any floor until the browser ↔ browser join is answered"
+            );
         }
     }
 

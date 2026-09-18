@@ -164,7 +164,17 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
     );
     let routed_session = a.peer_session_id(b_id).expect("session id");
 
-    let forwarded_before = r.router().stats().packets_forwarded;
+    // §10's PER-PAIR counter, not the node-global one.
+    //
+    // What used to be here was `r.router().stats().packets_forwarded
+    // >= forwarded_before`. It established nothing, twice over: that
+    // counter only ever increases, so `>=` is true of every possible
+    // run including one where the relay forwarded nothing at all;
+    // and it is node-global, so any unrelated traffic through R
+    // satisfies it. Assert the per-pair counter per phase instead —
+    // do not reintroduce the node-global `>=`.
+    let a_routing_id = (a.node_id() & 0xFFFF_FFFF) as u32;
+    let forwarded_before = r.forwarded_app_packets(a_routing_id, b_id);
     // The routed API, not the direct one: a routing envelope is what
     // the relay can forward without decrypting.
     a.send_routed(b_id, &batch(0, 4, "phase1-routed"))
@@ -174,9 +184,13 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
         delivered_with_tag(&b, "phase1-routed", Duration::from_secs(15)).await >= 1,
         "phase 1 must actually deliver A → R → B, not merely install a session"
     );
+    let forwarded_after_routed = r.forwarded_app_packets(a_routing_id, b_id);
     assert!(
-        r.router().stats().packets_forwarded >= forwarded_before,
-        "the relay's forwarding counter must not go backwards while it carries the phase"
+        forwarded_after_routed > forwarded_before,
+        "phase 1 is routed, so R's per-pair application-data counter for \
+         (A → B) MUST move while it carries the phase; without this moving \
+         leg, phase 3's flatness cannot tell 'direct' from 'broken' \
+         (before {forwarded_before}, after {forwarded_after_routed})"
     );
 
     // ---- phase 2: quiescent replacement by the RTC pair ---------
@@ -198,6 +212,12 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
     // 34727420769 and 652c786c9, on the initiator's error rather than
     // the responder's cause. No wait was widened: the precondition
     // the test claims to establish is now actually established.
+    //
+    // No per-pair forwarding assertion in this phase: phase 2 sends
+    // no application data on the A → B pair at all. It waits for
+    // quiescence and then runs the in-process SDP/Noise exchange,
+    // which never crosses R. An assertion here would be about
+    // nothing, so there is none.
     let a_id = a.node_id();
     let quiescent = wait_for(
         || {
@@ -239,12 +259,24 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
     );
 
     // ---- phase 3: direct delivery, then forced loss -------------
+    //
+    // The flatness leg. `assert_eq!` is the whole point: a `>=`
+    // could not distinguish "the DataChannel carried it" from "the
+    // relay is still carrying it", which is the only thing this
+    // phase exists to establish.
+    let flat_before = r.forwarded_app_packets(a_routing_id, b_id);
     a.send_to_peer_node(b_id, &batch(0, 4, "phase3-direct"))
         .await
         .expect("direct send");
     assert!(
         delivered_with_tag(&b, "phase3-direct", Duration::from_secs(15)).await >= 1,
         "phase 3 must deliver over the DataChannel"
+    );
+    assert_eq!(
+        r.forwarded_app_packets(a_routing_id, b_id),
+        flat_before,
+        "phase 3 is direct, so R's per-pair counter for (A → B) must stay \
+         EXACTLY flat while the DataChannel carries the payload"
     );
 
     // Forced DataChannel loss, then explicit interruption: the close
@@ -321,12 +353,20 @@ async fn routed_then_direct_then_loss_then_manually_restored_routed() {
          (restored {restored_session}, direct {direct_session}, routed {routed_session})"
     );
 
+    let forwarded_before_restore = r.forwarded_app_packets(a_routing_id, b_id);
     a.send_routed(b_id, &batch(0, 4, "phase4-restored"))
         .await
         .expect("restored routed send");
     assert!(
         delivered_with_tag(&b, "phase4-restored", Duration::from_secs(15)).await >= 1,
         "phase 4 must actually deliver again through the relay"
+    );
+    let forwarded_after_restore = r.forwarded_app_packets(a_routing_id, b_id);
+    assert!(
+        forwarded_after_restore > forwarded_before_restore,
+        "phase 4 puts the pair back on the relay, so the SAME per-pair counter \
+         that stayed flat while they were direct must move again \
+         (before {forwarded_before_restore}, after {forwarded_after_restore})"
     );
 
     // The stale RTC handle cannot reach the restored session.

@@ -89,6 +89,88 @@ const reentry = new Map();
 /// payloads" is a property of the package's fan-out and not of
 /// whichever one happened to be registered first.
 const streams = new Map();
+
+/// The stores this page hosts and joins, by runner-chosen handle.
+const hosts = new Map();
+const joins = new Map();
+
+/// The store surface, from the package's own exports.
+///
+/// Absent → the step fails LOUDLY naming it, exactly like
+/// `openSessionFn` above: a harness that silently skipped the store
+/// would report a green Stage 7 against a package that ships none.
+function storeApi() {
+  const { defineStore, hostStore, joinStore } = browserSdk;
+  if (typeof defineStore !== 'function') return null;
+  if (typeof hostStore !== 'function' || typeof joinStore !== 'function') return null;
+  return { defineStore, hostStore, joinStore };
+}
+
+/// One definition, identical on both sides — as it must be: the join
+/// carries the id and version and the host refuses a mismatch.
+function storeDefinition(defineStore) {
+  const record = value => {
+    if (typeof value !== 'object' || value === null) throw new Error('not a record');
+    return value;
+  };
+  return defineStore({
+    id: 'harness.stage7',
+    version: 1,
+    state: value => {
+      const raw = record(value);
+      const entries = {};
+      for (const [key, entry] of Object.entries(record(raw.entries ?? {}))) {
+        entries[key] = Number(entry);
+      }
+      return { entries, tick: Number(raw.tick ?? 0) };
+    },
+    empty: () => ({ entries: {}, tick: 0 }),
+    actions: {
+      bump: {
+        input: value => ({ by: Number(record(value).by) }),
+        output: value => ({ tick: Number(record(value).tick) }),
+      },
+    },
+    inputs: { nudge: value => ({ by: Number(record(value).by) }) },
+  });
+}
+
+/// A document large enough to need several chunks.
+function bulkEntries(count) {
+  const entries = {};
+  for (let i = 0; i < count; i += 1) entries[`entry-${i}`] = i;
+  return entries;
+}
+
+/// A cheap order-independent digest of a store document.
+///
+/// The runner compares host and replica by this rather than by
+/// shipping the document back: a mismatch is what matters, and a
+/// 700-entry world does not belong on the step channel.
+function digestOf(state) {
+  let hash = 2166136261;
+  const keys = Object.keys(state.entries).sort();
+  for (const key of keys) {
+    const text = `${key}=${String(state.entries[key])};`;
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+  }
+  return `${String(keys.length)}:${hash.toString(16)}:${String(state.tick)}`;
+}
+
+/// Bound a promise, so a step that never settles fails by name.
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out after ${String(ms)}ms`)), ms);
+    }),
+  ]);
+}
+
 /// Session-level event recorders, keyed by session name.
 ///
 /// One per session, installed by `session_events { arm: true }` and
@@ -209,6 +291,15 @@ function eventRow(e) {
 
 const loss = { dropEvery: 0, seen: 0, dropped: 0 };
 const reorder = { every: 0, seen: 0, swapped: 0, held: null };
+// DUPLICATION. Neither hook above can produce one: a drop removes a
+// datagram and a reorder moves it. With `duplicateEvery = N` the Nth
+// outbound message is sent TWICE, back to back, which is what a
+// retransmit looks like from the receiver's side — and the receiver
+// is supposed to deliver it once (`leaf/src/stream.rs`,
+// `a_retransmitted_duplicate_is_delivered_once`). Composed with the
+// store, that is what keeps a duplicated snapshot chunk idempotent
+// and a duplicated delta from moving a view twice.
+const dup = { every: 0, seen: 0, duplicated: 0 };
 /// Every message the leaf handed the DataChannel, counted
 /// unconditionally — hooks armed or not.
 ///
@@ -234,6 +325,21 @@ const wire = { messages: 0, bytes: 0 };
       if (loss.seen % loss.dropEvery === 0) {
         loss.dropped += 1;
         return; // the datagram never leaves the browser
+      }
+    }
+    if (dup.every > 0) {
+      dup.seen += 1;
+      if (dup.seen % dup.every === 0) {
+        dup.duplicated += 1;
+        // The original goes through the normal path below; this is
+        // the extra copy, sent first so the duplicate is genuinely
+        // on the wire rather than merely queued after it.
+        try {
+          reorder.send(this, data);
+        } catch {
+          // A channel that refuses the copy is not this hook's
+          // business; the original still goes.
+        }
       }
     }
     if (reorder.every > 0) {
@@ -1700,6 +1806,209 @@ async function execute(step) {
     case 'idle':
       await sleep(step.millis || 50);
       return { ok: true };
+
+    // ================================================================
+    // STAGE 7 — the store, over this session's real transport
+    //
+    // `hostStore` and `joinStore` take the SESSION as their transport:
+    // it already has `nodeIdHex`, `openStream` and `onEvent`, which is
+    // the whole structural surface the store uses. So these steps add
+    // no transport of their own — the frames ride the same DataChannel
+    // every witness above exercises, and the loss / reorder /
+    // duplication hooks apply to them unchanged.
+    //
+    // The document is deliberately LARGE (`entries`): a store snapshot
+    // is chunked at 5934 payload bytes, so a few hundred entries make
+    // the install span several real frames and the assembler's job
+    // real.
+    // ================================================================
+    case 'store_host': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const pkg = storeApi();
+      if (!pkg) return { ok: false, error: 'the package exports no hostStore/joinStore' };
+      const definition = storeDefinition(pkg.defineStore);
+      const initial = { entries: bulkEntries(step.entries || 0), tick: 0 };
+      let host;
+      try {
+        host = pkg.hostStore({
+          definition,
+          transport: node,
+          initialState: initial,
+          maxEventBytes: step.max_event_bytes || 8104,
+          authorize: () => true,
+          project: state => state,
+          actions: {
+            bump: (input, context) => {
+              const tick = context.getState().tick + input.by;
+              context.setState({ tick });
+              return { tick };
+            },
+          },
+          inputs: {
+            nudge: (input, context) => {
+              context.setState({ tick: context.getState().tick + input.by });
+            },
+          },
+        });
+      } catch (e) {
+        return { ok: false, error: (e && (e.message || String(e))) || 'hostStore threw' };
+      }
+      hosts.set(step.handle, host);
+      return {
+        ok: true,
+        stats: {
+          authority: host.authority,
+          node: node.nodeIdHex(),
+          entries: Object.keys(host.getState().entries).length,
+          counts: host.counts(),
+        },
+      };
+    }
+
+    // Join the store a peer is hosting and WAIT for a consistent view.
+    // `ready()` is the store's own boundary: it resolves when the
+    // manifest, every chunk and the validation have landed, so a
+    // witness that reads state after it is reading an installed
+    // document and not a partial one.
+    case 'store_join': {
+      const node = nodes.get(step.session);
+      if (!node) return { ok: false, error: 'no such session ' + step.session };
+      const pkg = storeApi();
+      if (!pkg) return { ok: false, error: 'the package exports no hostStore/joinStore' };
+      loss.dropEvery = step.drop_every || 0;
+      loss.seen = 0;
+      loss.dropped = 0;
+      reorder.every = step.reorder_every || 0;
+      reorder.seen = 0;
+      reorder.swapped = 0;
+      reorder.held = null;
+      dup.every = step.duplicate_every || 0;
+      dup.seen = 0;
+      dup.duplicated = 0;
+      const wireBefore = wire.messages;
+      const started = performance.now();
+      let joined;
+      try {
+        joined = pkg.joinStore({
+          definition: storeDefinition(pkg.defineStore),
+          transport: node,
+          host: step.host_hex,
+          audience: step.audience || ['crew'],
+          key: step.key || 'harness',
+          maxEventBytes: step.max_event_bytes || 8104,
+        });
+        joins.set(step.handle, joined);
+        await withTimeout(joined.ready(), step.timeout_ms || 20000, 'store ready');
+      } catch (e) {
+        flushHeld();
+        loss.dropEvery = 0;
+        reorder.every = 0;
+        dup.every = 0;
+        return {
+          ok: false,
+          error: (e && (e.message || String(e))) || 'joinStore threw',
+          stats: { dropped: loss.dropped, swapped: reorder.swapped, duplicated: dup.duplicated },
+        };
+      }
+      flushHeld();
+      loss.dropEvery = 0;
+      reorder.every = 0;
+      dup.every = 0;
+      const state = joined.getState();
+      return {
+        ok: true,
+        stats: {
+          ms: Math.round(performance.now() - started),
+          entries: Object.keys(state.entries).length,
+          digest: digestOf(state),
+          tick: state.tick,
+          status: joined.getStatus(),
+          // The hooks' own counts: a witness that armed loss and saw
+          // zero drops proves nothing, so the numbers come back and
+          // the runner asserts on them.
+          dropped: loss.dropped,
+          swapped: reorder.swapped,
+          duplicated: dup.duplicated,
+          wire_messages: wire.messages - wireBefore,
+        },
+      };
+    }
+
+    // What a joined replica currently believes. Digest plus counts, so
+    // the runner compares documents without moving megabytes over the
+    // step channel.
+    case 'store_state': {
+      const joined = joins.get(step.handle);
+      if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
+      const state = joined.getState();
+      return {
+        ok: true,
+        stats: {
+          entries: Object.keys(state.entries).length,
+          digest: digestOf(state),
+          tick: state.tick,
+          status: joined.getStatus(),
+        },
+      };
+    }
+
+    // The host writes. Returns once the frames the commit produced
+    // have been handed to the transport.
+    case 'store_commit': {
+      const host = hosts.get(step.handle);
+      if (!host) return { ok: false, error: 'no such hosted store ' + step.handle };
+      dup.every = step.duplicate_every || 0;
+      dup.seen = 0;
+      dup.duplicated = 0;
+      const wireBefore = wire.messages;
+      const next = host.getState();
+      host.setState({
+        entries: step.entries === undefined ? next.entries : bulkEntries(step.entries),
+        tick: step.tick === undefined ? next.tick + 1 : step.tick,
+      });
+      // One turn, so the sends the commit queued actually reach the
+      // channel before this step answers.
+      await new Promise(resolve => setTimeout(resolve, step.settle_ms || 150));
+      dup.every = 0;
+      return {
+        ok: true,
+        stats: {
+          tick: host.getState().tick,
+          entries: Object.keys(host.getState().entries).length,
+          digest: digestOf(host.getState()),
+          duplicated: dup.duplicated,
+          wire_messages: wire.messages - wireBefore,
+          counts: host.counts(),
+        },
+      };
+    }
+
+    // A correlated action, answered by the host's policy and handler.
+    case 'store_act': {
+      const joined = joins.get(step.handle);
+      if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
+      try {
+        const result = await withTimeout(
+          joined.act('bump', { by: step.by || 1 }),
+          step.timeout_ms || 15000,
+          'store action',
+        );
+        await new Promise(resolve => setTimeout(resolve, step.settle_ms || 150));
+        return { ok: true, stats: { result, tick: joined.getState().tick } };
+      } catch (e) {
+        return { ok: false, error: (e && (e.message || String(e))) || 'act threw', stats: { code: e && e.code } };
+      }
+    }
+
+    case 'store_close': {
+      const host = hosts.get(step.handle);
+      const joined = joins.get(step.handle);
+      if (host) { await host.close(); hosts.delete(step.handle); }
+      if (joined) { await joined.close(); joins.delete(step.handle); }
+      if (!host && !joined) return { ok: false, error: 'no such store ' + step.handle };
+      return { ok: true };
+    }
 
     case 'done':
       return { ok: true };

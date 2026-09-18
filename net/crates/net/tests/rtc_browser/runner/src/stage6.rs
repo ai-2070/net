@@ -146,9 +146,9 @@ pub struct Cx6<'a> {
 }
 
 /// One leaf's identity as the page reports it after `connect`.
-struct Leaf {
-    node_hex: String,
-    node_id: u64,
+pub(crate) struct Leaf {
+    pub(crate) node_hex: String,
+    pub(crate) node_id: u64,
 }
 
 /// Run every Stage 6 witness.
@@ -274,8 +274,8 @@ pub async fn run(cx: Cx6<'_>, ledger: &mut Ledger) -> Result<(), String> {
         }
     }
 
-    let found_b = discover(&mut script, TAB_A, &b.node_hex).await;
-    let found_a = discover(&mut script, TAB_B, &a.node_hex).await;
+    let found_b = discover(&mut script, TAB_A, &b.node_hex, "peer", PEER_TAG).await;
+    let found_a = discover(&mut script, TAB_B, &a.node_hex, "peer", PEER_TAG).await;
     ledger.record(
         WITNESSES[1],
         found_b.is_some() && found_a.is_some(),
@@ -977,7 +977,17 @@ async fn drive_to_open(script: &mut Script5, a_hex: &str, b_hex: &str) -> Result
 
 /// Poll `tab`'s capability query until it holds `peer_hex`, and return
 /// the Noise key it learned.
-async fn discover(script: &mut Script5, tab: &str, peer_hex: &str) -> Option<String> {
+pub(crate) async fn discover(
+    script: &mut Script5,
+    tab: &str,
+    peer_hex: &str,
+    // The session and the tag are the CALLER's: Stage 7 opens a
+    // session named `store` and announces under its own capability,
+    // and a query aimed at this module's names would ask a session
+    // that does not exist for a tag nobody published.
+    session: &str,
+    capability: &str,
+) -> Option<String> {
     let deadline = tokio::time::Instant::now() + DISCOVERY_DEADLINE;
     while tokio::time::Instant::now() < deadline {
         let seen = script
@@ -985,8 +995,8 @@ async fn discover(script: &mut Script5, tab: &str, peer_hex: &str) -> Option<Str
                 tab,
                 Step5::Query {
                     id: 0,
-                    session: "peer".to_string(),
-                    capability: PEER_TAG.to_string(),
+                    session: session.to_string(),
+                    capability: capability.to_string(),
                 },
             )
             .await;
@@ -1027,7 +1037,7 @@ fn noise_key_for(result: &StepResult, peer_hex: &str) -> Option<String> {
 }
 
 /// `{ ok, node_id }` from a `Connect` result.
-fn leaf_of(result: &StepResult) -> Option<Leaf> {
+pub(crate) fn leaf_of(result: &StepResult) -> Option<Leaf> {
     if !result.ok {
         return None;
     }
@@ -1382,7 +1392,7 @@ impl Forwarded {
 
 /// The `src_id` half of the anchor's key: the low 32 bits of a node
 /// id, which is what a routing header carries.
-fn routing_id(leaf: &Leaf) -> u32 {
+pub(crate) fn routing_id(leaf: &Leaf) -> u32 {
     u32::try_from(leaf.node_id & 0xFFFF_FFFF).expect("the low 32 bits of a u64 fit a u32")
 }
 
@@ -2271,8 +2281,8 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
             )
             .await;
     }
-    let found_b = discover(&mut script, TAB_A, &b.node_hex).await;
-    let found_a = discover(&mut script, TAB_B, &a.node_hex).await;
+    let found_b = discover(&mut script, TAB_A, &b.node_hex, "peer", PEER_TAG).await;
+    let found_a = discover(&mut script, TAB_B, &a.node_hex, "peer", PEER_TAG).await;
     if found_a.is_none() || found_b.is_none() {
         let detail =
             "the slice 3 leaves did not discover each other inside the announcement deadline"
