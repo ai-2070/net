@@ -2241,15 +2241,29 @@ async fn a_retry_after_result_retention_never_relaunches_or_redeems() {
     assert!(fx.record("t-retired").await.is_none());
     assert!(fx.ledger_has("t-retired").await, "the ledger outlives it");
 
-    let ack = fx
+    // The property this row exists for — never relaunch, never redeem a
+    // second time — is unchanged. What changed is the SHAPE of the
+    // refusal on the paid path, and the old shape was the defect: a paid
+    // submitter holding a proof for work that will never run again got
+    // prose, so its durable attempt read the refusal as retryable and
+    // stranded the charge as `Paid` forever with no operator exit. This
+    // assertion is retargeted rather than re-pinned: a terminal,
+    // machine-readable verdict is what lets the caller retain the
+    // evidence and escalate.
+    let refusal = fx
         .submit(&b, paid_headers("q-1"))
         .await
-        .expect("a retired retry is an in-body rejection");
-    assert!(!ack.accepted);
+        .expect_err("a retired paid retry must be a structured terminal refusal");
+    assert_eq!(refusal.reason(), "retired");
+    let schematic = refusal
+        .schematic
+        .as_ref()
+        .expect("the refusal carries a schematic");
     assert!(
-        ack.reason.as_deref().is_some_and(|r| r.contains("retired")),
-        "{:?}",
-        ack.reason
+        !schematic.recovery.safe_to_retry && !schematic.recovery.safe_to_requote,
+        "a retired task is terminal in both directions — retrying cannot help and \
+         buying another quote would be a second charge for work that will not run: {:?}",
+        schematic.recovery
     );
     assert_eq!(fx.gate.call_count(), 1, "no second redemption");
     assert_eq!(fx.exec.runs(), 1, "no second run");
@@ -2259,6 +2273,53 @@ async fn a_retry_after_result_retention_never_relaunches_or_redeems() {
         PrepareReply::Retired { task_id } => assert_eq!(task_id, "t-retired"),
         other => panic!("expected Retired, got {other:?}"),
     }
+}
+
+/// The control for the split above: on a **free** service a retired
+/// retry still answers an in-body `TaskAck`, unchanged.
+///
+/// Without this row, routing the retired refusal through the payment
+/// channel for everyone would satisfy the paid assertion and silently
+/// change the free wire — the thing the whole slice promises not to do.
+/// Nothing financial happened on a free submit, so there is nothing for
+/// a caller to retain and no operator to escalate to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_free_retired_retry_is_still_an_in_body_rejection() {
+    let fx = pending(false)
+        .await
+        .serve(vec![A2aServicePolicy::Free(offer(false))], false)
+        .await;
+    let b = brief("t-free-retired");
+
+    let ack = fx.submit(&b, vec![]).await.expect("free submit");
+    assert!(ack.accepted, "{:?}", ack.reason);
+    fx.exec.wait_started().await;
+    fx.await_tag("t-free-retired", StateTag::Terminal).await;
+    assert!(fx.registry.forget(fx.owner(), "t-free-retired"));
+    assert!(
+        fx.store()
+            .forget(fx.owner(), "t-free-retired")
+            .await
+            .expect("forget"),
+        "the result is retired"
+    );
+    assert!(
+        fx.ledger_has("t-free-retired").await,
+        "the ledger outlives it"
+    );
+
+    // In-body, not a payment refusal, and it still names the cause.
+    let ack = fx
+        .submit(&b, vec![])
+        .await
+        .expect("a free retired retry stays an in-body rejection");
+    assert!(!ack.accepted);
+    assert!(
+        ack.reason.as_deref().is_some_and(|r| r.contains("retired")),
+        "{:?}",
+        ack.reason
+    );
+    assert_eq!(fx.exec.runs(), 1, "no second run");
 }
 
 // ===========================================================================

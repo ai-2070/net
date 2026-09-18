@@ -756,6 +756,34 @@ fn schematic_no_reservation(tool_id: &str) -> FailureSchematic {
     s
 }
 
+/// `retired`: the task ran and its result has since been retired, so the
+/// launch ledger bars a relaunch and the redeem step is never reached.
+///
+/// Structured **only on the paid path**, and deliberately so. A free
+/// submitter gets the in-body `TaskAck` it always got — nothing
+/// financial happened, so there is nothing to reconcile. A *paid*
+/// submitter is in a different position: it holds a proof for work this
+/// provider will never run again, and a caller can only retain that
+/// evidence and reach an operator if the refusal is terminal and
+/// machine-readable. Rendering this as prose is what left a paid attempt
+/// stranded as retryable forever.
+///
+/// `funds_moved` / `prior_payment` stay `unknown`: the ledger proves the
+/// work ran, not what became of this particular payment.
+fn schematic_retired(tool_id: &str) -> FailureSchematic {
+    let mut s = base_schematic(
+        failure_vocab::STAGE_ADMISSION,
+        "retired",
+        "this task already ran and its result has been retired; the launch ledger \
+         bars a relaunch, so this proof cannot buy another run"
+            .to_string(),
+        tool_id,
+    );
+    s.recovery.actor = failure_vocab::ACTOR_CALLER_OPERATOR.to_string();
+    s.recovery.next_action = Some("contact_provider_operator".to_string());
+    s
+}
+
 /// `admission_revoked`: a payment may already have landed and the
 /// provider can no longer admit the work. Operator reconciliation, never
 /// an unpaid rejection — and never retryable or re-quotable, because a
@@ -1353,12 +1381,21 @@ impl ConfiguredA2a {
             None => {
                 // Ran once, result retired: the ledger bars a relaunch,
                 // and the redeem step is never reached.
+                //
+                // A PAID submitter holds a proof for work that will never
+                // run again, so the refusal has to be terminal and
+                // machine-readable or its attempt cannot retain the
+                // evidence and reach an operator. A free one gets the
+                // in-body ack it always got — nothing financial happened.
                 if self
                     .store
                     .ledger_has(owner, task_id)
                     .await
                     .map_err(|e| unavailable(e.to_string()))?
                 {
+                    if paid {
+                        return Err(refuse_payment(&schematic_retired(tool_id)));
+                    }
                     return Err(refuse(SubmitRejection::Retired {
                         task_id: task_id.to_string(),
                     }));

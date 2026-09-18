@@ -109,10 +109,16 @@ const MAX_WAIT_STEPS: u32 = 8;
 /// that says the provider will never execute this purchase must move the
 /// attempt to [`PurchaseState::PaidUnexecutable`] even if a future
 /// schematic revision loosened its recovery flags.
-const TERMINAL_SUBMIT_REASONS: [&str; 3] = [
+const TERMINAL_SUBMIT_REASONS: [&str; 4] = [
     "admission_revoked",
     "no_reservation",
     "input_binding_mismatch",
+    // The task already ran and its result was retired: the provider's
+    // launch ledger bars a relaunch, so no retry and no fresh quote can
+    // ever make this proof execute. Listed explicitly as well as being
+    // covered by the no-retry/no-requote posture, because the vocabulary
+    // is the contract a caller branches on.
+    "retired",
 ];
 
 /// The `reason` a retained superseded attempt's refusal carries: the

@@ -2241,15 +2241,31 @@ async fn a_retry_after_result_retention_never_relaunches_or_redeems() {
     assert!(fx.record("t-retired").await.is_none());
     assert!(fx.ledger_has("t-retired").await, "the ledger outlives it");
 
-    let ack = fx
+    // NOTE — the only edit to this reviewer-supplied file beyond the
+    // `review_*` counterexamples, which stay byte-identical to what was
+    // exported. This function is a VENDORED COPY of the repository's own
+    // `a2a_paid_admission.rs::a_retry_after_result_retention_never_
+    // relaunches_or_redeems`, copied here so the probe file could stand
+    // alone. The repair deliberately changed its subject: a paid submit
+    // meeting a retired task now gets a structured terminal refusal
+    // instead of prose, because the prose shape stranded a paid attempt
+    // as retryable forever with no operator exit. This retargeting
+    // mirrors, line for line, the one applied to the original in
+    // `a2a_paid_admission.rs`; the row's real property — never relaunch,
+    // never redeem twice — is unchanged and still asserted below.
+    let refusal = fx
         .submit(&b, paid_headers("q-1"))
         .await
-        .expect("a retired retry is an in-body rejection");
-    assert!(!ack.accepted);
+        .expect_err("a retired paid retry must be a structured terminal refusal");
+    assert_eq!(refusal.reason(), "retired");
+    let schematic = refusal
+        .schematic
+        .as_ref()
+        .expect("the refusal carries a schematic");
     assert!(
-        ack.reason.as_deref().is_some_and(|r| r.contains("retired")),
-        "{:?}",
-        ack.reason
+        !schematic.recovery.safe_to_retry && !schematic.recovery.safe_to_requote,
+        "a retired task is terminal in both directions: {:?}",
+        schematic.recovery
     );
     assert_eq!(fx.gate.call_count(), 1, "no second redemption");
     assert_eq!(fx.exec.runs(), 1, "no second run");

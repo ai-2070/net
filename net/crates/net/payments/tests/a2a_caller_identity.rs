@@ -1089,3 +1089,55 @@ async fn an_unstructured_rejected_ack_does_not_strand_a_paid_purchase() {
     assert_eq!(kept_proof, proof, "with the payment evidence retained");
     assert_eq!(w.billed().await, 1, "and one charge throughout");
 }
+
+/// A **retired** task is the case the provider's paid-path split exists
+/// for: the caller holds a proof for work that will never run again, so
+/// the refusal has to be terminal and machine-readable or the charge is
+/// stranded as `Paid` forever with no operator exit.
+///
+/// Its own attempt on purpose — a `PaidUnexecutable` record is already
+/// terminal and answers later submits from its retained refusal, so this
+/// cannot share the control above's task without measuring that instead.
+#[tokio::test]
+async fn a_retired_paid_submit_is_terminal_with_its_evidence_kept() {
+    let w = world(false, false).await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-retired"))
+        .await
+        .expect("prepare");
+    let paid = w.flow.purchase_task(NODE, "t-retired").await;
+    let A2aPurchase::Paid { proof, .. } = &paid else {
+        panic!("expected Paid, got {paid:?}");
+    };
+
+    w.tasks.push_submit(Err(A2aFlowError::PaymentRefused {
+        message: "this task already ran and its result has been retired".to_string(),
+        schematic: Some(Box::new(schematic("retired", false, false))),
+    }));
+    let retired = w.flow.submit_task(NODE, "t-retired").await;
+    let A2aSubmit::Unexecutable { refusal } = &retired else {
+        panic!("a retired paid submit must be terminal, not a retry: {retired:?}");
+    };
+    assert_eq!(refusal.reason.as_deref(), Some("retired"));
+
+    let attempt = w.attempt("t-retired").await;
+    let PurchaseState::PaidUnexecutable {
+        proof: kept_proof, ..
+    } = &attempt.state
+    else {
+        panic!("expected PaidUnexecutable, got {:?}", attempt.state);
+    };
+    assert_eq!(
+        kept_proof, proof,
+        "the payment evidence is retained for the operator"
+    );
+    assert!(
+        attempt.is_unresolved_financial(),
+        "and it is never pruned while unresolved"
+    );
+    assert_eq!(
+        w.billed().await,
+        1,
+        "still exactly one charge — a retired refusal must never buy again"
+    );
+}
