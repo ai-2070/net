@@ -72,6 +72,12 @@ pub mod node;
 pub mod retry;
 pub mod rpc;
 pub mod rpc_wire;
+/// Which open stream a proxy caller's handle owns. Native, so the
+/// addressing rule is assertable without a browser — and shared by
+/// the real backend and the browser witnesses' backend, so a change
+/// to it is visible to both.
+pub mod stream_ownership;
+
 /// The browser transport. `wasm32`-only: it is the one module that
 /// touches `web_sys`, and a native build has no `RTCPeerConnection`
 /// to touch.

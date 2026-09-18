@@ -5233,6 +5233,8 @@ jobs:
           a_promotion_whose_generation_transaction_fails_requeues_instead_of_stranding_the_tab
           a_proxied_send_broadcasts_another_streams_terminal_event_instead_of_panicking
           a_retained_stream_handle_cannot_address_a_same_id_successor
+          a_follower_owns_its_streams_independently_under_one_wire_id
+          two_peers_under_one_wire_id_own_their_streams_independently
           a_runtime_announcement_is_restored_by_the_promoted_tab
           a_superseded_session_is_refused_by_the_leader_and_by_storage
           a_tampered_identity_record_does_not_decrypt
@@ -5274,7 +5276,7 @@ jobs:
             # this step.
             case "$suite" in
               wasm_leaf)       floor=16 ;;
-              wasm_leader)     floor=27 ;;
+              wasm_leader)     floor=29 ;;
               wasm_anchorless) floor=2  ;;
               # S6-06's leaf half. `leaf/src/rtc.rs` is
               # `#![cfg(target_arch = "wasm32")]` in its entirety, so

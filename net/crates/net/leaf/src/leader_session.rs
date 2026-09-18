@@ -65,6 +65,7 @@ use crate::leader::{
 use crate::rpc::DEFAULT_CALL_TIMEOUT_MS;
 use crate::storage::{IdentityVault, DEFAULT_DB_NAME};
 use crate::stream::Reliability;
+use crate::stream_ownership::StreamOwnership;
 
 /// How often a leader revalidates its generation against the store.
 ///
@@ -1858,30 +1859,16 @@ pub fn spawn_fenced(
 struct NodeBackend {
     node: Rc<crate::wasm::LeafNode>,
     node_id: u64,
-    /// Open streams **by backend handle**, never by wire stream id.
+    /// The streams this backend owns, addressed by handle.
     ///
-    /// The wire id does not identify an open: it is derived from a
-    /// label and the peer is no part of that derivation, so two peers
-    /// under one label share it. Keying by it let the second open
-    /// overwrite the first's slot, after which the first caller's
-    /// `send` reached — and its `close` closed — the second peer's
-    /// stream.
-    streams: Rc<RefCell<HashMap<u64, crate::wasm::LeafStream>>>,
-    /// The next handle to hand out: monotone, never reused within a
-    /// backend, so a handle cannot come to name a different open.
-    next_handle: Rc<Cell<u64>>,
+    /// [`StreamOwnership`] is the one place that addressing lives, and
+    /// the browser witnesses' backend uses the same type — so a change
+    /// to how an open is addressed is visible to them.
+    streams: Rc<StreamOwnership<crate::wasm::LeafStream>>,
     /// The fence this backend's operations are admitted under — the
     /// same lease the server stamps its replies with.
     lease: GenerationLease,
     ops: Rc<OpRegistry>,
-}
-
-impl NodeBackend {
-    fn next_stream_handle(&self) -> u64 {
-        let next = self.next_handle.get().saturating_add(1);
-        self.next_handle.set(next);
-        next
-    }
 }
 
 impl LeaderBackend for NodeBackend {
@@ -1897,7 +1884,7 @@ impl LeaderBackend for NodeBackend {
         // A stream is session-scoped. D2 is explicit that it is not
         // resurrected, so the handles go with the node rather than
         // becoming a table a successor could be addressed through.
-        self.streams.borrow_mut().clear();
+        drop(self.streams.drain());
         let failed = self.node.retire(generation);
         if cancelled > 0 {
             report(&format!(
@@ -2070,42 +2057,36 @@ impl LeaderBackend for NodeBackend {
                 }
                 match node.open_stream(opts.into()) {
                     Ok(stream) => {
-                        // Read the identity back off the stream the
-                        // node actually opened, never off the request:
-                        // the options are what a follower *asked* for,
-                        // and a handle that filtered on those would be
-                        // trusting the asker.
-                        let resolved = (
-                            u64::from_str_radix(&stream.stream_id_hex(), 16),
-                            u64::from_str_radix(&stream.peer_node_hex(), 16),
-                            stream.incarnation().parse::<u64>(),
-                        );
-                        let (Ok(wire_id), Ok(resolved_peer), Ok(incarnation)) = resolved else {
-                            // Fail closed. A stream whose identity
-                            // cannot be read is not handed over with
-                            // the peer left unknown — that is exactly
-                            // the silently-permissive fallback this
-                            // repair exists to remove.
-                            stream.close();
-                            reply.fail(ProxyFailure::Typed(LeafError::Session(
-                                "opened stream did not report a readable identity".into(),
-                            )));
-                            return;
-                        };
-                        let handle = self.next_stream_handle();
-                        self.streams.borrow_mut().insert(handle, stream);
-                        reply.stream(handle, wire_id, resolved_peer, incarnation);
+                        // `adopt` resolves the identity off the stream
+                        // the node actually opened and allocates the
+                        // handle that owns it. The reply is built from
+                        // what it returns, so this arm cannot answer
+                        // with the peer the caller asked for.
+                        match self.streams.adopt(stream) {
+                            Ok((handle, id)) => {
+                                reply.stream(handle, id.wire_id, id.peer, id.incarnation);
+                            }
+                            Err(stream) => {
+                                // Fail closed: a stream whose identity
+                                // cannot be read is closed again, not
+                                // handed over with an unknown peer.
+                                stream.close();
+                                reply.fail(ProxyFailure::Typed(LeafError::Session(
+                                    "opened stream did not report a readable identity".into(),
+                                )));
+                            }
+                        }
                     }
                     Err(error) => reply.fail(reported(error)),
                 }
             }
             LeaderRequest::StreamSend { handle, payload } => {
-                let streams = self.streams.borrow();
-                match streams.get(&handle) {
-                    Some(stream) => match stream.send(Uint8Array::from(&payload[..])) {
-                        Ok(()) => reply.bytes(Bytes::new()),
-                        Err(error) => reply.fail(reported(error)),
-                    },
+                let sent = self
+                    .streams
+                    .with(handle, |stream| stream.send(Uint8Array::from(&payload[..])));
+                match sent {
+                    Some(Ok(())) => reply.bytes(Bytes::new()),
+                    Some(Err(error)) => reply.fail(reported(error)),
                     // The handle names one open, so this is "your
                     // stream is closed", never "some other peer's
                     // stream under the same wire id".
@@ -2115,7 +2096,7 @@ impl LeaderBackend for NodeBackend {
                 }
             }
             LeaderRequest::StreamClose { handle } => {
-                if let Some(stream) = self.streams.borrow_mut().remove(&handle) {
+                if let Some(stream) = self.streams.remove(handle) {
                     stream.close();
                 }
                 reply.bytes(Bytes::new());
@@ -2147,8 +2128,7 @@ fn node_factory() -> BackendFactory {
             let backend: Box<dyn LeaderBackend> = Box::new(NodeBackend {
                 node: Rc::new(node),
                 node_id,
-                streams: Rc::new(RefCell::new(HashMap::new())),
-                next_handle: Rc::new(Cell::new(0)),
+                streams: Rc::new(StreamOwnership::default()),
                 lease,
                 ops: Rc::new(OpRegistry::default()),
             });

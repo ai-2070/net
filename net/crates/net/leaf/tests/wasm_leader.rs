@@ -48,7 +48,6 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use bytes::Bytes;
@@ -72,6 +71,7 @@ use net_leaf::leader_session::{
 use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::storage::IdentityVault;
 use net_leaf::stream::Reliability;
+use net_leaf::stream_ownership::StreamOwnership;
 use net_leaf::{LeafIdentity, StreamHandle};
 
 // The point is a real browser engine: IndexedDB, `crypto.subtle`,
@@ -460,12 +460,14 @@ struct RealNode {
     /// lifecycle, so a synchronous arm can deliver a real node event
     /// exactly where production's `StreamSend` delivers one.
     sink: Rc<RefCell<Option<EventSink>>>,
-    /// Stream handles the backend opened, **by owning handle** —
-    /// production `NodeBackend` keeps the same table, and keys it the
-    /// same way, because two peers under one label share the wire id.
-    streams: Rc<RefCell<HashMap<u64, StreamHandle>>>,
-    /// The next owning handle, monotone and never reused.
-    next_handle: Rc<Cell<u64>>,
+    /// The streams this backend owns.
+    ///
+    /// **The production type**, not a second copy of the addressing:
+    /// `net_leaf::stream_ownership::StreamOwnership` is what the real
+    /// `NodeBackend` holds too, so a change to how an open is
+    /// addressed is visible to the witnesses below. A fixture with its
+    /// own table is a fixture that cannot see the mechanism change.
+    streams: Rc<StreamOwnership<StreamHandle>>,
     /// How many reliability sweeps a synchronous send's pump runs,
     /// and how far each one moves the node's clock argument. Zero for
     /// every test but the one whose subject is a retransmit budget
@@ -611,13 +613,18 @@ impl LeaderBackend for RealNodeBackend {
                 );
                 match opened {
                     Ok(handle) => {
-                        // Keyed by an owning handle, like production:
-                        // two peers under one label share the wire id,
-                        // so the id cannot name an open.
-                        let owner = handles.next_handle.get() + 1;
-                        handles.next_handle.set(owner);
-                        handles.streams.borrow_mut().insert(owner, handle);
-                        reply.stream(owner, handle.stream_id, handle.peer, handle.incarnation);
+                        // The production seam, exactly as
+                        // `NodeBackend` uses it: `adopt` allocates the
+                        // handle AND resolves the identity, so this arm
+                        // cannot answer with the requested peer either.
+                        match handles.streams.adopt(handle) {
+                            Ok((owner, id)) => {
+                                reply.stream(owner, id.wire_id, id.peer, id.incarnation);
+                            }
+                            Err(_) => reply.fail(ProxyFailure::Typed(LeafError::Session(
+                                "opened stream did not report a readable identity".into(),
+                            ))),
+                        }
                     }
                     Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
                 }
@@ -634,7 +641,7 @@ impl LeaderBackend for RealNodeBackend {
                 handle: owner,
                 payload,
             } => {
-                let handle = handles.streams.borrow().get(&owner).copied();
+                let handle = handles.streams.with(owner, |handle| *handle);
                 let Some(handle) = handle else {
                     reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
                         "no open stream for handle {owner}"
@@ -674,6 +681,18 @@ impl LeaderBackend for RealNodeBackend {
                     Ok(()) => reply.bytes(Bytes::new()),
                     Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
                 }
+            }
+            // Production's `NodeBackend::StreamClose` is this arm: it
+            // gives up the stream the handle owns and closes it on the
+            // node. Without this arm a close-A-leaves-B witness passes
+            // without closing anything.
+            LeaderRequest::StreamClose { handle: owner } => {
+                if let Some(handle) = handles.streams.remove(owner) {
+                    let mut node = handles.node.borrow_mut();
+                    let _ = node.close_stream(handle);
+                    node.take_outbound();
+                }
+                reply.bytes(Bytes::new());
             }
             _ => reply.bytes(Bytes::new()),
         }
@@ -810,8 +829,7 @@ fn real_pair() -> (RealNode, net_leaf::LeafNode) {
             barrier: Rc::new(RefCell::new(None)),
             dispatched: Rc::new(Cell::new(0)),
             sink: Rc::new(RefCell::new(None)),
-            next_handle: Rc::new(Cell::new(0)),
-            streams: Rc::new(RefCell::new(HashMap::new())),
+            streams: Rc::new(StreamOwnership::default()),
             sweeps: Rc::new(Cell::new(0)),
             transport: Rc::new(RefCell::new(None)),
         },
@@ -3407,22 +3425,26 @@ fn now_ms() -> f64 {
         .map_or(0.0, |performance| performance.now())
 }
 
-/// Two authenticated peers, one wire stream id, on the **leader's own**
-/// `MeshSession` — which wraps the same `ProxyStream` a follower's
-/// does, so this is not a follower-only property.
+/// Two authenticated peers, one wire stream id, and all four
+/// operations — on the leader's own `MeshSession` and on a follower's.
 ///
-/// Before the ownership repair the backend keyed its open-stream table
-/// by the wire id, so the second open overwrote the first's slot: the
-/// first handle's `send` reached the second peer's stream and its
-/// `close` closed it. And `ProxyStream::on_message` filtered the
-/// session's event vector by the id alone, so each consumer received
-/// whichever peer's payload arrived. That is R4-10 on the proxied
-/// path, and it needed all four operations fixed, not an accessor.
-#[wasm_bindgen_test]
-async fn two_peers_under_one_wire_id_own_their_streams_independently() {
+/// `MeshSession.openStream` always wraps `ProxyStream`, so this is not
+/// a follower-only property: the leader tab's own session had the same
+/// gap. Both paths run here, and the follower's runs through the real
+/// `BroadcastChannel` request/reply carrier.
+///
+/// Every operation is owner-scoped, and before the repair three were
+/// not: the backend keyed its open-stream table by the wire id, so the
+/// second open overwrote the first's slot and the earlier caller's
+/// `send` reached — and its `close` closed — the other peer's stream;
+/// and `ProxyStream::on_message` filtered by the id alone, so each
+/// consumer took whichever peer's payload arrived. The addressing now
+/// lives in the production `StreamOwnership` this fixture's backend
+/// holds too, so a change to it is visible from here.
+async fn two_peers_own_their_streams(through_follower: bool) {
     let db = unique("stream-own-db");
     let scope = unique("stream-own-scope");
-    let (handles, _peer_a) = real_pair();
+    let (handles, _peer_a_node) = real_pair();
     let peer_a = handles.peer;
     let (_peer_b_node, peer_b) = add_peer(&handles);
 
@@ -3432,6 +3454,27 @@ async fn two_peers_under_one_wire_id_own_their_streams_independently() {
     settle().await;
     assert_eq!(leader.role(), Role::Leader);
 
+    // The session under test: the leader's own, or a follower whose
+    // every request crosses the carrier to that leader.
+    let follower = if through_follower {
+        let f = Lifecycle::open(
+            opts(&db, &scope, &[], &[]),
+            factory(0x9999, Rc::new(RefCell::new(Log::default())), false),
+        )
+        .await
+        .expect("follower");
+        settle().await;
+        assert_eq!(
+            f.role(),
+            Role::Follower,
+            "the second tab must be a follower"
+        );
+        Some(f)
+    } else {
+        None
+    };
+    let session = follower.as_ref().unwrap_or(&leader);
+
     // One label, one explicit wire id, two peers.
     let open = |peer: u64| {
         let o = Object::new();
@@ -3440,32 +3483,52 @@ async fn two_peers_under_one_wire_id_own_their_streams_independently() {
         put(&o, "peer", &JsValue::from_str(&format!("{peer:016x}")));
         o
     };
-    let a = leader
+    let a = session
         .open_stream(&open(peer_a).into())
         .await
         .expect("open to peer A");
-    let b = leader
+    let b = session
         .open_stream(&open(peer_b).into())
         .await
         .expect("open to peer B");
 
     // Same wire id — the ordinary case, and the reason the id cannot
-    // be the owner.
+    // be the owner. Different resolved peers, each read off the stream
+    // the leader's node actually opened.
     assert_eq!(a.stream_id_hex(), b.stream_id_hex());
-    // Different resolved peers, each read off the stream the node
-    // actually opened.
     assert_eq!(a.peer_node_hex(), format!("{peer_a:016x}"));
     assert_eq!(b.peer_node_hex(), format!("{peer_b:016x}"));
-    assert_ne!(a.peer_node_hex(), b.peer_node_hex());
 
-    // Reception is isolated. Both consumers listen, and the session's
-    // event vector carries both peers' frames.
-    let to_a = Rc::new(Cell::new(0usize));
-    let to_b = Rc::new(Cell::new(0usize));
-    for (stream, counter) in [(&a, to_a.clone()), (&b, to_b.clone())] {
-        let counting = counter;
-        let callback = Closure::wrap(Box::new(move |_json: JsValue| {
-            counting.set(counting.get() + 1);
+    // The identity is RESOLVED, not echoed. An open that names no
+    // peer still learns which authenticated peer it got — so a handle
+    // that repeated the request's options back would read zero here,
+    // and its filter would match nothing while looking filled in.
+    let anonymous = Object::new();
+    put(&anonymous, "reliability", &JsValue::from_str("reliable"));
+    put(&anonymous, "streamId", &JsValue::from_str("11"));
+    let unnamed = session
+        .open_stream(&anonymous.into())
+        .await
+        .expect("open without naming a peer");
+    assert_eq!(
+        unnamed.peer_node_hex(),
+        format!("{peer_a:016x}"),
+        "an open that named no peer must report the peer it actually got"
+    );
+    unnamed.close();
+    settle().await;
+
+    // ── receive ──────────────────────────────────────────────────
+    // Both consumers listen; the session's event vector carries both
+    // peers' frames, exactly as the node emits them.
+    let to_a = Rc::new(RefCell::new(Vec::<String>::new()));
+    let to_b = Rc::new(RefCell::new(Vec::<String>::new()));
+    for (stream, seen) in [(&a, to_a.clone()), (&b, to_b.clone())] {
+        let collecting = seen;
+        let callback = Closure::wrap(Box::new(move |json: JsValue| {
+            collecting
+                .borrow_mut()
+                .push(json.as_string().unwrap_or_default());
         }) as Box<dyn FnMut(JsValue)>);
         stream.on_message(
             callback
@@ -3476,72 +3539,131 @@ async fn two_peers_under_one_wire_id_own_their_streams_independently() {
         callback.forget();
     }
     let sink = handles.sink.borrow().clone().expect("the production sink");
-    let stream_id_decimal = u64::from_str_radix(&a.stream_id_hex(), 16).expect("hex");
-    for peer in [peer_a, peer_b] {
+    let wire_id = u64::from_str_radix(&a.stream_id_hex(), 16).expect("hex");
+    // Distinct payloads, so "received something" cannot pass for
+    // "received its own": `AQ==` is [1] and `Ag==` is [2].
+    for (peer, payload) in [(peer_a, "AQ=="), (peer_b, "Ag==")] {
         sink(&format!(
-            "{{\"type\":\"stream_data\",\"peer_node\":\"{peer}\",\
-             \"incarnation\":\"1\",\"stream_id\":\"{stream_id_decimal}\",\
-             \"seq\":\"1\",\"payload\":\"AQI=\"}}"
+            "{{\"type\":\"stream_data\",\"peer_node\":\"{peer}\",\"incarnation\":\"1\",\
+             \"stream_id\":\"{wire_id}\",\"seq\":\"1\",\"payload\":\"{payload}\"}}"
         ));
     }
     settle().await;
-    assert_eq!(
-        to_a.get(),
-        1,
-        "peer A's consumer takes exactly its own frame"
+    let a_seen = to_a.borrow().clone();
+    let b_seen = to_b.borrow().clone();
+    assert_eq!(a_seen.len(), 1, "A took exactly one frame: {a_seen:?}");
+    assert_eq!(b_seen.len(), 1, "B took exactly one frame: {b_seen:?}");
+    assert!(
+        a_seen[0].contains("\"payload\":\"AQ==\"") && a_seen[0].contains(&peer_a.to_string()),
+        "A must take A's payload, got {a_seen:?}"
     );
-    assert_eq!(
-        to_b.get(),
-        1,
-        "peer B's consumer takes exactly its own frame"
+    assert!(
+        b_seen[0].contains("\"payload\":\"Ag==\"") && b_seen[0].contains(&peer_b.to_string()),
+        "B must take B's payload, got {b_seen:?}"
     );
 
-    // Sends reach the right peer. The double's arm pumps the real node,
-    // so the destination is observable on the wire.
-    handles.node.borrow_mut().take_outbound();
+    // ── send ─────────────────────────────────────────────────────
+    // The backend's arm pumps the real node and records what went out,
+    // so the destination is observable where the fixture puts it.
+    handles.wire.borrow_mut().clear();
     a.send(Uint8Array::from(&b"for-a"[..]))
         .await
         .expect("send on A");
+    settle().await;
     let addressed: Vec<u64> = handles
-        .node
-        .borrow_mut()
-        .take_outbound()
-        .into_iter()
-        .map(|out| out.peer)
+        .wire
+        .borrow()
+        .iter()
+        .map(|(peer, _)| *peer)
         .collect();
     assert!(
-        !addressed.is_empty() && addressed.iter().all(|to| *to == peer_a),
+        !addressed.is_empty(),
+        "A's send must put a packet on the wire"
+    );
+    assert!(
+        addressed.iter().all(|peer| *peer == peer_a),
         "A's payload must go to peer A alone, got {addressed:?}"
     );
 
-    // Closing A leaves B usable: the backend removed one entry, not
-    // the slot they would have shared.
-    a.close();
-    settle().await;
-    handles.node.borrow_mut().take_outbound();
+    handles.wire.borrow_mut().clear();
     b.send(Uint8Array::from(&b"for-b"[..]))
         .await
-        .expect("B must still send after A closed");
+        .expect("send on B");
+    settle().await;
     let addressed: Vec<u64> = handles
-        .node
-        .borrow_mut()
-        .take_outbound()
-        .into_iter()
-        .map(|out| out.peer)
+        .wire
+        .borrow()
+        .iter()
+        .map(|(peer, _)| *peer)
         .collect();
     assert!(
-        !addressed.is_empty() && addressed.iter().all(|to| *to == peer_b),
+        !addressed.is_empty() && addressed.iter().all(|peer| *peer == peer_b),
         "B's payload must go to peer B alone, got {addressed:?}"
     );
-    to_b.set(0);
+
+    // ── close ────────────────────────────────────────────────────
+    a.close();
+    settle().await;
+
+    // A is demonstrably unusable: the backend gave up the stream its
+    // handle owned, so this is refused rather than delivered to B's.
+    handles.wire.borrow_mut().clear();
+    let refused = a.send(Uint8Array::from(&b"after-close"[..])).await;
+    assert!(
+        refused.is_err(),
+        "a closed stream must refuse to send, not reach another open"
+    );
+    assert!(
+        handles.wire.borrow().is_empty(),
+        "a closed stream's send must put nothing on the wire: {:?}",
+        handles.wire.borrow().len()
+    );
+
+    // And B still works, both ways, under the same wire id.
+    handles.wire.borrow_mut().clear();
+    b.send(Uint8Array::from(&b"still-b"[..]))
+        .await
+        .expect("B must still send after A closed");
+    settle().await;
+    let addressed: Vec<u64> = handles
+        .wire
+        .borrow()
+        .iter()
+        .map(|(peer, _)| *peer)
+        .collect();
+    assert!(
+        !addressed.is_empty() && addressed.iter().all(|peer| *peer == peer_b),
+        "B's post-close payload must still go to peer B alone, got {addressed:?}"
+    );
+    to_b.borrow_mut().clear();
     sink(&format!(
-        "{{\"type\":\"stream_data\",\"peer_node\":\"{peer_b}\",\
-         \"incarnation\":\"1\",\"stream_id\":\"{stream_id_decimal}\",\
-         \"seq\":\"2\",\"payload\":\"AQI=\"}}"
+        "{{\"type\":\"stream_data\",\"peer_node\":\"{peer_b}\",\"incarnation\":\"1\",\
+         \"stream_id\":\"{wire_id}\",\"seq\":\"2\",\"payload\":\"Ag==\"}}"
     ));
     settle().await;
-    assert_eq!(to_b.get(), 1, "B still receives after A closed");
+    assert_eq!(
+        to_b.borrow().len(),
+        1,
+        "B still receives its own frames after A closed"
+    );
 
+    if let Some(follower) = follower {
+        follower.close();
+    }
     leader.close();
     settle().await;
+}
+
+/// The leader's own `MeshSession` — which wraps the same
+/// `ProxyStream` a follower's does.
+#[wasm_bindgen_test]
+async fn two_peers_under_one_wire_id_own_their_streams_independently() {
+    two_peers_own_their_streams(false).await;
+}
+
+/// The same property through a follower, so every request crosses the
+/// real carrier to the leader's backend.
+#[wasm_bindgen_test]
+async fn a_follower_owns_its_streams_independently_under_one_wire_id() {
+    two_peers_own_their_streams(true).await;
 }
