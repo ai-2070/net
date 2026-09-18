@@ -640,6 +640,78 @@ await probe('real_package_completes_teardown_when_a_child_close_throws', async (
  * reason ("openSession is not reachable"). This is the artifact
  * property, checked against the artifact, in one second.
  */
+// ───────────────── the codec, in the BUILT package ──────────────────
+//
+// The store witnesses in `test/store/` import from `src/`. These rows
+// run the same rules against `dist/`, because that is the artifact
+// that ships and because the review that found these defects ran
+// against it. A compiled-away check would pass in `src/` and fail
+// here.
+const codec = await import(new URL('store/wire.js', dist).href);
+const patcher = await import(new URL('store/patch.js', dist).href);
+const states = await import(new URL('store/state.js', dist).href);
+
+const H32 = 'a'.repeat(32);
+const Q16 = '0123456789abcdef';
+const decodeIn = (message, as = 'owner') =>
+  codec.decodeMessage(JSON.stringify({ v: 1, ...message }), { as, maxBytes: 8192 });
+
+await probe('real_package_keeps_an_ok_false_payload_as_data', () => {
+  for (const [template, field, side] of [
+    [{ k: 'act', q: Q16, h: H32, s: '1', name: 'fire' }, 'in', 'owner'],
+    [{ k: 'in', h: H32, s: '1', name: 'helm' }, 'in', 'owner'],
+    [{ k: 'res', q: Q16, h: H32, s: '1' }, 'out', 'replica'],
+  ]) {
+    const forged = { ok: false, code: 'closed', stage: 'payload', reason: 'supplied by payload' };
+    const result = decodeIn({ ...template, [field]: forged }, side);
+    if (result.ok !== true) {
+      throw new Error(`${template.k}: a forged-metadata payload was taken for a refusal`);
+    }
+    eq({ ...result.message[field] }, forged, `${template.k} payload is data`);
+  }
+});
+
+await probe('real_package_refuses_a_non_finite_source_value', () => {
+  for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    let thrown = null;
+    try {
+      codec.encodeMessage({ k: 'act', q: Q16, h: H32, s: '1', name: 'fire', in: { n: value } });
+    } catch (error) {
+      thrown = String(error && error.message);
+    }
+    if (thrown === null || !/non-finite-number/.test(thrown)) {
+      throw new Error(`encoding ${value} must be refused, got ${thrown}`);
+    }
+  }
+  // Control: finite values and an intentional null still encode.
+  const text = codec.encodeMessage({
+    k: 'act', q: Q16, h: H32, s: '1', name: 'fire', in: { z: 0, nothing: null },
+  });
+  eq(JSON.parse(text).in, { z: 0, nothing: null }, 'finite payload');
+});
+
+await probe('real_package_holds_the_unsolicited_refusal_shape', () => {
+  eq(decodeIn({ k: 'no', h: H32, code: 'forbidden' }, 'replica').reason,
+    'unsolicited-no-must-be-closed', 'a q-less forbidden');
+  eq(decodeIn({ k: 'no', h: H32, code: 'closed', s: '1' }, 'replica').reason,
+    'unsolicited-no-carries-no-sequence', 'a q-less action sequence');
+  // Controls.
+  eq(decodeIn({ k: 'no', h: H32, code: 'closed' }, 'replica').ok, true, 'the expiry notice');
+  eq(decodeIn({ k: 'no', q: Q16, h: H32, code: 'forbidden' }, 'replica').ok, true, 'correlated');
+});
+
+await probe('real_package_keeps_a_patched_proto_key_as_data', () => {
+  const current = states.reconcile(undefined, { crew: {} });
+  const ops = [{ o: 'r', p: ['crew'], val: JSON.parse('{"__proto__":{"marker":true}}') }];
+  const applied = patcher.applyPatch(current, ops, raw => JSON.parse(JSON.stringify(raw)));
+  if (applied.ok !== true) throw new Error(`the patch must apply: ${applied.reason}`);
+  eq(JSON.stringify(applied.next), '{"crew":{"__proto__":{"marker":true}}}', 'data preserved');
+  if (applied.next.crew.marker !== undefined) {
+    throw new Error('the value became a prototype');
+  }
+  if ({}.marker !== undefined) throw new Error('global prototype moved');
+});
+
 await probe('real_package_exports_every_symbol_the_browser_harness_imports', async () => {
   const pagePath = fileURLToPath(
     new URL('../../tests/rtc_browser/page/leaf5.js', import.meta.url),
