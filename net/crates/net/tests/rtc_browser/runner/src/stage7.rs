@@ -159,10 +159,8 @@ const STORE_TAG: &str = "stage7.store";
 // peers — the "the leaves did not discover each other" failure that
 // looked like a capacity problem for three rounds. Every byte here
 // has to stay distinct from `SECRET_*` in `stage6.rs`.
-const SECRET_HOST_ENTITY: &str =
-    "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6";
-const SECRET_HOST_NOISE: &str =
-    "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
+const SECRET_HOST_ENTITY: &str = "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6";
+const SECRET_HOST_NOISE: &str = "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
 const SECRET_PLAYER_ENTITY: &str =
     "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6";
 const SECRET_PLAYER_NOISE: &str =
@@ -220,18 +218,14 @@ fn stat_u64(result: &StepResult, key: &str) -> Option<u64> {
 }
 
 fn stat_str(result: &StepResult, key: &str) -> Option<String> {
-    Some(
-        result
-            .stats
-            .as_ref()?
-            .get(key)?
-            .as_str()?
-            .to_string(),
-    )
+    Some(result.stats.as_ref()?.get(key)?.as_str()?.to_string())
 }
 
 fn why(result: &StepResult) -> String {
-    result.error.clone().unwrap_or_else(|| "no error".to_string())
+    result
+        .error
+        .clone()
+        .unwrap_or_else(|| "no error".to_string())
 }
 
 /// Run every Stage 7 witness.
@@ -486,7 +480,9 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         )
         .await;
     let joined_lossy = script.run(tab_player, join_store("lossy", 0, 0, 0)).await;
-    let faults = script.run(tab_host, Step5::StoreFaultsReport { id: 0 }).await;
+    let faults = script
+        .run(tab_host, Step5::StoreFaultsReport { id: 0 })
+        .await;
     if !joined_lossy.ok {
         // The failing leg's own evidence, both sides. Printed only
         // when it fails, because on a pass it is noise, and printed
@@ -671,7 +667,6 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             why(&routed_commit)
         ),
     );
-
 
     for (tab, handle) in [(tab_host, "clean"), (tab_host, "lossy"), (tab_host, "dup")] {
         let _ = script
