@@ -17,20 +17,52 @@ edge workloads.
 - **One identity and policy surface.** The key that names a node also signs what it advertises,
   who may reach it, and which subnet that traffic belongs to.
 
-Where this fits and where it doesn't: [When to Use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases).
+## What it enables
+
+Capabilities, authority, and state on one substrate change what you can build:
+
+**Distance becomes a parameter, not a rewrite.** You invoke a capability the same way whether the
+provider sits in-process or on another host — a consistent calling model in which location is a
+placement choice. Work has to be expressed as a capability to be reached this way; once it is,
+running it beside the caller or across the mesh is a deployment decision, not a rewrite.
+[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
+[Architecture](https://ai2070.net/docs/concepts/architecture).
+
+**Sensing and computation stop sharing a body.** A device can produce data without hosting the
+intelligence that acts on it, and two sensors can address each other directly. The mesh routes
+sense-to-compute and sense-to-sense, wherever each end physically is.
+[Capabilities](https://ai2070.net/docs/concepts/capabilities),
+[Dataforts](https://ai2070.net/docs/guides/dataforts).
+
+**Coordination that never funnels through a coordinator.** There is no registry, broker, or leader
+whose capacity becomes the ceiling. Peers observe their own neighbourhood, derive the rest, and
+route, so coordination grows with the participants instead of concentrating in a control plane.
+[Event bus](https://ai2070.net/docs/guides/event-bus),
+[Capabilities](https://ai2070.net/docs/concepts/capabilities).
+
+**Software that outlives its host.** A daemon is an identity, not a process pinned to a box —
+addressed by what it is, placed where its capabilities are, and able to move with its history when
+the hardware underneath it changes. A long job can be handed to another participant with a
+lifecycle and an explicitly verified outcome.
+[Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
+[Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
+[Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
+
+These show up in agent runtimes, robotics and fleet operations, industrial control, edge and IoT,
+and local-first collaboration. Built end to end:
+[Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
+[Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
+[Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
 
 ## One system, end to end
 
 A document-processing capability lives on a machine that holds an internal docs-API credential.
-The credential must not travel. A caller on another machine wants a summary.
+The credential must not travel, so the provider keeps it and the caller never sees it.
 
-Application code below is marked as such; every **Net** call is the real surface, and the flows
-are runnable — the commands and source links are at the end of this section.
-
-**The provider** serves the capability from the machine that holds the credential:
+**The provider** serves the capability under its own authority — announced privately to its
+organization, executed where the credential lives:
 
 ```rust
-use net_sdk::macros::tool;
 use net_sdk::mesh::MeshBuilder;
 
 #[derive(JsonSchema, Deserialize, Serialize)]
@@ -38,65 +70,33 @@ struct SummarizeReq { doc_id: String }
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct SummarizeResp { summary: String }
 
-#[tool(description = "Summarize an internal document.", tag = "docs")]
-async fn summarize_document(req: SummarizeReq) -> Result<SummarizeResp, String> {
-    // Application code, not Net: this reads a credential that never leaves the machine.
-    let summary = summarize_with(&internal_docs_credential(), &req.doc_id).await?;
-    Ok(SummarizeResp { summary })
-}
-
 let provider = MeshBuilder::new("0.0.0.0:7700", &PSK)?.build().await?;
-let _handle = summarize_document_register(&provider)?;   // unregisters on drop
-provider.announce_capabilities(Default::default()).await?;
-```
 
-**The caller** discovers by capability — not by address — and invokes it:
-
-```rust
-// Nothing was configured with the provider's hostname. List what's live…
-for t in caller.list_tools(None) {
-    println!("{} v{}  tags={:?}", t.tool_id, t.version, t.tags);
-}
-
-// …then invoke by name. The mesh routes the call to whichever peer serves it.
-let resp: SummarizeResp = caller
-    .call_tool("summarize_document", &SummarizeReq { doc_id: "q3-plan".into() })
-    .await?;
-```
-
-**The tool path above is open to any peer that can discover it.** To restrict *who may call a
-capability*, serve it as an nRPC service through the org facade. The capability is then announced
-privately, org membership is the gate, and the handler receives the verified requester:
-
-```rust
-// Provider: serve it to this org only. `OrgAccess::Granted` instead admits a
-// cross-org caller holding a capability grant.
-mesh.serve_org("summarize.document", OrgAccess::SameOrg, |caller: OrgCaller, req: SummarizeReq| async move {
-    Ok(summarize_with(&internal_docs_credential(), &req.doc_id).await?)
+// Serve to this org only. `OrgAccess::Granted` admits a cross-org caller holding a
+// capability grant. The handler receives the caller's verified identity and authority.
+provider.serve_org("summarize.document", OrgAccess::SameOrg, |caller: OrgCaller, req: SummarizeReq| async move {
+    let summary = summarize_with(&internal_docs_credential(), &req.doc_id).await?;  // app code: secret stays here
+    Ok(SummarizeResp { summary })
 })?;
+```
 
-// Caller: bind org credentials once, then call the service.
-let org = mesh.org(credentials)?;
+**The caller** binds its organization once, then invokes by capability — no host was configured:
+
+```rust
+let org = caller.org(credentials)?;                          // sees only what this org may see
 let resp: SummarizeResp = org.call("summarize.document", &req).await?;
 ```
 
-A caller whose org holds no grant never reaches the handler and gets no error *from the
-provider*: the private announcement is opaque without the audience, so the call fails **locally**,
-before anything is sent, as `OrgSdkError::Discovery`. A membership revoked mid-flight turns the
-next call into `OrgSdkError::AdmissionDenied`. Both are pinned by runnable tests:
-
-```bash
-cargo run  --example tool_calling --features net,macros   # announce → discover → invoke
-cargo test -p net-mesh-sdk org::tests_live               # private discovery, no-grant refusal, revocation
-```
-
-In one scenario: the caller **selected a capability, not a machine**; the handler ran **where the
-credential lives**; the result came back **typed**; and the authority check **refused before any
-bytes were sent**. Sources: [`tool_calling.rs`](net/crates/net/sdk/examples/tool_calling.rs),
-[`org/tests_live.rs`](net/crates/net/sdk/src/org/tests_live.rs). Deeper:
+A caller whose organization holds no grant is not shown the capability at all: the private
+announcement is opaque without the audience, so discovery finds nothing and the call refuses
+locally, before anything is sent. That is resource-owner control, enforced by the provider.
 [Private capabilities](https://ai2070.net/docs/guides/private-capabilities),
-[Security model](https://ai2070.net/docs/concepts/security-model); larger results travel as
+[Security model](https://ai2070.net/docs/concepts/security-model). Larger results travel as
 content-addressed artifacts: [Dataforts](https://ai2070.net/docs/guides/dataforts).
+
+Tools are the same shape without the org gate — declare one with `#[tool]`, register it, and call
+it by name. A runnable two-node version is in
+[`sdk/examples/tool_calling.rs`](net/crates/net/sdk/examples/tool_calling.rs).
 
 ## Install
 
@@ -113,26 +113,23 @@ Published names and source imports differ on purpose: the crates/registries use
 [SDKs](#sdks). Full per-language setup:
 [Install](https://ai2070.net/docs/start/install), [Quickstart](https://ai2070.net/docs/start/quickstart).
 
-## Why the pieces belong together
+## Why the architecture works
 
-The interesting part is not any one primitive — it is that they compose without glue, because
-they share a substrate:
+A provider has an identity; its capabilities are discovered under that identity and its owner's
+authority; a caller invokes one; and the results, streams, state, and artifacts stay attached to
+the work. These are not separate products joined by glue — identity, discovery, channels, typed
+RPC, durable logs, folded state, and artifacts are one substrate, so authority and observation
+travel with the call instead of being re-established at every boundary.
+[Architecture](https://ai2070.net/docs/concepts/architecture),
+[Identity](https://ai2070.net/docs/concepts/identity),
+[Capabilities](https://ai2070.net/docs/concepts/capabilities),
+[nRPC](https://ai2070.net/docs/guides/nrpc),
+[Durable logs](https://ai2070.net/docs/guides/durable-logs),
+[Folds](https://ai2070.net/docs/guides/cortex-folds),
+[Dataforts](https://ai2070.net/docs/guides/dataforts),
+[Daemons](https://ai2070.net/docs/guides/daemons-and-placement).
 
-| Piece | What it gives you | Read |
-|---|---|---|
-| Identity | A node *is* its ed25519 keypair; delegable permission tokens gate access | [Identity](https://ai2070.net/docs/concepts/identity), [Organizations](https://ai2070.net/docs/concepts/organizations) |
-| Discovery | Capabilities announced and indexed locally; no registry to run | [Capabilities](https://ai2070.net/docs/concepts/capabilities), [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) |
-| Channels | Named pub/sub that is a name you match on, not a broker you connect to | [Channels](https://ai2070.net/docs/concepts/channels), [Event bus](https://ai2070.net/docs/guides/event-bus) |
-| Typed RPC | Request/response on the same transport — no second stack, no sidecar | [nRPC](https://ai2070.net/docs/guides/nrpc) |
-| Durable logs | An append-only stream that *is* the state, per-node and per-file | [RedEX](https://ai2070.net/docs/guides/durable-logs), [Storage stack](https://ai2070.net/docs/concepts/storage-stack) |
-| Folded state | A local, reactive view of that log — a value in your program, not a server | [Folds](https://ai2070.net/docs/guides/cortex-folds), [NetDB](https://ai2070.net/docs/guides/netdb-queries) |
-| Artifacts | Content-addressed blobs that follow the reads, with read-your-writes | [Dataforts](https://ai2070.net/docs/guides/dataforts) |
-| Execution | Stateful daemons addressed by identity, placed by capability, moved live | [Daemons](https://ai2070.net/docs/guides/daemons-and-placement), [Agent identity](https://ai2070.net/docs/concepts/agent-identity) |
-
-## Why the mesh
-
-The substrate under all of that is a flat, encrypted mesh. Three properties do most of the work;
-the rest follows.
+Underneath sits a flat, encrypted mesh. Three properties do most of the work.
 
 **Identity outlives a path.** A node is its keypair, and its address is incidental. If a route
 breaks, traffic is rerouted and the participants keep the same identity — there is no session to
@@ -174,45 +171,9 @@ Discovery, invocation, and outcome are separate: finding a provider does not aut
 a successful invocation is not proof that the real-world outcome holds. See [Submitted is not
 completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
-## What it enables
-
-Four things a capability mesh makes possible that a request/response network does not:
-
-**Distance becomes a parameter, not a rewrite.** A call to the function beside you and a call to a
-capability across the mesh have the same shape — you name what you need, not where it lives.
-Promoting work from in-process to another host is a placement decision, not a code change.
-[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
-[Architecture](https://ai2070.net/docs/concepts/architecture).
-
-**Sensing and computation stop sharing a body.** A device can produce data without hosting the
-intelligence that acts on it, and two sensors can address each other directly. The mesh routes
-sense-to-compute and sense-to-sense, wherever each end physically is.
-[Capabilities](https://ai2070.net/docs/concepts/capabilities),
-[Dataforts](https://ai2070.net/docs/guides/dataforts).
-
-**Coordination that never funnels through a coordinator.** There is no registry, broker, or leader
-to become the ceiling. Peers observe their own neighbourhood, derive the rest, and route — so
-real-time coordination holds across fleets in the millions, where no central scheduler could watch
-them all. [Event bus](https://ai2070.net/docs/guides/event-bus),
-[Capabilities](https://ai2070.net/docs/concepts/capabilities).
-
-**Software that outlives its host.** A daemon is an identity, not a process pinned to a box —
-addressed by what it is, placed where its capabilities are, and able to move with its history when
-the hardware underneath it changes. A long job can be handed to another participant with a
-lifecycle and an explicitly verified outcome.
-[Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
-[Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
-[Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
-
-These are the wedges that show up in agent runtimes, robotics and fleet operations, industrial
-control, edge and IoT, and local-first collaboration. Built end to end:
-[Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
-[Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
-[Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
-
 ## What's in the box
 
-A compressed tour; each links to the page that goes deep.
+The rest of the surface, one line each; every entry links to the page that goes deep.
 
 | Surface | One line | Read |
 |---|---|---|
