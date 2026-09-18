@@ -83,7 +83,17 @@ export function mergeShallow<S extends object>(current: S, patch: Partial<S>): S
       (patch as Record<string, unknown>)[key],
     );
     if (!Object.is((current as Record<string, unknown>)[key], incoming)) {
-      draft[key] = incoming;
+      // `defineProperty` for the reason `freezeRecord` uses it: a
+      // plain assignment of `__proto__` replaces this object's
+      // prototype rather than storing the caller's data. The spread
+      // above is already safe (it defines rather than assigns); this
+      // was the one that was not.
+      Object.defineProperty(draft, key, {
+        value: incoming,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
       changed = true;
     }
   }
@@ -121,7 +131,25 @@ function freezeRecord(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(next)) {
-    out[key] = reconcile(previous?.[key], next[key]);
+    // `defineProperty`, never `out[key] = …`.
+    //
+    // A plain assignment of the key `__proto__` goes through
+    // `Object.prototype`'s legacy setter: it REPLACES this object's
+    // prototype instead of storing a property. A patch whose
+    // replacement *value* is the ordinary JSON data
+    // `{"__proto__":{…}}` — no forbidden path segment anywhere — then
+    // came out of a successful, validated reconciliation as `{}` whose
+    // prototype carried the data, so the published state both lost the
+    // key and answered `true` for a field it does not own. The
+    // null-prototype parser and the null-prototype patch draft do not
+    // help here: this is the last step, after validation, and it built
+    // an ordinary object.
+    Object.defineProperty(out, key, {
+      value: reconcile(previous?.[key], next[key]),
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
   return Object.freeze(out);
 }

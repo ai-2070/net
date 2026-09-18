@@ -295,3 +295,99 @@ describe('prototype safety', () => {
     expect(next.crew['proto']).toBe('ok');
   });
 });
+
+describe('A2 — a replacement value is data, through reconciliation', () => {
+  /**
+   * A validator that accepts only plain records and returns a fresh
+   * JSON clone, as a definition's `state()` does. It is the oracle:
+   * the corrupted result used to fail the very schema that accepted
+   * the draft.
+   */
+  function plainRecords(raw: unknown): World {
+    const value = raw as Record<string, unknown>;
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error('not a record');
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (typeof nested !== 'object' || nested === null) continue;
+      if (Array.isArray(nested)) continue;
+      if (Object.getPrototypeOf(nested) !== Object.prototype && Object.getPrototypeOf(nested) !== null) {
+        throw new Error(`${key} is not a plain record`);
+      }
+    }
+    return JSON.parse(JSON.stringify(value)) as World;
+  }
+
+  it('keeps `__proto__` as an own key of the replacement value', () => {
+    const before = plainRecords({
+      ship: { heading: 90, sails: { main: true } },
+      crew: { bosun: 'kess' },
+      log: [1],
+    });
+    // Built through JSON, like the decoder does: an object LITERAL
+    // `{__proto__: …}` invokes the prototype setter and has no own
+    // key at all, so it would not reproduce anything.
+    const injected = JSON.parse('{"__proto__":{"reviewMarker":true}}') as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(injected, '__proto__')).toBe(true);
+
+    // No forbidden path SEGMENT anywhere: the special key is inside an
+    // ordinary replacement value, and the path is just ["crew"].
+    const outcome = applyPatch(before, [{ o: 'r', p: ['crew'], val: injected as never }], plainRecords);
+    if (!outcome.ok) throw new Error(`expected success, refused ${outcome.reason}`);
+    const next = outcome.next as unknown as Record<string, Record<string, unknown>>;
+
+    // The data survives as data …
+    expect(JSON.stringify(next['crew'])).toBe('{"__proto__":{"reviewMarker":true}}');
+    expect(Object.prototype.hasOwnProperty.call(next['crew'] as object, '__proto__')).toBe(true);
+    // … and is NOT the object's prototype.
+    expect(Object.getPrototypeOf(next['crew'] as object)).toBe(Object.prototype);
+    expect((next['crew'] as Record<string, unknown>)['reviewMarker']).toBeUndefined();
+
+    // The successful result satisfies the schema that accepted it.
+    expect(() => plainRecords(next)).not.toThrow();
+    // And nothing global moved.
+    expect(({} as Record<string, unknown>)['reviewMarker']).toBeUndefined();
+  });
+
+  it('keeps it at the root too', () => {
+    const before = plainRecords({ ship: { heading: 1, sails: { main: true } }, crew: {}, log: [] });
+    const root = JSON.parse(
+      '{"ship":{"heading":2,"sails":{"main":false}},"crew":{},"log":[],' +
+        '"__proto__":{"reviewMarker":true}}',
+    ) as Record<string, unknown>;
+
+    const outcome = applyPatch(before, [{ o: 'r', p: [], val: root as never }], plainRecords);
+    if (!outcome.ok) throw new Error(`expected success, refused ${outcome.reason}`);
+    const next = outcome.next as unknown as Record<string, unknown>;
+
+    expect(Object.prototype.hasOwnProperty.call(next, '__proto__')).toBe(true);
+    expect(next['reviewMarker']).toBeUndefined();
+    expect(() => plainRecords(next)).not.toThrow();
+  });
+
+  it('leaves the previous state untouched either way', () => {
+    const before = plainRecords({ ship: { heading: 90, sails: { main: true } }, crew: {}, log: [] });
+    const snapshot = JSON.stringify(before);
+
+    applyPatch(
+      before,
+      [{ o: 'r', p: ['crew'], val: JSON.parse('{"__proto__":{"reviewMarker":true}}') as never }],
+      plainRecords,
+    );
+
+    expect(JSON.stringify(before)).toBe(snapshot);
+    expect((before as unknown as Record<string, unknown>)['reviewMarker']).toBeUndefined();
+  });
+
+  it('still refuses `__proto__` as a path SEGMENT (control)', () => {
+    const before = world();
+    expect(rejected(before, [{ o: 'r', p: ['__proto__', 'x'], val: 1 }]).reason).toBe('segment-forbidden');
+  });
+
+  it('still shares identity for untouched subtrees (control)', () => {
+    const before = world();
+    const { next } = applied(before, [{ o: 'r', p: ['ship', 'heading'], val: 7 }]);
+    expect(next.crew).toBe(before.crew);
+    expect(next.log).toBe(before.log);
+  });
+});

@@ -133,3 +133,34 @@ describe('mergeShallow', () => {
     expect(next.tick).toBe(8);
   });
 });
+
+describe('a record key is data, never a prototype', () => {
+  it('reconcile keeps an own `__proto__` key as data', () => {
+    // Built through JSON so the key is an OWN property; an object
+    // literal would invoke the prototype setter instead.
+    const next = JSON.parse('{"crew":{"__proto__":{"marker":true}}}') as Record<string, unknown>;
+
+    const out = reconcile({}, next) as Record<string, Record<string, unknown>>;
+
+    expect(JSON.stringify(out)).toBe('{"crew":{"__proto__":{"marker":true}}}');
+    expect(Object.getPrototypeOf(out['crew'] as object)).toBe(Object.prototype);
+    expect((out['crew'] as Record<string, unknown>)['marker']).toBeUndefined();
+    expect(({} as Record<string, unknown>)['marker']).toBeUndefined();
+  });
+
+  it('mergeShallow keeps one as data too', () => {
+    const patch = JSON.parse('{"__proto__":{"marker":true}}') as Record<string, unknown>;
+
+    const out = mergeShallow({ a: 1 } as Record<string, unknown>, patch);
+
+    expect(Object.prototype.hasOwnProperty.call(out, '__proto__')).toBe(true);
+    expect((out as Record<string, unknown>)['marker']).toBeUndefined();
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+  });
+
+  it('an ordinary key is unaffected (control)', () => {
+    const out = reconcile({}, { crew: { bosun: 'kess' } }) as Record<string, Record<string, string>>;
+    expect(out['crew']?.['bosun']).toBe('kess');
+    expect(Object.isFrozen(out)).toBe(true);
+  });
+});

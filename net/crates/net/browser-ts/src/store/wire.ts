@@ -301,6 +301,33 @@ function refuse(stage: DecodeStage, reason: string, code: StoreErrorCode = 'inva
   return { ok: false, code, stage, reason };
 }
 
+/**
+ * A field-reader's refusal, in a box application data cannot inhabit.
+ *
+ * The readers below return either a value or a refusal, and a
+ * structural test for that refusal — "an object whose `ok` is
+ * `false`" — is a test application data can satisfy: `ok` is a
+ * perfectly ordinary key. An `act` whose `in` was `{"ok":false}`
+ * therefore came back from `decodeMessage` *as the refusal*, and a
+ * payload carrying `code`, `stage` and `reason` supplied the decoder's
+ * own purported metadata. A class the payload cannot be an instance of
+ * is the distinction that actually holds; nothing about `ok` is
+ * reserved in application data any more.
+ */
+class Refused {
+  constructor(readonly refusal: DecodeRefusal) {}
+}
+
+/** Wrap a refusal for a field reader. */
+function no(stage: DecodeStage, reason: string, code: StoreErrorCode = 'invalid-data'): Refused {
+  return new Refused(refuse(stage, reason, code));
+}
+
+/** Whether a field reader refused. Structural collision is impossible. */
+function bad(value: unknown): value is Refused {
+  return value instanceof Refused;
+}
+
 /** UTF-8 byte length without allocating a copy of the bytes. */
 export function utf8Length(text: string): number {
   let bytes = 0;
@@ -366,170 +393,167 @@ export function decodeMessage(frame: string, options: DecodeOptions): DecodeResu
 }
 
 function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
-  const hex = (key: string, length: number): Hex | DecodeRefusal => {
+  const hex = (key: string, length: number): Hex | Refused => {
     const v = body[key];
     if (typeof v !== 'string' || v.length !== length || !isCanonicalHex(v)) {
-      return refuse('payload', `non-canonical-hex:${key}`);
+      return no('payload', `non-canonical-hex:${key}`);
     }
     return v;
   };
-  const dec = (key: string): Decimal | DecodeRefusal => {
+  const dec = (key: string): Decimal | Refused => {
     const v = body[key];
     if (typeof v !== 'string' || !isCanonicalDecimal(v)) {
-      return refuse('payload', `non-canonical-decimal:${key}`);
+      return no('payload', `non-canonical-decimal:${key}`);
     }
     return v;
   };
-  const int = (key: string, min: number, max: number): number | DecodeRefusal => {
+  const int = (key: string, min: number, max: number): number | Refused => {
     const v = body[key];
     if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max) {
-      return refuse('payload', `bad-integer:${key}`);
+      return no('payload', `bad-integer:${key}`);
     }
     return v;
   };
-  const text = (key: string): string | DecodeRefusal => {
+  const text = (key: string): string | Refused => {
     const v = body[key];
-    if (typeof v !== 'string' || v.length === 0) return refuse('payload', `bad-string:${key}`);
+    if (typeof v !== 'string' || v.length === 0) return no('payload', `bad-string:${key}`);
     return v;
   };
-  const obj = (key: string): JsonObject | DecodeRefusal => {
+  const obj = (key: string): JsonObject | Refused => {
     const v = body[key];
     if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-      return refuse('payload', `bad-object:${key}`);
+      return no('payload', `bad-object:${key}`);
     }
     return v as JsonObject;
   };
-  const audience = (): readonly string[] | DecodeRefusal => {
+  const audience = (): readonly string[] | Refused => {
     const v = body['aud'];
-    if (!Array.isArray(v)) return refuse('payload', 'bad-audience');
-    if (v.length > MAX_AUDIENCE_LABELS) return refuse('payload', 'audience-too-many', 'capacity');
+    if (!Array.isArray(v)) return no('payload', 'bad-audience');
+    if (v.length > MAX_AUDIENCE_LABELS) return no('payload', 'audience-too-many', 'capacity');
     const labels: string[] = [];
     for (const label of v) {
-      if (typeof label !== 'string' || label.length === 0) return refuse('payload', 'bad-audience-label');
+      if (typeof label !== 'string' || label.length === 0) return no('payload', 'bad-audience-label');
       if (utf8Length(label) > MAX_AUDIENCE_LABEL_BYTES) {
-        return refuse('payload', 'audience-label-too-long', 'capacity');
+        return no('payload', 'audience-label-too-long', 'capacity');
       }
       labels.push(label);
     }
     return labels;
   };
 
-  const bad = (v: unknown): v is DecodeRefusal =>
-    typeof v === 'object' && v !== null && (v as DecodeRefusal).ok === false;
-
   switch (k) {
     case 'join': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const def = text('def');
-      if (bad(def)) return def;
+      if (bad(def)) return def.refusal;
       const ver = int('ver', 0, Number.MAX_SAFE_INTEGER);
-      if (bad(ver)) return ver;
+      if (bad(ver)) return ver.refusal;
       const key = text('key');
-      if (bad(key)) return key;
+      if (bad(key)) return key.refusal;
       const aud = audience();
-      if (bad(aud)) return aud;
+      if (bad(aud)) return aud.refusal;
       return { ok: true, message: { k, q, def, ver, key, aud } };
     }
     case 'resume':
     case 'aud': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const aud = audience();
-      if (bad(aud)) return aud;
+      if (bad(aud)) return aud.refusal;
       return { ok: true, message: { k, q, h, aud } as ResumeMessage | AudienceMessage };
     }
     case 'resync': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const g = dec('g');
-      if (bad(g)) return g;
+      if (bad(g)) return g.refusal;
       const have = dec('have');
-      if (bad(have)) return have;
+      if (bad(have)) return have.refusal;
       return { ok: true, message: { k, q, h, g, have } };
     }
     case 'alive':
     case 'leave':
     case 'ok': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       return { ok: true, message: { k, q, h } as AliveMessage | LeaveMessage | OkMessage };
     }
     case 'act': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const s = dec('s');
-      if (bad(s)) return s;
+      if (bad(s)) return s.refusal;
       const name = text('name');
-      if (bad(name)) return name;
+      if (bad(name)) return name.refusal;
       const input = obj('in');
-      if (bad(input)) return input;
+      if (bad(input)) return input.refusal;
       return { ok: true, message: { k, q, h, s, name, in: input } };
     }
     case 'in': {
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const name = text('name');
-      if (bad(name)) return name;
+      if (bad(name)) return name.refusal;
       const s = dec('s');
-      if (bad(s)) return s;
+      if (bad(s)) return s.refusal;
       const input = obj('in');
-      if (bad(input)) return input;
+      if (bad(input)) return input.refusal;
       return { ok: true, message: { k, h, name, s, in: input } };
     }
     case 'res': {
       const q = hex('q', REQUEST_HEX_LENGTH);
-      if (bad(q)) return q;
+      if (bad(q)) return q.refusal;
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const s = dec('s');
-      if (bad(s)) return s;
+      if (bad(s)) return s.refusal;
       const out = obj('out');
-      if (bad(out)) return out;
+      if (bad(out)) return out.refusal;
       return { ok: true, message: { k, q, h, s, out } };
     }
     case 'man': {
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const inc = hex('inc', INCARNATION_HEX_LENGTH);
-      if (bad(inc)) return inc;
+      if (bad(inc)) return inc.refusal;
       const g = dec('g');
-      if (bad(g)) return g;
+      if (bad(g)) return g.refusal;
       const r = dec('r');
-      if (bad(r)) return r;
+      if (bad(r)) return r.refusal;
       const n = int('n', 1, MAX_SNAPSHOT_CHUNKS);
-      if (bad(n)) return n;
+      if (bad(n)) return n.refusal;
       const bytes = dec('bytes');
-      if (bad(bytes)) return bytes;
+      if (bad(bytes)) return bytes.refusal;
       if (BigInt(bytes) > BigInt(MAX_SNAPSHOT_BYTES)) {
         return refuse('payload', 'snapshot-too-large', 'capacity');
       }
       if (Object.prototype.hasOwnProperty.call(body, 'q')) {
         const q = hex('q', REQUEST_HEX_LENGTH);
-        if (bad(q)) return q;
+        if (bad(q)) return q.refusal;
         return { ok: true, message: { k, q, h, inc, g, r, n, bytes } };
       }
       return { ok: true, message: { k, h, inc, g, r, n, bytes } };
     }
     case 'snap': {
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const g = dec('g');
-      if (bad(g)) return g;
+      if (bad(g)) return g.refusal;
       const r = dec('r');
-      if (bad(r)) return r;
+      if (bad(r)) return r.refusal;
       const n = int('n', 1, MAX_SNAPSHOT_CHUNKS);
-      if (bad(n)) return n;
+      if (bad(n)) return n.refusal;
       const i = int('i', 0, (n as number) - 1);
-      if (bad(i)) return i;
+      if (bad(i)) return i.refusal;
       const d = body['d'];
       if (typeof d !== 'string' || !isCanonicalBase64(d)) {
         return refuse('payload', 'non-canonical-base64:d');
@@ -538,15 +562,15 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
     }
     case 'delta': {
       const h = hex('h', HANDLE_HEX_LENGTH);
-      if (bad(h)) return h;
+      if (bad(h)) return h.refusal;
       const g = dec('g');
-      if (bad(g)) return g;
+      if (bad(g)) return g.refusal;
       const base = dec('base');
-      if (bad(base)) return base;
+      if (bad(base)) return base.refusal;
       const r = dec('r');
-      if (bad(r)) return r;
+      if (bad(r)) return r.refusal;
       const ops = readOps(body['ops']);
-      if (bad(ops)) return ops;
+      if (bad(ops)) return ops.refusal;
       return { ok: true, message: { k, h, g, base, r, ops } };
     }
     case 'no': {
@@ -556,25 +580,41 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       }
       const hasQ = Object.prototype.hasOwnProperty.call(body, 'q');
       const hasH = Object.prototype.hasOwnProperty.call(body, 'h');
+      const hasS = Object.prototype.hasOwnProperty.call(body, 's');
       // A `no` carrying neither names nothing (brief §1.12).
       if (!hasQ && !hasH) return refuse('payload', 'no-names-nothing');
+      // A `q`-less `no` is the **unsolicited expiry notice** and
+      // nothing else (brief §1.12): it is `closed`, it names the
+      // handle it is about, and it carries no action sequence. These
+      // are relationships inside one frame, so they belong here —
+      // unlike "is this `q` outstanding", which needs handle state.
+      //
+      // Admitting a `q`-less `forbidden` offered a refusal that named
+      // no request to attribute it to, and a `q`-less `s` named an
+      // action whose reply this cannot be.
+      // "Names a handle" needs no separate check here: a `q`-less
+      // frame without `h` is already refused above as naming nothing.
+      if (!hasQ) {
+        if (code !== 'closed') return refuse('payload', 'unsolicited-no-must-be-closed');
+        if (hasS) return refuse('payload', 'unsolicited-no-carries-no-sequence');
+      }
       const out: { -readonly [K in keyof NoMessage]: NoMessage[K] } = {
         k: 'no',
         code: code as StoreErrorCode,
       };
       if (hasQ) {
         const q = hex('q', REQUEST_HEX_LENGTH);
-        if (bad(q)) return q;
+        if (bad(q)) return q.refusal;
         out.q = q;
       }
       if (hasH) {
         const h = hex('h', HANDLE_HEX_LENGTH);
-        if (bad(h)) return h;
+        if (bad(h)) return h.refusal;
         out.h = h;
       }
-      if (Object.prototype.hasOwnProperty.call(body, 's')) {
+      if (hasS) {
         const s = dec('s');
-        if (bad(s)) return s;
+        if (bad(s)) return s.refusal;
         out.s = s;
       }
       if (Object.prototype.hasOwnProperty.call(body, 'detail')) {
@@ -590,32 +630,32 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
   }
 }
 
-function readOps(raw: JsonValue | undefined): readonly WireOp[] | DecodeRefusal {
-  if (!Array.isArray(raw)) return refuse('payload', 'bad-ops');
-  if (raw.length > MAX_PATCH_OPS) return refuse('payload', 'ops-too-many', 'capacity');
+function readOps(raw: JsonValue | undefined): readonly WireOp[] | Refused {
+  if (!Array.isArray(raw)) return no('payload', 'bad-ops');
+  if (raw.length > MAX_PATCH_OPS) return no('payload', 'ops-too-many', 'capacity');
   const ops: WireOp[] = [];
   for (const entry of raw) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-      return refuse('payload', 'bad-op');
+      return no('payload', 'bad-op');
     }
     const op = entry as JsonObject;
     const o = op['o'];
-    if (o !== 'r' && o !== 'x') return refuse('payload', 'bad-op-kind');
+    if (o !== 'r' && o !== 'x') return no('payload', 'bad-op-kind');
     const allowed = o === 'r' ? ['o', 'p', 'val'] : ['o', 'p'];
     for (const key of Object.keys(op)) {
-      if (!allowed.includes(key)) return refuse('payload', 'unknown-field');
+      if (!allowed.includes(key)) return no('payload', 'unknown-field');
     }
     if (o === 'r' && !Object.prototype.hasOwnProperty.call(op, 'val')) {
-      return refuse('payload', 'missing-field');
+      return no('payload', 'missing-field');
     }
     const p = op['p'];
-    if (!Array.isArray(p)) return refuse('payload', 'bad-path');
-    if (p.length > MAX_PATH_SEGMENTS) return refuse('payload', 'path-too-deep', 'capacity');
+    if (!Array.isArray(p)) return no('payload', 'bad-path');
+    if (p.length > MAX_PATH_SEGMENTS) return no('payload', 'path-too-deep', 'capacity');
     const path: string[] = [];
     for (const segment of p) {
-      if (typeof segment !== 'string' || segment.length === 0) return refuse('payload', 'bad-segment');
+      if (typeof segment !== 'string' || segment.length === 0) return no('payload', 'bad-segment');
       if (utf8Length(segment) > MAX_PATH_SEGMENT_BYTES) {
-        return refuse('payload', 'segment-too-long', 'capacity');
+        return no('payload', 'segment-too-long', 'capacity');
       }
       path.push(segment);
     }
@@ -693,14 +733,87 @@ export function decimalValue(value: Decimal): bigint {
 }
 
 /**
+ * Whether a value survives JSON serialization as itself.
+ *
+ * `JSON.stringify` is **lossy and silent**: `NaN`, `Infinity` and
+ * `-Infinity` become `null`, and `undefined`, functions and symbols
+ * are dropped from objects and become `null` in arrays. Validating the
+ * serialized text therefore cannot see what was asked for — the
+ * evidence is already gone — so an action input of `{n: NaN}` encoded
+ * happily as `{"n":null}` and sent a value the caller never wrote.
+ *
+ * These are ordinary `number`s at the type level; no cast or exotic
+ * object is needed to produce them. So the source values are checked
+ * **before** serialization, and an inadmissible one is a refusal
+ * rather than a substitution. `null` itself stays admissible: an
+ * intentional null is data.
+ */
+function inadmissibleValue(value: JsonValue | undefined, path: string): string | null {
+  if (value === null) return null;
+  switch (typeof value) {
+    case 'boolean':
+    case 'string':
+      return null;
+    case 'number':
+      // The one the brief names (§1.12): every number is finite.
+      return Number.isFinite(value) ? null : `non-finite-number:${path}`;
+    case 'object': {
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i += 1) {
+          const bad = inadmissibleValue(value[i] as JsonValue, `${path}[${i}]`);
+          if (bad !== null) return bad;
+        }
+        return null;
+      }
+      for (const [key, nested] of Object.entries(value as JsonObject)) {
+        const bad = inadmissibleValue(nested, `${path}.${key}`);
+        if (bad !== null) return bad;
+      }
+      return null;
+    }
+    default:
+      // `undefined`, function, symbol, bigint: each is either dropped,
+      // replaced or thrown on by `JSON.stringify`, and none of them is
+      // JSON.
+      return `not-json:${path}`;
+  }
+}
+
+/** Every value-bearing field of a message, for the check above. */
+function payloadFields(message: StoreMessage): [string, JsonValue][] {
+  switch (message.k) {
+    case 'act':
+    case 'in':
+      return [['in', message.in]];
+    case 'res':
+      return [['out', message.out]];
+    case 'delta':
+      return message.ops.flatMap((op, i) =>
+        op.o === 'r' ? ([[`ops[${i}].val`, op.val]] as [string, JsonValue][]) : [],
+      );
+    default:
+      return [];
+  }
+}
+
+/**
  * Encode a message in its canonical spelling.
  *
- * Validates through {@link decodeMessage}'s own rules — a producer must
- * not be able to emit a frame the parser would refuse — and throws
- * (rather than returning a refusal) because this is a local programming
- * error, not untrusted input.
+ * Validates the **source values** first — because serialization
+ * destroys the evidence of a non-finite number — then validates the
+ * serialized frame through {@link decodeMessage}'s own rules, so a
+ * producer cannot emit a frame the parser would refuse. Throws rather
+ * than returning a refusal: this is a local programming error, not
+ * untrusted input.
  */
 export function encodeMessage(message: StoreMessage): string {
+  for (const [path, value] of payloadFields(message)) {
+    const bad = inadmissibleValue(value, path);
+    if (bad !== null) {
+      throw new RangeError(`refusing to encode an invalid ${message.k}: ${bad}`);
+    }
+  }
+
   const body: Record<string, JsonValue> = { v: WIRE_VERSION, k: message.k };
   const source = message as unknown as Record<string, JsonValue>;
   for (const key of KEY_ORDER[message.k]) {

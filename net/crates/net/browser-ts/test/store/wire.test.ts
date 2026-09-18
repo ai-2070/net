@@ -360,3 +360,150 @@ describe('the ladder is ordered', () => {
     expect(result.reason).toBe('duplicate-key');
   });
 });
+
+describe('A1 — application data is never mistaken for a refusal', () => {
+  it('accepts an action whose input is {ok:false}', () => {
+    // `ok` is ordinary application data. The readers used to report a
+    // refusal as "an object whose ok is false", so this input came
+    // back FROM decodeMessage as the refusal itself.
+    const frame = { v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: { ok: false } };
+    const message = accepted(frame, 'owner');
+
+    expect(message.k).toBe('act');
+    if (message.k === 'act') expect(message.in).toEqual({ ok: false });
+  });
+
+  it('keeps payload-supplied refusal metadata as data, in all three branches', () => {
+    // The sharpest shape: a payload that spells the decoder's own
+    // refusal fields. They must stay data.
+    const hostile = { ok: false, code: 'closed', stage: 'payload', reason: 'supplied by payload' };
+
+    const act = accepted({ v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: hostile }, 'owner');
+    expect(act.k).toBe('act');
+    if (act.k === 'act') expect(act.in).toEqual(hostile);
+
+    const input = accepted({ v: 1, k: 'in', h: H, name: 'helm', s: '1', in: hostile }, 'owner');
+    if (input.k === 'in') expect(input.in).toEqual(hostile);
+
+    const res = accepted({ v: 1, k: 'res', q: Q, h: H, s: '7', out: hostile }, 'replica');
+    if (res.k === 'res') expect(res.out).toEqual(hostile);
+  });
+
+  it('round-trips such a payload through the encoder', () => {
+    // The encoder refused these legal messages too, with an undefined
+    // reason, because it validates through the decoder.
+    const message = accepted({ v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: { ok: false } }, 'owner');
+    const text = encodeMessage(message);
+    expect(accepted(text, 'owner')).toEqual(message);
+  });
+
+  it('still refuses a genuinely malformed payload (control)', () => {
+    expect(refused({ v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: [1] }, 'owner').reason).toBe(
+      'bad-object:in',
+    );
+    expect(refused({ v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: 'no' }, 'owner').reason).toBe(
+      'bad-object:in',
+    );
+    // And an ordinary {ok:true} payload is data, not a success signal.
+    const ok = accepted({ v: 1, k: 'res', q: Q, h: H, s: '7', out: { ok: true } }, 'replica');
+    if (ok.k === 'res') expect(ok.out).toEqual({ ok: true });
+  });
+});
+
+describe('A3 — the encoder refuses before serialization can hide the value', () => {
+  const nonFinite: [string, number][] = [
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['-Infinity', Number.NEGATIVE_INFINITY],
+  ];
+
+  it('refuses a non-finite number in every value-bearing field', () => {
+    for (const [label, value] of nonFinite) {
+      // JSON.stringify turns each of these into `null`, so validating
+      // the serialized text cannot see what was asked for.
+      expect(JSON.stringify({ n: value })).toBe('{"n":null}');
+
+      expect(() =>
+        encodeMessage({ k: 'act', q: Q, h: H, s: '7', name: 'fire', in: { n: value } }),
+        `act/${label}`,
+      ).toThrow(/non-finite-number:in\.n/);
+      expect(() =>
+        encodeMessage({ k: 'in', h: H, name: 'helm', s: '1', in: { n: value } }),
+        `in/${label}`,
+      ).toThrow(/non-finite-number:in\.n/);
+      expect(() =>
+        encodeMessage({ k: 'res', q: Q, h: H, s: '7', out: { n: value } }),
+        `res/${label}`,
+      ).toThrow(/non-finite-number:out\.n/);
+    }
+  });
+
+  it('refuses one nested anywhere, including inside an array and a patch value', () => {
+    expect(() =>
+      encodeMessage({ k: 'act', q: Q, h: H, s: '7', name: 'f', in: { a: { b: [1, Number.NaN] } } }),
+    ).toThrow(/non-finite-number:in\.a\.b\[1\]/);
+    expect(() =>
+      encodeMessage({
+        k: 'delta',
+        h: H,
+        g: '1',
+        base: '1',
+        r: '2',
+        ops: [{ o: 'r', p: ['x'], val: Number.POSITIVE_INFINITY }],
+      }),
+    ).toThrow(/non-finite-number:ops\[0\]\.val/);
+  });
+
+  it('refuses a value JSON would drop rather than dropping it', () => {
+    expect(() =>
+      encodeMessage({
+        k: 'act', q: Q, h: H, s: '7', name: 'f',
+        in: { gone: undefined as unknown as null },
+      }),
+    ).toThrow(/not-json:in\.gone/);
+  });
+
+  it('keeps finite numbers and intentional nulls (control)', () => {
+    const message = accepted(
+      { v: 1, k: 'act', q: Q, h: H, s: '7', name: 'fire', in: { z: 0, neg: -1.5, big: 1e308, nothing: null } },
+      'owner',
+    );
+    const text = encodeMessage(message);
+    expect(text).toContain('"z":0');
+    expect(text).toContain('"nothing":null');
+    expect(accepted(text, 'owner')).toEqual(message);
+  });
+});
+
+describe('A4 — a q-less refusal is the expiry notice and nothing else', () => {
+  it('refuses a q-less refusal that is not `closed`', () => {
+    const result = refused({ v: 1, k: 'no', h: H, code: 'forbidden' }, 'replica');
+    expect(result.reason).toBe('unsolicited-no-must-be-closed');
+    // Nothing could attribute it to a request.
+    for (const code of ['capacity', 'not-ready', 'owner-lost', 'action-rejected'] as const) {
+      expect(refused({ v: 1, k: 'no', h: H, code }, 'replica').reason).toBe(
+        'unsolicited-no-must-be-closed',
+      );
+    }
+  });
+
+  it('refuses a q-less refusal carrying an action sequence', () => {
+    expect(refused({ v: 1, k: 'no', h: H, code: 'closed', s: '1' }, 'replica').reason).toBe(
+      'unsolicited-no-carries-no-sequence',
+    );
+  });
+
+  it('refuses a q-less refusal that names no handle', () => {
+    // It has to be about something: `q`-less means "applied to `h`".
+    // The reason is the naming rule, not a second handle check — that
+    // check would be unreachable, so it does not exist.
+    expect(refused({ v: 1, k: 'no', code: 'closed' }, 'replica').reason).toBe('no-names-nothing');
+  });
+
+  it('admits the unsolicited notice, and a correlated refusal of any code (controls)', () => {
+    expect(accepted({ v: 1, k: 'no', h: H, code: 'closed' }, 'replica').k).toBe('no');
+    expect(accepted({ v: 1, k: 'no', q: Q, h: H, code: 'forbidden' }, 'replica').k).toBe('no');
+    // `s` belongs to a correlated action reply, and is admissible there.
+    expect(accepted({ v: 1, k: 'no', q: Q, h: H, code: 'action-rejected', s: '7' }, 'replica').k).toBe('no');
+  });
+});
