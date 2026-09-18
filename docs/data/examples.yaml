@@ -142,10 +142,9 @@ examples:
       rust: objectstore.rs
       typescript: objectstore.ts
       python: objectstore.py
+      c: objectstore.c
     absent:
-
-      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
-      c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
+      go: "the Go binding has no mesh blob-transfer bindings at all — ServeBlobTransfer / FetchBlob do not exist on MeshNode, and go/net.h carries none of the transport prototypes (net_serve_blob_transfer / net_fetch_blob). Local store/fetch works; the cross-node fetch this route is about does not."
     run:
       expect: "RESULT ok dedup=1 readback=1 bytes=64"
       timeout_s: 120

@@ -229,6 +229,43 @@ func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
 	return nil
 }
 
+// Publish computes the content address for `data` (BLAKE3), stores
+// it through this adapter under `uri`, and returns the *encoded*
+// BlobRef — the mint a producer needs. `Store` requires an
+// already-encoded ref, so before this existed a Go producer had no
+// way to create one; a consumer could only fetch a blob something
+// else had published.
+//
+// The URI's scheme must be one the adapter accepts (`mesh:` for a
+// substrate `MeshBlobAdapter`).
+func (a *MeshBlobAdapter) Publish(uri string, data []byte) ([]byte, error) {
+	cURI := C.CString(uri)
+	defer C.free(unsafe.Pointer(cURI))
+	var dataPtr *C.uint8_t
+	if len(data) > 0 {
+		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+	}
+	var outRef *C.uint8_t
+	var outLen C.size_t
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_publish(
+			handle,
+			(*C.uint8_t)(unsafe.Pointer(cURI)), C.size_t(len(uri)),
+			dataPtr, C.size_t(len(data)),
+			&outRef, &outLen,
+		)
+	}) {
+		return nil, ErrBlobClosed
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("%w: publish failed with rc=%d", ErrBlob, int(rc))
+	}
+	defer C.net_blob_free_buffer(outRef, outLen)
+	encoded := C.GoBytes(unsafe.Pointer(outRef), C.int(outLen))
+	return encoded, nil
+}
+
 // Fetch returns the content-addressed bytes for `blobRefBytes`.
 func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
 	var refPtr *C.uint8_t
