@@ -2870,6 +2870,39 @@ jobs:
           done
           echo "round-4 caller probes: all 3 executed and green"
 
+      # === A2A — reviewer round-4b probe (disposition inheritance) ==========
+      #
+      # The re-review of the round-4 repair found D2 half-closed: the
+      # archive-ABSENT branch consumed the live operator disposition, the
+      # archive-EXISTING branch dropped it. Which one late evidence meets is
+      # only an ordering accident — whether the archive was created before or
+      # after the operator resolved the live row — so the same charge came out
+      # `Resolved` or `PaidUnexecutable` depending on scheduling.
+      #
+      # Landed byte-identical (sha256 8758f47dc61a29e5…). Proven
+      # discriminating: forcing `inherit = false` in the existing-archive
+      # branch reddens it with "existing archive bypassed the live disposition
+      # of the same charge", left `PaidUnexecutable`, right `Resolved`.
+      #
+      # No exclusion needed here: all 16 tests in this binary pass, so the
+      # whole file runs rather than a filtered subset.
+      - name: A2A — reviewer round-4b probe (disposition inheritance)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          required=review_existing_archive_inherits_live_disposition_on_late_success
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(review_round4_disposition)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the round-4b disposition probe did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          printf '%s\n' "$out" | grep -qE "PASS .*$required\$" \
+            || { echo "::error::$required did not run and pass"; exit 1; }
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          [ "$listed" -ge 16 ] \
+            || { echo "::error::expected at least 16 rows in review_round4_disposition, saw $listed"; exit 1; }
+          echo "round-4b disposition probe: $listed executed, the named one green"
+
       # === A2A caller purchase + task redeem (WS-B) =========================
       #
       # The step above ran both binaries by auto-discovery. These two exist so

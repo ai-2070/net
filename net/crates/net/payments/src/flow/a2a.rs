@@ -1282,6 +1282,34 @@ impl A2aPurchaseStore {
                 .cloned();
             let archive = RecordClass::Retained.map(file);
             if let Some(existing) = archive.get_mut(&id_owned) {
+                // An archive row already exists for this incarnation. It
+                // does NOT follow that the archive is where the decision
+                // lives: the operator may have resolved the live row under
+                // the same key and generation, and which of the two the
+                // late evidence meets is only an ordering accident —
+                // whether archive creation or live resolution happened
+                // first. So the disposition governs from whichever map
+                // holds it, and this branch consumes it exactly as the
+                // archive-absent one below does.
+                //
+                // An archive that has its OWN terminal disposition is left
+                // to `merge_retained`, which already applies archive-local
+                // precedence — a separately resolved archive is not
+                // overwritten by a live one.
+                let inherit = existing.state.tag() != StateTag::Resolved;
+                if let (true, Some(disposition)) = (inherit, disposition) {
+                    let mut retained = disposition;
+                    // The archive's own evidence first, so proof and
+                    // billing already retained there survive the move, then
+                    // the late outcome. Both go through the same merge, so
+                    // precedence and operator-document preservation are the
+                    // one implementation.
+                    merge_retained(&mut retained, existing.clone());
+                    merge_retained(&mut retained, incoming);
+                    let changed = *existing != retained;
+                    *existing = retained;
+                    return (existing.clone(), changed);
+                }
                 let changed = merge_retained(existing, incoming);
                 return (existing.clone(), changed);
             }

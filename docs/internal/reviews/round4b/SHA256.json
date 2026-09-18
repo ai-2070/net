@@ -1,0 +1,11 @@
+{
+  "c5-ci-evidence.json": "7da71ce22ed84f44007881c3f94c2c3cc450d406911eadc10937943e999d6cd5",
+  "disposition-probe.log": "045cf3f548d19ee990406bebeff183bed0ec66675aeff5ff556975338d00a3df",
+  "exact-head-ci.json": "c6d372755c5030ecabc05c5f1871d3bbd374f1692481f87937b61001ee28e605",
+  "payments.log": "7168084c4ba5fba8becf7c926c92b1afc9681f100d281de184fd6d1c195ad0a0",
+  "results.json": "59ce7434feef84a452b7e19a7cc6e36138100fb5c91a1f3a369877415a2da71e",
+  "REVIEW.md": "a7e28ec0e91fd511270ac4a31ae8914a9d5df651215cb50a90816a574f7daa7d",
+  "run_tests.py": "46ae5927aef7f2f0a77157653752ed2d69d7dff4bb03fb5ddf24c4154528e51c",
+  "sdk.log": "ec74052ae87a11b815c370e2e86263390f7a0f9945cab312019ba3c2d5ea1ad2",
+  "test-witnesses/net/crates/net/payments/tests/review_round4_disposition.rs": "8758f47dc61a29e56870b1f25d065f9d37d8db46d85d97c86a3873ea237f2cd1"
+}
