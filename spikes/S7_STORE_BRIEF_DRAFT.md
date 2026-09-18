@@ -1160,6 +1160,75 @@ needs current-head evidence and neither is in hand. What the brief does
 is name the three properties and the slices whose *acceptance* requires
 each, so closure can be established against the head actually delivered.
 
+### 4a Current-head evidence: the authenticated-origin gate
+
+Read-only investigation at `be1d0f508`, plus one executed run. This is
+**evidence about the gate, not a claim that slice C is accepted** — C is
+not written. It exists because "no current-head evidence" was being read
+in both directions, and that is not a state a gate should sit in.
+
+**S6-01's property is executed and passing at this head.**
+`leaf/tests/establishment_identity.rs` is eleven tests on the public
+leaf API with no test double: the reviewer's impostor reproduction
+(`an_impostor_with_the_domain_psk_is_refused_the_identity_it_claims`),
+the honest control beside it, transcript binding
+(`a_proof_from_another_establishment_cannot_promote_this_one`), the
+deadline, supersession, close, retirement, the direct/routed parity
+case, and
+`application_bytes_on_an_unproven_establishment_are_never_delivered`.
+Run locally: **11 passed, 0 failed**. CI executes the file by
+auto-discovery (`cargo test` in the leaf crate), **but it is not in the
+pinned roster** that guards the `kyra_*` files, so a rename would be
+silent. That is a gap in the guard, not in the property.
+
+**The authenticated identity reaches the application on the direct
+path.** The chain, each link verified:
+
+| Link | Where |
+|---|---|
+| `on_datagram` pushes only the peer whose installed session opened the packet | `leaf/src/node.rs:2057-2073`, `:2706-2712` |
+| a responder-side establishment is held **outside** the session table until proven | `leaf/src/node.rs:396-411`, `:1005-1012`, `:1095-1138` |
+| `NodeId` is cryptographically bound to the entity key | `leaf/src/announce.rs:400-406`; `leaf/src/establish.rs:300-311` |
+| the event carries it | `LeafEvent::StreamData { peer_node, incarnation, .. }`, `leaf/src/node.rs:95-113` |
+| across wasm | `wasm.rs:2950` (event JSON), `wasm.rs:3486` (`LeafStream::peer_node_hex`) |
+| in TypeScript | `browser-ts/src/events.ts:98` (`StreamDataEvent.peerNode`) |
+| and it is already enforced per stream | `browser-ts/src/stream.ts:238-241` — a frame whose peer is not this stream's is dropped |
+
+So the gate's substance — category **(c)**, proven by the handshake — is
+present for a direct peer, and §1.3's refusal of carried originator
+fields is *confirmed* rather than merely asserted: the one adjacent
+field that looks like an origin, `ChannelMessage.origin_hash`, is
+**sender-set** (`leaf/src/session.rs:959`) and the leaf never binds it
+to the peer. A store that trusted it would be trusting the sender.
+
+**Two gaps, both recorded rather than repaired here.**
+
+1. **`LeafStream` filters on the peer but does not expose it.**
+   Delivery is payload-only (`stream.ts:75`, `:161`, `:170`); the peer
+   is read at `:132`, used at `:238-241`, and dropped at `:242`. Slice C
+   needs an accessor, and the store's own contract already expects one
+   (`store/types.ts:133` `ActionContext.peer`, `:141-157`
+   `AccessRequest.peer`). Small, and C's work.
+2. **The leader-proxied handle loses the identity, and loses it
+   silently.** `ProxyStream` has no peer accessor
+   (`leaf/src/leader_session.rs:2451-2456`; `leaf/pkg/net_leaf.d.ts`
+   `ProxyStream`), and `browser-ts/src/wasm.ts:161-162` declares
+   `peer_node_hex?()` **optional**, so on a follower `stream.ts:132`
+   yields `null` and the peer filter at `:238` goes **inert**: the
+   stream falls back to id-only admission. That is R4-10's cross-peer
+   admixture — one label open to two peers delivering each other's
+   bytes — reopened for followers, and the comment at `wasm.ts:151`
+   calling the proxy "identical but for `send`" is why it was not
+   noticed. It gates **G** (follower tabs) and it is leader-proxy
+   lifecycle work, so it is not fixed in passing: it touches the wasm
+   ABI, `net_leaf.d.ts` and the export baseline.
+
+**What this does not establish.** Nothing here is evidence about
+reliable transfer (B2′, D, H) or about the leader-proxy store lifecycle
+(G). Nine of the ten Stage 5 R4 items concern reliable transfer and are
+untouched by this investigation; R4-10 is the cross-peer admixture whose
+*direct*-path repair is visible above and whose *proxied* path is gap 2.
+
 ---
 
 ## 5. Acceptance cases

@@ -148,10 +148,20 @@ export interface LeafWasmStream {
 /**
  * The stream object a **session**'s `open_stream` resolves to.
  *
- * Identical to {@link LeafWasmStream} but for `send`, which is a
- * promise because on a follower the packet is put on the wire by
- * another tab. `on_message` delivers the same event JSON — one
- * decoder serves both.
+ * `send` is a promise because on a follower the packet is put on the
+ * wire by another tab, and `on_message` delivers the same event JSON,
+ * so one decoder serves both.
+ *
+ * **It is not otherwise identical, and the difference matters.** The
+ * real `ProxyStream` exports no `peer_node_hex` or `incarnation`
+ * (`leaf/src/leader_session.rs`), which is why they are optional
+ * here — and why a proxied stream's peer filter in `stream.ts` is
+ * inert: `peerId` reads `null` and admission falls back to the stream
+ * id alone. That is the cross-peer admixture the direct path fixed,
+ * still open for followers (S7 brief §4a). The optionality is a
+ * faithful declaration of today's ABI, not an invitation to rely on
+ * it: a consumer that needs the peer must not accept a proxied
+ * stream until the accessor exists.
  */
 export interface LeafWasmProxyStream {
   send(payload: Uint8Array): Promise<void>;
