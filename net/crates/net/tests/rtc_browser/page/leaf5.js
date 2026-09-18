@@ -291,7 +291,7 @@ function eventRow(e) {
 // of every step that armed the hook, so "reordered" never silently
 // becomes "lost".
 
-const loss = { dropEvery: 0, seen: 0, dropped: 0 };
+const loss = { dropEvery: 0, seen: 0, dropped: 0, lost: [] };
 const reorder = { every: 0, seen: 0, swapped: 0, held: null };
 // DUPLICATION. Neither hook above can produce one: a drop removes a
 // datagram and a reorder moves it. With `duplicateEvery = N` the Nth
@@ -326,6 +326,16 @@ const wire = { messages: 0, bytes: 0 };
       loss.seen += 1;
       if (loss.seen % loss.dropEvery === 0) {
         loss.dropped += 1;
+        // WHICH message was lost, not just how many. The hook
+        // patches the prototype, so it sees every channel this page
+        // has — the anchor's and any promoted direct one — and "a
+        // chunk was lost" and "a signalling packet was lost" are
+        // very different facts about a failing join.
+        loss.lost.push({
+          channel: (this && this.label) || '?',
+          bytes: (data && (data.byteLength !== undefined ? data.byteLength : data.length)) || 0,
+          nth: loss.seen,
+        });
         return; // the datagram never leaves the browser
       }
     }
@@ -977,6 +987,7 @@ async function execute(step) {
       loss.dropEvery = step.drop_every || 0;
       loss.seen = 0;
       loss.dropped = 0;
+      loss.lost = [];
       reorder.every = step.reorder_every || 0;
       reorder.seen = 0;
       reorder.swapped = 0;
@@ -1836,6 +1847,7 @@ async function execute(step) {
       loss.dropEvery = step.drop_every || 0;
       loss.seen = 0;
       loss.dropped = 0;
+      loss.lost = [];
       reorder.every = step.reorder_every || 0;
       reorder.seen = 0;
       reorder.swapped = 0;
@@ -1851,6 +1863,7 @@ async function execute(step) {
       flushHeld();
       const report = {
         dropped: loss.dropped,
+        lost: loss.lost.slice(0, 8),
         swapped: reorder.swapped,
         duplicated: dup.duplicated,
       };
@@ -1927,6 +1940,7 @@ async function execute(step) {
       loss.dropEvery = step.drop_every || 0;
       loss.seen = 0;
       loss.dropped = 0;
+      loss.lost = [];
       reorder.every = step.reorder_every || 0;
       reorder.seen = 0;
       reorder.swapped = 0;

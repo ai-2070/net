@@ -50,6 +50,21 @@
 //!    test anything: with no installed replica there is no audience,
 //!    so the commits sent nothing. Needs a driver that does not
 //!    depend on the join having succeeded.
+//! 5. *The store could re-ask instead.* TRIED AND REVERTED, and the
+//!    reason is worth keeping. The hook now reports WHICH message it
+//!    lost, and it was 130–200 bytes on channel `net` — the
+//!    MANIFEST, an order of magnitude too small to be one of the
+//!    5934-byte chunks. With no manifest no assembly is ever opened,
+//!    so the assembly deadline has no subject and the replica waits
+//!    on a message that is not coming. A deadline on the transition
+//!    ITSELF (re-`join` after 10 s, bounded to three) made the
+//!    in-process case recover with red inverses either way — and in
+//!    the browser it fixed NOTHING here while breaking witnesses 4
+//!    and 5, because each abandoned join leaves a subscription the
+//!    owner still holds and the next store on that session cannot
+//!    get one. Reverted whole. A re-ask has to release the
+//!    subscription it is replacing, and that is a design question,
+//!    not a patch.
 //! 4. *The anchor does not forward reliability control packets.*
 //!    REFUTED from source — the relay path is header-only routing
 //!    and type-agnostic (`mesh.rs`, the `dest_id != local` arm);
