@@ -132,7 +132,7 @@
     "eslint": "10.10.0",
     "eslint-config-next": "16.3.5",
     "github-slugger": "2.0.0",
-    "prettier": "3.9.7",
+    "prettier": "3.9.8",
     "prettier-plugin-tailwindcss": "0.8.1",
     "prisma": "7.10.0",
     "sharp": "0.35.4",
