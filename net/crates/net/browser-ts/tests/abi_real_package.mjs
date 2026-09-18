@@ -743,6 +743,121 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_action_executes_once_and_replays_its_outcome', async () => {
+  // Slice E against the SHIPPED build: one execution, one retained
+  // outcome, a conflicting request refused, and a rejection that stays
+  // a rejection after the handler would have succeeded.
+  const ownerModule = await import(new URL('store/owner.js', dist).href);
+  const definitionModule = await import(new URL('store/definition.js', dist).href);
+  const codec = await import(new URL('store/wire.js', dist).href);
+
+  let calls = 0;
+  const game = definitionModule.defineStore({
+    id: 'probe.act',
+    version: 1,
+    state: raw => ({ shots: Number(raw.shots ?? 0) }),
+    empty: () => ({ shots: 0 }),
+    actions: {
+      fire: {
+        input: value => ({ power: Number(value.power) }),
+        output: value => ({ shot: Number(value.shot) }),
+      },
+      jam: { input: () => ({}), output: value => ({ ok: Boolean(value.ok) }) },
+    },
+    inputs: { helm: value => ({ heading: Number(value.heading) }) },
+  });
+
+  let handles = 0;
+  let correlation = 0;
+  const nextQ = () => {
+    correlation += 1;
+    return correlation.toString(16).padStart(16, '0');
+  };
+  const owner = new ownerModule.StoreOwner({
+    definition: game,
+    authorize: () => true,
+    project: state => state,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newHandle: () => {
+      handles += 1;
+      return handles.toString(16).padStart(32, '0');
+    },
+    newIncarnation: () => 'abcdef0123456789',
+    actions: {
+      fire: (input, context) => {
+        calls += 1;
+        const shots = context.getState().shots + input.power;
+        context.setState({ shots });
+        return { shot: shots };
+      },
+      jam: (_input, context) => {
+        calls += 1;
+        context.setState({ shots: 999 });
+        if (calls <= 3) throw new Error('jammed');
+        return { ok: true };
+      },
+    },
+    inputs: { helm: () => {} },
+  });
+  owner.commit({ shots: 0 });
+
+  const joinOut = owner.receive(
+    codec.encodeMessage({ k: 'join', q: nextQ(), def: 'probe.act', ver: 1, key: 'k', aud: ['crew'] }),
+    '00000000000000aa',
+  ).out;
+  const manifest = codec.decodeMessage(joinOut[0].frame, { maxBytes: 8104, as: 'replica' });
+  const h = manifest.ok && manifest.message.h;
+
+  const action = (s, name, input) =>
+    owner.receive(
+      codec.encodeMessage({ k: 'act', q: nextQ(), h, s, name, in: input }),
+      '00000000000000aa',
+    );
+  const replyOf = dispatched => {
+    const decoded = codec.decodeMessage(dispatched.out[0].frame, { maxBytes: 8104, as: 'replica' });
+    if (!decoded.ok) throw new Error(`undecodable reply: ${decoded.reason}`);
+    return decoded.message;
+  };
+
+  // Executed once, answered with `res`.
+  const done = action('1', 'fire', { power: 2 });
+  eq([done.refused, calls, owner.getState().shots], [null, 1, 2], 'the first execution');
+  eq(replyOf(done).out, { shot: 2 }, 'its result');
+
+  // The same request replays the retained outcome without executing.
+  const replayed = action('1', 'fire', { power: 2 });
+  eq([replayed.refused, calls, owner.getState().shots], [null, 1, 2], 'the replay');
+  eq(replyOf(replayed).out, { shot: 2 }, 'the retained outcome');
+
+  // A DIFFERENT request under that sequence is refused, and the
+  // retained entry survives it.
+  const conflicting = action('1', 'fire', { power: 9 });
+  eq(conflicting.refused, 'act-binding-mismatch', 'the conflict');
+  eq(replyOf(conflicting).code, 'invalid-data', 'its code');
+  eq(replyOf(action('1', 'fire', { power: 2 })).out, { shot: 2 }, 'the entry after the conflict');
+
+  // A rejection is retained: the handler would succeed now, and the
+  // replay is still the rejection.
+  const rejected = action('2', 'jam', {});
+  eq(replyOf(rejected).code, 'action-rejected', 'the rejection');
+  eq(owner.getState().shots, 2, 'its writes were discarded');
+  const callsAfterRejection = calls;
+  eq(replyOf(action('2', 'jam', {})).code, 'action-rejected', 'the retained rejection');
+  eq(calls, callsAfterRejection, 'the handler was not called again');
+
+  // An input gets no reply at all.
+  const input = owner.receive(
+    codec.encodeMessage({ k: 'in', h, s: '1', name: 'helm', in: { heading: 90 } }),
+    '00000000000000aa',
+  );
+  eq([input.refused, input.out.length], [null, 0], 'the input');
+
+  // And the ledger goes with the handle.
+  owner.receive(codec.encodeMessage({ k: 'leave', q: nextQ(), h }), '00000000000000aa');
+  eq([owner.ledgerCount, owner.handleCount], [0, 0], 'what the handle took with it');
+});
+
 await probe('real_package_resync_is_authorized_and_recovery_is_not_ready', async () => {
   // The review round's two contract repairs, against the SHIPPED
   // build: a `resync` is a read and the policy rules on it again, and

@@ -33,10 +33,29 @@
 
 import { Assembly, AssemblyTable } from './assembly.js';
 import { assertChunkingFits, chunkSnapshot } from './chunker.js';
+import { StoreCore } from './core.js';
 import { StoreError, type StoreErrorCode } from './errors.js';
-import { reconcile } from './state.js';
-import type { AccessRequest, ActionSpec, InputSpec, Parse, StoreDefinition } from './types.js';
+import type { JsonObject, JsonValue } from './json.js';
 import {
+  canonicalRequest,
+  digestBinding,
+  inlineBinding,
+  LedgerTable,
+  needsDigest,
+  type Outcome,
+  type RequestBinding,
+} from './ledger.js';
+import type {
+  AccessRequest,
+  ActionContext,
+  Cancel,
+  ActionSpec,
+  InputSpec,
+  Parse,
+  StoreDefinition,
+} from './types.js';
+import {
+  decimalValue,
   decodeMessage,
   encodeMessage,
   HANDLE_HEX_LENGTH,
@@ -45,6 +64,9 @@ import {
   type CallerMessage,
   type Hex,
 } from './wire.js';
+
+/** Actions in flight per owner, against the pending bound (§2). */
+export const MAX_PENDING_ACTIONS = 32;
 
 /** Handles one owner will hold (brief §2). */
 export const MAX_HANDLES = 256;
@@ -74,7 +96,31 @@ export interface OwnerDeps<S extends object, A extends ActionSpec, I extends Inp
   newHandle(): Hex;
   /** 16 lowercase hex, one per owner incarnation. */
   newIncarnation(): Hex;
+  /**
+   * The action handlers, one per declared action.
+   *
+   * Each runs inside ONE synchronous transaction: it stages writes
+   * through its context and returns the output, or throws to reject.
+   * A throw is an `action-rejected` outcome that is RETAINED (§1.10),
+   * not an absent one.
+   */
+  readonly actions: ActionHandlers<S, A>;
+  /** The latest-value input handlers. Fire-and-forget, no reply. */
+  readonly inputs: InputHandlers<S, I>;
 }
+
+/** One handler per declared action. */
+export type ActionHandlers<S extends object, A extends ActionSpec> = {
+  readonly [K in keyof A]: (
+    input: A[K]['input'],
+    context: ActionContext<S>,
+  ) => A[K]['output'];
+};
+
+/** One handler per declared input. */
+export type InputHandlers<S extends object, I extends InputSpec> = {
+  readonly [K in keyof I]: (input: I[K], context: ActionContext<S>) => void;
+};
 
 /** One admitted subscription. */
 export interface OwnerHandle {
@@ -103,6 +149,18 @@ export interface Dispatched {
   readonly out: readonly Outbound[];
   /** A stable, countable refusal reason, when the frame was refused. */
   readonly refused: string | null;
+  /**
+   * The rest of an action whose request binding needed a digest.
+   *
+   * §1.10 puts one `await` in the ledger path, for inputs too large to
+   * retain verbatim. Rather than make every join and `alive` async to
+   * serve that one case, the synchronous answer comes back immediately
+   * and the remainder is handed over explicitly. A transport sends
+   * `out`, then sends the deferred result's `out` when it settles.
+   *
+   * `null` on every other path, which is all of them but one.
+   */
+  readonly deferred: Promise<Dispatched> | null;
 }
 
 interface Counters {
@@ -121,8 +179,18 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   private readonly counters: Counters = {};
   private readonly chunkBytes: number;
   private readonly incarnation: Hex;
-  private state: S;
-  private revision = 0;
+  /**
+   * The authoritative document.
+   *
+   * The owner's state IS a store: one place that validates, reconciles,
+   * counts revisions and runs a handler's synchronous transaction.
+   * Keeping a second copy beside it would give handler writes and
+   * `commit` two truths to disagree about.
+   */
+  private readonly core: StoreCore<S, A, I>;
+  /** Digest computations in flight, against the pending bound (§2). */
+  private pending = 0;
+  private readonly ledgers = new LedgerTable();
   /** Assemblies are the replica's concern; the owner keeps the type. */
   readonly assemblies = new AssemblyTable();
 
@@ -134,7 +202,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     if (this.incarnation.length !== INCARNATION_HEX_LENGTH) {
       throw new StoreError('invalid-data', 'newIncarnation must return 16 lowercase hex');
     }
-    this.state = deps.definition.empty();
+    this.core = new StoreCore({ definition: deps.definition, initialState: deps.definition.empty() });
   }
 
   /** Counters a host can report. Every refusal moves exactly one. */
@@ -154,15 +222,30 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
 
   /** Replace the authoritative state, as `setState` does. */
   commit(next: S): void {
-    const reconciled = reconcile(this.state, this.deps.definition.state(next));
-    if (reconciled === this.state) return;
-    this.state = reconciled;
-    this.revision += 1;
+    this.core.applySnapshot(next);
+  }
+
+  /** The authoritative document, for a host's own reads. */
+  getState(): S {
+    return this.core.getState() as S;
+  }
+
+  /**
+   * Subscribe to the authoritative document.
+   *
+   * The owner's own code watches the state it serves — a host renders
+   * from this, and an action's commit is the same revision its
+   * subscribers see.
+   */
+  subscribe(listener: (state: S, previous: S) => void): Cancel {
+    return this.core.subscribe((state, previous) => {
+      listener(state as S, previous as S);
+    });
   }
 
   /** The current authoritative revision. */
   get currentRevision(): number {
-    return this.revision;
+    return this.core.revision;
   }
 
   /**
@@ -173,7 +256,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   receive(frame: string, peer: string, now: number = this.deps.now()): Dispatched {
     const decoded = decodeMessage(frame, { maxBytes: this.deps.maxEventBytes, as: 'owner' });
-    if (!decoded.ok) return this.refuse(decoded.reason, [], null, null);
+    if (!decoded.ok) return this.refuse(decoded.reason, []);
 
     const message = decoded.message;
     if (message.k === 'join') return this.join(message, peer, now);
@@ -183,30 +266,22 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     // not re-authorize a handle.
     const bound = this.bind(message.h, peer, now);
     if (typeof bound === 'string') {
-      return this.refuse(bound, [this.no(peer, message.h, 'closed', requestOf(message))], null, null);
+      return this.refuse(bound, [this.no(peer, message.h, 'closed', requestOf(message))]);
     }
 
     switch (message.k) {
       case 'alive': {
         this.handles.set(bound.h, { ...bound, lastSeen: now });
-        return { out: [{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }], refused: null };
+        return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
       case 'leave': {
-        this.handles.delete(bound.h);
-        this.assemblies.reclaimHandle(bound.h);
-        return { out: [{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }], refused: null };
+        this.forget(bound.h);
+        return this.accept([{ peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) }]);
       }
       case 'act':
+        return this.action(message, bound, peer, now);
       case 'in':
-        // Gameplay before an installed view is `not-ready` (§1.7b), and
-        // the ledger that would answer it is slice E. Refused rather
-        // than half-answered.
-        return this.refuse(
-          `unimplemented-kind:${message.k}`,
-          message.k === 'act' ? [this.no(peer, bound.h, 'not-ready', message.q)] : [],
-          null,
-          null,
-        );
+        return this.input(message, bound, peer, now);
       case 'resync': {
         // §1.8. `g` and `have` are ADVISORY historical position, so
         // they are deliberately not read: a replica installed at A
@@ -225,25 +300,20 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         if (!this.permitsRead(peer, bound.audience)) {
           return this.refuse(
             'resync-forbidden',
-            [this.no(peer, bound.h, 'forbidden', message.q)],
-            null,
-            null,
+            [this.no(peer, bound.h, 'forbidden', message.q)]
           );
         }
         const renewed = { ...bound, lastSeen: now };
         this.handles.set(bound.h, renewed);
         const frames = this.install(renewed, message.q);
         if (frames === null) {
-          this.handles.delete(bound.h);
-          this.assemblies.reclaimHandle(bound.h);
+          this.forget(bound.h);
           return this.refuse(
             'resync-projection-capacity',
-            [this.no(peer, bound.h, 'capacity', message.q)],
-            null,
-            null,
+            [this.no(peer, bound.h, 'capacity', message.q)]
           );
         }
-        return { out: frames, refused: null };
+        return this.accept(frames);
       }
       case 'aud':
       case 'resume':
@@ -252,13 +322,259 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         // refusal for "this owner does not implement it yet".
         return this.refuse(
           `unimplemented-kind:${message.k}`,
-          [this.no(peer, bound.h, 'invalid-data', message.q)],
-          null,
-          null,
+          [this.no(peer, bound.h, 'invalid-data', message.q)]
         );
       default:
-        return this.refuse('unreachable-kind', [], null, null);
+        return this.refuse('unreachable-kind');
     }
+  }
+
+  /**
+   * One action (§1.10).
+   *
+   * The ladder: gameplay readiness, then the sequence, then the
+   * ledger's disposition, then — only for a genuinely new request —
+   * `authorize` and one synchronous transaction.
+   *
+   * The digest path is the one place this module awaits. Everything
+   * decided before the await is discarded and decided again after it:
+   * the handle may have expired, the policy may have been revoked, and
+   * the ledger may have retained this very sequence while the digest
+   * was computing.
+   */
+  private action(
+    message: Extract<CallerMessage, { k: 'act' }>,
+    bound: OwnerHandle,
+    peer: string,
+    now: number,
+  ): Dispatched {
+    // No gameplay-readiness refusal here, and the absence is the
+    // honest answer rather than an oversight. §1.6 makes gameplay
+    // admissible once a handle's current generation has been emitted
+    // in full, and in this owner every accepted emission is built and
+    // handed over synchronously, before the reply that admits the
+    // handle — so a live handle is always emitted for its current
+    // generation. A `not-ready` branch here could not fire, and a
+    // check that cannot fire is a claim.
+    //
+    // Slice F introduces the state that makes it meaningful: a
+    // deferred projection (§1.8) allocates a generation whose chunks
+    // are not yet out, and an `act` arriving in that window is the
+    // first one that must be refused `not-ready`. It belongs in the
+    // slice that can produce it.
+    const name = message.name;
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.actions, name)) {
+      return this.refuse('act-unknown-name', [this.no(peer, bound.h, 'invalid-data', message.q)]);
+    }
+
+    let canonical: string;
+    try {
+      canonical = canonicalRequest(name, message.in);
+    } catch {
+      return this.refuse('act-uncanonical', [this.no(peer, bound.h, 'invalid-data', message.q)]);
+    }
+
+    if (!needsDigest(canonical)) {
+      return this.decide(message, bound, peer, now, inlineBinding(canonical));
+    }
+
+    // The large-input path. The synchronous answer is "nothing yet";
+    // the rest arrives when the digest does.
+    if (this.pending >= MAX_PENDING_ACTIONS) {
+      return this.refuse('act-pending-bound', [this.no(peer, bound.h, 'capacity', message.q)]);
+    }
+    this.pending += 1;
+    const deferred = digestBinding(canonical)
+      .then(binding => {
+        // REVALIDATE. Nothing decided before the await is reused: the
+        // handle is re-bound to this peer and incarnation, readiness is
+        // re-checked, and the ledger is re-read.
+        const at = this.deps.now();
+        const rebound = this.bind(message.h, peer, at);
+        if (typeof rebound === 'string') {
+          return this.refuse(rebound, [this.no(peer, message.h, 'closed', message.q)]);
+        }
+        return this.decide(message, rebound, peer, at, binding);
+      })
+      .catch(() =>
+        // A digest that fails leaves the owner unable to say whether
+        // this request is the retained one, so it refuses rather than
+        // guessing either way.
+        this.refuse('act-digest-failed', [this.no(peer, message.h, 'indeterminate', message.q)]),
+      )
+      .finally(() => {
+        this.pending -= 1;
+      });
+    return { out: [], refused: null, deferred };
+  }
+
+  /**
+   * The ledger's decision, and the execution it may authorize.
+   *
+   * Synchronous from here on: no `await` may appear below this line,
+   * because the transaction it enters is synchronous by construction
+   * and a permission checked before a wait can have been revoked
+   * during it.
+   */
+  private decide(
+    message: Extract<CallerMessage, { k: 'act' }>,
+    bound: OwnerHandle,
+    peer: string,
+    now: number,
+    binding: RequestBinding,
+  ): Dispatched {
+    const ledger = this.ledgers.ledger(bound.h);
+    const s = decimalValue(message.s);
+    const disposition = ledger.disposition(s, binding, now);
+
+    switch (disposition.kind) {
+      case 'exhausted':
+        // The counter does not wrap: a fresh handle is the only way
+        // on, and prior outcomes are then unknown.
+        return this.refuse('act-sequence-exhausted', [this.no(peer, bound.h, 'capacity', message.q)]);
+      case 'conflict':
+        // A sequence identifies one request, not a slot. Not executed,
+        // and the retained entry is left exactly as it was.
+        return this.refuse('act-binding-mismatch', [this.no(peer, bound.h, 'invalid-data', message.q)]);
+      case 'expired':
+        // Used, and the outcome is gone. This asserts NOTHING about
+        // whether it committed.
+        return this.refuse('act-result-expired', [this.no(peer, bound.h, 'result-expired', message.q)]);
+      case 'replay': {
+        // A replay is re-authorized first: the retained outcome is not
+        // a permission that keeps working.
+        if (!this.permitsAction(peer, message.name, message.in)) {
+          return this.refuse('act-forbidden-replay', [this.no(peer, bound.h, 'forbidden', message.q)]);
+        }
+        this.renew(bound, now);
+        return this.accept([this.reply(bound, peer, message.q, s, disposition.outcome)]);
+      }
+      case 'execute':
+        break;
+    }
+
+    if (!this.permitsAction(peer, message.name, message.in)) {
+      // A denial is RETAINED. Otherwise a later policy change turns
+      // this refusal into an execution of the same sequence.
+      ledger.retain(s, binding, { kind: 'refusal', code: 'forbidden' }, now);
+      this.renew(bound, now);
+      return this.refuse('act-forbidden', [this.no(peer, bound.h, 'forbidden', message.q)]);
+    }
+
+    const spec = this.deps.definition.actions[message.name as keyof A];
+    let outcome: Outcome;
+    try {
+      const input = spec.input(message.in);
+      const handler = this.deps.actions[message.name as keyof A];
+      const produced = this.core.transact(context => handler(input, context), peer);
+      outcome = { kind: 'result', out: spec.output(produced) as JsonObject };
+    } catch {
+      // A handler that throws rejected the action, and the transaction
+      // discarded its writes. Retained as the refusal it is.
+      outcome = { kind: 'refusal', code: 'action-rejected' };
+    }
+
+    ledger.retain(s, binding, outcome, now);
+    this.renew(bound, now);
+    return this.accept([this.reply(bound, peer, message.q, s, outcome)]);
+  }
+
+  /** One latest-value input (§1.11). Fire and forget: no reply, ever. */
+  private input(
+    message: Extract<CallerMessage, { k: 'in' }>,
+    bound: OwnerHandle,
+    peer: string,
+    now: number,
+  ): Dispatched {
+    const name = message.name;
+    if (!Object.prototype.hasOwnProperty.call(this.deps.definition.inputs, name)) {
+      return this.refuse('in-unknown-name');
+    }
+    if (!this.ledgers.inputs(bound.h).admit(name, decimalValue(message.s))) {
+      // Stale. Loss is not an error here, and a dropped input may be
+      // the LAST one — the store promises no successor.
+      return this.refuse('in-stale-sequence');
+    }
+    if (!this.permitsInput(peer, name, message.in)) return this.refuse('in-forbidden');
+
+    try {
+      const parse = this.deps.definition.inputs[name as keyof I];
+      const input = parse(message.in);
+      const handler = this.deps.inputs[name as keyof I];
+      this.core.transact(context => handler(input, context), peer);
+    } catch {
+      return this.refuse('in-rejected');
+    }
+    this.renew(bound, now);
+    return this.accept([]);
+  }
+
+  /** A `res` for a result, a `no` for a retained refusal. */
+  private reply(
+    bound: OwnerHandle,
+    peer: string,
+    q: Hex,
+    s: bigint,
+    outcome: Outcome,
+  ): Outbound {
+    // A freshly constructed envelope carrying the retained OUTCOME —
+    // never a retained reply message, whose `q` belonged to the
+    // original request (§1.10).
+    const frame =
+      outcome.kind === 'result'
+        ? encodeMessage({ k: 'res', q, h: bound.h, s: s.toString(), out: outcome.out })
+        : encodeMessage({ k: 'no', q, h: bound.h, code: outcome.code, s: s.toString() });
+    return { peer, h: bound.h, frame };
+  }
+
+  private permitsAction(peer: string, name: string, input: JsonValue): boolean {
+    const request = { type: 'action', peer, name, input } as unknown as AccessRequest<A, I>;
+    try {
+      return this.deps.authorize(request) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private permitsInput(peer: string, name: string, input: JsonValue): boolean {
+    const request = { type: 'input', peer, name, input } as unknown as AccessRequest<A, I>;
+    try {
+      return this.deps.authorize(request) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The lease is renewed by an accepted message, refusals excepted. */
+  private renew(bound: OwnerHandle, now: number): void {
+    const live = this.handles.get(bound.h);
+    if (live === undefined) return;
+    this.handles.set(bound.h, { ...live, lastSeen: now });
+  }
+
+  /**
+   * Everything that belongs to one handle, gone together.
+   *
+   * §2: the ledger goes with the handle. That is what makes a replay
+   * after eviction `closed` rather than `result-expired` — the owner
+   * no longer knows the sequence existed — and it is what keeps the
+   * ledger table bounded by live handles instead of by the owner's
+   * lifetime.
+   */
+  private forget(h: Hex): void {
+    this.handles.delete(h);
+    this.assemblies.reclaimHandle(h);
+    this.ledgers.forget(h);
+  }
+
+  /** Ledgers held, for a host's own bounds reporting (§2). */
+  get ledgerCount(): number {
+    return this.ledgers.size;
+  }
+
+  /** An accepted frame's reply. */
+  private accept(out: readonly Outbound[], deferred: Promise<Dispatched> | null = null): Dispatched {
+    return { out, refused: null, deferred };
   }
 
   /** Expire handles whose lease has run out (§2). */
@@ -266,8 +582,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const expired: Hex[] = [];
     for (const [h, handle] of [...this.handles]) {
       if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-        this.handles.delete(h);
-        this.assemblies.reclaimHandle(h);
+        this.forget(h);
         expired.push(h);
       }
     }
@@ -288,27 +603,27 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     now: number,
   ): Dispatched {
     if (message.def !== this.deps.definition.id) {
-      return this.refuse('join-wrong-definition', [this.no(peer, null, 'version-mismatch', message.q)], null, null);
+      return this.refuse('join-wrong-definition', [this.no(peer, null, 'version-mismatch', message.q)]);
     }
     if (message.ver !== this.deps.definition.version) {
-      return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)], null, null);
+      return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)]);
     }
     if (message.aud.length > MAX_AUDIENCE_LABELS) {
-      return this.refuse('join-audience-bound', [this.no(peer, null, 'capacity', message.q)], null, null);
+      return this.refuse('join-audience-bound', [this.no(peer, null, 'capacity', message.q)]);
     }
     if (this.handles.size >= MAX_HANDLES) {
-      return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)], null, null);
+      return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
 
     // `authorize` receives the AUTHENTICATED peer and the audience it
     // asked to read. A refusal is `forbidden` and allocates nothing.
     if (!this.permitsRead(peer, message.aud)) {
-      return this.refuse('join-forbidden', [this.no(peer, null, 'forbidden', message.q)], null, null);
+      return this.refuse('join-forbidden', [this.no(peer, null, 'forbidden', message.q)]);
     }
 
     const h = this.newHandle();
     if (h === null || h.length !== HANDLE_HEX_LENGTH || this.handles.has(h)) {
-      return this.refuse('join-handle-unusable', [this.no(peer, null, 'owner-lost', message.q)], null, null);
+      return this.refuse('join-handle-unusable', [this.no(peer, null, 'owner-lost', message.q)]);
     }
 
     const handle: OwnerHandle = {
@@ -317,7 +632,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       peer,
       audience: [...message.aud],
       generation: 0,
-      revision: this.revision,
+      revision: this.core.revision,
       lastSeen: now,
     };
     this.handles.set(h, handle);
@@ -326,10 +641,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     if (emitted === null) {
       // The projection could not be encoded. The handle goes with it:
       // admitting one that can never be served is worse than refusing.
-      this.handles.delete(h);
-      return this.refuse('join-projection-capacity', [this.no(peer, null, 'capacity', message.q)], null, null);
+      this.forget(h);
+      return this.refuse('join-projection-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
-    return { out: emitted, refused: null };
+    return this.accept(emitted);
   }
 
   /**
@@ -354,10 +669,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
 
     // Owner-allocated, monotone per handle, only on acceptance (§1.7a).
     const generation = handle.generation + 1;
-    this.handles.set(handle.h, { ...handle, generation, revision: this.revision });
+    this.handles.set(handle.h, { ...handle, generation, revision: this.core.revision });
 
     const g = String(generation);
-    const r = String(this.revision);
+    const r = String(this.core.revision);
     const frames: Outbound[] = [
       {
         peer: handle.peer,
@@ -411,7 +726,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   private project(audience: readonly string[]): S | null {
     try {
-      return this.deps.definition.state(this.deps.project(this.state, audience));
+      return this.deps.definition.state(this.deps.project(this.core.getState() as S, audience));
     } catch {
       // `empty()` is application code as well, and it is reached
       // precisely when the application has already thrown once. A
@@ -439,8 +754,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const handle = this.handles.get(h);
     if (handle === undefined) return 'handle-unknown';
     if (now - handle.lastSeen >= HANDLE_LEASE_MS) {
-      this.handles.delete(h);
-      this.assemblies.reclaimHandle(h);
+      this.forget(h);
       return 'handle-expired';
     }
     if (handle.peer !== peer) return 'handle-foreign-peer';
@@ -466,9 +780,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     };
   }
 
-  private refuse(reason: string, out: Outbound[], _a: null, _b: null): Dispatched {
+  private refuse(reason: string, out: readonly Outbound[] = []): Dispatched {
     this.counters[reason] = (this.counters[reason] ?? 0) + 1;
-    return { out, refused: reason };
+    return { out, refused: reason, deferred: null };
   }
 }
 

@@ -89,6 +89,8 @@ function rig(
         return handles.toString(16).padStart(32, '0');
       },
       newIncarnation: () => 'f'.repeat(16),
+      actions: {},
+      inputs: {},
     }),
   };
   return self;
@@ -443,23 +445,21 @@ describe('the projection is the definition’s, or it is absence', () => {
 });
 
 describe('kinds this slice does not implement are refused, not half-served', () => {
-  it('refuses gameplay `not-ready` and controls `invalid-data`', () => {
+  it('refuses the controls it does not implement, never as `not-ready`', () => {
     const r = rig();
     const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
 
-    const act = r.owner.receive(
-      encodeMessage({ k: 'act', q: q(), h, s: '1', name: 'fire', in: {} }),
-      PEER_A,
-    );
-    expect(act.refused).toBe('unimplemented-kind:act');
-    // Gameplay before an installed view is `not-ready` (§1.7b).
-    expect(refusalCode(act.out)).toBe('not-ready');
+    for (const frame of [
+      encodeMessage({ k: 'aud', q: q(), h, aud: ['deck'] }),
+      encodeMessage({ k: 'resume', q: q(), h, aud: ['crew'] }),
+    ]) {
+      const refused = r.owner.receive(frame, PEER_A);
 
-    const aud = r.owner.receive(encodeMessage({ k: 'aud', q: q(), h, aud: ['deck'] }), PEER_A);
-    expect(aud.refused).toBe('unimplemented-kind:aud');
-    // A control is NEVER answered `not-ready` (§1.7b), even when the
-    // reason is "not implemented".
-    expect(refusalCode(aud.out)).not.toBe('not-ready');
+      expect(refused.refused).toMatch(/^unimplemented-kind:/);
+      // A control is NEVER answered `not-ready` (§1.7b), even when the
+      // reason is "not implemented".
+      expect(refusalCode(refused.out)).not.toBe('not-ready');
+    }
   });
 
   it('accepts `leave` and gives up the handle', () => {
