@@ -14,6 +14,9 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { StoreCore } from '../../src/store/core.js';
+import { defineStore } from '../../src/store/definition.js';
+import { applyPatch } from '../../src/store/patch.js';
 import { mergeShallow, reconcile } from '../../src/store/state.js';
 
 interface Player {
@@ -162,5 +165,174 @@ describe('a record key is data, never a prototype', () => {
     const out = reconcile({}, { crew: { bosun: 'kess' } }) as Record<string, Record<string, string>>;
     expect(out['crew']?.['bosun']).toBe('kess');
     expect(Object.isFrozen(out)).toBe(true);
+  });
+});
+
+/**
+ * The reviewer's second A2 round: `Object.defineProperty` repaired the
+ * WRITES, and the reads still answered from the prototype. An own
+ * `__proto__` key whose value is an *empty* object is the discriminating
+ * case, because `Object.prototype` has no own enumerable keys either —
+ * so the old comparison called them equal and the update disappeared.
+ *
+ * Every row here asserts what a caller can observe: the resulting
+ * document, the revision, the notifications, and that the stored value
+ * is a fresh frozen record rather than the global prototype.
+ */
+describe('an own key is never read through the prototype', () => {
+  /** A definition that keeps whatever own keys it is given. */
+  const bag = defineStore<Record<string, unknown>, Record<string, never>, Record<string, never>>({
+    id: 'bag',
+    version: 1,
+    state(value) {
+      const source = value as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(source)) {
+        Object.defineProperty(out, key, {
+          value: source[key],
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
+      return out;
+    },
+    empty: () => ({}),
+    actions: {},
+    inputs: {},
+  });
+
+  function bagCore(initialState: Record<string, unknown>): StoreCore<
+    Record<string, unknown>,
+    Record<string, never>,
+    Record<string, never>
+  > {
+    return new StoreCore({ definition: bag, initialState });
+  }
+
+  /** `{"__proto__":{}}` — an own data key with an empty object value. */
+  function protoKeyed(json: string): Record<string, unknown> {
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(true);
+    return parsed;
+  }
+
+  it('lands an owner update that adds an empty-valued `__proto__`', () => {
+    const store = bagCore({ a: 1 });
+    const seen: string[] = [];
+    store.subscribe(state => seen.push(JSON.stringify(state)));
+
+    store.applyOwnerUpdate(protoKeyed('{"a":1,"__proto__":{}}'));
+
+    expect(JSON.stringify(store.getState())).toBe('{"a":1,"__proto__":{}}');
+    expect(store.revision).toBe(1);
+    expect(seen).toEqual(['{"a":1,"__proto__":{}}']);
+  });
+
+  it('replaces the root when the new snapshot has different keys of equal count', () => {
+    // One own key each: `a` out, `__proto__` in. Equal cardinality was
+    // the other half of the disguise.
+    const store = bagCore({ a: 1 });
+    const seen: string[] = [];
+    store.subscribe(state => seen.push(JSON.stringify(state)));
+
+    store.applySnapshot(protoKeyed('{"__proto__":{}}'));
+
+    expect(JSON.stringify(store.getState())).toBe('{"__proto__":{}}');
+    expect(store.revision).toBe(1);
+    expect(seen).toEqual(['{"__proto__":{}}']);
+  });
+
+  it('stores a fresh frozen record, not the global prototype', () => {
+    // Starting from `{}` produced the other outcome: the own key
+    // survived, and its value was literally `Object.prototype`.
+    const store = bagCore({});
+    store.applySnapshot(protoKeyed('{"__proto__":{}}'));
+
+    const stored = Object.getOwnPropertyDescriptor(store.getState(), '__proto__')?.value as object;
+    expect(stored).not.toBe(Object.prototype);
+    expect(Object.isFrozen(stored)).toBe(true);
+    expect(Object.keys(stored)).toEqual([]);
+    // A fresh ordinary record: the repair is that it is not the global
+    // prototype, not that it is null-prototyped.
+    expect(Object.getPrototypeOf(stored)).toBe(Object.prototype);
+  });
+
+  it('lands a nested empty-valued `__proto__`', () => {
+    const store = bagCore({ crew: { rank: 1 } });
+    const update = JSON.parse('{"crew":{"rank":1,"__proto__":{}}}') as Record<string, unknown>;
+    // The own key is one level down here, so assert it there.
+    expect(Object.prototype.hasOwnProperty.call(update['crew'] as object, '__proto__')).toBe(true);
+    store.applyOwnerUpdate(update);
+
+    expect(JSON.stringify(store.getState())).toBe('{"crew":{"rank":1,"__proto__":{}}}');
+    const crew = store.getState()['crew'] as object;
+    const nested = Object.getOwnPropertyDescriptor(crew, '__proto__')?.value as object;
+    expect(nested).not.toBe(Object.prototype);
+    expect(Object.isFrozen(nested)).toBe(true);
+  });
+
+  it('applyPatch replaces the root and reports the change', () => {
+    // The nonempty version of this row already exists in
+    // patch.test.ts; the empty value is the one that read as equal.
+    const before = Object.freeze({ a: 1 }) as Record<string, unknown>;
+    const outcome = applyPatch(
+      before,
+      [{ o: 'r', p: [], val: protoKeyed('{"__proto__":{}}') as never }],
+      value => bag.state(value),
+    );
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.changed).toBe(true);
+    expect(outcome.next).not.toBe(before);
+    expect(JSON.stringify(outcome.next)).toBe('{"__proto__":{}}');
+  });
+
+  it('reconcile does not accept an inherited value as the previous one', () => {
+    // With the prior-subtree read repaired, `__proto__` can no longer
+    // reach the equality test: the merged value is a fresh record and
+    // the inherited one is `Object.prototype`, so they differ. What
+    // still reaches it is a value IDENTICAL to an inherited member.
+    // The wire cannot carry one — JSON has no function values — but a
+    // local `applyOwnerUpdate` can, so the equality test asks about
+    // own keys rather than trusting the count.
+    const previous = Object.freeze({ rank: 1 });
+
+    for (const inherited of ['toString', 'constructor', 'hasOwnProperty'] as const) {
+      const next = { [inherited]: (previous as Record<string, unknown>)[inherited] };
+      expect(Object.keys(next)).toHaveLength(Object.keys(previous).length);
+
+      const out = reconcile(previous, next);
+
+      expect(out).not.toBe(previous);
+      expect(Object.keys(out)).toEqual([inherited]);
+    }
+  });
+
+  it('drops no nested owner update whose value is an inherited member', () => {
+    const store = bagCore({ crew: { rank: 1 } });
+    store.applyOwnerUpdate({ crew: { toString: Object.prototype.toString } });
+
+    expect(Object.keys(store.getState()['crew'] as object)).toEqual(['toString']);
+    expect(store.revision).toBe(1);
+  });
+
+  it('reconcile keeps the previous root only when the own keys match', () => {
+    const previous = Object.freeze({ a: 1 });
+
+    // Equal count, different own key ⇒ a new root.
+    expect(reconcile(previous, protoKeyed('{"__proto__":{}}'))).not.toBe(previous);
+    // Equal count, same own key, same value ⇒ the old root.
+    expect(reconcile(previous, { a: 1 })).toBe(previous);
+  });
+
+  it('mergeShallow reports the change for an empty-valued `__proto__`', () => {
+    const current = Object.freeze({ a: 1 }) as Record<string, unknown>;
+    const merged = mergeShallow(current, protoKeyed('{"__proto__":{}}'));
+
+    expect(merged).not.toBe(current);
+    expect(JSON.stringify(merged)).toBe('{"a":1,"__proto__":{}}');
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
   });
 });

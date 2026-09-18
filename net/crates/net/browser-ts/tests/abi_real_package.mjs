@@ -743,6 +743,57 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_reconciles_an_own_proto_key_with_an_empty_value', async () => {
+  // The reviewer's A2 round-2 reproductions, run against the SHIPPED
+  // build: an own `__proto__` key whose value is an empty object. The
+  // first repair fixed the writes; these are the reads, which treated
+  // `Object.prototype` as existing previous state and concluded the
+  // update changed nothing.
+  const core = await import(new URL('store/core.js', dist).href);
+  const definition = await import(new URL('store/definition.js', dist).href);
+
+  const bag = definition.defineStore({
+    id: 'bag',
+    version: 1,
+    state: value => {
+      const out = {};
+      for (const key of Object.keys(value)) {
+        Object.defineProperty(out, key, {
+          value: value[key], enumerable: true, writable: true, configurable: true,
+        });
+      }
+      return out;
+    },
+    empty: () => ({}),
+    actions: {},
+    inputs: {},
+  });
+
+  // An owner update that adds the key.
+  const updated = new core.StoreCore({ definition: bag, initialState: { a: 1 } });
+  let updates = 0;
+  updated.subscribe(() => { updates += 1; });
+  updated.applyOwnerUpdate(JSON.parse('{"a":1,"__proto__":{}}'));
+  eq(JSON.stringify(updated.getState()), '{"a":1,"__proto__":{}}', 'the updated document');
+  eq([updated.revision, updates], [1, 1], 'its revision and notification');
+
+  // A whole-snapshot replacement, different key, equal cardinality.
+  const replaced = new core.StoreCore({ definition: bag, initialState: { a: 1 } });
+  let replacements = 0;
+  replaced.subscribe(() => { replacements += 1; });
+  replaced.applySnapshot(JSON.parse('{"__proto__":{}}'));
+  eq(JSON.stringify(replaced.getState()), '{"__proto__":{}}', 'the replaced document');
+  eq([replaced.revision, replacements], [1, 1], 'its revision and notification');
+
+  // And the stored value is a fresh frozen record, not the global
+  // prototype.
+  const fresh = new core.StoreCore({ definition: bag, initialState: {} });
+  fresh.applySnapshot(JSON.parse('{"__proto__":{}}'));
+  const stored = Object.getOwnPropertyDescriptor(fresh.getState(), '__proto__').value;
+  if (stored === Object.prototype) throw new Error('the stored value is Object.prototype itself');
+  eq([Object.isFrozen(stored), Object.keys(stored)], [true, []], 'the stored value');
+});
+
 await probe('real_package_owner_serves_a_join_and_binds_the_caller', async () => {
   const ownerModule = await import(new URL('store/owner.js', dist).href);
   const codec2 = await import(new URL('store/wire.js', dist).href);

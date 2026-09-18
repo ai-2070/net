@@ -51,9 +51,17 @@ export function reconcile<T>(previous: unknown, next: T): T {
     if (!isPlainObject(previous)) return freezeRecord(next, undefined) as T;
     const merged = freezeRecord(next, previous);
     const nextKeys = Object.keys(next);
+    // Own keys only, and the same SET of them — not merely the same
+    // count. Reading `previous[key]` would answer for an inherited
+    // member: `previous['__proto__']` is `Object.prototype` on any
+    // ordinary object, so a `next` carrying that as an own data key
+    // compared equal to a prototype it never came from, and
+    // reconciliation concluded the update changed nothing. Equal
+    // cardinality with different keys hid it further: `{a:1}` against
+    // an own `{__proto__:{}}` is one key each.
     if (
       nextKeys.length === Object.keys(previous).length &&
-      nextKeys.every(key => Object.is(previous[key], merged[key]))
+      nextKeys.every(key => hasOwn(previous, key) && Object.is(previous[key], merged[key]))
     ) {
       return previous as unknown as T;
     }
@@ -78,11 +86,14 @@ export function mergeShallow<S extends object>(current: S, patch: Partial<S>): S
   let changed = false;
   const draft: Record<string, unknown> = { ...(current as Record<string, unknown>) };
   for (const key of keys) {
-    const incoming = reconcile(
-      (current as Record<string, unknown>)[key],
-      (patch as Record<string, unknown>)[key],
-    );
-    if (!Object.is((current as Record<string, unknown>)[key], incoming)) {
+    // The prior subtree is an OWN property or it is absent. Reading
+    // through the prototype made `__proto__` look like an existing
+    // subtree equal to the incoming one, so the merge reported no
+    // change and the owner's update vanished: no new root, no
+    // revision, no notification.
+    const before = ownValue(current as Record<string, unknown>, key);
+    const incoming = reconcile(before, (patch as Record<string, unknown>)[key]);
+    if (!Object.is(before, incoming)) {
       // `defineProperty` for the reason `freezeRecord` uses it: a
       // plain assignment of `__proto__` replaces this object's
       // prototype rather than storing the caller's data. The spread
@@ -125,6 +136,17 @@ function freezeArray(
   return Object.freeze(out);
 }
 
+/** Whether a record carries this key itself. */
+function hasOwn(record: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/** A record's own value for a key, or `undefined` when it has none. */
+function ownValue(record: Record<string, unknown> | undefined, key: string): unknown {
+  if (record === undefined) return undefined;
+  return hasOwn(record, key) ? record[key] : undefined;
+}
+
 function freezeRecord(
   next: Record<string, unknown>,
   previous: Record<string, unknown> | undefined,
@@ -145,7 +167,7 @@ function freezeRecord(
     // help here: this is the last step, after validation, and it built
     // an ordinary object.
     Object.defineProperty(out, key, {
-      value: reconcile(previous?.[key], next[key]),
+      value: reconcile(ownValue(previous, key), next[key]),
       enumerable: true,
       writable: false,
       configurable: false,
