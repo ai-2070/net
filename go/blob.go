@@ -424,3 +424,130 @@ func (a *MeshBlobAdapter) SetOverflowConfig(cfg *OverflowConfig) error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// Content addressing + mesh transfer
+// ---------------------------------------------------------------------------
+
+// ErrTransfer is the umbrella error for failures surfaced by the
+// dataforts transport FFI (`net_serve_blob_transfer` / `net_fetch_blob`).
+var ErrTransfer = errors.New("blob transfer")
+
+// The transfer failures a caller branches on. Everything else in the
+// range is wrapped with ErrTransfer and the FFI code.
+var (
+	// ErrTransferNotFound - the holder did not have the content.
+	ErrTransferNotFound = fmt.Errorf("%w: holder lacked the content", ErrTransfer)
+	// ErrTransferHashMismatch - the bytes did not hash to the address.
+	ErrTransferHashMismatch = fmt.Errorf("%w: bytes did not hash to the address", ErrTransfer)
+	// ErrTransferEngineNotInstalled - ServeBlobTransfer was never called
+	// on this node.
+	ErrTransferEngineNotInstalled = fmt.Errorf("%w: engine not installed on this node", ErrTransfer)
+	// ErrTransferInvalidArgument - bad hash length, oversize, etc.
+	ErrTransferInvalidArgument = fmt.Errorf("%w: invalid argument", ErrTransfer)
+	// ErrTransferBackend - some other substrate transfer failure.
+	ErrTransferBackend = fmt.Errorf("%w: backend failure", ErrTransfer)
+)
+
+func transferErrorFromCode(code C.int) error {
+	switch code {
+	case 0:
+		return nil
+	case -200:
+		return ErrTransferNotFound
+	case -201:
+		return ErrTransferHashMismatch
+	case -202:
+		return fmt.Errorf("%w: no connected peer served it", ErrTransfer)
+	case -203:
+		return fmt.Errorf("%w: cancelled", ErrTransfer)
+	case -204:
+		return fmt.Errorf("%w: null pointer", ErrTransfer)
+	case -205:
+		return fmt.Errorf("%w: node is shutting down", ErrTransfer)
+	case -206:
+		return ErrTransferEngineNotInstalled
+	case -207:
+		return ErrTransferBackend
+	case -208:
+		return fmt.Errorf("%w: panic at the FFI boundary", ErrTransfer)
+	case -209:
+		return ErrTransferInvalidArgument
+	default:
+		return fmt.Errorf("%w: unknown code %d", ErrTransfer, int(code))
+	}
+}
+
+// BlobRefHash copies the 32-byte BLAKE3 content hash out of an encoded
+// BlobRef. The transport fetch addresses a blob by its raw hash, so this
+// is how a producer names what it just published.
+func BlobRefHash(encoded []byte) ([32]byte, error) {
+	var out [32]byte
+	if len(encoded) == 0 {
+		return out, fmt.Errorf("%w: encoded ref is empty", ErrTransferInvalidArgument)
+	}
+	rc := C.net_blob_ref_hash(
+		(*C.uint8_t)(unsafe.Pointer(&encoded[0])),
+		C.size_t(len(encoded)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])),
+	)
+	runtime.KeepAlive(encoded)
+	if err := transferErrorFromCode(rc); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// ServeBlobTransfer installs the blob-transfer engine on this node.
+//
+// Call once per node before serving OR fetching — a fetch needs it just
+// as much as a serve does, and without it the FFI answers
+// NET_ERR_TRANSFER_ENGINE_NOT_INSTALLED.
+func (m *MeshNode) ServeBlobTransfer(adapter *MeshBlobAdapter) error {
+	if adapter == nil {
+		return fmt.Errorf("%w: adapter is nil", ErrTransferInvalidArgument)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	var rc C.int
+	if !adapter.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_serve_blob_transfer(m.handle, handle)
+	}) {
+		return ErrBlobClosed
+	}
+	return transferErrorFromCode(rc)
+}
+
+// FetchBlob pulls the content addressed by the 32-byte BLAKE3 `hash`
+// from the known holder `holderID`.
+//
+// This is the cross-node half of the blob surface:
+// MeshBlobAdapter.Fetch reads only what this node already holds.
+func (m *MeshNode) FetchBlob(holderID uint64, hash []byte) ([]byte, error) {
+	if len(hash) < 32 {
+		return nil, fmt.Errorf(
+			"%w: hash must be 32 bytes, got %d", ErrTransferInvalidArgument, len(hash))
+	}
+	var out *C.uint8_t
+	var outLen C.size_t
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	rc := C.net_fetch_blob(
+		m.handle,
+		C.uint64_t(holderID),
+		(*C.uint8_t)(unsafe.Pointer(&hash[0])),
+		&out, &outLen,
+	)
+	runtime.KeepAlive(hash)
+	if err := transferErrorFromCode(rc); err != nil {
+		return nil, err
+	}
+	defer C.net_transport_free_buffer(out, outLen)
+	return C.GoBytes(unsafe.Pointer(out), C.int(outLen)), nil
+}
