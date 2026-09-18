@@ -20,6 +20,8 @@ edge workloads.
 
 ## Install
 
+One engine, several bindings — start with the package for your language:
+
 ```bash
 cargo add net-mesh-sdk                        # Rust
 npm install @net-mesh/sdk @net-mesh/core      # TypeScript / Node
