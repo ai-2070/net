@@ -375,6 +375,16 @@ struct Shared {
     browser_dist: PathBuf,
     leaf_pkg: PathBuf,
     three_dir: PathBuf,
+    /// `browser-ts/`, so the FLEET demo can be served from this
+    /// origin.
+    ///
+    /// Not a second demo bolted on: this process is the only shipped
+    /// thing that serves `ENROLL_SERVICE`, and a browser's
+    /// `connect()` blocks on that call, so it is also the only place
+    /// the fleet demo's `?mode=mesh` can run at all. The anchor's
+    /// CORS allow-list is this page server's origin, so the demo has
+    /// to come from here rather than from its own `serve.mjs`.
+    browser_ts: PathBuf,
     hz: u32,
     reports: Mutex<[Report; 3]>,
     /// The pair counter's last observed sum and when it last moved —
@@ -687,6 +697,7 @@ fn serve_page(listener: tokio::net::TcpListener, state: AppState) {
         .route("/report", post(report))
         .route("/log", post(page_log))
         .route("/browser/{*path}", get(browser_asset))
+        .route("/fleet/{*path}", get(fleet_asset))
         .route("/vendor/{*path}", get(vendor_asset))
         .with_state(state);
     tokio::spawn(async move {
@@ -722,6 +733,11 @@ fn content_type_of(path: &Path) -> &'static str {
         Some("js" | "mjs" | "cjs") => "text/javascript; charset=utf-8",
         Some("wasm") => "application/wasm",
         Some("json" | "map") => "application/json",
+        // The fleet demo brings a document and a stylesheet with it.
+        // Chromium ABORTS a navigation served as
+        // `application/octet-stream`, so this is not cosmetic.
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -753,6 +769,16 @@ async fn browser_asset(State(s): State<AppState>, AxPath(rel): AxPath<String>) -
         s.leaf_pkg.join(path)
     };
     file_response(&chosen, content_type_of(path))
+}
+
+/// The fleet demo's own tree, served whole so its relative imports
+/// (`./main.js`, `../dist/index.js`, `./node_modules/three/...`)
+/// resolve unchanged: `/fleet/demo/index.html` is the entry point.
+async fn fleet_asset(State(s): State<AppState>, AxPath(rel): AxPath<String>) -> Response {
+    let Some(path) = safe_relative(&rel) else {
+        return (StatusCode::BAD_REQUEST, "no traversal").into_response();
+    };
+    file_response(&s.browser_ts.join(path), content_type_of(path))
 }
 
 /// three.js, straight out of `node_modules/three/build`.
@@ -1294,6 +1320,7 @@ async fn run(
         browser_dist: assets.browser_dist,
         leaf_pkg: assets.leaf_pkg,
         three_dir: assets.three_dir,
+        browser_ts: net_root.join("browser-ts"),
         hz: args.hz,
         reports: Mutex::new([Report::default(), Report::default(), Report::default()]),
         flat: Mutex::new(Flat {

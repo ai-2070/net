@@ -41,65 +41,79 @@ evidence that two browsers can play.
 
 ### Mesh mode — two browsers, one anchor
 
-You need a running anchor (the native host path, unchanged by this
-demo) and a bootstrap credential minted against the same PSK. Both
-are `net-mesh` commands; the flags below are the real ones — run
-`net-mesh anchor serve --help` and `net-mesh anchor credential mint
---help` for the rest, and read
-`docs/internal/spikes/S4B_REPORT.md` for why the RTC and STUN
-endpoints must be distinct.
+**This has been run, and getting it to run found four things.** All
+four are recorded here because each one presents as a different
+failure than its cause.
 
-Two things about the build and the order, because both are easy to
-get wrong:
+1. **`net-mesh anchor serve` cannot host a browser.** A browser's
+   `connect()` makes an ENROLLMENT call while establishing its
+   session, and `anchor serve` registers only the anchor directory
+   and the ICE ledger (`cli/src/commands/anchor.rs`, `run_serve`).
+   Nothing answers `ENROLL_SERVICE`, so the page fails with
+   `session: rpc: the call's deadline elapsed` — after a perfectly
+   good TLS listener, credential and handshake. The browser-demo
+   example says it from the other side: its provider guard is "held
+   for the process's lifetime … then `connect()` would hang on its
+   enrollment call again".
+2. **The store needs `connect()`, not `openSession()`.** Joining
+   needs a SESSION with the host peer, which `connectPeer` installs —
+   and `connectPeer` lives on the `connect()` node, not on the
+   leader/follower `MeshSession`. Over a session the store's frames
+   fail with `no session with 0x…`. One tab per node is what this
+   demo wants anyway; the leader surface earns its keep when several
+   tabs share one node.
+3. **An announcement is a lease.** Announce once and a peer that
+   looks a few seconds later finds nothing: the joiner then reports
+   `the host … never announced fleet.host` about a host that did.
+   Both sides re-announce on a timer (the native browser-demo does it
+   every 500 ms).
+4. **Two tabs of one origin in one browser profile are ONE node** —
+   that is the identity-sharing feature, and it means the second tab
+   tries to join itself. The store refuses that with `invalid-data`
+   ("a replica cannot join the node it runs on"). Use two profiles
+   (`--user-data-dir`), two browsers, or two machines.
 
-- The CLI has exactly three features — `webrtc`, `rtc-bootstrap`
-  (which implies `webrtc`) and `keychain`. There is no `net` feature.
-  `anchor serve` is behind `rtc-bootstrap`, the only build that
-  carries an HTTP server at all; `anchor credential mint` is in every
-  build and needs no feature.
-- **`serve` runs before `mint`.** `mint` has to pin the anchor's
-  Noise static public key, and the only place that key is printed is
-  `serve`'s own JSON report, as `noise_pubkey`.
+#### The runnable path today
+
+The browser-demo example is the only shipped thing that serves
+enrollment, so it is also the only local anchor a browser can
+actually use — and it now serves this demo's tree at `/fleet/`:
 
 ```bash
 cd net/crates/net
+cargo run --release --manifest-path examples/browser-demo/host/Cargo.toml -- \
+  --headless --seconds 600
 
-# 0. An issuer identity and a trust-domain PSK, once. `identity
-#    generate` prints the identity's `public_key_hex`; that hex is
-#    what `--credential-issuer` wants in step 1 (`net-mesh identity
-#    show issuer.toml` prints it again later).
-cargo run -p net-cli -- identity generate --out issuer.toml
-openssl rand -hex 32 > psk.hex
-
-# 1. The anchor. `rtc-bootstrap` is NOT a default feature. It prints
-#    one JSON report — keep its `noise_pubkey` — and then serves
-#    until ctrl-c:
-cargo run -p net-cli --features rtc-bootstrap -- \
-  anchor serve \
-  --psk-file psk.hex \
-  --listen 0.0.0.0:8443 \
-  --url https://<name-on-your-certificate>:8443 \
-  --credential-issuer <issuer public_key_hex> \
-  --allow-origin http://localhost:8173 \
-  --tls-cert cert.pem --tls-key key.pem \
-  --rtc-bind 0.0.0.0:4433 \
-  --rtc-public-addr <public-ip>:4433 \
-  --rtc-stun-bind 0.0.0.0:0
-
-# 2. A bootstrap credential for the browser, `net-bootstrap:…` on
-#    stdout (`--out <path>` writes it 0600 instead). `--url` is the
-#    same URL the anchor published:
-cargo run -p net-cli -- \
-  anchor credential mint \
-  --root <mesh-root-entity-hex> \
-  --issuer-identity issuer.toml \
-  --anchor-noise-pubkey <noise_pubkey from step 1> \
-  --psk-file psk.hex \
-  --url https://<name-on-your-certificate>:8443
-
-# 3. Serve the demo over the SAME origin for both tabs:
-cd browser-ts/demo && npm install && node serve.mjs
+# It prints:  [demo] page http://localhost:<port>/
+# A credential for any of its three contexts:
+curl -s "http://localhost:<port>/config?tab=2" | jq -r .credentialB64
 ```
+
+Then open the HOST with that credential:
+
+```
+http://localhost:<port>/fleet/demo/index.html?mode=mesh&credential=<credential>
+```
+
+It prints its own node id in the status line. Open the JOINER **in a
+different browser profile**, with a different `tab=` credential:
+
+```
+http://localhost:<port>/fleet/demo/index.html?mode=mesh&host=<host node id>&credential=<other credential>
+```
+
+What that produced here, on two real nodes over one real anchor: two
+ships in both views, the joiner's steering moving its ship on the
+HOST's view, `fire` returning `{hull: 75}` and the damage appearing
+on both, `fire` at yourself refused `forbidden`, and the host seeing
+`waypoint: true` while the joiner sees `waypoint: false` — the
+`command` audience withheld from a replica across a real transport,
+which is the projection property the store exists for.
+
+#### The anchor-only recipe (for a deployment that has enrollment)
+
+Everything below brings up the anchor half. It is correct as far as it
+goes, and by itself it is not enough — see (1).
 
 `--bind` (the node's own mesh address) defaults to `0.0.0.0:0` and is
 left out above; `--listen` defaults to `0.0.0.0:8443`. Everything

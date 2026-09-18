@@ -97,18 +97,62 @@ async function startLocal(pkg) {
   return { host, player, self: playerId, spectator, others: [spectatorId] };
 }
 
+/** Node ids arrive decimal from a descriptor and hex from a URL. */
+function samePeerId(a, b) {
+  const value = text => {
+    const raw = String(text).trim();
+    return raw.startsWith('0x') ? BigInt(raw) : /^[0-9]+$/.test(raw) ? BigInt(raw) : BigInt(`0x${raw}`);
+  };
+  try {
+    return value(a) === value(b);
+  } catch {
+    return false;
+  }
+}
+
 async function startMesh(pkg) {
   const credential = params.get('credential');
   if (credential === null) {
     throw new Error('mesh mode needs ?credential=<base64 bootstrap credential> — see demo/README.md');
   }
-  const session = await pkg.openSession({
+  // `connect`, not `openSession`, and the reason is a finding rather
+  // than a preference: joining a store needs a SESSION with the host
+  // peer, which `connectPeer` installs — and `connectPeer` is on the
+  // `connect()` node, not on the leader/follower `MeshSession`. A
+  // store joined over a session therefore fails with `no session
+  // with 0x…`, which is what a real browser reported here. One tab
+  // per node is all this demo wants anyway; the leader surface earns
+  // its keep when several tabs share one node.
+  const session = await pkg.connect({
     credential,
     bootstrapUrl: params.get('bootstrap') ?? undefined,
   });
   const game = defineGame(pkg.defineStore);
   const self = session.nodeIdHex();
   const hostNode = params.get('host');
+
+  // Both sides announce this, and the joiner waits to SEE the host
+  // before it joins. Not decoration: `connectPeer` builds a session
+  // from the peer's own signed announcement, so a joiner that has
+  // never seen one cannot reach the host at all — the store's frames
+  // then fail with `no session with 0x…`, which is what this demo
+  // did before the wait existed. Discovery is the mesh's
+  // introduction; the store is what happens afterwards.
+  const FLEET_TAG = 'fleet.host';
+  // Announced REPEATEDLY, not once. An announcement is a lease the
+  // mesh lets expire — announce once and a peer that looks a few
+  // seconds later finds nothing, which is exactly what this demo did
+  // before: `the host … never announced fleet.host`, from a host that
+  // had announced it and then gone quiet. The native browser-demo
+  // re-announces every 500 ms; twice a second is generous here
+  // because nothing about this demo is announcement-latency bound.
+  await session.announce([FLEET_TAG]);
+  setInterval(() => {
+    void session.announce([FLEET_TAG]).catch(() => {
+      // A refused refresh is not fatal: the next tick tries again,
+      // and a page that cannot announce fails visibly at its join.
+    });
+  }, 2_000);
 
   if (hostNode === null) {
     const host = pkg.hostStore({
@@ -121,19 +165,70 @@ async function startMesh(pkg) {
       ...handlers(),
     });
     say(`hosting as ${String(self)} — join with ?mode=mesh&host=${String(self)}`);
-    // The host plays too, through its own loopback join.
-    const player = pkg.joinStore({
-      definition: game,
-      transport: session,
-      host: self,
-      audience: ['crew', 'command'],
-      key: 'host',
-      maxEventBytes: 8104,
+    // The hosting tab plays through its OWN authority, not through a
+    // replica of itself.
+    //
+    // It used to call `joinStore({host: self})`, and a real browser
+    // answered `no session with 0x…`: `openStream({peer})` needs a
+    // session with that peer and a node has none with itself. The
+    // store now refuses that construction with `invalid-data` and
+    // says what to hold instead — this.
+    //
+    // Nothing is bypassed by playing locally: the host IS where
+    // actions and inputs execute, and for the owner there is no
+    // network hop to make. Authorization is applied here explicitly
+    // so the owner is held to the same policy as a replica.
+    const spec = handlers();
+    const context = () => ({
+      peer: self,
+      getState: () => host.getState(),
+      setState: patch => {
+        host.setState({ ...host.getState(), ...patch });
+      },
     });
-    await player.ready();
+    // The same `authorize` a replica is held to, with the same
+    // request shape it receives — `type`, not `kind`, and the input
+    // included, because `fire` is refused by reading it.
+    const admit = (type, name, input) => {
+      if (!authorize({ type, name, input, peer: self, audience: ['crew', 'command'], host: self })) {
+        const error = new Error(`the host's own policy refused ${type} ${name}`);
+        error.code = 'forbidden';
+        throw error;
+      }
+    };
+    const player = {
+      ready: () => Promise.resolve(),
+      getState: () => host.getState(),
+      subscribe: listener => host.subscribe(listener),
+      subscribeStatus: listener => {
+        listener({ phase: 'ready', stale: false });
+        return () => {};
+      },
+      input: (name, payload) => {
+        admit('input', name, payload);
+        spec.inputs[name](payload, context());
+      },
+      act: (name, payload) =>
+        Promise.resolve().then(() => {
+          admit('action', name, payload);
+          return spec.actions[name](payload, context());
+        }),
+      close: () => Promise.resolve(),
+    };
     await player.act('enlist', { colour: 2 });
-    return { host, player, self, others: [] };
+    return { host, player, self, others: [], node: session };
   }
+
+  // Wait for the host's announcement, then let `joinStore` install
+  // the session from it.
+  const deadline = Date.now() + 20_000;
+  let seen = false;
+  while (!seen && Date.now() < deadline) {
+    const peers = await session.query(FLEET_TAG);
+    seen = peers.some(peer => samePeerId(peer.nodeId, hostNode));
+    if (!seen) await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  if (!seen) throw new Error(`the host ${hostNode} never announced ${FLEET_TAG}`);
 
   const player = pkg.joinStore({
     definition: game,
@@ -146,7 +241,7 @@ async function startMesh(pkg) {
   await player.ready();
   await player.act('enlist', { colour: 3 });
   say(`joined ${hostNode} as ${String(self)}`);
-  return { host: null, player, self, others: [] };
+  return { host: null, player, self, others: [], node: session };
 }
 
 async function main() {
@@ -213,6 +308,8 @@ async function main() {
   // For the harness: what the page believes, without scraping pixels.
   globalThis.__demo = {
     mode,
+    /** The node this page is on, for a run that needs to ask the mesh. */
+    node: world.node ?? null,
     self: world.self,
     state: () => world.player.getState(),
     status: () => world.player.getStatus(),

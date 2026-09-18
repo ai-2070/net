@@ -114,6 +114,21 @@ function randomHex(bytes: number): string {
 export function joinStore<S extends object, A extends ActionSpec, I extends InputSpec>(
   options: JoinStoreOptions<S, A, I>,
 ): JoinedStoreHandle<S, A, I> {
+  // A replica of the node it is running on cannot be reached over
+  // the mesh: `openStream({peer})` needs a SESSION with that peer,
+  // and a node has no session with itself. The fleet demo's mesh mode
+  // asked for exactly this — the hosting tab played through
+  // `joinStore({host: self})` — and what a real browser reported was
+  // `no session with 0x…`, from inside the transport, after the store
+  // had already accepted the subscription. Refused here instead,
+  // where the caller can read what it did wrong.
+  const selfId = options.transport.nodeIdHex();
+  if (selfId !== null && samePeer(selfId, options.host)) {
+    throw new StoreError(
+      'invalid-data',
+      'a replica cannot join the node it runs on: hold the hostStore handle instead',
+    );
+  }
   const streamId = options.streamId ?? `store/${options.definition.id}`;
   const now = options.now ?? (() => Date.now());
   const schedule =

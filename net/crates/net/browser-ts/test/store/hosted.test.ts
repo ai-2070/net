@@ -20,6 +20,7 @@ import { hostStore, type StoreTransport, type TransportFrame, type TransportStre
 import { joinStore } from '../../src/store/join.js';
 import { MAX_OUTSTANDING } from '../../src/store/join.js';
 import type { Cancel } from '../../src/store/types.js';
+import { StoreError } from '../../src/store/errors.js';
 import { encodeMessage, type Hex } from '../../src/store/wire.js';
 
 const MAX_EVENT_BYTES = 8104;
@@ -958,6 +959,39 @@ describe('a snapshot that loses a chunk recovers by itself', () => {
     expect(net.kinds(HOST_NODE)).toContain('resync');
     await joined.close();
     await host.close();
+  });
+});
+
+describe('a replica of its own node is refused', () => {
+  it('names the mistake instead of failing inside the transport', () => {
+    // What a real browser did: the fleet demo's mesh mode had the
+    // HOSTING tab play through `joinStore({host: self})`, and
+    // `openStream({peer})` needs a session with that peer — a node
+    // has none with itself. The failure arrived from inside the
+    // transport (`no session with 0x…`) after the store had already
+    // accepted the subscription, which is the wrong place and the
+    // wrong time to learn it.
+    const net = mesh();
+    const time = timeline();
+    let refused: StoreError | null = null;
+    try {
+      joinStore<Ship, Actions, Inputs>({
+        definition: ship,
+        transport: net.node(CALLER_NODE),
+        // The transport's own node, in the DECIMAL spelling the wire
+        // uses, so this is a peer comparison and not a string one.
+        host: BigInt(`0x${CALLER_NODE}`).toString(10),
+        audience: ['crew'],
+        key: 'self',
+        maxEventBytes: MAX_EVENT_BYTES,
+        now: time.now,
+        schedule: time.schedule,
+      });
+    } catch (error) {
+      refused = error as StoreError;
+    }
+    expect(refused?.code).toBe('invalid-data');
+    expect(refused?.message).toContain('cannot join the node it runs on');
   });
 });
 
