@@ -1378,21 +1378,26 @@ def test_an_admission_is_resolvable_by_its_exact_generation(tmp_path):
         provider.close()
 
 
-def test_a_generation_scoped_resolution_never_reaches_the_live_attempt(tmp_path):
-    """On the caller side the generation selects the **namespace**, not just
-    a row: with one supplied, the resolution goes to the exit that writes
-    only the retained archive, so it can never terminalize the live
-    purchase that occupies the same complete key.
+def test_a_generation_scoped_resolution_refuses_an_unknown_incarnation(tmp_path):
+    """A generation-scoped resolution validates its selector and refuses an
+    incarnation no archive holds, leaving the live purchase byte-identical.
 
-    Observable: a well-formed generation that names no retained
-    incarnation fails, and the live `paid` attempt is byte-identical
-    afterwards. Routed to the live resolver instead — the defect — the
-    same call would close that charge.
+    **Renamed, because the old name was a claim this test cannot support.**
+    It was `..._never_reaches_the_live_attempt`, and the reviewer showed that
+    claim is false-green: there is no retained row here at all, and `Closed`
+    is illegal against the live `Paid` row, so routing the call to the WRONG
+    resolver (`resolve_attempt` instead of `resolve_superseded_attempt`) also
+    raises and also leaves state unchanged. Both the correct and the broken
+    binding pass this test, so it never discriminated on routing — it only
+    ever proved selector validation.
 
-    Each live row also says which exit closes it: `retained` is false for
-    a live attempt, and the archive listing is what that flag is read
-    from, never the generation (a retained charge can share both key and
-    incarnation with the live row).
+    The routing property it used to claim is now carried by
+    `test_a2a_history_boundary.py`, which populates BOTH a historical and a
+    live incarnation under one key and drives the live one to
+    `paid_unexecutable` so it is genuinely eligible for the same `Closed`
+    operation. That test fails under the wrong-route mutation; this one does
+    not, which is precisely why both exist and why this one is named for the
+    narrower property.
     """
     provider, (caller,) = _topology(tmp_path)
     try:

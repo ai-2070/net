@@ -3481,6 +3481,27 @@ jobs:
       # pytest-timeout thread can't print through pytest's capture)
       # still dumps a C-level stack when SIGSEGV/SIGABRT fires or
       # when the watchdog sends the dump signal.
+      # C5's Python witness (`test_a2a_history_boundary.py`) shells out to a
+      # Rust fixture binary that seeds a retained historical incarnation
+      # through the production `retain_superseded` API. Built HERE, not inside
+      # the test: the pytest step below runs under a blanket `--timeout=30`,
+      # and compiling a Rust test target would blow that budget and read as a
+      # hang. The test falls back to building it itself when the variable is
+      # unset (the local path), and hard-fails rather than skipping if the
+      # binary cannot be produced — a skip would make the witness vacuous on
+      # exactly the machines that run it.
+      - name: Build the A2A history-boundary fixture seeder
+        working-directory: net/crates/net
+        run: |
+          exe=$(cargo test -p net-payments --features mesh \
+                  --test review_python_seed --no-run --message-format json \
+                | jq -r 'select(.reason=="compiler-artifact")
+                         | select(.target.name=="review_python_seed")
+                         | .executable' | tail -1)
+          test -n "$exe" && test -x "$exe" \
+            || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
+          echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
+
       - name: Run tests
         env:
           PYTHONFAULTHANDLER: "1"

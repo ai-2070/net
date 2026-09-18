@@ -1183,6 +1183,26 @@ struct StoreState {
     /// incarnation is never reused and a decision taken against an old
     /// one can never match a new one.
     next_generation: u64,
+    /// The instant capacity for a service was last **acquired**, by any
+    /// route — a fresh insertion, or an existing reservation taking its
+    /// slot back through [`open_decision`].
+    ///
+    /// This exists because `updated_at` cannot carry it. Reacquisition
+    /// deliberately does not rewrite `updated_at`: that field drives
+    /// retention, and advancing it there would keep rows past the
+    /// window the operator published. So a floor derived from
+    /// `max(updated_at)` alone is blind to exactly the event that
+    /// matters here, and a caller holding a pre-expiry sample could
+    /// walk back in and find its own lapsed reservation still live
+    /// while the slot had already been taken — two rows over a
+    /// `max_in_flight` of one.
+    ///
+    /// Per service, because capacity is per service. Monotonic within a
+    /// service, and only ever raises the clock a capacity decision is
+    /// taken against; retention still uses the caller's own clock,
+    /// where a stale sample can only keep a row longer, which is the
+    /// safe direction.
+    slot_floor: BTreeMap<String, u64>,
 }
 
 impl StoreState {
@@ -1245,10 +1265,29 @@ impl StoreState {
     /// earlier than the operator asked for, and a stale sample can only
     /// ever keep a row longer, which is the safe direction.
     fn slot_now(&self, service_id: &str, now: u64) -> u64 {
-        self.records
+        // Three sources, all of which are evidence that the service's
+        // clock has moved past the caller's sample:
+        //   * the caller's own `now`;
+        //   * the last write to any of this service's live rows;
+        //   * the last time capacity was ACQUIRED for this service.
+        // The third is not implied by the second. A reacquisition
+        // through `open_decision` takes a slot without writing
+        // `updated_at`, by design, so it is invisible to the second.
+        let written = self
+            .records
             .values()
             .filter(|r| r.service_id == service_id)
-            .fold(now, |floor, r| floor.max(r.updated_at))
+            .fold(now, |floor, r| floor.max(r.updated_at));
+        written.max(self.slot_floor.get(service_id).copied().unwrap_or(0))
+    }
+
+    /// Record that capacity for `service_id` was acquired at `at`.
+    ///
+    /// Called on every acquisition, not merely on fresh insertion —
+    /// that asymmetry is exactly what let a reacquisition go unrecorded.
+    fn note_acquisition(&mut self, service_id: &str, at: u64) {
+        let slot = self.slot_floor.entry(service_id.to_string()).or_insert(0);
+        *slot = (*slot).max(at);
     }
 
     /// Capacity + write, one critical section. `exclude` is the key of a
@@ -1308,10 +1347,13 @@ impl StoreState {
                 if self.at_capacity(&candidate.service_id, max_in_flight, slot_now, &k) {
                     return Ok(AdmitOutcome::Busy);
                 }
+                let service_id = candidate.service_id.clone();
                 let found = self.record_mut(candidate.owner, &candidate.task_id)?;
                 found.state = AdmissionState::Reserved { expires_at };
                 found.updated_at = now;
-                Ok(AdmitOutcome::Admitted(Box::new(found.clone())))
+                let admitted = Box::new(found.clone());
+                self.note_acquisition(&service_id, slot_now);
+                Ok(AdmitOutcome::Admitted(admitted))
             }
             None => {
                 if self.at_capacity(&candidate.service_id, max_in_flight, slot_now, &k) {
@@ -1320,6 +1362,7 @@ impl StoreState {
                 let mut record = candidate;
                 record.generation = self.mint_generation();
                 record.deciding = false;
+                self.note_acquisition(&record.service_id.clone(), slot_now);
                 self.records.insert(k, record.clone());
                 Ok(AdmitOutcome::Admitted(Box::new(record)))
             }
@@ -1380,7 +1423,13 @@ impl StoreState {
         // and one that ends without a financial state is lapsed again —
         // its next submit re-acquires through this same check.
         found.deciding = true;
-        Ok(DecisionOutcome::Open(Box::new(found.clone())))
+        let opened = Box::new(found.clone());
+        // This IS an acquisition, whether the row was still live or had
+        // lapsed and just took its slot back, so the service's floor
+        // moves. Recorded here rather than by writing `updated_at`,
+        // which belongs to retention: see `slot_floor`.
+        self.note_acquisition(&admission.service_id, slot_now);
+        Ok(DecisionOutcome::Open(opened))
     }
 
     fn close_decision(&mut self, admission: &AdmissionRecord) -> bool {
@@ -1915,6 +1964,14 @@ struct JournalFile {
     /// and hand a replacement row a number an old decision still names.
     #[serde(default)]
     next_generation: u64,
+    /// Per-service capacity-acquisition floor. Persisted for the same
+    /// reason as the counter: a restart must not rewind it and let a
+    /// caller holding a pre-restart sample acquire a slot the store has
+    /// already moved past. Absent in a file written before this field
+    /// existed, which is safe — `slot_now` takes a max, so an empty map
+    /// degrades to the previous behaviour rather than lowering a floor.
+    #[serde(default)]
+    slot_floor: BTreeMap<String, u64>,
 }
 
 impl JournalFile {
@@ -1949,6 +2006,7 @@ impl JournalFile {
                 .collect(),
             detached,
             next_generation,
+            slot_floor: self.slot_floor,
         }
     }
 
@@ -1959,6 +2017,7 @@ impl JournalFile {
             ledger: state.ledger.values().cloned().collect(),
             detached: state.detached.values().cloned().collect(),
             next_generation: state.next_generation,
+            slot_floor: state.slot_floor.clone(),
         }
     }
 }
