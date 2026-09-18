@@ -3308,8 +3308,33 @@ class CapabilityGateway:
     # Both-or-neither is enforced at runtime (passing exactly one delegation
     # arg raises ValueError), so express the two valid signatures as overloads
     # — a partial call then fails static analysis instead of only at runtime.
+    #
+    # THE PAYMENT KEYWORDS MUST BE REPEATED ON EVERY OVERLOAD. When a class has
+    # @overload declarations, a checker resolves calls against those ALONE and
+    # never against the implementation signature below — so a keyword present
+    # only there is a static error at every call site while working fine at
+    # runtime. That is exactly what happened: the paid surface shipped with
+    # these kwargs on the implementation only, and the first type-checked
+    # caller (the skill's paid A2A example) failed with "Unexpected keyword
+    # arguments ... for overloaded function". Add new constructor keywords in
+    # all three places or none.
     @overload
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = ...,
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+        a2a_purchase_path: Optional[str] = ...,
+    ) -> None: ...
     @overload
     def __init__(
         self,
@@ -3317,6 +3342,17 @@ class CapabilityGateway:
         pin_store_path: Optional[str],
         delegation_leaf: "Identity",
         delegation_chain: bytes,
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+        a2a_purchase_path: Optional[str] = ...,
     ) -> None: ...
     def __init__(
         self,
@@ -3590,8 +3626,25 @@ class AsyncCapabilityGateway:
     own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
     was built with the ``net`` + ``mcp`` features."""
 
+    # Same overload rule as :class:`CapabilityGateway` — a keyword that exists only on
+    # the implementation signature below is invisible to every type checker.
+    # This twin has no a2a_purchase_path: the A2A caller verbs are sync-only.
     @overload
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = ...,
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+    ) -> None: ...
     @overload
     def __init__(
         self,
@@ -3599,6 +3652,16 @@ class AsyncCapabilityGateway:
         pin_store_path: Optional[str],
         delegation_leaf: "Identity",
         delegation_chain: bytes,
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
     ) -> None: ...
     def __init__(
         self,

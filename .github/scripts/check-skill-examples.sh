@@ -212,17 +212,37 @@ fi
 # not that net_sdk imports, that referenced members exist, or that signatures
 # match. `--follow-imports=silent` resolves the SDK for types without reporting
 # the SDK's own pre-existing errors, which are not this example's problem.
+#
+# RUN FROM A SCRATCH DIRECTORY, NOT THE REPO ROOT. mypy puts its working
+# directory on the module search path, and this repo has a `net/` SOURCE
+# directory at its root. With cwd here, `import net` resolves to that as an
+# empty namespace package, and an example using the low-level binding fails
+# with `Module "net" has no attribute "NetMesh"` — a shadow, not a defect in
+# the example. Measured: identical invocation, exit 1 from the repo root and
+# exit 0 from a scratch dir.
+#
+# KNOWN GAP, deliberately not closed here. With the shadow gone `net` is
+# unresolved, so `--ignore-missing-imports` makes it `Any` and the binding's
+# API is not actually checked (net_sdk still is — it comes from MYPYPATH).
+# Pointing MYPYPATH at `bindings/python/python` would type-check against the
+# real `_net.pyi`, and that stub currently has six pre-existing defects of its
+# own (undefined `ServeHandle` / `WriteToken` / `MigrationPhasesIter`, a
+# method used as a type, and two overload implementations that are illegal in
+# a stub). Fixing those means deleting implementation signatures that carry
+# the user-facing docstrings — a real change with real risk, and not one to
+# smuggle in behind an example. Left named rather than silently claimed.
 echo "==> Python — type check against the SDK source"
 PY_FILES=$(files_for python)
 if [ -z "$PY_FILES" ]; then
   ok "no Python examples in the manifest"
 elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>&1; then
   MYPY=$(command -v mypy || echo "$PYTHON -m mypy")
+  mkdir -p "$WORK/mypy-cwd"
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
-    if MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
-         --ignore-missing-imports --follow-imports=silent --no-error-summary \
-         --cache-dir "$WORK/mypy-cache" "$ROOT/$path" >"$WORK/py-$id.log" 2>&1; then
+    if ( cd "$WORK/mypy-cwd" && MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
+           --ignore-missing-imports --follow-imports=silent --no-error-summary \
+           --cache-dir "$WORK/mypy-cache" "$ROOT/$path" ) >"$WORK/py-$id.log" 2>&1; then
       ok "$id: $(basename "$path")"
     else
       note "$id: $(basename "$path")"

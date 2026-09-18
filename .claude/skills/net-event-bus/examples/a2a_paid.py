@@ -178,6 +178,12 @@ def main() -> None:
                 )
                 raise AssertionError("a paid service accepted unpaid work")
             except PaymentRefused as refused:
+                # Optional by type, and the assertion is the point: a refusal
+                # MAY arrive with no schematic, and one that does is a much
+                # weaker answer — prose a caller has to parse.
+                assert refused.schematic is not None, (
+                    "the provider's failure schematic must survive the boundary"
+                )
                 schematic = json.loads(refused.schematic)
                 assert schematic["object"] == "net.payment.failure@1", schematic
                 assert schematic["handler_executed"] is False, schematic
