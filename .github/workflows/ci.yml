@@ -2860,8 +2860,8 @@ jobs:
             review_prior_format_archive_is_still_exactly_addressable
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
-                  --retries 0 --all-features --test review_round3_caller \
-                  -E 'test(review_)' 2>&1) \
+                  --retries 0 --all-features \
+                  -E 'binary(review_round3_caller) and test(review_)' 2>&1) \
             || { printf '%s\n' "$out"; echo "::error::the round-4 caller probes did not pass"; exit 1; }
           printf '%s\n' "$out" | tail -3
           for required in $REQUIRED; do
@@ -3581,8 +3581,14 @@ jobs:
       - name: Build the A2A history-boundary fixture seeder
         working-directory: net/crates/net
         run: |
+          # `--tests`, not `--test review_python_seed`: the integration-test
+          # pin guard inventories only the root and SDK crates, so a
+          # `--test <name>` naming a payments target is a pin it cannot
+          # attribute and refuses to guess at. Selecting the executable out
+          # of cargo's JSON by target name does the same job without
+          # inventing a pin form.
           exe=$(cargo test -p net-payments --features mesh \
-                  --test review_python_seed --no-run --message-format json \
+                  --tests --no-run --message-format json \
                 | jq -r 'select(.reason=="compiler-artifact")
                          | select(.target.name=="review_python_seed")
                          | .executable' | tail -1)
