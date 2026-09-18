@@ -120,9 +120,22 @@ export class Assembly {
     this.encoded = new Array<string | undefined>(manifest.n);
   }
 
-  /** Decoded bytes currently held, for the total-bytes bound. */
+  /** Decoded bytes currently held. */
   get bytesHeld(): number {
     return this.held;
+  }
+
+  /**
+   * Bytes this assembly is COMMITTED to, for the total-bytes bound.
+   *
+   * The manifest's declared total, not what has arrived: an assembly
+   * that has admitted one chunk of twenty still intends to hold the
+   * whole snapshot, and a bound tested against arrivals lets every
+   * one of them in while each is still nearly empty. A reclaimed
+   * assembly is committed to nothing.
+   */
+  get bytesReserved(): number {
+    return this.closed ? 0 : Math.max(Number(this.manifest.bytes), this.held);
   }
 
   /** How many distinct `i` have been admitted. */
@@ -276,6 +289,13 @@ export class AssemblyTable {
     return total;
   }
 
+  /** Bytes every open assembly is committed to holding. */
+  get bytesReserved(): number {
+    let total = 0;
+    for (const assembly of this.live.values()) total += assembly.bytesReserved;
+    return total;
+  }
+
   get size(): number {
     return this.live.size;
   }
@@ -306,7 +326,12 @@ export class AssemblyTable {
     // reclaims the predecessor rather than leaving it to a deadline.
     this.live.get(key)?.reclaim();
     this.live.delete(key);
-    if (this.bytesHeld + declared > this.maxTotalBytes) {
+    // Against RESERVATIONS, not arrivals. Testing the ceiling against
+    // bytes already admitted admitted every concurrent manifest —
+    // each one measured while the others were still empty — and the
+    // table then filled to many times its bound. The reservation is
+    // released when the assembly is reclaimed, completed or swept.
+    if (this.bytesReserved + declared > this.maxTotalBytes) {
       return reject('assembly-too-large', true, 'capacity');
     }
     const assembly = new Assembly(manifest, now);

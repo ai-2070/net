@@ -153,6 +153,16 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (this.#state === 'closed') {
       throw new StoreError('closed', 'a closed replica cannot join again');
     }
+    // A join is a FRESH SUBSCRIPTION with a new handle, and §1.7a
+    // restarts that handle's generations at 1 — so every value scoped
+    // to the old handle goes, `retired` included. Keeping the old
+    // watermark wedges the rejoin permanently: the new handle's first
+    // manifest names generation 1, fails `g > retired` against the
+    // watermark of a handle that no longer exists, and nothing can
+    // ever install again. Recovery knowledge goes for the same reason
+    // — a skip recorded before a cancellation must not make the next
+    // installation ask for work the caller cancelled.
+    this.#reset();
     const q = this.deps.newQ();
     this.#slot = q;
     this.#state = 'joining';
@@ -221,6 +231,14 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     this.#retireAssembly();
     this.#slot = null;
     this.#state = 'fenced';
+    // Recovery knowledge is NOT cleared here, and not because it does
+    // not matter: a skip from a cancelled epoch must never make the
+    // next installation ask for work the caller cancelled. It is
+    // cleared at the only exit a fenced replica has in this slice —
+    // `join`, through `#reset` — so clearing it twice would be a
+    // second claim about the same invariant. Slice F adds `aud` and
+    // `resume` as exits that keep the handle; each must decide this
+    // for itself rather than inherit an assumption from here.
     this.#clearView('failed');
   }
 
@@ -388,19 +406,17 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     }
 
     if (code === 'closed') {
-      // The handle is unusable. Every unusable handle arrives as this
-      // one code (§2), so there is nothing to distinguish and nothing
-      // to replay.
+      // The handle is unusable — but only if this refusal is about the
+      // handle NOW. An unsolicited `no {closed}` is the expiry notice
+      // (§1.7a), and one correlated to the live slot refuses the
+      // request in flight. A refusal carrying the `q` of a request
+      // this replica has already finished or abandoned is news about
+      // nothing: tearing down a healthy view on it discards an
+      // installed document, the watermark and the handle because a
+      // late frame answered a dead question.
+      if (q !== undefined && q !== this.#slot) return this.#drop('stale-correlation');
       const wasFenced = this.#state === 'fenced';
-      this.#retireAssembly();
-      this.#handle = null;
-      this.#incarnation = null;
-      this.#installed = null;
-      this.#revision = null;
-      this.#retired = 0n;
-      this.#skipped = null;
-      this.#behind = false;
-      this.#slot = null;
+      this.#reset();
       if (wasFenced) {
         // An expiry notice is no more the caller's consent than an
         // owner refresh was: the fence stays.
@@ -441,6 +457,14 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     this.#state = 'installing';
     this.#skipped = null;
     this.#behind = false;
+    // The published view is known to be behind — that is why this is
+    // being sent. Retained, because the audience has not changed, but
+    // NOT current, and the application is told so: reporting `ready`
+    // here means every consumer believes a stale world is live.
+    this.deps.core.setStatus({
+      phase: this.#published() ? 'reconnecting' : 'syncing',
+      stale: this.#published(),
+    });
     // `(g, have)` are ADVISORY historical position — what this replica
     // actually has, never a claim about the owner's current
     // generation. A replica installed at A whose replacement B timed
@@ -470,6 +494,19 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
       return [];
     }
     return this.#resync(behind ? 'behind' : 'skipped-refresh');
+  }
+
+  /** Discard everything scoped to one handle's subscription. */
+  #reset(): void {
+    this.#retireAssembly();
+    this.#handle = null;
+    this.#incarnation = null;
+    this.#installed = null;
+    this.#revision = null;
+    this.#retired = 0n;
+    this.#skipped = null;
+    this.#behind = false;
+    this.#slot = null;
   }
 
   #retireAssembly(): void {

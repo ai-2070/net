@@ -212,8 +212,24 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         // they are deliberately not read: a replica installed at A
         // whose replacement B timed out can only honestly name A, and
         // a current-generation check would refuse exactly the caller
-        // that most needs recovering. The handle is authenticated and
-        // bound (above); that is the whole admission.
+        // that most needs recovering.
+        //
+        // But a resync takes a FRESH projection at the current
+        // revision, which makes it a READ — so the policy rules on it
+        // exactly as it ruled on the join. Binding the handle proves
+        // WHO is asking; it does not carry a permission decision
+        // forward across time, and a read the policy has since revoked
+        // must not be served because the handle is still warm. The
+        // handle survives the refusal: the request was refused, not
+        // the subscription.
+        if (!this.permitsRead(peer, bound.audience)) {
+          return this.refuse(
+            'resync-forbidden',
+            [this.no(peer, bound.h, 'forbidden', message.q)],
+            null,
+            null,
+          );
+        }
         const renewed = { ...bound, lastSeen: now };
         this.handles.set(bound.h, renewed);
         const frames = this.install(renewed, message.q);
@@ -286,20 +302,12 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
 
     // `authorize` receives the AUTHENTICATED peer and the audience it
     // asked to read. A refusal is `forbidden` and allocates nothing.
-    const request = { type: 'read', peer, audience: message.aud } as AccessRequest<A, I>;
-    let permitted: boolean;
-    try {
-      permitted = this.deps.authorize(request) === true;
-    } catch {
-      // A throwing policy is a refusal, never an admission.
-      permitted = false;
-    }
-    if (!permitted) {
+    if (!this.permitsRead(peer, message.aud)) {
       return this.refuse('join-forbidden', [this.no(peer, null, 'forbidden', message.q)], null, null);
     }
 
-    const h = this.deps.newHandle();
-    if (h.length !== HANDLE_HEX_LENGTH || this.handles.has(h)) {
+    const h = this.newHandle();
+    if (h === null || h.length !== HANDLE_HEX_LENGTH || this.handles.has(h)) {
       return this.refuse('join-handle-unusable', [this.no(peer, null, 'owner-lost', message.q)], null, null);
     }
 
@@ -333,6 +341,10 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    */
   private install(handle: OwnerHandle, q: Hex | null): Outbound[] | null {
     const projected = this.project(handle.audience);
+    // `null` means the application could produce neither a projection
+    // nor its own empty value. There is nothing truthful to ship, so
+    // the emission fails and the caller refuses.
+    if (projected === null) return null;
     let chunked;
     try {
       chunked = chunkSnapshot(projected, this.chunkBytes);
@@ -368,17 +380,50 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   }
 
   /**
+   * One read decision, for the join and for every later read.
+   *
+   * A throwing policy is a refusal, never an admission.
+   */
+  private permitsRead(peer: string, audience: readonly string[]): boolean {
+    const request = { type: 'read', peer, audience: [...audience] } as AccessRequest<A, I>;
+    try {
+      return this.deps.authorize(request) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A handle from the application's allocator, or null if it threw. */
+  private newHandle(): Hex | null {
+    try {
+      return this.deps.newHandle();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * The audience projection, validated by the definition.
    *
    * A projection that does not satisfy `state()` is the owner's bug and
    * must not be shipped as a snapshot, so it becomes `empty()` — the
    * value that represents absence — rather than the full state.
    */
-  private project(audience: readonly string[]): S {
+  private project(audience: readonly string[]): S | null {
     try {
       return this.deps.definition.state(this.deps.project(this.state, audience));
     } catch {
-      return this.deps.definition.empty();
+      // `empty()` is application code as well, and it is reached
+      // precisely when the application has already thrown once. A
+      // second failure has no value left to fall back to, so it
+      // becomes a refusal rather than an exception escaping the frame
+      // handler — which would take down the transport loop for every
+      // other handle.
+      try {
+        return this.deps.definition.empty();
+      } catch {
+        return null;
+      }
     }
   }
 

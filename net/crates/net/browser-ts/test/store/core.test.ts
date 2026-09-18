@@ -473,3 +473,118 @@ describe('the type contract', () => {
     }).toThrow(TypeError);
   });
 });
+
+/** A permissive store for the cancellation rows below. */
+const bagDefinition = defineStore<{ readonly tick: number }, Record<string, never>, Record<string, never>>({
+  id: 'bag.cancel',
+  version: 1,
+  state: value => ({ tick: Number((value as { tick?: unknown }).tick ?? 0) }),
+  empty: () => ({ tick: 0 }),
+  actions: {},
+  inputs: {},
+});
+
+function bag(): StoreCore<{ readonly tick: number }, Record<string, never>, Record<string, never>> {
+  return new StoreCore({ definition: bagDefinition, initialState: { tick: 0 } });
+}
+
+describe('a cancellation that has returned is honoured', () => {
+  it('a listener cancelled during a notification is not called again', () => {
+    const store = bag();
+    const seen: number[] = [];
+    const cancel = store.subscribe(state => {
+      seen.push(state.tick);
+      cancel();
+    });
+
+    store.applyOwnerUpdate({ tick: 1 });
+    store.applyOwnerUpdate({ tick: 2 });
+
+    expect(seen).toEqual([1]);
+  });
+
+  it('a listener cancelled by ANOTHER listener mid-notification is not called', () => {
+    const store = bag();
+    const second = vi.fn();
+    const cancelSecond = { current: () => {} };
+    store.subscribe(() => cancelSecond.current());
+    cancelSecond.current = store.subscribe(second);
+
+    store.applyOwnerUpdate({ tick: 1 });
+
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it('a STATUS listener cancelled by another mid-notification is not called', () => {
+    const store = bag();
+    const second = vi.fn();
+    const cancelSecond = { current: () => {} };
+    store.subscribeStatus(() => cancelSecond.current());
+    cancelSecond.current = store.subscribeStatus(second);
+
+    store.setStatus({ phase: 'syncing' });
+
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it('cancelling twice does not remove a later identical listener', () => {
+    const store = bag();
+    const listener = vi.fn();
+    const cancel = store.subscribe(listener);
+    cancel();
+    cancel();
+
+    const again = vi.fn();
+    store.subscribe(again);
+    store.applyOwnerUpdate({ tick: 1 });
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(again).toHaveBeenCalledTimes(1);
+  });
+
+  it('a selector subscription cancelled during its own call stays cancelled', () => {
+    const store = bag();
+    const seen: number[] = [];
+    const cancel = store.subscribe(
+      state => state.tick,
+      value => {
+        seen.push(value);
+        cancel();
+      },
+    );
+
+    store.applyOwnerUpdate({ tick: 1 });
+    store.applyOwnerUpdate({ tick: 2 });
+
+    expect(seen).toEqual([1]);
+  });
+
+  it('a status listener cancelled during its own call stays cancelled', () => {
+    const store = bag();
+    const seen: string[] = [];
+    const cancel = store.subscribeStatus(status => {
+      seen.push(status.phase);
+      cancel();
+    });
+
+    store.setStatus({ phase: 'syncing' });
+    store.setStatus({ phase: 'ready' });
+
+    expect(seen).toEqual(['syncing']);
+  });
+
+  it('close() cancels every listener', () => {
+    const store = bag();
+    const listener = vi.fn();
+    const status = vi.fn();
+    store.subscribe(listener);
+    store.subscribeStatus(status);
+
+    store.close();
+    status.mockClear();
+    expect(() => store.applyOwnerUpdate({ tick: 1 })).toThrow();
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(status).not.toHaveBeenCalled();
+  });
+});

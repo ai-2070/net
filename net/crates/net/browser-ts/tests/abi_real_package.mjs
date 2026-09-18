@@ -743,6 +743,92 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_resync_is_authorized_and_recovery_is_not_ready', async () => {
+  // The review round's two contract repairs, against the SHIPPED
+  // build: a `resync` is a read and the policy rules on it again, and
+  // a recovery in flight does not report a stale view as current.
+  const ownerModule = await import(new URL('store/owner.js', dist).href);
+  const replicaModule = await import(new URL('store/replica.js', dist).href);
+  const coreModule = await import(new URL('store/core.js', dist).href);
+  const definitionModule = await import(new URL('store/definition.js', dist).href);
+  const codec = await import(new URL('store/wire.js', dist).href);
+
+  const game = definitionModule.defineStore({
+    id: 'probe.auth',
+    version: 1,
+    state: raw => ({ tick: Number(raw.tick ?? 0) }),
+    empty: () => ({ tick: 0 }),
+    actions: {},
+    inputs: {},
+  });
+
+  const reads = [];
+  let permit = true;
+  let handles = 0;
+  let qs = 0;
+  const owner = new ownerModule.StoreOwner({
+    definition: game,
+    authorize: request => {
+      reads.push(request);
+      return permit;
+    },
+    project: state => state,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newHandle: () => {
+      handles += 1;
+      return handles.toString(16).padStart(32, '0');
+    },
+    newIncarnation: () => 'abcdef0123456789',
+  });
+  owner.commit({ tick: 1 });
+
+  const core = new coreModule.StoreCore({ definition: game, initialState: game.empty() });
+  const replica = new replicaModule.StoreReplica({
+    definition: game,
+    core,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newQ: () => {
+      qs += 1;
+      return qs.toString(16).padStart(16, '0');
+    },
+    audience: ['crew'],
+    key: 'probe',
+  });
+
+  for (const frame of owner.receive(replica.join().frame, '00000000000000aa').out) {
+    replica.receive(frame.frame);
+  }
+  eq([replica.state, reads.length], ['ready', 1], 'the installed replica');
+
+  // A gap provokes recovery, and the status must say so.
+  const h = replica.handle;
+  const gap = replica.receive(codec.encodeMessage({
+    k: 'delta', h, g: '1', base: '9', r: '10', ops: [],
+  }));
+  eq(gap.dropped, 'gap', 'the gap');
+  eq(core.getStatus().phase !== 'ready' && core.getStatus().stale, true, 'the status during recovery');
+
+  // The policy has since revoked the read; the resync is refused and
+  // ships no state, and `authorize` was consulted again.
+  permit = false;
+  const revoked = owner.receive(gap.out[0].frame, '00000000000000aa');
+  eq(reads.length, 2, 'authorize was consulted for the resync');
+  eq(reads[1], { type: 'read', peer: '00000000000000aa', audience: ['crew'] }, 'the second read request');
+  if (revoked.refused === null) throw new Error('a revoked resync was served');
+  for (const frame of revoked.out) {
+    const decoded = codec.decodeMessage(frame.frame, { maxBytes: 8104, as: 'replica' });
+    if (!decoded.ok || decoded.message.k !== 'no') throw new Error('a revoked resync shipped state');
+  }
+
+  // And the handle survived the refusal, so permitting again works
+  // without a rejoin.
+  permit = true;
+  const allowed = owner.receive(gap.out[0].frame, '00000000000000aa');
+  eq(allowed.refused, null, 'the re-permitted resync');
+});
+
 await probe('real_package_owner_and_replica_complete_a_round_trip', async () => {
   // Both halves from the SHIPPED build, wired only through frames: a
   // join installs, a delta applies on its base, a gap provokes one

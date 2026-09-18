@@ -173,6 +173,9 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
     }
     this.#status = Object.freeze(candidate);
     for (const listener of [...this.#statusListeners]) {
+      // Same rule as the state pass: a cancellation that has already
+      // returned is honoured for the rest of this pass.
+      if (!this.#statusListeners.has(listener)) continue;
       dispatch(() => listener(this.#status, previous));
     }
   }
@@ -320,7 +323,14 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
     const previous = this.#state;
     this.#state = next;
     this.#revision += 1;
+    // The snapshot keeps a listener added DURING this pass out of it,
+    // and re-checking membership keeps a listener CANCELLED during it
+    // out too. Both are the same question asked at the right moment: a
+    // `cancel()` that has already returned must not be followed by a
+    // call, or a listener that has torn down its own scene graph gets
+    // handed one more frame of state it no longer expects.
     for (const subscription of [...this.#subscriptions]) {
+      if (!this.#subscriptions.has(subscription)) continue;
       subscription.notify(next, previous);
     }
   }
