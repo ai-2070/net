@@ -57,7 +57,11 @@ export default function DocsRootPage() {
       <>
         <main className="min-w-0 max-w-[740px]">
           <DocsPrevNextTop neighbours={neighbours} />
-          <DocsContent source={source} format={tree.rootReadme.ext} />
+          <DocsContent
+            source={source}
+            format={tree.rootReadme.ext}
+            path="/docs"
+          />
           <DocsPrevNextBottom neighbours={neighbours} />
         </main>
         <TocRail entries={toc} />
