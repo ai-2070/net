@@ -104,8 +104,8 @@ examples:
       rust: registry.rs
       typescript: registry.ts
       python: registry.py
+      go: registry.go
     absent:
-      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       # Asserted on the last line's fields, not a transcript: node ids are
@@ -124,8 +124,8 @@ examples:
       rust: jobqueue.rs
       typescript: jobqueue.ts
       python: jobqueue.py
+      go: jobqueue.go
     absent:
-      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       expect: "RESULT ok jobs=6 done=6 retried=1 duplicates=0"
@@ -161,8 +161,8 @@ examples:
       rust: liveconfig.rs
       typescript: liveconfig.ts
       python: liveconfig.py
+      go: liveconfig.go
     absent:
-      go: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
       c: "unwritten in wave 1 — Rust is the reference implementation; ports follow"
     run:
       expect: "RESULT ok subscribers=2 applied=2 version=2"

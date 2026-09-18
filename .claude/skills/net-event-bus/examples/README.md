@@ -57,12 +57,12 @@ Unlike `hello`/`observe`, these stand up **two to four real mesh nodes over loop
 
 | File | Bindings | The service it replaces | Route | Expected line |
 |---|---|---|---|---|
-| `registry.rs` / `registry.ts` / `registry.py` | Rust ✓ · TS ✓ · Py ✓ | Consul / etcd + a health poller | providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup | `RESULT ok providers=3 joined=1 best_moved=1` |
-| `jobqueue.rs` / `jobqueue.ts` / `jobqueue.py` | Rust ✓ · TS ✓ · Py ✓ | Celery / SQS + Redis | append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log | `RESULT ok jobs=6 done=6 retried=1 duplicates=0` |
+| `registry.rs` / `registry.ts` / `registry.py` / `registry.go` | Rust ✓ · TS ✓ · Py ✓ · Go ✓ | Consul / etcd + a health poller | providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup | `RESULT ok providers=3 joined=1 best_moved=1` |
+| `jobqueue.rs` / `jobqueue.ts` / `jobqueue.py` / `jobqueue.go` | Rust ✓ · TS ✓ · Py ✓ · Go ✓ | Celery / SQS + Redis | append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log | `RESULT ok jobs=6 done=6 retried=1 duplicates=0` |
 | `objectstore.rs` / `objectstore.ts` / `objectstore.py` | Rust ✓ · TS ✓ · Py ✓ | S3 / MinIO | store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address | `RESULT ok dedup=1 readback=1 bytes=64` |
-| `liveconfig.rs` / `liveconfig.ts` / `liveconfig.py` | Rust ✓ · TS ✓ · Py ✓ | LaunchDarkly / Consul KV | register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally | `RESULT ok subscribers=2 applied=2 version=2` |
+| `liveconfig.rs` / `liveconfig.ts` / `liveconfig.py` / `liveconfig.go` | Rust ✓ · TS ✓ · Py ✓ · Go ✓ | LaunchDarkly / Consul KV | register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally | `RESULT ok subscribers=2 applied=2 version=2` |
 
-Rust, TypeScript and Python are all **executed** in CI; the manifest carries a per-binding status, so a port that exists but is not proven cannot read as one that is.
+Rust, TypeScript, Python and Go are all **executed** in CI (Go's local floor here is `go vet`, which type-checks cgo without linking); C is checked with `gcc -fsyntax-only`; the manifest carries a per-binding status, so a port that exists but is not proven cannot read as one that is.
 
 ```bash
 cargo run --example registry
