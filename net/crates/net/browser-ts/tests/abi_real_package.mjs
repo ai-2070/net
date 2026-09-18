@@ -743,6 +743,96 @@ await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
   eq(second.bytesHeld, 0, 'the bytes are given back');
 });
 
+await probe('real_package_owner_and_replica_complete_a_round_trip', async () => {
+  // Both halves from the SHIPPED build, wired only through frames: a
+  // join installs, a delta applies on its base, a gap provokes one
+  // `resync`, and the owner's answer reinstalls at a new generation.
+  const ownerModule = await import(new URL('store/owner.js', dist).href);
+  const replicaModule = await import(new URL('store/replica.js', dist).href);
+  const coreModule = await import(new URL('store/core.js', dist).href);
+  const definitionModule = await import(new URL('store/definition.js', dist).href);
+  const codec = await import(new URL('store/wire.js', dist).href);
+
+  const game = definitionModule.defineStore({
+    id: 'probe.game',
+    version: 1,
+    state: raw => ({ tick: Number(raw.tick ?? 0) }),
+    empty: () => ({ tick: 0 }),
+    actions: {},
+    inputs: {},
+  });
+
+  let handles = 0;
+  let qs = 0;
+  const owner = new ownerModule.StoreOwner({
+    definition: game,
+    authorize: () => true,
+    project: state => state,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newHandle: () => {
+      handles += 1;
+      return handles.toString(16).padStart(32, '0');
+    },
+    newIncarnation: () => 'abcdef0123456789',
+  });
+  owner.commit({ tick: 1 });
+
+  const core = new coreModule.StoreCore({ definition: game, initialState: game.empty() });
+  const replica = new replicaModule.StoreReplica({
+    definition: game,
+    core,
+    maxEventBytes: 8104,
+    now: () => 0,
+    newQ: () => {
+      qs += 1;
+      return qs.toString(16).padStart(16, '0');
+    },
+    audience: ['crew'],
+    key: 'probe',
+  });
+
+  const deliver = out => {
+    const requests = [];
+    for (const frame of out) requests.push(...replica.receive(frame.frame).out);
+    return requests;
+  };
+
+  // The join round trip.
+  const join = replica.join();
+  const served = owner.receive(join.frame, '00000000000000aa');
+  if (served.refused !== null) throw new Error(`the join was refused: ${served.refused}`);
+  eq(deliver(served.out), [], 'the install asks for nothing further');
+  eq([replica.state, replica.installed, replica.revision], ['ready', '1', '1'], 'the replica');
+  eq(core.getState(), { tick: 1 }, 'the installed document');
+
+  // A delta on its base applies.
+  const h = replica.handle;
+  const delta = codec.encodeMessage({
+    k: 'delta', h, g: '1', base: '1', r: '2', ops: [{ o: 'r', p: ['tick'], val: 5 }],
+  });
+  eq(replica.receive(delta).dropped, null, 'the delta');
+  eq([core.getState().tick, replica.revision], [5, '2'], 'the patched document');
+
+  // A gap does not apply, and produces exactly one `resync` naming
+  // what this replica actually has.
+  const gapped = replica.receive(codec.encodeMessage({
+    k: 'delta', h, g: '1', base: '9', r: '10', ops: [{ o: 'r', p: ['tick'], val: 99 }],
+  }));
+  eq([gapped.dropped, gapped.out.length, core.getState().tick], ['gap', 1, 5], 'the gap');
+  const asked = codec.decodeMessage(gapped.out[0].frame, { maxBytes: 8104, as: 'owner' });
+  eq(asked.ok && asked.message.k, 'resync', 'the recovery request');
+  eq(asked.ok && [asked.message.g, asked.message.have], ['1', '2'], 'its advisory position');
+
+  // Which the owner answers with a NEW generation that reinstalls.
+  owner.commit({ tick: 12 });
+  const answered = owner.receive(gapped.out[0].frame, '00000000000000aa');
+  if (answered.refused !== null) throw new Error(`the resync was refused: ${answered.refused}`);
+  eq(deliver(answered.out), [], 'the reinstall asks for nothing further');
+  eq([replica.state, replica.installed], ['ready', '2'], 'the reinstalled replica');
+  eq(core.getState(), { tick: 12 }, 'the recovered document');
+});
+
 await probe('real_package_reconciles_an_own_proto_key_with_an_empty_value', async () => {
   // The reviewer's A2 round-2 reproductions, run against the SHIPPED
   // build: an own `__proto__` key whose value is an empty object. The

@@ -30,6 +30,8 @@
 
 import { StoreError } from './errors.js';
 import { mergeShallow, reconcile } from './state.js';
+import { applyPatch, type PatchOutcome } from './patch.js';
+import type { WireOp } from './wire.js';
 import type {
   Cancel,
   ReadonlyState,
@@ -235,6 +237,27 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
   applySnapshot(raw: unknown): void {
     this.#refuseWhenClosed();
     this.#commit(this.#validate(raw));
+  }
+
+  /**
+   * Apply a replica delta: the owner's patch operations, at this
+   * document, validated by this definition.
+   *
+   * This lives here rather than in the replica because the store owns
+   * the document, its validator and its revision. A replica that read
+   * the state out, patched it outside and pushed the result back would
+   * validate twice per delta and would be free to publish something
+   * the definition never saw.
+   *
+   * Refusals are returned, not thrown: a delta that does not apply is
+   * a recoverable divergence (§1.8 resynchronization), not a caller
+   * error.
+   */
+  applyDelta(ops: readonly WireOp[]): PatchOutcome<S> {
+    this.#refuseWhenClosed();
+    const outcome = applyPatch(this.#state, ops, raw => this.#validate(raw));
+    if (outcome.ok && outcome.changed) this.#commit(outcome.next);
+    return outcome;
   }
 
   /**

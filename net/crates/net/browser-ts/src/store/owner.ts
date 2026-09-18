@@ -207,11 +207,32 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
           null,
           null,
         );
+      case 'resync': {
+        // §1.8. `g` and `have` are ADVISORY historical position, so
+        // they are deliberately not read: a replica installed at A
+        // whose replacement B timed out can only honestly name A, and
+        // a current-generation check would refuse exactly the caller
+        // that most needs recovering. The handle is authenticated and
+        // bound (above); that is the whole admission.
+        const renewed = { ...bound, lastSeen: now };
+        this.handles.set(bound.h, renewed);
+        const frames = this.install(renewed, message.q);
+        if (frames === null) {
+          this.handles.delete(bound.h);
+          this.assemblies.reclaimHandle(bound.h);
+          return this.refuse(
+            'resync-projection-capacity',
+            [this.no(peer, bound.h, 'capacity', message.q)],
+            null,
+            null,
+          );
+        }
+        return { out: frames, refused: null };
+      }
       case 'aud':
       case 'resume':
-      case 'resync':
-        // Audience transitions and recovery are slice F. A control is
-        // never answered `not-ready` (§1.7b), so this is the honest
+        // Audience transitions and reconnection are slice F. A control
+        // is never answered `not-ready` (§1.7b), so this is the honest
         // refusal for "this owner does not implement it yet".
         return this.refuse(
           `unimplemented-kind:${message.k}`,

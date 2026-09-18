@@ -19,7 +19,7 @@ import { describe, expect, it } from 'vitest';
 import { Assembly, AssemblyTable, type AssemblyManifest } from '../../src/store/assembly.js';
 import { StoreOwner, MAX_HANDLES, HANDLE_LEASE_MS, type Outbound } from '../../src/store/owner.js';
 import type { AccessRequest } from '../../src/store/types.js';
-import { decodeMessage, encodeMessage, type Hex } from '../../src/store/wire.js';
+import { decimalValue, decodeMessage, encodeMessage, type Hex } from '../../src/store/wire.js';
 
 const MAX_EVENT_BYTES = 8104;
 const PEER_A = '00000000000000aa';
@@ -135,6 +135,13 @@ function assemble(out: readonly Outbound[]): unknown {
 }
 
 /** The refusal code the owner answered with, if it answered one. */
+/** The `man` frame an emission opened with, decoded. */
+function manifestOf(out: readonly Outbound[]) {
+  const decoded = decodeMessage(out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+  if (!decoded.ok || decoded.message.k !== 'man') throw new Error('the emission does not open with a manifest');
+  return decoded.message;
+}
+
 function refusalCode(out: readonly Outbound[]): string | null {
   for (const frame of out) {
     const decoded = decodeMessage(frame.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
@@ -465,6 +472,72 @@ describe('kinds this slice does not implement are refused, not half-served', () 
     expect(r.owner.handleCount).toBe(0);
     // Anything after `leave` is closed.
     expect(r.owner.receive(encodeMessage({ k: 'alive', q: q(), h }), PEER_A).refused).toBe('handle-unknown');
+  });
+});
+
+describe('a solicited `resync` is answered, never refused for its position', () => {
+  it('answers with a newly allocated generation and its chunks', () => {
+    const r = rig();
+    const served = r.owner.receive(joinFrame(['crew']), PEER_A);
+    const h = handleOf(served.out);
+    const first = manifestOf(served.out);
+
+    const again = r.owner.receive(
+      encodeMessage({ k: 'resync', q: q(), h, g: first.g, have: first.r }),
+      PEER_A,
+    );
+
+    expect(again.refused).toBeNull();
+    const second = manifestOf(again.out);
+    // A NEW installation generation, not a replay of the old one
+    // (§1.7a: an allocated generation is consumed for ever).
+    expect(decimalValue(second.g)).toBe(decimalValue(first.g) + 1n);
+    expect(again.out).toHaveLength(second.n + 1);
+  });
+
+  it('never refuses a `resync` for naming a stale or unknown generation', () => {
+    // §1.8: `(g, have)` are advisory historical position. The replica
+    // that most needs recovering is precisely the one whose newer
+    // generation never installed, so it can only name an older one —
+    // and a replica recovering from a failed first install names
+    // nothing at all.
+    const r = rig();
+    const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
+
+    for (const [g, have] of [
+      ['0', '0'],
+      ['1', '1'],
+      ['99999', '99999'],
+    ] as const) {
+      const answered = r.owner.receive(encodeMessage({ k: 'resync', q: q(), h, g, have }), PEER_A);
+
+      expect(answered.refused).toBeNull();
+      expect(manifestOf(answered.out).k).toBe('man');
+    }
+  });
+
+  it('refuses a `resync` on a dead handle as `closed`', () => {
+    const r = rig();
+    const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
+    r.owner.receive(encodeMessage({ k: 'leave', q: q(), h }), PEER_A);
+
+    const orphan = r.owner.receive(encodeMessage({ k: 'resync', q: q(), h, g: '1', have: '1' }), PEER_A);
+
+    expect(orphan.refused).toBe('handle-unknown');
+    expect(refusalCode(orphan.out)).toBe('closed');
+  });
+
+  it('renews the lease it answers on', () => {
+    const r = rig();
+    const h = handleOf(r.owner.receive(joinFrame(['crew']), PEER_A).out);
+
+    // A resync late in the lease keeps the handle alive, like any
+    // accepted message.
+    const late = HANDLE_LEASE_MS - 1;
+    r.owner.receive(encodeMessage({ k: 'resync', q: q(), h, g: '1', have: '1' }), PEER_A, late);
+    const after = r.owner.receive(encodeMessage({ k: 'alive', q: q(), h }), PEER_A, late + 1);
+
+    expect(after.refused).toBeNull();
   });
 });
 
