@@ -37,7 +37,7 @@
  */
 
 import { NetMesh as NapiNetMesh } from '@net-mesh/core';
-import type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+import type { IslandCriteria, IslandTopologyInput, StoredEvent } from '@net-mesh/core';
 // The subnet AUTHORITY provider verb (SSDK §3.5). Imported from the
 // low-level package's `./subnet` entry, which classifies the stable
 // `subnet:` envelope; `getNapiMesh` supplies the handle.
@@ -51,7 +51,7 @@ import type {
   OrgServeHandle as NapiOrgServeHandle,
 } from '@net-mesh/core';
 
-export type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+export type { IslandCriteria, IslandTopologyInput, StoredEvent } from '@net-mesh/core';
 
 /**
  * The verified admission facts a subnet-exported handler receives — the
@@ -530,6 +530,46 @@ export class MeshNode {
   /** Number of connected peers. */
   peerCount(): number {
     return this.native.peerCount();
+  }
+
+  // ─── Receive ─────────────────────────────────────────────────────
+
+  /**
+   * Number of inbound shards received traffic is spread across.
+   *
+   * Events land on `streamId % numShards`, which is what makes a
+   * targeted {@link recvShard} possible.
+   */
+  numShards(): number {
+    return this.native.numShards();
+  }
+
+  /** The inbound shard `streamId`'s events land on. */
+  shardForStream(streamId: bigint): number {
+    return this.native.shardForStream(streamId);
+  }
+
+  /**
+   * Poll one inbound shard for up to `limit` received events.
+   *
+   * Pair with {@link shardForStream} when you want one stream rather
+   * than a merge across all of them. This is the receive half of the
+   * channel API: {@link subscribeChannel} joins the publisher's
+   * roster, and delivered payloads are read here.
+   */
+  async recvShard(shardId: number, limit: number): Promise<StoredEvent[]> {
+    return await this.native.pollShard(shardId, limit);
+  }
+
+  /**
+   * Poll **every** shard for up to `limit` events in total.
+   *
+   * The sweep starts from a rotating shard, so a continuously-fed
+   * shard cannot starve a quiet one; events are therefore not
+   * returned in shard order.
+   */
+  async recv(limit: number): Promise<StoredEvent[]> {
+    return await this.native.poll(limit);
   }
 
   // ─── Stream API ──────────────────────────────────────────────────
