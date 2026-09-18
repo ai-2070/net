@@ -13,17 +13,31 @@ five state-machine/persistence contract gaps; revision 3 for two branch/table
 inconsistencies. §0.1 indexes each finding to the section and witness that closes
 it. Source-grounded against this worktree.
 
-**Review state (this is what is actually outstanding).** Two independent-reviewer
-HOLD packets have been worked: R1–R13 against `1ed7576` (closed, rounds 1–2,
-credited) and C1–C8 against `0743ca779` (repaired in `954eee853`). The current
-candidate is `687566524`, whose code-bearing head `84d178407` is green on
-exact-head CI — [46/46 jobs](https://github.com/ai-2070/net/actions/runs/35333578622),
-13/13 A2A enforced steps. **The reviewer has not yet accepted round 3**, so the
-HOLD stands. The per-blocker closure map is
-`docs/internal/reviews/A2A_C1_C8_CLOSURE_MAP.md`; it also carries the list of
-properties still unproven and explicitly not claimed (real settlement rails, the
-installed-wheel protected *paid* lifecycle, platform power-loss durability, the
-C5 Python caller half, a cross-process org-authority harness).
+**Review state (this is what is actually outstanding).** Three
+independent-reviewer HOLD packets have been worked:
+
+| Packet | Against | Findings | Disposition |
+|---|---|---|---|
+| 1 | `1ed7576` | R1–R13 | closed over rounds 1–2, credited |
+| 2 | `0743ca779` | C1–C8 | C1, C3, C4, C8 credited; C5 credited for the production route |
+| 3 | `84d178407` | D1–D4 + the C5 witness | repaired in `4a693ec99` + `22ba85f9a`, awaiting review |
+
+The third packet was bounded: "remaining findings are within C2/C6/C7 and the
+previously required C5 witness, not a new architecture or hardening round."
+Her counts were reproduced before any repair (provider 2 failed, caller 3
+failed) and every one of her probes now passes, each with an inverse receipt
+recorded in the two commits above.
+
+Current candidate `1067c6fee`, green on exact-head CI —
+[46/46 jobs](https://github.com/ai-2070/net/actions/runs/35395627084), now 16
+A2A enforced steps. **The reviewer has not yet ruled on round 4**, so the HOLD
+stands.
+
+Per-blocker closure map for packet 2: `docs/internal/reviews/A2A_C1_C8_CLOSURE_MAP.md`.
+Packet 3 is vendored at `docs/internal/reviews/round4/`. The list of
+properties still unproven and explicitly not claimed is unchanged: real
+settlement rails, the installed-wheel protected *paid* lifecycle, platform
+power-loss durability, a cross-process org-authority harness.
 
 **Deltas from the plan as written**, all deliberate and witnessed:
 
