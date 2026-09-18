@@ -77,6 +77,7 @@ ROOTS = [
     "net/crates/net/src/adapter/net/",  # mesh behaviour: behavior/, channel/, cortex/
     "net/crates/net/payments/",  # payments crate: src/, tests/
     "net/crates/net/payments/src/",  # payments modules: core/, x402/, engine/, flow/
+    "net/crates/net/browser-ts/",  # browser leaf package: src/, src/store/, src/three/, test/, tests/
     "net/crates/net/cli/src/",  # `net-mesh` command tree: commands/
     "net/crates/net/bindings/",  # go/rpc-ffi/, node/src/, python/src/
     "net/crates/net/bindings/python/",  # pytest suites under tests/

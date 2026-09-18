@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=87, total=135
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=17 universal=87, total=139
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -170,6 +170,12 @@ pages:
   sdk/c/headers-and-linking: boundary_native
   sdk/c/memory-and-threading: boundary_native
   sdk/c/quickstart: boundary_native
+  # The browser leaf is its own SDK surface (a sibling package, not a lens on
+  # the Node SDK), so it is a native section of its own kind: TypeScript-only.
+  sdk/browser: sdk_native
+  sdk/browser/quickstart: sdk_native
+  sdk/browser/store: sdk_native
+  sdk/browser/three: sdk_native
 
 # The ratchet. A count alone is not enforceable (a checker sees one checkout,
 # not yesterday's) and is too weak anyway: it would let one page regress while

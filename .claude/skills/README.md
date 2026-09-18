@@ -1,11 +1,12 @@
 # net-claude-skill — Claude skills for the Net mesh
 
-Two [Agent Skills](https://docs.anthropic.com/en/docs/claude-code/skills) that teach Claude how to write correct [**Net**](https://github.com/ai-2070/net) integration code:
+Three [Agent Skills](https://docs.anthropic.com/en/docs/claude-code/skills) that teach Claude how to write correct [**Net**](https://github.com/ai-2070/net) integration code:
 
 - **`net-event-bus`** — the mesh: pub/sub, nRPC request/response, agent-to-agent task handoff, the MCP bridge, org capability auth, the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
 - **`net-payments`** — x402 payments on the mesh: price a capability, quote, verify, settle, bill, and spend policy.
+- **`net-threejs`** — browser-native Net: a WebRTC DataChannel leaf (`@net-mesh/browser`), the anchor/bootstrap model, the networked game store (`defineStore` / `hostStore` / `joinStore`), and binding it to a Three.js scene (`@net-mesh/browser/three`). Browser-side TypeScript only.
 
-Net looks like Kafka/NATS on the surface but has no broker. Net Payments looks like a payment SDK but never moves money. Out of the box, a coding agent will happily write Net code that **compiles, runs, and is wrong** — these skills load the right mental model and verified per-SDK templates instead.
+Net looks like Kafka/NATS on the surface but has no broker. Net Payments looks like a payment SDK but never moves money. Net's browser leaf looks like an ordinary WebRTC app but the mesh is the transport. Out of the box, a coding agent will happily write Net code that **compiles, runs, and is wrong** — these skills load the right mental model and verified per-SDK templates instead.
 
 > These are skills *about* Net; they don't install Net itself. The SDK lives at [ai-2070/net](https://github.com/ai-2070/net).
 
@@ -52,7 +53,7 @@ The CLI symlinks each agent's skills directory to one canonical copy, so `npx sk
 ```bash
 git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
 mkdir -p ~/.claude/skills
-cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments ~/.claude/skills/
+cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments /tmp/net-claude-skill/net-threejs ~/.claude/skills/
 ```
 
 Swap in `~/.codex/skills/` for Codex, or `<your-repo>/.claude/skills/` for a project install. To hack on the skills locally, clone once and symlink the folders so `git pull` updates them in place.
@@ -61,11 +62,13 @@ Swap in `~/.codex/skills/` for Codex, or `<your-repo>/.claude/skills/` for a pro
 
 ## Check it worked
 
-Restart your agent — in Claude Code, `/skills` lists **net-event-bus** and **net-payments**. Then just ask for something Net-shaped:
+Restart your agent — in Claude Code, `/skills` lists **net-event-bus**, **net-payments** and **net-threejs**. Then just ask for something Net-shaped:
 
 > *"Wire up a Net publisher and subscriber over the mesh in TypeScript."*
 >
 > *"Price a Net capability with x402 and charge callers to invoke it."*
+>
+> *"Build a multiplayer Three.js scene two browser tabs share over the Net mesh."*
 
 The matching skill loads on its own — you never have to name it.
 
@@ -136,14 +139,30 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 
 </details>
 
+<details>
+<summary><b><code>net-threejs/</code></b> — full file map</summary>
+
+| File | Loaded when |
+|---|---|
+| `SKILL.md` | Entry point — routing table + the five load-bearing facts + the define→host→join→bind workflow. |
+| `concepts.md` | **Always first.** The browser leaf, the anchor as control plane ("how browsers find each other, not how they talk"), one-node-per-origin, the owner/replica store, inputs vs actions vs audiences, why reference identity is the point. |
+| `store.md` | Writing the networked state — `defineStore` / `hostStore` / `joinStore`, the handles, the three protocol facts, `StoreError` codes, enforced bounds, `StoreTransport`. |
+| `three.md` | Rendering it — `bindEntities`, the create/update/remove contract, the reference-identity skip rule, and what must stay out of the store. |
+| `bootstrap.md` | Connecting two browsers — `net-mesh anchor serve`, `net-mesh anchor credential mint`, the `net-bootstrap:` credential, TLS/origin rules, and the supported harnesses. |
+| `gotchas.md` | Before merging — the review invariant, the peer-id/label/indeterminate footguns, and what not to build. |
+| `testing.md` | Writing witnesses — the real-browser harnesses, the two demo modes' very different evidentiary weight, and witness discipline. |
+| `source-access.md` | A citation to open, or a mechanism question the chapters don't answer — how to root `browser-ts` paths and read the real package. |
+
+</details>
+
 ## Update / uninstall
 
 ```bash
-npx skills update -g                               # refresh to the latest
-npx skills remove net-event-bus net-payments -g    # uninstall
+npx skills update -g                                        # refresh to the latest
+npx skills remove net-event-bus net-payments net-threejs -g # uninstall
 ```
 
-Drop `-g` for project installs. If you installed by hand, `rm -rf ~/.claude/skills/net-event-bus ~/.claude/skills/net-payments`.
+Drop `-g` for project installs. If you installed by hand, `rm -rf ~/.claude/skills/net-event-bus ~/.claude/skills/net-payments ~/.claude/skills/net-threejs`.
 
 ## Links
 

@@ -12,13 +12,15 @@ source inspection or tests for the exact mechanism being changed.
 
 > These are skills _about_ Net. They don't install the library — that's [Install](/docs/start/install).
 
-## The two skills
+## The three skills
 
 **`net-event-bus`** — Net as an event bus: pub/sub over the mesh, nRPC request/response, the MCP bridge (`net-mesh wrap` / `net-mesh mcp serve`), [organization capability auth](/docs/guides/private-capabilities) (`serve_org` / `mesh.org(..).call`), the gang-claim scheduler, and the RedEX / CortEX / Dataforts layers on top.
 
 **`net-payments`** — x402-native payments: pricing a capability at discovery, signed quotes, the provider lifecycle engine (quote → verify → settle → bill), the caller-side pay-to-invoke flow, tiered on-chain verification, and spend policy.
 
-Install both or just the one you need. Each is a directory containing a `SKILL.md` plus reference files that load on demand.
+**`net-threejs`** — browser-native Net: a WebRTC DataChannel leaf (`@net-mesh/browser`), the anchor/bootstrap model, the networked game store (`defineStore` / `hostStore` / `joinStore`), and binding that store to a Three.js scene (`@net-mesh/browser/three`). Browser-side TypeScript only — see [Browser](/docs/sdk/browser).
+
+Install all three or just the one you need. Each is a directory containing a `SKILL.md` plus reference files that load on demand.
 
 ## Where skills live
 
@@ -72,6 +74,7 @@ git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
 mkdir -p ~/.claude/skills
 cp -R /tmp/net-claude-skill/net-event-bus ~/.claude/skills/
 cp -R /tmp/net-claude-skill/net-payments  ~/.claude/skills/
+cp -R /tmp/net-claude-skill/net-threejs   ~/.claude/skills/
 ```
 
 On Windows, in PowerShell:
@@ -82,6 +85,7 @@ $dest = "$env:USERPROFILE\.claude\skills"
 New-Item -ItemType Directory -Force $dest | Out-Null
 Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-event-bus" "$dest\"
 Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-payments" "$dest\"
+Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-threejs" "$dest\"
 ```
 
 Swap `~/.claude/skills/` for `<your-repo>/.claude/skills/` to install into a single project, then commit the two directories. To hack on the skills locally, clone once somewhere permanent and symlink so `git pull` updates them in place:
@@ -90,6 +94,7 @@ Swap `~/.claude/skills/` for `<your-repo>/.claude/skills/` to install into a sin
 git clone https://github.com/ai-2070/net-claude-skill.git ~/src/net-claude-skill
 ln -s ~/src/net-claude-skill/net-event-bus ~/.claude/skills/net-event-bus
 ln -s ~/src/net-claude-skill/net-payments ~/.claude/skills/net-payments
+ln -s ~/src/net-claude-skill/net-threejs ~/.claude/skills/net-threejs
 ```
 
 ## Verify
@@ -97,18 +102,22 @@ ln -s ~/src/net-claude-skill/net-payments ~/.claude/skills/net-payments
 Check the files landed:
 
 ```bash
-ls ~/.claude/skills/net-event-bus/SKILL.md ~/.claude/skills/net-payments/SKILL.md
+ls ~/.claude/skills/net-event-bus/SKILL.md \
+   ~/.claude/skills/net-payments/SKILL.md \
+   ~/.claude/skills/net-threejs/SKILL.md
 ```
 
-Then restart Claude Code and run `/skills` — **net-event-bus** and **net-payments** should be listed.
+Then restart Claude Code and run `/skills` — **net-event-bus**, **net-payments** and **net-threejs** should be listed.
 
 Skills load automatically when a request matches. To see one fire, ask for something Net-shaped:
 
 > _"Wire up a Net publisher and subscriber over the mesh in TypeScript."_
 >
 > _"Price a Net capability with x402 and charge callers to invoke it."_
+>
+> _"Build a multiplayer Three.js scene two browser tabs share over the Net mesh."_
 
-`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like _pub/sub with Net_, _nRPC_, _mesh RPC_, _RedEX_, _CortEX_, _Dataforts_, _gang scheduler_, _net-mesh wrap_, _serve_org_. `net-payments` triggers on `net-payments` / `net_payments` imports and on _price a capability_, _pay to invoke_, _x402_, _settle on Base/Solana/XRPL_, _spend limit_.
+`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like _pub/sub with Net_, _nRPC_, _mesh RPC_, _RedEX_, _CortEX_, _Dataforts_, _gang scheduler_, _net-mesh wrap_, _serve_org_. `net-payments` triggers on `net-payments` / `net_payments` imports and on _price a capability_, _pay to invoke_, _x402_, _settle on Base/Solana/XRPL_, _spend limit_. `net-threejs` triggers on `@net-mesh/browser` / `@net-mesh/browser/three` imports and on _three.js multiplayer_, _browser game on Net_, _browser mesh node_, _WebRTC DataChannel mesh_, _hostStore_, _joinStore_, _bindEntities_.
 
 ## Opensrc
 
@@ -143,14 +152,16 @@ Every source path the skills cite is resolved against the repository in CI, so a
 `npx skills update -g` updates to the latest version, as above. To uninstall:
 
 ```bash
-npx skills remove net-event-bus net-payments -g
+npx skills remove net-event-bus net-payments net-threejs -g
 ```
 
 If you installed by hand, re-run the copy step to update — a symlinked clone needs only `git pull` — and remove with:
 
 ```bash
-rm -rf ~/.claude/skills/net-event-bus ~/.claude/skills/net-payments   # personal
-rm -rf .claude/skills/net-event-bus .claude/skills/net-payments       # project
+rm -rf ~/.claude/skills/net-event-bus ~/.claude/skills/net-payments \
+       ~/.claude/skills/net-threejs                              # personal
+rm -rf .claude/skills/net-event-bus .claude/skills/net-payments \
+       .claude/skills/net-threejs                                # project
 ```
 
 ## Next

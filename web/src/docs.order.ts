@@ -31,7 +31,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "releases",
   ],
   folders: {
-    sdk: ["rust", "typescript", "python", "go", "c"],
+    sdk: ["rust", "typescript", "python", "go", "c", "browser"],
     "sdk/rust": [
       "quickstart",
       "announce",

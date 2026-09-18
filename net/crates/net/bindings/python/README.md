@@ -87,11 +87,13 @@ version:
 npx skills update -g
 ```
 
-Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
-should be listed. `net-event-bus` covers pub/sub, nRPC, the MCP bridge,
-organization capability auth, the gang-claim scheduler, and RedEX / CortEX /
-Dataforts. `net-payments` covers x402 pricing, quotes, settlement and spend
-policy. Full install options in
+Restart Claude Code and run `/skills` — **net-event-bus**, **net-payments** and
+**net-threejs** should be listed. `net-event-bus` covers pub/sub, nRPC, the MCP
+bridge, organization capability auth, the gang-claim scheduler, and RedEX /
+CortEX / Dataforts. `net-payments` covers x402 pricing, quotes, settlement and
+spend policy. `net-threejs` covers the browser leaf (`@net-mesh/browser`), the
+anchor bootstrap model and the networked Three.js scene store — browser-side
+TypeScript only. Full install options in
 [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
 ## What's in the box
