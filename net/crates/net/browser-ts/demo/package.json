@@ -1,0 +1,13 @@
+{
+  "name": "@net-mesh/browser-demo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Fleet: a Three.js scene driven by the real store. Not published.",
+  "type": "module",
+  "scripts": {
+    "serve": "node serve.mjs"
+  },
+  "dependencies": {
+    "three": "^0.186.0"
+  }
+}
