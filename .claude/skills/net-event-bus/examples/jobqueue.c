@@ -16,12 +16,6 @@
  */
 
 #include "net.go.h"
-/* net_rpc.h references `RpcResponseSinkHandleC` in
- * `net_rpc_streaming_handler_fn` (line ~501) before its own typedef
- * (line ~902), so including it alone fails to parse. Pre-declaring the
- * identical typedef makes the header self-consistent (C11 allows an
- * identical redefinition). */
-typedef struct RpcResponseSinkHandleC RpcResponseSinkHandleC;
 #include "net_rpc.h"
 
 #include <pthread.h>
