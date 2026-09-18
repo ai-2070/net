@@ -545,10 +545,10 @@ const A2A_FRAME_FIXED: usize = 128;
 ///   `debug_assert` in the header encoder and, in a **shipped profile**,
 ///   narrows the length into a `u16` — a corrupted frame rather than a
 ///   refusal. So the bound is enforced here, on both profiles.
-/// Then the complete framed request — envelope, both headers, the
-/// service name and the frame's own fields — is measured against one
-/// packet, because a request that does not fit is never delivered and
-/// never refused.
+/// * Then the complete framed request — envelope, both headers, the
+///   service name and the frame's own fields — is measured against one
+///   packet, because a request that does not fit is never delivered and
+///   never refused.
 fn check_proof(proof: &TaskPaymentProof, body: usize) -> Result<(), A2aFlowError> {
     let limit = net::adapter::net::cortex::MAX_RPC_HEADER_VALUE_LEN;
     let undeliverable = |detail: String| Err(A2aFlowError::ProofUndeliverable(detail));

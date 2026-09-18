@@ -142,6 +142,42 @@ async fn journal_at(path: &std::path::Path) -> A2aAdmissionJournal {
     A2aAdmissionJournal::open(path).await.expect("open journal")
 }
 
+/// Reopen a journal after its previous owner was dropped, waiting for the
+/// ownership lock to actually be released.
+///
+/// Dropping the `ServeHandle`s is not the same instant as releasing the
+/// owner, and that is by design: a launched executor future and the
+/// terminal hook each hold an `Arc<JournalOwner>` so a running task can
+/// still write after the handles are gone. A completed task's future is
+/// therefore dropped by the runtime a little *after* the work finishes,
+/// so a successor that opens immediately can legitimately lose the race
+/// and see `OwnedElsewhere`.
+///
+/// This is a bounded precondition on the observable being asserted, not
+/// a sleep that makes a flaky thing pass: the restart property is about
+/// what the successor INHERITS, and it cannot be observed until there is
+/// a successor. It fails loudly, naming the condition, rather than
+/// timing out somewhere less legible. (Found by Linux CI; on Windows the
+/// runtime happened to reap the task first, so it passed locally — the
+/// race was always there.)
+async fn journal_after_release(path: &std::path::Path) -> A2aAdmissionJournal {
+    for _ in 0..200 {
+        match A2aAdmissionJournal::open(path).await {
+            Ok(journal) => return journal,
+            Err(A2aJournalError::OwnedElsewhere { .. }) => {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("open journal: {e:?}"),
+        }
+    }
+    panic!(
+        "the previous owner never released {} — a dropped ServeHandle should not keep \
+         the journal owned once its tasks are done",
+        path.display()
+    )
+}
+
 /// Admit `record`, asserting it was admitted, and return the stored row
 /// (with its minted generation).
 async fn admit(
@@ -724,7 +760,7 @@ async fn a_gate_barrier_prune_and_reprepare_cannot_replace_a_deciding_admission(
     // Restart: a successor owner inherits that record and rewrites
     // nothing about its identity.
     drop(f.serving.take());
-    let successor = journal_at(&f.path).await;
+    let successor = journal_after_release(&f.path).await;
     let after = successor
         .lookup(f.owner(), "aba")
         .await
