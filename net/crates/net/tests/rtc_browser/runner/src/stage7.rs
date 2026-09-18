@@ -19,7 +19,9 @@
 //!
 //! Local status at the time of writing (Chromium, `--stage7`): 1, 2,
 //! 4 and 5 PASS; 3 does not, and is left failing rather than
-//! softened.
+//! softened. The full run is 52 witnesses, 1 failed — this stage no
+//! longer disturbs any other, which it did until its two identities
+//! were found to be slice 3's (see `SECRET_HOST_ENTITY`).
 //!
 //! What witness 3 has established, which is more than "it fails":
 //! ONE dropped datagram on the host's channel stalls the join past
@@ -31,7 +33,9 @@
 //! Four candidate explanations, and where each stands:
 //!
 //! 1. *The harness's offer budget refuses the attempt.* REFUTED —
-//!    raised 200 → 2000 per IP per minute, no change.
+//!    raised 200 → 2000 per IP per minute, no change. (The offer
+//!    budget stays raised; it is not the cause, and 200 was the
+//!    default for a run with far fewer contexts.)
 //! 2. *Nothing drives the replica's assembly deadline, so no resync
 //!    is ever sent.* TRUE, and fixed (`join.ts` now drives
 //!    `replica.tick()`, with its own red/green witness in
@@ -131,14 +135,23 @@ const CTX_PLAYER: &str = "stage7-ctx-player";
 /// store's `openStream({peer})` needs.
 const STORE_TAG: &str = "stage7.store";
 
+// Identities unique to this stage, and the reason that matters more
+// than it looks: an entity secret IS the node id. These constants
+// were copied from Stage 6 slice 3 (`c6…`/`c7…` and `d6…`/`d7…`), so
+// Stage 7's two leaves and slice 3's two leaves were THE SAME TWO
+// NODES. Whichever stage ran second announced under an identity the
+// anchor already held, and its capability query came back with zero
+// peers — the "the leaves did not discover each other" failure that
+// looked like a capacity problem for three rounds. Every byte here
+// has to stay distinct from `SECRET_*` in `stage6.rs`.
 const SECRET_HOST_ENTITY: &str =
-    "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6";
+    "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6";
 const SECRET_HOST_NOISE: &str =
-    "c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7";
+    "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
 const SECRET_PLAYER_ENTITY: &str =
-    "d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6";
+    "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6";
 const SECRET_PLAYER_NOISE: &str =
-    "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7";
+    "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7";
 
 /// What this stage needs from the runner.
 pub struct Cx7<'a> {

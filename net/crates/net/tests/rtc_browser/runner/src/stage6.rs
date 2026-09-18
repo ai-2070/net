@@ -989,6 +989,7 @@ pub(crate) async fn discover(
     capability: &str,
 ) -> Option<String> {
     let deadline = tokio::time::Instant::now() + DISCOVERY_DEADLINE;
+    let mut last: Option<String> = None;
     while tokio::time::Instant::now() < deadline {
         let seen = script
             .run(
@@ -1003,7 +1004,26 @@ pub(crate) async fn discover(
         if let Some(found) = noise_key_for(&seen, peer_hex) {
             return Some(found);
         }
+        // What the query DID answer, kept for the failure message.
+        // "Did not discover" is two different failures — an empty
+        // index and an index holding somebody else — and only one of
+        // them is about this pair.
+        last = Some(match seen.peers.as_ref().and_then(|p| p.as_array()) {
+            None => format!("no peers field (ok={}, {:?})", seen.ok, seen.error),
+            Some(peers) => format!(
+                "{} peer(s): {}",
+                peers.len(),
+                peers
+                    .iter()
+                    .filter_map(|e| e.get("nodeId").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        });
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(last) = last {
+        println!("[stage6] discover({tab}, {capability}) gave up; last answer: {last}");
     }
     None
 }
@@ -2269,8 +2289,14 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
         return;
     };
 
+    // The announce outcome is CARRIED, not discarded. It used to be
+    // `let _ = ...`, and the cost of that was a failure that blamed
+    // discovery for a refusal that happened one step earlier —
+    // "the leaves did not discover each other" is what an unpublished
+    // announcement looks like from here.
+    let mut announced: Vec<String> = Vec::new();
     for tab in [TAB_A, TAB_B] {
-        let _ = script
+        let said = script
             .run(
                 tab,
                 Step5::Announce {
@@ -2280,13 +2306,20 @@ async fn retry_witness(cx: &Cx6<'_>, ledger: &mut Ledger) {
                 },
             )
             .await;
+        announced.push(if said.ok {
+            format!("{tab}=ok")
+        } else {
+            format!("{tab}={:?}", said.error.unwrap_or_default())
+        });
     }
     let found_b = discover(&mut script, TAB_A, &b.node_hex, "peer", PEER_TAG).await;
     let found_a = discover(&mut script, TAB_B, &a.node_hex, "peer", PEER_TAG).await;
     if found_a.is_none() || found_b.is_none() {
-        let detail =
-            "the slice 3 leaves did not discover each other inside the announcement deadline"
-                .to_string();
+        let detail = format!(
+            "the slice 3 leaves did not discover each other inside the announcement deadline \
+             (announce: {})",
+            announced.join(" ")
+        );
         for name in P3_WITNESSES {
             ledger.record(name, false, detail.clone());
         }
