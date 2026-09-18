@@ -712,6 +712,37 @@ await probe('real_package_keeps_a_patched_proto_key_as_data', () => {
   if ({}.marker !== undefined) throw new Error('global prototype moved');
 });
 
+await probe('real_package_chunks_and_reassembles_a_snapshot', async () => {
+  const chunker = await import(new URL('store/chunker.js', dist).href);
+  const assembly = await import(new URL('store/assembly.js', dist).href);
+
+  // The budget is derived from the transport, in the built package too.
+  eq(chunker.chunkBytesFor(8104), 5934, 'derived chunk size');
+
+  const state = { crew: Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`m${i}`, i])) };
+  const split = chunker.chunkSnapshot(state, 512);
+  if (split.n < 2) throw new Error('the projection must need several chunks');
+
+  const manifest = { h: H32, g: '1', r: '1', n: split.n, bytes: String(split.bytes) };
+  const table = new assembly.AssemblyTable();
+  const open = table.open(manifest, 0);
+  let document = null;
+  for (let i = 0; i < split.n; i += 1) {
+    const outcome = open.accept({ ...manifest, i, d: split.pieces[i] }, (raw) => raw, 0);
+    if (outcome.ok !== true) throw new Error(`chunk ${i} was refused: ${outcome.reason}`);
+    if (outcome.done) document = outcome.document;
+  }
+  eq(document, state, 'the assembled snapshot');
+
+  // A conflicting duplicate refuses and reclaims, publishing nothing.
+  const second = table.open(manifest, 0);
+  second.accept({ ...manifest, i: 0, d: split.pieces[0] }, (raw) => raw, 0);
+  const conflict = second.accept({ ...manifest, i: 0, d: split.pieces[1] }, (raw) => raw, 0);
+  eq(conflict.ok, false, 'a conflicting duplicate');
+  eq(conflict.reason, 'chunk-conflict', 'the conflict reason');
+  eq(second.bytesHeld, 0, 'the bytes are given back');
+});
+
 await probe('real_package_exports_every_symbol_the_browser_harness_imports', async () => {
   const pagePath = fileURLToPath(
     new URL('../../tests/rtc_browser/page/leaf5.js', import.meta.url),
