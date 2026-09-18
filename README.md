@@ -176,17 +176,36 @@ completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
 ## What it enables
 
-A capability mesh changes what an application may assume about *where* work runs:
+Four things a capability mesh makes possible that a request/response network does not:
 
-- **Tools on other machines.** A caller discovers a capability and invokes it; the credential stays with the provider. [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke), [Agent to agent](https://ai2070.net/docs/guides/agent-to-agent).
-- **Work placed by capability.** A stateful daemon is addressed by identity, not host; placement follows capability, and migration carries a running daemon to another node with its history. [Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement), [Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration).
-- **Data that follows its readers.** Content-addressed blobs replicate toward the nodes reading them, with read-your-writes at the producer. [Dataforts](https://ai2070.net/docs/guides/dataforts).
-- **Coordination without a coordinator.** Peers observe, derive, and reroute; there is no registry, broker, or leader to operate. [Event bus](https://ai2070.net/docs/guides/event-bus), [Architecture](https://ai2070.net/docs/concepts/architecture).
-- **Cheap devices, remote compute.** A sensor announces what it produces; the mesh routes the work to a node that has the capability. [Capabilities](https://ai2070.net/docs/concepts/capabilities).
-- **Jobs that outlive a failure.** A long task can be handed to another participant with a lifecycle and an explicitly verified outcome. [Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle), [Submitted is not completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
+**Distance becomes a parameter, not a rewrite.** A call to the function beside you and a call to a
+capability across the mesh have the same shape — you name what you need, not where it lives.
+Promoting work from in-process to another host is a placement decision, not a code change.
+[Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke),
+[Architecture](https://ai2070.net/docs/concepts/architecture).
 
-These patterns show up in agent runtimes, robotics and fleet operations, industrial process
-control, edge and IoT, and local-first collaboration. Worked end to end:
+**Sensing and computation stop sharing a body.** A device can produce data without hosting the
+intelligence that acts on it, and two sensors can address each other directly. The mesh routes
+sense-to-compute and sense-to-sense, wherever each end physically is.
+[Capabilities](https://ai2070.net/docs/concepts/capabilities),
+[Dataforts](https://ai2070.net/docs/guides/dataforts).
+
+**Coordination that never funnels through a coordinator.** There is no registry, broker, or leader
+to become the ceiling. Peers observe their own neighbourhood, derive the rest, and route — so
+real-time coordination holds across fleets in the millions, where no central scheduler could watch
+them all. [Event bus](https://ai2070.net/docs/guides/event-bus),
+[Capabilities](https://ai2070.net/docs/concepts/capabilities).
+
+**Software that outlives its host.** A daemon is an identity, not a process pinned to a box —
+addressed by what it is, placed where its capabilities are, and able to move with its history when
+the hardware underneath it changes. A long job can be handed to another participant with a
+lifecycle and an explicitly verified outcome.
+[Daemons and placement](https://ai2070.net/docs/guides/daemons-and-placement),
+[Continuity and migration](https://ai2070.net/docs/guides/continuity-and-migration),
+[Task lifecycle](https://ai2070.net/docs/guides/task-lifecycle).
+
+These are the wedges that show up in agent runtimes, robotics and fleet operations, industrial
+control, edge and IoT, and local-first collaboration. Built end to end:
 [Distributed daemon](https://ai2070.net/docs/tutorials/distributed-daemon),
 [Event-sourced service](https://ai2070.net/docs/tutorials/event-sourced-service),
 [Fleet telemetry](https://ai2070.net/docs/tutorials/fleet-telemetry).
