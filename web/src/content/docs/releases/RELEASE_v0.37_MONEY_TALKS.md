@@ -73,13 +73,15 @@ Four facts are load-bearing enough to belong in the note rather than only in rus
 | `Launched`, no outcome | `interrupted { outcome_unknown }` | acknowledges the task and never relaunches | evidence retained; operator resolves |
 | `Reconcile` | `interrupted { admission_revoked }` | the same `admission_revoked` refusal, no state change | operator resolves |
 | `Terminal` | as recorded, until retention | acknowledges the task | — |
-| ledger only | `null` | `Retired` | — |
+| ledger only | `null` | free: in-body `Retired`; paid: the structured `retired` refusal → `PaidUnexecutable` | evidence retained; operator resolves |
 
 Settlement and acceptance are not atomic, and this release does not pretend they are. The payer's evidence is the billing event plus its own attempt; the provider's evidence is the journal; and the failure schematic vocabulary already had the words for it (`funds_moved: unknown`).
 
 ## Refusal shapes
 
-Payment and admission refusals are the `ERR_PAYMENT` application error with one `net-failure-schematic` reply header and a human body — byte-identical in shape to a paid tool's refusal. The reasons this slice adds: `missing_quote`, `binding_required`, `binding_rejected`, `no_reservation`, `admission_revoked`, `journal_unavailable` (the one retryable row) and `input_binding_mismatch`. Everything non-financial stays an in-body `TaskAck { accepted: false }` — unknown service, stale revision, bounds exceeded, `Busy`, `Retired`.
+Payment and admission refusals are the `ERR_PAYMENT` application error with one `net-failure-schematic` reply header and a human body — byte-identical in shape to a paid tool's refusal. The reasons this slice adds: `missing_quote`, `binding_required`, `binding_rejected`, `no_reservation`, `admission_revoked`, `journal_unavailable` (the one retryable row), `input_binding_mismatch` and `retired`. Everything non-financial stays an in-body `TaskAck { accepted: false }` — unknown service, stale revision, bounds exceeded, `Busy`.
+
+`Retired` is deliberately on **both** sides of that line, and it is the one case where the free and paid wires differ. A free submitter meeting a retired task gets the in-body ack it always got: nothing financial happened, so there is nothing to retain and nobody to escalate to. A *paid* submitter holds a proof for work the launch ledger will never run again, and prose cannot carry that — it read as retryable and stranded the charge as `Paid` for ever with no operator exit. So the paid path answers the structured `retired` reason instead, terminal in both directions (`safe_to_retry` and `safe_to_requote` both false, `funds_moved` / `prior_payment` `unknown` — the ledger proves the work ran, not what became of this payment), and the caller's attempt moves to `PaidUnexecutable` with its evidence kept.
 
 ---
 

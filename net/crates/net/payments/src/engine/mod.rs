@@ -1152,15 +1152,22 @@ impl PaymentEngine {
                             break 'claim Claim::AlreadySettled;
                         }
                         // Past this line the record holds no authoritative
-                        // outcome, so every remaining arm would take (or wait
-                        // on) a NEW settlement — which is exactly what an
-                        // expired quote may not have. The two arms above are
-                        // deliberately upstream of it: they report what this
-                        // exact purchase already did, and that answer does not
-                        // decay.
-                        if expired {
-                            break 'claim Claim::Expired;
-                        }
+                        // outcome, so every remaining arm either *reports an
+                        // admitted claim* or *takes a new settlement* — and
+                        // only the second of those decays with the quote.
+                        //
+                        // An attempt that already claimed this quote and has
+                        // not finished is this exact purchase in motion: its
+                        // authorization is exposed and its settlement may be
+                        // mid-flight at the rail. Answering a concurrent
+                        // duplicate `QuoteExpired` there would be a claim of
+                        // *non-payment* about money that is already moving,
+                        // so the in-flight answer is decided first and the
+                        // expiry bound applies to the fresh claim (and to the
+                        // takeover of a dead one) below it. The two arms
+                        // above are upstream of both: they report what this
+                        // exact purchase already did, and that answer does
+                        // not decay either.
                         if rec.in_flight {
                             // An attempt claimed this and has not finished:
                             // still running, or the process died before it
@@ -1180,6 +1187,12 @@ impl PaymentEngine {
                             if !stale {
                                 break 'claim Claim::InProgress;
                             }
+                            // Stale: taking the record over is a NEW
+                            // settlement, and that is precisely what an
+                            // expired quote may not have.
+                            if expired {
+                                break 'claim Claim::Expired;
+                            }
                             // Stale, so the attempt holding it is gone.
                             // Taking the record over with a different
                             // payload rebinds it, and the replay index has
@@ -1198,6 +1211,9 @@ impl PaymentEngine {
                             }
                             rec.in_flight_since_ns = Some(now_ns);
                             break 'claim Claim::Fresh;
+                        }
+                        if expired {
+                            break 'claim Claim::Expired;
                         }
                         // Not in flight, nothing settled, nothing billed.
                         // `release_claim` removes an unsettled record
