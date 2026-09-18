@@ -1085,6 +1085,27 @@ impl Replier {
     }
 }
 
+impl Replier {
+    /// A replier whose answer is delivered locally, for a test.
+    ///
+    /// Test-only: it exists so the shared stream dispatch
+    /// ([`crate::stream_ownership::answer_stream_request`]) can be
+    /// witnessed natively — the refusal paths in particular, which a
+    /// browser fixture holding an infallible stream type cannot reach.
+    #[cfg(test)]
+    pub(crate) fn local_for_test(generation: u64) -> (Self, oneshot::Receiver<ProxyOutcome>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                sink: Some(ReplySink::Local(tx)),
+                lease: GenerationLease::new(generation),
+                correlation: 0,
+            },
+            rx,
+        )
+    }
+}
+
 impl Drop for Replier {
     /// A replier dropped without an answer is a lost correlation, and
     /// a follower's promise that never settles is worse than a

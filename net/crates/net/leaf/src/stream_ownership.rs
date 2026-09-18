@@ -83,6 +83,109 @@ impl StreamIdentity for crate::wasm::LeafStream {
     }
 }
 
+/// What a backend can do with the streams it holds.
+///
+/// Three type-specific actions and nothing else: **which** stream an
+/// operation reaches, what the reply says and how a refusal is spelled
+/// all belong to [`answer_stream_request`], which is shared. A backend
+/// that reconstructed any of those would be a second implementation of
+/// the ownership rule, and the fixture that reconstructed its reply is
+/// exactly how "the backend cannot answer with the requested peer"
+/// came to be a comment rather than a property.
+pub trait StreamBackend {
+    /// The stream object this backend holds.
+    type Stream: StreamIdentity;
+
+    /// Open one, from the request's own fields.
+    fn open(
+        &self,
+        label: &str,
+        reliability: crate::stream::Reliability,
+        stream_id: Option<u64>,
+        channel_hash: Option<u16>,
+        peer: Option<u64>,
+    ) -> Result<Self::Stream, crate::leader::ProxyFailure>;
+
+    /// Put bytes on one this backend owns.
+    fn send(
+        &self,
+        stream: &Self::Stream,
+        payload: &[u8],
+    ) -> Result<(), crate::leader::ProxyFailure>;
+
+    /// Give one up.
+    fn close(&self, stream: Self::Stream);
+}
+
+/// Answer one stream request, for either backend.
+///
+/// Every decision is here: the handle an operation addresses, the
+/// identity the open reply carries, and the refusal a closed handle
+/// gets. `None` is returned for a request this does not handle, so a
+/// caller's `match` keeps its other arms.
+pub fn answer_stream_request<B: StreamBackend>(
+    owned: &StreamOwnership<B::Stream>,
+    backend: &B,
+    request: crate::leader::LeaderRequest,
+    reply: crate::leader::Replier,
+) -> Option<crate::leader::LeaderRequest> {
+    use crate::error::LeafError;
+    use crate::leader::{LeaderRequest, ProxyFailure};
+
+    match request {
+        LeaderRequest::StreamOpen {
+            label,
+            reliability,
+            stream_id,
+            channel_hash,
+            peer,
+        } => {
+            match backend.open(&label, reliability, stream_id, channel_hash, peer) {
+                Ok(stream) => match owned.adopt(stream) {
+                    // The identity comes off the stream the node
+                    // opened. The requested `peer` is not in scope
+                    // here, so it cannot be answered with.
+                    Ok((handle, id)) => {
+                        reply.stream(handle, id.wire_id, id.peer, id.incarnation);
+                    }
+                    Err(stream) => {
+                        // Fail closed: a stream whose identity cannot
+                        // be read is given back to be closed, not
+                        // handed over with an unknown peer.
+                        backend.close(stream);
+                        reply.fail(ProxyFailure::Typed(LeafError::Session(
+                            "opened stream did not report a readable identity".into(),
+                        )));
+                    }
+                },
+                Err(failure) => reply.fail(failure),
+            }
+            None
+        }
+        LeaderRequest::StreamSend { handle, payload } => {
+            match owned.with(handle, |stream| backend.send(stream, &payload)) {
+                Some(Ok(())) => reply.bytes(bytes::Bytes::new()),
+                Some(Err(failure)) => reply.fail(failure),
+                // The handle names one open, so this is "your stream
+                // is closed", never "some other peer's stream under
+                // the same wire id".
+                None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
+                    "no open stream for handle {handle}"
+                )))),
+            }
+            None
+        }
+        LeaderRequest::StreamClose { handle } => {
+            if let Some(stream) = owned.remove(handle) {
+                backend.close(stream);
+            }
+            reply.bytes(bytes::Bytes::new());
+            None
+        }
+        other => Some(other),
+    }
+}
+
 /// The streams one backend owns, addressed by handle.
 pub struct StreamOwnership<T> {
     streams: RefCell<HashMap<u64, T>>,
@@ -300,6 +403,208 @@ mod tests {
         ] {
             assert_eq!(resolve_identity(id, peer, inc), None, "{why}");
         }
+    }
+
+    /// The shared dispatch's own contract, natively.
+    ///
+    /// The browser witnesses drive this function through two real
+    /// backends, but a `StreamHandle`'s identity cannot fail, so the
+    /// refusal paths are unreachable from there. They are reachable
+    /// here, over a backend that fails on purpose — which is what
+    /// makes "an unresolvable identity is refused **and the stream
+    /// given back to be closed**" a witnessed rule rather than a line
+    /// of prose.
+    struct SpyBackend {
+        resolvable: bool,
+        closed: Cell<usize>,
+        sent: RefCell<Vec<Vec<u8>>>,
+    }
+
+    /// A stream that can be made unresolvable.
+    struct SpyStream {
+        resolvable: bool,
+    }
+
+    impl StreamIdentity for SpyStream {
+        fn identity(&self) -> Option<ResolvedIdentity> {
+            self.resolvable.then_some(ResolvedIdentity {
+                wire_id: 9,
+                peer: 0xaa,
+                incarnation: 1,
+            })
+        }
+    }
+
+    impl StreamBackend for SpyBackend {
+        type Stream = SpyStream;
+
+        fn open(
+            &self,
+            _label: &str,
+            _reliability: crate::stream::Reliability,
+            _stream_id: Option<u64>,
+            _channel_hash: Option<u16>,
+            _peer: Option<u64>,
+        ) -> Result<Self::Stream, crate::leader::ProxyFailure> {
+            Ok(SpyStream {
+                resolvable: self.resolvable,
+            })
+        }
+
+        fn send(
+            &self,
+            _stream: &Self::Stream,
+            payload: &[u8],
+        ) -> Result<(), crate::leader::ProxyFailure> {
+            self.sent.borrow_mut().push(payload.to_vec());
+            Ok(())
+        }
+
+        fn close(&self, _stream: Self::Stream) {
+            self.closed.set(self.closed.get() + 1);
+        }
+    }
+
+    fn spy(resolvable: bool) -> SpyBackend {
+        SpyBackend {
+            resolvable,
+            closed: Cell::new(0),
+            sent: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn answer(
+        owned: &StreamOwnership<SpyStream>,
+        backend: &SpyBackend,
+        request: crate::leader::LeaderRequest,
+    ) -> crate::leader::ProxyOutcome {
+        let (reply, mut rx) = crate::leader::Replier::local_for_test(1);
+        assert!(answer_stream_request(owned, backend, request, reply).is_none());
+        rx.try_recv()
+            .expect("the replier answered")
+            .expect("exactly one answer")
+    }
+
+    fn open_request(peer: Option<u64>) -> crate::leader::LeaderRequest {
+        crate::leader::LeaderRequest::StreamOpen {
+            label: "l".into(),
+            reliability: crate::stream::Reliability::Reliable,
+            stream_id: Some(9),
+            channel_hash: None,
+            peer,
+        }
+    }
+
+    #[test]
+    fn the_open_reply_carries_the_resolved_identity_not_the_requested_peer() {
+        let owned = StreamOwnership::default();
+        let backend = spy(true);
+
+        // The request names a DIFFERENT peer from the one the stream
+        // resolves to, which is the case that separates "resolved"
+        // from "echoed". An unnamed-peer open is the same case with
+        // `None`.
+        for requested in [None, Some(0xbbbb)] {
+            let outcome = answer(&owned, &backend, open_request(requested));
+            match outcome.expect("opened") {
+                crate::leader::ProxyValue::Stream {
+                    peer,
+                    stream_id,
+                    incarnation,
+                    ..
+                } => {
+                    assert_eq!(peer, 0xaa, "the reply must carry the resolved peer");
+                    assert_eq!(stream_id, 9);
+                    assert_eq!(incarnation, 1);
+                }
+                other => panic!("expected a stream answer, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_open_is_refused_and_the_stream_is_closed() {
+        let owned = StreamOwnership::default();
+        let backend = spy(false);
+
+        let outcome = answer(&owned, &backend, open_request(Some(0xaa)));
+
+        assert!(outcome.is_err(), "an unresolvable identity must be refused");
+        assert_eq!(
+            backend.closed.get(),
+            1,
+            "the stream must be given back and closed, not leaked open"
+        );
+        assert!(owned.is_empty(), "nothing is owned after a refusal");
+    }
+
+    #[test]
+    fn a_send_reaches_the_stream_its_handle_owns() {
+        let owned = StreamOwnership::default();
+        let backend = spy(true);
+        let first = match answer(&owned, &backend, open_request(None)).expect("open") {
+            crate::leader::ProxyValue::Stream { handle, .. } => handle,
+            other => panic!("{other:?}"),
+        };
+        let second = match answer(&owned, &backend, open_request(None)).expect("open") {
+            crate::leader::ProxyValue::Stream { handle, .. } => handle,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(first, second);
+
+        assert!(answer(
+            &owned,
+            &backend,
+            crate::leader::LeaderRequest::StreamSend {
+                handle: second,
+                payload: bytes::Bytes::from_static(b"two"),
+            }
+        )
+        .is_ok());
+        assert_eq!(backend.sent.borrow().len(), 1);
+
+        // Closing one leaves the other, and the closed handle is then
+        // refused rather than reaching the survivor.
+        assert!(answer(
+            &owned,
+            &backend,
+            crate::leader::LeaderRequest::StreamClose { handle: first }
+        )
+        .is_ok());
+        assert_eq!(backend.closed.get(), 1);
+        let refused = answer(
+            &owned,
+            &backend,
+            crate::leader::LeaderRequest::StreamSend {
+                handle: first,
+                payload: bytes::Bytes::from_static(b"after"),
+            },
+        );
+        assert!(refused.is_err(), "a closed handle must be refused");
+        assert_eq!(
+            backend.sent.borrow().len(),
+            1,
+            "a closed handle's send must not reach the surviving stream"
+        );
+    }
+
+    #[test]
+    fn a_request_this_dispatch_does_not_handle_is_returned() {
+        let owned: StreamOwnership<SpyStream> = StreamOwnership::default();
+        let backend = spy(true);
+        let (reply, _rx) = crate::leader::Replier::local_for_test(1);
+
+        let returned = answer_stream_request(
+            &owned,
+            &backend,
+            crate::leader::LeaderRequest::Counters,
+            reply,
+        );
+
+        assert!(
+            returned.is_some(),
+            "a caller's other arms must still see it"
+        );
     }
 
     #[test]

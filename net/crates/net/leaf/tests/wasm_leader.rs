@@ -71,7 +71,7 @@ use net_leaf::leader_session::{
 use net_leaf::rtc::RtcLeafTransport;
 use net_leaf::storage::IdentityVault;
 use net_leaf::stream::Reliability;
-use net_leaf::stream_ownership::StreamOwnership;
+use net_leaf::stream_ownership::{answer_stream_request, StreamBackend, StreamOwnership};
 use net_leaf::{LeafIdentity, StreamHandle};
 
 // The point is a real browser engine: IndexedDB, `crypto.subtle`,
@@ -591,108 +591,16 @@ impl LeaderBackend for RealNodeBackend {
             }
             LeaderRequest::Counters | LeaderRequest::Query { .. } => reply.text("[]".into()),
             LeaderRequest::IsEnrolled => reply.flag(true),
-            // A real stream on the real node, in the real stream
-            // table — the same shape production's `NodeBackend` keeps.
-            LeaderRequest::StreamOpen {
-                label,
-                reliability,
-                stream_id,
-                channel_hash,
-                peer,
-            } => {
-                let opened = handles.node.borrow_mut().open_stream(
-                    // The request's peer when it names one, and this
-                    // double's own peer otherwise — the same
-                    // "absent means the anchor" rule the real backend
-                    // applies.
-                    peer.unwrap_or(handles.peer),
-                    &label,
-                    reliability,
-                    stream_id,
-                    channel_hash,
-                );
-                match opened {
-                    Ok(handle) => {
-                        // The production seam, exactly as
-                        // `NodeBackend` uses it: `adopt` allocates the
-                        // handle AND resolves the identity, so this arm
-                        // cannot answer with the requested peer either.
-                        match handles.streams.adopt(handle) {
-                            Ok((owner, id)) => {
-                                reply.stream(owner, id.wire_id, id.peer, id.incarnation);
-                            }
-                            Err(_) => reply.fail(ProxyFailure::Typed(LeafError::Session(
-                                "opened stream did not report a readable identity".into(),
-                            ))),
-                        }
-                    }
-                    Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
-                }
-            }
-            // **Synchronous, and that is the whole point.**
-            // Production's `NodeBackend::StreamSend` is this arm: it
-            // calls a real `wasm::LeafStream::send`, which pumps the
-            // node, drives reliability and *dispatches every event
-            // that produced* before returning — all of it inside the
-            // `Shared.server` borrow its caller is holding. So this
-            // arm pumps and delivers to the production sink in the
-            // same frame, rather than spawning.
-            LeaderRequest::StreamSend {
-                handle: owner,
-                payload,
-            } => {
-                let handle = handles.streams.with(owner, |handle| *handle);
-                let Some(handle) = handle else {
-                    reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
-                        "no open stream for handle {owner}"
-                    ))));
-                    return;
-                };
-                let sink = handles.sink.borrow().clone();
-                let (outcome, events) = {
-                    let mut node = handles.node.borrow_mut();
-                    let outcome = node.stream_send(handle, &payload);
-                    // The pump. `wasm::LeafStream::send` ends in
-                    // `Inner::pump`, which ticks the node — so a
-                    // retransmit budget really can expire inside one
-                    // synchronous send. `sweeps` is how many ticks
-                    // this pump runs; the elapsed time is real,
-                    // because `ReliableStream::get_timed_out` reads
-                    // the clock itself rather than taking the tick's
-                    // argument, which is why the test waits between
-                    // sweeps instead of arithmetic on `now`.
-                    for _ in 0..handles.sweeps.get() {
-                        node.tick(net_leaf::clock::now());
-                    }
-                    let produced = node.take_outbound();
-                    handles.sent.set(handles.sent.get() + produced.len());
-                    handles
-                        .wire
-                        .borrow_mut()
-                        .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
-                    (outcome, node.drain_events())
-                };
-                if let Some(sink) = sink {
-                    for event in &events {
-                        sink(&event.to_json());
-                    }
-                }
-                match outcome {
-                    Ok(()) => reply.bytes(Bytes::new()),
-                    Err(error) => reply.fail(ProxyFailure::Reported(error.to_string())),
-                }
-            }
-            // Production's `NodeBackend::StreamClose` is this arm: it
-            // gives up the stream the handle owns and closes it on the
-            // node. Without this arm a close-A-leaves-B witness passes
-            // without closing anything.
-            LeaderRequest::StreamClose { handle: owner } => {
-                if let Some(handle) = handles.streams.remove(owner) {
-                    let mut node = handles.node.borrow_mut();
-                    let _ = node.close_stream(handle);
-                    node.take_outbound();
-                }
-                reply.bytes(Bytes::new());
+            // The SAME shared dispatch production uses. This fixture
+            // supplies only the three type-specific actions
+            // (`StreamBackend` below), so it cannot reconstruct the
+            // reply — which is exactly how the production identity
+            // wiring stayed untested while only `adopt` was shared.
+            other @ (LeaderRequest::StreamOpen { .. }
+            | LeaderRequest::StreamSend { .. }
+            | LeaderRequest::StreamClose { .. }) => {
+                let owned = handles.streams.clone();
+                answer_stream_request(&owned, self, other, reply);
             }
             _ => reply.bytes(Bytes::new()),
         }
@@ -865,6 +773,76 @@ fn add_peer(handles: &RealNode) -> (net_leaf::LeafNode, u64) {
     peer.drain_events();
     handles.node.borrow_mut().take_outbound();
     (peer, peer_id)
+}
+
+impl StreamBackend for RealNodeBackend {
+    type Stream = StreamHandle;
+
+    fn open(
+        &self,
+        label: &str,
+        reliability: Reliability,
+        stream_id: Option<u64>,
+        channel_hash: Option<u16>,
+        peer: Option<u64>,
+    ) -> Result<Self::Stream, ProxyFailure> {
+        self.handles
+            .node
+            .borrow_mut()
+            .open_stream(
+                // The request's peer when it names one, and this
+                // double's own peer otherwise — the same "absent means
+                // the anchor" rule the real backend applies.
+                peer.unwrap_or(self.handles.peer),
+                label,
+                reliability,
+                stream_id,
+                channel_hash,
+            )
+            .map_err(|error| ProxyFailure::Reported(error.to_string()))
+    }
+
+    /// **Synchronous, and that is the whole point.**
+    ///
+    /// Production's `NodeBackend::send` calls a real
+    /// `wasm::LeafStream::send`, which pumps the node, drives
+    /// reliability and *dispatches every event that produced* before
+    /// returning — all inside the `Shared.server` borrow its caller
+    /// holds. So this pumps and delivers to the production sink in the
+    /// same frame rather than spawning.
+    fn send(&self, stream: &Self::Stream, payload: &[u8]) -> Result<(), ProxyFailure> {
+        let handles = &self.handles;
+        let sink = handles.sink.borrow().clone();
+        let (outcome, events) = {
+            let mut node = handles.node.borrow_mut();
+            let outcome = node.stream_send(*stream, payload);
+            // `sweeps` is how many ticks this pump runs; the elapsed
+            // time is real, because `get_timed_out` reads the clock
+            // itself rather than taking the tick's argument.
+            for _ in 0..handles.sweeps.get() {
+                node.tick(net_leaf::clock::now());
+            }
+            let produced = node.take_outbound();
+            handles.sent.set(handles.sent.get() + produced.len());
+            handles
+                .wire
+                .borrow_mut()
+                .extend(produced.into_iter().map(|out| (out.peer, out.packet)));
+            (outcome, node.drain_events())
+        };
+        if let Some(sink) = sink {
+            for event in &events {
+                sink(&event.to_json());
+            }
+        }
+        outcome.map_err(|error| ProxyFailure::Reported(error.to_string()))
+    }
+
+    fn close(&self, stream: Self::Stream) {
+        let mut node = self.handles.node.borrow_mut();
+        let _ = node.close_stream(stream);
+        node.take_outbound();
+    }
 }
 
 fn real_factory(handles: RealNode) -> BackendFactory {

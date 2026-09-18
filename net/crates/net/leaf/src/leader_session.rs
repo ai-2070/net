@@ -65,7 +65,7 @@ use crate::leader::{
 use crate::rpc::DEFAULT_CALL_TIMEOUT_MS;
 use crate::storage::{IdentityVault, DEFAULT_DB_NAME};
 use crate::stream::Reliability;
-use crate::stream_ownership::StreamOwnership;
+use crate::stream_ownership::{answer_stream_request, StreamBackend, StreamOwnership};
 
 /// How often a leader revalidates its generation against the store.
 ///
@@ -2020,88 +2020,67 @@ impl LeaderBackend for NodeBackend {
                     }
                 })
             }
-            LeaderRequest::StreamOpen {
-                label,
-                reliability,
-                stream_id,
-                channel_hash,
-                peer,
-            } => {
-                let opts = Object::new();
-                let spelling = match reliability {
-                    Reliability::Reliable => "reliable",
-                    Reliability::FireAndForget => "fireAndForget",
-                };
-                if set(&opts, "reliability", &JsValue::from_str(spelling))
-                    .and_then(|()| set(&opts, "label", &JsValue::from_str(&label)))
-                    .is_err()
-                {
-                    reply.fail(ProxyFailure::Typed(LeafError::Session(
-                        "could not build the stream options".into(),
-                    )));
-                    return;
-                }
-                if let Some(id) = stream_id {
-                    let _ = set(&opts, "streamId", &JsValue::from_str(&id.to_string()));
-                }
-                if let Some(hash) = channel_hash {
-                    let _ = set(&opts, "channelHash", &JsValue::from_f64(f64::from(hash)));
-                }
-                if let Some(peer) = peer {
-                    // 16 lowercase hex, the only spelling the direct
-                    // surface accepts — a decimal id addresses a
-                    // different node rather than failing, which is
-                    // why the conversion happens here and not in the
-                    // page.
-                    let _ = set(&opts, "peer", &JsValue::from_str(&format!("{peer:016x}")));
-                }
-                match node.open_stream(opts.into()) {
-                    Ok(stream) => {
-                        // `adopt` resolves the identity off the stream
-                        // the node actually opened and allocates the
-                        // handle that owns it. The reply is built from
-                        // what it returns, so this arm cannot answer
-                        // with the peer the caller asked for.
-                        match self.streams.adopt(stream) {
-                            Ok((handle, id)) => {
-                                reply.stream(handle, id.wire_id, id.peer, id.incarnation);
-                            }
-                            Err(stream) => {
-                                // Fail closed: a stream whose identity
-                                // cannot be read is closed again, not
-                                // handed over with an unknown peer.
-                                stream.close();
-                                reply.fail(ProxyFailure::Typed(LeafError::Session(
-                                    "opened stream did not report a readable identity".into(),
-                                )));
-                            }
-                        }
-                    }
-                    Err(error) => reply.fail(reported(error)),
-                }
-            }
-            LeaderRequest::StreamSend { handle, payload } => {
-                let sent = self
-                    .streams
-                    .with(handle, |stream| stream.send(Uint8Array::from(&payload[..])));
-                match sent {
-                    Some(Ok(())) => reply.bytes(Bytes::new()),
-                    Some(Err(error)) => reply.fail(reported(error)),
-                    // The handle names one open, so this is "your
-                    // stream is closed", never "some other peer's
-                    // stream under the same wire id".
-                    None => reply.fail(ProxyFailure::Typed(LeafError::Session(format!(
-                        "no open stream for handle {handle}"
-                    )))),
-                }
-            }
-            LeaderRequest::StreamClose { handle } => {
-                if let Some(stream) = self.streams.remove(handle) {
-                    stream.close();
-                }
-                reply.bytes(Bytes::new());
+            // Every stream request goes through the shared dispatch:
+            // it owns which stream an operation reaches, what the open
+            // reply says, and how a closed handle is refused. This
+            // backend supplies only the three type-specific actions
+            // (`StreamBackend`), so there is no reply construction here
+            // to answer with the requested peer instead of the
+            // resolved one.
+            other @ (LeaderRequest::StreamOpen { .. }
+            | LeaderRequest::StreamSend { .. }
+            | LeaderRequest::StreamClose { .. }) => {
+                answer_stream_request(&self.streams.clone(), self, other, reply);
             }
         }
+    }
+}
+
+impl StreamBackend for NodeBackend {
+    type Stream = crate::wasm::LeafStream;
+
+    /// Build the direct surface's options and open. The peer is
+    /// converted to the 16-hex spelling that surface accepts, because
+    /// a decimal id addresses a different node rather than failing.
+    fn open(
+        &self,
+        label: &str,
+        reliability: Reliability,
+        stream_id: Option<u64>,
+        channel_hash: Option<u16>,
+        peer: Option<u64>,
+    ) -> Result<Self::Stream, ProxyFailure> {
+        let opts = Object::new();
+        let spelling = match reliability {
+            Reliability::Reliable => "reliable",
+            Reliability::FireAndForget => "fireAndForget",
+        };
+        if set(&opts, "reliability", &JsValue::from_str(spelling))
+            .and_then(|()| set(&opts, "label", &JsValue::from_str(label)))
+            .is_err()
+        {
+            return Err(ProxyFailure::Typed(LeafError::Session(
+                "could not build the stream options".into(),
+            )));
+        }
+        if let Some(id) = stream_id {
+            let _ = set(&opts, "streamId", &JsValue::from_str(&id.to_string()));
+        }
+        if let Some(hash) = channel_hash {
+            let _ = set(&opts, "channelHash", &JsValue::from_f64(f64::from(hash)));
+        }
+        if let Some(peer) = peer {
+            let _ = set(&opts, "peer", &JsValue::from_str(&format!("{peer:016x}")));
+        }
+        self.node.open_stream(opts.into()).map_err(reported)
+    }
+
+    fn send(&self, stream: &Self::Stream, payload: &[u8]) -> Result<(), ProxyFailure> {
+        stream.send(Uint8Array::from(payload)).map_err(reported)
+    }
+
+    fn close(&self, stream: Self::Stream) {
+        stream.close();
     }
 }
 
