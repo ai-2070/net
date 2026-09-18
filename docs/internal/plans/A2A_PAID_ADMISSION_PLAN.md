@@ -4,40 +4,48 @@
 
 **The sentence:** an A2A service is *explicitly* free or paid by provider configuration; a paid task is **prepared** (validated, capacity-reserved, provider-minted admission id) before any money moves, **purchased** against that exact reservation with a durable caller-side attempt that is resumed rather than re-quoted, **submitted** with the evidence, and **launched once** under a lifetime-exclusive journal owner — and a crash anywhere between money and work leaves a recoverable record rather than a second charge or a second run.
 
-**Status: IMPLEMENTED and under independent review, revision 4.** Every WS-A…WS-F
-box below is ticked, all 50 §4 acceptance witnesses exist in the tree, and the
-38 public surfaces this plan names resolve. Landed in `101145315` (WS-A/B/C) and
-`af0f28ad1` (WS-D/E/F), plus `047245bcf`; the two upstream gaps in `faf4ff29b` /
-`1ed757629`. Revision 1 was held for six architecture-level gaps; revision 2 for
-five state-machine/persistence contract gaps; revision 3 for two branch/table
-inconsistencies. §0.1 indexes each finding to the section and witness that closes
-it. Source-grounded against this worktree.
+**Status: ACCEPTED at `efe9707f2`, revision 4.** The independent-review HOLD is
+lifted for the Net-side prerequisite. Every WS-A…WS-F box below is ticked, all
+50 §4 acceptance witnesses exist in the tree, and the 38 public surfaces this
+plan names resolve. Landed in `101145315` (WS-A/B/C) and `af0f28ad1`
+(WS-D/E/F), plus `047245bcf`; the two upstream gaps in `faf4ff29b` /
+`1ed757629`.
 
-**Review state (this is what is actually outstanding).** Three
-independent-reviewer HOLD packets have been worked:
+**The review ledger, closed.** Four independent-reviewer HOLD packets:
 
 | Packet | Against | Findings | Disposition |
 |---|---|---|---|
-| 1 | `1ed7576` | R1–R13 | closed over rounds 1–2, credited |
-| 2 | `0743ca779` | C1–C8 | C1, C3, C4, C8 credited; C5 credited for the production route |
-| 3 | `84d178407` | D1–D4 + the C5 witness | repaired in `4a693ec99` + `22ba85f9a`, awaiting review |
+| 1 | `1ed7576` | R1–R13 | closed over rounds 1–2 |
+| 2 | `0743ca779` | C1–C8 | repaired in `954eee853` |
+| 3 | `84d178407` | D1–D4 + the C5 witness | repaired in `4a693ec99` + `22ba85f9a` |
+| 4 | `1067c6fee` | D2 existing-archive branch | repaired in `efe9707f2` |
 
-The third packet was bounded: "remaining findings are within C2/C6/C7 and the
-previously required C5 witness, not a new architecture or hardening round."
-Her counts were reproduced before any repair (provider 2 failed, caller 3
-failed) and every one of her probes now passes, each with an inverse receipt
-recorded in the two commits above.
+Every packet's counts were reproduced before any repair, and every repair
+carries an inverse receipt — the production change reverted, the probe watched
+to redden with its own message, restored byte-identical by sha256. **No
+implementation finding in this ledger remains open.**
 
-Current candidate `1067c6fee`, green on exact-head CI —
-[46/46 jobs](https://github.com/ai-2070/net/actions/runs/35395627084), now 16
-A2A enforced steps. **The reviewer has not yet ruled on round 4**, so the HOLD
-stands.
+Exact-head CI at the accepted SHA:
+[46/46 jobs](https://github.com/ai-2070/net/actions/runs/35399104134), with 17
+A2A enforced steps including all three round-4 probe steps.
 
-Per-blocker closure map for packet 2: `docs/internal/reviews/A2A_C1_C8_CLOSURE_MAP.md`.
-Packet 3 is vendored at `docs/internal/reviews/round4/`. The list of
-properties still unproven and explicitly not claimed is unchanged: real
-settlement rails, the installed-wheel protected *paid* lifecycle, platform
-power-loss durability, a cross-process org-authority harness.
+Packets are vendored at `docs/internal/reviews/` (packet 2 plus its closure map
+`A2A_C1_C8_CLOSURE_MAP.md`), `round4/` and `round4b/`.
+
+**What acceptance does NOT establish.** The reviewer was explicit, and so is
+this file: no real settlement rails and no authorization to move real funds; no
+installed-wheel protected *paid* lifecycle qualification; no
+cross-process/cross-host organization-authority evidence; no platform
+power-loss durability proof; no working `hermes-net` plugin or real unattended
+Hermes execution. The shipped-wheel historical-resolution witness is **not** a
+protected paid lifecycle witness.
+
+**Next bounded slice** is the parent `hermes-net` plan's G1: qualify unattended
+execution through supported Hermes gateway APIs — dedicated service profile,
+constrained effective tools, exact job/result correlation, cancellation
+reaching the specific execution — under free/mock payment conditions until the
+real-rail release gate is separately qualified. Do not reopen this Net
+state-machine slice without a concrete regression.
 
 **Deltas from the plan as written**, all deliberate and witnessed:
 
