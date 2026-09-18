@@ -63,9 +63,73 @@
 //! all-free catalog therefore needs no journal, and a handler written
 //! against the trait never learns which one it has.
 //!
+//! # Identity, not a state tag
+//!
+//! Every record carries an immutable, monotonic
+//! [`generation`](AdmissionRecord::generation) minted by the store when
+//! the row is created, and its [`identity`](AdmissionRecord::identity)
+//! is that generation plus the `admission_id` a purchase hash commits
+//! to and the `commitment` of the brief. **Every write that lands after
+//! an await re-presents the record it decided against**
+//! ([`AdmissionStore::redeem`], [`AdmissionStore::open_decision`],
+//! [`AdmissionStore::close_decision`],
+//! [`AdmissionStore::delete_reservation`]) and the store refuses it
+//! unless the row under that key is still the same incarnation — not
+//! merely because the state tag still matches. A replacement row
+//! (reprepare, or prune-then-reprepare) mints a **new** generation, so a
+//! decision taken against an older one can never land on it. The
+//! generation counter is persisted and never rewound by pruning, a
+//! recreated row or a restart, so an incarnation number is never reused.
+//!
+//! A refused post-await write is **retryable**, never a verdict about
+//! money — and when the refused write carries a redemption the gate
+//! already granted, that evidence is retained against the **original**
+//! admission as a detached record (see below) rather than dropped or
+//! attached to the replacement.
+//!
+//! # Capacity is held across the decision
+//!
+//! [`AdmissionStore::admit_reserved`] counts what holds capacity and
+//! inserts (or re-acquires) the reservation **in one transaction**, so
+//! two prepares of distinct tasks cannot both pass a ceiling of one.
+//! [`AdmissionStore::open_decision`] then marks the record
+//! [`deciding`](AdmissionRecord::deciding): it holds its slot for as
+//! long as the decision runs, whatever its reservation clock says, and
+//! it is excluded from pruning and from a sibling's
+//! `delete_reservation`. So an awaited preflight or redemption cannot
+//! have its slot taken by a competitor and then land against a stale
+//! time sample.
+//!
+//! The hold belongs to the owner that took it — liveness *is* the lock —
+//! so a successor clears every inherited hold at
+//! [`open`](A2aAdmissionJournal::open).
+//!
+//! # Detached admissions
+//!
+//! An admission whose row left its key — aged out of reservation
+//! retention, or replaced — is kept as a **detached** record when it was
+//! purchasable (a quote may have committed to its purchase hash and can
+//! still be presented). A redemption that arrives for one is recorded
+//! *there*, in the unresolved-financial class: reported by
+//! [`AdmissionStore::unresolved`], never pruned automatically, and
+//! closable only by an operator [`AdmissionStore::resolve`].
+//!
+//! # Writes complete, then publish durably
+//!
+//! The whole publish — temp file, `sync_all`, rename, directory barrier —
+//! runs in a **cancellation-independent worker** that owns the
+//! transaction locks, so aborting a store-operation future cannot
+//! release a guard while filesystem work is still in flight, and a
+//! successor's write cannot reuse the temp path (created exclusively,
+//! named after the full destination filename) or race the rename.
+//!
 //! An [`A2aJournalError::Io`] leaves the file **untouched** (the rename
 //! is what publishes a write), which is what lets the serving path keep
-//! its rule: *nothing runs unless the claim write returned `Ok`*.
+//! its rule: *nothing runs unless the claim write returned `Ok`*. An
+//! [`A2aJournalError::Ambiguous`] is the one outcome that does **not**
+//! promise that: the rename landed and only its durability is
+//! unconfirmed, so the write may survive a power loss. It is retryable
+//! and must never be read as "the file is unchanged".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -107,6 +171,28 @@ pub enum A2aJournalError {
         /// What was refused, and what the record actually holds.
         reason: String,
     },
+    /// The record this decision was taken against is no longer the one
+    /// under its key: it was replaced by a later incarnation, or it left
+    /// the key entirely. The write was **not** applied to the
+    /// replacement.
+    ///
+    /// Distinct from [`Conflict`](Self::Conflict) because it is not a
+    /// programming error and not a state-tag mismatch — the tag may
+    /// match perfectly. If the refused write carried a redemption, that
+    /// evidence was retained as a detached record of the original
+    /// admission and is reported by [`AdmissionStore::unresolved`].
+    #[error(
+        "admission {admission_id:?} of task {task_id:?} (generation {generation}) was \
+         superseded; the decision taken against it was not applied"
+    )]
+    Superseded {
+        /// The task id whose row was replaced.
+        task_id: String,
+        /// The admission id the decision was taken against.
+        admission_id: Option<String>,
+        /// The incarnation the decision was taken against.
+        generation: u64,
+    },
     /// An I/O failure reading or writing the journal. The file is
     /// unchanged.
     #[error("admission journal I/O error at {path}: {reason}")]
@@ -114,6 +200,22 @@ pub enum A2aJournalError {
         /// The path involved.
         path: String,
         /// The stringified underlying error.
+        reason: String,
+    },
+    /// The write was **published** — the rename landed and a reader sees
+    /// it — but its durability could not be confirmed, so a power loss
+    /// may or may not recover it.
+    ///
+    /// The one refusal that must never be read as "the file is
+    /// unchanged": a caller that treats this like [`Io`](Self::Io) would
+    /// conclude nothing happened while the store already moved.
+    /// Retryable — a retry re-reads the published state and either
+    /// confirms it or applies the write again.
+    #[error("admission journal at {path} was published but not confirmed durable: {reason}")]
+    Ambiguous {
+        /// The path involved.
+        path: String,
+        /// Why durability could not be confirmed.
         reason: String,
     },
     /// The journal file exists but does not parse. Refused rather than
@@ -389,6 +491,31 @@ pub struct AdmissionRecord {
     /// Gate denials and header mismatches: audit, never a state change.
     #[serde(default)]
     pub attempts: Vec<AttemptNote>,
+    /// The immutable incarnation number of this row, minted by the store
+    /// when it was created and never rewritten. A replacement row under
+    /// the same key always gets a higher one, and the counter is
+    /// persisted, so an incarnation is never reused after a prune, a
+    /// recreated row, or a restart.
+    ///
+    /// `0` on a record a caller built for insertion (the store mints the
+    /// real one) and on a row written before this field existed — in
+    /// which case the store's counter is raised past every generation it
+    /// finds, so the next mint is still unique.
+    #[serde(default)]
+    pub generation: u64,
+    /// Whether a decision (an awaited preflight, a redemption) is open
+    /// against this exact incarnation. A deciding record holds its
+    /// capacity slot whatever its reservation clock says, and neither
+    /// [`prune`](AdmissionStore::prune) nor a sibling's
+    /// [`delete_reservation`](AdmissionStore::delete_reservation) may
+    /// remove it.
+    ///
+    /// Cleared by whatever ends the decision: every state change, an
+    /// explicit [`close_decision`](AdmissionStore::close_decision), or a
+    /// successor owner at [`open`](A2aAdmissionJournal::open) — the hold
+    /// belongs to the owner that took it.
+    #[serde(default)]
+    pub deciding: bool,
 }
 
 impl AdmissionRecord {
@@ -426,18 +553,46 @@ impl AdmissionRecord {
             },
             updated_at: now,
             attempts: Vec::new(),
+            // Minted by the store on insert: a caller cannot choose its
+            // own incarnation number.
+            generation: 0,
+            deciding: false,
+        }
+    }
+
+    /// What a post-await write must re-present: this exact incarnation,
+    /// the admission id a purchase hash commits to, and the brief's
+    /// commitment.
+    pub fn identity(&self) -> AdmissionIdentity {
+        AdmissionIdentity {
+            owner: self.owner,
+            task_id: self.task_id.clone(),
+            generation: self.generation,
+            admission_id: self.admission_id.clone(),
+            commitment: self.commitment.clone(),
         }
     }
 
     /// Whether this record still holds capacity at `now`: every state
     /// except a lapsed reservation, a recorded terminal, and a revoked
-    /// admission.
+    /// admission — and a lapsed reservation **does** still hold it while
+    /// a decision is open against it, which is what keeps a competitor
+    /// from taking the slot an awaited redemption is still using.
     pub fn holds_capacity(&self, now: u64) -> bool {
         match &self.state {
-            AdmissionState::Reserved { expires_at } => *expires_at > now,
+            AdmissionState::Reserved { expires_at } => *expires_at > now || self.deciding,
             AdmissionState::Paid { .. } | AdmissionState::Launched { .. } => true,
             AdmissionState::Terminal { .. } | AdmissionState::Reconcile { .. } => false,
         }
+    }
+
+    /// Whether a purchase could still be presented against this
+    /// admission: it is priced and carries the provider-minted
+    /// `admission_id` a quote's input hash commits to. Such a record is
+    /// retained as a detached admission rather than dropped when its row
+    /// leaves its key.
+    fn purchasable(&self) -> bool {
+        self.paid && self.admission_id.is_some()
     }
 }
 
@@ -488,6 +643,82 @@ pub enum InsertOutcome {
     Existing(Box<AdmissionRecord>),
 }
 
+/// The immutable identity of one admission: which incarnation of which
+/// `(owner, task id)`, the provider-minted `admission_id` a purchase
+/// hash commits to, and the commitment of the brief.
+///
+/// This — not the state tag — is what a write landing after an await
+/// must re-present, and what the store compares before applying it.
+/// Built with [`AdmissionRecord::identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionIdentity {
+    /// The submitter.
+    pub owner: TaskOwner,
+    /// The task id.
+    pub task_id: String,
+    /// The incarnation this decision was taken against.
+    pub generation: u64,
+    /// The admission id it was taken against.
+    pub admission_id: Option<String>,
+    /// The commitment it was taken against.
+    pub commitment: String,
+}
+
+impl AdmissionIdentity {
+    /// Whether `record` is still the incarnation this identity names.
+    ///
+    /// All three fields, not just the generation: the generation is what
+    /// distinguishes two incarnations of the same key, and the admission
+    /// id and commitment are what a purchase hash was computed over, so
+    /// a mismatch in any of them means the decision was taken against
+    /// something else.
+    pub fn matches(&self, record: &AdmissionRecord) -> bool {
+        self.generation == record.generation
+            && self.admission_id == record.admission_id
+            && self.commitment == record.commitment
+    }
+
+    fn superseded(&self) -> A2aJournalError {
+        A2aJournalError::Superseded {
+            task_id: self.task_id.clone(),
+            admission_id: self.admission_id.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+/// What [`AdmissionStore::admit_reserved`] decided, in one transaction
+/// with the capacity count that decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmitOutcome {
+    /// The reservation holds capacity: either freshly inserted (with a
+    /// newly minted generation) or a lapsed one whose slot was
+    /// re-acquired, keeping its generation and admission id. Carries the
+    /// stored record.
+    Admitted(Box<AdmissionRecord>),
+    /// A record is already there and no capacity decision was needed — a
+    /// live reservation, an admission past `Reserved`, or a different
+    /// brief under the same id. Nothing was written; the caller
+    /// dispatches on it exactly as D2 P4/S4 prescribe.
+    Existing(Box<AdmissionRecord>),
+    /// The service is at `max_in_flight` and nothing was written.
+    Busy,
+}
+
+/// What [`AdmissionStore::open_decision`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    /// The decision is open: this record holds its capacity slot until
+    /// the decision ends, whatever its reservation clock says. Carries
+    /// the stored record, whose identity every later write of this
+    /// decision must re-present.
+    Open(Box<AdmissionRecord>),
+    /// The reservation had lapsed and the service is at
+    /// `max_in_flight`, so its slot could not be re-acquired. Nothing
+    /// was written and no decision is open.
+    Busy,
+}
+
 /// Unix seconds now — the clock every store call is given explicitly,
 /// so no store ever guesses its own time.
 pub fn now_secs() -> u64 {
@@ -512,6 +743,14 @@ pub fn now_secs() -> u64 {
 /// executor's outcome, [`AdmissionStore::resolve`] for an operator's).
 /// A general `transition` that could reach them would be a way to
 /// launch without a ledger entry.
+///
+/// `transition` is **identity-unbound** — it names a record by key and a
+/// state tag — so the serving path does not use it for the financial
+/// row: [`AdmissionStore::redeem`] is the identity-bound verb that
+/// writes `Paid`. What is left here for an operator or a test fixture
+/// refuses the financial row outright once the key is known to have
+/// held a different purchasable admission, because a payment presented
+/// with no identity cannot then be attributed to an incarnation.
 const TRANSITIONS: &[(StateTag, StateTag)] = &[
     // P4 / S4: an expired reservation re-acquires capacity — same
     // admission id, refreshed `expires_at`.
@@ -557,6 +796,94 @@ pub trait AdmissionStore: Send + Sync {
         &self,
         record: AdmissionRecord,
     ) -> Result<InsertOutcome, A2aJournalError>;
+
+    /// Admit a reservation **under a capacity ceiling, in one
+    /// transaction**: count what holds capacity for `record`'s service
+    /// at `now` and only then insert the fresh row — or re-acquire a
+    /// lapsed one that is already there.
+    ///
+    /// This is what makes a published `max_in_flight` mean something.
+    /// Counting with [`in_flight`](Self::in_flight) and then inserting
+    /// with [`insert_reserved`](Self::insert_reserved) is two
+    /// transactions, and concurrent prepares of **distinct** task ids
+    /// each see a count taken before any of them wrote: registry
+    /// deduplication protects identical ids and nothing protects
+    /// competing ones. The ceiling has to be enforced where the write
+    /// happens.
+    ///
+    /// A live reservation, or any record past `Reserved`, needs no
+    /// capacity decision and comes back as
+    /// [`Existing`](AdmitOutcome::Existing) with nothing written — so a
+    /// re-prepare cannot extend a reservation that is still good.
+    async fn admit_reserved(
+        &self,
+        record: AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<AdmitOutcome, A2aJournalError>;
+
+    /// Open a decision against exactly `admission`: the awaited window
+    /// in which a preflight runs and a payment is redeemed.
+    ///
+    /// Identity-bound: refuses with
+    /// [`Superseded`](A2aJournalError::Superseded) unless the row under
+    /// the key is still that incarnation. While the decision is open the
+    /// record holds its capacity slot whatever its reservation clock
+    /// says, and neither [`prune`](Self::prune) nor
+    /// [`delete_reservation`](Self::delete_reservation) may remove it —
+    /// so an expiry mid-decision cannot hand the slot to a competitor
+    /// and leave this decision landing against a stale time sample.
+    ///
+    /// A reservation that has **already** lapsed re-acquires its slot
+    /// here, in the same transaction, or the call answers
+    /// [`Busy`](DecisionOutcome::Busy) with nothing written.
+    async fn open_decision(
+        &self,
+        admission: &AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<DecisionOutcome, A2aJournalError>;
+
+    /// End a decision without changing the state: release the capacity
+    /// hold [`open_decision`](Self::open_decision) took.
+    ///
+    /// Idempotent and forgiving by design — it is called on every
+    /// refusal path, including those whose own write already cleared the
+    /// hold, and a record that has since been superseded or removed has
+    /// no hold of this decision's to release. `Ok(())` either way;
+    /// nothing is published when there is nothing to clear.
+    async fn close_decision(
+        &self,
+        admission: &AdmissionRecord,
+        now: u64,
+    ) -> Result<(), A2aJournalError>;
+
+    /// Record a redeemed payment against exactly `admission`:
+    /// `Reserved → Paid`, identity-bound.
+    ///
+    /// This is the **only** verb the serving path writes a financial
+    /// state with, because it is the only one that re-presents what the
+    /// decision was taken against. Three outcomes, not two:
+    ///
+    /// | Found under the key | Result |
+    /// |---|---|
+    /// | the same incarnation, `Reserved` and holding capacity | `Paid` is written |
+    /// | a different incarnation, or nothing | [`Superseded`](A2aJournalError::Superseded) — **and the redemption is retained as a detached record of the original admission**, in the unresolved-financial class |
+    /// | the same incarnation in a state that cannot be paid | [`Conflict`](A2aJournalError::Conflict) |
+    ///
+    /// The middle row is the one that matters: refusing protects the
+    /// replacement, but a payment the gate already granted is a fact.
+    /// It is never attached to the replacement and never dropped behind
+    /// a retryable error — it is retained where an operator can see it
+    /// through [`unresolved`](Self::unresolved) and close it with
+    /// [`resolve`](Self::resolve).
+    async fn redeem(
+        &self,
+        admission: &AdmissionRecord,
+        quote_id: String,
+        payer: [u8; 32],
+        now: u64,
+    ) -> Result<(), A2aJournalError>;
 
     /// How many admissions of `service_id` hold capacity at `now`: live
     /// reservations, paid-not-launched, and launched-not-terminal. A
@@ -610,11 +937,12 @@ pub trait AdmissionStore: Send + Sync {
     /// Delete an unlaunched **free** reservation (D2 S5: preflight
     /// failed and nothing financial exists). Refuses a paid record and
     /// any state other than `Reserved`; the ledger is never touched.
-    async fn delete_reservation(
-        &self,
-        owner: TaskOwner,
-        task_id: &str,
-    ) -> Result<(), A2aJournalError>;
+    ///
+    /// Identity-bound, like every other post-await write: the decision
+    /// to abandon the work was taken against one incarnation, and it may
+    /// not delete a replacement. It **may** delete its own deciding
+    /// record — this is the decision ending — but never a sibling's.
+    async fn delete_reservation(&self, admission: &AdmissionRecord) -> Result<(), A2aJournalError>;
 
     /// Claim the launch: `Paid → Launched` (paid) or `Reserved →
     /// Launched` (free), **and** the ledger entry, in one atomic
@@ -623,6 +951,20 @@ pub trait AdmissionStore: Send + Sync {
     /// Either both land or neither does; there is no instant at which
     /// the store holds a launched admission with no ledger entry. The
     /// serving path spawns only after this returns `Ok`.
+    ///
+    /// Refuses a record that no longer holds capacity: a launch claim
+    /// that arrives after its reservation lapsed would be running work
+    /// whose slot may already belong to somebody else. A `Paid` record
+    /// always holds capacity, and an open decision holds it for a free
+    /// one, so this only ever refuses a claim nothing was holding open.
+    ///
+    /// Identity is enforced by what can reach the claim rather than by a
+    /// parameter: `Paid` is written only by
+    /// [`redeem`](Self::redeem) (identity-bound) and cannot be pruned,
+    /// forgotten or deleted, and a free `Reserved` record under an open
+    /// decision is excluded from both pruning and
+    /// [`delete_reservation`](Self::delete_reservation) — so the row a
+    /// claim finds is the row its decision was opened on.
     async fn claim_launch(
         &self,
         owner: TaskOwner,
@@ -647,6 +989,12 @@ pub trait AdmissionStore: Send + Sync {
     /// `Paid`, `Launched` or `Reconcile` → `Terminal`. The one exit from
     /// the never-pruned class; after it, the resolved-result retention
     /// rule applies.
+    ///
+    /// Resolves the live row under the key when that row is unresolved;
+    /// otherwise the oldest unresolved **detached** admission of the
+    /// same key — a redemption retained by [`redeem`](Self::redeem)
+    /// after its admission was superseded has no other exit, and the
+    /// live row (a later incarnation) is not an operator's to close.
     async fn resolve(
         &self,
         owner: TaskOwner,
@@ -662,7 +1010,10 @@ pub trait AdmissionStore: Send + Sync {
     async fn ledger_has(&self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError>;
 
     /// Every record in the unresolved financial class, for an operator
-    /// view. Deterministically ordered.
+    /// view — live rows and retained **detached** admissions alike,
+    /// because a redemption whose admission was superseded is exactly
+    /// the thing an operator must see. Deterministically ordered: live
+    /// rows by key, then detached ones by key and incarnation.
     async fn unresolved(&self) -> Result<Vec<AdmissionRecord>, A2aJournalError>;
 
     /// Drop a **terminal** result immediately, once the requester has
@@ -671,14 +1022,22 @@ pub trait AdmissionStore: Send + Sync {
     /// record was removed.
     async fn forget(&self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError>;
 
-    /// Apply the three retention classes at `now`, returning how many
-    /// records were removed:
+    /// Apply the retention classes at `now`, returning how many rows
+    /// left the live table:
     ///
     /// | Class | States | Pruned |
     /// |---|---|---|
     /// | Resolved result | `Terminal` | `retention_secs` after `updated_at` |
     /// | Unpaid reservation | `Reserved`, notes included | `reservation_retention_secs` after `updated_at` |
+    /// | Deciding reservation | `Reserved` with a decision open | **never** |
     /// | Unresolved financial | `Paid`, `Launched`, `Reconcile` | **never** |
+    ///
+    /// A pruned reservation that was **purchasable** (priced, with a
+    /// provider-minted admission id a quote may have committed to) is
+    /// retained as a detached admission rather than forgotten, so a
+    /// payment that arrives for it is attributable; it is dropped once
+    /// its own resolved-result window has passed. Either way it is gone
+    /// from the live table and counted here.
     ///
     /// The ledger is never pruned.
     async fn prune(&self, now: u64) -> Result<u64, A2aJournalError>;
@@ -731,6 +1090,17 @@ fn conflict(reason: impl Into<String>) -> A2aJournalError {
 struct StoreState {
     records: BTreeMap<Key, AdmissionRecord>,
     ledger: BTreeMap<Key, LaunchLedgerEntry>,
+    /// Admissions whose row left its key — aged out of reservation
+    /// retention, or superseded by a later incarnation — kept because a
+    /// quote committed to their purchase hash can still be presented.
+    /// Keyed by `(key, generation)`, so two incarnations of one task are
+    /// distinct rows and neither can be mistaken for the live one.
+    detached: BTreeMap<(Key, u64), AdmissionRecord>,
+    /// The next incarnation number to mint. Persisted and monotonic: a
+    /// prune, a recreated row or a restart never rewinds it, so an
+    /// incarnation is never reused and a decision taken against an old
+    /// one can never match a new one.
+    next_generation: u64,
 }
 
 impl StoreState {
@@ -744,9 +1114,17 @@ impl StoreState {
             .ok_or_else(|| conflict(format!("no admission record for task {task_id:?}")))
     }
 
+    /// The next incarnation number, advancing the counter.
+    fn mint_generation(&mut self) -> u64 {
+        // 1-based: `0` is what a caller-built record and a pre-generation
+        // row carry, and neither may ever compare equal to a minted one.
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.next_generation
+    }
+
     fn insert_reserved(
         &mut self,
-        record: AdmissionRecord,
+        mut record: AdmissionRecord,
     ) -> Result<InsertOutcome, A2aJournalError> {
         if record.state.tag() != StateTag::Reserved {
             return Err(conflict(format!(
@@ -758,8 +1136,193 @@ impl StoreState {
         if let Some(existing) = self.records.get(&k) {
             return Ok(InsertOutcome::Existing(Box::new(existing.clone())));
         }
+        record.generation = self.mint_generation();
+        record.deciding = false;
         self.records.insert(k, record);
         Ok(InsertOutcome::Inserted)
+    }
+
+    /// Capacity + write, one critical section. `exclude` is the key of a
+    /// record the caller is about to change and whose own slot therefore
+    /// must not count against it.
+    fn at_capacity(&self, service_id: &str, max_in_flight: u64, now: u64, exclude: &Key) -> bool {
+        let held = self
+            .records
+            .iter()
+            .filter(|(k, r)| *k != exclude && r.service_id == service_id && r.holds_capacity(now))
+            .count() as u64;
+        held >= max_in_flight
+    }
+
+    fn admit_reserved(
+        &mut self,
+        candidate: AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<AdmitOutcome, A2aJournalError> {
+        if candidate.state.tag() != StateTag::Reserved {
+            return Err(conflict(format!(
+                "an admission may only be admitted as reserved, not {}",
+                candidate.state.tag().as_str()
+            )));
+        }
+        let k = key(candidate.owner, &candidate.task_id);
+        let expires_at = match candidate.state {
+            AdmissionState::Reserved { expires_at } => expires_at,
+            // Guarded above.
+            _ => return Err(conflict("unreachable admission state")),
+        };
+        match self.records.get(&k) {
+            // A different brief under the same id, or an admission past
+            // `Reserved`: no capacity decision to make here.
+            Some(found)
+                if found.commitment != candidate.commitment
+                    || found.state.tag() != StateTag::Reserved =>
+            {
+                Ok(AdmitOutcome::Existing(Box::new(found.clone())))
+            }
+            // Still holding its slot: idempotent, and deliberately NOT
+            // refreshed — re-preparing must not be a way to hold capacity
+            // indefinitely.
+            Some(found) if found.holds_capacity(now) => {
+                Ok(AdmitOutcome::Existing(Box::new(found.clone())))
+            }
+            // Lapsed: re-acquire the slot in this same transaction,
+            // keeping the incarnation and the admission id a quote may
+            // already commit to.
+            Some(_) => {
+                if self.at_capacity(&candidate.service_id, max_in_flight, now, &k) {
+                    return Ok(AdmitOutcome::Busy);
+                }
+                let found = self.record_mut(candidate.owner, &candidate.task_id)?;
+                found.state = AdmissionState::Reserved { expires_at };
+                found.updated_at = now;
+                Ok(AdmitOutcome::Admitted(Box::new(found.clone())))
+            }
+            None => {
+                if self.at_capacity(&candidate.service_id, max_in_flight, now, &k) {
+                    return Ok(AdmitOutcome::Busy);
+                }
+                let mut record = candidate;
+                record.generation = self.mint_generation();
+                record.deciding = false;
+                self.records.insert(k, record.clone());
+                Ok(AdmitOutcome::Admitted(Box::new(record)))
+            }
+        }
+    }
+
+    /// The live row, if it is still the incarnation `identity` names.
+    fn matching_mut(
+        &mut self,
+        identity: &AdmissionIdentity,
+    ) -> Result<&mut AdmissionRecord, A2aJournalError> {
+        let k = key(identity.owner, &identity.task_id);
+        match self.records.get_mut(&k) {
+            Some(found) if identity.matches(found) => Ok(found),
+            // Superseded, not a conflict: the tag may match perfectly and
+            // the caller did nothing wrong.
+            _ => Err(identity.superseded()),
+        }
+    }
+
+    fn open_decision(
+        &mut self,
+        admission: &AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<DecisionOutcome, A2aJournalError> {
+        let identity = admission.identity();
+        let k = key(identity.owner, &identity.task_id);
+        let lapsed = {
+            let found = self.matching_mut(&identity)?;
+            match &found.state {
+                AdmissionState::Reserved { .. } | AdmissionState::Paid { .. } => {
+                    !found.holds_capacity(now)
+                }
+                other => {
+                    return Err(conflict(format!(
+                        "task {:?} is {}, which is not an admission a decision can open on",
+                        identity.task_id,
+                        other.tag().as_str()
+                    )))
+                }
+            }
+        };
+        if lapsed && self.at_capacity(&admission.service_id, max_in_flight, now, &k) {
+            return Ok(DecisionOutcome::Busy);
+        }
+        let found = self.matching_mut(&identity)?;
+        // The hold itself is what carries the slot: `holds_capacity`
+        // honours a decision over the reservation clock, so nothing here
+        // rewrites `expires_at` or `updated_at`. A reservation that
+        // lapses mid-decision keeps its slot until the decision ends,
+        // and one that ends without a financial state is lapsed again —
+        // its next submit re-acquires through this same check.
+        found.deciding = true;
+        Ok(DecisionOutcome::Open(Box::new(found.clone())))
+    }
+
+    fn close_decision(&mut self, admission: &AdmissionRecord) -> bool {
+        let identity = admission.identity();
+        match self
+            .records
+            .get_mut(&key(identity.owner, &identity.task_id))
+        {
+            Some(found) if identity.matches(found) && found.deciding => {
+                found.deciding = false;
+                true
+            }
+            // Nothing of this decision's to release: the write that ended
+            // it already cleared the hold, or the row is no longer this
+            // incarnation and the hold (if any) is not ours.
+            _ => false,
+        }
+    }
+
+    fn redeem(
+        &mut self,
+        admission: &AdmissionRecord,
+        quote_id: String,
+        payer: [u8; 32],
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        let identity = admission.identity();
+        let k = key(identity.owner, &identity.task_id);
+        let current = self.records.get(&k);
+        if !current.is_some_and(|found| identity.matches(found)) {
+            // The admission this payment was redeemed for is gone or
+            // replaced. Refuse — and retain the redemption where it
+            // belongs: against the original admission, in the
+            // unresolved-financial class.
+            let detached = self
+                .detached
+                .entry((k, identity.generation))
+                .or_insert_with(|| admission.clone());
+            detached.deciding = false;
+            detached.state = AdmissionState::Paid { quote_id, payer };
+            detached.updated_at = now;
+            return Err(identity.superseded());
+        }
+        let found = self.matching_mut(&identity)?;
+        match &found.state {
+            AdmissionState::Reserved { .. } if found.holds_capacity(now) => {
+                found.state = AdmissionState::Paid { quote_id, payer };
+                found.updated_at = now;
+                found.deciding = false;
+                Ok(())
+            }
+            AdmissionState::Reserved { .. } => Err(conflict(format!(
+                "task {:?} no longer holds its capacity slot; its redemption cannot be recorded \
+                 against a reservation that lapsed with no decision open",
+                identity.task_id
+            ))),
+            other => Err(conflict(format!(
+                "task {:?} is {}, and only a reservation records a redemption",
+                identity.task_id,
+                other.tag().as_str()
+            ))),
+        }
     }
 
     fn in_flight(&self, service_id: &str, now: u64) -> u64 {
@@ -794,8 +1357,32 @@ impl StoreState {
                 to_tag.as_str()
             )));
         }
+        // This verb names a record by key and a tag, so it has no
+        // identity to check — and once the key is known to have held a
+        // different purchasable admission, a payment presented with no
+        // identity cannot be attributed to an incarnation. Refuse rather
+        // than guess which one it belongs to; `redeem` is the verb that
+        // re-presents the admission and retains the evidence.
+        if to_tag == StateTag::Paid {
+            let admission_id = record.admission_id.clone();
+            if let Some(other) = self
+                .detached_of(owner, task_id)
+                .find(|d| d.purchasable() && d.admission_id != admission_id)
+            {
+                return Err(conflict(format!(
+                    "task {task_id:?} previously held admission {:?} (generation {}), which is \
+                     retained and could still be paid; an unattributed financial write is \
+                     refused — use `redeem`, which re-presents the admission it decided against",
+                    other.admission_id, other.generation
+                )));
+            }
+        }
+        let record = self.record_mut(owner, task_id)?;
         record.state = to;
         record.updated_at = now;
+        // The hold belongs to the decision, and the decision ended with
+        // this state change.
+        record.deciding = false;
         Ok(())
     }
 
@@ -811,12 +1398,10 @@ impl StoreState {
         Ok(())
     }
 
-    fn delete_reservation(
-        &mut self,
-        owner: TaskOwner,
-        task_id: &str,
-    ) -> Result<(), A2aJournalError> {
-        let record = self.record_mut(owner, task_id)?;
+    fn delete_reservation(&mut self, admission: &AdmissionRecord) -> Result<(), A2aJournalError> {
+        let identity = admission.identity();
+        let (owner, task_id) = (identity.owner, identity.task_id.as_str());
+        let record = self.matching_mut(&identity)?;
         if record.state.tag() != StateTag::Reserved {
             return Err(conflict(format!(
                 "task {task_id:?} is {}, and only a reservation may be deleted",
@@ -845,6 +1430,15 @@ impl StoreState {
             )));
         }
         let record = self.record_mut(owner, task_id)?;
+        if !record.holds_capacity(now) {
+            // A claim whose slot lapsed with no decision holding it open
+            // would be starting work against a ceiling somebody else may
+            // already be inside. Retryable: the retry re-acquires or is
+            // told the service is busy.
+            return Err(conflict(format!(
+                "task {task_id:?} no longer holds its capacity slot and cannot claim a launch"
+            )));
+        }
         let (quote_id, payer) = match &record.state {
             AdmissionState::Paid { quote_id, payer } => (Some(quote_id.clone()), Some(*payer)),
             AdmissionState::Reserved { .. } if !record.paid => (None, None),
@@ -870,6 +1464,7 @@ impl StoreState {
         };
         record.state = AdmissionState::Launched { quote_id, payer };
         record.updated_at = now;
+        record.deciding = false;
         self.ledger.insert(k, entry.clone());
         Ok(entry)
     }
@@ -905,13 +1500,34 @@ impl StoreState {
         state: TaskState,
         now: u64,
     ) -> Result<(), A2aJournalError> {
-        let record = self.record_mut(owner, task_id)?;
-        if !record.state.is_unresolved() {
-            return Err(conflict(format!(
-                "task {task_id:?} is {}, which is not an unresolved financial record",
-                record.state.tag().as_str()
-            )));
-        }
+        let live_is_unresolved = self
+            .records
+            .get(&key(owner, task_id))
+            .is_some_and(|r| r.state.is_unresolved());
+        let record = if live_is_unresolved {
+            self.record_mut(owner, task_id)?
+        } else {
+            // The live row is not an operator's to close (it may be a
+            // later incarnation of somebody else's work); the oldest
+            // retained detached admission is.
+            let generation = self
+                .detached_of(owner, task_id)
+                .find(|d| d.state.is_unresolved())
+                .map(|d| d.generation);
+            match generation {
+                Some(generation) => self
+                    .detached
+                    .get_mut(&(key(owner, task_id), generation))
+                    .ok_or_else(|| conflict("detached admission vanished"))?,
+                None => {
+                    let found = self.record_mut(owner, task_id)?;
+                    return Err(conflict(format!(
+                        "task {task_id:?} is {}, which is not an unresolved financial record",
+                        found.state.tag().as_str()
+                    )));
+                }
+            }
+        };
         let (quote_id, payer) = record.state.evidence();
         record.state = AdmissionState::Terminal {
             quote_id,
@@ -919,6 +1535,7 @@ impl StoreState {
             state,
         };
         record.updated_at = now;
+        record.deciding = false;
         Ok(())
     }
 
@@ -939,24 +1556,68 @@ impl StoreState {
 
     fn prune(&mut self, now: u64) -> u64 {
         let before = self.records.len();
+        let mut detach: Vec<AdmissionRecord> = Vec::new();
         self.records.retain(|_, r| match &r.state {
             // Resolved result.
             AdmissionState::Terminal { .. } => now < r.updated_at.saturating_add(r.retention_secs),
-            // Unpaid reservation, attempt notes included.
+            // A decision is open against it: its slot and its evidence
+            // both belong to that decision until it ends.
+            AdmissionState::Reserved { .. } if r.deciding => true,
+            // Unpaid reservation, attempt notes included. A purchasable
+            // one is retained as a detached admission rather than
+            // forgotten: a quote committed to its purchase hash can
+            // still be presented, and a payment nobody can attribute is
+            // worse than a row nobody reads.
             AdmissionState::Reserved { .. } => {
-                now < r.updated_at.saturating_add(r.reservation_retention_secs)
+                let keep = now < r.updated_at.saturating_add(r.reservation_retention_secs);
+                if !keep && r.purchasable() {
+                    detach.push(r.clone());
+                }
+                keep
             }
             // Unresolved financial: never automatically.
             AdmissionState::Paid { .. }
             | AdmissionState::Launched { .. }
             | AdmissionState::Reconcile { .. } => true,
         });
+        for mut record in detach {
+            let k = (key(record.owner, &record.task_id), record.generation);
+            // Detaching is itself a change to the row, and `updated_at`
+            // is what its retention is measured from: the reservation
+            // clock stays in `state`, so nothing is lost.
+            record.updated_at = now;
+            self.detached.entry(k).or_insert(record);
+        }
+        // A detached admission that was never paid for is remembered for
+        // the offer's own result-retention window — long enough that a
+        // quote issued against its purchase hash is attributable rather
+        // than landing on a successor — and then dropped. One carrying a
+        // redemption is unresolved financial evidence and is never
+        // dropped automatically.
+        self.detached.retain(|_, r| {
+            r.state.is_unresolved() || now < r.updated_at.saturating_add(r.retention_secs)
+        });
         (before - self.records.len()) as u64
+    }
+
+    /// Every detached admission of `(owner, task_id)`, oldest
+    /// incarnation first.
+    fn detached_of<'a>(
+        &'a self,
+        owner: TaskOwner,
+        task_id: &str,
+    ) -> impl Iterator<Item = &'a AdmissionRecord> + 'a {
+        let k = key(owner, task_id);
+        self.detached
+            .iter()
+            .filter(move |((dk, _), _)| *dk == k)
+            .map(|(_, r)| r)
     }
 
     fn unresolved(&self) -> Vec<AdmissionRecord> {
         self.records
             .values()
+            .chain(self.detached.values())
             .filter(|r| r.state.is_unresolved())
             .cloned()
             .collect()
@@ -980,21 +1641,48 @@ struct JournalFile {
     records: Vec<AdmissionRecord>,
     #[serde(default)]
     ledger: Vec<LaunchLedgerEntry>,
+    /// Admissions retained after their row left its key. Flat, because
+    /// the key and the incarnation are both already in the record.
+    #[serde(default)]
+    detached: Vec<AdmissionRecord>,
+    /// The incarnation counter. Persisted so a restart cannot rewind it
+    /// and hand a replacement row a number an old decision still names.
+    #[serde(default)]
+    next_generation: u64,
 }
 
 impl JournalFile {
     fn into_state(self) -> StoreState {
+        let records: BTreeMap<Key, AdmissionRecord> = self
+            .records
+            .into_iter()
+            .map(|r| (key(r.owner, &r.task_id), r))
+            .collect();
+        let detached: BTreeMap<(Key, u64), AdmissionRecord> = self
+            .detached
+            .into_iter()
+            .map(|r| ((key(r.owner, &r.task_id), r.generation), r))
+            .collect();
+        // Raised past everything on disk, not merely trusted: a file
+        // written before the counter existed carries `0`, and a row
+        // whose generation survived a counter that did not must never be
+        // mintable again.
+        let next_generation = records
+            .values()
+            .chain(detached.values())
+            .map(|r| r.generation)
+            .chain(std::iter::once(self.next_generation))
+            .max()
+            .unwrap_or_default();
         StoreState {
-            records: self
-                .records
-                .into_iter()
-                .map(|r| (key(r.owner, &r.task_id), r))
-                .collect(),
+            records,
             ledger: self
                 .ledger
                 .into_iter()
                 .map(|e| (key(e.owner, &e.task_id), e))
                 .collect(),
+            detached,
+            next_generation,
         }
     }
 
@@ -1003,6 +1691,8 @@ impl JournalFile {
             version: JOURNAL_VERSION,
             records: state.records.values().cloned().collect(),
             ledger: state.ledger.values().cloned().collect(),
+            detached: state.detached.values().cloned().collect(),
+            next_generation: state.next_generation,
         }
     }
 }
@@ -1135,19 +1825,248 @@ async fn open_sidecar(path: PathBuf) -> Result<std::fs::File, A2aJournalError> {
 /// See the module docs for the ownership contract and its limits.
 #[derive(Debug)]
 pub struct A2aAdmissionJournal {
-    path: PathBuf,
+    files: Arc<JournalFiles>,
     owner: Arc<JournalOwner>,
     /// Serializes this process's own writers before they contend for the
     /// `.lock` sidecar, so a load→mutate→replace is never interleaved
-    /// in-process. `tokio`'s mutex because the body awaits file I/O.
-    write_mu: tokio::sync::Mutex<()>,
+    /// in-process. `tokio`'s mutex because the acquisition awaits, and
+    /// an `Arc` because the guard is **owned by the writing worker**:
+    /// dropping the future that started a write must not release it
+    /// while the write is still running.
+    write_mu: Arc<tokio::sync::Mutex<()>>,
     recovered: Vec<RecoveredAdmission>,
-    /// Arms exactly one durable write to fail without touching the file.
+}
+
+/// The journal's file half: everything the writer needs, in an `Arc` it
+/// can own outright.
+///
+/// The write runs on a blocking worker that is **never cancelled**
+/// (`spawn_blocking` futures detach rather than abort), and that worker
+/// holds the in-process guard, the `.lock` sidecar and the ownership
+/// handle until the rename has landed. Aborting a store-operation future
+/// therefore cannot release a guard while filesystem work is still in
+/// flight — the defect a `tokio::fs` write path has, because its I/O
+/// continues on the blocking pool after the awaiting future is dropped.
+#[derive(Debug)]
+struct JournalFiles {
+    path: PathBuf,
+    /// Distinguishes this journal's concurrent temp files from each
+    /// other. The destination **filename** is what distinguishes them
+    /// from a same-stem sibling's (`admissions.json` and
+    /// `admissions.backup` used to collapse onto one temp name), and
+    /// every temp is created exclusively, so a name is never shared.
+    seq: std::sync::atomic::AtomicU64,
+    /// Arms one durable write to fail without touching the file: the
+    /// countdown decrements per write and fails the one that reaches
+    /// zero, so a witness can name the write it means (the launch claim
+    /// rather than whatever wrote first).
     #[cfg(feature = "testing")]
-    fail_next: std::sync::atomic::AtomicBool,
+    fail_write: std::sync::atomic::AtomicU64,
+    /// Arms exactly one durability barrier to fail *after* the rename
+    /// landed — the ambiguous boundary.
+    #[cfg(feature = "testing")]
+    fail_next_barrier: std::sync::atomic::AtomicBool,
     /// How many atomic replaces this journal has published.
     #[cfg(feature = "testing")]
     writes: std::sync::atomic::AtomicU64,
+    /// How many writers are inside the worker right now.
+    #[cfg(feature = "testing")]
+    in_worker: std::sync::atomic::AtomicU64,
+    /// Parks the next worker just before it writes, until the witness
+    /// releases it.
+    #[cfg(feature = "testing")]
+    hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl JournalFiles {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            seq: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            fail_write: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            fail_next_barrier: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            writes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            in_worker: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            hold: Mutex::new(None),
+        }
+    }
+
+    fn io_err(&self, e: impl std::fmt::Display) -> A2aJournalError {
+        A2aJournalError::Io {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        }
+    }
+
+    /// Read the journal. A missing file is an empty journal (first run);
+    /// an unparseable one is [`A2aJournalError::Corrupt`]. No lock: the
+    /// atomic rename is what prevents a torn read.
+    fn load(&self) -> Result<StoreState, A2aJournalError> {
+        load_at(&self.path)
+    }
+
+    /// Publish `state`: exclusive 0600 temp, `sync_all`, atomic rename,
+    /// then the directory barrier.
+    ///
+    /// A failure up to and including the rename leaves the live file
+    /// exactly as it was ([`Io`](A2aJournalError::Io)). A failure of the
+    /// barrier **after** the rename is
+    /// [`Ambiguous`](A2aJournalError::Ambiguous): the write is visible
+    /// and only its survival of a power loss is unknown.
+    fn publish(&self, state: &StoreState) -> Result<(), A2aJournalError> {
+        // Only the fault seams and the write counter read it.
+        #[cfg(feature = "testing")]
+        use std::sync::atomic::Ordering::SeqCst;
+
+        #[cfg(feature = "testing")]
+        {
+            let held = self.hold.lock().take();
+            if let Some(rx) = held {
+                // A blocking worker, so a blocking wait is the right
+                // shape: this is the window a witness aborts the calling
+                // future in.
+                let _ = rx.recv();
+            }
+            let armed = self
+                .fail_write
+                .fetch_update(SeqCst, SeqCst, |n| (n > 0).then(|| n - 1))
+                .unwrap_or(0);
+            if armed == 1 {
+                return Err(self.io_err("injected write failure (testing seam)"));
+            }
+        }
+
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| self.io_err(e))?;
+            }
+        }
+
+        let bytes = serde_json::to_vec_pretty(&JournalFile::from_state(state))
+            .map_err(|e| self.io_err(format!("serialize admission journal: {e}")))?;
+
+        let tmp = self.create_temp()?;
+        let written = self.write_temp(&tmp.1, &bytes);
+        drop(tmp.1);
+        let path = &tmp.0;
+
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(path, &self.path) {
+            // Never leave a temp sibling behind from a failed write.
+            let _ = std::fs::remove_file(path);
+            return Err(self.io_err(e));
+        }
+        #[cfg(feature = "testing")]
+        self.writes.fetch_add(1, SeqCst);
+        // Published. Everything from here can only be ambiguous.
+        self.barrier()
+    }
+
+    /// An exclusively-created temp file beside the journal, named after
+    /// the **full destination filename**.
+    ///
+    /// `with_extension` would replace the extension instead of extending
+    /// the name, collapsing `admissions.json` and `admissions.backup`
+    /// onto one `admissions.tmp.<pid>` — while their `.owner` and
+    /// `.lock` sidecars keep the full filename and so never serialize
+    /// the two journals against each other. `create_new` then makes
+    /// "unique" a fact rather than a hope: a collision is an error to
+    /// retry, never a silent truncation of somebody else's temp.
+    fn create_temp(&self) -> Result<(PathBuf, std::fs::File), A2aJournalError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let pid = std::process::id();
+        let mut last = None;
+        for _ in 0..64 {
+            let seq = self.seq.fetch_add(1, Relaxed);
+            let candidate = sidecar(&self.path, &format!(".tmp.{pid}.{seq}"));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // Owner-only (0600) from the start — the journal holds payer
+            // keys and quote ids. The mode travels with the inode
+            // through the rename. On Windows the per-user directory's
+            // inherited ACLs scope access instead.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            match opts.open(&candidate) {
+                Ok(file) => return Ok((candidate, file)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(self.io_err(e)),
+            }
+        }
+        Err(self.io_err(match last {
+            Some(e) => format!("no unused temp name beside the journal: {e}"),
+            None => "no unused temp name beside the journal".to_string(),
+        }))
+    }
+
+    fn write_temp(&self, mut file: &std::fs::File, bytes: &[u8]) -> Result<(), A2aJournalError> {
+        use std::io::Write as _;
+        file.write_all(bytes).map_err(|e| self.io_err(e))?;
+        file.flush().map_err(|e| self.io_err(e))?;
+        // Durable before it becomes the live file, so a crash right
+        // after the rename can never surface a truncated journal.
+        file.sync_all().map_err(|e| self.io_err(e))
+    }
+
+    /// Make the **rename** durable, not merely the bytes it published.
+    ///
+    /// `sync_all` on the temp file commits its contents; the directory
+    /// entry that makes it the journal is separate metadata, and without
+    /// a barrier a power loss can recover the previous image — an old
+    /// `Paid` row for work that has already started. On unix the barrier
+    /// is an fsync of the parent directory, which is exactly what POSIX
+    /// requires for rename durability.
+    ///
+    /// Windows exposes no portable parent-directory handle to flush;
+    /// re-opening the published file for write and flushing it is the
+    /// closest available barrier (NTFS commits the file's metadata with
+    /// it), and the residual gap — a volume-level flush needs privileges
+    /// this process does not have — is stated rather than papered over.
+    fn barrier(&self) -> Result<(), A2aJournalError> {
+        let ambiguous = |e: std::io::Error| A2aJournalError::Ambiguous {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        };
+        #[cfg(feature = "testing")]
+        if self
+            .fail_next_barrier
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(A2aJournalError::Ambiguous {
+                path: self.path.display().to_string(),
+                reason: "injected durability-barrier failure (testing seam)".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            let parent = match self.path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            std::fs::File::open(&parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(ambiguous)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|f| f.sync_all())
+                .map_err(ambiguous)
+        }
+    }
 }
 
 impl A2aAdmissionJournal {
@@ -1191,7 +2110,11 @@ impl A2aAdmissionJournal {
             _lock: file,
         });
 
-        let state = load(&path).await?;
+        let files = Arc::new(JournalFiles::new(path));
+        let mut state = {
+            let files = Arc::clone(&files);
+            blocking(move || files.load()).await?
+        };
         let recovered = state
             .records
             .values()
@@ -1206,21 +2129,41 @@ impl A2aAdmissionJournal {
             .filter(|r| r.found.is_unresolved())
             .collect();
 
+        // A decision hold belongs to the owner that took it, and this
+        // handle is a successor: whatever was deciding when the previous
+        // owner stopped is not deciding now, and leaving the hold would
+        // consume a capacity slot no work will ever use. Cleared
+        // durably, because every mutation reloads from the file.
+        //
+        // Nothing else about the inherited state is rewritten — the
+        // recovery table on `AdmissionState::status` is what reads it.
+        let stale: Vec<Key> = state
+            .records
+            .iter()
+            .filter(|(_, r)| r.deciding)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !stale.is_empty() {
+            for k in &stale {
+                if let Some(r) = state.records.get_mut(k) {
+                    r.deciding = false;
+                }
+            }
+            let files = Arc::clone(&files);
+            blocking(move || files.publish(&state)).await?;
+        }
+
         Ok(Self {
-            path,
+            files,
             owner,
-            write_mu: tokio::sync::Mutex::new(()),
+            write_mu: Arc::new(tokio::sync::Mutex::new(())),
             recovered,
-            #[cfg(feature = "testing")]
-            fail_next: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(feature = "testing")]
-            writes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// The journal file's path.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.files.path
     }
 
     /// A clone of the ownership handle. Give one to every serve handle,
@@ -1253,8 +2196,52 @@ impl A2aAdmissionJournal {
     /// than a description of one.
     #[cfg(feature = "testing")]
     pub fn fail_next_write(&self) {
-        self.fail_next
+        self.fail_nth_write(1);
+    }
+
+    /// **Testing seam**: arm the `n`-th durable write from now to fail,
+    /// leaving the ones before it alone.
+    ///
+    /// A serving path makes several writes per submission, so "the next
+    /// write" cannot name the launch claim. A witness about the claim
+    /// has to be able to say *which* write it means, or it is a witness
+    /// about whatever wrote first.
+    #[cfg(feature = "testing")]
+    pub fn fail_nth_write(&self, n: u64) {
+        self.files
+            .fail_write
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// **Testing seam**: arm the next durability barrier to fail *after*
+    /// the rename has landed — the ambiguous boundary, which a witness
+    /// must be able to reach without a power cut.
+    #[cfg(feature = "testing")]
+    pub fn fail_next_barrier(&self) {
+        self.files
+            .fail_next_barrier
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// **Testing seam**: park the next write inside its worker until the
+    /// returned sender is used (or dropped). The window in which a
+    /// witness can abort the future that started the write and observe
+    /// that the write still completes under its own guards.
+    #[cfg(feature = "testing")]
+    pub fn hold_next_write(&self) -> std::sync::mpsc::Sender<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.files.hold.lock() = Some(rx);
+        tx
+    }
+
+    /// **Testing seam**: how many writers are inside the I/O worker
+    /// right now — the precondition a witness waits on instead of
+    /// sleeping.
+    #[cfg(feature = "testing")]
+    pub fn writers_in_flight(&self) -> u64 {
+        self.files
+            .in_worker
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// **Testing seam**: how many atomic replaces this journal has
@@ -1262,14 +2249,15 @@ impl A2aAdmissionJournal {
     /// land in ONE replace" an observation rather than a claim.
     #[cfg(feature = "testing")]
     pub fn durable_writes(&self) -> u64 {
-        self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        self.files.writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// in-process mutex → `.lock` → load → check → temp + fsync +
-    /// rename. `f` decides; a refusal from it publishes nothing.
-    async fn mutate<R>(
+    /// rename + barrier. `f` decides; a refusal from it publishes
+    /// nothing.
+    async fn mutate<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut StoreState) -> Result<R, A2aJournalError>,
+        f: impl FnOnce(&mut StoreState) -> Result<R, A2aJournalError> + Send + 'static,
     ) -> Result<R, A2aJournalError> {
         self.mutate_if(|state| Ok((f(state)?, true))).await
     }
@@ -1277,108 +2265,72 @@ impl A2aAdmissionJournal {
     /// [`mutate`](Self::mutate) for a decision that may conclude in
     /// "nothing changed": `f` returns its result plus whether the state
     /// is dirty, and a clean outcome publishes no write at all.
-    async fn mutate_if<R>(
+    ///
+    /// The whole transaction — the `.lock` sidecar, the load, `f`, and
+    /// the publish — runs on **one blocking worker that owns every
+    /// guard**, including the in-process mutex and the ownership handle.
+    /// `spawn_blocking` work is never cancelled, so dropping this future
+    /// (an aborted runtime task, a `select!` that lost) cannot release a
+    /// guard while the write is still running, and the next writer
+    /// cannot start — or reuse a temp path — until this one has
+    /// finished. That is the difference between an atomic replace and a
+    /// half-published one.
+    async fn mutate_if<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut StoreState) -> Result<(R, bool), A2aJournalError>,
+        f: impl FnOnce(&mut StoreState) -> Result<(R, bool), A2aJournalError> + Send + 'static,
     ) -> Result<R, A2aJournalError> {
-        let _serialized = self.write_mu.lock().await;
-        let _lock = WriteLock::acquire(&self.path).await?;
-        let mut state = load(&self.path).await?;
-        let (out, dirty) = f(&mut state)?;
-        if dirty {
-            self.save(&state).await?;
-        }
-        Ok(out)
-    }
-
-    /// Publish `state`: 0600 temp, `sync_all`, atomic rename. A failure
-    /// anywhere leaves the live file exactly as it was.
-    async fn save(&self, state: &StoreState) -> Result<(), A2aJournalError> {
-        #[cfg(feature = "testing")]
-        if self
-            .fail_next
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(A2aJournalError::Io {
-                path: self.path.display().to_string(),
-                reason: "injected write failure (testing seam)".to_string(),
-            });
-        }
-
-        let io_err = |e: std::io::Error| A2aJournalError::Io {
-            path: self.path.display().to_string(),
-            reason: e.to_string(),
-        };
-
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
-            }
-        }
-
-        let bytes = serde_json::to_vec_pretty(&JournalFile::from_state(state)).map_err(|e| {
-            A2aJournalError::Io {
-                path: self.path.display().to_string(),
-                reason: format!("serialize admission journal: {e}"),
-            }
-        })?;
-
-        // A per-process-unique temp name so two writers never clobber
-        // each other's partial file; the rename is still last-wins.
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-
-        // Owner-only (0600) from the start — the journal holds payer
-        // keys and quote ids — and truncated, so a stale same-pid temp
-        // from a prior crash cannot leave trailing bytes. The mode
-        // travels with the inode through the rename. On Windows the
-        // per-user directory's inherited ACLs scope access and the rest
-        // of the path is identical.
-        use tokio::io::AsyncWriteExt;
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        // `tokio::fs::OpenOptions::mode` is tokio's own unix-gated
-        // inherent method — importing `std::os::unix::fs::OpenOptionsExt`
-        // to reach it is redundant, and the unused import is a hard error
-        // under the strict lint profile on every unix job. `pins.rs` is
-        // the precedent: same call, no import.
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts.open(&tmp).await.map_err(io_err)?;
-        let written: Result<(), A2aJournalError> = async {
-            f.write_all(&bytes).await.map_err(io_err)?;
-            f.flush().await.map_err(io_err)?;
-            // Durable before it becomes the live file, so a crash right
-            // after the rename can never surface a truncated journal.
-            f.sync_all().await.map_err(io_err)?;
-            Ok(())
-        }
-        .await;
-        drop(f);
-
-        let result = match written {
-            Ok(()) => tokio::fs::rename(&tmp, &self.path).await.map_err(io_err),
-            Err(e) => Err(e),
-        };
-        if result.is_err() {
-            // Never leak a `.tmp.<pid>` sibling from a failed write.
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
-        #[cfg(feature = "testing")]
-        if result.is_ok() {
-            self.writes
+        let serialized = Arc::clone(&self.write_mu).lock_owned().await;
+        let lock = WriteLock::acquire(&self.files.path).await?;
+        let files = Arc::clone(&self.files);
+        let owner = Arc::clone(&self.owner);
+        blocking(move || {
+            // Every guard is owned here, and released only when this
+            // closure returns: the serialization guard, the cross-process
+            // transaction lock, and the journal's lifetime owner.
+            let _serialized = serialized;
+            let _lock = lock;
+            let _owner = owner;
+            #[cfg(feature = "testing")]
+            files
+                .in_worker
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        result
+            let out = (|| {
+                let mut state = files.load()?;
+                let (out, dirty) = f(&mut state)?;
+                if dirty {
+                    files.publish(&state)?;
+                }
+                Ok(out)
+            })();
+            #[cfg(feature = "testing")]
+            files
+                .in_worker
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            out
+        })
+        .await
     }
 }
 
-/// Read the journal. A missing file is an empty journal (first run);
-/// an unparseable one is [`A2aJournalError::Corrupt`]. No lock: the
-/// atomic rename is what prevents a torn read.
-async fn load(path: &Path) -> Result<StoreState, A2aJournalError> {
-    let bytes = match tokio::fs::read(path).await {
+/// Run `f` on the blocking pool, mapping a worker panic to an I/O
+/// failure rather than swallowing it.
+async fn blocking<R: Send + 'static>(
+    f: impl FnOnce() -> Result<R, A2aJournalError> + Send + 'static,
+) -> Result<R, A2aJournalError> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(out) => out,
+        Err(e) => Err(A2aJournalError::Io {
+            path: String::new(),
+            reason: format!("admission-journal I/O worker panicked: {e}"),
+        }),
+    }
+}
+
+/// Read the journal at `path`. A missing file is an empty journal (first
+/// run); an unparseable one is [`A2aJournalError::Corrupt`]. No lock:
+/// the atomic rename is what prevents a torn read.
+fn load_at(path: &Path) -> Result<StoreState, A2aJournalError> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoreState::default()),
         Err(e) => {
@@ -1396,6 +2348,12 @@ async fn load(path: &Path) -> Result<StoreState, A2aJournalError> {
     Ok(file.into_state())
 }
 
+/// Read the journal at `path` off the runtime thread.
+async fn load(path: &Path) -> Result<StoreState, A2aJournalError> {
+    let path = path.to_path_buf();
+    blocking(move || load_at(&path)).await
+}
+
 #[async_trait::async_trait]
 impl AdmissionStore for A2aAdmissionJournal {
     async fn lookup(
@@ -1403,7 +2361,7 @@ impl AdmissionStore for A2aAdmissionJournal {
         owner: TaskOwner,
         task_id: &str,
     ) -> Result<Option<AdmissionRecord>, A2aJournalError> {
-        Ok(load(&self.path)
+        Ok(load(&self.files.path)
             .await?
             .records
             .get(&key(owner, task_id))
@@ -1425,8 +2383,76 @@ impl AdmissionStore for A2aAdmissionJournal {
         .await
     }
 
+    async fn admit_reserved(
+        &self,
+        record: AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<AdmitOutcome, A2aJournalError> {
+        // The count and the write are the same transaction, so two
+        // prepares of distinct tasks cannot both read a count taken
+        // before either wrote.
+        self.mutate_if(move |state| {
+            let out = state.admit_reserved(record, max_in_flight, now)?;
+            let dirty = matches!(out, AdmitOutcome::Admitted(_));
+            Ok((out, dirty))
+        })
+        .await
+    }
+
+    async fn open_decision(
+        &self,
+        admission: &AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<DecisionOutcome, A2aJournalError> {
+        let admission = admission.clone();
+        self.mutate_if(move |state| {
+            let out = state.open_decision(&admission, max_in_flight, now)?;
+            let dirty = matches!(out, DecisionOutcome::Open(_));
+            Ok((out, dirty))
+        })
+        .await
+    }
+
+    async fn close_decision(
+        &self,
+        admission: &AdmissionRecord,
+        _now: u64,
+    ) -> Result<(), A2aJournalError> {
+        let admission = admission.clone();
+        // Nothing to clear publishes nothing: a refusal path must not
+        // turn a clean no-op into an I/O failure of its own.
+        self.mutate_if(move |state| Ok(((), state.close_decision(&admission))))
+            .await
+    }
+
+    async fn redeem(
+        &self,
+        admission: &AdmissionRecord,
+        quote_id: String,
+        payer: [u8; 32],
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        let admission = admission.clone();
+        // A superseded redemption is retained, so its refusal is a
+        // *dirty* outcome: the detached record must be published before
+        // the error reaches the caller, or the payment would be a fact
+        // with no durable trace.
+        let out = self
+            .mutate_if(
+                move |state| match state.redeem(&admission, quote_id, payer, now) {
+                    Ok(()) => Ok((Ok(()), true)),
+                    Err(e @ A2aJournalError::Superseded { .. }) => Ok((Err(e), true)),
+                    Err(e) => Err(e),
+                },
+            )
+            .await?;
+        out
+    }
+
     async fn in_flight(&self, service_id: &str, now: u64) -> Result<u64, A2aJournalError> {
-        Ok(load(&self.path).await?.in_flight(service_id, now))
+        Ok(load(&self.files.path).await?.in_flight(service_id, now))
     }
 
     async fn transition(
@@ -1437,7 +2463,9 @@ impl AdmissionStore for A2aAdmissionJournal {
         to: AdmissionState,
         now: u64,
     ) -> Result<(), A2aJournalError> {
-        self.mutate(|state| state.transition(owner, task_id, from, to, now))
+        let task_id = task_id.to_string();
+        let from = from.to_vec();
+        self.mutate(move |state| state.transition(owner, &task_id, &from, to, now))
             .await
     }
 
@@ -1447,15 +2475,14 @@ impl AdmissionStore for A2aAdmissionJournal {
         task_id: &str,
         note: AttemptNote,
     ) -> Result<(), A2aJournalError> {
-        self.mutate(|state| state.note(owner, task_id, note)).await
+        let task_id = task_id.to_string();
+        self.mutate(move |state| state.note(owner, &task_id, note))
+            .await
     }
 
-    async fn delete_reservation(
-        &self,
-        owner: TaskOwner,
-        task_id: &str,
-    ) -> Result<(), A2aJournalError> {
-        self.mutate(|state| state.delete_reservation(owner, task_id))
+    async fn delete_reservation(&self, admission: &AdmissionRecord) -> Result<(), A2aJournalError> {
+        let admission = admission.clone();
+        self.mutate(move |state| state.delete_reservation(&admission))
             .await
     }
 
@@ -1468,7 +2495,8 @@ impl AdmissionStore for A2aAdmissionJournal {
         // ONE `mutate`, therefore one atomic replace: the `Launched`
         // state and the ledger entry become visible together or not at
         // all.
-        self.mutate(|state| state.claim_launch(owner, task_id, now))
+        let task_id = task_id.to_string();
+        self.mutate(move |state| state.claim_launch(owner, &task_id, now))
             .await
     }
 
@@ -1479,7 +2507,8 @@ impl AdmissionStore for A2aAdmissionJournal {
         state: TaskState,
         now: u64,
     ) -> Result<(), A2aJournalError> {
-        self.mutate(|s| s.record_terminal(owner, task_id, state, now))
+        let task_id = task_id.to_string();
+        self.mutate(move |s| s.record_terminal(owner, &task_id, state, now))
             .await
     }
 
@@ -1490,26 +2519,29 @@ impl AdmissionStore for A2aAdmissionJournal {
         state: TaskState,
         now: u64,
     ) -> Result<(), A2aJournalError> {
-        self.mutate(|s| s.resolve(owner, task_id, state, now)).await
+        let task_id = task_id.to_string();
+        self.mutate(move |s| s.resolve(owner, &task_id, state, now))
+            .await
     }
 
     async fn ledger_has(&self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError> {
-        Ok(load(&self.path)
+        Ok(load(&self.files.path)
             .await?
             .ledger
             .contains_key(&key(owner, task_id)))
     }
 
     async fn unresolved(&self) -> Result<Vec<AdmissionRecord>, A2aJournalError> {
-        Ok(load(&self.path).await?.unresolved())
+        Ok(load(&self.files.path).await?.unresolved())
     }
 
     async fn forget(&self, owner: TaskOwner, task_id: &str) -> Result<bool, A2aJournalError> {
-        self.mutate(|s| s.forget(owner, task_id)).await
+        let task_id = task_id.to_string();
+        self.mutate(move |s| s.forget(owner, &task_id)).await
     }
 
     async fn prune(&self, now: u64) -> Result<u64, A2aJournalError> {
-        self.mutate(|s| Ok(s.prune(now))).await
+        self.mutate(move |s| Ok(s.prune(now))).await
     }
 }
 
@@ -1560,6 +2592,47 @@ impl AdmissionStore for A2aAdmissions {
         self.state.lock().insert_reserved(record)
     }
 
+    async fn admit_reserved(
+        &self,
+        record: AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<AdmitOutcome, A2aJournalError> {
+        // One critical section under the mutex: the same atomicity the
+        // journal gets from one transaction.
+        self.state.lock().admit_reserved(record, max_in_flight, now)
+    }
+
+    async fn open_decision(
+        &self,
+        admission: &AdmissionRecord,
+        max_in_flight: u64,
+        now: u64,
+    ) -> Result<DecisionOutcome, A2aJournalError> {
+        self.state
+            .lock()
+            .open_decision(admission, max_in_flight, now)
+    }
+
+    async fn close_decision(
+        &self,
+        admission: &AdmissionRecord,
+        _now: u64,
+    ) -> Result<(), A2aJournalError> {
+        self.state.lock().close_decision(admission);
+        Ok(())
+    }
+
+    async fn redeem(
+        &self,
+        admission: &AdmissionRecord,
+        quote_id: String,
+        payer: [u8; 32],
+        now: u64,
+    ) -> Result<(), A2aJournalError> {
+        self.state.lock().redeem(admission, quote_id, payer, now)
+    }
+
     async fn in_flight(&self, service_id: &str, now: u64) -> Result<u64, A2aJournalError> {
         Ok(self.state.lock().in_flight(service_id, now))
     }
@@ -1584,12 +2657,8 @@ impl AdmissionStore for A2aAdmissions {
         self.state.lock().note(owner, task_id, note)
     }
 
-    async fn delete_reservation(
-        &self,
-        owner: TaskOwner,
-        task_id: &str,
-    ) -> Result<(), A2aJournalError> {
-        self.state.lock().delete_reservation(owner, task_id)
+    async fn delete_reservation(&self, admission: &AdmissionRecord) -> Result<(), A2aJournalError> {
+        self.state.lock().delete_reservation(admission)
     }
 
     async fn claim_launch(

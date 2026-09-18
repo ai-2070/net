@@ -112,12 +112,13 @@ use std::sync::Arc;
 
 use crate::a2a::{
     await_admission_verdict, purchase_hash, random_id, task_commitment, A2aOffer, Admission,
-    AdmissionReservation, CancelToken, PrepareReply, PreparedTask, SubmitRejection, TaskAck,
-    TaskBrief, TaskExecutor, TaskOwner, TaskRecord, TaskRegistry, TerminalHook,
+    AdmissionReservation, CancelToken, PrepareReply, PreparedTask, ReservationRefusal,
+    SubmitRejection, TaskAck, TaskBrief, TaskExecutor, TaskOwner, TaskRecord, TaskRegistry,
+    TerminalHook,
 };
 use crate::a2a_journal::{
-    now_secs, A2aAdmissionJournal, A2aAdmissions, AdmissionRecord, AdmissionState, AttemptNote,
-    InsertOutcome, JournalOwner, SharedAdmissionStore, StateTag,
+    now_secs, A2aAdmissionJournal, A2aAdmissions, A2aJournalError, AdmissionRecord, AdmissionState,
+    AdmitOutcome, AttemptNote, DecisionOutcome, JournalOwner, SharedAdmissionStore, StateTag,
 };
 use crate::a2a_payment::{
     TaskAdmissionGate, TaskPaymentClaim, TaskPaymentProof, A2A_DESCRIBE_SERVICE,
@@ -793,29 +794,53 @@ fn schematic_journal_unavailable(tool_id: &str, detail: &str) -> FailureSchemati
     s
 }
 
-/// A payment or admission refusal on the full-fidelity reply channel:
-/// the human message stays the body (byte-identical to what the wire has
-/// always carried for a paid refusal) and the schematic rides exactly
-/// one reply header.
+/// A payment or admission refusal, as a **structured verdict** rather
+/// than a rendered reply.
 ///
-/// Returned as `Ok(payload)` because the `RpcHandlerError` convenience
-/// channel flattens headers away — the same reason
-/// `PaidToolHandler` does it.
-fn payment_refusal(schematic: &FailureSchematic) -> RpcResponsePayload {
-    RpcResponsePayload {
-        status: RpcStatus::Application(ERR_PAYMENT),
-        headers: schematic.header_entry().into_iter().collect(),
-        body: schematic.message.clone().into(),
+/// The configured submit decides first and renders last, because the
+/// same verdict goes to two places: the reply this caller gets and the
+/// reservation channel every concurrent duplicate is parked on. A
+/// verdict that existed only as bytes could not reach the second.
+fn refuse_payment(schematic: &FailureSchematic) -> ReservationRefusal {
+    ReservationRefusal::Payment {
+        message: schematic.message.clone(),
+        schematic: Box::new(schematic.clone()),
     }
 }
 
 /// A gate denial, passed through untouched: the gate's own message and
 /// its own schematic.
-fn gate_refusal(message: String, schematic: &FailureSchematic) -> RpcResponsePayload {
-    RpcResponsePayload {
-        status: RpcStatus::Application(ERR_PAYMENT),
-        headers: schematic.header_entry().into_iter().collect(),
-        body: message.into(),
+fn refuse_gate(message: String, schematic: &FailureSchematic) -> ReservationRefusal {
+    ReservationRefusal::Payment {
+        message,
+        schematic: Box::new(schematic.clone()),
+    }
+}
+
+/// A non-payment rejection, in-body exactly like the free path.
+fn refuse(reason: impl std::fmt::Display) -> ReservationRefusal {
+    ReservationRefusal::Rejected(reason.to_string())
+}
+
+/// Render a verdict for the wire.
+///
+/// A payment refusal goes out on the full-fidelity reply channel: the
+/// human message stays the body (byte-identical to what the wire has
+/// always carried for a paid refusal) and the schematic rides exactly
+/// one reply header. Returned as `Ok(payload)` because the
+/// `RpcHandlerError` convenience channel flattens headers away — the
+/// same reason `PaidToolHandler` does it.
+///
+/// One function, so a waiter's reply is **byte-identical** to the
+/// decider's.
+fn refusal_payload(refusal: &ReservationRefusal) -> RpcResponsePayload {
+    match refusal {
+        ReservationRefusal::Rejected(reason) => ack_refused(reason),
+        ReservationRefusal::Payment { message, schematic } => RpcResponsePayload {
+            status: RpcStatus::Application(ERR_PAYMENT),
+            headers: schematic.header_entry().into_iter().collect(),
+            body: message.clone().into(),
+        },
     }
 }
 
@@ -1066,11 +1091,6 @@ impl ConfiguredA2a {
             Ok(false) => {}
             Err(e) => return rejected(e),
         }
-        match self.store.in_flight(&offer.service_id, now).await {
-            Ok(in_flight) if in_flight >= offer.bounds.max_in_flight => return PrepareReply::Busy,
-            Ok(_) => {}
-            Err(e) => return rejected(e),
-        }
         // The admission id is minted here, by the provider, per
         // reservation — never derived from anything the caller sent.
         let record = AdmissionRecord::reserved(
@@ -1081,23 +1101,30 @@ impl ConfiguredA2a {
             commitment.clone(),
             now,
         );
-        match self.store.insert_reserved(record.clone()).await {
-            Ok(InsertOutcome::Inserted) => PrepareReply::Reservation(self.reservation_of(
-                &record,
+        // Capacity and the write are ONE transaction. Counting first and
+        // inserting second is what let four concurrent prepares of
+        // distinct task ids all pass a ceiling of one: each read a count
+        // taken before any of them had written.
+        match self
+            .store
+            .admit_reserved(record.clone(), offer.bounds.max_in_flight, now)
+            .await
+        {
+            Ok(AdmitOutcome::Admitted(stored)) => PrepareReply::Reservation(self.reservation_of(
+                &stored,
                 &offer,
                 now.saturating_add(offer.reservation_ttl_secs),
             )),
+            Ok(AdmitOutcome::Busy) => PrepareReply::Busy,
             // Lost the CAS to a concurrent prepare of the same task: the
             // stored record is authoritative, so answer from it rather
             // than from the reservation this call would have made.
-            Ok(InsertOutcome::Existing(found)) if found.commitment == commitment => {
+            Ok(AdmitOutcome::Existing(found)) if found.commitment == commitment => {
                 self.prepare_reply_for(&found, &offer, now).await
             }
-            Ok(InsertOutcome::Existing(_)) => {
-                rejected(SubmitRejection::IdReusedForDifferentBrief {
-                    task_id: record.task_id.clone(),
-                })
-            }
+            Ok(AdmitOutcome::Existing(_)) => rejected(SubmitRejection::IdReusedForDifferentBrief {
+                task_id: record.task_id.clone(),
+            }),
             Err(e) => rejected(e),
         }
     }
@@ -1119,28 +1146,42 @@ impl ConfiguredA2a {
             // it held was released. Re-acquire it or report Busy — never
             // hand back a reservation that does not hold capacity.
             AdmissionState::Reserved { .. } => {
-                match self.store.in_flight(&offer.service_id, now).await {
-                    Ok(in_flight) if in_flight >= offer.bounds.max_in_flight => {
-                        return PrepareReply::Busy
-                    }
-                    Ok(_) => {}
-                    Err(e) => return rejected(e),
-                }
-                let expires_at = now.saturating_add(offer.reservation_ttl_secs);
-                if let Err(e) = self
+                // Re-acquire under the ceiling in ONE transaction,
+                // keeping this record's admission id and incarnation —
+                // never hand back a reservation that does not hold
+                // capacity, and never check the ceiling in a
+                // transaction other than the one that writes.
+                let candidate = AdmissionRecord::reserved(
+                    record.owner,
+                    record.brief.clone(),
+                    offer,
+                    record.admission_id.clone(),
+                    record.commitment.clone(),
+                    now,
+                );
+                match self
                     .store
-                    .transition(
-                        record.owner,
-                        &task_id,
-                        &[StateTag::Reserved],
-                        AdmissionState::Reserved { expires_at },
-                        now,
-                    )
+                    .admit_reserved(candidate, offer.bounds.max_in_flight, now)
                     .await
                 {
-                    return rejected(e);
+                    Ok(AdmitOutcome::Admitted(stored)) => {
+                        let expires_at = match stored.state {
+                            AdmissionState::Reserved { expires_at } => expires_at,
+                            _ => now.saturating_add(offer.reservation_ttl_secs),
+                        };
+                        PrepareReply::Reservation(self.reservation_of(&stored, offer, expires_at))
+                    }
+                    Ok(AdmitOutcome::Busy) => PrepareReply::Busy,
+                    // A concurrent decision got there first; its record is
+                    // authoritative.
+                    Ok(AdmitOutcome::Existing(found)) => match found.state {
+                        AdmissionState::Reserved { expires_at } => PrepareReply::Reservation(
+                            self.reservation_of(&found, offer, expires_at),
+                        ),
+                        _ => PrepareReply::Existing { task_id },
+                    },
+                    Err(e) => rejected(e),
                 }
-                PrepareReply::Reservation(self.reservation_of(record, offer, expires_at))
             }
             // Already paid for: the caller may go straight to submit. No
             // new quote is needed, and a paid admission holds capacity
@@ -1163,6 +1204,15 @@ impl ConfiguredA2a {
     /// `net.a2a.task`, configured. The D2 sequence, in order, with the
     /// per-state dispatch at S4 as the only branch point.
     ///
+    /// **Decide, publish, then render.** Everything from S4 to S7 is
+    /// [`decide`](Self::decide), which returns a verdict rather than
+    /// reply bytes; this function publishes that verdict to every
+    /// concurrent duplicate parked on the reservation and only then
+    /// renders it for this caller. A waiter therefore receives the
+    /// decider's complete answer — the same status, the same schematic,
+    /// the same body — instead of a generic rejection that reads as
+    /// permanent when the decider's own refusal was retryable.
+    ///
     /// Every early return still holding the [`AdmissionTicket`] releases
     /// the reservation on drop, so no refusal path can strand a
     /// `Requested` entry that would then refuse every later submission
@@ -1184,10 +1234,8 @@ impl ConfiguredA2a {
             Ok(offer) => offer.clone(),
             Err(rejection) => return ack_refused(rejection),
         };
-        let paid = offer.pricing_terms.is_some();
         let tool_id = tool_id_of(&offer.service_id);
         let task_id = brief.task_id.clone();
-        let commitment = task_commitment(&offer, &brief);
 
         // S3 — claim the registry slot without starting work.
         let ticket = match self.registry.reserve(owner, brief.clone()) {
@@ -1202,8 +1250,10 @@ impl ConfiguredA2a {
             Ok(Admission::Pending(rx)) => {
                 return match await_admission_verdict(rx).await {
                     Ok(id) => ack_accepted(id),
-                    Err(reason) => ack_refused(reason),
-                }
+                    // The decider's verdict, rendered by the one function
+                    // that rendered its own reply.
+                    Err(refusal) => refusal_payload(&refusal),
+                };
             }
             Ok(Admission::Reserved(ticket)) => ticket,
         };
@@ -1217,25 +1267,75 @@ impl ConfiguredA2a {
                 .and_then(|raw| std::str::from_utf8(raw).ok()),
             binding: request_header(headers, HDR_PAYMENT_BINDING),
         };
-        let quote = sub.quote;
-        let binding = sub.binding;
+
+        // S4..S7. `deciding` is the record whose capacity hold has to be
+        // released on every outcome but a launch, which is what makes
+        // "held across the awaited preflight and redemption" bounded
+        // rather than permanent.
+        let mut deciding: Option<AdmissionRecord> = None;
+        let outcome = self.decide(&sub, &offer, &brief, now, &mut deciding).await;
+        if !matches!(outcome, Ok(Admitted::Launch)) {
+            if let Some(record) = deciding.as_ref() {
+                let _ = self.store.close_decision(record, now_secs()).await;
+            }
+        }
+        match outcome {
+            // S8 — launch, retained for exactly as long as the offer
+            // published. `launch` publishes the id to the waiters itself.
+            Ok(Admitted::Launch) => {
+                let id = ticket
+                    .with_retention(offer.retention_secs)
+                    .launch(Arc::clone(&self.executor));
+                ack_accepted(id)
+            }
+            Ok(Admitted::Underway(id)) => {
+                ticket.resolve_existing(id.clone());
+                ack_accepted(id)
+            }
+            Err(refusal) => {
+                let payload = refusal_payload(&refusal);
+                ticket.refuse(refusal);
+                payload
+            }
+        }
+    }
+
+    /// S4..S7: everything between the registry claim and the spawn.
+    ///
+    /// Returns the decision, never reply bytes — see
+    /// [`submit`](Self::submit) for why. `deciding` is set to the record
+    /// a capacity hold was opened on, so the caller can release it.
+    async fn decide(
+        &self,
+        sub: &Submission<'_>,
+        offer: &A2aOffer,
+        brief: &TaskBrief,
+        now: u64,
+        deciding: &mut Option<AdmissionRecord>,
+    ) -> Result<Admitted, ReservationRefusal> {
+        let (owner, task_id, tool_id) = (sub.owner, sub.task_id, sub.tool_id);
+        let paid = offer.pricing_terms.is_some();
+        let commitment = task_commitment(offer, brief);
+        let unavailable =
+            |detail: String| refuse_payment(&schematic_journal_unavailable(tool_id, &detail));
 
         // S4 — per-state dispatch. The ONLY branch point.
-        let found = match self.store.lookup(owner, &task_id).await {
-            Ok(found) => found,
-            Err(e) => {
-                return payment_refusal(&schematic_journal_unavailable(&tool_id, &e.to_string()))
-            }
-        };
+        let found = self
+            .store
+            .lookup(owner, task_id)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
         let mut record = match found {
             Some(record) if record.commitment != commitment => {
-                return ack_refused(SubmitRejection::IdReusedForDifferentBrief { task_id })
+                return Err(refuse(SubmitRejection::IdReusedForDifferentBrief {
+                    task_id: task_id.to_string(),
+                }))
             }
             Some(record) => match &record.state {
                 // Store-side "already under way": status shows the
                 // recorded (or interrupted) state; never relaunched.
                 AdmissionState::Launched { .. } | AdmissionState::Terminal { .. } => {
-                    return ack_accepted(task_id)
+                    return Ok(Admitted::Underway(task_id.to_string()))
                 }
                 // Post-payment revocation: the same refusal, every time,
                 // with no state change. An operator's `resolve` is the
@@ -1243,131 +1343,103 @@ impl ConfiguredA2a {
                 AdmissionState::Reconcile {
                     claimed_quote_id, ..
                 } => {
-                    let schematic =
-                        schematic_admission_revoked(&tool_id, claimed_quote_id.as_deref());
-                    return payment_refusal(&schematic);
+                    return Err(refuse_payment(&schematic_admission_revoked(
+                        tool_id,
+                        claimed_quote_id.as_deref(),
+                    )))
                 }
                 _ => Some(record),
             },
             None => {
-                match self.store.ledger_has(owner, &task_id).await {
-                    // Ran once, result retired: the ledger bars a
-                    // relaunch, and the redeem step is never reached.
-                    Ok(true) => return ack_refused(SubmitRejection::Retired { task_id }),
-                    Ok(false) => {}
-                    Err(e) => {
-                        return payment_refusal(&schematic_journal_unavailable(
-                            &tool_id,
-                            &e.to_string(),
-                        ))
-                    }
+                // Ran once, result retired: the ledger bars a relaunch,
+                // and the redeem step is never reached.
+                if self
+                    .store
+                    .ledger_has(owner, task_id)
+                    .await
+                    .map_err(|e| unavailable(e.to_string()))?
+                {
+                    return Err(refuse(SubmitRejection::Retired {
+                        task_id: task_id.to_string(),
+                    }));
                 }
                 if paid {
                     // A paid service requires a prior reservation — and
                     // this is a payment/admission verdict, so it is
                     // refused structurally, before the gate is touched.
-                    return payment_refusal(&schematic_no_reservation(&tool_id));
+                    return Err(refuse_payment(&schematic_no_reservation(tool_id)));
                 }
                 None
             }
         };
 
-        // S4, continued: a lapsed reservation re-acquires capacity before
-        // anything else. Over capacity is a retryable in-body Busy with
-        // the gate NOT called — never an unpaid rejection of a purchase
-        // that is still good.
+        // S4b — open the decision. Identity-bound, so nothing that
+        // follows can land on a replacement record; and the record holds
+        // its capacity slot for the whole awaited window, so a
+        // reservation that lapses mid-decision cannot have its slot
+        // taken by a competitor and then be transitioned against this
+        // stale time sample. A lapsed reservation re-acquires here, in
+        // the same transaction as the check — over capacity is a
+        // retryable in-body Busy with the gate NOT called, never an
+        // unpaid rejection of a purchase that is still good.
         if let Some(current) = record.as_ref() {
-            if matches!(&current.state, AdmissionState::Reserved { expires_at } if *expires_at <= now)
+            match self
+                .store
+                .open_decision(current, offer.bounds.max_in_flight, now)
+                .await
             {
-                match self.store.in_flight(&offer.service_id, now).await {
-                    Ok(in_flight) if in_flight >= offer.bounds.max_in_flight => {
-                        return ack_refused(SubmitRejection::Busy)
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return payment_refusal(&schematic_journal_unavailable(
-                            &tool_id,
-                            &e.to_string(),
-                        ))
-                    }
+                Ok(DecisionOutcome::Open(open)) => {
+                    *deciding = Some((*open).clone());
+                    record = Some(*open);
                 }
-                let expires_at = now.saturating_add(offer.reservation_ttl_secs);
-                if let Err(e) = self
-                    .store
-                    .transition(
-                        owner,
-                        &task_id,
-                        &[StateTag::Reserved],
-                        AdmissionState::Reserved { expires_at },
-                        now,
-                    )
-                    .await
-                {
-                    return payment_refusal(&schematic_journal_unavailable(
-                        &tool_id,
-                        &e.to_string(),
-                    ));
-                }
-                if let Some(r) = record.as_mut() {
-                    r.state = AdmissionState::Reserved { expires_at };
-                }
+                Ok(DecisionOutcome::Busy) => return Err(refuse(SubmitRejection::Busy)),
+                Err(e) => return Err(unavailable(e.to_string())),
             }
         }
 
         // S5 — the application preflight runs again, on every path:
         // authority may have changed since prepare.
-        if let Err(reason) = self.run_preflight(owner, &offer, &brief).await {
-            return self.revoked(&sub, record.as_ref(), reason).await;
+        if let Err(reason) = self.run_preflight(owner, offer, brief).await {
+            return Err(self.revoked(sub, record.as_ref(), reason).await);
         }
 
         // S5a — free inline admission: the same capacity rule prepare
-        // applies, for a caller that never prepared.
+        // applies, for a caller that never prepared, and in the same one
+        // transaction.
         if record.is_none() {
-            match self.store.in_flight(&offer.service_id, now).await {
-                Ok(in_flight) if in_flight >= offer.bounds.max_in_flight => {
-                    return ack_refused(SubmitRejection::Busy)
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return payment_refusal(&schematic_journal_unavailable(
-                        &tool_id,
-                        &e.to_string(),
-                    ))
-                }
-            }
             let inline = AdmissionRecord::reserved(
                 owner,
                 brief.clone(),
-                &offer,
+                offer,
                 // No admission id: nothing was minted, because nothing
                 // can be purchased against a free offer.
                 None,
                 commitment.clone(),
                 now,
             );
-            match self.store.insert_reserved(inline.clone()).await {
-                Ok(InsertOutcome::Inserted) => record = Some(inline),
+            match self
+                .store
+                .admit_reserved(inline, offer.bounds.max_in_flight, now)
+                .await
+            {
+                Ok(AdmitOutcome::Admitted(stored)) => record = Some(*stored),
+                Ok(AdmitOutcome::Busy) => return Err(refuse(SubmitRejection::Busy)),
                 // A prepare of the same task landed between the lookup
                 // and this insert. Its reservation is authoritative;
                 // this submit claims the launch against it.
-                Ok(InsertOutcome::Existing(found))
+                Ok(AdmitOutcome::Existing(found))
                     if found.commitment == commitment
                         && matches!(found.state, AdmissionState::Reserved { .. }) =>
                 {
                     record = Some(*found)
                 }
-                Ok(InsertOutcome::Existing(found)) => {
-                    return ack_refused(format!(
+                Ok(AdmitOutcome::Existing(found)) => {
+                    return Err(refuse(format!(
                         "this task is already admitted as {}",
                         found.state.tag().as_str()
-                    ))
+                    )))
                 }
-                Err(e) => {
-                    return payment_refusal(&schematic_journal_unavailable(
-                        &tool_id,
-                        &e.to_string(),
-                    ))
-                }
+                Err(e) => return Err(unavailable(e.to_string())),
             }
         }
 
@@ -1376,12 +1448,12 @@ impl ConfiguredA2a {
             let Some(current) = record.as_ref() else {
                 // Unreachable: a paid service with no record answered
                 // `no_reservation` at S4. Fail closed rather than launch.
-                return payment_refusal(&schematic_no_reservation(&tool_id));
+                return Err(refuse_payment(&schematic_no_reservation(tool_id)));
             };
             match &current.state {
                 AdmissionState::Reserved { .. } => {
-                    if let Some(refusal) = self.redeem(&sub, current, now).await {
-                        return refusal;
+                    if let Some(refusal) = self.redeem(sub, current, now).await {
+                        return Err(refusal);
                     }
                 }
                 AdmissionState::Paid { quote_id, .. } => {
@@ -1389,23 +1461,25 @@ impl ConfiguredA2a {
                     // the gate is NOT called: this admission was already
                     // paid for, and redeeming again is how a retry turns
                     // into a second charge.
-                    let matches_record = quote == Some(quote_id.as_str()) && binding.is_some();
+                    let matches_record =
+                        sub.quote == Some(quote_id.as_str()) && sub.binding.is_some();
                     if !matches_record {
-                        self.note(owner, &task_id, "binding_rejected", quote).await;
-                        return payment_refusal(&schematic_binding_rejected(
-                            &tool_id,
+                        self.note(owner, task_id, "binding_rejected", sub.quote)
+                            .await;
+                        return Err(refuse_payment(&schematic_binding_rejected(
+                            tool_id,
                             Some(quote_id),
                             "this admission is already paid for by another quote, or the \
                              submission carried no binding signature"
                                 .to_string(),
-                        ));
+                        )));
                     }
                 }
                 other => {
-                    return payment_refusal(&schematic_journal_unavailable(
-                        &tool_id,
-                        &format!("admission is {}", other.tag().as_str()),
-                    ))
+                    return Err(unavailable(format!(
+                        "admission is {}",
+                        other.tag().as_str()
+                    )))
                 }
             }
         }
@@ -1413,16 +1487,11 @@ impl ConfiguredA2a {
         // S7 — the launch claim is durable BEFORE the spawn. A write
         // failure leaves the store exactly as it was and runs nothing;
         // the retry re-enters S4 with the same state.
-        if let Err(e) = self.store.claim_launch(owner, &task_id, now).await {
-            return payment_refusal(&schematic_journal_unavailable(&tool_id, &e.to_string()));
-        }
-
-        // S8 — launch, retained for exactly as long as the offer
-        // published.
-        let id = ticket
-            .with_retention(offer.retention_secs)
-            .launch(Arc::clone(&self.executor));
-        ack_accepted(id)
+        self.store
+            .claim_launch(owner, task_id, now)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        Ok(Admitted::Launch)
     }
 
     /// S5's refusal dispatch: what a preflight failure at submit means
@@ -1432,40 +1501,37 @@ impl ConfiguredA2a {
         sub: &Submission<'_>,
         record: Option<&AdmissionRecord>,
         reason: String,
-    ) -> RpcResponsePayload {
+    ) -> ReservationRefusal {
         let (owner, task_id, tool_id) = (sub.owner, sub.task_id, sub.tool_id);
+        let unavailable =
+            |detail: String| refuse_payment(&schematic_journal_unavailable(tool_id, &detail));
         let Some(record) = record else {
             // Free, never prepared: nothing was reserved.
-            return ack_refused(reason);
+            return refuse(reason);
         };
         if !record.paid {
             // Free, prepared: delete the reservation — nothing financial
             // exists, so leaving it would hold capacity for work that
-            // will not run.
-            if let Err(e) = self.store.delete_reservation(owner, task_id).await {
-                return payment_refusal(&schematic_journal_unavailable(tool_id, &e.to_string()));
+            // will not run. Identity-bound: the decision to abandon this
+            // work may not delete a replacement, and it deletes its own
+            // deciding record because this *is* the decision ending.
+            if let Err(e) = self.store.delete_reservation(record).await {
+                return unavailable(e.to_string());
             }
-            return ack_refused(reason);
+            return refuse(reason);
         }
         let (from, claimed, payer) = match &record.state {
             // Paid service, reserved, no payment presented: nothing has
             // been claimed paid, so this is an ordinary unpaid rejection
             // and the reservation stays exactly as it was.
-            AdmissionState::Reserved { .. } if !sub.carries_payment() => {
-                return ack_refused(reason)
-            }
+            AdmissionState::Reserved { .. } if !sub.carries_payment() => return refuse(reason),
             AdmissionState::Reserved { .. } => {
                 ([StateTag::Reserved], sub.quote.map(str::to_string), None)
             }
             AdmissionState::Paid { quote_id, payer } => {
                 ([StateTag::Paid], Some(quote_id.clone()), Some(*payer))
             }
-            other => {
-                return payment_refusal(&schematic_journal_unavailable(
-                    tool_id,
-                    &format!("admission is {}", other.tag().as_str()),
-                ))
-            }
+            other => return unavailable(format!("admission is {}", other.tag().as_str())),
         };
         // A payment may already have landed. This is reconciliation, not
         // a rejection: the record is retained until an operator resolves
@@ -1485,9 +1551,9 @@ impl ConfiguredA2a {
             )
             .await
         {
-            return payment_refusal(&schematic_journal_unavailable(tool_id, &e.to_string()));
+            return unavailable(e.to_string());
         }
-        payment_refusal(&schematic_admission_revoked(tool_id, claimed.as_deref()))
+        refuse_payment(&schematic_admission_revoked(tool_id, claimed.as_deref()))
     }
 
     /// S6 — redeem a payment for exactly this reservation. `Some` is the
@@ -1497,11 +1563,11 @@ impl ConfiguredA2a {
         sub: &Submission<'_>,
         record: &AdmissionRecord,
         now: u64,
-    ) -> Option<RpcResponsePayload> {
+    ) -> Option<ReservationRefusal> {
         let (owner, task_id, tool_id) = (sub.owner, sub.task_id, sub.tool_id);
         let Some(quote_id) = sub.quote else {
             self.note(owner, task_id, "missing_quote", None).await;
-            return Some(payment_refusal(&schematic_missing_quote(tool_id)));
+            return Some(refuse_payment(&schematic_missing_quote(tool_id)));
         };
         // Mandatory, unlike a paid tool's optional bearer fallback: a
         // task is a long-running side effect, so possession of a quote id
@@ -1509,14 +1575,14 @@ impl ConfiguredA2a {
         let Some(binding) = sub.binding else {
             self.note(owner, task_id, "binding_required", Some(quote_id))
                 .await;
-            return Some(payment_refusal(&schematic_binding_required(
+            return Some(refuse_payment(&schematic_binding_required(
                 tool_id, quote_id,
             )));
         };
         let Some(gate) = self.gate.as_ref() else {
             // Serve-time invariants make this unreachable; fail closed
             // rather than serve paid work for nothing.
-            return Some(payment_refusal(&FailureSchematic::gate_missing(tool_id)));
+            return Some(refuse_payment(&FailureSchematic::gate_missing(tool_id)));
         };
         // The expected hash is computed from the PROVIDER's own record,
         // never read off the request: that is what makes a valid payment
@@ -1542,7 +1608,7 @@ impl ConfiguredA2a {
                 // admission instead of buying a second one.
                 self.note(owner, task_id, &denial.schematic.reason, Some(quote_id))
                     .await;
-                return Some(gate_refusal(denial.message, &denial.schematic));
+                return Some(refuse_gate(denial.message, &denial.schematic));
             }
         };
         // A verified end-to-end principal is matched against the payer:
@@ -1552,36 +1618,49 @@ impl ConfiguredA2a {
         {
             self.note(owner, task_id, "binding_rejected", Some(&evidence.quote_id))
                 .await;
-            return Some(payment_refusal(&schematic_binding_rejected(
+            return Some(refuse_payment(&schematic_binding_rejected(
                 tool_id,
                 Some(&evidence.quote_id),
                 "the payer this quote was issued to is not the admitted caller".to_string(),
             )));
         }
-        if let Err(e) = self
+        // The financial write re-presents the admission the gate was
+        // asked about: the generation, the admission id the purchase hash
+        // above was computed over, and the commitment. A record that is
+        // no longer that incarnation refuses — and the redemption is
+        // retained against the original admission, because the payment
+        // happened whether or not the provider can still use it. That is
+        // reconciliation, not a retry: a second purchase would be a
+        // second charge for work this provider will not admit.
+        match self
             .store
-            .transition(
-                owner,
-                task_id,
-                &[StateTag::Reserved],
-                AdmissionState::Paid {
-                    quote_id: evidence.quote_id,
-                    payer: evidence.payer,
-                },
-                now,
-            )
+            .redeem(record, evidence.quote_id.clone(), evidence.payer, now)
             .await
         {
-            // The redeem was idempotent per purchase hash, so the retry
-            // re-enters S4 as `Reserved`, redeems again without a second
-            // charge, and proceeds.
-            return Some(payment_refusal(&schematic_journal_unavailable(
-                tool_id,
-                &e.to_string(),
-            )));
+            Ok(()) => None,
+            Err(A2aJournalError::Superseded { .. }) => Some(refuse_payment(
+                &schematic_admission_revoked(tool_id, Some(&evidence.quote_id)),
+            )),
+            Err(e) => {
+                // The redeem was idempotent per purchase hash, so the
+                // retry re-enters S4 as `Reserved`, redeems again without
+                // a second charge, and proceeds.
+                Some(refuse_payment(&schematic_journal_unavailable(
+                    tool_id,
+                    &e.to_string(),
+                )))
+            }
         }
-        None
     }
+}
+
+/// What [`ConfiguredA2a::decide`] concluded when it did not refuse.
+enum Admitted {
+    /// The launch claim is durable: spawn the executor.
+    Launch,
+    /// The work this submission names is already under way — a launched
+    /// or recorded admission. Answer with its id and spawn nothing.
+    Underway(String),
 }
 
 /// A prepare refusal from anything that can render itself.

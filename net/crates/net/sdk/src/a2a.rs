@@ -58,6 +58,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::tool_payment::FailureSchematic;
+
 /// The lifecycle state of an A2A task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -671,8 +673,8 @@ struct Entry {
     /// `Some` while this entry is a reservation no ticket has resolved yet:
     /// the verdict channel every concurrent identical admission waits on.
     /// Taken at launch (the task id is published to the waiters); the whole
-    /// entry is removed on release (the reason is published instead).
-    reservation: Option<watch::Sender<Option<Result<String, String>>>>,
+    /// entry is removed on release (the refusal is published instead).
+    reservation: Option<watch::Sender<ReservationVerdict>>,
     /// Per-entry terminal-record retention, overriding
     /// [`TERMINAL_RECORD_TTL_SECS`]. `None` uses the global default.
     retention_secs: Option<u64>,
@@ -795,6 +797,59 @@ pub type TerminalHook = Arc<dyn Fn(TaskOwner, &str, &TaskState) + Send + Sync>;
 /// Published to waiters when a reservation resolves without launching.
 const RESERVATION_RELEASED: &str = "the reservation was released without launching";
 
+/// Why a reservation resolved without launching — **in the shape the
+/// decider answered with**, so a waiter can reproduce it exactly.
+///
+/// A concurrent duplicate parks on [`Admission::Pending`] instead of
+/// deciding (and paying for) the same task twice, which means the
+/// decider's verdict is the waiter's verdict. A refusal flattened to
+/// prose loses the one thing the waiter has to act on: whether the
+/// refusal is retryable. A deciding submit that fails a journal write
+/// answers a retryable payment schematic; a waiter handed a bare string
+/// cannot tell that from a permanent refusal, and treating "retry the
+/// same proof" as "this purchase can never execute" is how a paid task
+/// is abandoned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReservationRefusal {
+    /// A plain in-body rejection: the reason a [`TaskAck`] carries.
+    Rejected(String),
+    /// A payment or admission refusal: the human message plus the
+    /// structured [`FailureSchematic`] the decider authored, which is
+    /// what says whether the refusal is retryable, what it cost, and
+    /// whether a re-quote is safe.
+    Payment {
+        /// The message the decider answered with.
+        message: String,
+        /// The decider's schematic, verbatim. Boxed: a schematic is far
+        /// larger than the string arm, and this enum travels through a
+        /// watch channel by value.
+        schematic: Box<FailureSchematic>,
+    },
+}
+
+impl ReservationRefusal {
+    /// The human-readable reason, for a consumer that has no use for the
+    /// structured half.
+    pub fn message(&self) -> &str {
+        match self {
+            ReservationRefusal::Rejected(reason) => reason,
+            ReservationRefusal::Payment { message, .. } => message,
+        }
+    }
+
+    /// The structured refusal, when the decider authored one.
+    pub fn schematic(&self) -> Option<&FailureSchematic> {
+        match self {
+            ReservationRefusal::Rejected(_) => None,
+            ReservationRefusal::Payment { schematic, .. } => Some(schematic),
+        }
+    }
+}
+
+/// What a reservation resolved to: `None` while it is still being
+/// decided, then the launched task id or the decider's complete refusal.
+pub type ReservationVerdict = Option<Result<String, ReservationRefusal>>;
+
 /// What [`TaskRegistry::reserve`] found for an `(owner, task id)`.
 ///
 /// The three arms are the admission split: work that is already under way,
@@ -807,36 +862,37 @@ pub enum Admission {
     /// An identical brief is reserved but not yet launched: a concurrent
     /// admission is deciding it (redeeming a payment, writing a journal
     /// record). The receiver resolves to `Some(Ok(task id))` if that
-    /// admission launches and `Some(Err(reason))` if it is released —
-    /// [`await_admission_verdict`] does the waiting.
+    /// admission launches and `Some(Err(refusal))` if it is refused or
+    /// released — [`await_admission_verdict`] does the waiting.
     ///
     /// Converging here rather than reserving a second time is what keeps
     /// two racing retransmits to one payment and one run.
-    Pending(watch::Receiver<Option<Result<String, String>>>),
+    Pending(watch::Receiver<ReservationVerdict>),
     /// A fresh reservation: the entry exists in [`TaskState::Requested`]
     /// and this ticket is the only thing that can launch or release it.
     Reserved(AdmissionTicket),
 }
 
 /// Await an [`Admission::Pending`] reservation's verdict: the launched task
-/// id, or why the reservation was released.
+/// id, or the decider's complete refusal.
 ///
 /// Never hangs on a lost decider: a reservation whose entry disappears
 /// without a verdict (a `forget` racing the decision) resolves as a
 /// released reservation, because the sender is gone and no verdict can
 /// ever arrive.
 pub async fn await_admission_verdict(
-    mut rx: watch::Receiver<Option<Result<String, String>>>,
-) -> Result<String, String> {
+    mut rx: watch::Receiver<ReservationVerdict>,
+) -> Result<String, ReservationRefusal> {
     loop {
         if let Some(verdict) = rx.borrow_and_update().clone() {
             return verdict;
         }
         if rx.changed().await.is_err() {
-            return rx
-                .borrow()
-                .clone()
-                .unwrap_or_else(|| Err(RESERVATION_RELEASED.to_string()));
+            return rx.borrow().clone().unwrap_or_else(|| {
+                Err(ReservationRefusal::Rejected(
+                    RESERVATION_RELEASED.to_string(),
+                ))
+            });
         }
     }
 }
@@ -978,24 +1034,56 @@ impl AdmissionTicket {
     /// again — a later submission of the same brief reserves afresh.
     pub fn release(mut self) {
         self.armed = false;
-        release_reservation(&self.inner, &self.key);
+        release_reservation(&self.inner, &self.key, None);
+    }
+
+    /// Consume the ticket and publish `refusal` — **the decider's own
+    /// answer** — to every waiter, instead of the generic "released"
+    /// note.
+    ///
+    /// This is what makes concurrent submitters converge: the waiter
+    /// receives the verdict the decider produced, retryability and all,
+    /// rather than a summary of it. The entry is deleted, so the id is
+    /// free for a retry.
+    pub fn refuse(mut self, refusal: ReservationRefusal) {
+        self.armed = false;
+        release_reservation(&self.inner, &self.key, Some(refusal));
+    }
+
+    /// Consume the ticket and publish `task_id` to every waiter without
+    /// launching anything: the work this submission names is already
+    /// under way (a launched or recorded admission the store answered
+    /// from), so the waiters converge on it exactly as they would on a
+    /// launch.
+    pub fn resolve_existing(mut self, task_id: String) {
+        self.armed = false;
+        let mut map = self.inner.lock();
+        let reserved = map.get(&self.key).is_some_and(|e| e.reservation.is_some());
+        if !reserved {
+            return;
+        }
+        if let Some(tx) = map.remove(&self.key).and_then(|e| e.reservation) {
+            tx.send_replace(Some(Ok(task_id)));
+        }
     }
 }
 
 impl Drop for AdmissionTicket {
     fn drop(&mut self) {
         if self.armed {
-            release_reservation(&self.inner, &self.key);
+            release_reservation(&self.inner, &self.key, None);
         }
     }
 }
 
-/// Delete an unlaunched reservation and publish the refusal to its waiters.
+/// Delete an unlaunched reservation and publish the refusal to its waiters:
+/// `refusal` when the decider authored one, else the generic released note.
 /// Checks the entry is still a reservation first: a launched entry is a
 /// running task, never something a stale ticket may delete.
 fn release_reservation(
     inner: &Arc<Mutex<HashMap<(TaskOwner, String), Entry>>>,
     key: &(TaskOwner, String),
+    refusal: Option<ReservationRefusal>,
 ) {
     let mut map = inner.lock();
     let reserved = map.get(key).is_some_and(|e| e.reservation.is_some());
@@ -1003,7 +1091,9 @@ fn release_reservation(
         return;
     }
     if let Some(tx) = map.remove(key).and_then(|e| e.reservation) {
-        tx.send_replace(Some(Err(RESERVATION_RELEASED.to_string())));
+        tx.send_replace(Some(Err(refusal.unwrap_or_else(|| {
+            ReservationRefusal::Rejected(RESERVATION_RELEASED.to_string())
+        }))));
     }
 }
 

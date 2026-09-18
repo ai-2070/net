@@ -865,6 +865,13 @@ impl CallerPaymentFlow {
     /// and this call quotes fresh. Only an expired or unparseable hold is
     /// cleared.
     ///
+    /// The returned quote's `input_hash` must **equal** the requested
+    /// one, exactly. Verifying signature, parties, capability,
+    /// requirements and expiry says the quote is genuine; only this
+    /// comparison says it prices *this* purchase, and a caller that
+    /// skips it can settle a real payment for evidence its reservation
+    /// will refuse.
+    ///
     /// `Err` carries the terminal [`CallerDecision`] the flow would
     /// return, so `run` composes by `?`-shaped early exit and the two can
     /// never disagree about how a quote failure reads.
@@ -989,6 +996,27 @@ impl CallerPaymentFlow {
                 policy_reason: "quote deviates from the announced terms — never pay more \
                                 than discovery showed"
                     .to_string(),
+            });
+        }
+        // The quote must price **the work that was asked about**. Every
+        // other check above establishes who/what/how-much; this one
+        // establishes *which unit of work*, and it is the only thing
+        // standing between a caller and paying for evidence its
+        // reservation cannot redeem. A provider that answers a bound
+        // request with an unbound quote (`input_hash: None`) or with
+        // somebody else's hash is refused here — before spend policy,
+        // before authoring, before any money moves. The comparison is
+        // exact in both directions: an unbound request must not come
+        // back bound either, or the caller would be paying under a
+        // commitment it never made.
+        if quote.input_hash.as_deref() != input_hash {
+            return Err(CallerDecision::Denied {
+                policy_reason: format!(
+                    "quote is bound to input {:?} but this purchase asked for {:?} — \
+                     never pay for work the quote does not price",
+                    quote.input_hash.as_deref(),
+                    input_hash
+                ),
             });
         }
         if quote.is_expired_at(self.clock.now_ns()) {

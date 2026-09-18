@@ -19,6 +19,26 @@
 //! payload were durable **before** the pay call, which is what
 //! [`A2aCallerFlow::purchase_task`] guarantees.
 //!
+//! **What a compare-and-set here actually compares.** A state tag is not
+//! an identity: re-preparing replaces the record under the same key, so
+//! an awaited decision — a wallet still signing, a refusal still in
+//! flight — would otherwise publish its result onto whatever now
+//! occupies that key and buy a quote nobody authorized. Every record
+//! therefore carries an immutable [`AttemptGeneration`], minted at
+//! creation and re-minted on replacement, and every write that lands
+//! *after* an await re-presents the [`AttemptIdentity`] it was decided
+//! against — that generation and that exact quote id. A refused write is
+//! [`PurchaseError::Superseded`]: retryable, and never a claim about
+//! money.
+//!
+//! Refusing the stale write protects the replacement; it cannot unmake a
+//! charge. So when the awaited operation *did* produce a financial
+//! result — a settled payment, or an exposed payload of unknown fate —
+//! that result is retained beside the live attempt under the incarnation
+//! it belongs to, in the unresolved-financial class, and closes through
+//! [`A2aCallerFlow::resolve_superseded_attempt`]. Discarding it behind a
+//! retryable error would be a lost payment.
+//!
 //! Three boundaries hold throughout, and each one is a state, not a
 //! convention:
 //!
@@ -51,8 +71,7 @@ use std::sync::Arc;
 
 use net::adapter::net::identity::EntityId;
 use net_sdk::a2a::{
-    purchase_hash, task_commitment, A2aOffer, PrepareReply, PreparedTask, SubmitRejection, TaskAck,
-    TaskBrief,
+    purchase_hash, task_commitment, A2aOffer, PrepareReply, PreparedTask, TaskAck, TaskBrief,
 };
 use net_sdk::a2a_payment::TaskPaymentProof;
 use net_sdk::mesh::Mesh;
@@ -95,6 +114,11 @@ const TERMINAL_SUBMIT_REASONS: [&str; 3] = [
     "no_reservation",
     "input_binding_mismatch",
 ];
+
+/// The `reason` a retained superseded attempt's refusal carries: the
+/// purchase is paid (or exposed) and its intent key moved on, so no
+/// retry and no re-quote can close it — only an operator can.
+pub const SUPERSEDED_REFUSAL_REASON: &str = "superseded_attempt";
 
 // ---------------------------------------------------------------------------
 // Keys, records, states
@@ -162,6 +186,81 @@ pub struct RefusalRecord {
     pub safe_to_requote: bool,
 }
 
+/// The immutable identity of one **incarnation** of a
+/// [`PurchaseAttempt`].
+///
+/// A compare-and-swap that checks only the state *tag* cannot tell an
+/// attempt from its replacement, so an awaited decision — a signer that
+/// finally returned, a refusal that finally landed — publishes its
+/// result onto whatever record now occupies the key. The generation is
+/// what makes that impossible: it is minted when the record is created,
+/// never mutated afterwards, and every post-await write re-presents it
+/// (see [`AttemptIdentity`]).
+///
+/// Two fields, because each answers a question the other cannot:
+///
+/// - `seq` is monotonic within the key, so "older decision" is a
+///   readable fact in the store and in an error message.
+/// - `incarnation` is unique per creation, because `seq` **restarts** at
+///   1 when a key is pruned or discarded and prepared again. A pure
+///   counter would let a decision taken against the first incarnation
+///   match the third — the same ABA the generation exists to close.
+///
+/// `Default` — `gen 0/` — exists for exactly one reason: the field is
+/// `#[serde(default)]`, so a file written before generations existed
+/// still loads. **No production path mints it**; every mint goes through
+/// `mint_generation` with `seq >= 1` and a unique incarnation. Two
+/// pre-generation rows therefore share this identity *value*, which is
+/// harmless because a guarded write resolves its record by key and only
+/// then compares: a shared value lets a decision write to the row it was
+/// read from, and to nothing else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptGeneration {
+    /// 1 for a fresh record; +1 on every replacement (re-prepare, or a
+    /// stale-lease takeover). `0` only on a record written before
+    /// generations existed.
+    pub seq: u64,
+    /// Minted at creation from the pid, a per-process sequence, the
+    /// caller's clock and the key. Not a secret and not a nonce: it only
+    /// has to be unique, so that no incarnation of a key can be mistaken
+    /// for another one. Empty only on a pre-generation record.
+    pub incarnation: String,
+}
+
+impl std::fmt::Display for AttemptGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gen {}/{}", self.seq, self.incarnation)
+    }
+}
+
+/// What a write decided **before** an await must re-present to be
+/// allowed to land afterwards: the exact record incarnation, and the
+/// exact quote the decision was taken against.
+///
+/// Both halves are load-bearing. The generation refuses a write aimed at
+/// a record that has been replaced; the quote id refuses one aimed at a
+/// quote that has been replaced *within* a record. A write the store
+/// refuses on this check is [`PurchaseError::Superseded`] — retryable,
+/// and never a statement about money.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptIdentity {
+    /// The incarnation the decision was taken against.
+    pub generation: AttemptGeneration,
+    /// The quote the decision was taken against, if the record had one.
+    pub quote_id: Option<String>,
+}
+
+impl std::fmt::Display for AttemptIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} quote {}",
+            self.generation,
+            self.quote_id.as_deref().unwrap_or("-")
+        )
+    }
+}
+
 /// One caller-side purchase attempt: the durable record of everything
 /// needed to finish, or to reconcile, exactly one purchase.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +272,14 @@ pub struct PurchaseAttempt {
     /// different commitment under the same key is
     /// [`PurchaseError::CommitmentConflict`], never a silent re-purchase.
     pub commitment: String,
+    /// This incarnation's immutable identity. Minted when the record is
+    /// created, re-minted when the record is *replaced*, and never
+    /// touched by an ordinary transition — which is what lets a write
+    /// decided before an await prove it is still writing to the record
+    /// it decided about. `#[serde(default)]` so a file written before
+    /// generations existed still loads (as `gen 0/`).
+    #[serde(default)]
+    pub generation: AttemptGeneration,
     /// The provider's reservation and the exact brief it admits. `None`
     /// only while `Preparing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +355,20 @@ impl PurchaseAttempt {
                 | PurchaseState::PaidUnexecutable { .. }
                 | PurchaseState::Paid { .. }
         )
+    }
+
+    /// What a decision taken against this record must re-present to
+    /// publish its result: this incarnation, and this quote.
+    ///
+    /// Read **before** the await, compared **after** it. A colliding
+    /// pair is not reachable by accident: `incarnation` is unique per
+    /// creation, so two records with the same identity are the same
+    /// record.
+    pub fn identity(&self) -> AttemptIdentity {
+        AttemptIdentity {
+            generation: self.generation.clone(),
+            quote_id: self.quote_id.clone(),
+        }
     }
 }
 
@@ -471,6 +592,24 @@ pub enum PurchaseError {
     /// key — the one refusal that must never be a silent re-purchase.
     #[error("purchase attempt for {key} commits to different work")]
     CommitmentConflict { key: String },
+    /// This write was decided against a record incarnation (or a quote)
+    /// the key no longer holds — a replacement was minted while the
+    /// decision was in flight.
+    ///
+    /// **Retryable, and never a financial fact.** It says one thing
+    /// only: this result may not be published *here*. Whether money
+    /// moved is the awaited operation's answer, and an authoritative one
+    /// is retained against the original incarnation rather than
+    /// discarded (see [`A2aCallerFlow::resolve_superseded_attempt`]).
+    #[error(
+        "purchase attempt for {key} is no longer the incarnation this decision was taken \
+         against (decided for {expected}, key now holds {found})"
+    )]
+    Superseded {
+        key: String,
+        expected: String,
+        found: String,
+    },
     /// Not a row of the caller transition table.
     #[error("`{from}` → `{to}` is not a caller purchase transition")]
     NotATransition { from: StateTag, to: StateTag },
@@ -523,6 +662,42 @@ pub enum PrepareClaim {
     Ready(Box<PurchaseAttempt>),
     /// Another caller holds a live `Preparing` lease.
     Awaiting,
+}
+
+/// What an [`A2aPurchaseStore`] CAS checks *besides* the state tag.
+///
+/// Exactly one guard, never a pair, because the two are the same thing
+/// at two ages of the record: before a quote exists, the caller's lease
+/// id is the record's identity (it is minted per claim, so a replacement
+/// cannot accept a write under it); once a quote exists, the
+/// [`AttemptIdentity`] is.
+enum CasGuard<'a> {
+    /// The state table only — for a write decided and published without
+    /// an await in between.
+    None,
+    /// The record must still be leased by this exact claim.
+    Lease(&'a str),
+    /// The record must still be the incarnation, and carry the quote,
+    /// that this write was decided against.
+    Identity(&'a AttemptIdentity),
+}
+
+/// [`CasGuard`] with its borrows resolved, so it can cross into the
+/// `'static` locked-mutation closure.
+enum OwnedGuard {
+    None,
+    Lease(String),
+    Identity(AttemptIdentity),
+}
+
+impl CasGuard<'_> {
+    fn owned(self) -> OwnedGuard {
+        match self {
+            Self::None => OwnedGuard::None,
+            Self::Lease(lease) => OwnedGuard::Lease(lease.to_string()),
+            Self::Identity(identity) => OwnedGuard::Identity(identity.clone()),
+        }
+    }
 }
 
 impl A2aPurchaseStore {
@@ -583,6 +758,7 @@ impl A2aPurchaseStore {
         let key_owned = key.clone();
         let commitment_owned = commitment.to_string();
         let lease_id = mint_lease(&id, now_ns);
+        let fresh_generation = mint_generation(&id, now_ns, 1);
         let id_owned = id.clone();
         let claim = mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
             let id = id_owned;
@@ -592,6 +768,7 @@ impl A2aPurchaseStore {
                     PurchaseAttempt {
                         key: key_owned,
                         commitment: commitment_owned,
+                        generation: fresh_generation,
                         prepared: None,
                         quote_bytes: None,
                         quote_id: None,
@@ -730,6 +907,13 @@ impl A2aPurchaseStore {
     /// Move the attempt from one of `from` to `to`, refusing any pair
     /// outside the caller transition table.
     ///
+    /// No identity check: for writes taken and published without an
+    /// await in between (an operator's resolution, a state change
+    /// decided from the record just read under the same lock-free
+    /// re-read), the state check *is* the whole contract. Anything that
+    /// awaits between its decision and its write MUST use
+    /// [`Self::transition_exact`] instead.
+    ///
     /// The store never reads a clock: `now_ns` stamps the record, so a
     /// recovery pass can replay with the times it is reasoning about.
     pub async fn transition(
@@ -739,16 +923,34 @@ impl A2aPurchaseStore {
         to: PurchaseState,
         now_ns: u64,
     ) -> Result<PurchaseAttempt, PurchaseError> {
-        self.cas(key, from, None, to, now_ns, |_| {}).await
+        self.cas(key, from, CasGuard::None, to, now_ns, |_| {})
+            .await
+    }
+
+    /// [`Self::transition`], plus the check that makes a post-await write
+    /// safe: the record must still be the incarnation (and carry the
+    /// quote) the decision was taken against, or the write is refused as
+    /// [`PurchaseError::Superseded`] rather than landing on whatever
+    /// replaced it.
+    pub async fn transition_exact(
+        &self,
+        key: &PurchaseKey,
+        from: &[StateTag],
+        identity: &AttemptIdentity,
+        to: PurchaseState,
+        now_ns: u64,
+    ) -> Result<PurchaseAttempt, PurchaseError> {
+        self.cas(key, from, CasGuard::Identity(identity), to, now_ns, |_| {})
+            .await
     }
 
     /// The CAS every verb funnels through: table check, state check,
-    /// optional lease check, patch, one atomic file replace.
+    /// guard check, patch, one atomic file replace.
     async fn cas<F>(
         &self,
         key: &PurchaseKey,
         from: &[StateTag],
-        lease: Option<&str>,
+        guard: CasGuard<'_>,
         to: PurchaseState,
         now_ns: u64,
         patch: F,
@@ -756,13 +958,49 @@ impl A2aPurchaseStore {
     where
         F: FnOnce(&mut PurchaseAttempt) + Send,
     {
-        let id = key.id();
+        self.cas_at(key.id(), from, guard, to, now_ns, patch).await
+    }
+
+    /// [`Self::cas`] against an explicit record id, so a retained
+    /// superseded record (which lives beside the live attempt, under its
+    /// own id) is resolved through the same table and the same lock.
+    async fn cas_at<F>(
+        &self,
+        record_id: String,
+        from: &[StateTag],
+        guard: CasGuard<'_>,
+        to: PurchaseState,
+        now_ns: u64,
+        patch: F,
+    ) -> Result<PurchaseAttempt, PurchaseError>
+    where
+        F: FnOnce(&mut PurchaseAttempt) + Send,
+    {
+        let id = record_id;
+        let wake_id = id.clone();
         let expected: Vec<StateTag> = from.to_vec();
-        let lease = lease.map(str::to_string);
+        let guard = guard.owned();
         let updated = mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
             let Some(attempt) = file.attempts.get_mut(&id) else {
                 return (Err(PurchaseError::Missing { key: id.clone() }), false);
             };
+            // Identity before state: a write aimed at a record that no
+            // longer exists under this key must read as *superseded*,
+            // not as a state conflict — the two mean different things to
+            // the caller, and only one of them is about this attempt.
+            if let OwnedGuard::Identity(identity) = &guard {
+                let found = attempt.identity();
+                if found != *identity {
+                    return (
+                        Err(PurchaseError::Superseded {
+                            key: id.clone(),
+                            expected: identity.to_string(),
+                            found: found.to_string(),
+                        }),
+                        false,
+                    );
+                }
+            }
             let found = attempt.state.tag();
             if !expected.contains(&found) {
                 return (
@@ -787,7 +1025,7 @@ impl A2aPurchaseStore {
                     false,
                 );
             }
-            if let Some(lease) = &lease {
+            if let OwnedGuard::Lease(lease) = &guard {
                 if attempt.state.lease() != Some(lease.as_str()) {
                     return (Err(PurchaseError::LeaseLost { key: id.clone() }), false);
                 }
@@ -798,8 +1036,79 @@ impl A2aPurchaseStore {
             (Ok(attempt.clone()), true)
         })
         .await??;
-        self.wake(key.id().as_str());
+        self.wake(&wake_id);
         Ok(updated)
+    }
+
+    /// Retain the financial outcome of a decision whose record was
+    /// replaced before the outcome could be published.
+    ///
+    /// Refusing a stale write protects the *replacement*; it does not
+    /// unmake a payment. So when the awaited operation came back with
+    /// something financial — a settled payment, or an exposed payload
+    /// whose fate is unknown — the evidence is written beside the live
+    /// attempt under the **original** incarnation's own record id, in the
+    /// unresolved-financial class, where `attempts()` shows it and
+    /// [`A2aCallerFlow::resolve_superseded_attempt`] closes it. The live
+    /// key is untouched.
+    ///
+    /// Insert-or-replace by design: re-publishing the same superseded
+    /// outcome (a retry of the same decision) must not mint a second
+    /// record of one payment.
+    pub async fn retain_superseded(
+        &self,
+        attempt: &PurchaseAttempt,
+        state: PurchaseState,
+        now_ns: u64,
+    ) -> Result<PurchaseAttempt, StoreError> {
+        let id = superseded_record_id(&attempt.key, &attempt.generation);
+        let mut retained = attempt.clone();
+        retained.state = state;
+        retained.updated_at_ns = now_ns;
+        let stored = retained.clone();
+        let id_owned = id.clone();
+        mutate_json_if_changed::<A2aPurchaseFile, _, _>(&self.path, move |file| {
+            file.attempts.insert(id_owned.clone(), stored.clone());
+            ((), true)
+        })
+        .await?;
+        self.wake(&id);
+        Ok(retained)
+    }
+
+    /// The retained superseded record for one incarnation of a key, if
+    /// one was ever written.
+    pub async fn superseded(
+        &self,
+        key: &PurchaseKey,
+        generation: &AttemptGeneration,
+    ) -> Result<Option<PurchaseAttempt>, StoreError> {
+        let file: A2aPurchaseFile = load_json(&self.path).await?;
+        Ok(file
+            .attempts
+            .get(&superseded_record_id(key, generation))
+            .cloned())
+    }
+
+    /// Move a retained superseded record, by the same table every other
+    /// transition obeys.
+    pub async fn transition_superseded(
+        &self,
+        key: &PurchaseKey,
+        generation: &AttemptGeneration,
+        from: &[StateTag],
+        to: PurchaseState,
+        now_ns: u64,
+    ) -> Result<PurchaseAttempt, PurchaseError> {
+        self.cas_at(
+            superseded_record_id(key, generation),
+            from,
+            CasGuard::None,
+            to,
+            now_ns,
+            |_| {},
+        )
+        .await
     }
 
     /// Drop attempts that have finished and aged out.
@@ -840,6 +1149,46 @@ fn mint_lease(key_id: &str, now_ns: u64) -> String {
     hex::encode(&hasher.finalize().as_bytes()[..16])
 }
 
+/// Mint the identity of a newly created — or newly *replaced* — record.
+///
+/// `seq` is supplied by the caller (1 for a fresh record, one more than
+/// the record being replaced otherwise) so the ordering stays readable;
+/// the incarnation is unique by the same construction as
+/// [`mint_lease`], which is what keeps a pruned-and-recreated key from
+/// handing incarnation *n*'s identity back to a decision taken against
+/// incarnation 1.
+fn mint_generation(key_id: &str, now_ns: u64, seq: u64) -> AttemptGeneration {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"net.payments.a2a.generation@1");
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&SEQ.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    hasher.update(&now_ns.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(key_id.as_bytes());
+    AttemptGeneration {
+        seq,
+        incarnation: hex::encode(&hasher.finalize().as_bytes()[..16]),
+    }
+}
+
+/// Where the retained evidence of one superseded incarnation lives.
+///
+/// Beside the live attempt rather than inside it: the live record is the
+/// *current* purchase and must stay readable as such, while the
+/// superseded charge is its own reconciliation item. Keyed by the
+/// incarnation, so two supersessions of one key never overwrite each
+/// other. The `#` cannot collide with a [`PurchaseKey::id`] because a
+/// caller hex is fixed-width and a node id is decimal.
+fn superseded_record_id(key: &PurchaseKey, generation: &AttemptGeneration) -> String {
+    format!(
+        "{}#superseded/{}-{}",
+        key.id(),
+        generation.seq,
+        generation.incarnation
+    )
+}
+
 /// Put the attempt back into `Preparing` under `lease_id`, clearing
 /// everything the previous quote established.
 ///
@@ -848,6 +1197,15 @@ fn mint_lease(key_id: &str, now_ns: u64) -> String {
 /// about to get a different one (boundary a).
 fn take_lease(attempt: &mut PurchaseAttempt, lease_id: &str, now_ns: u64) -> Option<String> {
     let cleared = attempt.quote_id.take();
+    // Replacing the record mints a new incarnation: every decision taken
+    // against the old quote — a signer still running, a refusal still in
+    // flight — is now unpublishable here, by identity rather than by
+    // whatever state tag it happens to find.
+    attempt.generation = mint_generation(
+        &attempt.key.id(),
+        now_ns,
+        attempt.generation.seq.saturating_add(1),
+    );
     attempt.prepared = None;
     attempt.quote_bytes = None;
     attempt.quote_expires_at_ns = None;
@@ -999,7 +1357,13 @@ pub enum A2aPurchase {
     /// The payment may or may not have landed. Recovered by calling
     /// `purchase_task` again — it re-sends the stored payload.
     Unknown { quote_id: String },
-    /// Could not get far enough to have an opinion about the money.
+    /// Could not get far enough to have an opinion about the money —
+    /// with one exception the `message` always names: a purchase whose
+    /// intent key was replaced while it was in flight *did* have an
+    /// outcome, and that outcome is retained as a superseded attempt for
+    /// an operator to close. Such a failure is never `retryable`,
+    /// because re-sending cannot help and buying again would be a second
+    /// charge.
     Failed {
         quote_id: Option<String>,
         message: String,
@@ -1225,7 +1589,11 @@ impl A2aCallerFlow {
             .cas(
                 &key,
                 &[StateTag::Preparing],
-                Some(&lease_id),
+                // The lease id *is* this phase's identity: it is minted
+                // per claim, so a replacement record (which mints its
+                // own) cannot accept this write. Nothing financial
+                // exists to bind a quote id to yet.
+                CasGuard::Lease(&lease_id),
                 PurchaseState::Quoted,
                 self.clock.now_ns(),
                 move |attempt| {
@@ -1490,6 +1858,12 @@ impl A2aCallerFlow {
                 }
             }
         };
+        // Everything below this line happens *after* an await — spend
+        // policy, an operator's approval, a wallet signing a bearer
+        // authorization — and every one of those writes re-presents this
+        // identity. A state tag cannot tell this attempt from its
+        // replacement; the incarnation and the exact quote can.
+        let identity = attempt.identity();
         // Expiry is checked here, before anything is authored: an
         // expired quote cannot be paid, and refusing it *unexposed* is
         // what leaves the key open for a re-prepare (the D4 row) instead
@@ -1518,9 +1892,10 @@ impl A2aCallerFlow {
                 if !from.contains(&StateTag::AwaitingApproval) {
                     if let Err(e) = self
                         .store
-                        .transition(
+                        .transition_exact(
                             key,
                             from,
+                            &identity,
                             PurchaseState::AwaitingApproval,
                             self.clock.now_ns(),
                         )
@@ -1570,7 +1945,7 @@ impl A2aCallerFlow {
             .cas(
                 key,
                 from,
-                None,
+                CasGuard::Identity(&identity),
                 PurchaseState::Paying {
                     lease_id,
                     since_ns: self.clock.now_ns(),
@@ -1581,6 +1956,26 @@ impl A2aCallerFlow {
             .await;
         match claimed {
             Ok(claimed) => self.settle(key, claimed, &[StateTag::Paying]).await,
+            Err(PurchaseError::Superseded {
+                expected, found, ..
+            }) => {
+                // The record this authorization was decided against is
+                // gone: a replacement was minted while the wallet was
+                // signing. Nothing was sent, so nothing is ambiguous —
+                // hand the reservation back and let the caller decide
+                // again against whatever the key holds now. The one
+                // thing that must not happen is this payload landing on
+                // the replacement, whose quote nobody authorized.
+                self.payments.release_spend(&quote).await;
+                A2aPurchase::Failed {
+                    quote_id: attempt.quote_id.clone(),
+                    message: format!(
+                        "this purchase was authorized for {expected}, and the key now holds \
+                         {found}; a replacement quote needs its own authorization"
+                    ),
+                    retryable: true,
+                }
+            }
             Err(PurchaseError::Conflict { .. }) | Err(PurchaseError::LeaseLost { .. }) => {
                 // A sibling claimed it first. Hand back this attempt's
                 // holder of the reservation and converge on the stored
@@ -1660,9 +2055,13 @@ impl A2aCallerFlow {
     ) -> A2aPurchase {
         if let Err(e) = self
             .store
-            .transition(
+            .transition_exact(
                 key,
                 from,
+                // Nothing left the process, so there is no financial
+                // evidence to retain — but this refusal still may not
+                // land on a record it was not decided about.
+                &attempt.identity(),
                 PurchaseState::RefusedUnexposed {
                     reason: reason.clone(),
                 },
@@ -1712,6 +2111,10 @@ impl A2aCallerFlow {
         };
         let decision = self.payments.pay_exact(&quote_bytes, &payload_bytes).await;
         let now_ns = self.clock.now_ns();
+        // The payload is exposed now, so every write below publishes the
+        // result of an await and must prove it is writing to the record
+        // the payment was sent for.
+        let identity = attempt.identity();
         match decision {
             CallerDecision::Paid {
                 quote_id,
@@ -1727,27 +2130,77 @@ impl A2aCallerFlow {
                     quote_id: quote_id.clone(),
                     binding_sig: binding_sig.unwrap_or_default(),
                 };
-                let state = PurchaseState::Paid {
-                    proof: task_proof.clone(),
-                    billing: proof.clone(),
-                };
-                if let Err(e) = self.store.transition(key, from, state, now_ns).await {
-                    return A2aPurchase::Failed {
+                let landed = self
+                    .store
+                    .cas(
+                        key,
+                        // Authoritative success is publishable from the
+                        // claim it was sent under *or* from an ambiguity
+                        // a sibling published while it was in flight:
+                        // evidence of this purchase only ever improves.
+                        // What makes that safe is the identity — same
+                        // incarnation, same quote — not the tag, and it
+                        // is what keeps a duplicate's `Unknown` from
+                        // making a later success unrepresentable or
+                        // costing a third round trip to recover.
+                        &[StateTag::Paying, StateTag::Unknown],
+                        CasGuard::Identity(&identity),
+                        PurchaseState::Paid {
+                            proof: task_proof.clone(),
+                            billing: proof.clone(),
+                        },
+                        now_ns,
+                        |_| {},
+                    )
+                    .await;
+                match landed {
+                    Ok(_) => {
+                        // The human's approval was for this exact quote
+                        // and is consumed by the payment it authorized.
+                        self.payments.clear_approval(&quote_id).await;
+                        A2aPurchase::Paid {
+                            task_id: key.task_id.clone(),
+                            proof: task_proof,
+                            billing: proof,
+                        }
+                    }
+                    Err(e @ (PurchaseError::Superseded { .. } | PurchaseError::Missing { .. })) => {
+                        // Refusing a stale write protects the
+                        // replacement; it cannot unmake a charge. The
+                        // settled purchase is retained against the
+                        // incarnation that bought it, where an operator
+                        // can reconcile it — discarding it behind a
+                        // retryable error would be a lost payment.
+                        self.payments.clear_approval(&quote_id).await;
+                        self.publish_superseded(
+                            &attempt,
+                            PurchaseState::PaidUnexecutable {
+                                proof: task_proof,
+                                billing: proof,
+                                refusal: RefusalRecord {
+                                    at_ns: now_ns,
+                                    message: format!(
+                                        "this purchase settled and its intent key had already \
+                                         moved on ({e})"
+                                    ),
+                                    reason: Some(SUPERSEDED_REFUSAL_REASON.to_string()),
+                                    safe_to_retry: false,
+                                    safe_to_requote: false,
+                                },
+                            },
+                            "this payment settled",
+                            now_ns,
+                        )
+                        .await
+                    }
+                    Err(e) => A2aPurchase::Failed {
                         quote_id: Some(quote_id),
                         message: format!(
                             "the payment landed but recording it failed ({e}); the stored \
                              attempt is still resumable"
                         ),
                         retryable: true,
-                    };
-                }
-                // The human's approval was for this exact quote and is
-                // consumed by the payment it authorized.
-                self.payments.clear_approval(&quote_id).await;
-                A2aPurchase::Paid {
-                    task_id: key.task_id.clone(),
-                    proof: task_proof,
-                    billing: proof,
+                    },
                 }
             }
             CallerDecision::Failed {
@@ -1758,19 +2211,35 @@ impl A2aCallerFlow {
                 // Ambiguous: the payment MAY have landed. The reservation
                 // stays, the payload stays, and the next purchase_task
                 // re-sends it.
-                let _ = self
+                let published = self
                     .store
-                    .transition(
+                    .transition_exact(
                         key,
                         from,
+                        &identity,
                         PurchaseState::Unknown {
                             last_error: message.clone(),
                         },
                         now_ns,
                     )
                     .await;
-                A2aPurchase::Unknown {
-                    quote_id: quote_id.unwrap_or_default(),
+                match published {
+                    Err(PurchaseError::Superseded { .. } | PurchaseError::Missing { .. }) => {
+                        // Exposed and unresolved, against a record that
+                        // is gone: the ambiguity is evidence too.
+                        self.publish_superseded(
+                            &attempt,
+                            PurchaseState::Unknown {
+                                last_error: message,
+                            },
+                            "this payment may have landed",
+                            now_ns,
+                        )
+                        .await
+                    }
+                    _ => A2aPurchase::Unknown {
+                        quote_id: quote_id.unwrap_or_default(),
+                    },
                 }
             }
             CallerDecision::Denied { policy_reason } => {
@@ -1811,19 +2280,38 @@ impl A2aCallerFlow {
             .spend_reservation_held(&quote.quote_id)
             .await
             .unwrap_or(!reject_releases_reservation(quote));
+        let exposed = PurchaseState::RefusedExposed {
+            reason: reason.clone(),
+            reservation_kept,
+        };
         if let Err(e) = self
             .store
-            .transition(
+            .transition_exact(
                 key,
                 from,
-                PurchaseState::RefusedExposed {
-                    reason: reason.clone(),
-                    reservation_kept,
-                },
+                &attempt.identity(),
+                exposed.clone(),
                 self.clock.now_ns(),
             )
             .await
         {
+            if matches!(
+                e,
+                PurchaseError::Superseded { .. } | PurchaseError::Missing { .. }
+            ) {
+                // The authorization was exposed and the record it was
+                // exposed for is gone: a claimed refusal is not proof of
+                // non-settlement, so this ambiguity is retained against
+                // the incarnation that took the risk.
+                return self
+                    .publish_superseded(
+                        attempt,
+                        exposed,
+                        &format!("this payment was refused after exposure ({reason})"),
+                        self.clock.now_ns(),
+                    )
+                    .await;
+            }
             return A2aPurchase::Failed {
                 quote_id: attempt.quote_id.clone(),
                 message: e.to_string(),
@@ -1834,6 +2322,50 @@ impl A2aCallerFlow {
             quote_id: attempt.quote_id.clone(),
             policy_reason: reason,
             funds_ambiguous: reservation_kept,
+        }
+    }
+
+    /// Publish a financial outcome whose record was replaced — pruned,
+    /// re-prepared — while the payment was in flight.
+    ///
+    /// The result is retained beside the live attempt under the
+    /// incarnation it belongs to, in the unresolved-financial class, so
+    /// it survives retention, shows up in
+    /// [`A2aCallerFlow::attempts`], and closes through
+    /// [`A2aCallerFlow::resolve_superseded_attempt`]. The live key is
+    /// left exactly as it is: whatever occupies it was authorized on its
+    /// own terms and this outcome is not about it.
+    ///
+    /// The answer is deliberately **not** retryable: re-sending cannot
+    /// help, and the caller must not read a retained charge as a reason
+    /// to buy again.
+    async fn publish_superseded(
+        &self,
+        attempt: &PurchaseAttempt,
+        state: PurchaseState,
+        known: &str,
+        now_ns: u64,
+    ) -> A2aPurchase {
+        let generation = attempt.generation.clone();
+        match self.store.retain_superseded(attempt, state, now_ns).await {
+            Ok(_) => A2aPurchase::Failed {
+                quote_id: attempt.quote_id.clone(),
+                message: format!(
+                    "{known}, and its intent key no longer holds the attempt it was bought \
+                     for; the evidence is retained as superseded attempt {generation} — close \
+                     it with resolve_superseded_attempt, never by buying again"
+                ),
+                retryable: false,
+            },
+            Err(e) => A2aPurchase::Failed {
+                quote_id: attempt.quote_id.clone(),
+                message: format!(
+                    "{known}, its intent key no longer holds the attempt it was bought for, \
+                     and retaining that evidence failed ({e}); superseded attempt \
+                     {generation} must be reconciled from the billing log"
+                ),
+                retryable: true,
+            },
         }
     }
 
@@ -1906,6 +2438,8 @@ impl A2aCallerFlow {
             };
         };
 
+        // Read before the provider round trip, presented after it.
+        let identity = attempt.identity();
         let outcome = self.tasks.submit(&prepared, &proof).await;
         let now_ns = self.clock.now_ns();
         match outcome {
@@ -1916,9 +2450,10 @@ impl A2aCallerFlow {
             }) => {
                 let _ = self
                     .store
-                    .transition(
+                    .transition_exact(
                         &key,
                         &[StateTag::Paid],
+                        &identity,
                         PurchaseState::Submitted {
                             task_id: acked.clone(),
                         },
@@ -1934,45 +2469,52 @@ impl A2aCallerFlow {
             }) => {
                 let message =
                     reason.unwrap_or_else(|| "the provider refused the brief".to_string());
-                // The one retryable in-body refusal is capacity — the
-                // provider's own wording for it, not a literal here.
-                if message == SubmitRejection::Busy.to_string() {
-                    return self.keep_paid(&key, now_ns, message).await;
-                }
-                self.unexecutable(
-                    &key,
-                    proof,
-                    billing,
-                    RefusalRecord {
-                        at_ns: now_ns,
-                        message,
-                        reason: None,
-                        safe_to_retry: false,
-                        safe_to_requote: false,
-                    },
-                )
-                .await
+                // A rejected ack is prose. It carries no recovery
+                // posture, and a `String` cannot be turned back into the
+                // `SubmitRejection` it was rendered from — so on this
+                // path there is no structured verdict to interpret. For
+                // an attempt that is already **paid**, "the provider
+                // will never execute this" is a claim about money and
+                // needs positive evidence: a schematic that says so.
+                // Without one the purchase keeps its evidence and the
+                // same proof is resubmitted. Matching one variant's
+                // sentence and reading every other sentence as permanent
+                // is exactly what stranded a retryable refusal.
+                self.keep_paid(&key, &identity, now_ns, message).await
             }
             Err(A2aFlowError::PaymentRefused { message, schematic }) => {
+                // The structured path: the provider's own recovery
+                // posture decides, never this flow's reading of its
+                // wording.
                 match classify_refusal(&message, schematic.as_deref(), now_ns) {
-                    Ok(refusal) => self.unexecutable(&key, proof, billing, refusal).await,
-                    Err(message) => self.keep_paid(&key, now_ns, message).await,
+                    Ok(refusal) => {
+                        self.unexecutable(&key, &identity, proof, billing, refusal)
+                            .await
+                    }
+                    Err(message) => self.keep_paid(&key, &identity, now_ns, message).await,
                 }
             }
-            Err(e) => self.keep_paid(&key, now_ns, e.to_string()).await,
+            Err(e) => self.keep_paid(&key, &identity, now_ns, e.to_string()).await,
         }
     }
 
     /// A retryable submit refusal: the attempt stays `Paid`, so the same
     /// proof is what gets resubmitted.
-    async fn keep_paid(&self, key: &PurchaseKey, now_ns: u64, message: String) -> A2aSubmit {
+    async fn keep_paid(
+        &self,
+        key: &PurchaseKey,
+        identity: &AttemptIdentity,
+        now_ns: u64,
+        message: String,
+    ) -> A2aSubmit {
         if let Ok(Some(attempt)) = self.store.attempt(key).await {
             if let PurchaseState::Paid { proof, billing } = attempt.state {
                 let _ = self
                     .store
-                    .transition(
+                    .transition_exact(
                         key,
                         &[StateTag::Paid],
+                        identity,
                         PurchaseState::Paid { proof, billing },
                         now_ns,
                     )
@@ -1985,15 +2527,17 @@ impl A2aCallerFlow {
     async fn unexecutable(
         &self,
         key: &PurchaseKey,
+        identity: &AttemptIdentity,
         proof: TaskPaymentProof,
         billing: serde_json::Value,
         refusal: RefusalRecord,
     ) -> A2aSubmit {
         match self
             .store
-            .transition(
+            .transition_exact(
                 key,
                 &[StateTag::Paid],
+                identity,
                 PurchaseState::PaidUnexecutable {
                     proof,
                     billing,
@@ -2024,39 +2568,64 @@ impl A2aCallerFlow {
         resolution: AttemptResolution,
     ) -> Result<PurchaseAttempt, PurchaseError> {
         let key = self.key(provider_node, task_id);
-        let now_ns = self.clock.now_ns();
-        match resolution {
-            AttemptResolution::Paid { proof, billing } => {
-                self.store
-                    .transition(
-                        &key,
-                        &[StateTag::Unknown],
-                        PurchaseState::Paid { proof, billing },
-                        now_ns,
-                    )
-                    .await
-            }
-            AttemptResolution::NotPaid { reason } => {
-                self.store
-                    .transition(
-                        &key,
-                        &[StateTag::Unknown],
-                        PurchaseState::RefusedUnexposed { reason },
-                        now_ns,
-                    )
-                    .await
-            }
-            AttemptResolution::Closed { outcome, evidence } => {
-                self.store
-                    .transition(
-                        &key,
-                        &[StateTag::RefusedExposed, StateTag::PaidUnexecutable],
-                        PurchaseState::Resolved { outcome, evidence },
-                        now_ns,
-                    )
-                    .await
-            }
+        let (from, to) = resolution_target(resolution);
+        self.store
+            .transition(&key, from, to, self.clock.now_ns())
+            .await
+    }
+
+    /// The same exit, for the retained evidence of a **superseded**
+    /// incarnation: a purchase that settled (or was exposed) against a
+    /// record the intent key no longer holds.
+    ///
+    /// Addressed by the pair that identifies it — the key and the
+    /// generation — both of which every record returned by
+    /// [`Self::attempts`] carries, so an operator never has to guess a
+    /// store id. The live attempt under the same key is untouched.
+    pub async fn resolve_superseded_attempt(
+        &self,
+        provider_node: u64,
+        task_id: &str,
+        generation: &AttemptGeneration,
+        resolution: AttemptResolution,
+    ) -> Result<PurchaseAttempt, PurchaseError> {
+        let key = self.key(provider_node, task_id);
+        let (from, to) = resolution_target(resolution);
+        self.store
+            .transition_superseded(&key, generation, from, to, self.clock.now_ns())
+            .await
+    }
+
+    /// The retained evidence of one superseded incarnation, if any was
+    /// written.
+    pub async fn superseded_attempt(
+        &self,
+        provider_node: u64,
+        task_id: &str,
+        generation: &AttemptGeneration,
+    ) -> Result<Option<PurchaseAttempt>, StoreError> {
+        self.store
+            .superseded(&self.key(provider_node, task_id), generation)
+            .await
+    }
+}
+
+/// Which states an [`AttemptResolution`] may be applied from, and what
+/// it writes — shared by the live and superseded operator exits so the
+/// two can never disagree about what an operator's decision means.
+fn resolution_target(resolution: AttemptResolution) -> (&'static [StateTag], PurchaseState) {
+    match resolution {
+        AttemptResolution::Paid { proof, billing } => {
+            (&[StateTag::Unknown], PurchaseState::Paid { proof, billing })
         }
+        AttemptResolution::NotPaid { reason } => (
+            &[StateTag::Unknown],
+            PurchaseState::RefusedUnexposed { reason },
+        ),
+        AttemptResolution::Closed { outcome, evidence } => (
+            &[StateTag::RefusedExposed, StateTag::PaidUnexecutable],
+            PurchaseState::Resolved { outcome, evidence },
+        ),
     }
 }
 

@@ -683,6 +683,7 @@ async fn seed(world: &World, task_id: &str, state: PurchaseState) {
     let attempt = PurchaseAttempt {
         key: key.clone(),
         commitment: task_commitment(&world.offer, &brief(task_id)),
+        generation: Default::default(),
         prepared: None,
         quote_bytes: None,
         quote_id: None,
