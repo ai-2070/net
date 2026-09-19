@@ -5632,7 +5632,14 @@ jobs:
           # a failing harness still leaves a complete log for the
           # inventory step to read.
           set -uo pipefail
-          net/crates/net/tests/rtc_browser/run.sh --engine chromium 2>&1 \
+          # `--stage7` on THIS engine only. The store witnesses have
+          # run green on Chromium (52/0, twice) and have never been
+          # run on Firefox at all — the Firefox leg below keeps the
+          # 47-witness surface until somebody runs them there, which
+          # is why the floors below are per engine rather than one
+          # number. A flag whose witnesses are unproven on an engine
+          # does not belong in that engine's gate.
+          net/crates/net/tests/rtc_browser/run.sh --engine chromium --stage7 2>&1 \
             | tee "$RUNNER_TEMP/rtcb.log"
           exit "${PIPESTATUS[0]}"
 
@@ -5730,11 +5737,30 @@ jobs:
             --source net/crates/net/tests/rtc_browser/runner/src/main.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage5.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage6.rs \
+            --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
             $REQUIRED
+          # The five store witnesses, required on the engine that runs
+          # them. They carry the plan's B2' composition gate — the
+          # store's chunker on the REAL stream transport, under
+          # injected loss and reorder — and the property that a
+          # duplicated wire message moves a view exactly once.
+          STAGE7="
+          stage7_store_snapshot_installs_over_the_real_stream
+          stage7_store_snapshot_installs_through_injected_loss_and_reorder
+          stage7_an_action_round_trip_crosses_the_real_transport
+          stage7_a_duplicated_store_frame_moves_the_view_once
+          stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "browser matrix stage 7" --mode literal \
+            --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
+            $STAGE7
           for engine in chromium firefox; do
+            # Floors are PER ENGINE: Chromium runs the store stage,
+            # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log" ;;
-              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=52; extra="$STAGE7" ;;
+              firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
             # any count, so a changed output format reads as "fix the
@@ -5748,18 +5774,18 @@ jobs:
             fi
             passes=$(grep -c '^RTCB PASS ' "$log" || true)
             fails=$(grep -c '^RTCB FAIL ' "$log" || true)
-            echo "[$engine] $passes passed, $fails failed (floor 47)"
+            echo "[$engine] $passes passed, $fails failed (floor $floor)"
             if [ "$fails" -ne 0 ]; then
               grep '^RTCB FAIL ' "$log"
               echo "::error::[$engine] a browser witness failed"
               exit 1
             fi
-            if [ "$passes" -lt 47 ]; then
-              echo "::error::[$engine] emitted $passes witnesses, floor is 47 — \
+            if [ "$passes" -lt "$floor" ]; then
+              echo "::error::[$engine] emitted $passes witnesses, floor is $floor — \
           lower the floor deliberately or restore the witness"
               exit 1
             fi
-            for required in $REQUIRED; do
+            for required in $REQUIRED $extra; do
               if ! grep -q "^RTCB PASS $required " "$log"; then
                 echo "::error::[$engine] required browser witness missing or failed: $required"
                 exit 1
