@@ -1882,6 +1882,11 @@ async function execute(step) {
       if (!pkg) return { ok: false, error: 'the package exports no hostStore/joinStore' };
       const definition = storeDefinition(pkg.defineStore);
       const initial = { entries: bulkEntries(step.entries || 0), tick: 0 };
+      // Entries only the `command` audience may see. Named, few, and
+      // present in every hosted store so a witness can ask for them.
+      for (let i = 0; i < (step.command_entries || 0); i += 1) {
+        initial.entries[`cmd-${i}`] = 1000 + i;
+      }
       let host;
       try {
         host = pkg.hostStore({
@@ -1897,7 +1902,18 @@ async function execute(step) {
           initialState: initial,
           maxEventBytes: step.max_event_bytes || 8104,
           authorize: () => true,
-          project: state => state,
+          // A REAL projection, because an audience that withholds
+          // nothing cannot witness an audience change. Entries named
+          // `cmd-*` belong to the `command` audience; everything else
+          // is the crew's.
+          project: (state, audience) => {
+            if (audience.includes('command')) return state;
+            const entries = {};
+            for (const [key, value] of Object.entries(state.entries)) {
+              if (!key.startsWith('cmd-')) entries[key] = value;
+            }
+            return { entries, tick: state.tick };
+          },
           actions: {
             bump: (input, context) => {
               const tick = context.getState().tick + input.by;
@@ -2072,6 +2088,7 @@ async function execute(step) {
         stats: {
           ms: Math.round(performance.now() - started),
           entries: Object.keys(state.entries).length,
+          command_entries: Object.keys(state.entries).filter(k => k.startsWith('cmd-')).length,
           digest: digestOf(state),
           tick: state.tick,
           status: joined.getStatus(),
@@ -2104,6 +2121,7 @@ async function execute(step) {
         ok: true,
         stats: {
           entries: Object.keys(state.entries).length,
+          command_entries: Object.keys(state.entries).filter(k => k.startsWith('cmd-')).length,
           digest: digestOf(state),
           tick: state.tick,
           status: joined.getStatus(),
@@ -2189,12 +2207,84 @@ async function execute(step) {
       }
     }
 
+    case 'store_audience': {
+      const joined = joins.get(step.handle);
+      if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
+      try {
+        await withTimeout(
+          joined.setAudience(step.audience || ['crew']),
+          step.timeout_ms || 15000,
+          'store setAudience',
+        );
+      } catch (e) {
+        const out = typedFailure(e);
+        out.stats = { ...(out.stats || {}), phase: joined.getStatus().phase };
+        return out;
+      }
+      await new Promise(resolve => setTimeout(resolve, step.settle_ms || 200));
+      const state = joined.getState();
+      return {
+        ok: true,
+        stats: {
+          entries: Object.keys(state.entries).length,
+          command_entries: Object.keys(state.entries).filter(k => k.startsWith('cmd-')).length,
+          tick: state.tick,
+          status: joined.getStatus(),
+        },
+      };
+    }
+
+    case 'store_reconnect': {
+      const joined = joins.get(step.handle);
+      if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
+      try {
+        await withTimeout(joined.reconnect(), step.timeout_ms || 20000, 'store reconnect');
+      } catch (e) {
+        return typedFailure(e);
+      }
+      await new Promise(resolve => setTimeout(resolve, step.settle_ms || 200));
+      const state = joined.getState();
+      return {
+        ok: true,
+        stats: {
+          entries: Object.keys(state.entries).length,
+          command_entries: Object.keys(state.entries).filter(k => k.startsWith('cmd-')).length,
+          digest: digestOf(state),
+          tick: state.tick,
+          status: joined.getStatus(),
+        },
+      };
+    }
+
+    // What the HOST is holding: handles, ledgers, deferred work, and
+    // its counters. A subscription that outlived its caller shows up
+    // here and nowhere else.
+    case 'store_counts': {
+      const host = hosts.get(step.handle);
+      if (!host) return { ok: false, error: 'no such hosted store ' + step.handle };
+      const counts = host.counts();
+      return {
+        ok: true,
+        stats: {
+          handles: counts.handles,
+          ledgers: counts.ledgers,
+          deferred: counts.deferred,
+          tick: host.getState().tick,
+          counters: JSON.stringify(host.counters()),
+        },
+      };
+    }
+
     case 'store_close': {
       const host = hosts.get(step.handle);
       const joined = joins.get(step.handle);
       if (host) { await host.close(); hosts.delete(step.handle); }
       if (joined) { await joined.close(); joins.delete(step.handle); }
       if (!host && !joined) return { ok: false, error: 'no such store ' + step.handle };
+      // A `leave` is a FRAME: it has to cross before the host can
+      // have released anything, so a witness that reads the host's
+      // handles needs this settle rather than a lucky schedule.
+      if (step.settle_ms) await new Promise(resolve => setTimeout(resolve, step.settle_ms));
       return { ok: true };
     }
 

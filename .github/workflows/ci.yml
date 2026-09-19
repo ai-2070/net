@@ -5654,7 +5654,7 @@ jobs:
 
       # Firefox + the store witnesses, RECORDED and not a gate — yet.
       #
-      # The Chromium leg gates them (floor 53). They have never run on
+      # The Chromium leg gates them (floor 55). They have never run on
       # Firefox: the local workstation cannot seed a Firefox profile's
       # NSS database (the `certutil` on PATH there is Microsoft's, and
       # the only other prompt-free mechanism, an enterprise policy, is
@@ -5665,7 +5665,7 @@ jobs:
       # is the rule that kept them behind a flag in the first place.
       #
       # So: run them, keep the log, and promote this to the gate — a
-      # `--stage7` on the leg above and a Firefox floor of 53 — on the
+      # `--stage7` on the leg above and a Firefox floor of 55 — on the
       # first green run. If it is NOT green, the log says what the
       # engine does differently, which is the point.
       - name: Browser harness — Firefox + Stage 7 (recorded, not a gate)
@@ -5776,6 +5776,8 @@ jobs:
           stage7_a_duplicated_store_frame_moves_the_view_once
           stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed
           stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct
+          stage7_narrowing_an_audience_withholds_only_that_replicas_view
+          stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "browser matrix stage 7" --mode literal \
@@ -5785,7 +5787,7 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=53; extra="$STAGE7" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=55; extra="$STAGE7" ;;
               firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
@@ -5820,13 +5822,13 @@ jobs:
             # Chromium also carries the five Stage 7 store witnesses;
             # Firefox does not (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
-          (+ 6 Stage 7 on chromium)"
+          (+ 8 Stage 7 on chromium)"
           done
 
       # The recorded Firefox + Stage 7 leg, PRINTED and never gated.
       # These numbers are what a promotion decision reads — a
       # `--stage7` on the Firefox harness step and a Firefox floor of
-      # 53 — and no floor consults them today. A missing log is not a
+      # 55 — and no floor consults them today. A missing log is not a
       # failure: the step above is `continue-on-error`.
       - name: Firefox + Stage 7 evidence (recorded, no floor)
         if: ${{ !cancelled() }}
@@ -5846,7 +5848,9 @@ jobs:
             stage7_an_action_round_trip_crosses_the_real_transport \
             stage7_a_duplicated_store_frame_moves_the_view_once \
             stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed \
-            stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct; do
+            stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct \
+            stage7_narrowing_an_audience_withholds_only_that_replicas_view \
+            stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle; do
             if grep -q "^RTCB PASS $required " "$log"; then
               echo "[firefox+stage7] PASS $required"
             else

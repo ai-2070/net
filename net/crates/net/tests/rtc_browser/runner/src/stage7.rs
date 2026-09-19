@@ -12,7 +12,7 @@
 //! So these six witnesses put the store on the transport the rest of
 //! this harness exercises, in two isolated browsing contexts of a real
 //! engine. **CI gates them on CHROMIUM**: that leg passes `--stage7`,
-//! its floor is 53 and all six names are pinned REQUIRED (`ci.yml`).
+//! its floor is 55 and all eight names are pinned REQUIRED (`ci.yml`).
 //!
 //! **Firefox RUNS them, recorded, and does not gate them.** They had
 //! never executed on that engine at all — this workstation cannot
@@ -25,7 +25,7 @@
 //!
 //! The promotion is one edit each and is deliberately left to a
 //! human reading a real run: `--stage7` on the gating Firefox step
-//! and its floor from 47 to 53. Gating an unproven engine before one
+//! and its floor from 47 to 55. Gating an unproven engine before one
 //! observed run is the mistake this stage already made once, in the
 //! other direction.
 //!
@@ -94,9 +94,18 @@
 //!    costs the replica no upstream word;
 //! 5. store traffic moves the anchor's per-pair forwarding counter
 //!    while the pair is relayed;
-//! 6. and the SAME traffic leaves that counter exactly flat once the
-//!    pair is direct — the other half of the plan's criterion, which
-//!    is a pair of readings and not one.
+//! 6. narrowing one replica's audience withholds from IT and from
+//!    nobody else;
+//! 7. a reconnect recovers the current view without replaying the
+//!    action it already accepted, and a leave frees what the host
+//!    was holding;
+//! 8. and the SAME traffic leaves the per-pair counter exactly flat
+//!    once the pair is direct — the other half of the plan's
+//!    criterion, which is a pair of readings and not one.
+//!
+//! 8 is LAST because a promotion replaces the session, and a store
+//! that opens a new stream on it afterwards is refused by a fenced
+//! stream id. Everything that opens one runs before it.
 //!
 //! **These numbers are the EXECUTION order**, matching the `// --- N`
 //! section comments below, and they are the numbering every sentence
@@ -105,7 +114,7 @@
 //! it, twice.
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
-//! 3 duplicate, 4 routed, 5 direct — and stays that way because each record
+//! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect — and stays that way because each record
 //! names its position by index, so reordering the array would
 //! silently retarget records (the same reason Stage 5's list is
 //! append-only). An earlier header mixed the two numberings and so
@@ -161,7 +170,7 @@ const ENTRIES: u32 = 700;
 /// chunk budget from (`MAX_EVENT_SIZE`).
 const MAX_EVENT_BYTES: u32 = 8104;
 
-pub const WITNESSES: [&str; 6] = [
+pub const WITNESSES: [&str; 8] = [
     "stage7_store_snapshot_installs_over_the_real_stream",
     "stage7_store_snapshot_installs_through_injected_loss_and_reorder",
     "stage7_an_action_round_trip_crosses_the_real_transport",
@@ -170,22 +179,43 @@ pub const WITNESSES: [&str; 6] = [
     // Appended, never inserted: every record above names its
     // position by index.
     "stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct",
+    "stage7_narrowing_an_audience_withholds_only_that_replicas_view",
+    "stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle",
 ];
 
 /// The tabs this stage drives, on their own isolated contexts.
-pub const TABS: [&str; 2] = [TAB_HOST, TAB_PLAYER];
+pub const TABS: [&str; 3] = [TAB_HOST, TAB_PLAYER, TAB_SECOND];
 
 const TAB_HOST: &str = "s7host";
 const TAB_PLAYER: &str = "s7player";
+/// A SECOND independent participant.
+///
+/// Not a convenience: the audience witness needs two replicas of ONE
+/// store with different audiences, and two replicas on one node
+/// cannot have them — both would open the stream the shared label
+/// derives, and the second open fails the stream terminally. Two
+/// participants is also what the plan's criterion says ("independent
+/// browser participants"), so the topology is the honest one rather
+/// than a workaround.
+const TAB_SECOND: &str = "s7second";
 const PAGE_HOST: &str = "stage7-host";
 const PAGE_PLAYER: &str = "stage7-player";
+const PAGE_SECOND: &str = "stage7-second";
 const CTX_HOST: &str = "stage7-ctx-host";
 const CTX_PLAYER: &str = "stage7-ctx-player";
+const CTX_SECOND: &str = "stage7-ctx-second";
 
 /// One capability tag, so each leaf can discover the other's signed
 /// announcement — which is what installs the relayed session the
 /// store's `openStream({peer})` needs.
 const STORE_TAG: &str = "stage7.store";
+
+/// Entries the host projects ONLY to the `command` audience.
+///
+/// Small and named (`cmd-0`…): the audience witness reads them by
+/// count, and a projection that withholds nothing cannot witness an
+/// audience change at all.
+const COMMAND_ENTRIES: u32 = 4;
 
 // Identities unique to this stage, and the reason that matters more
 // than it looks: an entity secret IS the node id. These constants
@@ -202,6 +232,10 @@ const SECRET_PLAYER_ENTITY: &str =
     "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6";
 const SECRET_PLAYER_NOISE: &str =
     "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7";
+const SECRET_SECOND_ENTITY: &str =
+    "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4";
+const SECRET_SECOND_NOISE: &str =
+    "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
 
 /// What this stage needs from the runner.
 pub struct Cx7<'a> {
@@ -283,11 +317,14 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let tab_player = TAB_PLAYER;
     let anchor = cx.anchor;
 
+    let tab_second = TAB_SECOND;
     let url_host = format!("{}/leaf5.html?tab={TAB_HOST}", cx.page_origin);
     let url_player = format!("{}/leaf5.html?tab={TAB_PLAYER}", cx.page_origin);
+    let url_second = format!("{}/leaf5.html?tab={TAB_SECOND}", cx.page_origin);
     for (page, url, ctx) in [
         (PAGE_HOST, &url_host, CTX_HOST),
         (PAGE_PLAYER, &url_player, CTX_PLAYER),
+        (PAGE_SECOND, &url_second, CTX_SECOND),
     ] {
         if let Err(reason) = cx.driver.open_page_in(page, url, Some(ctx)).await {
             let detail = format!("a Stage 7 browsing context would not open: {reason}");
@@ -322,6 +359,12 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         .run(
             tab_player,
             connect(SECRET_PLAYER_ENTITY, SECRET_PLAYER_NOISE),
+        )
+        .await;
+    let second_connected = script
+        .run(
+            tab_second,
+            connect(SECRET_SECOND_ENTITY, SECRET_SECOND_NOISE),
         )
         .await;
     let (host, player) = match (leaf_of(&host_connected), leaf_of(&player_connected)) {
@@ -364,7 +407,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // the store, not an incidental step — and the earlier "nothing
     // here needs either" was an assumption that the transport double
     // could not contradict.
-    for tab in [tab_host, tab_player] {
+    for tab in [tab_host, tab_player, tab_second] {
         let announced = script
             .run(
                 tab,
@@ -379,8 +422,14 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             println!("[stage7] {tab} could not announce: {}", why(&announced));
         }
     }
+    let second = leaf_of(&second_connected);
     let found_player = discover(&mut script, tab_host, &player.node_hex, &session, STORE_TAG).await;
     let found_host = discover(&mut script, tab_player, &host.node_hex, &session, STORE_TAG).await;
+    // The second participant discovers the HOST too — its replica
+    // cannot address a store on a peer it has no session with, which
+    // is the same precondition the player's join has.
+    let found_host_from_second =
+        discover(&mut script, tab_second, &host.node_hex, &session, STORE_TAG).await;
     if found_player.is_none() || found_host.is_none() {
         let detail = format!(
             "the leaves did not discover each other, so neither has a session with the \
@@ -393,19 +442,42 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         return Ok(());
     }
 
-    let host_store = |handle: &str| Step5::StoreHost {
+    // `command_entries` is per store, and only the audience store has
+    // any: a host whose document carries entries the joining audience
+    // cannot read has a DIFFERENT digest from its replica, which is
+    // exactly what witnesses 1 and 2 compare. Giving every store four
+    // of them turned both of those green witnesses red — correctly.
+    let host_store_with = |handle: &str, command_entries: u32| Step5::StoreHost {
         id: 0,
         session: session.clone(),
         handle: handle.to_string(),
         label: format!("store/stage7/{handle}"),
         entries: ENTRIES,
+        command_entries,
         max_event_bytes: MAX_EVENT_BYTES,
+    };
+    let host_store = |handle: &str| host_store_with(handle, 0);
+    let join_as = |handle: &str, store: &str, audience: &[&str]| Step5::StoreJoin {
+        id: 0,
+        session: session.clone(),
+        handle: handle.to_string(),
+        store: store.to_string(),
+        label: format!("store/stage7/{store}"),
+        host_hex: host.node_hex.clone(),
+        audience: audience.iter().map(|name| (*name).to_string()).collect(),
+        key: "harness".to_string(),
+        max_event_bytes: MAX_EVENT_BYTES,
+        drop_every: 0,
+        reorder_every: 0,
+        duplicate_every: 0,
+        timeout_ms: 30_000,
     };
     let join_store = |handle: &str, drop_every: u32, reorder_every: u32, duplicate_every: u32| {
         Step5::StoreJoin {
             id: 0,
             session: session.clone(),
             handle: handle.to_string(),
+            store: handle.to_string(),
             label: format!("store/stage7/{handle}"),
             host_hex: host.node_hex.clone(),
             audience: vec!["crew".to_string()],
@@ -762,7 +834,216 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         ),
     );
 
-    // --- 6. direct: the same traffic, and the counter does NOT move -
+    // --- 6. narrowing an audience ----------------------------------
+    //
+    // BEFORE the direct promotion below, and that ordering is a
+    // finding rather than a preference: a promotion REPLACES the
+    // session (§9 step 4), and a store that opens a NEW stream on it
+    // afterwards was refused `stream … failed terminally
+    // (incarnation 3); reconnect or use another stream id`. The
+    // reopen repair covers a HELD handle; it does not resurrect an
+    // id the session has fenced. So everything that opens a stream
+    // runs while the pair is relayed, and the promotion is the last
+    // thing this stage does.
+    //
+    // The plan's criterion has two halves and the second is the one a
+    // naive implementation fails: changing an audience must stop
+    // irrelevant delivery AND remove what left the view, WITHOUT
+    // removing entities another active audience still covers. So two
+    // replicas of ONE store join with the same wide audience, and
+    // only one of them narrows.
+    //
+    // The host projects `cmd-*` entries to `command` alone
+    // (`leaf5.js`), so "withheld" is observable as entries the
+    // replica no longer holds rather than as a flag.
+    let _hosted_aud = script
+        .run(tab_host, host_store_with("aud", COMMAND_ENTRIES))
+        .await;
+    let wide = script
+        .run(tab_player, join_as("aud-wide", "aud", &["crew", "command"]))
+        .await;
+    // On the SECOND participant: two replicas of one store on one
+    // node would both open the stream their shared label derives.
+    let narrowing = script
+        .run(
+            tab_second,
+            join_as("aud-narrow", "aud", &["crew", "command"]),
+        )
+        .await;
+    let wide_before = stat_u64(&wide, "command_entries");
+    let narrow_before = stat_u64(&narrowing, "command_entries");
+    let narrowed = script
+        .run(
+            tab_second,
+            Step5::StoreAudience {
+                id: 0,
+                handle: "aud-narrow".to_string(),
+                audience: vec!["crew".to_string()],
+                settle_ms: 400,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    // The OTHER replica, re-read after the change: its view must not
+    // have moved. This is the half that fails when a host projects
+    // per store rather than per handle.
+    let wide_after = script
+        .run(
+            tab_player,
+            Step5::StoreState {
+                id: 0,
+                handle: "aud-wide".to_string(),
+            },
+        )
+        .await;
+    let narrow_after = stat_u64(&narrowed, "command_entries");
+    let wide_kept = stat_u64(&wide_after, "command_entries");
+    let second_ready = second.is_some() && found_host_from_second.is_some();
+    let audience_held = second_ready
+        && wide.ok
+        && narrowing.ok
+        && narrowed.ok
+        && wide_before == Some(u64::from(COMMAND_ENTRIES))
+        && narrow_before == Some(u64::from(COMMAND_ENTRIES))
+        && narrow_after == Some(0)
+        && wide_kept == Some(u64::from(COMMAND_ENTRIES))
+        // The narrowed replica keeps everything its remaining
+        // audience covers: this is a withholding, not a reset.
+        && stat_u64(&narrowed, "entries") == Some(u64::from(ENTRIES));
+    ledger.record(
+        WITNESSES[6],
+        audience_held,
+        format!(
+            "NARROWING AN AUDIENCE WITHHOLDS FROM THAT REPLICA AND NOBODY ELSE. Two \
+             replicas of ONE store, on TWO INDEPENDENT PARTICIPANTS (a third browsing \
+             context, connected and discovered={second_ready} — two replicas on ONE \
+             node cannot have different audiences here, because both would open the \
+             stream their shared label derives), joined with `[crew, command]`, and the host projects \
+             `cmd-*` entries to `command` alone — so a withheld entry is an entry the \
+             replica NO LONGER HOLDS, not a flag. Both installed {COMMAND_ENTRIES} \
+             command entries ({wide_before:?} and {narrow_before:?}). One then asked for \
+             `[crew]`: its command entries went to {narrow_after:?} while it KEPT all \
+             {ENTRIES} crew entries ({:?}) — a withholding, not a reset. The other \
+             replica, re-read after the change, still holds {wide_kept:?}, which is the \
+             half that fails when a host projects per STORE instead of per HANDLE. {} {}",
+            stat_u64(&narrowed, "entries"),
+            why(&narrowed),
+            why(&wide_after)
+        ),
+    );
+
+    // --- 7. reconnect, and leave -----------------------------------
+    //
+    // Three properties the plan names together, on one handle: a
+    // reconnect recovers the CURRENT state, the action it accepted
+    // before the reconnect is NOT replayed, and a leave frees what
+    // the host was holding for it.
+    //
+    // Non-duplication is read from the HOST's own document: `bump`
+    // ADDS, so a replayed action shows up as a tick that moved twice.
+    let acted_before = script
+        .run(
+            tab_player,
+            Step5::StoreAct {
+                id: 0,
+                handle: "aud-wide".to_string(),
+                by: 7,
+                settle_ms: 300,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    let host_after_act = script
+        .run(
+            tab_host,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "aud".to_string(),
+            },
+        )
+        .await;
+    let tick_after_act = stat_u64(&host_after_act, "tick");
+    // Read AFTER the reconnect, not before: a resume installs its
+    // own handle, so the count taken before it is not the number a
+    // leave subtracts from — the first version of this witness read
+    // 4 → 5 and called it a leak.
+    let tick_before_reconnect = stat_u64(&host_after_act, "tick");
+    let reconnected = script
+        .run(
+            tab_player,
+            Step5::StoreReconnect {
+                id: 0,
+                handle: "aud-wide".to_string(),
+                settle_ms: 400,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    let host_after_reconnect = script
+        .run(
+            tab_host,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "aud".to_string(),
+            },
+        )
+        .await;
+    let closed = script
+        .run(
+            tab_player,
+            Step5::StoreClose {
+                id: 0,
+                handle: "aud-wide".to_string(),
+                settle_ms: 600,
+            },
+        )
+        .await;
+    // Give the leave time to reach the host, then read what it holds.
+    let host_after_leave = script
+        .run(
+            tab_host,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "aud".to_string(),
+            },
+        )
+        .await;
+    let handles_before_leave = stat_u64(&host_after_reconnect, "handles");
+    let handles_after_leave = stat_u64(&host_after_leave, "handles");
+    let recovered = stat_u64(&reconnected, "tick") == tick_after_act
+        && stat_str(&reconnected, "digest").is_some();
+    let not_replayed = stat_u64(&host_after_reconnect, "tick") == tick_after_act
+        && tick_before_reconnect == tick_after_act;
+    let freed = match (handles_before_leave, handles_after_leave) {
+        (Some(before), Some(after)) => before > 0 && after == before - 1,
+        _ => false,
+    };
+    ledger.record(
+        WITNESSES[7],
+        acted_before.ok && reconnected.ok && closed.ok && recovered && not_replayed && freed,
+        format!(
+            "A RECONNECT RECOVERS WITHOUT REPLAYING, AND A LEAVE FREES THE HANDLE. The \
+             replica's `bump {{by: 7}}` was accepted and moved the host's document to \
+             tick {tick_after_act:?}. Then `reconnect()` — §1.6's resume — and the \
+             replica's own view came back at that same tick \
+             ({:?}, digest {:?}), while the HOST's document did NOT move \
+             ({:?}): the accepted action was recovered, not re-executed, which is read \
+             from the authority's own state because `bump` ADDS and a replay would show \
+             as a second increment. Finally the replica LEFT, and what the host was \
+             holding for it went with it: handles {handles_before_leave:?} → \
+             {handles_after_leave:?}. A subscription that outlived its caller would \
+             read identically to one that was cleaned up if this were counted on the \
+             replica's side, so it is counted on the host's. {} {} {}",
+            stat_u64(&reconnected, "tick"),
+            stat_str(&reconnected, "digest"),
+            stat_u64(&host_after_reconnect, "tick"),
+            why(&acted_before),
+            why(&reconnected),
+            why(&host_after_leave)
+        ),
+    );
+
+    // --- 8. direct: the same traffic, and the counter does NOT move -
     //
     // The plan's criterion is a PAIR of readings, not one: flat for
     // direct AND increasing for routed, both with delivery
@@ -887,13 +1168,19 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         ),
     );
 
-    for (tab, handle) in [(tab_host, "clean"), (tab_host, "lossy"), (tab_host, "dup")] {
+    for (tab, handle) in [
+        (tab_host, "clean"),
+        (tab_host, "lossy"),
+        (tab_host, "dup"),
+        (tab_host, "aud"),
+    ] {
         let _ = script
             .run(
                 tab,
                 Step5::StoreClose {
                     id: 0,
                     handle: handle.to_string(),
+                    settle_ms: 0,
                 },
             )
             .await;
@@ -918,5 +1205,6 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         .await;
     let _ = cx.driver.close_page(PAGE_HOST).await;
     let _ = cx.driver.close_page(PAGE_PLAYER).await;
+    let _ = cx.driver.close_page(PAGE_SECOND).await;
     Ok(())
 }

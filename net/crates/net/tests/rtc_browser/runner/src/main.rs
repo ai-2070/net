@@ -1453,7 +1453,7 @@ async fn main() {
             // Opt IN to the Stage 7 store witnesses. Off by default
             // so a bare local run keeps the 47-witness surface, and
             // ON in CI's Chromium leg, where all five are pinned at
-            // floor 53. The Firefox leg leaves them off: they have
+            // floor 55. The Firefox leg leaves them off: they have
             // never been run on that engine, and a flag whose
             // witnesses are unproven there does not belong in its
             // gate. They were behind this flag for a different
@@ -3714,7 +3714,7 @@ async fn run(
         for name in stage7::WITNESSES {
             println!(
                 "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses. CI's \
-                 Chromium leg does (floor 53, all six pinned); the Firefox leg does \
+                 Chromium leg does (floor 55, all eight pinned); the Firefox leg does \
                  not, because they have never been run on that engine"
             );
         }

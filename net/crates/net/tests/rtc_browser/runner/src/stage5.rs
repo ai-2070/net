@@ -700,6 +700,9 @@ pub enum Step5 {
         /// label share the id the leaf derives from it.
         label: String,
         entries: u32,
+        /// Entries only the `command` audience may read, so an
+        /// audience change has something to withhold.
+        command_entries: u32,
         max_event_bytes: u32,
     },
     /// Arm the loss / reorder / duplication hooks on ONE page.
@@ -724,6 +727,10 @@ pub enum Step5 {
         session: String,
         handle: String,
         label: String,
+        /// WHICH store of the definition to join, by the name its
+        /// host declared. Defaults to `handle` on the page when
+        /// absent, which is what every earlier witness meant.
+        store: String,
         host_hex: String,
         audience: Vec<String>,
         key: String,
@@ -760,9 +767,32 @@ pub enum Step5 {
         settle_ms: u64,
         timeout_ms: u64,
     },
+    /// `setAudience` on a joined replica.
+    StoreAudience {
+        id: u64,
+        handle: String,
+        audience: Vec<String>,
+        settle_ms: u64,
+        timeout_ms: u64,
+    },
+    /// `reconnect()` on a joined replica.
+    StoreReconnect {
+        id: u64,
+        handle: String,
+        settle_ms: u64,
+        timeout_ms: u64,
+    },
+    /// What a HOST is holding: handles, ledgers, deferred work.
+    StoreCounts {
+        id: u64,
+        handle: String,
+    },
     StoreClose {
         id: u64,
         handle: String,
+        /// Wait after closing, so a witness can read what the host
+        /// released: a `leave` is a frame and has to cross first.
+        settle_ms: u64,
     },
     Close {
         id: u64,
@@ -803,6 +833,9 @@ impl Step5 {
             | Self::NodeCounters { id, .. }
             | Self::StoreCommit { id, .. }
             | Self::StoreAct { id, .. }
+            | Self::StoreAudience { id, .. }
+            | Self::StoreReconnect { id, .. }
+            | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
@@ -854,6 +887,9 @@ impl Step5 {
             | Self::NodeCounters { id, .. }
             | Self::StoreCommit { id, .. }
             | Self::StoreAct { id, .. }
+            | Self::StoreAudience { id, .. }
+            | Self::StoreReconnect { id, .. }
+            | Self::StoreCounts { id, .. }
             | Self::StoreClose { id, .. }
             | Self::PeerConnect { id, .. }
             | Self::PeerAccept { id, .. }
