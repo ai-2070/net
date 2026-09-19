@@ -15,6 +15,20 @@ import { ARENA } from './game.js';
 
 const HULL_COLOURS = [0x4fc3f7, 0xffb74d, 0x81c784, 0xe57373, 0xba68c8];
 
+/**
+ * Put a ship's group where its state says it is.
+ *
+ * One function, used by BOTH `create` and `update`, so an initial
+ * render and a later one cannot drift apart.
+ */
+function place(group, ship) {
+  group.position.set(ship.x, 0, ship.z);
+  group.rotation.y = ship.heading;
+  const hull = group.userData.hull;
+  hull.scale.x = Math.max(ship.hull, 0) / 100;
+  hull.material.color.setHex(ship.hull > 50 ? 0x7cffb2 : 0xff7c7c);
+}
+
 export function createScene(canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio ?? 1, 2));
@@ -130,15 +144,18 @@ export function createScene(canvas) {
           // what it gets back is the group and the hull bar rides
           // along on it.
           entry.group.userData.hull = entry.hull;
+          // CREATE ALSO PLACES IT. The binding skips an entity whose
+          // reference did not change, so a ship that is created and
+          // then never moves is never updated either — it would sit
+          // at the geometry's defaults (origin, heading 0, full
+          // hull) however far from them its actual state is. A
+          // review probe measured exactly that: expected
+          // {x:-6,z:3,heading:1,hull:0.75}, observed {0,0,0,1}.
+          // `create` returns a rendered object, not a blank one.
+          place(entry.group, ship);
           return entry.group;
         },
-        update: (group, ship) => {
-          group.position.set(ship.x, 0, ship.z);
-          group.rotation.y = ship.heading;
-          const hull = group.userData.hull;
-          hull.scale.x = Math.max(ship.hull, 0) / 100;
-          hull.material.color.setHex(ship.hull > 50 ? 0x7cffb2 : 0xff7c7c);
-        },
+        update: place,
         remove: group => {
           // Ours to do: Three.js leaks geometries and materials, and
           // only this file knows none of these are shared.

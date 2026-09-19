@@ -1885,6 +1885,8 @@ async function execute(step) {
       let host;
       try {
         host = pkg.hostStore({
+          // WHICH store of this definition: this page hosts three.
+          store: step.handle,
           definition,
           transport: node,
           // One label per store, not one per definition: the id the
@@ -1962,14 +1964,60 @@ async function execute(step) {
         // renewals all land in one number, and the duplicate witness
         // read it as store traffic. Wrapping the transport counts
         // what THIS replica said and nothing else.
-        const sent = { frames: 0 };
+        const sent = { frames: 0, snaps: 0, stream: null };
         upstream.set(step.handle, sent);
+        // The handle spells its stream id in HEX and the event
+        // spells it in DECIMAL (`stream.ts` says so, and comparing
+        // them textually drops every frame). A bare string can be
+        // either, so both readings are tried and a match on either
+        // counts — this is a counter, not an authorization.
+        const readings = t => {
+          const raw = String(t).trim();
+          const out = [];
+          if (/^0x[0-9a-f]+$/i.test(raw)) out.push(BigInt(raw));
+          if (/^[0-9]+$/.test(raw)) out.push(BigInt(raw));
+          if (/^[0-9a-f]+$/i.test(raw)) out.push(BigInt('0x' + raw));
+          return out;
+        };
+        const sameId = (a, b) => {
+          if (a === undefined || a === null || b === undefined || b === null) return false;
+          try {
+            const left = readings(a);
+            return readings(b).some(value => left.includes(value));
+          } catch {
+            return false;
+          }
+        };
         const counting = {
           nodeIdHex: () => node.nodeIdHex(),
-          onEvent: handler => node.onEvent(handler),
+          onEvent: handler =>
+            node.onEvent(event => {
+              // RECEIVED snapshot chunks, for THIS store's stream.
+              //
+              // The witness that asserts "more than one chunk" must
+              // read chunks, not the page's outbound submissions: a
+              // request, an ack or a control packet satisfies an
+              // outbound count without a snapshot ever being cut.
+              if (event && event.type === 'stream_data') {
+                let parsed = null;
+                try {
+                  parsed = JSON.parse(new TextDecoder().decode(event.payload));
+                } catch {
+                  // Not this store's JSON; not a chunk.
+                }
+                if (parsed && parsed.k === 'snap' && sameId(event.streamId, sent.stream)) {
+                  sent.snaps += 1;
+                }
+              }
+              handler(event);
+            }),
           connectPeer: node.connectPeer ? peer => node.connectPeer(peer) : undefined,
           openStream: async options => {
             const stream = await node.openStream(options);
+            // Both ends derive the same id from the label, so the
+            // stream this replica opened names the one its host's
+            // answers arrive on.
+            if (stream && stream.streamId !== undefined) sent.stream = stream.streamId;
             return {
               send: payload => {
                 sent.frames += 1;
@@ -1982,6 +2030,8 @@ async function execute(step) {
         joined = pkg.joinStore({
           definition: storeDefinition(pkg.defineStore),
           transport: counting,
+          // The store this replica is asking for, by name.
+          store: step.store || step.handle,
           streamId: step.label || undefined,
           host: step.host_hex,
           audience: step.audience || ['crew'],
@@ -2032,6 +2082,12 @@ async function execute(step) {
           swapped: reorder.swapped,
           duplicated: dup.duplicated,
           wire_messages: wire.messages - wireBefore,
+          // Snapshot chunks this replica RECEIVED on its own stream,
+          // which is what "a multi-chunk snapshot" means. The page's
+          // outbound submission count above cannot say it: a
+          // request or an ack satisfies it without a snapshot ever
+          // having been cut.
+          snap_chunks: (upstream.get(step.handle) || { snaps: 0 }).snaps,
         },
       };
     }
@@ -2062,6 +2118,8 @@ async function execute(step) {
           // duplicate and refetched the document": both end at the
           // same value and both publish once.
           upstream_frames: (upstream.get(step.handle) || { frames: 0 }).frames,
+          // Snapshot chunks this replica RECEIVED on its own stream.
+          snap_chunks: (upstream.get(step.handle) || { snaps: 0 }).snaps,
         },
       };
     }

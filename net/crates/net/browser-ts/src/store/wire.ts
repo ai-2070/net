@@ -90,7 +90,14 @@ export type MessageKind = CallerKind | OwnerKind;
  * one spelling.
  */
 const FIELDS: Readonly<Record<MessageKind, { required: readonly string[]; optional: readonly string[] }>> = {
-  join: { required: ['v', 'k', 'q', 'def', 'ver', 'key', 'aud'], optional: [] },
+  // `store` names WHICH store of this definition the caller wants.
+  // Required, and not inferable: a node may host several stores of
+  // one definition, every host store on that node sees every frame,
+  // and a `join` names no handle — so without this field the store
+  // that answers is whichever listener happened to run first. `key`
+  // cannot serve: it is the caller's opaque policy token, and two
+  // callers of one store carry different ones.
+  join: { required: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud'], optional: [] },
   resume: { required: ['v', 'k', 'q', 'h', 'aud'], optional: [] },
   resync: { required: ['v', 'k', 'q', 'h', 'g', 'have'], optional: [] },
   aud: { required: ['v', 'k', 'q', 'h', 'aud'], optional: [] },
@@ -108,7 +115,7 @@ const FIELDS: Readonly<Record<MessageKind, { required: readonly string[]; option
 
 /** Canonical key order for encoding, per kind. */
 const KEY_ORDER: Readonly<Record<MessageKind, readonly string[]>> = {
-  join: ['v', 'k', 'q', 'def', 'ver', 'key', 'aud'],
+  join: ['v', 'k', 'q', 'def', 'ver', 'store', 'key', 'aud'],
   resume: ['v', 'k', 'q', 'h', 'aud'],
   resync: ['v', 'k', 'q', 'h', 'g', 'have'],
   aud: ['v', 'k', 'q', 'h', 'aud'],
@@ -144,6 +151,8 @@ export interface JoinMessage {
   readonly q: Hex;
   readonly def: string;
   readonly ver: number;
+  /** Which store of this definition — the owner's declared address. */
+  readonly store: string;
   readonly key: string;
   readonly aud: readonly string[];
 }
@@ -485,11 +494,13 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       if (bad(def)) return def.refusal;
       const ver = int('ver', 0, Number.MAX_SAFE_INTEGER);
       if (bad(ver)) return ver.refusal;
+      const store = text('store');
+      if (bad(store)) return store.refusal;
       const key = text('key');
       if (bad(key)) return key.refusal;
       const aud = audience();
       if (bad(aud)) return aud.refusal;
-      return { ok: true, message: { k, q, def, ver, key, aud } };
+      return { ok: true, message: { k, q, def, ver, store, key, aud } };
     }
     case 'resume':
     case 'aud': {

@@ -866,6 +866,9 @@ await probe('real_package_narrows_the_audience_before_the_owner_agrees', async (
   let handles = 0;
   let qs = 0;
   const owner = new ownerModule.StoreOwner({
+    // The store's own address: a join names it, and an owner
+    // it is not addressed to refuses in silence.
+    store: 'probe-store',
     definition: world,
     authorize: request => {
       if (request.type === 'read') audiences.push([...request.audience]);
@@ -890,6 +893,7 @@ await probe('real_package_narrows_the_audience_before_the_owner_agrees', async (
 
   const core = new coreModule.StoreCore({ definition: world, initialState: world.empty() });
   const replica = new replicaModule.StoreReplica({
+    store: 'probe-store',
     definition: world,
     core,
     maxEventBytes: 8104,
@@ -963,6 +967,9 @@ await probe('real_package_action_executes_once_and_replays_its_outcome', async (
     return correlation.toString(16).padStart(16, '0');
   };
   const owner = new ownerModule.StoreOwner({
+    // The store's own address: a join names it, and an owner
+    // it is not addressed to refuses in silence.
+    store: 'probe-store',
     definition: game,
     authorize: () => true,
     project: state => state,
@@ -992,7 +999,7 @@ await probe('real_package_action_executes_once_and_replays_its_outcome', async (
   owner.commit({ shots: 0 });
 
   const joinOut = owner.receive(
-    codec.encodeMessage({ k: 'join', q: nextQ(), def: 'probe.act', ver: 1, key: 'k', aud: ['crew'] }),
+    codec.encodeMessage({ k: 'join', q: nextQ(), def: 'probe.act', ver: 1, store: 'probe-store', key: 'k', aud: ['crew'] }),
     '00000000000000aa',
   ).out;
   const manifest = codec.decodeMessage(joinOut[0].frame, { maxBytes: 8104, as: 'replica' });
@@ -1071,6 +1078,9 @@ await probe('real_package_resync_is_authorized_and_recovery_is_not_ready', async
   let handles = 0;
   let qs = 0;
   const owner = new ownerModule.StoreOwner({
+    // The store's own address: a join names it, and an owner
+    // it is not addressed to refuses in silence.
+    store: 'probe-store',
     definition: game,
     authorize: request => {
       reads.push(request);
@@ -1089,6 +1099,7 @@ await probe('real_package_resync_is_authorized_and_recovery_is_not_ready', async
 
   const core = new coreModule.StoreCore({ definition: game, initialState: game.empty() });
   const replica = new replicaModule.StoreReplica({
+    store: 'probe-store',
     definition: game,
     core,
     maxEventBytes: 8104,
@@ -1155,6 +1166,9 @@ await probe('real_package_owner_and_replica_complete_a_round_trip', async () => 
   let handles = 0;
   let qs = 0;
   const owner = new ownerModule.StoreOwner({
+    // The store's own address: a join names it, and an owner
+    // it is not addressed to refuses in silence.
+    store: 'probe-store',
     definition: game,
     authorize: () => true,
     project: state => state,
@@ -1170,6 +1184,7 @@ await probe('real_package_owner_and_replica_complete_a_round_trip', async () => 
 
   const core = new coreModule.StoreCore({ definition: game, initialState: game.empty() });
   const replica = new replicaModule.StoreReplica({
+    store: 'probe-store',
     definition: game,
     core,
     maxEventBytes: 8104,
@@ -1282,6 +1297,9 @@ await probe('real_package_owner_serves_a_join_and_binds_the_caller', async () =>
   const seen = [];
   let issued = 0;
   const owner = new ownerModule.StoreOwner({
+    // The store's own address: a join names it, and an owner
+    // it is not addressed to refuses in silence.
+    store: 'probe-store',
     definition: {
       id: 'probe.store',
       version: 1,
@@ -1306,7 +1324,7 @@ await probe('real_package_owner_serves_a_join_and_binds_the_caller', async () =>
   owner.commit({ n: 7 });
 
   const join = codec2.encodeMessage({
-    k: 'join', q: '0'.repeat(16), def: 'probe.store', ver: 1, key: 'k', aud: ['crew'],
+    k: 'join', q: '0'.repeat(16), def: 'probe.store', ver: 1, store: 'probe-store', key: 'k', aud: ['crew'],
   });
   const served = owner.receive(join, '00000000000000aa');
   if (served.refused !== null) throw new Error(`the join was refused: ${served.refused}`);

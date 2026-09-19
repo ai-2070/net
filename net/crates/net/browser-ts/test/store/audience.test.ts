@@ -74,6 +74,7 @@ function pair(
   const clock = { value: 0 };
   const projectable = { value: true };
   const owner = new StoreOwner<World, Record<string, never>, Record<string, never>>({
+    store: 'test-store',
     definition: world,
     authorize: options.authorize ?? (() => true),
     project: projection,
@@ -95,6 +96,7 @@ function pair(
     initialState: world.empty(),
   });
   const replica = new StoreReplica({
+    store: 'test-store',
     definition: world,
     core,
     maxEventBytes: MAX_EVENT_BYTES,

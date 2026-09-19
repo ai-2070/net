@@ -214,7 +214,10 @@ What this DIRECTORY establishes and what it does not, now that
   on STORE traffic. Nothing in this directory reads a counter.
 - **Reliable transfer** (the B2′ gate) is held by the Stage 7 harness
   witness that installs a snapshot through injected loss and reorder,
-  not by anything you can see by opening this page.
+  not by anything you can see by opening this page — and it is the
+  transport and the store TOGETHER: the transport repairs a gap it
+  notices, and the joiner re-asks for what nothing noticed (a lost
+  manifest opens no assembly, so there is nothing to expire).
 
 So: this is a demonstration of the store, and — in mesh mode — of the
 store composed with the mesh. The transport's own properties are the

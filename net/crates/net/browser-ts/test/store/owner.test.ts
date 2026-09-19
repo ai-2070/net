@@ -71,6 +71,7 @@ function rig(
     seen,
     handles: 0,
     owner: new StoreOwner<World, Record<string, never>, Record<string, never>>({
+      store: 'test-store',
       definition: definition(),
       authorize: (request) => {
         seen.push(request);
@@ -109,6 +110,7 @@ function joinFrame(aud: readonly string[], over: { def?: string; ver?: number } 
     q: q(),
     def: over.def ?? 'pirate.ship',
     ver: over.ver ?? 1,
+    store: 'test-store',
     key: 'black-petrel',
     aud,
   });
@@ -236,6 +238,7 @@ describe('authorize receives the authenticated caller', () => {
       q: q(),
       def: 'pirate.ship',
       ver: 1,
+      store: 'test-store',
       key: 'k',
       aud: ['crew'],
       peer: PEER_B,

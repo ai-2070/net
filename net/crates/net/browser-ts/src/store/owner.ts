@@ -79,6 +79,20 @@ export const HANDLE_LEASE_MS = 60_000;
 export interface OwnerDeps<S extends object, A extends ActionSpec, I extends InputSpec> {
   readonly definition: StoreDefinition<S, A, I>;
   /**
+   * WHICH store of this definition this owner is — the address a
+   * joiner names in `join.store`.
+   *
+   * A node may host several stores of one definition (a lobby and a
+   * match; three worlds in a harness), every host store on that node
+   * receives every frame, and a `join` names no handle. So without
+   * this, the store that answers a join is whichever listener
+   * happened to be registered first — and a caller asking for B got
+   * A's document, A's handle and A's state mutated by its actions.
+   * Found by review: two COLD stores, join the second, and the first
+   * answers.
+   */
+  readonly store: string;
+  /**
    * The owner's policy. Receives the **authenticated** caller, because
    * that is the only identity this module will ever hand it.
    */
@@ -827,6 +841,14 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     }
     if (message.ver !== this.deps.definition.version) {
       return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)]);
+    }
+    // Not this store. Refused SILENTLY — no `no`, no reply — because
+    // on a node hosting several stores of one definition every owner
+    // sees every join, and an owner that is not the addressee must
+    // neither answer it nor refuse it on the addressee's behalf. The
+    // one it IS addressed to answers.
+    if (message.store !== this.deps.store) {
+      return this.refuse('join-other-store', []);
     }
     if (this.handles.size >= MAX_HANDLES) {
       return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);

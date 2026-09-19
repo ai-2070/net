@@ -435,7 +435,7 @@ describe('a joiner installs the host’s world', () => {
       HOST_NODE,
       OTHER_NODE,
       derivedStreamId('store/other'),
-      encodeMessage({ k: 'join', q: '5'.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] }),
+      encodeMessage({ k: 'join', q: '5'.repeat(16) as Hex, def: 'ship', ver: 1, store: 'ship', key: 'x', aud: ['crew'] }),
     );
     await flush();
 
@@ -466,7 +466,7 @@ describe('a joiner installs the host’s world', () => {
     });
 
     const join = (q: string) =>
-      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] });
+      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, store: 'ship', key: 'x', aud: ['crew'] });
     net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('1'));
     await flush();
     net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/second'), join('2'));
@@ -477,22 +477,102 @@ describe('a joiner installs the host’s world', () => {
     await host.close();
   });
 
-  it('does not answer a join addressed to a sibling store on the same node', async () => {
-    // One node, two stores of one definition — which Stage 7 hosts
-    // three of. Every hostStore sees every `stream_data` event on the
-    // node, a `join` names no handle, and `key` is the caller's
-    // opaque policy token, so nothing in the frame says which store
-    // it is for. The stream does: both ends derive the same id from
-    // the same label.
+  it('answers only the store a join names, whichever host was registered first', async () => {
+    // Two stores of ONE definition on one node, BOTH COLD — neither
+    // has seen a frame — and the joiner asks for the second. The
+    // review's counterexample: before `join.store`, the store that
+    // answered was whichever listener was registered first, so a
+    // caller joining B installed A's document, took A's handle, and
+    // its next action mutated A.
     //
-    // Before the claim table, the SECOND store answered the first
-    // store's join, pinned the first store's id, and was then
-    // permanently unreachable by its own replicas — silent, with a
-    // hung `ready()` and one counter. Review probe B.
+    // The join names the store; the other owner refuses in silence.
+    // Registration order must not appear in the outcome, so this runs
+    // BOTH orders.
+    for (const askFor of ['alpha', 'beta'] as const) {
+      const net = mesh();
+      const time = timeline();
+      const transport = net.node(HOST_NODE);
+      const common = {
+        definition: ship,
+        maxEventBytes: MAX_EVENT_BYTES,
+        authorize: () => true,
+        project: (state: Ship) => state,
+        actions: {
+          fire: (_input: Actions['fire']['input'], context: { getState: () => Ship; setState: (next: Partial<Ship>) => void }) => {
+            const hull = context.getState().hull + 1;
+            context.setState({ hull });
+            return { shot: hull };
+          },
+        },
+        inputs: { helm: () => {} },
+        now: time.now,
+        schedule: time.schedule,
+      };
+      // `alpha` is registered FIRST in both passes: if listener order
+      // decided, `beta` could never win.
+      const alpha = hostStore<Ship, Actions, Inputs>({
+        ...common,
+        transport,
+        store: 'alpha',
+        streamId: 'store/alpha',
+        initialState: { ...FULL, hull: 10 },
+      });
+      const beta = hostStore<Ship, Actions, Inputs>({
+        ...common,
+        transport,
+        store: 'beta',
+        streamId: 'store/beta',
+        initialState: { ...FULL, hull: 20 },
+      });
+
+      const replica = joinStore<Ship, Actions, Inputs>({
+        definition: ship,
+        transport: net.node(CALLER_NODE),
+        host: HOST_NODE,
+        store: askFor,
+        streamId: `store/${askFor}`,
+        audience: ['crew'],
+        key: 'x',
+        maxEventBytes: MAX_EVENT_BYTES,
+        now: time.now,
+        schedule: time.schedule,
+      });
+      await replica.ready();
+
+      const asked = askFor === 'alpha' ? alpha : beta;
+      const other = askFor === 'alpha' ? beta : alpha;
+      // The document installed is the one asked for, and the other
+      // store issued nothing at all.
+      expect(replica.getState().hull).toBe(askFor === 'alpha' ? 10 : 20);
+      expect(asked.counts().handles).toBe(1);
+      expect(other.counts().handles).toBe(0);
+
+      // And an ordinary action lands on the store that was asked
+      // for: the review's counterexample mutated the OTHER one.
+      const before = { asked: asked.getState().hull, other: other.getState().hull };
+      await replica.act('fire', { power: 1 });
+      await flush(20);
+      expect(asked.getState().hull).toBe(before.asked + 1);
+      expect(other.getState().hull).toBe(before.other);
+
+      await replica.close();
+      await alpha.close();
+      await beta.close();
+    }
+  });
+
+  it('refuses a second store answering to the same name on one transport', () => {
+    // Two stores at one address make the address ambiguous, and the
+    // whole point of the address is that registration order does not
+    // decide. So the ambiguity is refused where it is legible — at
+    // construction — rather than resolved silently by whichever
+    // listener runs first.
     const net = mesh();
     const time = timeline();
+    const transport = net.node(HOST_NODE);
     const common = {
       definition: ship,
+      transport,
       initialState: FULL,
       maxEventBytes: MAX_EVENT_BYTES,
       authorize: () => true,
@@ -502,82 +582,25 @@ describe('a joiner installs the host’s world', () => {
       now: time.now,
       schedule: time.schedule,
     };
-    const transport = net.node(HOST_NODE);
-    const first = hostStore<Ship, Actions, Inputs>({ ...common, transport, streamId: 'store/first' });
-    const join = (q: string) =>
-      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] });
+    const first = hostStore<Ship, Actions, Inputs>({ ...common, store: 'world' });
+    let refused: StoreError | null = null;
+    try {
+      hostStore<Ship, Actions, Inputs>({ ...common, store: 'world' });
+    } catch (error) {
+      refused = error as StoreError;
+    }
+    expect(refused?.code).toBe('invalid-data');
+    expect(refused?.message).toContain('already hosted on this transport');
 
-    // The first store learns its stream from its own replica's join.
-    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('1'));
-    await flush();
-    expect(first.counts().handles).toBe(1);
-
-    // A second store, hosted while the first is live, then another
-    // frame of the FIRST store's traffic.
-    const second = hostStore<Ship, Actions, Inputs>({ ...common, transport, streamId: 'store/second' });
-    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('3'));
-    await flush();
-
-    // The second store issued NOTHING: it is not this join's store.
-    expect(second.counts().handles).toBe(0);
-    expect(second.counters()['other-stores-stream']).toBe(1);
-
-    // And it still serves its OWN traffic, which is the half a
-    // blanket refusal would break.
-    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/second'), join('4'));
-    await flush();
-    expect(second.counts().handles).toBe(1);
-
-    await first.close();
-    await second.close();
-  });
-
-  it('does not pin its stream from a frame it refuses', async () => {
-    // A node may host stores of DIFFERENT definitions, and each sees
-    // the others' frames. If the first frame a store happens to see
-    // pinned its id regardless of whether the owner accepted it, a
-    // store would claim a stream belonging to another definition
-    // entirely — and then refuse every frame of its own as
-    // `foreign-stream`, for the life of the page.
-    const net = mesh();
-    const time = timeline();
-    const host = hostStore<Ship, Actions, Inputs>({
-      definition: ship,
-      transport: net.node(HOST_NODE),
-      streamId: 'store/mine',
-      initialState: FULL,
-      maxEventBytes: MAX_EVENT_BYTES,
-      authorize: () => true,
-      project: state => state,
-      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
-      inputs: { helm: () => {} },
-      now: time.now,
-      schedule: time.schedule,
+    // A DIFFERENT name on the same transport is fine, and so is the
+    // same name once the first store has closed.
+    const sibling = hostStore<Ship, Actions, Inputs>({ ...common, store: 'lobby' });
+    expect(sibling.counts().handles).toBe(0);
+    void first.close().then(() => {
+      const successor = hostStore<Ship, Actions, Inputs>({ ...common, store: 'world' });
+      void successor.close();
     });
-
-    // Another definition's join, on another definition's stream.
-    net.injectLabelled(
-      HOST_NODE,
-      OTHER_NODE,
-      derivedStreamId('store/someone-else'),
-      encodeMessage({ k: 'join', q: 'a'.repeat(16) as Hex, def: 'other.doc', ver: 1, key: 'x', aud: ['crew'] }),
-    );
-    await flush();
-    expect(host.counts().handles).toBe(0);
-    expect(host.counters()['join-wrong-definition']).toBe(1);
-
-    // Its OWN traffic still works — which is what pinning the
-    // refused frame's stream would have broken.
-    net.injectLabelled(
-      HOST_NODE,
-      OTHER_NODE,
-      derivedStreamId('store/mine'),
-      encodeMessage({ k: 'join', q: 'b'.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] }),
-    );
-    await flush();
-    expect(host.counts().handles).toBe(1);
-    expect(host.counters()['foreign-stream'] ?? 0).toBe(0);
-    await host.close();
+    void sibling.close();
   });
 
   it('serves two callers their own projections', async () => {

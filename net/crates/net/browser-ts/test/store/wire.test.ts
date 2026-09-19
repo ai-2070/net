@@ -52,7 +52,7 @@ function refused(frame: string | object, as: Side = 'owner', maxBytes = BIG): De
   return result;
 }
 
-const join = { v: 1, k: 'join', q: Q, def: 'pirate.ship', ver: 1, key: 'black-petrel', aud: ['crew'] };
+const join = { v: 1, k: 'join', q: Q, def: 'pirate.ship', ver: 1, store: 'test-store', key: 'black-petrel', aud: ['crew'] };
 const man = { v: 1, k: 'man', q: Q, h: H, inc: INC, g: '1', r: '418', n: 3, bytes: '14208' };
 const snap = { v: 1, k: 'snap', h: H, g: '1', r: '418', i: 0, n: 3, d: 'QUJD' };
 const delta = {
@@ -135,7 +135,7 @@ describe('rung 1 — byte length, before any parse', () => {
   });
 
   it('measures UTF-8 bytes, not characters', () => {
-    const frame = JSON.stringify({ v: 1, k: 'join', q: Q, def: 'ship', ver: 1, key: '\u00e9\u00e9', aud: ['crew'] });
+    const frame = JSON.stringify({ v: 1, k: 'join', q: Q, def: 'ship', ver: 1, store: 'test-store', key: '\u00e9\u00e9', aud: ['crew'] });
     // Two two-byte characters: the character count fits, the byte count
     // does not.
     expect(refused(frame, 'owner', frame.length).stage).toBe('bytes');

@@ -1450,13 +1450,15 @@ async fn main() {
             // so the ledger is never quietly short and the CI floor
             // (which counts `RTCB PASS`) still fails.
             "--no-stage5" => stage5 = false,
-            // Opt IN to the Stage 7 store witnesses. Off by default,
-            // and deliberately so: they are written and they run, but
-            // the join is not yet answered on a browser ↔ browser
-            // pair (see `stage7.rs`), so pinning them would make the
-            // gate red about a blocker rather than about a
-            // regression. A witness that cannot pass yet does not
-            // belong in a floor; it belongs behind a flag, named.
+            // Opt IN to the Stage 7 store witnesses. Off by default
+            // so a bare local run keeps the 47-witness surface, and
+            // ON in CI's Chromium leg, where all five are pinned at
+            // floor 52. The Firefox leg leaves them off: they have
+            // never been run on that engine, and a flag whose
+            // witnesses are unproven there does not belong in its
+            // gate. They were behind this flag for a different
+            // reason once — the browser ↔ browser join was not
+            // answered — and that reason is gone.
             "--stage7" => stage7 = true,
             // Opt in to the routable-interface topology on Windows,
             // accepting the Windows Firewall prompt the non-loopback
@@ -3711,8 +3713,9 @@ async fn run(
     } else {
         for name in stage7::WITNESSES {
             println!(
-                "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses; they are \
-                 not in any floor until the browser ↔ browser join is answered"
+                "RTCB SKIPPED {name} — pass --stage7 to run the store witnesses. CI's \
+                 Chromium leg does (floor 52, all five pinned); the Firefox leg does \
+                 not, because they have never been run on that engine"
             );
         }
     }

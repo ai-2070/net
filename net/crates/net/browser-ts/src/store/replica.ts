@@ -101,6 +101,12 @@ export interface ReplicaDeps<S extends object, A extends ActionSpec, I extends I
    * is what every later request states — never the owner's older one.
    */
   readonly audience: readonly string[];
+  /**
+   * WHICH store of this definition to join — the owner's declared
+   * address, carried on the join so the owner it is NOT addressed to
+   * can refuse it. See `wire.ts`'s field table.
+   */
+  readonly store: string;
   /** The opaque join key the owner's policy reads. */
   readonly key: string;
 }
@@ -250,6 +256,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
         k: 'join',
         q,
         def: this.deps.definition.id,
+        store: this.deps.store,
         ver: this.deps.definition.version,
         key: this.deps.key,
         aud: [...this.#desired],

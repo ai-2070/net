@@ -62,6 +62,18 @@ export interface JoinStoreOptions<S extends object, A extends ActionSpec, I exte
   readonly host: string;
   /** The audience this caller wants. */
   readonly audience: readonly string[];
+  /**
+   * WHICH store of this definition to join, when the host serves
+   * more than one. Defaults to the definition id, which is what a
+   * host serving a single store of it declares.
+   *
+   * Not `key`: that is the caller's opaque policy token, and two
+   * callers of ONE store carry different ones. This is the store's
+   * address, and it is on the wire because every host store on a
+   * node sees every frame and a `join` names no handle — without it
+   * the store that answers is whichever listener ran first.
+   */
+  readonly store?: string;
   /** The opaque key the host's policy reads. */
   readonly key: string;
   readonly maxEventBytes: number;
@@ -151,6 +163,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     now,
     newQ: () => (options.newQ ?? (() => randomHex(8) as Hex))(),
     audience: options.audience,
+    store: options.store ?? options.definition.id,
     key: options.key,
   });
 

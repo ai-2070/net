@@ -5791,7 +5791,10 @@ jobs:
                 exit 1
               fi
             done
-            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6"
+            # Chromium also carries the five Stage 7 store witnesses;
+            # Firefox does not (see the harness step).
+            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
+          (+ 5 Stage 7 on chromium)"
           done
 
       # WebKit's verdicts are surfaced, never gated.

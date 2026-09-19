@@ -88,6 +88,7 @@ function rig(
   const headings: number[] = [];
   const sails: number[] = [];
   const owner = new StoreOwner<Ship, Actions, Inputs>({
+    store: 'test-store',
     definition: ship,
     authorize: options.authorize ?? (() => true),
     project: state => state,
@@ -134,7 +135,7 @@ function q(): Hex {
 
 function joined(owner: StoreOwner<Ship, Actions, Inputs>, peer = PEER_A): Hex {
   const out = owner.receive(
-    encodeMessage({ k: 'join', q: q(), def: 'ship', ver: 1, key: 'k', aud: ['crew'] }),
+    encodeMessage({ k: 'join', q: q(), def: 'ship', ver: 1, store: 'test-store', key: 'k', aud: ['crew'] }),
     peer,
   ).out;
   const decoded = decodeMessage(out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });

@@ -53,6 +53,7 @@ function owner(options: {
 } = {}) {
   let handles = 0;
   const store = new StoreOwner<Doc, Record<string, never>, Record<string, never>>({
+    store: 'test-store',
     definition: options.definition ?? definition(),
     authorize: options.authorize ?? (() => true),
     project: options.project ?? (state => state),
@@ -93,7 +94,7 @@ function failingEmpty(quiet = 2): () => Doc {
 }
 
 function joinFrame(): string {
-  return encodeMessage({ k: 'join', q: '1'.repeat(16), def: 'probe', ver: 1, key: 'k', aud: ['crew'] });
+  return encodeMessage({ k: 'join', q: '1'.repeat(16), def: 'probe', ver: 1, store: 'test-store', key: 'k', aud: ['crew'] });
 }
 
 function handleOf(frames: readonly { readonly frame: string }[]): Hex {
@@ -276,6 +277,7 @@ describe('D — the replica', () => {
       initialState: definitionValue.empty(),
     });
     const replica = new StoreReplica({
+      store: 'test-store',
       definition: definitionValue,
       core,
       maxEventBytes: MAX_EVENT_BYTES,
@@ -413,6 +415,7 @@ function cancelRig(definition: StoreDefinition<Doc, Record<string, never>, Recor
   let handles = 0;
   let qs = 0;
   const owner = new StoreOwner({
+    store: 'test-store',
     definition,
     authorize: () => true,
     project: (state: Doc) => state,
@@ -430,6 +433,7 @@ function cancelRig(definition: StoreDefinition<Doc, Record<string, never>, Recor
   owner.commit({ tick: 5 });
   const core = new StoreCore({ definition, initialState: definition.empty() });
   const replica = new StoreReplica({
+    store: 'test-store',
     definition,
     core,
     maxEventBytes: MAX_EVENT_BYTES,
@@ -464,6 +468,7 @@ describe('an action is refused before it commits, never after', () => {
   function rig2(options: { output?: (value: unknown) => { readonly tick: number } } = {}) {
     let handles = 0;
     const owner = new StoreOwner<Doc2, Acts, Record<string, never>>({
+      store: 'test-store',
       definition: defineStore<Doc2, Acts, Record<string, never>>({
         id: 'commit',
         version: 1,
@@ -509,7 +514,7 @@ describe('an action is refused before it commits, never after', () => {
 
   function joinedHandle(owner: StoreOwner<Doc2, Acts, Record<string, never>>): Hex {
     const out = owner.receive(
-      encodeMessage({ k: 'join', q: '1'.repeat(16) as Hex, def: 'commit', ver: 1, key: 'k', aud: [] }),
+      encodeMessage({ k: 'join', q: '1'.repeat(16) as Hex, def: 'commit', ver: 1, store: 'test-store', key: 'k', aud: [] }),
       PEER,
     ).out;
     const decoded = decodeMessage(out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });

@@ -11,11 +11,13 @@
 //!
 //! So these five witnesses put the store on the transport the rest of
 //! this harness exercises, in two isolated browsing contexts of a real
-//! engine. **CI does not run them yet** — they are behind `--stage7`,
-//! which neither engine's job passes, and they are in no floor. The
-//! earlier version of this header said CI ran them on both engines,
-//! which was simply untrue: the harness's own default run excludes
-//! them by name.
+//! engine. **CI runs them on CHROMIUM**: that leg passes `--stage7`,
+//! its floor is 52 and all five names are pinned REQUIRED
+//! (`ci.yml`). The FIREFOX leg does not — these have never been run
+//! on Firefox, and a flag whose witnesses are unproven on an engine
+//! does not belong in that engine's gate — so its floor stays 47.
+//! They are still off by DEFAULT, which is what a local run gets
+//! without the flag.
 //!
 //! Local status (Chromium, `--stage7`): **52 witnesses, 0 failed** —
 //! all five below pass, and this stage disturbs no other, which it
@@ -73,8 +75,8 @@
 //! ## The five witnesses, in the order they run
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
-//! 2. it still installs through injected loss **and** reorder;
-//! 3. an action crosses, executes once, and its result comes back;
+//! 2. an action crosses, executes once, and its result comes back;
+//! 3. the same install, through injected loss **and** reorder;
 //! 4. a duplicated wire message moves the view exactly once AND
 //!    costs the replica no upstream word;
 //! 5. and store traffic moves the anchor's per-pair forwarding
@@ -82,7 +84,9 @@
 //!
 //! **These numbers are the EXECUTION order**, matching the `// --- N`
 //! section comments below, and they are the numbering every sentence
-//! in this header uses.
+//! in this header uses. The previous header listed loss second and
+//! the action third, which is the ARRAY's order — the review caught
+//! it, twice.
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
 //! 3 duplicate, 4 counter — and stays that way because each record
@@ -397,7 +401,13 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let joined = script.run(tab_player, join_store("clean", 0, 0, 0)).await;
     let host_digest = stat_str(&hosted, "digest");
     let replica_digest = stat_str(&joined, "digest");
-    let chunks = stat_u64(&joined, "wire_messages").unwrap_or(0);
+    // Snapshot chunks the REPLICA received on its own stream, not
+    // the page's outbound submission count: a request, an ack or a
+    // control packet satisfies an outbound total without a snapshot
+    // ever having been cut, so the old reading could pass with one
+    // chunk. Counted at the joining page, on the stream that
+    // replica opened.
+    let chunks = stat_u64(&joined, "snap_chunks").unwrap_or(0);
     let installed = joined.ok
         && host_digest.is_some()
         && host_digest == replica_digest
@@ -417,7 +427,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
              read here, digested and compared with the host's — not the step's ok flag, \
              and not a partial view, because `ready()` resolves only once the manifest, \
              every chunk and the definition's validation have landed. host={host_digest:?} \
-             replica={replica_digest:?} entries={:?} wire messages this join cost={chunks} \
+             replica={replica_digest:?} entries={:?} snapshot chunks received={chunks} \
              (a single-chunk snapshot would make this a test of one `send`; the store \
              chunks at 5934 payload bytes). host node={} player node={}. {}",
             stat_u64(&joined, "entries"),
@@ -474,11 +484,14 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
 
     // --- 3. the same install, through loss and reorder -------------
     //
-    // Both hooks armed on the JOINING side, so the caller's own
-    // requests and the acknowledgements the reliable stream needs are
-    // what get dropped and swapped. The store has no retransmission
-    // of its own: if this passes, the transport's reliability is what
-    // carried it.
+    // Both hooks are armed on the HOST side, below, because the
+    // snapshot is the host's outbound traffic — this comment used to
+    // say the joining side, immediately above the step that arms the
+    // host, which is the drift a reader trusts and should not have
+    // to check. What recovers a gap is the transport's reliability
+    // AND the store's own re-ask when nothing noticed the loss
+    // (a manifest opens no assembly); the witness does not separate
+    // them.
     let hosted_lossy = script.run(tab_host, host_store("lossy")).await;
     // Armed on the HOST, because the snapshot is the host's outbound
     // traffic. Arming the joining page faulted its requests and
@@ -554,9 +567,15 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
              overtook it, for the whole join. The hooks' own counts come back and are \
              asserted NON-ZERO — a loss witness that dropped nothing is a witness about \
              nothing: dropped={dropped} reordered={swapped}. The document still installed \
-             byte-identical: host={:?} replica={lossy_digest:?}. The store retransmits \
-             nothing itself, so what recovered this is `wire/src/reliability.rs` plus \
-             `leaf/src/stream.rs`'s reorder buffer. {}",
+             byte-identical: host={:?} replica={lossy_digest:?}. WHAT RECOVERED IT is \
+             the two layers TOGETHER, and this witness does not separate them: the \
+             transport repairs a gap it notices (`wire/src/reliability.rs` and \
+             `leaf/src/stream.rs`'s reorder buffer), and the STORE asks again for what \
+             nothing noticed — a lost manifest opens no assembly, so the joiner's own \
+             deadline reissues the join (`replica.ts`, driven by `join.ts`). An earlier \
+             version of this line credited the transport alone; a review probe observed \
+             the second join directly, so that was a claim this witness could not make. \
+             {}",
             stat_str(&hosted_lossy, "digest"),
             why(&joined_lossy)
         ),
@@ -624,9 +643,18 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // duplicated the count stayed 1 while the replica sent a
     // `resync`. What separates "idempotent" from "recovered" is
     // whether the replica had to say anything at all.
-    let upstream_before = stat_u64(&before_state, "upstream_frames").unwrap_or(0);
-    let upstream_after = stat_u64(&after, "upstream_frames").unwrap_or(0);
-    let replica_sent = upstream_after.saturating_sub(upstream_before);
+    // Both readings must be PRESENT and monotone before their
+    // difference means anything: defaulting a missing counter to
+    // zero and subtracting with saturation makes "no upstream
+    // traffic" the answer to "no instrumentation", which is the
+    // failure mode this witness exists to rule out.
+    let upstream_before = stat_u64(&before_state, "upstream_frames");
+    let upstream_after = stat_u64(&after, "upstream_frames");
+    let upstream_read = match (upstream_before, upstream_after) {
+        (Some(before), Some(after)) if after >= before => Some(after - before),
+        _ => None,
+    };
+    let replica_sent = upstream_read;
     let once = joined_dup.ok
         && committed.ok
         && after.ok
@@ -634,7 +662,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         && replica_tick == Some(41)
         && before_tick != 41
         && moves == 1
-        && replica_sent == 0;
+        && replica_sent == Some(0);
     ledger.record(
         WITNESSES[3],
         once,
@@ -646,7 +674,9 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
              replica made: {applications_before} → {applications_after}, so exactly \
              {moves} — the final value cannot carry it, since the commit ASSIGNS tick \
              41 and applying the delta twice ends at 41 too. (b) The replica's own \
-             UPSTREAM messages across the same window: {replica_sent}, asserted ZERO. \
+             UPSTREAM messages across the same window: {replica_sent:?}, asserted
+             `Some(0)` — present, monotone and zero, because a MISSING reading must
+             not read as silence. \
              (b) exists because (a) cannot tell IDEMPOTENT from RECOVERED: a resync \
              that reinstalls the same document also publishes once (`core.ts`'s \
              `#publish` returns early on an unchanged state), and the review's probe A \

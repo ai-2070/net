@@ -35,8 +35,9 @@ param(
   [string]$Engine = "chromium",
   [string]$BrowserPath = "",
   [switch]$NoStage5,
-  # Opt in to the Stage 7 store witnesses. Off by default because
-  # they are not in any floor yet; see `runner/src/stage7.rs`.
+  # Opt in to the Stage 7 store witnesses. Off by default so a bare
+  # run keeps the 47-witness surface; CI's Chromium leg passes this
+  # and holds them at floor 52. See `runner/src/stage7.rs`.
   [switch]$Stage7,
   [switch]$UseRoutableInterface
 )

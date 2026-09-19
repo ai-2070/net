@@ -130,8 +130,22 @@ export function samePeer(left: string, right: string): boolean {
 
 /** What a host needs beyond the owner's own dependencies. */
 export interface HostStoreOptions<S extends object, A extends ActionSpec, I extends InputSpec>
-  extends Omit<OwnerDeps<S, A, I>, 'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject'> {
+  extends Omit<
+    OwnerDeps<S, A, I>,
+    'maxEventBytes' | 'newHandle' | 'newIncarnation' | 'now' | 'canProject' | 'store'
+  > {
   readonly transport: StoreTransport;
+  /**
+   * WHICH store of this definition this is — the address a joiner
+   * names. Defaults to the definition id, which is what a node
+   * serving a single store of it means.
+   *
+   * A node hosting SEVERAL stores of one definition MUST name each,
+   * and their joiners must ask for them by name: every host store on
+   * a node sees every frame, so this is the only thing that decides
+   * which one answers.
+   */
+  readonly store?: string;
   /** The stream id both sides address. One label per store. */
   readonly streamId?: string;
   readonly maxEventBytes: number;
@@ -158,35 +172,28 @@ export interface HostedStoreHandle<S extends object> {
 }
 
 /**
- * Which live host store owns which stream id, per transport.
+ * The store addresses live on each transport.
  *
- * Every `hostStore` on a node receives every `stream_data` event on
- * that node, and the only thing distinguishing one store's traffic
- * from another's is the stream it arrives on — the id the leaf derives
- * from the label BOTH ends pass. Nothing else can: `key` is the
- * caller's opaque policy token, a `join` names no handle, and two
- * stores of one definition are indistinguishable by definition id.
+ * A node may host several stores of one definition, and a joiner
+ * names the one it wants (`join.store`). Two stores answering to the
+ * SAME name on one transport make that name ambiguous: both would
+ * accept the join and the first listener registered would win, which
+ * is the non-determinism the address exists to remove. So the second
+ * one is refused at construction, where the mistake is legible,
+ * rather than silently resolved by registration order.
  *
- * So a store that has learned its id CLAIMS it here, and a store that
- * has not yet learned one refuses a frame another store has claimed.
- * Without this, a second store hosted on a live node adopted the
- * FIRST store's id from the first frame it happened to see, answered a
- * join that was not addressed to it, and was then permanently
- * unreachable with its own traffic counted `foreign-stream` — silent,
- * with a hung `ready()` at the joiner. Found by review probe B.
- *
- * Keyed weakly on the transport: two stores on two nodes share
- * nothing, and a dropped transport takes its claims with it.
+ * Keyed weakly on the transport OBJECT, which makes this check
+ * BEST-EFFORT by construction: a page that wraps its node in a fresh
+ * object per store — the harness does exactly that for its joiners —
+ * presents a different key each time and gets no warning. That is
+ * acceptable precisely because correctness does NOT rest here. A
+ * join names its store (`join.store`, `owner.ts`), and an owner that
+ * is not the addressee refuses it whatever this table says. This
+ * only turns one specific mistake — two stores answering to one name
+ * through one transport handle — from a silent ambiguity into a
+ * legible refusal.
  */
-const claimsByTransport = new WeakMap<StoreTransport, Map<string, object>>();
-
-function claims(transport: StoreTransport): Map<string, object> {
-  const existing = claimsByTransport.get(transport);
-  if (existing !== undefined) return existing;
-  const fresh = new Map<string, object>();
-  claimsByTransport.set(transport, fresh);
-  return fresh;
-}
+const addressesByTransport = new WeakMap<StoreTransport, Set<string>>();
 
 function randomHex(bytes: number): string {
   const buffer = new Uint8Array(bytes);
@@ -212,8 +219,21 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
   options: HostStoreOptions<S, A, I>,
 ): HostedStoreHandle<S> {
   const streamId = options.streamId ?? `store/${options.definition.id}`;
+  const address = options.store ?? options.definition.id;
+  const taken = addressesByTransport.get(options.transport) ?? new Set<string>();
+  if (taken.has(address)) {
+    throw new StoreError(
+      'invalid-data',
+      `a store named ${address} is already hosted on this transport: name each store of ` +
+        'one definition, or a join for that name is ambiguous',
+    );
+  }
+  taken.add(address);
+  addressesByTransport.set(options.transport, taken);
+
   const owner = new StoreOwner<S, A, I>({
     definition: options.definition,
+    store: address,
     authorize: options.authorize,
     project: options.project,
     actions: options.actions,
@@ -243,9 +263,6 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
    * this owner issued.
    */
   let arrivesOn: string | null = null;
-  /** This store's identity in the per-transport claim table. */
-  const token = {};
-  const claimed = claims(options.transport);
   const pendingReplies = new Map<string, Promise<TransportStream>>();
   const dropped: Record<string, number> = {};
   let closed = false;
@@ -321,19 +338,6 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['foreign-stream'] = (dropped['foreign-stream'] ?? 0) + 1;
       return;
     }
-    // Unpinned, and the stream belongs to a live sibling store on
-    // this node: not this store's traffic, and answering it would
-    // steal the sibling's replica.
-    //
-    // No `owns !== token` arm here: unpinned means this store has
-    // claimed nothing, so a claim it finds is always somebody
-    // else's. The arm was written and deleted — a control proved
-    // nothing could distinguish it, which is what unreachable
-    // defence looks like.
-    if (arrivesOn === null && arrived !== undefined && claimed.has(arrived)) {
-      dropped['other-stores-stream'] = (dropped['other-stores-stream'] ?? 0) + 1;
-      return;
-    }
     let text: string;
     try {
       text = decoder.decode(payload);
@@ -351,18 +355,18 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       return;
     }
     // Pin the stream id from a frame the OWNER ACCEPTED, never from
-    // one it then refuses — and never from a stream a SIBLING store
-    // on this node has already claimed.
+    // one it then refuses.
     //
-    // A `join` names no handle, so without the claim check every
-    // store on the node answers every join it sees: the store this
-    // one was not addressed to installs a handle, pins the wrong id,
-    // and is then unreachable by its own replicas. See
-    // `claimsByTransport`.
+    // Every hostStore on a node sees every frame on it, and a node
+    // may host stores of DIFFERENT definitions: pinning whatever
+    // arrived first would make a store claim a stream belonging to
+    // another store entirely, and then refuse all of its own traffic
+    // as `foreign-stream` for the life of the page. Which store a
+    // JOIN is for is decided before this, by `join.store`
+    // (`owner.ts`); this is what keeps the id learned from it right.
     const outcome = owner.receive(text, authenticated);
     if (arrived !== undefined && arrivesOn === null && outcome.refused === null) {
       arrivesOn = arrived;
-      claimed.set(arrived, token);
     }
     dispatched(outcome);
   });
@@ -420,10 +424,8 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       for (const stream of replies.values()) stream.close();
       replies.clear();
       pendingReplies.clear();
-      // Release the claim, so a successor store on this node may
-      // take the same label. Only THIS store's claim: a sibling's
-      // stays its own.
-      if (arrivesOn !== null && claimed.get(arrivesOn) === token) claimed.delete(arrivesOn);
+      // The name is free again, so a successor may take it.
+      addressesByTransport.get(options.transport)?.delete(address);
     },
   };
 }

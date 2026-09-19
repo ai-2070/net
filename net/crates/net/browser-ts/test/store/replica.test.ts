@@ -54,6 +54,7 @@ function pair(initial: World = { tick: 1, crew: { ada: { hp: 10 } } }) {
   let handles = 0;
   let qs = 0;
   const owner = new StoreOwner<World, Record<string, never>, Record<string, never>>({
+    store: 'test-store',
     definition: world,
     authorize: () => true,
     project: state => state,
@@ -76,6 +77,7 @@ function pair(initial: World = { tick: 1, crew: { ada: { hp: 10 } } }) {
     initialState: world.empty(),
   });
   const replica = new StoreReplica({
+    store: 'test-store',
     definition: world,
     core,
     maxEventBytes: MAX_EVENT_BYTES,
