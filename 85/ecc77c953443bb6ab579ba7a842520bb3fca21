@@ -1,0 +1,14 @@
+AGENTS.md
+  h_64425bc75e3f3d 127,129-142,151-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "85ecc77c953443bb6ab579ba7a842520bb3fca21",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
