@@ -5652,6 +5652,31 @@ jobs:
             | tee "$RUNNER_TEMP/rtcb-firefox.log"
           exit "${PIPESTATUS[0]}"
 
+      # Firefox + the store witnesses, RECORDED and not a gate — yet.
+      #
+      # The Chromium leg gates them (floor 53). They have never run on
+      # Firefox: the local workstation cannot seed a Firefox profile's
+      # NSS database (the `certutil` on PATH there is Microsoft's, and
+      # the only other prompt-free mechanism, an enterprise policy, is
+      # not profile-scoped and would defeat this harness's own TLS
+      # control), so this job is the first place they can execute at
+      # all. Gating them here before a single observed run would make
+      # the gate red about a blocker rather than a regression, which
+      # is the rule that kept them behind a flag in the first place.
+      #
+      # So: run them, keep the log, and promote this to the gate — a
+      # `--stage7` on the leg above and a Firefox floor of 53 — on the
+      # first green run. If it is NOT green, the log says what the
+      # engine does differently, which is the point.
+      - name: Browser harness — Firefox + Stage 7 (recorded, not a gate)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          net/crates/net/tests/rtc_browser/run.sh --engine firefox --stage7 2>&1 \
+            | tee "$RUNNER_TEMP/rtcb-firefox-stage7.log" || true
+
       # WebKit is recorded, never a gate: Playwright's WebKit build
       # is not the engine Safari ships, so its verdicts are evidence
       # about a related engine, not about Safari.
@@ -5796,6 +5821,38 @@ jobs:
             # Firefox does not (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
           (+ 6 Stage 7 on chromium)"
+          done
+
+      # The recorded Firefox + Stage 7 leg, PRINTED and never gated.
+      # These numbers are what a promotion decision reads — a
+      # `--stage7` on the Firefox harness step and a Firefox floor of
+      # 53 — and no floor consults them today. A missing log is not a
+      # failure: the step above is `continue-on-error`.
+      - name: Firefox + Stage 7 evidence (recorded, no floor)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/rtcb-firefox-stage7.log"
+          if [ ! -f "$log" ]; then
+            echo "[firefox+stage7] no log — the recorded step did not run"
+            exit 0
+          fi
+          passes=$(grep -c '^RTCB PASS ' "$log" || true)
+          fails=$(grep -c '^RTCB FAIL ' "$log" || true)
+          echo "[firefox+stage7] $passes passed, $fails failed (RECORDED, no floor)"
+          for required in \
+            stage7_store_snapshot_installs_over_the_real_stream \
+            stage7_store_snapshot_installs_through_injected_loss_and_reorder \
+            stage7_an_action_round_trip_crosses_the_real_transport \
+            stage7_a_duplicated_store_frame_moves_the_view_once \
+            stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed \
+            stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct; do
+            if grep -q "^RTCB PASS $required " "$log"; then
+              echo "[firefox+stage7] PASS $required"
+            else
+              echo "[firefox+stage7] NOT PASSING $required"
+              grep "^RTCB FAIL $required " "$log" || true
+            fi
           done
 
       # WebKit's verdicts are surfaced, never gated.

@@ -11,11 +11,24 @@
 //!
 //! So these six witnesses put the store on the transport the rest of
 //! this harness exercises, in two isolated browsing contexts of a real
-//! engine. **CI runs them on CHROMIUM**: that leg passes `--stage7`,
-//! its floor is 52 and all five names are pinned REQUIRED
-//! (`ci.yml`). The FIREFOX leg does not — these have never been run
-//! on Firefox, and a flag whose witnesses are unproven on an engine
-//! does not belong in that engine's gate — so its floor stays 47.
+//! engine. **CI gates them on CHROMIUM**: that leg passes `--stage7`,
+//! its floor is 53 and all six names are pinned REQUIRED (`ci.yml`).
+//!
+//! **Firefox RUNS them, recorded, and does not gate them.** They had
+//! never executed on that engine at all — this workstation cannot
+//! seed a Firefox profile's NSS database (the `certutil` on PATH is
+//! Microsoft's, and the only other prompt-free mechanism, an
+//! enterprise policy, is not profile-scoped and would defeat the
+//! harness's own TLS control) — so a second, `continue-on-error`
+//! Firefox step exists to produce that evidence, with its verdicts
+//! printed by a step of their own and consulted by no floor.
+//!
+//! The promotion is one edit each and is deliberately left to a
+//! human reading a real run: `--stage7` on the gating Firefox step
+//! and its floor from 47 to 53. Gating an unproven engine before one
+//! observed run is the mistake this stage already made once, in the
+//! other direction.
+//!
 //! They are still off by DEFAULT, which is what a local run gets
 //! without the flag.
 //!
