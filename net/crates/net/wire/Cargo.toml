@@ -77,7 +77,7 @@ snow = { version = "0.10.0", default-features = false, features = [
 # browser opt-in of their own major, or the build stops at a
 # `compile_error!` inside getrandom itself. (S0a §6.2.)
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
-getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+getrandom_02 = { package = "getrandom", version = "0.4.0", features = ["js"] }
 # Packet AEAD for wasm32: 0.10.1 (aead 0.5, `AeadInPlace`), not the
 # 0.11 the core pins — 0.11 moved to aead 0.6's `InOutBuf` API, and
 # 0.10.1 is already in the tree under snow's default resolver, so this

@@ -55,7 +55,7 @@ snow = { version = "0.10.0", default-features = false, features = [
 # the build stops at a `compile_error!` inside getrandom 0.2 —
 # nothing in the copied Net code is wrong. See the report.
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
-getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+getrandom_02 = { package = "getrandom", version = "0.4.0", features = ["js"] }
 # Packet AEAD for wasm32. 0.10.1 (aead 0.5, `AeadInPlace`) rather
 # than the 0.11 `net` pins: 0.11 moved to aead 0.6's `InOutBuf` API,
 # and 0.10.1 is already in the tree under snow's default resolver, so
