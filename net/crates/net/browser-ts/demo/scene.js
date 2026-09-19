@@ -149,8 +149,9 @@ export function createScene(canvas) {
           // then never moves is never updated either — it would sit
           // at the geometry's defaults (origin, heading 0, full
           // hull) however far from them its actual state is. A
-          // review probe measured exactly that: expected
-          // {x:-6,z:3,heading:1,hull:0.75}, observed {0,0,0,1}.
+          // measured in headless Chromium by reading the THREE
+          // objects rather than the store: with the placement below
+          // removed, a ship whose state says x=-6 draws at x=0.
           // `create` returns a rendered object, not a blank one.
           place(entry.group, ship);
           return entry.group;

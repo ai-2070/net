@@ -826,10 +826,17 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   /**
    * Admit a join.
    *
-   * Order matters and is the ladder's: definition identity, audience
-   * bounds, capacity, `authorize`, and only then a handle. Nothing is
-   * allocated before the policy has ruled, so a refused caller costs
-   * one counter and no state.
+   * Order matters and is the ladder's: **the store address first**,
+   * because it decides whether this owner may answer at all; then
+   * definition identity and version, which are loud for the store
+   * they ARE addressed to; then capacity, `authorize`, and only then
+   * a handle. Nothing is allocated before the policy has ruled, so a
+   * refused caller costs one counter and no state.
+   *
+   * This summary is written out in full because it was wrong for one
+   * commit — it still listed the definition first, ten lines above
+   * the code that had just been reordered, in the rung whose
+   * position was the point of the change.
    */
   private join(
     message: Extract<CallerMessage, { k: 'join' }>,
