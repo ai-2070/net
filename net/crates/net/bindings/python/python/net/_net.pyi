@@ -2646,6 +2646,22 @@ class AsyncDuplexCall:
     def call_id(self) -> int: ...
     def flow_controlled(self) -> bool: ...
 
+class ServeHandle:
+    """Handle to a registered nRPC service.
+
+    Returned by ``MeshRpc.serve`` / ``AsyncMeshRpc.serve``. In-flight handlers
+    continue to completion on ``close()``, but no new request is dispatched;
+    ``close`` is idempotent, and leaving the ``with`` block closes for you.
+    """
+
+    def close(self) -> None: ...
+    def is_closed(self) -> bool: ...
+    def __enter__(self) -> "ServeHandle": ...
+    def __exit__(
+        self, exc_type: Any, exc_value: Any, traceback: Any
+    ) -> bool: ...
+
+
 class AsyncMeshRpc:
     """Async sibling of :class:`MeshRpc`."""
 
@@ -2703,6 +2719,24 @@ class AsyncMeshRpc:
     ) -> ServeHandle: ...
 
 # ----- T2: cortex -----
+
+class WriteToken:
+    """A durable-write token — the point a stream's fold has reached.
+
+    ``origin_hash`` identifies the stream, ``seq`` the sequence it marks. Hand
+    it to ``wait_for_token`` to block until the fold has reached that point.
+    """
+
+    def __init__(self, origin_hash: int, seq: int) -> None: ...
+    @staticmethod
+    def from_string(s: str) -> "WriteToken": ...
+    @property
+    def origin_hash(self) -> int: ...
+    @property
+    def seq(self) -> int: ...
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
 
 class AsyncMemoryWatchIter:
     """PEP 525 async iterator over a memories watch."""
@@ -2809,6 +2843,13 @@ class AsyncMigrationHandle:
     async def cancel(self) -> None: ...
     def phases(self) -> MigrationPhasesIter: ...
     def __repr__(self) -> str: ...
+
+class MigrationPhasesIter:
+    """Iterator over a migration's phase names (``str``)."""
+
+    def __iter__(self) -> "MigrationPhasesIter": ...
+    def __next__(self) -> str: ...
+
 
 class AsyncDaemonRuntime:
     """Async sibling of :class:`DaemonRuntime`."""
@@ -3176,10 +3217,10 @@ class AsyncPinStore:
     async def reject(self, cap_id: "str | CapabilityId") -> bool: ...
     async def is_approved(self, cap_id: "str | CapabilityId") -> bool: ...
     async def state(self, cap_id: "str | CapabilityId") -> Optional[str]: ...
-    async def approved(self) -> list[str]: ...
-    async def pending(self) -> list[str]: ...
-    async def list(self) -> list[tuple[str, str]]: ...
-    async def snapshot_and_watch(self) -> tuple[list[str], "AsyncPinWatcher"]:
+    async def approved(self) -> List[str]: ...
+    async def pending(self) -> List[str]: ...
+    async def list(self) -> List[Tuple[str, str]]: ...
+    async def snapshot_and_watch(self) -> Tuple[List[str], "AsyncPinWatcher"]:
         """Snapshot the currently-approved capabilities AND subscribe to
         changes, atomically. Returns ``(approved, watcher)`` — promote the
         snapshot, then ``async for change in watcher:`` for subsequent deltas.
@@ -3304,6 +3345,56 @@ class CapabilityGateway:
         delegation_leaf: "Identity",
         delegation_chain: bytes,
     ) -> None: ...
+    # Build a gateway over a started ``mesh``. ``pin_store_path`` should
+    # be the machine-shared pin store so approvals are honored both ways;
+    # omit it to keep consent in-memory (every gated capability then always
+    # requires approval).
+    #
+    # Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
+    # ``delegation_chain`` (a serialized ``DelegationChain``) together to have
+    # every invoke carry a per-invoke signed delegation (Phase 3); a remote
+    # provider running a delegation gate then admits by verified delegation
+    # and audits this gateway's leaf. **Both or neither** — passing exactly
+    # one raises ``ValueError``.
+    #
+    # Pass ``payment_policy_path`` (the machine-shared spend-policy store)
+    # to enable paid capabilities: the invoke gate then clears them through
+    # the Rust payments flow (quote -> spend policy -> x402 payload -> pay
+    # over the mesh). ``payment_profile`` is ``"production"`` (the
+    # fail-closed default: every mock spend holds for approval) or
+    # ``"dev_test"`` (mock auto-allows under the configured limits);
+    # ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
+    # for production-profile demos. Without ``payment_policy_path``, a paid
+    # capability fails closed as a structured ``denied`` — never a silent
+    # unpaid serve. Requires the ``payments`` build feature (the default
+    # wheel has it); passing payment kwargs on a build without it raises
+    # ``ValueError``.
+    #
+    # The payment identity is the node's mesh identity: quotes are issued
+    # to, spend is tracked against, and invocation proofs are signed by the
+    # same ed25519 identity peers see on the mesh.
+    #
+    # Real (non-mock) networks additionally need a settlement signer
+    # *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
+    # address) **and** ``payment_signer`` (both or neither), a callable
+    # ``(typed_data_json: str) -> str`` that forwards the full EIP-712
+    # typed-data document to your wallet / KMS and returns the 65-byte
+    # ``0x…``-hex signature. Only the typed document and the signature
+    # cross the language boundary — there is no way to hand Net a private
+    # key, and the only thing this surface can ask your signer for is a
+    # logged, typed transfer authorization (never raw bytes). Enablement
+    # still requires the network in the spend policy's
+    # ``allowed_networks`` — the signer is capability, not consent.
+    #
+    # Solana and XRPL settlement use the same seam under their own
+    # namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
+    # (a ``(intent_json: str) -> str`` returning the base64 partially-signed
+    # SVM transaction) and ``payment_signer_xrpl_address`` +
+    # ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
+    # blob). Each pair is both-or-neither; an absent pair means that scheme
+    # is simply unavailable. The callable always sees a typed intent JSON,
+    # never key material — identical doctrine to the eip155 seam."""
+    @overload
     def __init__(
         self,
         mesh: "NetMesh",
@@ -3319,57 +3410,7 @@ class CapabilityGateway:
         payment_signer_svm: Optional[Callable[[str], str]] = None,
         payment_signer_xrpl_address: Optional[str] = None,
         payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None:
-        """Build a gateway over a started ``mesh``. ``pin_store_path`` should
-        be the machine-shared pin store so approvals are honored both ways;
-        omit it to keep consent in-memory (every gated capability then always
-        requires approval).
-
-        Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
-        ``delegation_chain`` (a serialized ``DelegationChain``) together to have
-        every invoke carry a per-invoke signed delegation (Phase 3); a remote
-        provider running a delegation gate then admits by verified delegation
-        and audits this gateway's leaf. **Both or neither** — passing exactly
-        one raises ``ValueError``.
-
-        Pass ``payment_policy_path`` (the machine-shared spend-policy store)
-        to enable paid capabilities: the invoke gate then clears them through
-        the Rust payments flow (quote -> spend policy -> x402 payload -> pay
-        over the mesh). ``payment_profile`` is ``"production"`` (the
-        fail-closed default: every mock spend holds for approval) or
-        ``"dev_test"`` (mock auto-allows under the configured limits);
-        ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
-        for production-profile demos. Without ``payment_policy_path``, a paid
-        capability fails closed as a structured ``denied`` — never a silent
-        unpaid serve. Requires the ``payments`` build feature (the default
-        wheel has it); passing payment kwargs on a build without it raises
-        ``ValueError``.
-
-        The payment identity is the node's mesh identity: quotes are issued
-        to, spend is tracked against, and invocation proofs are signed by the
-        same ed25519 identity peers see on the mesh.
-
-        Real (non-mock) networks additionally need a settlement signer
-        *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
-        address) **and** ``payment_signer`` (both or neither), a callable
-        ``(typed_data_json: str) -> str`` that forwards the full EIP-712
-        typed-data document to your wallet / KMS and returns the 65-byte
-        ``0x…``-hex signature. Only the typed document and the signature
-        cross the language boundary — there is no way to hand Net a private
-        key, and the only thing this surface can ask your signer for is a
-        logged, typed transfer authorization (never raw bytes). Enablement
-        still requires the network in the spend policy's
-        ``allowed_networks`` — the signer is capability, not consent.
-
-        Solana and XRPL settlement use the same seam under their own
-        namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
-        (a ``(intent_json: str) -> str`` returning the base64 partially-signed
-        SVM transaction) and ``payment_signer_xrpl_address`` +
-        ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
-        blob). Each pair is both-or-neither; an absent pair means that scheme
-        is simply unavailable. The callable always sees a typed intent JSON,
-        never key material — identical doctrine to the eip155 seam."""
-        ...
+    ) -> None: ...
 
     @property
     def pin_store_path(self) -> Optional[str]:
@@ -3447,6 +3488,16 @@ class AsyncCapabilityGateway:
         delegation_leaf: "Identity",
         delegation_chain: bytes,
     ) -> None: ...
+    # Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
+    # ``delegation_chain`` together (both or neither) to sign + attach a
+    # delegation on every invoke (Phase 3); pass ``payment_policy_path``
+    # (+ optional ``payment_profile`` / unsafe flag) to enable paid
+    # capabilities through the payments flow, and
+    # ``payment_signer_address`` + ``payment_signer`` (both or neither)
+    # for real-network settlement — see :class:`CapabilityGateway` for the
+    # signer-reference contract. The signer callable runs on a blocking
+    # worker thread, never on your event loop."""
+    @overload
     def __init__(
         self,
         mesh: "NetMesh",
@@ -3462,17 +3513,8 @@ class AsyncCapabilityGateway:
         payment_signer_svm: Optional[Callable[[str], str]] = None,
         payment_signer_xrpl_address: Optional[str] = None,
         payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None:
-        """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
-        ``delegation_chain`` together (both or neither) to sign + attach a
-        delegation on every invoke (Phase 3); pass ``payment_policy_path``
-        (+ optional ``payment_profile`` / unsafe flag) to enable paid
-        capabilities through the payments flow, and
-        ``payment_signer_address`` + ``payment_signer`` (both or neither)
-        for real-network settlement — see :class:`CapabilityGateway` for the
-        signer-reference contract. The signer callable runs on a blocking
-        worker thread, never on your event loop."""
-        ...
+    ) -> None: ...
+
     @property
     def pin_store_path(self) -> Optional[str]: ...
     async def search(self, query: str) -> str:
