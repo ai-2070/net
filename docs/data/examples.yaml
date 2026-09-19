@@ -208,3 +208,25 @@ examples:
       expect: "RESULT ok granted=1 refused=1"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------------------ wave 3
+  # One route, and a negative result worth more than the other two candidates.
+  # All five bindings.
+
+  - id: service-failover
+    skill: net-event-bus
+    title: The sidecar you no longer run
+    route: two providers behind one service name · the caller addresses the service, never a node id · the answering provider dies · the next call lands on the survivor
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: failover.rs
+      typescript: failover.ts
+      python: failover.py
+      go: failover.go
+      c: failover.c
+    absent: {}
+    run:
+      expect: "RESULT ok providers=2 moved=1 served=2"
+      timeout_s: 120
+      not_wired: {}
