@@ -2514,11 +2514,11 @@ mod tests {
     /// authority hiccup.
     ///
     /// Parking needs a shared handle to the node (`self_weak`), which only
-    /// `start_arc` populates - the production entry points all call it.
+    /// `start` populates - the production entry points all call it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_unit_returning_release_parks_a_refused_ticket() {
         let node = demand_node("unit-release-park", Duration::from_secs(30)).await;
-        node.start_arc();
+        node.start();
         let family = OrgSensingFamily::mint(&node).expect("mint");
         let provider = node.node_id().wrapping_add(1);
 

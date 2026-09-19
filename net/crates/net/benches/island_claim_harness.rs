@@ -256,9 +256,9 @@ async fn w_routed_chain_not_reported() {
     let b = node().await;
     connect(&a, &r).await;
     connect(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     // Capabilities DO relay through R, so B learns A's caps...
     warm_pair(&a, &b).await;
     let cb = install_counter(&b, 0);
@@ -426,7 +426,7 @@ async fn w_reset_failure_fails_loud() {
     // publisher and it is NOT connected to H, so H's release never reaches
     // it → reset must fail loud. A short timeout keeps the harness fast.
     let o = node().await;
-    o.start_arc();
+    o.start();
     let foreign = EntityKeypair::generate();
     apply_reserve(o.reservation_fold(), &foreign, island, 1);
     let h2 = h.clone();

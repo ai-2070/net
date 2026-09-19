@@ -23,7 +23,7 @@
 //!   publication (`announce_capabilities`) or registry mutation call.
 //! - **`capability_announce_version()` is a version delta, NOT an
 //!   emission count** (D2). It over-bumps on `serve_rpc` nodes.
-//! - **`start_arc()`, not `start()`** (D1) — installs the weak
+//! - **`start()`, not `start()`** (D1) — installs the weak
 //!   self-reference the change-driven announcer + deferred flush need.
 //!
 //! See `docs/internal/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md`.
@@ -130,7 +130,7 @@ impl BenchConfig {
 }
 
 // ============================================================================
-// Node + topology builders (public API only; started via start_arc).
+// Node + topology builders (public API only; started via start).
 // ============================================================================
 
 /// Build one node (not yet started) against a `BenchConfig`.
@@ -155,20 +155,20 @@ pub async fn connect(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     accept.await.expect("accept task panicked").expect("accept");
 }
 
-/// A↔B direct, both started via `start_arc()` (D1), warmed so B's fold
+/// A↔B direct, both started via `start()` (D1), warmed so B's fold
 /// already knows A — subsequent announces measure steady state, not
 /// first-contact handshake.
 pub async fn direct_pair(cfg: &BenchConfig) -> (Arc<MeshNode>, Arc<MeshNode>) {
     let a = node(cfg).await;
     let b = node(cfg).await;
     connect(&a, &b).await;
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     warm(&a, &b).await;
     (a, b)
 }
 
-/// A↔R↔B chain (no direct A–B edge), all started via `start_arc()`,
+/// A↔R↔B chain (no direct A–B edge), all started via `start()`,
 /// warmed so B has learned A THROUGH the relay R. warm() panics on
 /// non-convergence, so a routed measurement can never silently degrade
 /// into "no propagation".
@@ -178,9 +178,9 @@ pub async fn routed_chain(cfg: &BenchConfig) -> (Arc<MeshNode>, Arc<MeshNode>, A
     let b = node(cfg).await;
     connect(&a, &r).await;
     connect(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     warm(&a, &b).await;
     (a, r, b)
 }
@@ -193,8 +193,8 @@ pub async fn established_pair(cfg: &BenchConfig) -> (Arc<MeshNode>, Arc<MeshNode
     let a = node(cfg).await;
     let b = node(cfg).await;
     connect(&a, &b).await;
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     // The session is up once connect()/accept() return; peer_count is
     // the transport-level readiness sentinel and, unlike the entity pin,
     // does NOT require a prior capability announce — so the first announce
@@ -230,9 +230,9 @@ pub async fn fan_out(cfg: &BenchConfig, n: usize) -> (Arc<MeshNode>, Vec<Arc<Mes
         connect(&a, &c).await;
         consumers.push(c);
     }
-    a.start_arc();
+    a.start();
     for c in &consumers {
-        c.start_arc();
+        c.start();
     }
     a.announce_capabilities(CapabilitySet::new().add_tag("cpb:warmup"))
         .await
@@ -260,9 +260,9 @@ pub async fn intake(cfg: &BenchConfig, n: usize) -> (Arc<MeshNode>, Vec<Arc<Mesh
         connect(&p, &b).await;
         providers.push(p);
     }
-    b.start_arc();
+    b.start();
     for p in &providers {
-        p.start_arc();
+        p.start();
     }
     for p in &providers {
         p.announce_capabilities(CapabilitySet::new().add_tag("cpb:warmup"))

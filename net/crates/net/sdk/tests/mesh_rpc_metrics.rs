@@ -39,8 +39,8 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: std::net::SocketAddr) {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 }
 
 /// Three successful calls + one server-error + one timeout →

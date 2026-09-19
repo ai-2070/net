@@ -142,7 +142,7 @@ const GRANT_EVENTS_PER_PACKET: usize =
 /// **The tag only reaches a peer once this node actually broadcasts a
 /// capability announcement.** A node advertises when the application
 /// calls [`MeshNode::announce_capabilities`], and — for a node started
-/// via [`MeshNode::start_arc`] — on the reannounce loop's cadence
+/// via [`MeshNode::start`] — on the reannounce loop's cadence
 /// (`capability_reannounce_interval`). A node started via the bare
 /// [`MeshNode::start`] that never announces will not advertise this
 /// tag, so its peers keep the legacy cumulative-ACK + NACK path toward
@@ -2202,7 +2202,7 @@ pub struct MeshNodeConfig {
     /// re-announce on their own cadence). Default 150 s (→ 300 s TTL,
     /// matching the announce default).
     ///
-    /// The loop runs only for nodes started via [`MeshNode::start_arc`]
+    /// The loop runs only for nodes started via [`MeshNode::start`]
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
@@ -2298,7 +2298,7 @@ pub struct MeshNodeConfig {
     /// and `local_announcement` are updated so self-queries + late-
     /// joiner session-open pushes reflect the latest caps, and one
     /// trailing-edge flush re-broadcasts the newest announcement at
-    /// window end (RT-1; needs [`MeshNode::start_arc`], else the
+    /// window end (RT-1; needs [`MeshNode::start`], else the
     /// in-window broadcast is dropped as before). Rate-limits apps
     /// that re-announce in tight loops.
     pub min_announce_interval: Duration,
@@ -2331,7 +2331,7 @@ pub struct MeshNodeConfig {
     /// [`MeshNode::announce_capabilities`] calls, session-open
     /// pushes, and the re-announce keep-alive). Like the keep-alive
     /// loop, the announcer runs only for nodes started via
-    /// [`MeshNode::start_arc`]. Default 100 ms.
+    /// [`MeshNode::start`]. Default 100 ms.
     pub announce_debounce: Duration,
     /// Minimum gap between event-triggered pingwaves (RT-4,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Topology changes —
@@ -12058,18 +12058,18 @@ pub struct MeshNode {
     ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
     /// Whether the node has been started
     started: AtomicBool,
-    /// Weak self-reference, set by [`Self::start_arc`] when the node is
+    /// Weak self-reference, set by [`Self::start`] when the node is
     /// driven through an `Arc`. The capability re-announce loop upgrades it
     /// each tick to call `announce_capabilities` (the broadcast goes
     /// through `&self` per-peer sends, so it needs an owned `Arc`). Unset
     /// on a bare [`Self::start`] of a non-`Arc` node, in which case the
     /// loop is a no-op. Set-once.
-    /// Weak self-handle set by [`Self::start_arc`]. Wrapped in `Arc`
+    /// Weak self-handle set by [`Self::start`]. Wrapped in `Arc`
     /// so the `self_weak`-dependent background loops (re-announce
     /// keep-alive, RT-3 change announcer) can hold the *holder* and
     /// re-read it each iteration instead of snapshotting it at spawn.
     /// That makes a bare [`Self::start`] followed by a later
-    /// [`Self::start_arc`] work — the loops pick up the weak once it
+    /// [`Self::start`] work — the loops pick up the weak once it
     /// is set, rather than parking forever (RT-3 review Finding 7).
     self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
     /// Number of `accept()` calls currently awaiting
@@ -14923,7 +14923,7 @@ impl MeshNode {
         // So park it on the node's own refused-release ledger, which is exactly
         // what the in-crate path does, and let the refresh worker retry it on
         // its cadence. This needs an `Arc<MeshNode>`, which only a node started
-        // through `start_arc` has (`self_weak`); a bare node cannot park, and
+        // through `start` has (`self_weak`); a bare node cannot park, and
         // says so rather than pretending it released something.
         let owner = self
             .self_weak
@@ -14936,7 +14936,7 @@ impl MeshNode {
                 "sensing lease: release REFUSED and this node has no shared handle to \
                  park the still-live ticket on, so the holder is LEAKED — the row and \
                  its upstream registration will outlive every owner. Start the node \
-                 through `start_arc`, or use `try_release_sensing_interest_lease`, \
+                 through `start`, or use `try_release_sensing_interest_lease`, \
                  which hands the live ticket back"
             );
             return;
@@ -19614,7 +19614,7 @@ impl MeshNode {
         // stale emission must also be REBUILT under the new key. Wake an
         // immediate re-announce so a fresh emission is published; until it lands,
         // the send path keeps the stale scoped envelopes off the wire.
-        // Best-effort — only a node started via `start_arc` (populated
+        // Best-effort — only a node started via `start` (populated
         // `self_weak`) inside a runtime can spawn; a bare node reconciles on its
         // next explicit announce.
         if let Some(weak) = self.self_weak.get().cloned() {
@@ -19719,7 +19719,7 @@ impl MeshNode {
     /// fresh, coherent emission (public + owner + granted). Rebuilds from the
     /// CURRENT live baseline (`None`), never a captured one — a captured baseline
     /// would reintroduce the RT-3 stale-baseline race (Kyra OA3-4b1 B2). Only a
-    /// node started via `start_arc` (populated `self_weak`) inside a runtime can
+    /// node started via `start` (populated `self_weak`) inside a runtime can
     /// spawn; a bare node reconciles on its next explicit announce, and until the
     /// rebuild lands the send-path pointer check keeps the stale granted envelopes
     /// off the wire.
@@ -22456,34 +22456,48 @@ impl MeshNode {
     /// which the dispatcher would race the responder for the
     /// inbound msg1.
     ///
-    /// Note: this does NOT enable the periodic capability re-announce
-    /// (which keeps the node's entry alive in its own and peers' folds
-    /// past one TTL) — that needs an owned `Arc` to re-broadcast. Drive
-    /// the node through [`Self::start_arc`] (as the SDK / FFI do) to get
-    /// it; a bare `start` is for short-lived / test nodes.
+    /// Takes the node's `Arc` because several lifecycle loops have to
+    /// outlive the call: the periodic capability re-announce (which
+    /// keeps this node's entry alive in its own and every peer's fold
+    /// past one announcement TTL), the change-driven announcer, and the
+    /// trailing-edge flush that carries an announcement made inside the
+    /// `min_announce_interval` window. Each is a spawned task holding a
+    /// `Weak<MeshNode>`, so none of them can keep a dropped node alive
+    /// — but all of them need an `Arc` to exist in the first place.
     ///
-    /// **The same missing `Arc` also drops in-window announcements.**
-    /// [`Self::announce_capabilities`] rate-limits the broadcast to
-    /// `min_announce_interval` (10 s default) and normally coalesces a
-    /// within-window call into a trailing-edge flush at the end of the
-    /// window. That flush is a spawned task, so it needs the owned `Arc`
-    /// too — under a bare `start` there is nothing to schedule, and the
-    /// call is **silently dropped while still returning `Ok(())`**. With
-    /// no re-announce loop either, the change then never reaches peers
-    /// at all: they keep serving the previous announcement's tags,
-    /// reflex, and `nat:*` class until something else triggers an
-    /// out-of-window announce.
+    /// This used to be two entry points, and the difference was a trap.
+    /// A bare `start(&self)` left `self_weak` unset, and an
+    /// announcement made inside the rate-limit window was then
+    /// **silently discarded while still returning `Ok(())`** — with no
+    /// re-announce loop either, the change reached peers only if some
+    /// later out-of-window announce happened to carry it. That reads
+    /// exactly like a stale peer-side fold and is not one, and it bit
+    /// hardest on state peers act on rather than display: a NAT
+    /// reclassification publishes a new `nat:*` tag, and a peer still
+    /// reading the old one computes the wrong pair action for the
+    /// direct-path upgrade. One start removes the failure mode instead
+    /// of documenting it.
     ///
-    /// This bites hardest on state peers act on rather than merely
-    /// display — a NAT reclassification publishes a new `nat:*` tag, and
-    /// a peer still reading the old one computes the wrong pair action
-    /// for the direct-path upgrade. Under `start_arc` the flush fires
-    /// and the new class propagates promptly. A test that forces a class
-    /// and re-announces on a bare-`start` node observes neither, which
-    /// reads convincingly like a stale-fold bug and is not one: set the
-    /// class *before* the first announce (see `force_nat_class_for_test`),
-    /// or drive the node with [`Self::start_arc`].
-    pub fn start(&self) {
+    /// Idempotent.
+    pub fn start(self: &Arc<Self>) {
+        // Store the weak BEFORE the loops below are spawned — the
+        // re-announce and change-announcer tasks read this holder each
+        // iteration. `set` only fails if already set (a re-start); the
+        // existing weak is equally valid, so ignore the result.
+        let _ = self.self_weak.set(Arc::downgrade(self));
+        self.start_inner();
+        // Background direct-path upgrade scan loop (Stage 3). The loop
+        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
+        // unconditionally is cheap. Detached like the other lifecycle
+        // loops — it exits on `shutdown_notify`.
+        #[cfg(feature = "nat-traversal")]
+        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+    }
+
+    /// Everything `start` does that needs only `&self`. Split out so
+    /// the `Arc` wiring above happens exactly once, before any loop
+    /// that reads it is spawned.
+    fn start_inner(&self) {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
             return; // already started
@@ -22619,31 +22633,6 @@ impl MeshNode {
                 tasks.push(h);
             }
         }
-    }
-
-    /// Start the node through its `Arc`, enabling the periodic capability
-    /// re-announce on top of everything [`Self::start`] does. The
-    /// re-announce re-broadcasts this node's capabilities every
-    /// [`MeshNodeConfig::capability_reannounce_interval`], keeping its
-    /// entry alive in its own fold (so its callee-side nRPC gate doesn't
-    /// expire its own services) AND in every peer's fold (so it stays
-    /// discoverable) past one announcement TTL. Production entry points
-    /// (the SDK, the FFI) call this; a bare [`Self::start`] omits the
-    /// re-announce (fine for short-lived / test nodes). Idempotent.
-    pub fn start_arc(self: &Arc<Self>) {
-        // Store the weak before `start` spawns the re-announce loop, which
-        // captures it. `set` only fails if already set (a re-start) — the
-        // existing weak is equally valid, so ignore the result.
-        let _ = self.self_weak.set(Arc::downgrade(self));
-        self.start();
-        // Background direct-path upgrade scan loop (Stage 3). The loop
-        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
-        // unconditionally is cheap; keeping it here means any Arc-held
-        // node started via `start_arc` gets upgrades when enabled.
-        // Detached like the other lifecycle loops — it exits on
-        // `shutdown_notify`.
-        #[cfg(feature = "nat-traversal")]
-        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
     }
 
     /// The ONE production path that constructs a [`RoutingSupervisor`] and
@@ -23588,11 +23577,11 @@ impl MeshNode {
     /// for peers.) `Duration::MAX` disables the loop.
     ///
     /// Re-broadcasting needs an owned `Arc` (the per-peer sends go through
-    /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start_arc`]
+    /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start`]
     /// each tick — using a `Weak` (not `Arc`) so the task doesn't keep the
     /// node alive. The loop holds the shared `self_weak` OnceLock (not a
     /// snapshot) and re-reads it each tick, so a bare [`Self::start`]
-    /// followed by a later [`Self::start_arc`] enables re-announce rather
+    /// followed by a later [`Self::start`] enables re-announce rather
     /// than parking the loop forever (RT-3 review Finding 7); until the
     /// weak is set the tick is a harmless no-op.
     fn spawn_capability_reannounce_loop(&self) -> JoinHandle<()> {
@@ -23616,8 +23605,8 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         // Re-read the weak each tick: `None` = not started
-                        // via `start_arc` (yet); keep ticking so a later
-                        // `start_arc` enables the loop.
+                        // via `start` (yet); keep ticking so a later
+                        // `start` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
                         // Decision 8, trigger 2: if the observed
@@ -23660,13 +23649,13 @@ impl MeshNode {
     ///
     /// The loop holds the shared `self_weak` OnceLock and re-reads it
     /// each cycle rather than snapshotting it at spawn, so a bare
-    /// [`Self::start`] followed by a later [`Self::start_arc`] enables
+    /// [`Self::start`] followed by a later [`Self::start`] enables
     /// the announcer instead of parking it forever (RT-3 review
     /// Finding 7). A change that fires before the weak is set is NOT
     /// consumed: the loop parks (re-checking every
-    /// [`Self::CHANGE_ANNOUNCE_START_ARC_POLL`]) until `start_arc` installs
+    /// [`Self::CHANGE_ANNOUNCE_START_ARC_POLL`]) until `start` installs
     /// the weak, then announces the current baseline — so a mutation
-    /// landing between a bare `start()` and a later `start_arc()`
+    /// landing between a bare `start()` and a later `start()`
     /// survives instead of being marked-seen-and-dropped (RT-3 review
     /// P2). Consuming before the weak check dropped it permanently.
     ///
@@ -23674,11 +23663,11 @@ impl MeshNode {
     /// (`capability_reannounce_ttl`) so a change-driven entry
     /// survives until the keep-alive refreshes it.
     ///
-    /// Poll cadence for the "wait until `start_arc` installs the weak"
+    /// Poll cadence for the "wait until `start` installs the weak"
     /// park. Only ticks when a change is pending AND the node was
-    /// bare-`start()`ed without `start_arc` yet — a narrow, transient
+    /// bare-`start()`ed without `start` yet — a narrow, transient
     /// window — so the cost is a single sleeping timer, and the announce
-    /// latency after `start_arc` is bounded by this.
+    /// latency after `start` is bounded by this.
     const CHANGE_ANNOUNCE_START_ARC_POLL: Duration = Duration::from_millis(200);
 
     fn spawn_capability_announce_on_change_loop(&self) -> JoinHandle<()> {
@@ -23712,14 +23701,14 @@ impl MeshNode {
                         }
                         // Resolve the node BEFORE consuming the change.
                         // A mutation that lands between a bare `start()`
-                        // and a later `start_arc()` must survive for
-                        // start_arc's announcer — the old order called
+                        // and a later `start()` must survive for
+                        // start's announcer — the old order called
                         // `borrow_and_update` first, marking it seen, so
                         // when `self_weak` was still `None` the change
                         // was dropped permanently (until the next
                         // reannounce or another mutation). Park here,
                         // WITHOUT consuming, re-checking the weak until
-                        // start_arc installs it.
+                        // start installs it.
                         let node = loop {
                             match self_weak.get() {
                                 Some(weak) => match weak.upgrade() {
@@ -36776,7 +36765,7 @@ impl MeshNode {
     /// it was broadcast.** Calls inside the `min_announce_interval`
     /// window (10 s default) coalesce into one trailing-edge flush at
     /// the end of the window — and on a node started with
-    /// [`Self::start`] rather than [`Self::start_arc`] there is no owned
+    /// [`Self::start`] rather than [`Self::start`] there is no owned
     /// `Arc` to schedule that flush with, so the broadcast is dropped
     /// outright. See [`Self::start`] for why that combination makes a
     /// changed announcement look like a stale peer-side fold.
@@ -37434,19 +37423,13 @@ impl MeshNode {
                         if gate.deferred_scheduled {
                             return Ok(AnnounceOutcome::Coalesced);
                         }
-                        // Bare-start node (no `start_arc`): there is no
-                        // owned `Arc` for a flush task to hold — same
-                        // constraint as the re-announce loop. Preserve
-                        // the pre-RT-1 drop semantics (peers see the
-                        // change on the next out-of-window announce or
-                        // the keep-alive).
-                        if self.self_weak.get().is_none() {
-                            tracing::debug!(
-                                "capability: in-window announce not deferred \
-                             (node not started via start_arc)"
-                            );
-                            return Ok(AnnounceOutcome::Coalesced);
-                        }
+                        // No bare-start arm any more: `start` takes the
+                        // node's `Arc` and populates `self_weak` before
+                        // anything can announce, so the trailing-edge
+                        // flush is always schedulable. This used to be
+                        // the one place an accepted announcement could
+                        // be discarded outright while the caller was
+                        // told `Ok(())`.
                         gate.deferred_scheduled = true;
                         // New deferral claim → new generation. The
                         // flush task captures this and re-checks it, so
@@ -42781,59 +42764,6 @@ mod reclassify_override_race_tests {
         );
     }
 
-    /// RT-3 review P2: a capability mutation that lands between a bare
-    /// `start()` and a later `start_arc()` must survive. The change loop
-    /// used to `borrow_and_update` (mark the signal seen) BEFORE checking
-    /// whether `self_weak` was installed, so a mutation in that window
-    /// was dropped permanently until the next reannounce. The landed
-    /// Finding-7 test called `start_arc` before mutating, so it missed
-    /// this ordering.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bare_start_then_mutate_then_start_arc_still_announces() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let cfg = MeshNodeConfig::new(addr, [0x23u8; 32])
-            // Enable the change-driven announcer with a snappy debounce…
-            .with_announce_debounce(Duration::from_millis(20))
-            // …and DISABLE the keep-alive reannounce so the ONLY thing
-            // that can bump capability_version after start_arc is the
-            // change-driven announce we are testing.
-            .with_capability_reannounce_interval(Duration::MAX);
-        let node = Arc::new(
-            MeshNode::new(EntityKeypair::generate(), cfg)
-                .await
-                .expect("MeshNode::new"),
-        );
-
-        // Bare start: spawns the change loop with `self_weak` still None.
-        node.start();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // A local-caps mutation lands BEFORE start_arc.
-        node.test_bump_local_caps_changed();
-        // Give the loop time to (pre-fix) consume + drop the signal.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let v_before = node.capability_version.load(Ordering::Relaxed);
-
-        // Enable the Arc-started announcer. The parked mutation must now
-        // drive an announce, bumping capability_version.
-        node.start_arc();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut announced = false;
-        while tokio::time::Instant::now() < deadline {
-            if node.capability_version.load(Ordering::Relaxed) > v_before {
-                announced = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            announced,
-            "the mutation made between bare start() and start_arc() was dropped — \
-             capability_version never advanced after start_arc"
-        );
-    }
-
     /// Regression for the capability re-announce loop. A node's own
     /// capability self-entry TTL-expires and the fold sweeper reaps it,
     /// after which (a) its callee-side nRPC gate denies its own services
@@ -42855,7 +42785,7 @@ mod reclassify_override_race_tests {
         node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
             .await
             .expect("announce");
-        node.start_arc();
+        node.start();
 
         let v0 = node.capability_version.load(Ordering::Relaxed);
         // Past the 120 ms TTL and a fold sweep tick.
@@ -42890,7 +42820,7 @@ mod reclassify_override_race_tests {
         node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
             .await
             .expect("announce");
-        node.start_arc();
+        node.start();
 
         tokio::time::sleep(Duration::from_millis(750)).await;
         let present = node

@@ -87,8 +87,8 @@ async fn main() -> net_sdk::error::Result<()> {
     });
     accept_res.map_err(|e| net_sdk::error::SdkError::Config(format!("accept: {e}")))?;
     connect_res.map_err(|e| net_sdk::error::SdkError::Config(format!("connect: {e}")))?;
-    server.inner().start();
-    caller.inner().start();
+    server.start();
+    caller.start();
 
     // ──────────────────────────────────────────────────────────────
     // Register two typed RPC services on the server. The handler

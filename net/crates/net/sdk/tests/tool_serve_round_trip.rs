@@ -73,8 +73,8 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: SocketAddr) {
     );
     r1.expect("accept");
     r2.expect("connect");
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 }
 
 async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {

@@ -129,8 +129,8 @@ pub async fn pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
     let a = node().await;
     let b = node().await;
     connect(&a, &b).await;
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     warm_all(&[a.clone(), b.clone()]).await;
     (a, b)
 }
@@ -150,7 +150,7 @@ pub async fn full_mesh(n: usize) -> Vec<Arc<MeshNode>> {
         }
     }
     for nd in &nodes {
-        nd.start_arc();
+        nd.start();
     }
     warm_all(&nodes).await;
     nodes

@@ -325,9 +325,9 @@ async fn build_fixture() -> Fixture {
 
     connect(&a, &r).await;
     connect(&a, &o).await;
-    a.start_arc();
-    r.start_arc();
-    o.start_arc();
+    a.start();
+    r.start();
+    o.start();
 
     a.announce_capabilities(CapabilitySet::new())
         .await

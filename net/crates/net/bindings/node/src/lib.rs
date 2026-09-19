@@ -1825,7 +1825,7 @@ mod mesh_bindings {
         /// tokio runtime — `MeshNode::start()` spawns background
         /// tasks via `tokio::spawn` and panics outside a reactor.
         ///
-        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// Uses `start` (like the C FFI and the Rust SDK) so
         /// the Arc-scoped lifecycle loops run too: periodic
         /// capability re-announce (with the reflex-diff
         /// re-classify trigger) and — when `autoDirectUpgrade`
@@ -1834,7 +1834,7 @@ mod mesh_bindings {
         pub async fn start(&self) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            node.start_arc();
+            node.start();
             Ok(())
         }
 

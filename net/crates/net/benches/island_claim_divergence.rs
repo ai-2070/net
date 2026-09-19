@@ -838,9 +838,9 @@ async fn w5_missing_delivery_invalidates() {
     let c1 = node().await;
     connect(&observer, &c0).await;
     connect(&observer, &c1).await;
-    observer.start_arc();
-    c0.start_arc();
-    c1.start_arc();
+    observer.start();
+    c0.start();
+    c1.start();
     warm_pair(&c0, &observer).await;
     warm_pair(&c1, &observer).await;
     let oc = install_counter(&observer, 0);
@@ -958,9 +958,9 @@ async fn w12_raw_chain_cannot_enter_matrix() {
     let b = node().await;
     connect(&a, &r).await;
     connect(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     warm_pair(&a, &b).await;
     let cb = install_counter(&b, 0);
     assert!(

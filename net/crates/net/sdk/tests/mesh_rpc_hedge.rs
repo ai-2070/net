@@ -40,8 +40,8 @@ async fn handshake(a: &Mesh, b: &Mesh) {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 }
 
 /// Primary sleeps 800ms before responding. Backup is instant. With

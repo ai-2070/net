@@ -233,7 +233,7 @@ async fn poll_until<F: FnMut() -> bool>(limit: Duration, mut check: F) -> bool {
 async fn watch_self(mesh: &Mesh, capability: &str) -> ProviderInterestKey {
     let own_id = mesh.inner().node_id();
     let spec = self_interest(mesh, capability, own_id);
-    mesh.inner().start();
+    mesh.start();
     mesh.inner()
         .register_sensing_interest(&spec, own_id, D, TTL)
         .expect("self interest registers");

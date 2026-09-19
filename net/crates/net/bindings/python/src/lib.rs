@@ -1646,7 +1646,7 @@ mod mesh_bindings {
 
         /// Start the receive loop and heartbeats.
         ///
-        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// Uses `start` (like the C FFI and the Rust SDK) so
         /// the Arc-scoped lifecycle loops run too: periodic
         /// capability re-announce (with the reflex-diff
         /// re-classify trigger) and — when `auto_direct_upgrade`
@@ -1660,7 +1660,7 @@ mod mesh_bindings {
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
             let _guard = self.runtime.enter();
-            node.start_arc();
+            node.start();
             Ok(())
         }
 
@@ -3378,14 +3378,14 @@ mod mesh_bindings {
         /// Start the receive loop + heartbeats. Sync — internal
         /// `tokio::spawn`, no network round-trip.
         ///
-        /// `start_arc`, matching the sync `NetMesh.start`: enables
+        /// `start`, matching the sync `NetMesh.start`: enables
         /// the Arc-scoped lifecycle loops (periodic re-announce +
         /// the opt-in background direct-path upgrade).
         fn start(&self) -> PyResult<()> {
             let handle = crate::async_bridge::runtime()
                 .ok_or_else(|| PyRuntimeError::new_err("async bridge not initialized"))?;
             let _guard = handle.enter();
-            self.node.start_arc();
+            self.node.start();
             Ok(())
         }
 

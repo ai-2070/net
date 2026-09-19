@@ -1229,12 +1229,11 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_publish(
         };
         let adapter = h.inner.clone();
         let data_owned = data_slice.to_vec();
-        let result =
-            block_on(async move {
-                // `adapter` is `ManuallyDrop<Arc<MeshBlobAdapter>>`; two derefs reach
-                // the adapter itself, which is what implements `BlobAdapter`.
-                publish_blob_ref(&**adapter, uri, &data_owned).await
-            });
+        let result = block_on(async move {
+            // `adapter` is `ManuallyDrop<Arc<MeshBlobAdapter>>`; two derefs reach
+            // the adapter itself, which is what implements `BlobAdapter`.
+            publish_blob_ref(&**adapter, uri, &data_owned).await
+        });
         match result {
             Ok(blob_ref) => {
                 let encoded = blob_ref.encode();

@@ -64,7 +64,7 @@ async fn try_port_mapping_on_doesnt_block_boot() {
         .unwrap();
 
     let start_t = tokio::time::Instant::now();
-    mesh.inner().start();
+    mesh.start();
     let elapsed = start_t.elapsed();
 
     // start() is non-blocking — spawns tasks and returns.

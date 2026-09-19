@@ -1495,8 +1495,8 @@ mod paid_invoke_e2e {
         });
         accept.expect("accept");
         connect.expect("connect");
-        server.inner().start();
-        caller.inner().start();
+        server.start();
+        caller.start();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
