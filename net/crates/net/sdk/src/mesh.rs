@@ -1665,6 +1665,7 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
         "UnknownChannel" => Some(AckReason::UnknownChannel),
         "RateLimited" => Some(AckReason::RateLimited),
         "TooManyChannels" => Some(AckReason::TooManyChannels),
+        "IdentityNotEstablished" => Some(AckReason::IdentityNotEstablished),
         _ => None,
     }
 }

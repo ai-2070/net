@@ -1086,6 +1086,16 @@ mod mesh_bindings {
                 if reason == "Some(TooManyChannels)" {
                     return super::ChannelError::new_err("channel: too many channels");
                 }
+                if reason == "Some(IdentityNotEstablished)" {
+                    // An auth-axis failure, so `ChannelAuthError` —
+                    // but a distinct one from `unauthorized`: the
+                    // credential was never evaluated, because the
+                    // publisher holds no authenticated entity for this
+                    // session's peer to bind its leaf to.
+                    return super::ChannelAuthError::new_err(
+                        "channel: identity not established for this session",
+                    );
+                }
                 return super::ChannelError::new_err(format!("channel: rejected ({})", reason));
             }
         }

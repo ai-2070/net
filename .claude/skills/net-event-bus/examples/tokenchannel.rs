@@ -19,7 +19,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use net_sdk::capabilities::{CapabilityFilter, CapabilitySet};
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{
     ChannelConfig, ChannelId, ChannelName, Identity, SubscribeOptions, TokenScope, Visibility,
@@ -73,30 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     publisher.inner().start();
     subscriber.inner().start();
 
-    // Both nodes announce before anything is gated. A token's leaf binds to
-    // the subscribing peer's EntityId, and the publisher only learns that
-    // EntityId from a signature-verified announcement — so a subscriber that
-    // has announced nothing is unauthorized no matter what it presents.
-    publisher
-        .announce_capabilities(CapabilitySet::new())
-        .await?;
-    subscriber
-        .announce_capabilities(CapabilitySet::new())
-        .await?;
-
-    // Wait for the publisher to index it; the announcement is what populates
-    // the publisher's peer-entity map.
-    let subscriber_node_id = subscriber.inner().node_id();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if publisher
-            .find_nodes(&CapabilityFilter::new())
-            .contains(&subscriber_node_id)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Nothing else to set up. A token's leaf binds to the subscribing peer's
+    // EntityId, and the runtime establishes that binding as part of the
+    // token-bearing subscribe itself — a bounded, session-bound identity proof
+    // over the encrypted session. The subscriber advertises no capabilities
+    // and queries no discovery index; a consumer should not have to publish
+    // services to use a credential issued to it.
 
     // The channel's subscriber ACL is rooted at the publisher's own entity id.
     // `with_token_roots` is what turns `require_token` on, so this is one

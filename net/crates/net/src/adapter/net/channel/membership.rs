@@ -22,6 +22,7 @@ const ACK_REASON_UNAUTHORIZED: u8 = 1;
 const ACK_REASON_UNKNOWN_CHANNEL: u8 = 2;
 const ACK_REASON_RATE_LIMITED: u8 = 3;
 const ACK_REASON_TOO_MANY_CHANNELS: u8 = 4;
+const ACK_REASON_IDENTITY_NOT_ESTABLISHED: u8 = 5;
 
 /// Why a `Subscribe` or `Unsubscribe` was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,18 @@ pub enum AckReason {
     RateLimited,
     /// Per-peer channel cap exceeded.
     TooManyChannels,
+    /// The publisher has no authenticated `EntityId` for this peer,
+    /// so a credential whose leaf must bind to that identity cannot
+    /// be evaluated at all. **Not** a verdict on the credential: the
+    /// prerequisite is a session-bound identity proof (see
+    /// [`MeshNode::prove_identity_to`](crate::adapter::net::MeshNode::prove_identity_to)),
+    /// which token-bearing subscribes perform for the caller.
+    ///
+    /// Retryable once identity is established; distinguishing it from
+    /// [`Self::Unauthorized`] is the difference between "you are not
+    /// who you say you are yet" and "your credential does not
+    /// authorize this".
+    IdentityNotEstablished,
 }
 
 /// Channel membership wire message.
@@ -183,6 +196,7 @@ pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
                 Some(AckReason::UnknownChannel) => ACK_REASON_UNKNOWN_CHANNEL,
                 Some(AckReason::RateLimited) => ACK_REASON_RATE_LIMITED,
                 Some(AckReason::TooManyChannels) => ACK_REASON_TOO_MANY_CHANNELS,
+                Some(AckReason::IdentityNotEstablished) => ACK_REASON_IDENTITY_NOT_ESTABLISHED,
             });
         }
     }
@@ -348,6 +362,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 ACK_REASON_UNKNOWN_CHANNEL => Some(AckReason::UnknownChannel),
                 ACK_REASON_RATE_LIMITED => Some(AckReason::RateLimited),
                 ACK_REASON_TOO_MANY_CHANNELS => Some(AckReason::TooManyChannels),
+                ACK_REASON_IDENTITY_NOT_ESTABLISHED => Some(AckReason::IdentityNotEstablished),
                 other => return Err(MembershipCodecError::UnknownType(other)),
             };
             // Same strict-trailer rejection on the ACK
@@ -478,6 +493,7 @@ mod tests {
             AckReason::UnknownChannel,
             AckReason::RateLimited,
             AckReason::TooManyChannels,
+            AckReason::IdentityNotEstablished,
         ];
         for r in reasons {
             let msg = MembershipMsg::Ack {

@@ -35,11 +35,6 @@ static const char *PSK_HEX =
  * minted credential is never a standing secret. */
 #define TOKEN_TTL_SECONDS 300
 
-/* Wait up to 2s (80 polls at 25ms) for the publisher to index the
- * subscriber's node id from its announcement. */
-#define CONVERGE_TRIES 80
-#define POLL_US 25000
-
 static void seed_bytes(uint8_t out[32], unsigned char b) {
     memset(out, b, 32);
 }
@@ -100,48 +95,6 @@ static int handshake(net_meshnode_t *responder, net_meshnode_t *initiator,
     return (rc == 0 && a.rc == 0) ? 0 : -1;
 }
 
-/* Does a JSON array of node ids (u64) contain `want`? */
-static int json_contains_u64(const char *s, uint64_t want) {
-    if (!s) return 0;
-    const char *open = strchr(s, '[');
-    if (!open) return 0;
-    const char *p = open + 1;
-    while (*p) {
-        if (*p == ']') break;
-        if (*p >= '0' && *p <= '9') {
-            char *end = NULL;
-            uint64_t v = strtoull(p, &end, 10);
-            if (v == want) return 1;
-            p = end;
-        } else {
-            p++;
-        }
-    }
-    return 0;
-}
-
-/*
- * Wait for the publisher to index the subscriber's node id. The publisher
- * only learns a peer's EntityId from a signature-verified capability
- * announcement, so a token-gated subscribe is Unauthorized until this
- * converges.
- */
-static int until_indexed(net_meshnode_t *publisher, uint64_t want) {
-    for (int i = 0; i < CONVERGE_TRIES; i++) {
-        char *json = NULL;
-        size_t len = 0;
-        if (net_mesh_find_nodes(publisher, "{}", &json, &len) == 0) {
-            int has = json_contains_u64(json, want);
-            if (json) net_free_string(json);
-            if (has) return 1;
-        } else if (json) {
-            net_free_string(json);
-        }
-        usleep(POLL_US);
-    }
-    return 0;
-}
-
 int main(void) {
     const char *channel = "config/gated";
     const unsigned PORT_PUBLISHER = 39051, PORT_SUBSCRIBER = 39052;
@@ -178,23 +131,12 @@ int main(void) {
     net_mesh_start(publisher);
     net_mesh_start(subscriber);
 
-    /* Both nodes announce before anything is gated. A token's leaf binds to
-     * the subscribing peer's EntityId, and the publisher only learns that
-     * EntityId from a signature-verified announcement — so a subscriber that
-     * has announced nothing is unauthorized no matter what it presents. */
-    if (net_mesh_announce_capabilities(publisher, "{}") != 0 ||
-        net_mesh_announce_capabilities(subscriber, "{}") != 0) {
-        fprintf(stderr, "announce failed\n");
-        return 1;
-    }
-
-    /* Wait for the publisher to index it; the announcement is what populates
-     * the publisher's peer-entity map. */
-    uint64_t subscriber_node_id = net_mesh_node_id(subscriber);
-    if (!until_indexed(publisher, subscriber_node_id)) {
-        fprintf(stderr, "publisher never indexed the subscriber\n");
-        return 1;
-    }
+    /* Nothing else to set up. A token's leaf binds to the subscribing peer's
+     * EntityId, and the runtime establishes that binding as part of the
+     * token-bearing subscribe itself — a bounded, session-bound identity
+     * proof over the encrypted session. The subscriber advertises no
+     * capabilities and queries no discovery index; a consumer should not
+     * have to publish services to use a credential issued to it. */
 
     /* The channel's subscriber ACL is rooted at the publisher's own entity id.
      * `token_roots` is what turns token enforcement on, so this is one

@@ -21,9 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"slices"
 	"strings"
-	"time"
 
 	mesh "github.com/ai-2070/net/go"
 )
@@ -106,31 +104,12 @@ func main() {
 		}
 	}()
 
-	// Both nodes announce before anything is gated. A token's leaf binds to
-	// the subscribing peer's EntityId, and the publisher only learns that
-	// EntityId from a signature-verified announcement — so a subscriber that
-	// has announced nothing is unauthorized no matter what it presents.
-	if err := publisher.AnnounceCapabilities(mesh.CapabilitySet{}); err != nil {
-		log.Fatalf("publisher announce: %v", err)
-	}
-	if err := subscriber.AnnounceCapabilities(mesh.CapabilitySet{}); err != nil {
-		log.Fatalf("subscriber announce: %v", err)
-	}
-
-	// Wait for the publisher to index it; the announcement is what populates
-	// the publisher's peer-entity map.
-	subscriberNodeID := subscriber.NodeID()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		peers, err := publisher.FindNodes(mesh.CapabilityFilter{})
-		if err != nil {
-			log.Fatalf("find nodes: %v", err)
-		}
-		if slices.Contains(peers, subscriberNodeID) {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
+	// Nothing else to set up. A token's leaf binds to the subscribing peer's
+	// EntityId, and the runtime establishes that binding as part of the
+	// token-bearing subscribe itself — a bounded, session-bound identity
+	// proof over the encrypted session. The subscriber advertises no
+	// capabilities and queries no discovery index; a consumer should not
+	// have to publish services to use a credential issued to it.
 
 	// The channel's subscriber ACL is rooted at the publisher's own entity id.
 	// Setting TokenRoots is what turns token enforcement on, so this is one

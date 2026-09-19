@@ -1503,6 +1503,15 @@ mod mesh_bindings {
                 if reason == "Some(TooManyChannels)" {
                     return Error::from_reason("channel: too many channels".to_string());
                 }
+                if reason == "Some(IdentityNotEstablished)" {
+                    // Distinct from `unauthorized`: the credential was
+                    // never evaluated. The publisher has no
+                    // authenticated entity for this session's peer to
+                    // bind the chain's leaf to.
+                    return Error::from_reason(
+                        "channel: identity not established for this session".to_string(),
+                    );
+                }
                 return Error::from_reason(format!("channel: rejected ({})", reason));
             }
         }
