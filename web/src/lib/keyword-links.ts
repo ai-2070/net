@@ -39,6 +39,7 @@ export const KEYWORD_LINKS: readonly KeywordLink[] = [
   { term: "storage stack", slug: "concepts/storage-stack" },
   { term: "security model", slug: "concepts/security-model" },
   { term: "subnets", slug: "concepts/subnets" },
+  { term: "WebRTC", slug: "concepts/webrtc-transport" },
 
   // ---- the storage and daemon stack ---------------------------------------
   { term: "RedEX", slug: "guides/durable-logs" },

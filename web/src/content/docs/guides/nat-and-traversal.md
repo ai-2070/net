@@ -105,5 +105,14 @@ Two things the NAT-traversal layer is deliberately not:
 
 **It is not a substitute for network design.** A deployment that puts all its critical nodes behind symmetric NATs with no public connectivity will hit relay paths a lot, and relays add latency. For high-throughput, low-latency workloads, give at least some of the nodes public IPs or stable port mappings; the traversal layer is there for the realistic cases, not for an adversarial topology.
 
+## The browser leg is a different mechanism
+
+A browser cannot open a UDP socket, so none of the above applies to it. A page
+reaches the mesh over a [WebRTC DataChannel](/docs/concepts/webrtc-transport) to
+a native anchor, using ICE for that one hop while the mesh's own session and
+identity rules stay unchanged. The two paths meet at the same place: a pair that
+cannot go direct — for a browser, a pair whose ICE never connects — stays
+routed, and a routed session is a working session rather than a failure.
+
 For latency-sensitive deployments, provide enough publicly reachable or stably
 mapped nodes that relay paths remain a fallback rather than the normal topology.
