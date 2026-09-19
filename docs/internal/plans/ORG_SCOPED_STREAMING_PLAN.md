@@ -138,6 +138,41 @@ claim of a new exact-head run in this document.
 
 ## Approved design direction and specification obligations
 
+### D0. Correctness-preserving, performance-conscious reuse
+
+Extend the existing nRPC implementation rather than build a parallel org-RPC
+stack. Reuse the current call/serve shapes, dispatch, stream objects, framing,
+flow control, cancellation, timers, routing and SDK iteration/sink/disposal
+conventions wherever their actual invariants satisfy the protected-call contract.
+Compose the shared organization-admission extension with that lifecycle; do not
+implement separate authority semantics for each shape or language.
+
+Reuse is constrained by correctness, not by a target percentage of unchanged
+code. Do not preserve an unsafe lifetime, overload a unary proof, or hide a
+missing ownership fence merely to avoid a new type or a small refactor. Equally,
+a second registry, queue, timer loop, cancellation framework or stream wrapper
+requires a concrete missing invariant and an explanation of why extending the
+existing owner is insufficient. Extract shared logic only where ownership and
+semantics genuinely agree; do not manufacture a universal framework.
+
+Keep the steady-state item path lean. Perform expensive proof work at opening;
+use the admitted context and bounded session/call/authority checks thereafter.
+Avoid unnecessary payload copies, re-encoding, allocations, per-item signature
+verification, global scans and locks shared across unrelated calls. Revalidation
+must still meet the approved revocation boundary: caching or batching must not
+turn stale authority into permission. No guard may cross a network/handler wait.
+
+Before implementation, produce a source-backed reuse/gap map:
+**required guarantee -> existing mechanism and production callers -> missing
+hook -> smallest change -> discriminating witness -> expected hot-path cost**.
+Measure opening cost separately from steady-state throughput/latency, memory and
+cancellation/revocation cleanup under comparable workloads. Attribute expected
+security overhead explicitly; do not promise zero overhead or trade away a
+security check to match public streaming. Compare unchanged unary/public paths
+against the pinned baseline and investigate regressions rather than hiding them
+inside aggregate results. The all-SDK acceptance matrix is coverage, not a
+requirement to implement each cell independently.
+
 ### D1. Bind the streaming shape, not just the initial body
 
 The signed opening must unambiguously identify unary/server/client/duplex shape,
@@ -311,7 +346,10 @@ does not satisfy the all-shape/all-SDK release gate.
 
 ### Stage 0 — Wire specification and executable lifetime model
 
-Apply the approved microservice/tool scope to all four shapes. Freeze the opening
+Start with D0's reuse/gap map, tracing actual core and SDK callers rather than
+inferring absent machinery from the unary-only org gate. Establish comparable
+baseline workloads and the boundaries to measure; no new benchmark framework is
+required. Apply the approved microservice/tool scope to all four shapes. Freeze the opening
 transcript, continuation identity, expiry/revocation policy, replay collision lifecycle,
 limits, typed denial/terminal mapping and mixed-version behavior. Model opening,
 concurrent replay, proof expiry before stream end, two independent calls,
@@ -319,8 +357,10 @@ revocation while blocked, session replacement and shutdown. Produce the complete
 SDK/package/runtime inventory and shared conformance vectors before parallel
 binding implementation; no omitted runtime silently disappears from scope.
 
-**Exit:** a verified detailed protocol contract and positive/negative model
-witnesses for all shapes; old unary/public contracts explicitly preserved.
+**Exit:** a source-backed reuse/gap map, verified detailed protocol contract and
+positive/negative model witnesses for all shapes; old unary/public contracts
+explicitly preserved. Proposed new lifecycle machinery has a demonstrated need,
+and performance measurements separate opening work from per-item work.
 Owner decisions above stand; this gate resolves engineering details rather than
 asking again whether the product needs each shape. No production wire or
 binding export changes in this specification slice.
