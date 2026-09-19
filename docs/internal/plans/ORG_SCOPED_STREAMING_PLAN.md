@@ -1,13 +1,15 @@
 # Organization-Scoped Streaming RPC Plan
 
-> **For Hermes:** After approval of the protocol decisions below, use
-> subagent-driven-development for one bounded slice at a time. This document
-> records a substrate gap; it does not authorize production wire changes or
-> removing the existing unary-only admission refusal.
+> **For Hermes:** Use subagent-driven-development for bounded implementation
+> slices after the wire/lifecycle specification gate. The owner has approved
+> the design direction and release scope below, not a blind removal of the
+> existing unary-only admission refusal or an unreviewed wire encoding.
 
-**Goal:** Extend Net's organization admission to server-streaming,
-client-streaming and duplex nRPC while preserving authenticated attribution,
-capability-specific authority, private discovery and bounded stream ownership.
+**Goal:** Ship organization-authorized unary, server-streaming, client-streaming
+and duplex nRPC across every supported Net SDK from the first release of this
+feature, for microservices and agentic tool calls. Preserve authenticated
+attribution, capability-specific authority, private discovery and bounded call
+ownership under one shared admission/lifecycle contract.
 
 **Architecture:** Admit a protected stream before handler entry, then bind every
 continuation and terminal operation to that admitted call and its live transport
@@ -21,8 +23,10 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 
 ## Status
 
-**PENDING — design draft, not started. This is a substrate limit in Rust and
-all bindings, not owed marshaling work.** Source inspected at
+**PENDING IMPLEMENTATION — owner-approved design direction and day-one parity
+scope; detailed wire/lifecycle specification remains to be verified.** This is
+a substrate limit in Rust and all bindings, not merely owed marshaling work.
+Source inspected at
 `3e88e50f35cb941b32297bf19f0fc649468376f1` on `master` in
 `C:/Users/chief/Desktop/github/net`. Paths/lines below refer to this baseline;
 re-read them at the committed implementation base. No tests were run or protocol
@@ -32,8 +36,55 @@ This plan is independent of the browser/game-store work and the
 [Serverless Capability Integration Plan](SERVERLESS_CAPABILITY_INTEGRATION_PLAN.md).
 Serverless v1 remains unary; its streaming adapter is separately deferred until
 there is a named consumer. An HTTP/WebSocket adapter or binding cannot close the
-core admission gap. Core implementation also needs an approved initial consumer,
-shape and protocol decision; writing this plan is not that approval.
+core admission gap. The approved consumer class here is microservices and
+agentic tool invocation, not a model-token product or a new workflow framework.
+All four call shapes are in the first release; internal sequencing does not
+authorize a server-streaming-only or Rust-only feature release.
+
+### Owner decisions — release contract
+
+- One shared organization-admission and call-lifecycle mechanism covers all four
+  RPC shapes. Preserve existing unary semantics rather than replacing them.
+- Streaming uses a distinct versioned/domain-separated opening binding tied to
+  the exact fresh session establishment. One signed opening admits a bounded
+  call; continuation frames use authenticated session/call ownership, not a
+  fresh signature per item.
+- Streams have finite call deadlines bounded by provider policy and credential
+  validity. Opening-proof freshness is not execution duration. No in-place
+  renewal initially; reopening is a new call, not replay/resumption of work.
+- Active revocation stops further authorized input/output, including idle and
+  credit-blocked calls. Already delivered bytes and performed effects cannot be
+  recalled. Replay retention and active-call ownership are separate lifetimes.
+- Additive protected APIs keep proof creation, provider resolution, flow control
+  and cleanup inside the runtime. Do not expose an authority framework to
+  application developers or impose application-level handler serialization.
+- **Unary, server-streaming, client-streaming and duplex, caller and provider,
+  must work in all supported Net SDKs on day one.** No binding is deferred for
+  lack of a separate named consumer. Implementation stages are integration
+  checkpoints, not progressively reduced definitions of release completion.
+
+### SDK release matrix
+
+Every row requires all four shapes, both call and serve, same-org and granted
+authority, typed denials/terminal errors, cancellation and bounded cleanup.
+
+| Supported surface at the inspected baseline | Required release evidence |
+|---|---|
+| Rust core and `net-mesh-sdk` | Public core and ergonomic org-facade call/serve paths; external consumer compilation |
+| Node.js / TypeScript bindings and supported high-level SDK surface | Real native addon plus typed public API; async iteration/sink and disposal behavior; no private-native escape hatch required |
+| Python bindings and supported SDK surfaces | Real extension with documented sync/async forms where supported; iteration, cancellation, close and event-loop ownership |
+| Go | Real cgo execution through public APIs, context cancellation, typed errors and stream/serve-handle cleanup |
+| C ABI | Public headers and the single `net-ffi` cdylib; caller/provider ownership, callbacks, lengths, errors and close/free behavior |
+
+The release inventory must enumerate the actual public packages and supported
+runtimes, not stop at language names. Browser/WASM packages are absent from this
+checkout's package inventory but exist in the separate browser development lane:
+if that surface is supported in the implementation/release base, it joins the
+same four-shape matrix and needs real-browser evidence. Absence at this older
+source pin is not an exemption or a finding of browser support. Any proposed
+exclusion from the supported-SDK matrix requires an explicit owner scope change.
+The proposed, not-yet-supported `@net-mesh/serverless` adapter remains governed
+by its separate unary plan and named-consumer streaming deferral.
 
 ## Context — verified boundary
 
@@ -61,7 +112,8 @@ claim of a new exact-head run in this document.
 
 ## Goals
 
-- Protected streaming in the core, then an ergonomic Rust organization facade.
+- All four protected RPC shapes through the core and every supported SDK, with
+  a small language-idiomatic organization invocation/serving surface.
 - Same-org and explicitly granted cross-org authority, with provider policy final.
 - Exactly one admitted call owner for a stream, bounded across session replacement,
   expiry, cancellation, half-close, handler completion and service shutdown.
@@ -80,20 +132,19 @@ claim of a new exact-head run in this document.
 - A second nRPC protocol, replay service, identity system or permission hierarchy.
 - Automatic stream migration, reconnect/resume, durable continuation, per-item
   transactions or exactly-once business effects.
-- Long-lived authority renewal, per-frame signatures or new wire objects without
-  the Stage 0 decision and evidence that they are necessary.
-- HTTP/WebSocket bridging, serverless runtime support, browser org parity, payments
-  or an all-language rollout in the first core slice.
+- In-place authority renewal or per-frame signatures in this initial contract.
+- HTTP/WebSocket bridging, serverless runtime support, payments or unrelated
+  SDK parity work. Required org-RPC parity is explicitly in scope.
 
-## Design decisions to freeze before production
+## Approved design direction and specification obligations
 
 ### D1. Bind the streaming shape, not just the initial body
 
 The signed opening must unambiguously identify unary/server/client/duplex shape,
 caller and acting org, provider and provider org, capability, call identity,
-canonical opening headers/body, deadline and the agreed authority/lifecycle
-limits. Existing canonical flags may already cover some of these fields; Stage 0
-must trace their actual signing and verification rather than duplicate them.
+canonical opening headers/body, deadline, exact fresh session establishment and
+the agreed authority/lifecycle limits. Existing canonical flags may already
+cover some fields; Stage 0 must trace them rather than create parallel meanings.
 
 A provider must not reinterpret a unary opening as streaming or a
 server-streaming opening as upload authority. The initial body digest cannot
@@ -101,16 +152,19 @@ purport to cover data that has not been produced yet. For client-streaming and
 duplex, authority must explicitly permit a bounded continuation under the chosen
 operation; handlers still validate every item's business meaning.
 
-**Decision required:** can the existing proof encoding plus a versioned signed
-request extension express this safely, or is a separate domain/version required?
-No field layout, header name or numeric protocol ID is reserved by this draft.
+**Decision:** use a distinct versioned/domain-separated streaming opening proof;
+leave the existing unary proof/transcript unchanged. Reuse credential objects
+and canonicalization helpers where semantics agree, but never make the old
+unary signature authorize a new streaming interpretation. Stage 0 freezes the
+exact transcript/encoding, authenticated session-binding input and support
+detection; no field layout, header name or numeric ID is reserved by this draft.
 New callers must not fall back to public invocation when protected streaming is
 unsupported; old callers and providers retain explicit refusal.
 
 ### D2. Opening proof versus continuation authority
 
-**Recommended starting point, not yet an owner ruling:** verify one signed
-opening, create a finite provider-owned admitted-call record, and authenticate
+**Decision:** verify one signed opening, create a finite provider-owned
+admitted-call record, and authenticate
 continuations through the established session and exact call incarnation.
 Validate liveness/authority state at the points where input enters the handler
 and output is committed for transmission. Do not verify an Ed25519 signature
@@ -135,19 +189,21 @@ The existing opening proof has a short finite freshness window. Three choices
 must not be conflated: latest time to admit the opening; maximum live duration;
 and validity of membership/grants during execution.
 
-**Recommended initial policy:** finite protected streams, no in-place renewal.
-Require a bounded deadline and clamp to provider limits and the approved
-credential-expiry policy. Opening proof expiry is not silently reused as the
-stream deadline, nor does accepting an opening confer permanent authority.
+**Decision:** finite protected streams, no in-place renewal. The effective end
+is bounded by the call deadline, provider duration limit and applicable credential
+validity. An omitted caller deadline receives a documented finite default, not
+an infinite lease. Opening proof expiry is not silently reused as the stream
+deadline, nor does accepting an opening confer permanent authority.
 Keep public streaming's existing no-deadline behavior separate.
 
-**Owner decision required:** freeze the lifetime maximum, handling of credential
-expiry, and the observable revocation boundary. Prefer bounded revocation of
-active streams when the provider's trusted authority view changes, with a
-specified maximum detection interval and fail-closed behavior if that view is
-unavailable. State exactly which queued input/output is retired and where already
-committed delivery may still arrive. Do not promise rollback or instantaneous
-revocation of bytes already sent or handler side effects already performed.
+**Decision:** actively revoke affected streams when the provider's trusted
+authority changes, with bounded detection for idle/blocked streams and
+fail-closed behavior when current authority cannot be qualified. Stage 0 must
+specify the exact revalidation/publication boundary, numeric resource/duration
+defaults and maximum detection interval, including which queued input/output
+is retired. Do not promise rollback or instantaneous recall of bytes already
+sent or handler effects already performed. Microservice/tool requirements, not
+an arbitrary model-token timeout, determine the finite provider defaults.
 
 Translate accepted time bounds using a coherent clock sample; monotonic runtime
 expiry must not be extended by wall-clock rollback. Expiry must run while idle
@@ -168,11 +224,13 @@ active-call allocation, terminal retirement and replay retention:
 - Closing a stream may release active queues/credits, but must not erase a still
   needed replay refusal. Quota reclamation must not evict live authority.
 - Counter/generation exhaustion refuses without wrap or aliasing.
-- A provider/session restart retires live streams. State what the volatile
-  replay boundary allows for an old opening that remains cryptographically
-  valid; if the intended guarantee is stronger, explicitly bind a fresh
-  establishment incarnation or add approved durable state. Do not invent
-  cross-restart exactly-once protection by prose.
+- A provider/session restart retires live streams. The streaming opening binds
+  a fresh authenticated establishment incarnation, so an old signed opening
+  cannot admit on the new session even while its wall-clock proof remains
+  valid. Stage 0 must identify the actual shared cryptographic binding, not
+  assume a reused numeric session ID provides freshness. This adds no durable
+  replay service or exactly-once business guarantee; a freshly signed new call
+  may still repeat an application effect unless the application deduplicates it.
 
 Retain existing per-caller/per-organization/global protection against resource
 monopolization. Add bounded active-stream, queued-byte and pending-verification
@@ -205,8 +263,9 @@ and never expose them to a handler prematurely.
 Expose admitted caller facts to streaming handlers from verified state, never
 construct them from `RpcStreamingContext.caller_origin`. The public Rust shape
 needs compatibility review: a new field on a public constructible context is not
-a free internal refactor. Consider an additive protected context/handler surface
-rather than silently breaking existing public streaming handlers.
+a free internal refactor. Use an additive protected context/handler surface
+rather than silently breaking existing public streaming handlers. Keep the
+application verbs small; verified caller context is data, not a policy framework.
 
 Owner-private and grant-scoped services must retain their existing discovery
 boundaries. Capability gating and org admission are different paths: preserve
@@ -229,28 +288,42 @@ All paths are repo-relative. New test files below are proposed, not existing.
 | Caller, registration and dispatch integration | `net/crates/net/src/adapter/net/mesh_rpc.rs` |
 | Fold call ownership, context and flow control | `net/crates/net/src/adapter/net/cortex/rpc.rs` |
 | Rust facade | `net/crates/net/sdk/src/org/{call,serve,client,error,types}.rs`; preserve unary APIs |
+| Node/TypeScript | `net/crates/net/bindings/node/src/org.rs`, `bindings/node/org.ts` under the same crate root; public org/nRPC exports and applicable `sdk-ts/` wrappers |
+| Python | `net/crates/net/bindings/python/src/{org,org_serve}.rs`, `bindings/python/python/net/org.py` under the same crate root; applicable `sdk-py/` public wrappers |
+| C/Go | `net/crates/net/bindings/go/org-ffi/`, `bindings/go/rpc-ffi/`, `include/net_org.h`, `include/net_rpc.h` under the same crate root; `go/org.go`, `go/mesh_rpc.go` and typed wrappers |
 | Existing baseline tests | `net/crates/net/tests/nrpc_streaming_gate.rs`, `integration_nrpc_streaming.rs`; existing org admission/replay units and SDK org tests |
 | New live protocol tests | Proposed `net/crates/net/tests/org_rpc_streaming.rs` and `net/crates/net/sdk/tests/org_streaming.rs` |
 | CI and docs | `.github/workflows/ci.yml`, `net/crates/net/docs/ORGANIZATIONS.md`, existing nRPC/transport docs; OSDK/OSDK-L plans only when stage status changes |
 
 SDK and bindings must not reach around the core denial with public-stream calls
-or handwritten org headers. Do not add every binding's new API before the core
-contract is accepted. Transport code outside these paths is in scope only for a
-specific proven dependency, not as a general reliability refactor.
+or handwritten org headers. Binding API design and test preparation can run in
+parallel once the shared contract is frozen; implementation acceptance follows
+the load-bearing core. No SDK's required parity may be dropped to call the
+release complete. Transport work is scoped to a proven dependency, not a general
+reliability refactor.
 
 ## Stages
 
-### Stage 0 — Protocol decision and executable lifetime model
+These are internal integration slices toward one complete release. Server-first
+development is permitted; server-only shipping is not. SDK work may overlap core
+slices after the common contract is frozen. Acceptance of an intermediate slice
+does not satisfy the all-shape/all-SDK release gate.
 
-Name the first consumer and shape. Review D1–D6, freeze the opening transcript,
-continuation identity, expiry/revocation policy, replay collision lifecycle,
+### Stage 0 — Wire specification and executable lifetime model
+
+Apply the approved microservice/tool scope to all four shapes. Freeze the opening
+transcript, continuation identity, expiry/revocation policy, replay collision lifecycle,
 limits, typed denial/terminal mapping and mixed-version behavior. Model opening,
 concurrent replay, proof expiry before stream end, two independent calls,
-revocation while blocked, session replacement and shutdown.
+revocation while blocked, session replacement and shutdown. Produce the complete
+SDK/package/runtime inventory and shared conformance vectors before parallel
+binding implementation; no omitted runtime silently disappears from scope.
 
-**Exit:** an approved protocol contract and positive/negative model witnesses;
-old unary/public contracts explicitly preserved. All recommended choices above
-remain proposals until this exit. No production wire or binding export changes.
+**Exit:** a verified detailed protocol contract and positive/negative model
+witnesses for all shapes; old unary/public contracts explicitly preserved.
+Owner decisions above stand; this gate resolves engineering details rather than
+asking again whether the product needs each shape. No production wire or
+binding export changes in this specification slice.
 
 ### Stage 1 — Core protected server-streaming
 
@@ -264,6 +337,8 @@ production paths. Unary-only registrations continue refusing streaming requests.
 items and explicit completion; forbidden requests cause zero handler effects;
 expiry/revocation and backpressure-blocked retirement are executable. Unsupported
 peers fail closed, not downgrade. This exits server-streaming only.
+It is an internal checkpoint, not a releasable partial org-streaming feature;
+existing unary behavior also remains under regression test.
 
 ### Stage 2 — Core protected client-streaming and duplex
 
@@ -275,12 +350,13 @@ backpressure without allowing one direction's completion to forge the other's.
 **Exit:** client-streaming aggregate and duplex exchange execute with valid org
 proofs, with separate zero-effect denials and wrong-session/control-frame probes.
 Every shape has its own live positive and inverse; server-streaming success is
-not evidence for upload or duplex.
+not evidence for upload or duplex. Both shapes are mandatory before release,
+not deferred pending another consumer.
 
 ### Stage 3 — Rust organization facade
 
-Expose ergonomic org-scoped verbs that resolve an authorized provider internally
-and pin the selected provider for the stream. Preserve exact proof semantics and
+Expose all four ergonomic org-scoped call/serve shapes. Caller verbs resolve an
+authorized provider internally and pin it for the call. Preserve exact proof semantics and
 verified handler context. No midstream load balancing or automatic restart on a
 different provider. Add typed stream items/terminal outcomes and deterministic
 close/drop behavior. Final names/options are frozen after core acceptance, not
@@ -290,18 +366,28 @@ invented as already-existing exports in this draft.
 granted discovery, revocation, cancellation and ownership witnesses. External
 consumer compilation catches unintended unary/public API breakage.
 
-### Stage 4 — Named-consumer bindings and documentation
+### Stage 4 — All supported SDKs and unified release acceptance
 
-Only after substrate and Rust-facade acceptance, add the language surface the
-consumer needs. Update OSDK-L's non-goal with an exact accepted shape/version,
-not a blanket all-streaming parity claim. Each binding proves handler dispatch,
-ordered items, terminal errors, cancellation, serve-handle shutdown and no
-surviving bridge tasks through actual native artifacts.
+Implement every SDK/runtime row and all four shapes, on caller and provider
+sides. No new binding-specific proof interpretation: wrappers compile concise
+language-idiomatic verbs to the shared authoritative core path. Update OSDK-L's
+historical non-goal only with exact accepted shape/version evidence. Each SDK
+proves handler dispatch, ordered items, terminal errors, cancellation,
+backpressure, half-close where applicable, serve-handle shutdown and absence of
+surviving bridge tasks through its real artifacts.
 
-**Exit:** real two-process caller/provider witnesses for each shipped language
-and shape, artifact/declaration/error compatibility checks, exact-head CI green.
-Unimplemented bindings remain explicitly deferred. The serverless streaming
-adapter still requires its own named consumer and real platform acceptance.
+**Exit:** live two-process caller/provider witnesses for every SDK/shape cell,
+plus cross-language interoperability (each runtime against Rust in both roles,
+and direct mixed non-Rust controls using shared vectors). Real browser contexts
+substitute for OS processes only for an included browser runtime. Test packaged
+artifacts from an external consumer, not workspace declarations alone; run Go
+with cgo actually enabled and C against the single production cdylib.
+
+Exact-head CI, artifact/declaration/header/error parity, unary compatibility and
+the complete required inventory must all pass. A missing SDK, provider half,
+shape or terminal path blocks the feature release; no stub or silent public-RPC
+fallback satisfies a cell. The separate, not-yet-supported serverless adapter's
+streaming remains deferred under its own plan, not implicitly activated here.
 
 ## Required witnesses
 
@@ -320,6 +406,8 @@ adapter still requires its own named consumer and real platform acceptance.
 | Teardown | Independent call remains healthy | Cancel/revoke/replace one call, then release its parked work; successor and sibling unaffected |
 | Mixed versions | New peers use supported protected mode | Old/unsupported provider returns typed refusal; no public retry/fallback |
 | Compatibility | Existing unary/public streaming tests unchanged | Consumer compile tests catch unintended signature/context/enum breaks |
+| SDK completeness | Every supported SDK calls and serves all four org-protected shapes | Inventory gate fails if any required runtime/shape/role is skipped or selects zero tests |
+| Interoperability | Shared fixtures and live cross-language calls preserve authority and terminal outcomes | Malformed/unknown errors, narrowing IDs, callback loss or decoder disagreement must not become success |
 
 An opening handler counter alone does not prove zero streaming side effects.
 Observe input delivery, output emission, grant mutation and task/queue ownership.
@@ -349,23 +437,30 @@ full applicable `AGENTS.md` pre-push checks and rustdoc before acceptance.
 For each authority/lifetime branch retain a bounded applied-RED/restored-GREEN
 mutation receipt. Mutation must change the production decision, not only a helper
 that production bypasses. Reconcile inventory and actual execution; unchanged
-unary golden transcripts and new opening vectors are separate checks.
+unary golden transcripts and new opening vectors are separate checks. Collect
+per-SDK/shape/role execution evidence from actual artifacts; a core pass cannot
+stand in for binding dispatch, callback ownership or lifecycle behavior.
 
 Publish no protocol IDs, version bump or package until compatibility is decided
 and exact-head gates are green. If public Rust/API/wire breaks are necessary,
 name them and obtain release authorization rather than calling them mechanical.
 No implementation, commit, push or hosted side effect is authorized by this plan.
 
-## Open decisions
+## Remaining specification work — not unresolved product scope
 
-1. Named first consumer and initial streaming shape; server-streaming-first is the
-   proposed implementation order, not permission to implement all shapes now.
-2. Signed opening representation/version and peer support detection; old-peer
-   refusal must be established before emission is enabled.
-3. Proof-freshness versus stream lifetime, credential expiry and active-revocation
-   semantics, including a bounded detection/termination point.
-4. Replay/active-owner/restart contract and exact resource limits.
-5. Additive protected handler context/API shape and language rollout boundary.
+1. Exact versioned opening bytes, canonical signing input, fresh session-binding
+   derivation and peer-support detection. Old-peer refusal is proven before
+   emission, with no downgrade.
+2. Numeric finite defaults/resource limits and revocation detection bound;
+   actual commit/teardown points for the approved lifetime semantics.
+3. Atomic replay/active-owner lifecycle implementation and restart witnesses.
+4. Additive API names and full SDK/runtime/shape/role inventory, including any
+   browser surface supported at the eventual release base.
+
+The consumer class, all four day-one shapes, shared authority mechanism,
+finite-lifetime/no-renewal policy, active revocation and all-supported-SDK parity
+are owner decisions, not questions to defer again. Implementation details must
+be executable and reviewed; recording them does not constitute a passing test.
 
 ## Related plans
 
@@ -386,3 +481,9 @@ No implementation, commit, push or hosted side effect is authorized by this plan
   Recorded the gap as pending substrate work rather than language parity.
   Recommendations are separated from required owner decisions. No tests or
   production edits performed during this documentation task.
+- Owner decision: focus on the reusable microservice/agentic-tool invocation
+  substrate; accept the common opening/lifetime/replay/additive-API direction.
+  Require unary, server-streaming, client-streaming and duplex across every
+  supported Net SDK in the first feature release. Internal stages remain for
+  implementation discipline, not shape or language deferral. Plan reconciled
+  to that decision; no production implementation or runtime evidence claimed.
