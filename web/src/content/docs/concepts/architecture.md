@@ -95,6 +95,9 @@ classification and traversal, and direct or relayed paths. Operators configure
 listen addresses, bootstrap peers, and any relay or port-mapping policy required by
 the deployment.
 
+A browser tab is a node too, and it reaches the mesh over a WebRTC DataChannel to
+a native anchor rather than over UDP — see [WebRTC transport](/docs/concepts/webrtc-transport).
+
 Exact packet fields and compatibility rules belong in [Wire format](/docs/reference/wire-format).
 Operational topology belongs in [NAT and traversal](/docs/guides/nat-and-traversal)
 and [Production deployment](/docs/guides/production-deployment).
