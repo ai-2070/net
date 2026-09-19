@@ -6,7 +6,10 @@
 
 **Status: ACCEPTED at `efe9707f2`, revision 4.** The independent-review HOLD is
 lifted for the Net-side prerequisite. Every WS-A…WS-F box below is ticked, all
-50 §4 acceptance witnesses exist in the tree, and the 38 public surfaces this
+49 §4 acceptance witnesses exist in the tree as tests — the matrix's fiftieth
+entry is `run` equivalence after the staged-verb split, which is discharged by
+unedited pre-existing suites rather than by a test of its own and is labelled
+that way in both places it appears. The 38 public surfaces this
 plan names resolve. Landed in `101145315` (WS-A/B/C) and `af0f28ad1`
 (WS-D/E/F), plus `047245bcf`; the two upstream gaps in `faf4ff29b` /
 `1ed757629`.
@@ -621,7 +624,7 @@ Every handle is a **complete JSON document**; nothing is resolved from a hash. `
 | Identical retry / lost replies | `an_identical_retry_returns_the_original_task_without_a_second_redeem`, `a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge`, `a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof` |
 | Never re-quote an ambiguous purchase | `purchase_never_requotes_while_an_attempt_is_unresolved`, `a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid`, `a_caller_restart_mid_purchase_resumes_the_stored_attempt` |
 | One authoritative caller attempt | `concurrent_prepares_converge_on_one_quote`, `concurrent_purchases_send_one_payload`, `a_conflicting_commitment_under_the_same_key_is_rejected`, `two_processes_share_one_attempt` |
-| Refusal ≠ proven non-payment | `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous`, `run_is_byte_for_byte_equivalent_after_the_split` |
+| Refusal ≠ proven non-payment | `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous`; plus `run` equivalence after the staged-verb split, which is **not a test** — it is discharged by the pre-existing `flow_end_to_end` / `mcp_gate_composition` / `lifecycle_modes` / `spend_policy` / `http402_outbound` suites staying green **unedited** (see the delta note above) |
 | Caller table is complete and consistent | `every_caller_transition_outside_the_table_is_a_conflict`, `an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare`, `unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote`, `a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence`, `a_retryable_submit_refusal_keeps_the_attempt_paid` |
 | Altered request | `an_altered_brief_under_the_same_id_is_rejected_before_payment`, `redeem_for_task_refuses_a_mismatched_purchase_hash`, `commitment_frames_array_boundaries` |
 | No duplicate execution across owners / after retention | `a_reused_proof_from_another_peer_is_refused_and_never_launches`, `a_retry_after_result_retention_never_relaunches_or_redeems` |
