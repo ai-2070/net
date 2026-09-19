@@ -86,7 +86,8 @@ Serverless caller -> authenticated HTTPS -> adapter -> authorized selection
 - Public gateway credentials that confer blanket organization dispatch power.
 - Durable workflows, transactions across functions, exactly-once external effects,
   speculative duplicate invocation, or automatic retries after ambiguous execution.
-- Streaming RPC, arbitrary callback URLs, all serverless platforms at once, a new
+- Streaming RPC until a named consumer justifies it (see the deferred section
+  below); arbitrary callback URLs, all serverless platforms at once, a new
   organization authority scheme, or automatic original-caller impersonation.
 
 ## Context — what can be reused, and what cannot be assumed
@@ -244,6 +245,42 @@ best-effort interruption, not rollback. Disable transparent SDK/HTTP/platform
 retries for ambiguous non-idempotent invocation; any duplicate-suppression
 contract must name its retention/restart boundaries. Do not label a transport
 request ID an exactly-once mechanism.
+
+## Deferred: streaming RPC — named consumer required
+
+The initial integration is unary. Server-streaming, client-streaming and
+bidirectional RPC remain deferred until a named application requires a specific
+stream shape, invocation direction and supported platform. Examples such as
+model tokens or progress events illustrate possible uses; they do not themselves
+authorize implementation. No speculative streaming exports or persistent
+WebSocket infrastructure are prerequisites for this plan.
+
+When a consumer is identified, scope a separate bounded slice:
+
+| Shape | Transport to evaluate first | Platform condition to prove |
+|---|---|---|
+| Server-streaming: one request, many responses | Framed streaming HTTPS response; SSE where appropriate | Runtime and invocation ingress deliver incrementally rather than buffer the whole result |
+| Client-streaming: many request items, one response | Streaming HTTP request where supported; otherwise evaluate WebSocket | Provider receives input incrementally with bounded flow control |
+| Bidirectional: independent input and output | WebSocket or supported full-duplex HTTP protocol | An explicit owner preserves call state and authority throughout the stream |
+
+Streaming is not synonymous with WebSockets. A managed WebSocket service that
+dispatches each message to a separate function invocation does not automatically
+provide one live RPC owner. Likewise, an adapter cannot turn a buffered function
+response into live incremental delivery. Verify consuming a stream from a
+function separately from serving one through that platform's invocation path.
+
+The slice must preserve admission and exact call ownership across the adapter,
+define data/completion/terminal-error framing, propagate bounded backpressure,
+deadlines and cancellation, and reclaim resources on disconnect or function
+termination. Connection closure is not automatically successful completion;
+cancellation is not rollback. Resume/replay needs its own explicit cursor and
+retention contract and must not be implied by reconnecting a socket.
+
+Acceptance requires the named consumer's real platform path, including slow
+consumers, interruption, late-frame fencing and terminal error propagation.
+Reuse existing mesh-side nRPC streaming semantics where they satisfy that
+contract; do not infer bridge support merely because native streaming exists.
+No streaming work is authorized by recording this deferral.
 
 ## Proposed implementation surfaces
 
