@@ -102,10 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     handshake(&caller, &b, addr_caller).await; // B <-> caller
     handshake(&caller, &c, addr_caller).await; // C <-> caller
 
-    a.inner().start();
-    b.inner().start();
-    c.inner().start();
-    caller.inner().start();
+    a.start();
+    b.start();
+    c.start();
+    caller.start();
 
     // The two original providers announce. That is the entire registration.
     a.announce_capabilities(provider(16)).await?;

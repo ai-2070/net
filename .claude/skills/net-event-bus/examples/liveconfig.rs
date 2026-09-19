@@ -112,9 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     handshake(&publisher, &s1, publisher_addr).await;
     handshake(&publisher, &s2, publisher_addr).await;
 
-    publisher.inner().start();
-    s1.inner().start();
-    s2.inner().start();
+    publisher.start();
+    s1.start();
+    s2.start();
 
     // The publisher owns the channel config. No broker registers it.
     let channel = ChannelName::new("config/edge").expect("channel name");

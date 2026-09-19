@@ -69,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let publisher_addr = publisher.inner().local_addr();
     handshake(&publisher, &subscriber, publisher_addr).await;
-    publisher.inner().start();
-    subscriber.inner().start();
+    publisher.start();
+    subscriber.start();
 
     // Nothing else to set up. A token's leaf binds to the subscribing peer's
     // EntityId, and the runtime establishes that binding as part of the

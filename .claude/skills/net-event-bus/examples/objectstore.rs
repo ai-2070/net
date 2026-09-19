@@ -69,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let holder_addr = holder.inner().local_addr();
     handshake(&holder, &reader, holder_addr).await;
-    holder.inner().start();
-    reader.inner().start();
+    holder.start();
+    reader.start();
 
     // Install the blob-transfer engine on both nodes before any store or fetch.
     // A fetch needs it just as much as a serve does.

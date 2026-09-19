@@ -82,9 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // makes re-dispatch to "any worker" a local query rather than a config file.
     handshake(&w1, &w2, w1_addr).await;
 
-    producer.inner().start();
-    w1.inner().start();
-    w2.inner().start();
+    producer.start();
+    w1.start();
+    w2.start();
 
     let w1_id = w1.inner().node_id();
     let w2_id = w2.inner().node_id();
