@@ -252,7 +252,7 @@ mechanism. Costs are expectations to be measured in Stage 1/2, not promises.
 |---|---|---|---|---|---|
 | Opening binds shape/headers/body/deadline/limits | `CallBinding.request_digest` via `org_request_digest` (`org_admission_gate.rs:60-95`) — flags, `deadline_ns`, ordered headers, body. Callers: `sign_admission_proof` `mesh_rpc.rs:6534`; `admit_and_dispatch_protected` `:1104` | No kind discriminator inside the proof; version only in derive_key context (`org_call.rs:151`) | Extended proof + new transcript context (Spec §1); reuse `credential_digest`, `check_expiry_at`, `org_request_digest` unchanged | Flip a flag / window header / deadline on a signed opening → `BindingInvalid`; unary-context proof on a streaming registration → `BindingInvalid` | Opening: +33 B hashed; per item: none |
 | Member + fresh-session binding | `resolve_direct_caller` (`caller_identity.rs:71-89`, `peer_entity_ids` pin table); `RpcInboundEvent.session_id` = handshake_hash[0..8] (`crypto.rs:383`) | 32-byte handshake hash discarded after key derivation; transcript has no session term | Retain `handshake_hash` on `SessionKeys`/`NetSession`; `MeshNode::peer_session_binding`; sign it in the opening; provider compares against the *receiving* session (Spec §1.3) | Re-handshake same peers, replay wall-clock-fresh opening → `SessionBindingMismatch`; same session → `Replay` | Opening: one 32-B compare + one map get |
-| Replay collision vs active ownership | `AdmissionReplayGuard::admit` (`org_admission_replay.rs:719-848`), caller `org_admission.rs:632` | No active/terminal state, no release; expired key reusable (`:738-761`); replay insert and policy are owned back-to-back by `verify_org_admission` (`:626-653`) | New `ProtectedCallRegistry` keyed `(caller, call_id)` with per-record incarnation, **bracketing** `verify_org_admission` (reserve before, install after) rather than inserting between its steps; retire/complete carry the incarnation; guard untouched (Spec §3) | Same-digest duplicate while active → `Replay`; changed digest → `CallIdCollision`; new valid proof on active id after `expiry+300 s` → `ActiveCallOwned`; late retire after key reuse is a no-op; completion removes exactly once | Opening: one map op; per item: none |
+| Replay collision vs active ownership | `AdmissionReplayGuard::admit` (`org_admission_replay.rs:719-848`), caller `org_admission.rs:632` | No active/terminal state, no release; expired key reusable (`:738-761`); replay insert and policy are owned back-to-back by `verify_org_admission` (`:626-653`) | New `ProtectedCallRegistry` keyed `(caller, call_id)` with per-record incarnation, **bracketing** `verify_org_admission` (reserve before, install after, `confirm` at the fold's effect boundary) rather than inserting between its steps; retire/complete carry the incarnation; guard untouched (Spec §3) | Duplicate while the key is live → `ActiveCallOwned` before decode; duplicate after completion inside the guard window → `Replay` (same digest) / `CallIdCollision` (changed digest); new valid proof on a live id after `expiry+300 s` → `ActiveCallOwned`; late retire after key reuse is a no-op; completion removes exactly once | Opening: one map op; per item: none |
 | Continuation identity (session + call incarnation) | Unary key includes session (`cortex/rpc.rs:1692`); ingress sets `session_id` (`mesh.rs:30434`); client target gate (`rpc.rs:4252`) | Streaming folds key 3-tuple (`:1680`), ignore `ev.session_id`; CS `session_id` never set (`:3136`) | Widen the three streaming in-flight/sender/flow maps to `(from_node, session_id, origin, call_id)` and set `self.session_id` in `apply_inbound` mirroring `:1831` (Owner Q3 on public scope) | Open on session A; CHUNK/CANCEL/GRANT under session B with same `(node, origin, call_id)`: stream sees nothing, token unflipped, permits unchanged | Per frame: one extra `u64` in the hash key |
 | Session-replacement retirement | `install_peer_locked` displaces under CAS (`mesh.rs:23903-23937`); `commit_peer_transition` bumps `SessionCurrentness` (`:10367-10404`); handles fenced by `SessionSuperseded` (`:45882`) | No callback per displaced session; displaced `NetSession` not deactivated outside webrtc (`:23977`) | Call `registry.retire_session(old_session_id)` from the displaced branch of `install_peer_locked` and the dead-peer sweep (`:32061`, retire site `:32161`) — push, no polling | Replace peer mid-stream: old handler token fires, terminal cannot settle on successor, successor call with same call_id unaffected | Replacement path: O(active streams of that session) once |
 | Proof freshness ≠ stream lifetime | `MAX_ORG_PROOF_TTL_SECS = 30`; `deadline_ns` in digest; `CallOptions.deadline None → 0` (`mesh_rpc.rs:5715`); CS/DX handler-only `tokio::time::timeout` (`rpc.rs:3410`, `:3863`); SS pump awaited after the handler (`:2779-2836`) | No provider default/cap; SS fold has no deadline; a handler timeout cannot retire a pump parked on credit (`:2792`); wall-clock `SystemTime` sample; terminal `Internal` not `Timeout` | Default only for an omitted deadline, refuse over cap, clamp to credential validity (Spec §2.1); one per-call supervisor owning handler, pump, semaphores and terminal (§2.2) | Omitted → default and idle expiry; requested > cap → denied at opening, zero effects; requested within cap → honoured; pump parked on zero credit at deadline → terminal within bound; proof expiry mid-stream does not terminate | Opening: 3 compares; steady: one `Instant` compare at commit points |
@@ -393,14 +393,21 @@ task) that owns every piece of the call and completes within a bound:
 | grant-emitter entries | coalesced entries for the key discarded on drain |
 | terminal emission | exactly one, by the supervisor, **after** the pump has stopped, via the `DirectOnly` emitter with the record's `session_id` |
 
-The supervisor is `select!` over {handler outcome, `sleep_until(record.deadline)`,
-retire signal}. Queued-data policy per terminal reason:
+The supervisor is `select!` over {handler outcome, pump exit,
+`sleep_until(record.deadline)`, retire signal}, and it stays in that
+`select!` after the handler returns: **producer finished is not terminal.**
+On handler return the record enters `output = Draining(result)`; the pump
+keeps running, valid `STREAM_GRANT`s for the exact `(session, call)` keep
+being credited, and deadline, cancel and revocation stay armed until the pump
+exits (queue empty, or closed by retire). Only then does the supervisor
+commit the terminal and emit it. Queued-data policy per terminal reason:
 
 | Terminal reason | Queued response chunks | Queued request chunks |
 |---|---|---|
-| `Completed` (handler Ok, output ended) | drained in order, then terminal `Ok/end` (today's behaviour) | n/a (input already ended) |
+| `Completed(Ok)` (handler Ok, pump drained under live credit) | drained in order, then terminal `Ok/end` | discarded; input admission closed at handler return (2.6) |
+| `Completed(Err(status))` (handler Err) | drained in order, then the handler's error terminal | discarded; input admission closed |
 | `Cancelled` (caller CANCEL / handle drop) | discarded | discarded |
-| `Timeout` / credential expiry | discarded; terminal after pump stop | discarded |
+| `Timeout` / credential expiry (incl. **while draining**) | discarded; terminal after pump stop | discarded |
 | `Revoked` / `AuthorityUnavailable` | discarded | discarded |
 | `SessionReplaced` / disconnect | discarded (no route); terminal attempted `DirectOnly`, dropped if the session is gone | discarded |
 | `ServeHandleDropped` / node shutdown | discarded; terminal `Cancelled` | discarded |
@@ -408,9 +415,11 @@ retire signal}. Queued-data policy per terminal reason:
 Bound: from the retire signal, the supervisor's remaining work is close
 semaphores → abort/await pump → emit one terminal → `registry.complete`; no
 step awaits the network or the handler, so completion is bounded by the abort
-and one `try_send` into the response drainer. Public folds keep their current
-shape unless Q3 rules otherwise; CS/DX `tokio::time::timeout` (`:3410`, `:3863`)
-is the handler-only form this section replaces for protected calls.
+and one `try_send` into the response drainer. A drain that the caller never
+credits is bounded by the deadline, not by the drain. Public folds keep their
+current shape unless Q3 rules otherwise; CS/DX `tokio::time::timeout`
+(`:3410`, `:3863`) is the handler-only form this section replaces for
+protected calls.
 
 **2.3 Revocation — push to retire, requalify on movement.** The
 `ProtectedCallRegistry` (one per `MeshNode`) holds a `RaiseSubscription` from
@@ -471,19 +480,32 @@ handler effects are not recalled.
 `RpcResponseJob` (today `0`). Opening denials reuse `emit_admission_denial`
 unchanged (`mesh_rpc.rs:863-946`).
 
-**2.6 Lifecycle state model (D5) — independent halves plus terminal
-ownership.** The record holds
-`input: Half { Open, Ended }`, `output: Half { Open, Ended }`,
-`terminal: Option<Terminal { reason, emitted: bool }>` and `incarnation: u64`.
-Initial state by shape: server-streaming `input = Ended` (single request),
-`output = Open`; client-streaming `input = Open`, `output = Open` (the single
-response ends it); duplex both `Open`. Rules, table-driven and unit-tested
-(Stage 0 slice 0.3): END ⇒ `input = Ended` once, idempotent, never touches
-`output`; handler Ok/Err or single response ⇒ `output = Ended`; both `Ended`
-with no terminal ⇒ `terminal = Completed`; `retire(reason)` ⇒ `terminal =
-reason` if `terminal.is_none()` (first writer wins), later END/handler-return
-are no-ops; any frame while `terminal.is_some()` ⇒ dropped, no credit, no
-delivery; `emitted` flips exactly once, by the supervisor.
+**2.6 Lifecycle state model (D5) — independent halves, preserved handler
+result, terminal ownership.** The record holds
+`input: Input { Open, Ended, Closed }`, `output: Output { Open,
+Draining(HandlerResult), Ended }`, `terminal: Option<Terminal { reason,
+emitted: bool }>` and `incarnation: u64`, where `HandlerResult = Ok |
+Err(RpcStatus, body)`. Initial state by shape: server-streaming `input =
+Ended`, `output = Open`; client-streaming and duplex both `Open`. Rules,
+table-driven and unit-tested (Stage 0 slice 0.3):
+
+- END from the caller ⇒ `input = Ended` once, idempotent, never touches
+  `output`.
+- Handler return (Ok or Err) ⇒ `output = Draining(result)` **and** `input =
+  Closed` if it was `Open`: the consumer is gone, so no further request
+  chunks are admitted, delivered or retained (dropped; their bytes released).
+  Half-close independence protects legitimate *output* from an early END; it
+  does not oblige a handler to wait for END before rejecting. The single
+  response of client-streaming is the same transition.
+- Pump exit while `Draining(result)` ⇒ `output = Ended`, `terminal =
+  Completed(result)`; the handler's error is the terminal, never `Ok`.
+- `retire(reason)` from any state (including `Draining`) ⇒ `terminal =
+  reason` if `terminal.is_none()` (first writer wins); later END, handler
+  return or pump exit are no-ops.
+- Frames while `terminal.is_some()` ⇒ dropped, no credit, no delivery.
+  Frames while `Draining` ⇒ `STREAM_GRANT` credited; CHUNK/END dropped.
+- `emitted` flips exactly once, by the supervisor, after the pump has
+  stopped.
 
 **2.7 Resource accounting at the queue boundary — bytes, not chunks.**
 `RpcResponseSink::send`/`send_wait` queue arbitrary `Bytes` (`rpc.rs:2203-2233`)
@@ -499,11 +521,26 @@ account bytes where they enter a queue:
   after `emit`. Aggregates — per caller, per acting org, per node — are
   `AtomicUsize` in the registry, checked at the same enqueue and released at
   the same dequeue.
-- *Request direction.* `apply_request_chunk_to_senders` (`:3022`) accounts
-  `payload.len()` against the same per-call/per-caller/per-node counters
-  before `try_send`; over budget ⇒ chunk dropped + metric (as a full mpsc is
-  today, `:3072-3079`), released when the handler's `RequestStream` yields
-  the chunk.
+- *Request direction — refuse the call, never truncate it.*
+  `apply_request_chunk_to_senders` (`:3022`) accounts `payload.len()` against
+  the per-call/per-caller/per-node counters before `try_send`. The protected
+  upload path is flow-controlled (`nrpc-request-window-initial` +
+  `REQUEST_GRANT`, `mesh_rpc.rs:141-165`, `:2672-2678`): the provider grants
+  only what the budgets can hold, so a conforming caller never overruns. If a
+  chunk nonetheless cannot be reserved or delivered (over budget, full mpsc,
+  or an unknown/closed sender for an admitted call) ⇒ **retire the call**
+  with `ResourceExhausted` (`Unavailable`), zero further delivery; the
+  handler's `RequestStream` yields EOF-after-error and the caller's terminal
+  says so. Dropping an admitted request item and later completing `Ok` (the
+  public sink's contract at `:3072-3079`) is never the protected outcome.
+  Bytes are released when the handler's `RequestStream` yields the chunk.
+- *Reservation atomicity.* Reserve is one CAS-style `fetch_add` per counter
+  in fixed order (call → caller → node); on any refusal the earlier
+  increments are undone in reverse before returning, so a refused chunk
+  leaves every counter unchanged. Release on dequeue and release on
+  retire/cancel both go through one `release(n)` that saturates at zero and is
+  driven by the record's own accounting (what it reserved minus what it
+  released), so a cancel racing a dequeue cannot double-release or leak.
 - Budgets (Owner Q1 proposal): per call 16 MiB queued in each direction; per
   caller 64 MiB; per node 512 MiB; the existing 1024-slot mpsc caps remain as
   item-count bounds. With these, the global active-stream limit bounds queued
@@ -535,9 +572,20 @@ inserted between them. The registry brackets that call instead:
    with the now-known `(acting_org, member, generation)` and the current
    `(authority_ptr, store_ptr, store_generation)` exactly as in 2.3; fail ⇒
    release + deny. Otherwise fill the member facts, deadline, budgets and
-   captured stamp and transition `Opening → Admitted`.
-5. **Fold entry**: `apply_inbound_admitted`. If the fold refuses (duplicate
+   captured stamp and transition `Opening → Admitted`, returning an
+   `AdmissionLease { key, incarnation }`.
+5. **Fold entry — conditional on the exact live record at the effect
+   boundary.** `apply_inbound_admitted(frame, lease)`; inside the fold, under
+   its own lock and before any side effect (in-flight insert, sender
+   creation, handler spawn), the fold calls `registry.confirm(&lease)`, which
+   succeeds only if the record is still `Admitted` with that incarnation.
+   A retire between 4 and 5 (revocation, session replacement, drop) makes
+   `confirm` fail ⇒ the fold refuses with zero side effects and the bridge
+   calls `release`; the retire path that won emits nothing (there was no
+   handler) and `complete`s the record. If the fold itself refuses (duplicate
    in-flight key, flag check) ⇒ `registry.release(key, incarnation)`.
+   `confirm` marks the record `Running`, so a retire after it is delivered
+   through the supervisor (2.2), never lost.
 6. **End of life**: `retire(key, incarnation, reason)` from any source is a
    no-op on mismatch; the supervisor is the only caller of
    `complete(key, incarnation)`, so normal completion removes the record
@@ -549,6 +597,16 @@ call for its retained window); `SessionCurrentness` generation `u64::MAX`
 (`org_routing_registry.rs:513-518`) ⇒ refuse admission (`Unavailable`); the
 registry is volatile like the guard, and a restarted provider has new sessions
 so every old opening fails §1.3.
+
+Replay classification for a duplicate opening is decided by whichever check
+sees it first, and the witnesses are written to that algorithm: a duplicate
+while the key is **live** (Opening/Admitted/Running/Draining) is refused by
+`reserve` as `ActiveCallOwned` (`Denied`) before decode; the guard's
+`Replay`/`CallIdCollision` are observed only for a key that is **not live**
+but inside the guard's retained window (completed or retired call, proof not
+yet expired + 300 s). The reuse-map witness names both cases separately;
+`ActiveCallOwned` and `Replay` share the coarse byte, so the wire is
+unchanged.
 
 ### §4. Handler context and additive API surface
 
@@ -645,7 +703,7 @@ require. Nothing in the *Approval* column is granted by this document.
 |---|---|---|---|---|---|---|
 | C1 | `RpcStreamingContext` gains `org_admission: Option<Admitted>` + `#[non_exhaustive]` | source break | `net` pub struct, pub fields, externally constructible (`cortex/rpc.rs:2287`) | necessary for CS/DX verified context | separate `RpcProtected{ClientStreaming,Duplex}Handler` traits + a second fold generic (rejected under D0 as a duplicate stream wrapper, but it exists) | **Q2** |
 | C2 | `SessionKeys` gains `handshake_hash: [u8; 32]` | source break | `net-mesh-wire` pub struct, pub fields, externally constructible (`wire/src/crypto.rs:73`) | necessary for §1.3 | `NetSession::with_binding(keys, hash)` + `Option<[u8;32]>` on `NetSession` only, leaving `SessionKeys` untouched; costs one extra constructor and a hash that is `None` for hand-built test sessions | **Q7** |
-| C3 | `AdmissionContext.is_unary: bool` → `shape: RpcCallShape` | source break | `net` pub struct, pub fields (`org_admission.rs:319-340`) | necessary (shape term) | keep `is_unary` and add `shape` (redundant, `is_unary` derivable) — additive but two sources of truth | **Q7** |
+| C3 | `AdmissionContext.is_unary: bool` → `shape: RpcCallShape` | source break | `net` pub struct, pub fields, externally constructible (`org_admission.rs:319-340`) | necessary (shape term) | **none that is source-compatible**: adding `shape` beside `is_unary` still breaks struct-literal constructors; a builder/`new()` would be a new surface that existing literals do not use | **Q7** |
 | C4 | New `AdmissionDenied` variants (`ShapeMismatch`, `SessionBindingMismatch`, `ActiveCallOwned`, `ActiveStreamCapacity`, `DeadlineExceedsPolicy`, `Revoked`) | source break | `net` pub enum, **not** `#[non_exhaustive]` (`org_admission.rs:86`); external exhaustive `match` breaks | necessary | none that keeps one enum; add `#[non_exhaustive]` now (itself a break) | **Q7** |
 | C5 | Streaming in-flight keys gain `session_id` | behavioural | public SS/CS/DX folds | necessary for protected; optional for public | protected-only record keyed 4-tuple beside the 3-tuple public maps (second keying scheme) | **Q3** |
 | C6 | SS fold enforces `deadline_ns` (today advisory, `cortex/rpc.rs:2299-2302`) — a public SS handler that ignored an expired deadline previously kept running | behavioural, observable | public SS fold | necessary for protected; optional for public | enforce only for protected records | **Q3** |
@@ -704,8 +762,8 @@ behaviour or export changes; no owner ruling is needed to start.
 |---|---|---|---|
 | 0.1 Baseline benches | `sdk/benches/nrpc_common/mod.rs`, `nrpc_{unary,streaming,client_streaming,duplex}.rs` | `Pair::protected()` (adopts authority, mints an `OrgProofIntent`), `org_unary_open` group only (the sole protected shape today); record public group numbers at head as the regression control | `cargo bench --bench nrpc_unary --features net,cortex -p net-mesh-sdk` runs both groups; numbers recorded in `S0_REPORT.md` next to the June-13 audit |
 | 0.2 External consumer probe | new `guards/org_api_probe/` on the `guards/fixtures_off_probe` + `ci.yml:1735-1804` pattern | Compiles today's `serve_org`/`org.call`/`serve_rpc_*_typed`/`call_*_typed` signatures, constructs `CallOptions { .. }` and `RpcStreamingContext { .. }` literals (the latter is expected to **stop compiling** in Stage 1 under Q2 — that failure is the named break, and the probe is updated in the same commit) | New CI step, green at head |
-| 0.3 Lifecycle model | new `src/adapter/net/behavior/org_stream_lifecycle.rs`: the record of §2.6 (`input`/`output` halves, `terminal`, `incarnation`) and a supervisor model of §2.2 over abstract handler/pump/semaphore/terminal pieces (no fold, no network) | Table-driven witnesses per shape: SS starts `input = Ended`; END idempotent and never touches `output`; both-ended ⇒ `Completed` once; retire from every state, first writer wins, later END/return no-ops; frames in terminal dropped; pump parked on zero credit is released and stopped by retire; `send_wait` blocked over budget wakes with closed; terminal emitted exactly once **after** pump stop under every terminal reason; queued-data policy per reason matches the §2.2 table; two independent calls unaffected by each other's retire | `cargo tfl adapter::net::behavior::org_stream_lifecycle::` ≥ 16 tests, each with an inverse (flip one table entry or reorder abort/emit → red) |
-| 0.4 Transaction model | new `src/adapter/net/behavior/org_stream_registry.rs`: `reserve`/`release`/`install`/`retire`/`complete` with incarnations and `authority_epoch`, over an abstract authority (floors, generation, poison) — no `verify_org_admission` call yet | Schedules under `loom` where the interleaving matters (`tests/loom_models.rs` pattern) or deterministic interleaving otherwise: raise between reserve and install ⇒ install denies, zero effects; policy veto ⇒ release, key reusable, guard slot untouched; fold refusal after install ⇒ release; late `retire(old_incarnation)` after key reuse ⇒ no-op on successor; `complete` exactly once; requalify keeps an unaffected call across a generation move and retires an affected one; store replacement retires all; budgets refuse the N+1th reserve | `cargo tfl adapter::net::behavior::org_stream_registry::` ≥ 12 tests with inverses; loom schedules named in the report |
+| 0.3 Lifecycle model | new `src/adapter/net/behavior/org_stream_lifecycle.rs`: the record of §2.6 (`input` incl. `Closed`, `output` incl. `Draining(HandlerResult)`, `terminal`, `incarnation`) and a supervisor model of §2.2 over abstract handler/pump/semaphore/grant/terminal pieces (no fold, no network) | Obligations, each a named witness with an inverse: (a) SS starts `input = Ended`; (b) END idempotent, never touches `output`; (c) **handler return with queued output and zero credit → not terminal; a later valid GRANT is credited and the drain completes; then and only then `Completed(Ok)`**; (d) **deadline, cancel and revocation fire while draining and produce their own terminal, discarding the remainder**; (e) **handler `Err` → `Completed(Err(status))` after drain; never reported `Ok`**; (f) **handler return (Ok or Err) on CS/DX with `input = Open` → `input = Closed`, later CHUNKs dropped with bytes released, END a no-op, terminal emitted without waiting for END**; (g) retire from every state incl. `Draining`, first writer wins; (h) frames after terminal dropped; GRANT during `Draining` credited, CHUNK/END during `Draining` dropped; (i) pump parked on zero credit is released and stopped by retire; `send_wait` blocked over budget wakes closed; (j) terminal emitted exactly once, after pump stop, under every reason; (k) queued-data policy per reason matches the §2.2 table; (l) two independent calls unaffected by each other's retire; (m) **request chunk that cannot be reserved/delivered on an admitted call → call retired `ResourceExhausted`, no `Ok` terminal is reachable afterwards**; (n) **counter reservation refused at the node level leaves call and caller counters unchanged; cancel racing dequeue releases exactly the reserved bytes** | `cargo tfl adapter::net::behavior::org_stream_lifecycle::` ≥ 20 tests; each obligation (a)–(n) has an inverse (flip one table entry, reorder abort/emit, or skip a release → red) |
+| 0.4 Transaction model | new `src/adapter/net/behavior/org_stream_registry.rs`: `reserve`/`release`/`install`/`confirm`/`retire`/`complete` with incarnations and `authority_epoch`, over an abstract authority (floors, generation, poison) and an abstract fold effect boundary — no `verify_org_admission` call yet | Schedules under `loom` where the interleaving matters (`tests/loom_models.rs` pattern) or deterministic interleaving otherwise: raise between reserve and install ⇒ install denies, zero effects; **retire between install and `confirm` ⇒ `confirm` fails, zero fold effects, retire path emits nothing and completes the record**; retire after `confirm` ⇒ delivered through the supervisor; policy veto ⇒ release, key reusable, guard slot untouched; fold refusal after `confirm` ⇒ release; late `retire(old_incarnation)` after key reuse ⇒ no-op on successor; `complete` exactly once; requalify keeps an unaffected call across a generation move and retires an affected one; store replacement retires all; budgets refuse the N+1th reserve; **duplicate opening while live ⇒ `ActiveCallOwned` before decode; duplicate after completion inside the guard window ⇒ `Replay`/`CallIdCollision`** | `cargo tfl adapter::net::behavior::org_stream_registry::` ≥ 14 tests with inverses; loom schedules named in the report |
 
 ### Stage 1 — core protected server-streaming
 
@@ -777,7 +835,7 @@ cross-language matrix.
 | Node | napi verbs + `org.ts` typed wrappers + `OrgServeHandle` runtime handle + `classifyOrgError` on stream errors | `bindings/node/test/org_live.test.ts` siblings per shape; built addon on the CI feature list (`ci.yml:3406-3454`); consumer-compile |
 | Python | sync verbs + `AsyncOrgClient` + serve verbs + `.pyi` + `org_err_to_py` on stream errors | `bindings/python/tests/test_org_live.py` siblings (sync and async); wheel-acceptance profile (`ci.yml:3856-3857`); `task.cancel()` propagation witness |
 | Go/C | `net_org_*` streaming exports, dispatchers, handle-type sharing, ABI stamp, baseline, headers | `go/org_test.go` live siblings with `RUN_INTEGRATION_TESTS=1` and cgo on; C skill example against the single `libnet`; `check-ffi-exports.py`, header-parity, callback-buffer scripts green |
-| Pure SDKs (Q6) | re-exports | `check-ts-consumer.sh` imports |
+| Pure SDKs (Q6) | re-exports | TS: a consumer program that calls **and serves** all four shapes through `@net-mesh/sdk` alone (`check-ts-consumer.sh` pattern); Python: a consumer/runtime run that calls and serves through `net_sdk` alone — both are executable CI steps, not import checks |
 | Cross-language | new `tests/cross_lang_org/streaming_opening_vectors.json` generated by the `gen_org_error_fixtures` pattern; each runtime against Rust in both roles; one mixed non-Rust pair | every runtime consumes the vector file (today only Rust consumes `golden_vectors_streaming.json`) |
 
 **Exit:** exact-head CI green; artifact/declaration/header/error parity; unary
