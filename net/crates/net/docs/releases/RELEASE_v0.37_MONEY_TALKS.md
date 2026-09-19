@@ -101,7 +101,7 @@ Payment and admission refusals are the `ERR_PAYMENT` application error with one 
 
 **Node / TypeScript**
 
-- `submitTask` accepts an optional `taskId`, plus optional `service` / `revision` addressing a catalog entry. Those two are **free-path only**: a catalog's paid entry refuses the uncharged submit verb with `ERR_PAYMENT` / `missing_quote` before the executor runs. **Paid A2A is deferred in both directions** — no serving, and no caller verbs either (`describeA2a`, prepare/purchase and `submitTaskPaid` have no Node twin). Free behavior is unchanged.
+- `submitTask` accepts an optional `taskId`, plus optional `service` / `revision` addressing a catalog entry. Those two are **free-path only**: a catalog's paid entry refuses the uncharged submit verb with `ERR_PAYMENT` / `no_reservation` before the executor runs — structurally, before the payment gate is even consulted, because there is no admission record to redeem against (`missing_quote` is the different case where a reservation exists but carries no quote header). **Paid A2A is deferred in both directions** — no serving, and no caller verbs either (`describeA2a`, prepare/purchase and `submitTaskPaid` have no Node twin). Free behavior is unchanged.
 
 **Go**
 

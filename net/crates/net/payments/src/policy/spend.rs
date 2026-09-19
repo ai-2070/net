@@ -190,24 +190,24 @@ pub struct ApprovalRecord {
     /// Capability the quote binds (display form), for redemption lookup.
     #[serde(default)]
     pub capability: String,
-    /// The quote's input binding, denormalized out of `quote_b64` for
-    /// the same reason `capability` is: redemption lookup.
-    ///
-    /// An approval authorizes **one purchase**, and two concurrent
-    /// purchases of the same capability differ only here. Without it
-    /// the only key is the capability, so a resuming caller is handed
-    /// whichever hold sorts first by quote id — which may be the other
-    /// purchase's. It then leaves that hold alone (correctly) and
-    /// quotes fresh, so its *own* granted approval is never found and
-    /// the human is asked a second time for work they already
-    /// authorized.
-    ///
-    /// Defaulted for stores written before the field existed: those
-    /// records are all capability-level quotes, which is exactly what
-    /// `None` means.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_hash: Option<String>,
     /// The quote envelope's canonical bytes, base64.
+    ///
+    /// This is the authority for **what** the approval authorizes: the
+    /// provider signed it, an edited policy file cannot lie about it,
+    /// and it carries the quote's input binding — which
+    /// [`SpendPolicyEngine::approved_quote_for_input`] reads from here
+    /// rather than from a field beside it.
+    ///
+    /// That binding is deliberately **not** denormalized alongside.
+    /// `Option<String>` beside the envelope cannot distinguish "this
+    /// quote binds no input" from "written by a build that did not
+    /// record the binding": both are `None` after `#[serde(default)]`.
+    /// So on upgrade an input-bound approval would read as unbound,
+    /// miss the exact-match lookup, and re-park the human to approve a
+    /// purchase they already authorized — the operator's decision
+    /// silently discarded while the record proving it sat on disk. The
+    /// envelope always knows, and records written before this lookup
+    /// existed carry it too.
     #[serde(default)]
     pub quote_b64: String,
 }
@@ -361,7 +361,6 @@ impl SpendPolicyEngine {
 
         let quote_id = quote.quote_id.clone();
         let capability = quote.capability.clone();
-        let input_hash = quote.input_hash.clone();
         let day = now_ns / NS_PER_DAY;
         let requirements_asset = requirements.asset.clone();
         let counter_key = format!("{day}|{network}|{requirements_asset}");
@@ -458,7 +457,6 @@ impl SpendPolicyEngine {
                                 ApprovalRecord {
                                     state: ApprovalState::Pending,
                                     capability: capability.clone(),
-                                    input_hash: input_hash.clone(),
                                     quote_b64: base64::engine::general_purpose::STANDARD
                                         .encode(bytes),
                                 },
@@ -825,6 +823,22 @@ impl SpendPolicyEngine {
     /// `None` to accept any hold for the capability, or `Some(binding)`
     /// to demand that exact binding (itself `Option`, since absence is
     /// a legitimate binding).
+    ///
+    /// The binding is read out of the held **envelope**, which is the
+    /// signed authority for what the human approved, rather than out of
+    /// a denormalized field beside it. A field is an index, and an
+    /// index has an absent case: a record written before the index
+    /// existed would read as an unbound quote and lose the exact match,
+    /// discarding a live approval. The envelope has no absent case.
+    ///
+    /// Only the input-scoped query pays for the decode — the
+    /// capability-only one never needs the binding.
+    ///
+    /// A held envelope that does not verify is skipped, not raised: it
+    /// is not redeemable by anyone (the caller re-verifies before
+    /// riding it and clears it), so it must neither hide a valid
+    /// sibling hold nor fail an unrelated purchase of the same
+    /// capability.
     async fn find_approved(
         &self,
         capability: &str,
@@ -839,14 +853,15 @@ impl SpendPolicyEngine {
             {
                 continue;
             }
-            if let Some(wanted) = required_input {
-                if record.input_hash.as_deref() != wanted {
-                    continue;
-                }
-            }
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&record.quote_b64)
                 .map_err(|e| SpendError::Malformed(e.to_string()))?;
+            if let Some(wanted) = required_input {
+                match PaymentQuote::from_json_bytes(&bytes) {
+                    Ok(held) if held.input_hash.as_deref() == wanted => {}
+                    _ => continue,
+                }
+            }
             return Ok(Some((quote_id.clone(), bytes)));
         }
         Ok(None)
@@ -1070,5 +1085,106 @@ mod tests {
             .await
             .expect("lookup")
             .is_none());
+    }
+
+    /// The input binding comes off the provider-signed envelope, not
+    /// off a field beside it — because a record persisted before such a
+    /// field existed does not have one, and `Option::default()` reads
+    /// an input-**bound** approval as unbound. The exact-match lookup
+    /// then misses the operator's decision, the caller quotes fresh,
+    /// and the human is parked again to approve a purchase they already
+    /// approved while the record proving it sits on disk.
+    ///
+    /// The fixture is written as the **old JSON** rather than as the
+    /// struct with a field cleared: the upgrade only exists on the
+    /// deserialization path, so a struct-built record cannot show it.
+    #[tokio::test]
+    async fn an_approval_persisted_before_the_binding_field_existed_still_binds_its_input() {
+        use crate::facilitator::mock::{MOCK_NETWORK, MOCK_SCHEME};
+        use crate::x402::requirements::PaymentRequirements;
+        use crate::x402::X402Carry;
+        use base64::Engine as _;
+        use net::adapter::net::identity::EntityKeypair;
+
+        const NOW: u64 = 1_000_000_000_000_000;
+        const CAPABILITY: &str = "prov/legacy-tool";
+        const BOUND: &str = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+        const OTHER: &str = "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spend-policy.json");
+        let provider = EntityKeypair::generate();
+        let registry = crate::core::registry::default_mock_registry(provider.entity_id().clone());
+        let mut quote = PaymentQuote::new(
+            provider.entity_id().clone(),
+            EntityKeypair::generate().entity_id().clone(),
+            CAPABILITY,
+            Some(BOUND.to_string()),
+            X402Carry::author(&PaymentRequirements {
+                scheme: MOCK_SCHEME.into(),
+                network: MOCK_NETWORK.into(),
+                amount: "2500".into(),
+                asset: "musd".into(),
+                pay_to: "mock-provider-settle-addr".into(),
+                max_timeout_seconds: 60,
+                extra: None,
+            })
+            .expect("author requirements"),
+            registry.reference().expect("registry ref"),
+            NOW,
+            NOW + 60_000_000_000,
+        );
+        crate::core::canonical::SignedEnvelope::sign_with(&mut quote, &provider).expect("sign");
+        let bytes = crate::core::canonical::canonical_bytes(&quote).expect("canonical bytes");
+        let quote_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        // Exactly what the previous schema wrote: state, capability,
+        // quote_b64 — and no binding key at all.
+        let legacy = format!(
+            r#"{{"approvals":{{"{}":{{"state":"approved","capability":"{}","quote_b64":"{}"}}}}}}"#,
+            quote.quote_id, CAPABILITY, quote_b64
+        );
+        std::fs::write(&path, legacy.as_bytes()).expect("write pre-upgrade store");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read back")
+                .contains("input_hash"),
+            "the fixture must be the pre-upgrade shape: no binding field on the record"
+        );
+
+        let engine = SpendPolicyEngine::new(path, SpendProfile::Production);
+
+        // The approval the human granted before the upgrade is still
+        // this purchase's approval.
+        let (id, held) = engine
+            .approved_quote_for_input(CAPABILITY, Some(BOUND))
+            .await
+            .expect("lookup")
+            .expect("an approval persisted by the previous schema must still match its own input");
+        assert_eq!(id, quote.quote_id);
+        assert_eq!(
+            held, bytes,
+            "the bytes handed back must be the envelope the human approved"
+        );
+
+        // ...and it is still exactly one purchase's approval. Absent
+        // field must not degrade into a wildcard that lets a different
+        // input — or a capability-level quote — ride a bound hold.
+        assert!(
+            engine
+                .approved_quote_for_input(CAPABILITY, Some(OTHER))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a different purchase must not ride this bound approval"
+        );
+        assert!(
+            engine
+                .approved_quote_for_input(CAPABILITY, None)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a capability-level purchase must not ride an input-bound approval"
+        );
     }
 }

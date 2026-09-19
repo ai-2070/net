@@ -35,6 +35,11 @@ from pathlib import Path
 from net import CapabilityGateway, NetMesh, PaymentProvider, PaymentRefused
 
 PSK = "a7" * 32
+
+# One value, used by both the join and its diagnostic: two literals drift the
+# moment either is edited, and a message that misreports its own timeout sends
+# the reader looking in the wrong place.
+HANDSHAKE_TIMEOUT_S = 5
 SERVICE = "summarize"
 REVISION = "r1"
 
@@ -71,7 +76,7 @@ def handshake(connector: NetMesh, acceptor: NetMesh) -> None:
     thread.start()
     time.sleep(0.05)
     connector.connect(acceptor.local_addr, acceptor.public_key, acceptor.node_id)
-    thread.join(timeout=5)
+    thread.join(timeout=HANDSHAKE_TIMEOUT_S)
     if errors:
         raise errors[0]
     # A join that TIMED OUT is not a completed handshake. Without this the
@@ -79,7 +84,8 @@ def handshake(connector: NetMesh, acceptor: NetMesh) -> None:
     # error that names neither the handshake nor this thread.
     if thread.is_alive():
         raise RuntimeError(
-            "the accept side is still blocked 5s after connect returned: the "
+            "the accept side is still blocked "
+            f"{HANDSHAKE_TIMEOUT_S}s after connect returned: the "
             "noise handshake never completed, so nothing below is routable"
         )
 

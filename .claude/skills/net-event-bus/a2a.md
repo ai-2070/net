@@ -153,12 +153,19 @@ if buy["status"] == "requires_payment_approval":
     gw.approve_payment(buy["quote_id"])      # operator decision
     buy = json.loads(gw.purchase_task(prepared))
 for _ in range(8):
-    # `unknown` is a lost pay reply, not a refusal. The SAME stored payment
-    # resolves it — this call re-sends it, it does not buy a second time.
-    if buy["status"] != "unknown":
-        break
-    time.sleep(0.2)
-    buy = json.loads(gw.purchase_task(prepared))
+    # Two retryable shapes, not one. `unknown` is a lost pay reply, not a
+    # refusal — the SAME stored payment resolves it, so this call re-sends
+    # it and does not buy a second time. `failed` with `retryable: true` is
+    # a transient local condition (a store read, a sibling still authoring
+    # this purchase, a prepare still in flight); it also re-sends, and
+    # treating it as terminal is what pushes a caller into re-preparing.
+    if buy["status"] == "unknown" or (
+        buy["status"] == "failed" and buy.get("retryable")
+    ):
+        time.sleep(0.2)
+        buy = json.loads(gw.purchase_task(prepared))
+        continue
+    break
 if buy["status"] != "paid":                  # denied | failed | unknown
     # denied + funds_ambiguous=True is NOT proven non-payment: an operator
     # resolves it with gw.a2a_resolve_attempt(...). Do not retry it. An

@@ -10,14 +10,30 @@ myself at this head, not lane claims; where a lane is the only source it says so
 ## Probe reproduction, before any repair
 
 Reproduced at `f7e6b4bba`, which is `0743ca779` — the head the packet itself
-pins — **plus exactly one commit**: "A2A review round 2: land the reviewer's
-repair probes and packet verbatim". That commit adds her probe files and
-nothing else, and it is the minimum needed to run them at all, since the
-probes do not exist at `0743ca779`. So the production code under test is
-byte-identical to the reviewed head; `git merge-base --is-ancestor 0743ca779
-f7e6b4bba` confirms the ancestry. The candidate being closed, `84d178407`, is
-the later repaired head — it is what the repairs land on, not what the probes
-were reproduced against.
+pins — plus exactly one commit: "A2A review round 2: land the reviewer's
+repair probes and packet verbatim". It is the minimum needed to run the probes
+at all, since they do not exist at `0743ca779`.
+
+The byte-identity of the production code is established by the diff, not by
+reachability. An earlier version of this paragraph cited
+`git merge-base --is-ancestor`, which was the wrong evidence: ancestry says
+nothing about how many commits separate two heads or what they touched. The
+claim rests on this instead, and it is cheap to re-run:
+
+```
+git rev-list --count 0743ca779..f7e6b4bba   # 1
+git diff --name-only 0743ca779 f7e6b4bba    # 5 files
+```
+
+All five are review artifacts or probe files —
+`docs/internal/reviews/A2A_PAID_ADMISSION_REVIEW_0743ca7.md`, the two
+`startup-*.patch` files, `payments/tests/review_repair_expiry.rs` and
+`sdk/tests/review_repair_provider.rs`. Filtering that list to anything outside
+`tests/` or `docs/` returns **zero** paths, so no production source differs
+between the reviewed head and the head the probes ran at.
+
+The candidate being closed, `84d178407`, is the later repaired head — what the
+repairs land on, not what the probes were reproduced against.
 
 Reproducing the packet at that head:
 

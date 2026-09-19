@@ -94,10 +94,15 @@ pub enum TaskState {
     /// `admission_revoked`).
     ///
     /// **The one wire addition of the paid-admission slice.** Because
-    /// [`TaskState`] is a serde-tagged enum, a Rust requester built
-    /// before this variant existed cannot decode a status reply that
-    /// carries it; the Python and Node bindings return the status as a
-    /// JSON string and pass the tag through untouched. Nothing on the
+    /// [`TaskState`] is a serde-tagged enum, a requester built before
+    /// this variant existed cannot decode a status reply that carries
+    /// it — and that includes the bindings. A **previously built**
+    /// Python or Node artifact fails exactly as a previously built Rust
+    /// requester does, because the decode happens in this enum before
+    /// any JSON exists; returning status "as a JSON string" does not
+    /// make a native binding a passthrough shim. Passing the tag
+    /// through needs a binding built from the release that introduced
+    /// it, or later. Nothing on the
     /// free path produces it, so only a deployment that opts into a
     /// configured catalog can put one on the wire.
     Interrupted {

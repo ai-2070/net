@@ -65,7 +65,7 @@ this one says so instead of implying otherwise.
 |---|---|
 | `a2a_paid.rs` | the full surface: `serve_a2a_configured` + `A2aCallerFlow` |
 | `a2a_paid.py` | the same flow through `PaymentProvider` / `CapabilityGateway` |
-| TypeScript, Go, C | no paid A2A surface exists to exercise — Go and C have no A2A at all, and Node has none in either direction: paid serving is an explicit non-goal and no caller verbs are bound either (`submitTask` is the free verb only). `docs/data/examples.yaml` records the reason per binding. |
+| TypeScript, Go, C | no paid A2A surface exists to exercise — Go and C have no A2A at all, and Node has none in either direction: paid serving is an explicit non-goal, and no *paid* caller verbs are bound — `submitTask` is exported, but it is the free, uncharged verb, and there is no `describeA2a`, prepare/purchase pair or `submitTaskPaid`. `docs/data/examples.yaml` records the reason per binding. |
 
 **The Rust and Python packages publish under a different name than they import.** `cargo add net-mesh-sdk` then `use net_sdk::…`; `pip install net-mesh-sdk` then `from net_sdk import …`. There is no package called `net-sdk` — don't install one.
 

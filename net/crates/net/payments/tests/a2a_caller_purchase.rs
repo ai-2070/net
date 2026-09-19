@@ -265,6 +265,15 @@ impl A2aProviderChannel for ScriptedTasks {
 }
 
 /// What the scripted payment channel does with the next pay call.
+///
+/// **Every arm but `Forward` puts the payload through the real engine
+/// first: the money moves and a billing event is minted on each one.**
+/// So every injection is spent as soon as it fires — the mode disarms
+/// itself back to `Forward` the moment its staged reply is produced
+/// (hence the `Once` in each name), and a world can never be charged
+/// twice for one staged fault. An injection whose *engine* call failed
+/// is left armed on purpose: a broken engine is reported as itself, not
+/// dressed up as the fault under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayMode {
     /// Straight through to the engine.
@@ -280,7 +289,7 @@ enum PayMode {
     /// "rejected" anyway. A caller cannot tell that from a refusal that
     /// settled nothing, which is the whole reason an exposed refusal is
     /// financially ambiguous.
-    RejectAlways,
+    RejectOnce,
 }
 
 /// The payment channel, scripted: counts, fault injection, and a gate.
@@ -376,7 +385,7 @@ impl ProviderChannel for ScriptedChannel {
                     required: "confirmed(3)".to_string(),
                 })
             }
-            PayMode::RejectAlways => {
+            PayMode::RejectOnce => {
                 // Settle first, refuse second. A rejection that never
                 // reached the engine would leave nothing exposed — the
                 // ambiguity witness would then be about a string, not
@@ -387,6 +396,9 @@ impl ProviderChannel for ScriptedChannel {
                     "an exposed refusal is staged on top of a settlement the engine \
                      really performed, got {settled:?}"
                 );
+                // Spent: this arm charges the caller every time it
+                // fires, so it fires once, like its siblings.
+                self.set_mode(PayMode::Forward);
                 Ok(PayResponse::Rejected {
                     reason: "provider says no".to_string(),
                 })
@@ -1596,7 +1608,7 @@ async fn an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_att
         .prepare_task(NODE, &w.offer, &brief("t-exposed"))
         .await
         .expect("prepare");
-    w.channel.set_mode(PayMode::RejectAlways);
+    w.channel.set_mode(PayMode::RejectOnce);
 
     let denied = w.flow.purchase_task(NODE, "t-exposed").await;
     let A2aPurchase::Denied {
@@ -1681,6 +1693,67 @@ async fn an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_att
         resolved.quote_id.as_deref(),
         quote_id.as_deref(),
         "the quote it was about is retained"
+    );
+}
+
+/// The injected refusal is spent when it fires — the next purchase on
+/// the same world is served, and the provider banks one charge per
+/// purchase.
+///
+/// This is about the harness being honest about money. The arm settles
+/// for real before answering "rejected", so an arm that stayed hot
+/// would charge every later purchase on that world while telling the
+/// caller no each time: a test staging one refusal would bank two
+/// charges, and the provider's log and the caller's record would
+/// disagree without anything failing. So the ledgers are reconciled
+/// here: two purchases, two billing events, and the purchase nobody
+/// staged a fault for is `Paid` on both sides.
+#[tokio::test]
+async fn an_injected_refusal_is_spent_when_it_fires_and_the_next_purchase_is_served() {
+    // The mock world, not the exact-SVM one: the scripted SVM wallet
+    // returns one constant authorization blob, so a second purchase
+    // there is refused by the engine's consumed-payload index before
+    // the channel's mode is ever consulted — which would make this
+    // witness about payload identity instead of about the injection.
+    let w = world().await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-staged"))
+        .await
+        .expect("prepare");
+    w.channel.set_mode(PayMode::RejectOnce);
+    let denied = w.flow.purchase_task(NODE, "t-staged").await;
+    assert!(
+        matches!(denied, A2aPurchase::Denied { .. }),
+        "expected the staged refusal, got {denied:?}"
+    );
+    assert_eq!(
+        w.billed().await,
+        1,
+        "the staged refusal settled for real, so it cost one charge"
+    );
+
+    // A second purchase, on a key nobody staged anything for.
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-after"))
+        .await
+        .expect("prepare");
+    let second = w.flow.purchase_task(NODE, "t-after").await;
+    let billed = w.billed().await;
+    assert!(
+        matches!(second, A2aPurchase::Paid { .. }),
+        "the refusal injection must be spent when it fires: an unstaged purchase was \
+         refused too, and the engine settled it anyway — {billed} charges banked for \
+         {sends} payments, got {second:?}",
+        sends = w.channel.pay_sends()
+    );
+    assert_eq!(
+        billed, 2,
+        "one charge per purchase — the stale injection would bank a second refusal"
+    );
+    assert_eq!(
+        w.state("t-after").await,
+        StateTag::Paid,
+        "and the caller's record agrees with the provider's log"
     );
 }
 

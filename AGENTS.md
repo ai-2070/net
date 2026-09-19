@@ -61,9 +61,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 # net-payments. It does NOT document `net-python`, and nothing else in CI does
 # either — so the third command has no CI counterpart to match and this local
 # run is the only rustdoc gate the pyo3 binding has. Its feature list is
-# maintained by hand from the `python-tests` job's `maturin develop` set (the
-# widest net-python surface CI compiles), minus `extension-module`, which is a
-# maturin link-mode feature and not a code surface. Keep it in step with that
+# maintained by hand from the `python-tests` job's `maturin develop` set, minus
+# `extension-module`, which is a maturin link-mode feature and not a code
+# surface. That set is NOT the widest net-python surface CI compiles: the
+# `ffi-clippy` python matrix entry additionally compiles `dataforts`,
+# `nat-traversal` and `port-mapping`, so neither list subsumes the other and
+# both are hand-maintained. Keep it in step with that
 # step if the build set changes.
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps --features full
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-payments --no-deps --all-features

@@ -938,12 +938,16 @@ impl CallerPaymentFlow {
         if let Some((held_id, held_bytes)) = held {
             match PaymentQuote::from_json_bytes(&held_bytes) {
                 Ok(held_quote) if !held_quote.is_expired_at(self.clock.now_ns()) => {
-                    // The lookup already selected on the record's
-                    // denormalized binding; this re-reads it off the
-                    // provider-**signed** envelope, which is the only
-                    // copy an edited policy file cannot lie about. A
-                    // hold that disagrees is not this purchase's, so
-                    // it is left on file rather than ridden.
+                    // Kept as defence in depth, not as the selection.
+                    // The lookup now reads the binding off this same
+                    // provider-**signed** envelope — there is no
+                    // denormalized copy in the record to disagree with
+                    // it any more — so this re-check can only fail if
+                    // the two decodes of one envelope disagree. Cheap,
+                    // and it means a hold that is not this purchase's
+                    // is left on file rather than ridden even if the
+                    // lookup is ever changed to index on something
+                    // softer than the signature.
                     if held_quote.input_hash.as_deref() == input_hash {
                         approval_id = Some(held_id);
                         resumed = Some(held_bytes);

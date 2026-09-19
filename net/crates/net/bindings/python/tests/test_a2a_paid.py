@@ -288,6 +288,25 @@ class Caller:
         return json.loads(self.gateway.a2a_attempts())
 
 
+def _release(node, mesh):
+    """Tear down a harness node that may never have been constructed.
+
+    `Provider.__init__` serves (and validates at serve time) and
+    `Caller.__init__` builds a gateway, so either can raise over a mesh
+    that is already started. A `finally` naming the unbound result would
+    then raise `NameError` *over* the real failure and leak the mesh, so
+    teardown releases whichever half exists: the node if it was built,
+    the bare mesh if it was not.
+    """
+    if node is not None:
+        node.close()
+        return
+    try:
+        mesh.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _wait_state(mesh, node, task_id, want, timeout=8.0):
     """Poll until the executor's record reaches `want`. The precondition the
     assertion is about — never a fixed sleep."""
@@ -332,11 +351,20 @@ def _topology(tmp_path, *, callers=(("c", "dev_test"),), preflight=None, offers=
     pmesh.start()
     for _name, _profile, cmesh in cmeshes:
         cmesh.start()
-    provider = Provider(tmp_path, pmesh, preflight=preflight, offers=offers)
-    built = [
-        Caller(tmp_path, cmesh, provider, name=name, profile=profile)
-        for name, profile, cmesh in cmeshes
-    ]
+    provider = None
+    built = []
+    try:
+        provider = Provider(tmp_path, pmesh, preflight=preflight, offers=offers)
+        for name, profile, cmesh in cmeshes:
+            built.append(Caller(tmp_path, cmesh, provider, name=name, profile=profile))
+    except BaseException:
+        # A half-built topology is still N started meshes, and the test
+        # that asked for it never gets a `finally`. Release what exists
+        # and let the real failure out unchanged.
+        for idx, (_name, _profile, cmesh) in enumerate(cmeshes):
+            _release(built[idx] if idx < len(built) else None, cmesh)
+        _release(provider, pmesh)
+        raise
     return provider, built
 
 
@@ -550,8 +578,9 @@ def test_stopping_the_serve_handle_releases_the_journal_with_the_provider_alive(
     """
     mesh = _mesh()
     mesh.start()
-    provider = Provider(tmp_path, mesh)
+    provider = None
     try:
+        provider = Provider(tmp_path, mesh)
         # Control: while the handle serves, the journal is owned.
         assert provider.handle.serving is True
         held = subprocess.run(
@@ -585,7 +614,7 @@ def test_stopping_the_serve_handle_releases_the_journal_with_the_provider_alive(
             "the provider object is alive: " + taken.stdout + taken.stderr
         )
     finally:
-        provider.close()
+        _release(provider, mesh)
 
 
 def test_the_operator_queue_refuses_once_no_serve_handle_is_live(tmp_path):
@@ -600,8 +629,9 @@ def test_the_operator_queue_refuses_once_no_serve_handle_is_live(tmp_path):
     """
     mesh = _mesh()
     mesh.start()
-    provider = Provider(tmp_path, mesh)
+    provider = None
     try:
+        provider = Provider(tmp_path, mesh)
         assert provider.unresolved() == [], "the queue answers while a handle serves"
         live = provider.provider
         provider.handle.stop()
@@ -611,7 +641,7 @@ def test_the_operator_queue_refuses_once_no_serve_handle_is_live(tmp_path):
             live.a2a_unresolved()
         assert "journal" in str(closed.value), str(closed.value)
     finally:
-        provider.close()
+        _release(provider, mesh)
 
 
 # ---------------------------------------------------------------------------
@@ -1298,10 +1328,11 @@ def test_one_task_id_on_two_providers_is_resolvable_by_naming_the_provider(tmp_p
     pmesh_a.start()
     pmesh_b.start()
     cmesh.start()
-    prov_a = Provider(tmp_path, pmesh_a, name="pa")
-    prov_b = Provider(tmp_path, pmesh_b, name="pb")
-    caller = Caller(tmp_path, cmesh, prov_a, name="col")
+    prov_a = prov_b = caller = None
     try:
+        prov_a = Provider(tmp_path, pmesh_a, name="pa")
+        prov_b = Provider(tmp_path, pmesh_b, name="pb")
+        caller = Caller(tmp_path, cmesh, prov_a, name="col")
         # The SAME task id, prepared and paid on both providers.
         for prov in (prov_a, prov_b):
             caller.provider_node = prov.mesh.node_id
@@ -1349,9 +1380,9 @@ def test_one_task_id_on_two_providers_is_resolvable_by_naming_the_provider(tmp_p
         }
         assert states == {pmesh_a.node_id: "paid", pmesh_b.node_id: "paid"}, states
     finally:
-        caller.close()
-        prov_a.close()
-        prov_b.close()
+        _release(caller, cmesh)
+        _release(prov_a, pmesh_a)
+        _release(prov_b, pmesh_b)
 
 
 def test_two_caller_identities_sharing_one_store_see_only_their_own(tmp_path):
