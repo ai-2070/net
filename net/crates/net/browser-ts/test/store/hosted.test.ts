@@ -561,7 +561,7 @@ describe('a joiner installs the host’s world', () => {
     }
   });
 
-  it('refuses a second store answering to the same name on one transport', () => {
+  it('refuses a second store answering to the same name on one transport', async () => {
     // Two stores at one address make the address ambiguous, and the
     // whole point of the address is that registration order does not
     // decide. So the ambiguity is refused where it is legible — at
@@ -592,15 +592,112 @@ describe('a joiner installs the host’s world', () => {
     expect(refused?.code).toBe('invalid-data');
     expect(refused?.message).toContain('already hosted on this transport');
 
-    // A DIFFERENT name on the same transport is fine, and so is the
-    // same name once the first store has closed.
+    // A DIFFERENT name on the same transport is fine — and it SERVES,
+    // which "0 handles on a store nobody has joined" did not say.
     const sibling = hostStore<Ship, Actions, Inputs>({ ...common, store: 'lobby' });
-    expect(sibling.counts().handles).toBe(0);
-    void first.close().then(() => {
-      const successor = hostStore<Ship, Actions, Inputs>({ ...common, store: 'world' });
-      void successor.close();
+    net.injectLabelled(
+      HOST_NODE,
+      OTHER_NODE,
+      derivedStreamId('store/lobby'),
+      encodeMessage({ k: 'join', q: 'c'.repeat(16) as Hex, def: 'ship', ver: 1, store: 'lobby', key: 'x', aud: ['crew'] }),
+    );
+    await flush();
+    expect(sibling.counts().handles).toBe(1);
+
+    // The name FREES on close, and the successor serves under it.
+    // Awaited, and asserted: `void first.close().then(...)` inside a
+    // synchronous test made this unfalsifiable — the review showed
+    // the file still reporting 51 passed with the release deleted,
+    // failing only later as an unhandled rejection blamed on another
+    // test.
+    await first.close();
+    const successor = hostStore<Ship, Actions, Inputs>({ ...common, store: 'world' });
+    net.injectLabelled(
+      HOST_NODE,
+      OTHER_NODE,
+      derivedStreamId('store/world'),
+      encodeMessage({ k: 'join', q: 'd'.repeat(16) as Hex, def: 'ship', ver: 1, store: 'world', key: 'x', aud: ['crew'] }),
+    );
+    await flush();
+    expect(successor.counts().handles).toBe(1);
+
+    await successor.close();
+    await sibling.close();
+  });
+
+  it('lets a sibling of another definition answer, and says nothing itself', async () => {
+    // A node hosting `app.chat` and `app.world`. An ordinary joiner
+    // of one used to have the OTHER reject it first — loudly, with
+    // the joiner's own `q`, `version-mismatch` — so `ready()` was
+    // already rejected when the right owner's manifest arrived. The
+    // address is read before the definition now, and an owner that
+    // is not the addressee is silent. Review probe K.
+    const net = mesh();
+    const time = timeline();
+    const transport = net.node(HOST_NODE);
+    const chat = defineStore<{ lines: number }, Record<string, never>, Record<string, never>>({
+      id: 'app.chat',
+      version: 1,
+      state: raw => ({ lines: Number((raw as { lines?: number }).lines ?? 0) }),
+      empty: () => ({ lines: 0 }),
+      actions: {},
+      inputs: {},
     });
-    void sibling.close();
+    const chatHost = hostStore({
+      definition: chat,
+      transport,
+      store: 'chat',
+      streamId: 'store/chat',
+      initialState: { lines: 3 },
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: (state: { lines: number }) => state,
+      actions: {},
+      inputs: {},
+      now: time.now,
+      schedule: time.schedule,
+    });
+    const worldHost = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport,
+      store: 'world',
+      streamId: 'store/world',
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    const joiner = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      store: 'world',
+      streamId: 'store/world',
+      audience: ['crew'],
+      key: 'x',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await joiner.ready();
+
+    expect(joiner.getStatus().phase).toBe('ready');
+    expect(joiner.getState().hull).toBe(FULL.hull);
+    expect(worldHost.counts().handles).toBe(1);
+    // The chat store neither answered nor allocated, and it counted
+    // the frame as another store's rather than as a bad version.
+    expect(chatHost.counts().handles).toBe(0);
+    expect(chatHost.counters()['join-other-store']).toBe(1);
+    expect(chatHost.counters()['join-wrong-definition'] ?? 0).toBe(0);
+
+    await joiner.close();
+    await worldHost.close();
+    await chatHost.close();
   });
 
   it('serves two callers their own projections', async () => {
@@ -1202,7 +1299,18 @@ describe('a join whose manifest is lost', () => {
     const time = timeline();
     const host = hosted(net, time);
     net.silence(HOST_NODE);
-    const store = joined(net, time, 'unanswered');
+    const store = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      // A store nobody hosts, so the timeout has a name to report.
+      store: 'unanswered',
+      audience: ['crew'],
+      key: 'unanswered',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
     const outcome = store.ready().then(
       () => 'installed',
       (error: unknown) => (error as StoreError).code,
@@ -1216,6 +1324,10 @@ describe('a join whose manifest is lost', () => {
     expect(await outcome).toBe('timeout');
     expect(store.getStatus().phase).toBe('failed');
     expect(store.getStatus().error?.code).toBe('timeout');
+    // The message NAMES the store asked for: a mistyped address
+    // settles here too, and "the store never answered" would send
+    // the reader looking at the network.
+    expect(store.getStatus().error?.message).toContain('unanswered');
     // The first join plus exactly MAX_JOIN_REASKS more, then quiet.
     expect(net.kinds(HOST_NODE).filter(k => k === 'join')).toHaveLength(MAX_JOIN_REASKS + 1);
     await store.close();

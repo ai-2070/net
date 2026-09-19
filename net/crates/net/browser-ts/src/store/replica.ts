@@ -426,7 +426,15 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
       this.#retireAssembly();
       this.#clearView(
         'failed',
-        new StoreError('timeout', 'the store never answered the join'),
+        new StoreError(
+          'timeout',
+          // NAMES THE STORE. A mistyped address settles typed, but
+          // after the full ladder — and "the store never answered"
+          // sends the reader looking at the network when the only
+          // evidence of the real cause is a `join-other-store`
+          // counter on a host they may not be able to read.
+          `no store named ${this.deps.store} answered the join`,
+        ),
       );
       return [];
     }

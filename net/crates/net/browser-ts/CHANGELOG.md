@@ -20,7 +20,13 @@ the README on why it is a sibling package rather than a sub-path.
 
 - **The game store.** `defineStore()`, `hostStore()` and
   `joinStore()`: one authoritative document served to replicas over a
-  mesh stream, with audience projections, correlated actions,
+  mesh stream. A node may host several stores of one definition, so
+  each names itself — `hostStore({store})` declares an address and
+  `joinStore({store})` asks for one; both default to the definition
+  id. The address rides on the `join` frame, because every host store
+  on a node sees every frame and a join names no handle. Two stores
+  answering to one name on one transport is refused at construction.
+  Each store serves with audience projections, correlated actions,
   coalesced inputs, chunked snapshots and a replica that recovers a
   lost manifest or a stalled assembly by asking again. `StoreError`
   carries the code a caller branches on. See `demo/README.md` for the

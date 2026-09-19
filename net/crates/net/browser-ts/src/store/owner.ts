@@ -836,19 +836,32 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     peer: string,
     now: number,
   ): Dispatched {
+    // THE ADDRESS DECIDES WHETHER THIS OWNER MAY SPEAK AT ALL, so it
+    // is read before anything else about the frame.
+    //
+    // Refused SILENTLY — no `no`, no reply: every host store on a
+    // node sees every join, and an owner that is not the addressee
+    // must neither answer it nor refuse it on the addressee's
+    // behalf. The one it IS addressed to answers.
+    //
+    // The order matters and used to be wrong. The definition and
+    // version checks below answer LOUDLY, with the joiner's own `q`,
+    // so a node hosting `app.chat` and `app.world` had the chat
+    // store reject a perfectly good `app.world` join —
+    // `version-mismatch`, status failed — before the world store's
+    // manifest could land. Same defect as the one this address
+    // exists to fix, two rungs higher, and found by review probe K.
+    if (message.store !== this.deps.store) {
+      return this.refuse('join-other-store', []);
+    }
+    // Addressed to THIS store, and wrong about it: that is worth
+    // saying out loud, and it is how a stale client learns it is
+    // stale.
     if (message.def !== this.deps.definition.id) {
       return this.refuse('join-wrong-definition', [this.no(peer, null, 'version-mismatch', message.q)]);
     }
     if (message.ver !== this.deps.definition.version) {
       return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)]);
-    }
-    // Not this store. Refused SILENTLY — no `no`, no reply — because
-    // on a node hosting several stores of one definition every owner
-    // sees every join, and an owner that is not the addressee must
-    // neither answer it nor refuse it on the addressee's behalf. The
-    // one it IS addressed to answers.
-    if (message.store !== this.deps.store) {
-      return this.refuse('join-other-store', []);
     }
     if (this.handles.size >= MAX_HANDLES) {
       return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);

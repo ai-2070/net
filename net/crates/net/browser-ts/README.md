@@ -145,14 +145,18 @@ replicas of it.
 import { defineStore, hostStore, joinStore } from '@net-mesh/browser';
 
 const host = hostStore({
-  definition, transport: node, initialState, maxEventBytes: 8104,
+  // `store` names WHICH store of this definition this is, and a
+  // joiner asks for it by that name. Both default to the definition
+  // id; name them when one node hosts several, or the joins are
+  // ambiguous and the wrong store answers.
+  definition, store: 'world', transport: node, initialState, maxEventBytes: 8104,
   authorize: request => request.audience.every(a => a !== 'command'),
   project: (state, audience) => audience.includes('command') ? state : publicPart(state),
   actions, inputs,
 });
 
 const replica = joinStore({
-  definition, transport: node, host: hostNodeIdHex,
+  definition, store: 'world', transport: node, host: hostNodeIdHex,
   audience: ['crew'], key: 'player', maxEventBytes: 8104,
 });
 await replica.ready();
