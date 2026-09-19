@@ -38,9 +38,10 @@ pub enum AckReason {
     /// The publisher has no authenticated `EntityId` for this peer,
     /// so a credential whose leaf must bind to that identity cannot
     /// be evaluated at all. **Not** a verdict on the credential: the
-    /// prerequisite is a session-bound identity proof (see
-    /// [`MeshNode::prove_identity_to`](crate::adapter::net::MeshNode::prove_identity_to)),
-    /// which token-bearing subscribes perform for the caller.
+    /// prerequisite is a session-bound identity proof
+    /// (`net::adapter::net::MeshNode::prove_identity_to` in the core
+    /// crate, which depends on this one — so it cannot be linked from
+    /// here), which token-bearing subscribes perform for the caller.
     ///
     /// Retryable once identity is established; distinguishing it from
     /// [`Self::Unauthorized`] is the difference between "you are not
