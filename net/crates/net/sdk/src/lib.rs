@@ -231,6 +231,17 @@ pub use ::net::consumer::Ordering;
 pub use ::net::event::{Event, RawEvent, StoredEvent};
 pub use ::net::Filter;
 
+/// `bytes::Bytes`, re-exported because this SDK's public signatures
+/// are written in it — `Mesh::publish`, `publish_many`, every stream
+/// send — so a consumer cannot call them without the type.
+///
+/// Leaving it out meant every user added a direct `bytes` dependency
+/// and had to keep its version in step with ours, or hit a
+/// two-versions-of-one-type mismatch that reads as a nonsense
+/// signature error. Re-exporting makes the version we compiled
+/// against the one they get.
+pub use ::bytes::Bytes;
+
 // Feature-gated re-exports.
 #[cfg(feature = "redis")]
 pub use ::net::config::RedisAdapterConfig;

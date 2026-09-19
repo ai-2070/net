@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use net_sdk::Bytes;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{
     ChannelConfig, ChannelId, ChannelName, PublishConfig, PublishReport, Reliability, Visibility,
