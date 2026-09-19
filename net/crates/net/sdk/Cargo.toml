@@ -190,7 +190,7 @@ time = "0.3"
 # `tests/bootstrap_dep_boundary.rs` reads this crate's and the core's
 # manifests to hold the "a default build has no HTTP server" line,
 # the same way the MCP adapter's boundary test reads its own.
-toml = "0.9"
+toml = "1.0"
 # Workspace lock discipline (clippy disallows std::sync::Mutex::lock);
 # the paid-tool serve test's scripted gate records under a lock.
 parking_lot = "0.12"
