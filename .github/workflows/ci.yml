@@ -2264,8 +2264,26 @@ jobs:
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
+      #
+      # ONE exclusion, and it is not a gap in the gate. The reviewer's C4 probe
+      # `review_aborted_startup_writer_cannot_outlive_its_owner` only reaches
+      # its subject under her scheduling overlay
+      # (docs/internal/reviews/startup-barrier.patch). Run bare — which is what
+      # this auto-discovering sweep does — it fails its own precondition with
+      # "startup reached publication barrier", which she explicitly warns must
+      # not be mistaken for the ownership counterexample. Wiring the overlay in
+      # would mean shipping review instrumentation in the product, which the
+      # packet forbids; weakening her assertion is likewise not allowed. So the
+      # row stays in the tree byte-identical and is excluded HERE by name, with
+      # its acceptance recorded in the round-3 commit: with the barrier alone
+      # and no owner-control patch, it passes. Its three self-contained
+      # siblings are pinned with a floor in the "reviewer repair probes
+      # (provider)" step below.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*, sensing_provider, sensing_consumer, org_exact_sensing)
-        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+        run: |
+          cargo nextest run --no-fail-fast --no-tests=fail \
+            --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures" \
+            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
 
       # === S1: the CONSUMER observation lifecycle ==========================
       #
@@ -2437,6 +2455,326 @@ jobs:
           done
           echo "organization exact planning units: 5 pinned by name, each executed"
 
+      # === A2A paid admission (WS-C) =======================================
+      #
+      # Same discipline as the two steps above, same reason: the
+      # auto-discovery run has already executed this binary, so this step
+      # exists to keep the roster from shrinking silently. The floor is the
+      # count the binary reports (`cargo nextest list` said 41 when it
+      # landed), and the pinned names are the ones carrying a financial or
+      # once-only property outright — cardinality cannot say WHICH witness
+      # vanished.
+      #
+      # `testing` is what gates the journal's `fail_next_write` fault hook,
+      # and it is already in the feature list above; without it
+      # `a_failed_claim_write_never_launches_and_a_retry_launches_once`
+      # cannot inject the failed write it is named for.
+      #
+      # Two of these carry each other and must both stay:
+      # `a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection`
+      # fails if post-payment revocation is rendered as an ordinary unpaid
+      # rejection, and
+      # `a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation`
+      # is the control that keeps the first from passing for a provider that
+      # simply reconciles everything.
+      - name: A2A — paid admission witnesses (WS-C)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_paid_service_refuses_to_start_without_a_gate
+            a_paid_service_refuses_to_start_without_a_journal
+            a_paid_service_refuses_to_start_without_pricing
+            a_free_service_refuses_pricing
+            a_free_service_without_a_journal_runs_preflight_on_direct_submit
+            a_free_service_without_a_journal_enforces_capacity_on_direct_submit
+            prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving
+            an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor
+            a_bearer_submit_is_refused_binding_required
+            a_paid_submit_without_a_reservation_is_refused_before_the_gate
+            a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection
+            a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation
+            a_gate_denial_keeps_the_reservation_and_a_valid_retry_launches_once
+            a_paid_record_resumes_without_a_second_redeem
+            a_paid_record_refuses_a_different_quote_header
+            every_handler_path_performs_only_its_table_transition
+            a_paid_submit_redeems_once_and_runs_once
+            an_identical_retry_returns_the_original_task_without_a_second_redeem
+            concurrent_identical_submits_converge_on_one_admission
+            an_altered_brief_under_the_same_id_is_rejected_before_payment
+            a_reused_proof_from_another_peer_is_refused_and_never_launches
+            a_retry_after_result_retention_never_relaunches_or_redeems
+            a_failed_claim_write_never_launches_and_a_retry_launches_once
+            the_owner_outlives_a_running_executor
+            another_peer_cannot_read_or_cancel_a_paid_task
+            status_cancel_prepare_and_describe_are_uncharged
+            a_restart_after_payment_before_claim_surfaces_paid_not_started_and_resumes_once
+            a_restart_after_claim_surfaces_outcome_unknown_and_never_reruns
+            a_restart_with_a_reconcile_record_keeps_refusing_until_resolved
+            legacy_serve_a2a_ignores_the_service_and_revision_fields
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_paid_admission 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-C paid admission witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_paid_admission \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          # Floor kept AT the reported count, so `$listed` equals it on a
+          # healthy run; `-ge` is what keeps ADDING a witness from tripping
+          # the gate, while a lower floor would let a dropped one pass.
+          [ "$listed" -ge 43 ] \
+            || { echo "::error::expected at least 43 paid admission witnesses executed, saw $listed"; exit 1; }
+          echo "A2A paid admission: $listed executed, $pinned pinned by name, all green"
+
+      # === A2A admission journal (WS-C) ====================================
+      #
+      # The durability half: the lifetime-exclusive `.owner` lock (including
+      # the cross-process probe that re-execs this binary), the CAS
+      # transition table, the atomic launch claim + ledger write, the three
+      # retention classes, and the successor owner's recovery reading. These
+      # are what stop a second charge or a second run after a crash, so the
+      # roster is pinned rather than left to auto-discovery.
+      - name: A2A — admission journal durability (WS-C)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_second_owner_is_excluded_after_a_journal_replacement
+            a_second_open_in_the_same_process_is_refused
+            every_transition_outside_the_table_is_a_conflict
+            the_memory_store_and_the_journal_agree_on_the_transition_table
+            a_gate_denial_note_does_not_change_state
+            claim_launch_writes_the_launched_state_and_the_ledger_atomically
+            unresolved_paid_launched_and_reconcile_records_survive_result_retention
+            an_unpaid_reservation_is_pruned_after_reservation_retention_only
+            a_retired_result_still_answers_ledger_has
+            a_failed_write_leaves_the_journal_untouched
+            a_successor_owner_surfaces_paid_not_started_and_outcome_unknown_without_relaunching
+            capacity_counts_only_in_flight_admissions
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_admission_journal 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-C admission journal witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_admission_journal \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 12 ] \
+            || { echo "::error::expected at least 12 admission journal witnesses executed, saw $listed"; exit 1; }
+          echo "A2A admission journal: $listed executed, $pinned pinned by name, all green"
+
+      # Two defects hid behind one symptom: the A2A wire's array-of-bytes
+      # envelope quadruples a brief, so one past ~2 KB overflowed a packet and
+      # was never delivered — and because `CallOptions::deadline` defaults to
+      # `None`, the caller then waited for a reply that could not come. These
+      # witnesses pin both halves, and `a_brief_at_the_wire_limit_round_trips`
+      # additionally guards the mirrored packet-budget constant: it sends a
+      # brief of exactly the limit over a real wire, so a shrinking budget
+      # fails here instead of silently losing requests again.
+      - name: A2A — call size and deadline bounds
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_brief_at_the_wire_limit_round_trips
+            a_brief_over_the_wire_limit_is_refused_locally_and_never_sent
+            a_brief_past_the_packet_cliff_is_refused_instead_of_vanishing
+            prepare_refuses_an_over_limit_brief_before_reserving
+            a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve
+            a_delivered_request_that_is_never_answered_times_out
+            a_healthy_peer_answers_well_inside_the_deadline
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_call_bounds 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the A2A call-bounds witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_call_bounds \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 14 ] \
+            || { echo "::error::expected at least 14 A2A call-bounds witnesses executed, saw $listed"; exit 1; }
+          echo "A2A call bounds: $listed executed, $pinned pinned by name, all green"
+
+      # ===================================================================
+      # The independent reviewer's counterexample probes.
+      #
+      # These arrived as a HOLD packet: each row asserts the SAFE behaviour,
+      # so a failure reproduces a defect rather than describing one. They are
+      # committed verbatim — no assertion in a `review_*` row has been
+      # weakened, reworded or retargeted — and they are pinned here because a
+      # counterexample that is only ever run by hand stops being a gate the
+      # moment someone is busy. They were RED when they landed and are GREEN
+      # only because the defects are fixed; if one reddens again, a repair has
+      # been undone.
+      # ===================================================================
+      - name: A2A — reviewer counterexample probes (provider + wire)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            review_distinct_prepares_cannot_overbook_one_slot
+            review_stale_financial_transition_rejects_replacement_admission
+            review_accepted_description_is_discoverable
+            review_short_description_control
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" \
+                  --test review_a2a_provider --test review_a2a_wire 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer counterexample probe reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" \
+                       --test review_a2a_provider --test review_a2a_wire \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 45 ] \
+            || { echo "::error::expected at least 45 reviewer provider+wire rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer probes (provider+wire): $listed executed, $pinned pinned by name, all green"
+
+      # The identity/generation repair (reviewer findings R1-R3, R9-R11): a CAS
+      # that checked a state TAG where the invariant needs an immutable record
+      # IDENTITY. Several of these are the only executed evidence for
+      # schedules the reviewer could reach only by source-tracing.
+      - name: A2A — admission identity and journal transaction safety
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            a_decision_holds_its_capacity_slot_across_an_expiring_reservation
+            a_decision_opens_only_on_the_incarnation_it_names
+            a_failed_durability_barrier_is_ambiguous_not_untouched
+            a_gate_barrier_prune_and_reprepare_cannot_replace_a_deciding_admission
+            a_generation_is_never_reused_after_a_prune_and_a_restart
+            a_superseded_redemption_is_retained_against_its_own_admission
+            an_aborted_mutation_completes_its_write_under_its_own_guards
+            concurrent_admissions_of_distinct_tasks_cannot_pass_a_ceiling_of_one
+            concurrent_submits_converge_on_the_deciders_retryable_verdict
+            two_same_stem_journals_never_share_a_temp_file
+            an_installed_org_identity_reaches_a_protected_a2a_lifecycle
+            an_installed_org_identity_refuses_an_unauthorized_target_locally
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test a2a_admission_identity 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the A2A admission identity witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test a2a_admission_identity \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 admission identity witnesses executed, saw $listed"; exit 1; }
+          echo "A2A admission identity: $listed executed, $pinned pinned by name, all green"
+
+      # The reviewer's SECOND HOLD packet (candidate 0743ca779): C2 stale-clock
+      # capacity reacquisition, C3 launch retargeting, C5 ambiguous operator
+      # resolution. Committed verbatim, red when they landed, green only
+      # because those repairs hold.
+      #
+      # `review_aborted_startup_writer_cannot_outlive_its_owner` (C4) is
+      # DELIBERATELY EXCLUDED and is not a gap in the gate. It only reaches its
+      # subject under the reviewer's scheduling overlay
+      # (docs/internal/reviews/startup-barrier.patch); run bare it fails its own
+      # precondition with "startup reached publication barrier", which she warns
+      # against mistaking for the ownership counterexample. Its acceptance is
+      # recorded in the round-3 commit: with the barrier alone and NO
+      # owner-control patch, it passes — verified by hand, since the production
+      # fix moved the patch's context lines. Wiring an overlay-dependent row
+      # into CI would mean committing review instrumentation into the product,
+      # which the packet explicitly forbids.
+      - name: A2A — reviewer repair probes (provider)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          REQUIRED="
+            review_pre_pin_stale_clock_cannot_reacquire_an_occupied_slot
+            review_operator_replacement_cannot_retarget_a_live_launch
+            review_provider_resolution_refuses_ambiguous_incarnations
+          "
+          SKIP='test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test review_repair_provider \
+                  -E "not $SKIP" 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer repair probe (provider) reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --features "$FEATURES" --test review_repair_provider \
+                       -E "test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 reviewer provider repair rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer repair probes (provider): $listed executed, $pinned pinned by name, all green"
+
+      # === A2A — reviewer round-4 probes (provider) =========================
+      #
+      # D1/C2: an older reservation reacquiring its slot must contribute
+      # clock-floor evidence, so a competitor re-presenting a pre-expiry
+      # sample cannot also acquire and put the service over `max_in_flight`.
+      # Paid and free are separate rows because the capacity path differs.
+      #
+      # Landed byte-identical (sha256 fceb89bda2bd…) and proven
+      # discriminating: deleting the single `note_acquisition` call in
+      # `open_decision` reddens both with "reacquiring old B did not advance
+      # the slot floor, so stale A also acquired".
+      - name: A2A — reviewer round-4 probes (provider)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            review_paid_capacity_survives_old_competitor_reacquisition
+            review_free_capacity_survives_old_competitor_reacquisition
+          "
+          FEATURES="net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --features "$FEATURES" --test review_round3_provider \
+                  -E 'test(review_)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the round-4 provider probes did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          for required in $REQUIRED; do
+            printf '%s\n' "$out" | grep -qE "PASS .*$required\$" \
+              || { echo "::error::$required did not run and pass"; exit 1; }
+          done
+          echo "round-4 provider probes: both executed and green"
+
       # The SDK's `fixtures` feature must mean the same thing STANDALONE as it
       # does inside a workspace dev build: it forwards core's own `fixtures`
       # seam, and a dev-dependency used to hide the missing forwarding. This is
@@ -2471,10 +2809,392 @@ jobs:
       # turns on `mcp-gate`, whose composition tests drive the real
       # `gated_invoke` payment gate end to end — without it they compile
       # to an empty test binary and the WS4 contract goes unverified.
+      # TWO EXCLUSIONS, both named, neither a weakened assertion.
+      #
+      #   * `review_seed_python_history` is not a test. It is the fixture the
+      #     C5 Python witness shells out to, and it requires
+      #     `NET_REVIEW_PURCHASE_PATH` to point at a throwaway store. Run bare
+      #     by this auto-discovering sweep it fails on the missing variable,
+      #     which says nothing about the product. The Python job builds and
+      #     drives it for real.
+      #
+      #   * `review_round3_caller`'s NON-`review_` tests are the reviewer's
+      #     vendored copies of our own round-3 tests, snapshotted BEFORE the
+      #     D3 repair. D3 was her own requirement — keep the operator's opaque
+      #     document whole inside an outer envelope instead of writing
+      #     generated fields into it — so the evidence shape those copies pin
+      #     is exactly the shape she asked us to change. The live counterparts
+      #     in `a2a_caller_identity` were updated with the repair and are
+      #     gated below. Her file stays byte-identical; the filter is her own
+      #     documented one, `test(review_)`.
       - name: Run net-payments tests (includes payments_golden_vectors + mcp_gate_composition)
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
-        run: cargo nextest run --no-fail-fast --no-tests=fail --all-features
+        run: |
+          cargo nextest run --no-fail-fast --no-tests=fail --all-features \
+            -E 'not test(=review_seed_python_history)
+                and not (binary(review_round3_caller) and not test(review_))'
+
+      # === A2A — reviewer round-4 probes (caller) ===========================
+      #
+      # D2, D3 and D4 from the fourth review packet, landed byte-identical
+      # (sha256 841fdf242db6…). Pinned by name because each one is the only
+      # executed evidence for its finding, and each was proven discriminating
+      # by reverting the production change and watching it redden:
+      #
+      #   D2  a live operator disposition is inherited by late settlement,
+      #       rather than minting a second unresolved item for one charge
+      #   D3  generated late evidence never overwrites operator-owned JSON
+      #   D4  a prior-format persisted archive is still exactly addressable
+      #
+      # Filtered to `test(review_)`, which is the reviewer's own documented
+      # command — see the exclusion note on the sweep above for why the
+      # vendored non-`review_` copies in this binary are not run.
+      - name: A2A — reviewer round-4 probes (caller)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            review_late_settlement_preserves_a_live_operator_disposition
+            review_late_settlement_preserves_arbitrary_operator_evidence
+            review_prior_format_archive_is_still_exactly_addressable
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features \
+                  -E 'binary(review_round3_caller) and test(review_)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the round-4 caller probes did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          for required in $REQUIRED; do
+            printf '%s\n' "$out" | grep -qE "PASS .*$required\$" \
+              || { echo "::error::$required did not run and pass"; exit 1; }
+          done
+          echo "round-4 caller probes: all 3 executed and green"
+
+      # === A2A — reviewer round-4b probe (disposition inheritance) ==========
+      #
+      # The re-review of the round-4 repair found D2 half-closed: the
+      # archive-ABSENT branch consumed the live operator disposition, the
+      # archive-EXISTING branch dropped it. Which one late evidence meets is
+      # only an ordering accident — whether the archive was created before or
+      # after the operator resolved the live row — so the same charge came out
+      # `Resolved` or `PaidUnexecutable` depending on scheduling.
+      #
+      # Landed byte-identical (sha256 8758f47dc61a29e5…). Proven
+      # discriminating: forcing `inherit = false` in the existing-archive
+      # branch reddens it with "existing archive bypassed the live disposition
+      # of the same charge", left `PaidUnexecutable`, right `Resolved`.
+      #
+      # No exclusion needed here: all 16 tests in this binary pass, so the
+      # whole file runs rather than a filtered subset.
+      - name: A2A — reviewer round-4b probe (disposition inheritance)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          required=review_existing_archive_inherits_live_disposition_on_late_success
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(review_round4_disposition)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the round-4b disposition probe did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          printf '%s\n' "$out" | grep -qE "PASS .*$required\$" \
+            || { echo "::error::$required did not run and pass"; exit 1; }
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          [ "$listed" -ge 16 ] \
+            || { echo "::error::expected at least 16 rows in review_round4_disposition, saw $listed"; exit 1; }
+          echo "round-4b disposition probe: $listed executed, the named one green"
+
+      # === A2A caller purchase + task redeem (WS-B) =========================
+      #
+      # The step above ran both binaries by auto-discovery. These two exist so
+      # the roster cannot shrink silently, and because this is the money half:
+      # one authoritative attempt per intent key, a lost reply resumed rather
+      # than re-quoted, an exposed refusal that is NOT proof of
+      # non-settlement, and a redemption bound to one reservation of one
+      # brief.
+      #
+      # Floors are the counts the binaries report (`cargo nextest list` said
+      # 22 and 6 when they landed), kept AT that count for the reason the
+      # sibling SDK steps give.
+      #
+      # Two pairs carry each other:
+      # `an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous`
+      # and `an_unexposed_refusal_releases_and_may_prepare_again` — without
+      # the second, the first passes for an implementation that treats every
+      # refusal as ambiguous and never lets a caller retry;
+      # `redeem_for_task_is_idempotent_for_the_same_purchase_hash` and
+      # `a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed` —
+      # without the second, the first passes for a quote that is infinitely
+      # redeemable.
+      #
+      # `-E 'binary(NAME)'` and NOT `--test NAME`, deliberately: the
+      # "Integration test pin guard" job attributes every `--test <name>`
+      # pin to a crate and inventories only the ROOT crate and the SDK, so a
+      # `--test` pin under this step's `working-directory` resolves to
+      # `dir:net/crates/net/payments`, which that guard refuses rather than
+      # guesses at — a hard failure on a pin that is perfectly correct. A
+      # filterset carries no `--test` token, and `--no-tests=fail` is the
+      # stronger guarantee anyway: a `binary()` that matches nothing FAILS
+      # here at run time, where the guard's check is only lexical.
+      - name: A2A — caller purchase store witnesses (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            prepare_task_moves_no_money_and_reserves_no_spend
+            purchase_consumes_the_prepared_quote_not_a_fresh_one
+            purchase_never_requotes_while_an_attempt_is_unresolved
+            a_lost_pay_reply_is_resumed_by_resending_the_identical_payload
+            a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid
+            unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote
+            a_caller_restart_mid_purchase_resumes_the_stored_attempt
+            an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id
+            an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare
+            an_operator_rejection_of_a_held_quote_is_an_unexposed_refusal
+            concurrent_prepares_converge_on_one_quote
+            concurrent_purchases_send_one_payload
+            a_conflicting_commitment_under_the_same_key_is_rejected
+            a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not
+            two_processes_share_one_attempt
+            an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous
+            an_unexposed_refusal_releases_and_may_prepare_again
+            every_caller_transition_outside_the_table_is_a_conflict
+            a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence
+            a_retryable_submit_refusal_keeps_the_attempt_paid
+            unresolved_financial_attempts_are_never_pruned
+            the_task_gate_refuses_a_proof_bought_for_another_reservation
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_caller_purchase)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-B caller purchase witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_caller_purchase) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 23 ] \
+            || { echo "::error::expected at least 23 caller purchase witnesses executed, saw $listed"; exit 1; }
+          echo "A2A caller purchase: $listed executed, $pinned pinned by name, all green"
+
+      - name: A2A — task redeem witnesses (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            a_quote_carries_the_purchase_hash_into_its_id
+            redeem_for_task_refuses_a_mismatched_purchase_hash
+            redeem_for_task_is_idempotent_for_the_same_purchase_hash
+            a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed
+            a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools
+            an_approved_quote_resumes_only_for_its_own_purchase_hash
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_task_redeem)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-B task redeem witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_task_redeem) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 6 ] \
+            || { echo "::error::expected at least 6 task redeem witnesses executed, saw $listed"; exit 1; }
+          echo "A2A task redeem: $listed executed, $pinned pinned by name, all green"
+
+      # The payment channel's own deadline. Both verbs were built with
+      # `Default::default()`, i.e. no deadline, so a request delivered to a
+      # live `net.payments.pay.v1` whose handler never replied parked the
+      # caller forever — the worst possible place for an unbounded wait, since
+      # the payload has already left the process and the ambiguity can never
+      # be recorded. The witness stages a genuinely wedged handler (an
+      # unserved service fails fast with no-route instead, which is NOT the
+      # defect) and requires a retryable verdict, which is what drives a
+      # durable attempt to `Unknown` rather than to a false "did not happen".
+      - name: A2A — payment channel deadline (WS-B)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            an_unanswered_pay_times_out_retryably_instead_of_hanging
+            a_responsive_provider_answers_well_inside_the_deadline
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(payment_channel_deadline)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the payment channel deadline witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(payment_channel_deadline) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 2 ] \
+            || { echo "::error::expected at least 2 payment channel deadline witnesses executed, saw $listed"; exit 1; }
+          echo "A2A payment channel deadline: $listed executed, $pinned pinned by name, all green"
+
+      # The reviewer's caller-side counterexamples, same standing as the
+      # provider pair above: committed verbatim, red when they landed, green
+      # only because R1/R4/R5/R6/R7 are fixed. `a_lost_pay_reply_is_resumed_
+      # by_resending_the_identical_payload` is her CONTROL — it passed before
+      # any repair, so it is pinned to catch a "fix" that breaks the ordinary
+      # lost-reply path while satisfying the counterexamples.
+      - name: A2A — reviewer counterexample probes (caller)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            review_stale_signer_cannot_pay_unapproved_replacement_quote
+            review_wrong_input_hash_is_refused_before_payment
+            review_paying_survives_retention
+            review_lost_reply_recovers_after_quote_expiry
+            review_redeem_recovery_survives_engine_retention
+            a_lost_pay_reply_is_resumed_by_resending_the_identical_payload
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(review_a2a_caller)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer caller counterexample reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(review_a2a_caller) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 27 ] \
+            || { echo "::error::expected at least 27 reviewer caller rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer probes (caller): $listed executed, $pinned pinned by name, all green"
+
+      # The reviewer's SECOND HOLD packet, caller side: C1 an expired retry
+      # declaring a settlement-in-flight unpaid, C6 archive keys colliding with
+      # live task ids, C7 late ambiguity erasing retained settlement.
+      # `a_later_authoritative_success_survives_a_duplicates_ambiguity` is her
+      # control from round 1 — it passed before these repairs and is pinned so a
+      # C1 "fix" cannot break the ordinary Unknown-to-Paid convergence while
+      # satisfying the new rows.
+      - name: A2A — reviewer repair probes (caller)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            review_expired_in_flight_payment_is_not_proven_unpaid
+            review_superseded_key_cannot_overwrite_a_live_purchase
+            review_retained_success_cannot_be_downgraded_by_late_ambiguity
+            a_later_authoritative_success_survives_a_duplicates_ambiguity
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(review_repair_expiry)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::a reviewer repair probe (caller) reddened — a repair has regressed"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(review_repair_expiry) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 12 ] \
+            || { echo "::error::expected at least 12 reviewer caller repair rows executed, saw $listed"; exit 1; }
+          echo "A2A reviewer repair probes (caller): $listed executed, $pinned pinned by name, all green"
+
+      # The caller half of the identity repair, plus the retention/recovery
+      # witnesses the reviewer asked for by name (a real in-flight payment
+      # surviving caller death and retention; a settled-but-superseded charge
+      # retained against its own incarnation).
+      - name: A2A — caller attempt identity and recovery
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliation
+            a_defaulted_generation_matches_only_the_row_it_was_read_from
+            a_quote_bound_to_another_purchase_is_refused_before_payment
+            a_correctly_bound_quote_is_purchased_and_redeemed
+            an_unstructured_rejected_ack_does_not_strand_a_paid_purchase
+            concurrent_submitters_of_a_retryable_refusal_both_keep_the_purchase_paid
+            a_later_authoritative_success_survives_a_duplicates_ambiguity
+            a_retired_paid_submit_is_terminal_with_its_evidence_kept
+            an_exposed_payment_survives_caller_death_and_retention
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_caller_identity)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the A2A caller identity witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_caller_identity) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 15 ] \
+            || { echo "::error::expected at least 15 caller identity witnesses executed, saw $listed"; exit 1; }
+          echo "A2A caller identity: $listed executed, $pinned pinned by name, all green"
+
+      # === A2A paid end to end (WS-D) ======================================
+      #
+      # The whole slice against the REAL engine rather than a scripted gate:
+      # provider = `PaymentEngine` + mock facilitator + the engine-backed
+      # admission gate + a journal; requester = the caller flow over a mesh
+      # payment channel + spend policy + purchase store. It is the only
+      # binary here where a "one charge, one run" claim is made end to end,
+      # which is why it is named rather than left to auto-discovery.
+      #
+      # Floor 6 is the count the binary reports (`6 tests run: 6 passed`).
+      # All six are platform-independent (loopback UDP + tempdirs).
+      - name: A2A — paid end to end with the real engine (WS-D)
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/payments
+        run: |
+          set -uo pipefail
+          REQUIRED="
+            prepare_then_purchase_then_submit_runs_the_task_once
+            a_pending_approval_resumes_after_approve_payment_for_the_same_purchase_only
+            a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge
+            a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof
+            a_provider_restart_between_redeem_and_claim_reconciles_the_original_payment
+            a_caller_restart_between_pay_and_submit_resumes_from_the_purchase_store
+          "
+          out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                  --retries 0 --all-features -E 'binary(a2a_paid_end_to_end)' 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::the WS-D end-to-end witnesses did not pass"; exit 1; }
+          printf '%s\n' "$out" | tail -3
+          listed=$(printf '%s\n' "$out" | grep -cE '^ +(PASS|FAIL)')
+          pinned=0
+          for required in $REQUIRED; do
+            single=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
+                       --retries 0 --all-features \
+                       -E "binary(a2a_paid_end_to_end) and test(=$required)" 2>&1) \
+              || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
+            pinned=$((pinned + 1))
+          done
+          [ "$listed" -ge 6 ] \
+            || { echo "::error::expected at least 6 end-to-end witnesses executed, saw $listed"; exit 1; }
+          echo "A2A paid end to end: $listed executed, $pinned pinned by name, all green"
 
       # Same reason as the SDK doctest step: nextest does not run doctests, and
       # the `cargo test --all-features` this replaced was running net-payments'
@@ -2890,6 +3610,33 @@ jobs:
       # pytest-timeout thread can't print through pytest's capture)
       # still dumps a C-level stack when SIGSEGV/SIGABRT fires or
       # when the watchdog sends the dump signal.
+      # C5's Python witness (`test_a2a_history_boundary.py`) shells out to a
+      # Rust fixture binary that seeds a retained historical incarnation
+      # through the production `retain_superseded` API. Built HERE, not inside
+      # the test: the pytest step below runs under a blanket `--timeout=30`,
+      # and compiling a Rust test target would blow that budget and read as a
+      # hang. The test falls back to building it itself when the variable is
+      # unset (the local path), and hard-fails rather than skipping if the
+      # binary cannot be produced — a skip would make the witness vacuous on
+      # exactly the machines that run it.
+      - name: Build the A2A history-boundary fixture seeder
+        working-directory: net/crates/net
+        run: |
+          # `--tests`, not `--test review_python_seed`: the integration-test
+          # pin guard inventories only the root and SDK crates, so a
+          # `--test <name>` naming a payments target is a pin it cannot
+          # attribute and refuses to guess at. Selecting the executable out
+          # of cargo's JSON by target name does the same job without
+          # inventing a pin form.
+          exe=$(cargo test -p net-payments --features mesh \
+                  --tests --no-run --message-format json \
+                | jq -r 'select(.reason=="compiler-artifact")
+                         | select(.target.name=="review_python_seed")
+                         | .executable' | tail -1)
+          test -n "$exe" && test -x "$exe" \
+            || { echo "::error::the C5 fixture seeder did not build"; exit 1; }
+          echo "NET_A2A_SEEDER_EXE=$exe" >> "$GITHUB_ENV"
+
       - name: Run tests
         env:
           PYTHONFAULTHANDLER: "1"
@@ -3459,7 +4206,18 @@ jobs:
             # `delegation` / `publish` / `a2a` add the V2 enrollment, local-tool
             # publication, and A2A binding modules so clippy lints them (they
             # match the `python-tests` build set).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a
+            #
+            # `payments` / `payments-http` are here because the paid surface is
+            # NOT reachable through `a2a` alone: the paid-A2A gateway verbs
+            # (`prepare_task`, `purchase_task`, `submit_task`,
+            # `a2a_attempts`, `a2a_resolve_attempt`) and `PaymentProvider`'s
+            # `serve_a2a_configured` / `a2a_unresolved` / `a2a_resolve` sit
+            # behind `#[cfg(feature = "payments")]`. With `a2a` on and
+            # `payments` off, every one of those functions compiles OUT and
+            # this job lints an empty surface while reporting success — the
+            # same silent-coverage shape the comments above describe. The
+            # `python-tests` build set carries both.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping,consent,mcp,delegation,publish,a2a,payments,payments-http
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -3580,7 +4338,18 @@ jobs:
             features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,publish,payments,payments-http,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments
+            # `a2a` and `publish` join `payments` here so the paid-A2A
+            # binding surface EXISTS in this job. Three gates, not one:
+            # `mod a2a_paid` is `#[cfg(all(feature = "a2a", feature =
+            # "payments"))]`, and the `PaymentProvider` pyclass that calls
+            # into it lives in `payment_provider.rs`'s `mod provider`, which
+            # is `#[cfg(feature = "publish")]`. With `payments` alone the
+            # whole paid surface compiled out; with `payments,a2a` and no
+            # `publish` it compiled but nothing reached it, which rustc
+            # reported as 17 never-used items (measured). All three together
+            # are warning-clean and give the in-crate `#[cfg(test)]` blocks
+            # in `src/a2a.rs` / `src/a2a_paid.rs` something to run against.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,consent,mcp,payments,a2a,publish
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""

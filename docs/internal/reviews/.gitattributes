@@ -1,0 +1,16 @@
+# Vendored independent-review evidence. Byte-exact, not text.
+#
+# Every packet ships a SHA256.json that pins the exact content of the
+# artifacts beside it, and reviewers verify against it. Git for Windows defaults `core.autocrlf=true` on the committing machine
+# (the repo itself sets no `text` attribute and has no `.editorconfig`, so
+# this is a property of the committer's install, not of Git generally), and
+# that normalises CRLF to LF on commit, silently rewriting those bytes: the working tree still hashes correctly, the committed blob does
+# not, and the manifest stops verifying for anyone who checks it out. That
+# happened — three artifacts (round4/results.json, round4b/results.json,
+# round4b/c5-ci-evidence.json) were committed LF-normalised and no longer
+# matched their own manifests until they were restored from the packets.
+#
+# `-text` disables all EOL conversion for this tree so what is committed is
+# what the reviewer hashed. Do not "fix line endings" in here: the mixed
+# endings ARE the artifact.
+* -text

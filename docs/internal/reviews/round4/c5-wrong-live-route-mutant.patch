@@ -1,0 +1,15 @@
+diff --git a/net/crates/net/bindings/python/src/a2a_paid.rs b/net/crates/net/bindings/python/src/a2a_paid.rs
+index 8c780d949..73202f6fe 100644
+--- a/net/crates/net/bindings/python/src/a2a_paid.rs
++++ b/net/crates/net/bindings/python/src/a2a_paid.rs
+@@ -924,8 +924,9 @@ pub(crate) async fn do_resolve_attempt(
+         }
+     };
+     if let Some(generation) = generation {
++        let _ = generation;
+         return flow
+-            .resolve_superseded_attempt(provider_node, task_id, &generation, resolution)
++            .resolve_attempt(provider_node, task_id, resolution)
+             .await
+             .map(|_| ())
+             .map_err(|e| PyRuntimeError::new_err(format!("resolve_superseded_attempt: {e}")));

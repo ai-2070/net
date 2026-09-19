@@ -122,7 +122,7 @@ fn main() {
                     "accept must Serve"
                 );
                 assert!(
-                    matches!(redeem, RedeemDecision::Admitted),
+                    matches!(redeem, RedeemDecision::Admitted { .. }),
                     "redeem must Admit"
                 );
                 admits += 1;
@@ -169,7 +169,7 @@ fn main() {
                     .expect("redeem_for_invocation");
                 hist.record(t.elapsed().as_nanos() as u64).expect("record");
                 assert!(
-                    matches!(redeem, RedeemDecision::Admitted),
+                    matches!(redeem, RedeemDecision::Admitted { .. }),
                     "redeem must Admit"
                 );
                 admits += 1;

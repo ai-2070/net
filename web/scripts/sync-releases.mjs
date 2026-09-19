@@ -116,6 +116,7 @@ const TITLES = {
   "RELEASE_v0.34_HOTEL_CALIFORNIA.md": "v0.34.0 — Hotel California",
   "RELEASE_v0.35_DOUBLEBACK.md": "v0.35.0 — Doubleback",
   "RELEASE_v0.36_PARANOID.md": "v0.36.0 — Paranoid",
+  "RELEASE_v0.37_MONEY_TALKS.md": "v0.37.0 — Money Talks",
   "RELEASE_v0.8_KILLING_MOON.md": "v0.8 — Killing Moon",
   "RELEASE_v0.9_FIRST_BLOOD.md": "v0.9 — First Blood",
 };

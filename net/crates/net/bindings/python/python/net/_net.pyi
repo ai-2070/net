@@ -930,12 +930,53 @@ class NetMesh:
         prompt: str,
         context_refs: List[str] = ...,
         tags: List[str] = ...,
+        *,
+        task_id: Optional[str] = None,
+        service: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> str:
         """Hand off a task to the executor at ``target_node_id``: ``prompt`` plus
         optional Datafort ``context_refs`` (the executor doesn't share your
         memory) and routing ``tags``. Returns the accepted task id; raises if the
         executor rejected it. The node must already be connected to
-        ``target_node_id``. (Requires the ``a2a`` feature.)"""
+        ``target_node_id``. (Requires the ``a2a`` feature.)
+
+        ``task_id`` retains a caller-chosen id instead of the random one a brief
+        mints (``None`` = random) — a retained id is what makes a submission
+        idempotent on a provider keeping durable admission records: the caller
+        that lost a reply re-submits the *same* id and converges on the original
+        admission. ``service`` + ``revision`` (both or neither) name a catalog
+        entry on a provider served with
+        :meth:`PaymentProvider.serve_a2a_configured`; the free
+        :meth:`serve_a2a` path ignores them."""
+        ...
+    def describe_a2a(self, target_node_id: int) -> str:
+        """What ``target_node_id`` serves, as a JSON array of ``A2aOffer``
+        objects — ``{service_id, revision, description?, pricing_terms?, bounds,
+        reservation_ttl_secs, reservation_retention_secs, retention_secs}`` per
+        configured service. Uncharged, and the only sanctioned way to learn a
+        price: a payment commitment is computed against the offer, so a caller
+        that paid against one can prove which one. A node serving the legacy
+        free path (:meth:`serve_a2a`) has no describe service and raises.
+        (Requires the ``a2a`` feature.)"""
+        ...
+    def submit_task_paid(self, prepared_json: str, proof_json: str) -> str:
+        """Submit a prepared, paid task: the brief from ``prepared_json`` (a
+        ``PreparedTask`` document — the ``prepared`` field of
+        :meth:`CapabilityGateway.prepare_task`'s result) with the quote id and
+        binding signature from ``proof_json`` (a ``TaskPaymentProof`` — the
+        ``proof`` field of :meth:`CapabilityGateway.purchase_task`'s), sent to
+        the provider node the reservation lives on. Returns the accepted task
+        id.
+
+        The **raw** verb: it keeps no records. Use
+        :meth:`CapabilityGateway.submit_task` for the durable attempt. Safe to
+        re-send — admission is idempotent per purchase, so a lost reply is
+        recovered by submitting the same proof rather than buying another.
+
+        Raises :class:`PaymentRefused` on a payment or admission refusal
+        (``args`` = ``(message, schematic_json | None)``). (Requires the
+        ``a2a`` feature.)"""
         ...
     def task_status(self, target_node_id: int, task_id: str) -> Optional[str]:
         """The executor's status for ``task_id`` as a JSON string
@@ -1734,14 +1775,44 @@ class LocalPublicationHandle:
 
 class A2aServeHandle:
     """Keeps the served agent-to-agent task services alive (returned by
-    ``NetMesh.serve_a2a``). Dropping it or calling :meth:`stop` unregisters
-    them."""
+    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``).
+    Dropping it or calling :meth:`stop` unregisters them."""
 
     def stop(self) -> None:
         """Stop accepting A2A tasks (unregister the services)."""
         ...
     @property
     def serving(self) -> bool: ...
+    @property
+    def services(self) -> int:
+        """How many nRPC services are registered: three on the free
+        ``NetMesh.serve_a2a`` path, five on the configured
+        ``PaymentProvider.serve_a2a_configured`` one (which also serves
+        ``net.a2a.prepare`` and ``net.a2a.describe``). ``0`` once stopped."""
+        ...
+
+class PaymentRefused(Exception):
+    """A paid A2A submission was refused on payment or admission grounds — the
+    provider answered the ``net.payment`` application error rather than an ack.
+
+    ``args`` is ``(message, schematic_json | None)``: the human refusal, and
+    the machine-actionable ``net.payment.failure@1`` document when the provider
+    sent one (also on :attr:`schematic`). The schematic's ``reason`` names the
+    refusal (``missing_quote``, ``binding_required``, ``binding_rejected``,
+    ``no_reservation``, ``admission_revoked``, ``journal_unavailable``,
+    ``input_binding_mismatch``) and its ``recovery`` block says whether
+    retrying or re-quoting is safe. Distinct from a transport failure
+    (``RuntimeError``) for exactly that reason."""
+
+    schematic: Optional[str]
+
+class JournalOwnedElsewhere(Exception):
+    """The A2A admission journal at this path is already owned by a live holder
+    — another :class:`PaymentProvider` in this process, or another process on
+    this machine. Two writers over one set of admission records would each
+    believe they may launch the same paid work, so
+    :meth:`PaymentProvider.serve_a2a_configured` fails closed instead.
+    Ownership is held for the lifetime of the serve handle."""
 
 # =============================================================================
 # Stubs for symbols exported by `net._net` at runtime that aren't yet typed
@@ -3850,9 +3921,9 @@ class PinStore:
     def reject(self, cap_id: "str | CapabilityId") -> bool: ...
     def is_approved(self, cap_id: "str | CapabilityId") -> bool: ...
     def state(self, cap_id: "str | CapabilityId") -> Optional[str]: ...
-    def approved(self) -> list[str]: ...
-    def pending(self) -> list[str]: ...
-    def list(self) -> list[tuple[str, str]]: ...
+    def approved(self) -> List[str]: ...
+    def pending(self) -> List[str]: ...
+    def list(self) -> List[Tuple[str, str]]: ...
     def __repr__(self) -> str: ...
 
 class AsyncPinStore:
@@ -3986,85 +4057,32 @@ class CapabilityGateway:
     # Both-or-neither is enforced at runtime (passing exactly one delegation
     # arg raises ValueError), so express the two valid signatures as overloads
     # — a partial call then fails static analysis instead of only at runtime.
-    @overload
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
-    @overload
-    def __init__(
-        self,
-        mesh: "NetMesh",
-        pin_store_path: Optional[str],
-        delegation_leaf: "Identity",
-        delegation_chain: bytes,
-    ) -> None: ...
-    # Build a gateway over a started ``mesh``. ``pin_store_path`` should
-    # be the machine-shared pin store so approvals are honored both ways;
-    # omit it to keep consent in-memory (every gated capability then always
-    # requires approval).
     #
-    # Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
-    # ``delegation_chain`` (a serialized ``DelegationChain``) together to have
-    # every invoke carry a per-invoke signed delegation (Phase 3); a remote
-    # provider running a delegation gate then admits by verified delegation
-    # and audits this gateway's leaf. **Both or neither** — passing exactly
-    # one raises ``ValueError``.
-    #
-    # Pass ``payment_policy_path`` (the machine-shared spend-policy store)
-    # to enable paid capabilities: the invoke gate then clears them through
-    # the Rust payments flow (quote -> spend policy -> x402 payload -> pay
-    # over the mesh). ``payment_profile`` is ``"production"`` (the
-    # fail-closed default: every mock spend holds for approval) or
-    # ``"dev_test"`` (mock auto-allows under the configured limits);
-    # ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
-    # for production-profile demos. Without ``payment_policy_path``, a paid
-    # capability fails closed as a structured ``denied`` — never a silent
-    # unpaid serve. Requires the ``payments`` build feature (the default
-    # wheel has it); passing payment kwargs on a build without it raises
-    # ``ValueError``.
-    #
-    # The payment identity is the node's mesh identity: quotes are issued
-    # to, spend is tracked against, and invocation proofs are signed by the
-    # same ed25519 identity peers see on the mesh.
-    #
-    # Real (non-mock) networks additionally need a settlement signer
-    # *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
-    # address) **and** ``payment_signer`` (both or neither), a callable
-    # ``(typed_data_json: str) -> str`` that forwards the full EIP-712
-    # typed-data document to your wallet / KMS and returns the 65-byte
-    # ``0x…``-hex signature. Only the typed document and the signature
-    # cross the language boundary — there is no way to hand Net a private
-    # key, and the only thing this surface can ask your signer for is a
-    # logged, typed transfer authorization (never raw bytes). Enablement
-    # still requires the network in the spend policy's
-    # ``allowed_networks`` — the signer is capability, not consent.
-    #
-    # Solana and XRPL settlement use the same seam under their own
-    # namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
-    # (a ``(intent_json: str) -> str`` returning the base64 partially-signed
-    # SVM transaction) and ``payment_signer_xrpl_address`` +
-    # ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
-    # blob). Each pair is both-or-neither; an absent pair means that scheme
-    # is simply unavailable. The callable always sees a typed intent JSON,
-    # never key material — identical doctrine to the eip155 seam."""
-    # The payment-bearing form is split the same way, and for the same
-    # reason: a single overload taking both delegation arguments as
-    # optional would re-admit the partial call the pair above exists to
-    # reject, and the runtime `ValueError` would be the first anyone
-    # heard of it.
+    # THE PAYMENT KEYWORDS MUST BE REPEATED ON EVERY OVERLOAD. When a class has
+    # @overload declarations, a checker resolves calls against those ALONE and
+    # never against the implementation signature below — so a keyword present
+    # only there is a static error at every call site while working fine at
+    # runtime. That is exactly what happened: the paid surface shipped with
+    # these kwargs on the implementation only, and the first type-checked
+    # caller (the skill's paid A2A example) failed with "Unexpected keyword
+    # arguments ... for overloaded function". Add new constructor keywords in
+    # all three places or none.
     @overload
     def __init__(
         self,
         mesh: "NetMesh",
-        pin_store_path: Optional[str] = None,
+        pin_store_path: Optional[str] = ...,
         *,
-        payment_policy_path: Optional[str] = None,
-        payment_profile: Optional[str] = None,
-        payment_unsafe_mock_auto_allow: bool = False,
-        payment_signer_address: Optional[str] = None,
-        payment_signer: Optional[Callable[[str], str]] = None,
-        payment_signer_svm_address: Optional[str] = None,
-        payment_signer_svm: Optional[Callable[[str], str]] = None,
-        payment_signer_xrpl_address: Optional[str] = None,
-        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+        a2a_purchase_path: Optional[str] = ...,
     ) -> None: ...
     @overload
     def __init__(
@@ -4074,16 +4092,79 @@ class CapabilityGateway:
         delegation_leaf: "Identity",
         delegation_chain: bytes,
         *,
-        payment_policy_path: Optional[str] = None,
-        payment_profile: Optional[str] = None,
-        payment_unsafe_mock_auto_allow: bool = False,
-        payment_signer_address: Optional[str] = None,
-        payment_signer: Optional[Callable[[str], str]] = None,
-        payment_signer_svm_address: Optional[str] = None,
-        payment_signer_svm: Optional[Callable[[str], str]] = None,
-        payment_signer_xrpl_address: Optional[str] = None,
-        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None: ...
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+        a2a_purchase_path: Optional[str] = ...,
+    ) -> None:
+        """Build a gateway over a started ``mesh``. ``pin_store_path`` should
+        be the machine-shared pin store so approvals are honored both ways;
+        omit it to keep consent in-memory (every gated capability then always
+        requires approval).
+
+        Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
+        ``delegation_chain`` (a serialized ``DelegationChain``) together to have
+        every invoke carry a per-invoke signed delegation (Phase 3); a remote
+        provider running a delegation gate then admits by verified delegation
+        and audits this gateway's leaf. **Both or neither** — passing exactly
+        one raises ``ValueError``.
+
+        Pass ``payment_policy_path`` (the machine-shared spend-policy store)
+        to enable paid capabilities: the invoke gate then clears them through
+        the Rust payments flow (quote -> spend policy -> x402 payload -> pay
+        over the mesh). ``payment_profile`` is ``"production"`` (the
+        fail-closed default: every mock spend holds for approval) or
+        ``"dev_test"`` (mock auto-allows under the configured limits);
+        ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
+        for production-profile demos. Without ``payment_policy_path``, a paid
+        capability fails closed as a structured ``denied`` — never a silent
+        unpaid serve. Requires the ``payments`` build feature (the default
+        wheel has it); passing payment kwargs on a build without it raises
+        ``ValueError``.
+
+        The payment identity is the node's mesh identity: quotes are issued
+        to, spend is tracked against, and invocation proofs are signed by the
+        same ed25519 identity peers see on the mesh.
+
+        Real (non-mock) networks additionally need a settlement signer
+        *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
+        address) **and** ``payment_signer`` (both or neither), a callable
+        ``(typed_data_json: str) -> str`` that forwards the full EIP-712
+        typed-data document to your wallet / KMS and returns the 65-byte
+        ``0x…``-hex signature. Only the typed document and the signature
+        cross the language boundary — there is no way to hand Net a private
+        key, and the only thing this surface can ask your signer for is a
+        logged, typed transfer authorization (never raw bytes). Enablement
+        still requires the network in the spend policy's
+        ``allowed_networks`` — the signer is capability, not consent.
+
+        Solana and XRPL settlement use the same seam under their own
+        namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
+        (a ``(intent_json: str) -> str`` returning the base64 partially-signed
+        SVM transaction) and ``payment_signer_xrpl_address`` +
+        ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
+        blob). Each pair is both-or-neither; an absent pair means that scheme
+        is simply unavailable. The callable always sees a typed intent JSON,
+        never key material — identical doctrine to the eip155 seam.
+
+        Pass ``a2a_purchase_path`` (the durable purchase store, e.g.
+        ``a2a-purchases.json``) to enable the paid agent-to-agent verbs
+        :meth:`prepare_task` / :meth:`purchase_task` / :meth:`submit_task` /
+        :meth:`a2a_attempts` / :meth:`a2a_resolve_attempt`. It holds one
+        attempt per ``(caller, provider, task id)``, written before any
+        network call, which is what makes a lost pay reply recoverable
+        instead of a second charge — so it must be durable and
+        single-owner, exactly like the spend-policy store. It requires
+        ``payment_policy_path`` (a purchase store with no spend policy
+        would record payments nothing authorized); without it the A2A
+        verbs raise ``ValueError``."""
+        ...
 
     @property
     def pin_store_path(self) -> Optional[str]:
@@ -4142,6 +4223,135 @@ class CapabilityGateway:
         ``"mock:net"`` / ``"musd"``), matching the quote's requirements."""
         ...
 
+    def prepare_task(
+        self,
+        target_node_id: int,
+        service: str,
+        prompt: str,
+        context_refs: List[str] = ...,
+        tags: List[str] = ...,
+        task_id: Optional[str] = None,
+    ) -> str:
+        """**Paid A2A, step 1 — read-only on the money side.** Ask
+        ``target_node_id`` to validate this brief and reserve capacity for it,
+        and obtain a provider-signed quote bound to that exact reservation. No
+        spend is reserved and no payment is made, so it is safe to call merely
+        to display a price.
+
+        Returns ``{"status": "ok" | "rejected" | "busy" | "retired" |
+        "conflict", "prepared": {...}, "quote": {"quote_id", "amount",
+        "network", "asset", "expires_at_ns"}}``. Keep ``prepared`` — it is the
+        complete ``PreparedTask`` document (provider node, byte-exact brief,
+        offer hash, reservation) that :meth:`purchase_task` /
+        :meth:`submit_task` / :meth:`NetMesh.submit_task_paid` take back as a
+        JSON string, and nothing is re-derived from it.
+
+        ``busy`` means nothing was reserved and nothing was quoted — retry (it
+        also covers a transport failure and a contended concurrent prepare).
+        ``conflict`` means this id already names other work on this provider;
+        ``rejected`` and ``retired`` are dead ends. A ``service`` the
+        provider's catalog does not name is ``rejected``, not ``busy``: the
+        provider answered with its offers and this was not among them, so no
+        amount of retrying changes the answer.
+
+        Exactly one attempt per ``(caller, provider, task_id)`` does the work:
+        a concurrent call that finds a live prepare awaits it and returns the
+        same reservation. ``task_id=None`` mints a random id; retaining one is
+        what makes the purchase resumable across a crash. Needs
+        ``payment_policy_path`` + ``a2a_purchase_path`` (else ``ValueError``)
+        and the ``payments`` build feature."""
+        ...
+
+    def purchase_task(self, prepared_json: str) -> str:
+        """**Paid A2A, step 2 — this is where money moves.** Consume the quote
+        :meth:`prepare_task` stored for ``prepared_json`` and pay it under
+        spend policy.
+
+        Returns ``{"status": "paid" | "requires_payment_approval" | "denied" |
+        "unknown" | "failed", "task_id", "quote_id", "proof": {...}?,
+        "policy_reason"?, "approve_hint"?, "retryable"?, "funds_ambiguous"?}``.
+
+        - ``paid`` carries the ``proof`` :meth:`submit_task` presents.
+        - ``requires_payment_approval`` holds *this* quote for an operator:
+          :meth:`approve_payment` on the quote id, then call this verb again.
+        - ``denied`` with ``funds_ambiguous: False`` is proven
+          non-settlement — nothing left this process, and a fresh
+          :meth:`prepare_task` is allowed (re-running policy and approval).
+        - ``denied`` with ``funds_ambiguous: True`` means an authorization was
+          exposed first: the spend reservation is held and
+          :meth:`a2a_resolve_attempt` is the only exit.
+        - ``unknown`` is a lost reply, not a failure: call this verb again and
+          it re-sends the *stored* payload rather than buying twice.
+
+        Concurrent calls converge on the one stored attempt."""
+        ...
+
+    def submit_task(self, prepared_json: str) -> str:
+        """**Paid A2A, step 3.** Submit ``prepared.brief`` with the **stored**
+        proof, recording the outcome on the attempt.
+
+        Returns ``{"status": "accepted" | "retry" | "unexecutable",
+        "task_id", "message"?, "schematic"?}``. ``retry`` keeps the purchase
+        good — re-submit the same proof, never re-purchase. ``unexecutable``
+        means the provider will not execute this purchase; the payment
+        evidence is retained and :meth:`a2a_resolve_attempt` is the exit.
+        ``schematic`` (when the provider sent one) is
+        ``{reason, safe_to_retry, safe_to_requote}``."""
+        ...
+
+    def a2a_attempts(self) -> str:
+        """Every stored purchase attempt **this gateway's caller identity
+        owns**, as a JSON array — the operator's queue. Rows written to the
+        same store file by a different caller identity are not listed: an
+        operator must not be invited to resolve an attempt it could not have
+        paid for. Each row is ``{key: {caller_hex, provider_node, task_id},
+        commitment, prepared?, quote_id?, quote_expires_at_ns?, state: {...},
+        updated_at_ns}``. The financially unresolved states (``unknown``,
+        ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
+        never submitted) are exempt from retention and stay until
+        :meth:`a2a_resolve_attempt` closes them."""
+        ...
+
+    def set_a2a_org_caller(self, org_client: Any | None = None) -> None:
+        """Install (or clear with ``None``) the organization identity the
+        paid-A2A lifecycle presents to a PROTECTED provider.
+
+        Required to reach a provider serving its catalog under
+        ``principal="same_org"`` / ``"granted"``: all five A2A services
+        register PROTECTED, so an ordinary session-peer call is never
+        admitted. Applies to :meth:`prepare_task`, :meth:`purchase_task` and
+        :meth:`submit_task` from the next call onward. Fail-loud: a target
+        that is not an authorized provider of the service raises rather than
+        silently downgrading to an unprotected call."""
+        ...
+
+    def a2a_resolve_attempt(
+        self, task_id: str, outcome_json: str, provider_node: int | None = None
+    ) -> None:
+        """Close an attempt the automatic path cannot: ``unknown``, ``denied``
+        with ``funds_ambiguous``, or ``unexecutable``.
+
+        ``outcome_json`` is one of::
+
+            {"resolution": "paid", "proof": {...}, "billing": {...}}
+            {"resolution": "not_paid", "reason": "..."}
+            {"resolution": "closed", "outcome": "refunded", "evidence": {...}}
+
+        ``paid`` / ``not_paid`` resolve an ``unknown`` attempt from evidence
+        the operator established out of band — ``not_paid`` re-opens the key
+        for a fresh :meth:`prepare_task`. ``closed`` retires an ambiguous or
+        unexecutable attempt (refunded, written off, executed elsewhere)
+        keeping its evidence.
+
+        A purchase key is ``(caller, provider_node, task_id)``; the caller
+        half is this gateway's identity, so ``provider_node`` completes it and
+        the attempt is resolved with no search. Omit it and ``task_id`` is
+        resolved against this caller's own rows — unambiguous until the same
+        id names attempts on two providers, in which case the ``ValueError``
+        lists the provider node ids to pass here. Raises ``ValueError`` if no
+        attempt carries ``task_id``."""
+        ...
+
     def __repr__(self) -> str: ...
 
 class AsyncCapabilityGateway:
@@ -4151,8 +4361,25 @@ class AsyncCapabilityGateway:
     own runtime, so mesh I/O stays on the right reactor. Present iff the wheel
     was built with the ``net`` + ``mcp`` features."""
 
+    # Same overload rule as :class:`CapabilityGateway` — a keyword that exists only on
+    # the implementation signature below is invisible to every type checker.
+    # This twin has no a2a_purchase_path: the A2A caller verbs are sync-only.
     @overload
-    def __init__(self, mesh: "NetMesh", pin_store_path: Optional[str] = ...) -> None: ...
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str] = ...,
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+    ) -> None: ...
     @overload
     def __init__(
         self,
@@ -4160,34 +4387,27 @@ class AsyncCapabilityGateway:
         pin_store_path: Optional[str],
         delegation_leaf: "Identity",
         delegation_chain: bytes,
-    ) -> None: ...
-    # Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
-    # ``delegation_chain`` together (both or neither) to sign + attach a
-    # delegation on every invoke (Phase 3); pass ``payment_policy_path``
-    # (+ optional ``payment_profile`` / unsafe flag) to enable paid
-    # capabilities through the payments flow, and
-    # ``payment_signer_address`` + ``payment_signer`` (both or neither)
-    # for real-network settlement — see :class:`CapabilityGateway` for the
-    # signer-reference contract. The signer callable runs on a blocking
-    # worker thread, never on your event loop."""
-    @overload
-    def __init__(
-        self,
-        mesh: "NetMesh",
-        pin_store_path: Optional[str] = None,
-        delegation_leaf: Optional["Identity"] = None,
-        delegation_chain: Optional[bytes] = None,
-        payment_policy_path: Optional[str] = None,
-        payment_profile: Optional[str] = None,
-        payment_unsafe_mock_auto_allow: bool = False,
-        payment_signer_address: Optional[str] = None,
-        payment_signer: Optional[Callable[[str], str]] = None,
-        payment_signer_svm_address: Optional[str] = None,
-        payment_signer_svm: Optional[Callable[[str], str]] = None,
-        payment_signer_xrpl_address: Optional[str] = None,
-        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None: ...
-
+        *,
+        payment_policy_path: Optional[str] = ...,
+        payment_profile: Optional[str] = ...,
+        payment_unsafe_mock_auto_allow: bool = ...,
+        payment_signer_address: Optional[str] = ...,
+        payment_signer: Optional[Callable[[str], str]] = ...,
+        payment_signer_svm_address: Optional[str] = ...,
+        payment_signer_svm: Optional[Callable[[str], str]] = ...,
+        payment_signer_xrpl_address: Optional[str] = ...,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = ...,
+    ) -> None:
+        """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
+        ``delegation_chain`` together (both or neither) to sign + attach a
+        delegation on every invoke (Phase 3); pass ``payment_policy_path``
+        (+ optional ``payment_profile`` / unsafe flag) to enable paid
+        capabilities through the payments flow, and
+        ``payment_signer_address`` + ``payment_signer`` (both or neither)
+        for real-network settlement — see :class:`CapabilityGateway` for the
+        signer-reference contract. The signer callable runs on a blocking
+        worker thread, never on your event loop."""
+        ...
     @property
     def pin_store_path(self) -> Optional[str]: ...
     async def search(self, query: str) -> str:
@@ -4459,6 +4679,90 @@ class PaymentProvider:
         ``NetMesh.publish_tools``. Hold the returned handle to keep serving."""
         ...
 
+    def serve_a2a_configured(
+        self,
+        callback: Any,
+        services: Dict[str, Dict[str, Any]],
+        journal_path: str,
+        *,
+        principal: str = "session_peer",
+        preflight: Optional[Any] = None,
+    ) -> "A2aServeHandle":
+        """Serve the **configured** (catalog-driven) agent-to-agent task
+        lifecycle on this provider's node: paid services gated by this
+        provider's own payment engine, every admission recorded durably in the
+        journal at ``journal_path``. Requires the ``a2a`` build feature
+        alongside ``payments``.
+
+        ``callback`` is the async task executor — the free
+        ``NetMesh.serve_a2a`` signature plus two **keyword** arguments:
+        ``async (task_id, prompt, context_refs, tags, *, service, revision)
+        -> str`` returning the result's artifact ref.
+
+        ``services`` maps a service id to its offer::
+
+            {"summarize": {
+                "revision": "r1",
+                "pricing_terms": provider.pricing_terms(
+                    "net.a2a.task/summarize", requirements_json),
+                "bounds": {"max_prompt_bytes": 1024, "max_context_refs": 8,
+                           "max_tags": 8, "max_tag_bytes": 64,
+                           "max_in_flight": 4},
+                "reservation_ttl_secs": 300,
+                "reservation_retention_secs": 86400,
+                "retention_secs": 3600,
+                "description": "summarize a document"}}
+
+        ``pricing_terms`` is the free/paid selector: present prices the
+        service, ``None`` (or absent) serves it for nothing. A paid service is
+        **never** served free — an announced price with no gate, terms on a
+        free service, or a catalog key disagreeing with its own offer all
+        raise ``ValueError`` here rather than registering anything.
+
+        ``principal`` chooses who a submission is attributed to:
+        ``"session_peer"`` (the AEAD-authenticated session peer — direct
+        sessions only) or ``"same_org"`` / ``"granted"`` (the entity an
+        organization admission proof names, which additionally enforces
+        payer == caller on every paid admission).
+
+        ``preflight`` is the application's own admission check, an async
+        callable ``(owner_json, offer_json, brief_json) -> None | str``
+        returning ``None`` to admit or a reason to refuse. It runs at prepare
+        **and again** at submit, so it must be pure.
+
+        Raises :class:`JournalOwnedElsewhere` if another live holder already
+        owns ``journal_path``. Hold the returned handle to keep accepting
+        tasks."""
+        ...
+
+    def a2a_unresolved(self) -> str:
+        """The **unresolved-financial** admissions, as a JSON array of
+        admission records: money may have moved and the outcome is not
+        recorded (``paid``, ``launched`` without a terminal, or
+        ``reconcile``). Each row is ``{owner: {kind, node?, entity?}, task_id,
+        service_id, revision, admission_id?, commitment, brief, paid,
+        retention_secs, reservation_retention_secs, state: {...}, updated_at,
+        attempts: [...]}``.
+
+        This class is never pruned automatically — by design. It is the
+        operator's queue, and :meth:`a2a_resolve` is its only exit. Raises
+        ``ValueError`` before :meth:`serve_a2a_configured` has opened a
+        journal. Requires the ``a2a`` build feature."""
+        ...
+
+    def a2a_resolve(self, owner_json: str, task_id: str, state_json: str) -> None:
+        """Resolve one unresolved-financial admission to a terminal state:
+        ``owner_json`` and ``task_id`` exactly as they appear on an
+        :meth:`a2a_unresolved` row, ``state_json`` the ``TaskState`` the
+        operator established — e.g. ``{"state": "completed", "result_ref":
+        "blob://x"}``, ``{"state": "failed", "error": "..."}``.
+
+        Operator surface: it records what a human established out of band. It
+        never relaunches the work, and the launch ledger still bars a second
+        execution of the same admission afterwards. Requires the ``a2a``
+        build feature."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Organization capability auth (OSDK-L Workstream P, the `org` feature)
@@ -4605,3 +4909,259 @@ def apply_subnet_control_fact(mesh: Any, fact: bytes) -> dict:
     floors and descriptive facts. Returns ``{"kind": str, "applied": bool}``;
     ``applied=False`` is an authenticated stale/idempotent outcome."""
     ...
+
+
+# === COMPLETING THE STUB: declarations recovered from the pyo3 source ===
+#
+# These symbols are real exports of `net._net` that the stub does not declare
+# above. Every signature below was read from the Rust `#[pyclass]` /
+# `#[pymethods]` / `#[pyfunction]` source, NOT introspected from the built
+# module: pyo3 exposes a constructor `__text_signature__` and nothing else, so
+# an introspected stub would have invented method signatures and return types.
+
+
+# --------------------------------------------------------------------------
+# Cortex surface
+# --------------------------------------------------------------------------
+
+class AsyncToolWatchIter:
+    """Async iterator (``async for change in iter:``) over the live
+    ``watch_tools`` stream. Each yield is a JSON-encoded ``ToolListChange``."""
+
+    def __aiter__(self) -> AsyncToolWatchIter: ...
+    async def __anext__(self) -> str: ...
+    def close(self) -> None:
+        """Stop the iterator. Idempotent. Subsequent ``__anext__`` calls
+        raise ``StopAsyncIteration``."""
+        ...
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close` so users can write
+        ``await iter.aclose()``."""
+        ...
+
+
+# --------------------------------------------------------------------------
+# Deck surface
+# --------------------------------------------------------------------------
+
+class LogStream:
+    """Live log stream as a sync Python iterator.
+
+    Each ``__next__`` blocks until the next record matching the
+    filter publishes, or raises ``StopIteration`` when the
+    underlying stream's substrate runtime shuts down.
+    """
+
+    def __iter__(self) -> "LogStream": ...
+    def __next__(self) -> Dict[str, Any]:
+        """Next log record as a dict with keys seq, ts_ms, level,
+        daemon_id, node_id, message. Blocks until one is published."""
+        ...
+    def close(self) -> None:
+        """Close the stream; subsequent ``__next__`` raises
+        ``DeckSdkError`` with kind ``stream_closed``."""
+        ...
+
+class FailureStream:
+    """Live failure stream as a sync Python iterator.
+
+    Each ``__next__`` blocks until the next failure record
+    publishes, or raises ``StopIteration`` when the underlying
+    stream's substrate runtime shuts down.
+    """
+
+    def __iter__(self) -> "FailureStream": ...
+    def __next__(self) -> Dict[str, Any]:
+        """Next failure record as a dict with keys seq, source,
+        reason, recorded_at_ms. Blocks until one is published."""
+        ...
+    def close(self) -> None:
+        """Close the stream; subsequent ``__next__`` raises
+        ``DeckSdkError`` with kind ``stream_closed``."""
+        ...
+
+class AuditQuery:
+    """Fluent admin-audit query builder.
+
+    Chain the filter methods before calling ``.collect()`` (eager
+    list) or ``.stream()`` (sync iterator). Mirrors the substrate's
+    ``AuditQuery`` API. Each filter method returns the mutated
+    builder so consumers can chain idiomatically.
+
+    Not directly instantiable — obtain one from ``DeckClient.audit()``.
+    """
+
+    def recent(self, limit: int) -> "AuditQuery":
+        """Limit the query to the most recent ``limit`` records."""
+        ...
+    def by_operator(self, operator_id: int) -> "AuditQuery":
+        """Filter to records committed by ``operator_id``."""
+        ...
+    def between(self, start_ms: int, end_ms: int) -> "AuditQuery":
+        """Filter to records committed in the ``[start_ms, end_ms]``
+        millisecond window."""
+        ...
+    def force_only(self) -> "AuditQuery":
+        """Filter to force (break-glass) records only."""
+        ...
+    def since(self, seq: int) -> "AuditQuery":
+        """Filter to records with sequence number >= ``seq``."""
+        ...
+    def collect(self) -> List[str]:
+        """Collect the matching audit records into a list of JSON
+        strings. The ``sdk-py`` wrapper parses each entry into a
+        native dict."""
+        ...
+    def stream(self) -> "AuditStream":
+        """Return a sync iterator over JSON-encoded audit records."""
+        ...
+
+class AuditStream:
+    """Admin-audit record stream as a sync Python iterator.
+
+    Each ``__next__`` blocks until the next matching record
+    publishes, or raises ``StopIteration`` when the underlying
+    stream's substrate runtime shuts down.
+    """
+
+    def __iter__(self) -> "AuditStream": ...
+    def __next__(self) -> str:
+        """Next audit record as a JSON string. Blocks until one is
+        published."""
+        ...
+    def close(self) -> None:
+        """Close the stream; subsequent ``__next__`` raises
+        ``DeckSdkError`` with kind ``stream_closed``."""
+        ...
+
+
+# =============================================================================
+# Dataforts blob capability tags (`blob.rs`). Fixed string literals from the
+# core dataforts modules.
+# =============================================================================
+
+DATAFORTS_BLOB_TREE_SUPPORTED: str = "dataforts:blob-tree-supported"
+"""Capability tag a node advertises when it supports the v0.3
+hierarchical-manifest tree path (``BlobRef::Tree``). Compare advertisement
+payloads against this string to choose Tree vs downgrading to v0.2
+Manifest."""
+
+DATAFORTS_BLOB_CDC_SUPPORTED: str = "dataforts:blob-cdc-supported"
+"""Capability tag a node advertises when it supports the v0.3 Phase B
+content-defined-chunking store path (``ChunkingStrategy.cdc(...)``).
+Independent of the Tree tag — a node can run Phase A (Tree + Fixed)
+without Phase B (CDC)."""
+
+DATAFORTS_BLOB_ERASURE_SUPPORTED: str = "dataforts:blob-erasure-supported"
+"""Capability tag a node advertises when it supports the v0.3 Phase C
+Reed-Solomon erasure-coding store path (``Encoding.reed_solomon(k, m)``).
+Independent of Tree/CDC tags; peers without it must downgrade to
+``Encoding.replicated()``."""
+
+DATAFORTS_BLOB_BANDWIDTH_CLASS_SUPPORTED: str = "dataforts:blob-bandwidth-class-supported"
+"""Capability tag a node advertises when it accepts the v0.3 Phase D
+per-stream ``BandwidthClass`` hint. A peer that doesn't advertise it
+silently drops the hint and serves every call uniformly."""
+
+# =============================================================================
+# Dataforts blob value types (`blob.rs`).
+# =============================================================================
+
+class BandwidthClass:
+    """Per-stream bandwidth class hint for the v0.3 Phase D blob path.
+    Construct via ``foreground()`` / ``background()`` / ``realtime()``."""
+
+    kind: str
+    """Discriminant: ``"foreground"``, ``"background"``, or ``"realtime"``."""
+
+    @staticmethod
+    def foreground() -> "BandwidthClass":
+        """Foreground-class hint."""
+        ...
+
+    @staticmethod
+    def background() -> "BandwidthClass":
+        """Background-class hint."""
+        ...
+
+    @staticmethod
+    def realtime() -> "BandwidthClass":
+        """Realtime-class hint."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class Encoding:
+    """Producer-facing encoding-strategy value type. Mirrors the Rust
+    ``Encoding`` enum (``Replicated`` vs ``ReedSolomon { k, m }``). Construct
+    via ``replicated()`` / ``reed_solomon(k, m)`` / ``default_reed_solomon()``."""
+
+    kind: str
+    """Discriminant: ``"replicated"`` or ``"reed_solomon"``."""
+
+    k: Optional[int]
+    """RS data shards per stripe — populated iff ``kind == "reed_solomon"``."""
+
+    m: Optional[int]
+    """RS parity shards per stripe — populated iff ``kind == "reed_solomon"``."""
+
+    @staticmethod
+    def replicated() -> "Encoding":
+        """Replication-only encoding. Each chunk stored verbatim; cross-node
+        replication provides redundancy."""
+        ...
+
+    @staticmethod
+    def reed_solomon(k: int, m: int) -> "Encoding":
+        """Reed-Solomon erasure encoding: each stripe of ``k`` data chunks
+        gets ``m`` parity chunks; stripe survives any ``m`` chunk losses."""
+        ...
+
+    @staticmethod
+    def default_reed_solomon() -> "Encoding":
+        """Production RS defaults: ``(k=10, m=4)``."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class ChunkingStrategy:
+    """Producer-facing chunking-strategy value type for the v0.3 Tree store
+    path. Construct via ``fixed(size)`` / ``cdc(min, avg, max)`` /
+    ``production_cdc()``."""
+
+    kind: str
+    """Discriminant: ``"fixed"`` for fixed-size chunks, ``"cdc"`` for
+    content-defined chunking."""
+
+    size: Optional[int]
+    """Chunk size in bytes — populated iff ``kind == "fixed"``."""
+
+    min: Optional[int]
+    """CDC minimum chunk size in bytes — populated iff ``kind == "cdc"``."""
+
+    avg: Optional[int]
+    """CDC target average chunk size in bytes — populated iff
+    ``kind == "cdc"``."""
+
+    max: Optional[int]
+    """CDC maximum chunk size in bytes — populated iff ``kind == "cdc"``."""
+
+    @staticmethod
+    def fixed(size: int) -> "ChunkingStrategy":
+        """Fixed-size chunks. ``size`` must equal the v0.2-compatible
+        ``BLOB_CHUNK_SIZE_BYTES`` (4 MiB) for cluster-wide dedup."""
+        ...
+
+    @staticmethod
+    def cdc(min: int, avg: int, max: int) -> "ChunkingStrategy":
+        """Content-defined chunking (FastCDC). For cluster-wide CDC dedup,
+        pass the spec'd production triple — see ``production_cdc()``."""
+        ...
+
+    @staticmethod
+    def production_cdc() -> "ChunkingStrategy":
+        """Production CDC parameters pinned by Phase B of the v0.3 blob plan:
+        ``min = 1 MiB``, ``avg = 4 MiB``, ``max = 16 MiB``."""
+        ...
+
+    def __repr__(self) -> str: ...

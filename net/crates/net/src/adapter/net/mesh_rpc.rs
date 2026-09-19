@@ -37,16 +37,17 @@ use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, Publ
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome, ServiceMetricsAtomic};
 use crate::adapter::net::cortex::{
     build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant,
-    parse_request_window_initial, peek_request_service, EventMeta, RpcAsyncResponseEmitter,
-    RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler, RpcContext, RpcDuplexFold,
-    RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher, RpcInboundEvent,
-    RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload, RpcResponseEmitter,
-    RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus, RpcStreamingHandler,
-    RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL, DISPATCH_RPC_REQUEST,
-    DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT, DISPATCH_RPC_STREAM_GRANT,
-    EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_PROPAGATE_TRACE,
-    FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_REQUEST_WINDOW_INITIAL,
-    HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_FRAME_BODY_OFFSET, RPC_ROUTE_V1_SIZE,
+    parse_request_window_initial, peek_request_service, request_wire_size, EventMeta,
+    RpcAsyncResponseEmitter, RpcCancellationToken, RpcClientFold, RpcClientStreamingHandler,
+    RpcContext, RpcDuplexFold, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcInboundDispatcher,
+    RpcInboundEvent, RpcRequestChunkPayload, RpcRequestGrantEmitter, RpcRequestPayload,
+    RpcResponseEmitter, RpcResponsePayload, RpcServerFold, RpcServerStreamingFold, RpcStatus,
+    RpcStreamingHandler, RpcStreamingRequestFold, StreamItem, TraceContext, DISPATCH_RPC_CANCEL,
+    DISPATCH_RPC_REQUEST, DISPATCH_RPC_REQUEST_CHUNK, DISPATCH_RPC_REQUEST_GRANT,
+    DISPATCH_RPC_STREAM_GRANT, EVENT_META_SIZE, FLAG_RPC_CLIENT_STREAMING_REQUEST,
+    FLAG_RPC_PROPAGATE_TRACE, FLAG_RPC_REQUEST_END, FLAG_RPC_STREAMING_RESPONSE,
+    HEADER_NRPC_REQUEST_WINDOW_INITIAL, HEADER_NRPC_STREAM_WINDOW_INITIAL, RPC_FRAME_BODY_OFFSET,
+    RPC_ROUTE_V1_SIZE,
 };
 use crate::error::AdapterError;
 
@@ -5440,6 +5441,28 @@ impl MeshNode {
                 direction: CodecDirection::Encode,
                 message: format!("org admission: finalized request exceeds wire bounds: {e}"),
             })?;
+            // Field ceilings are not the packet. One nRPC frame rides ONE
+            // mesh packet, and a frame that does not fit is neither
+            // delivered nor refused — it disappears, and the caller waits
+            // out its deadline for an answer nobody could send. The
+            // signed proof is request bytes like any others, so a request
+            // a caller sized against the accepted budget can be pushed
+            // over it by an addition made HERE, after every caller-side
+            // check has already passed. Measure what will actually be
+            // sent, and refuse it locally — before the pending oneshot is
+            // registered, so nothing is left waiting.
+            let finalized = request_wire_size(&req);
+            if finalized > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE {
+                let budget = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: format!(
+                        "org admission: the finalized request is {finalized} bytes with the \
+                         signed admission proof on it, over the {budget}-byte per-packet \
+                         budget; a frame that large is never delivered, so it is refused here"
+                    ),
+                });
+            }
         }
 
         // Caller-side metrics guard, created ONLY after all fallible LOCAL
@@ -6346,6 +6369,31 @@ pub enum ServeError {
          attach terms to the descriptor, or serve it free via Mesh::serve_tool"
     )]
     MissingPricingTerms(String),
+    /// A configured A2A service announces an `A2aBounds` this wire
+    /// cannot honor: its `max_prompt_bytes` exceeds the largest brief a
+    /// request can actually carry.
+    ///
+    /// An announced bound is a promise a caller sizes its work against,
+    /// and an over-large A2A request is not refused on arrival — it
+    /// exceeds one packet and is never delivered at all, so the caller
+    /// sees a silence indistinguishable from an absent peer. Refusing at
+    /// serve time is the same discipline as
+    /// [`UnenforceablePricing`](Self::UnenforceablePricing): a term this
+    /// path cannot enforce must never reach discovery.
+    #[error("a2a service bounds cannot be honored by the wire: {0}")]
+    A2aUndeliverableBounds(String),
+    /// A configured paid A2A service could not be served as
+    /// configured: no admission gate, or an admission journal that is
+    /// missing, unreadable, or already owned by another live holder.
+    /// Refused at serve time because the alternative is worse — a
+    /// service whose catalog announces a price would otherwise come up
+    /// serving that work for free, or with two writers over one set of
+    /// admissions.
+    #[error(
+        "paid A2A service is misconfigured and must not degrade to free: {0} — \
+         fix the configuration, or publish the service as free"
+    )]
+    A2aPaidMisconfigured(String),
     /// A protected (`serve_rpc_protected`) registration was attempted with no
     /// installed node authority (E1.1). Org admission needs the provider's
     /// proven owner org + revocation store; without them the handler could
@@ -8448,6 +8496,116 @@ mod roster_fallback_tests {
                 .await,
             Err(RpcError::Codec { .. })
         ));
+    }
+
+    /// A protected call measures the **finalized** envelope — the signed
+    /// admission proof included — against one packet, and refuses it
+    /// locally before the pending oneshot is registered.
+    ///
+    /// Field ceilings are not the packet. A request can pass every
+    /// caller-side bound (the A2A payment-proof budget, the per-field
+    /// `MAX_RPC_*` caps) and still be pushed past `MAX_PAYLOAD_SIZE` by
+    /// the proof header appended HERE, after those checks have already
+    /// run. One nRPC frame rides one mesh packet: an over-budget frame
+    /// is neither delivered nor refused by the wire — it disappears, and
+    /// the caller burns its deadline waiting for an answer nobody can
+    /// send.
+    ///
+    /// The cliff is what makes this a witness rather than a description:
+    /// a body sized to fill the packet exactly is accepted unprotected
+    /// (it reaches the network and times out) and refused once the proof
+    /// rides with it, naming both numbers. Inverse checked by deleting
+    /// the finalized measurement: the over-budget protected call is
+    /// accepted and times out instead, i.e. it was sent.
+    #[tokio::test]
+    async fn a_protected_call_refuses_a_finalized_frame_over_one_packet() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
+        const TARGET: u64 = 0xDEAD_BEEF;
+        const SERVICE: &str = "svc";
+
+        let server = build_server().await;
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        server.test_pin_peer_entity(TARGET, provider.clone());
+        let pending = server.rpc_client_pending();
+
+        // Exactly one packet with no headers: the frame prefix, the
+        // service name, the deadline, the flags, the header count and the
+        // body's own length prefix.
+        let fixed = RPC_FRAME_BODY_OFFSET + 1 + SERVICE.len() + 8 + 2 + 1 + 4;
+        let body = Bytes::from(vec![0x5au8; MAX_PAYLOAD_SIZE - fixed]);
+        let at_budget = RpcRequestPayload {
+            service: SERVICE.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: Vec::new(),
+            body: body.clone(),
+        };
+        assert_eq!(
+            request_wire_size(&at_budget),
+            MAX_PAYLOAD_SIZE,
+            "the fixture body fills the packet exactly"
+        );
+
+        let intent = || CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider.clone(),
+            )),
+            deadline: Some(Instant::now() + std::time::Duration::from_millis(250)),
+            ..Default::default()
+        };
+
+        let refused = server
+            .call(TARGET, SERVICE, body.clone(), intent())
+            .await
+            .expect_err("a finalized frame over one packet must be refused");
+        match &refused {
+            RpcError::Codec { message, .. } => {
+                assert!(
+                    message.contains(&MAX_PAYLOAD_SIZE.to_string())
+                        && message.contains("per-packet"),
+                    "the refusal must name the budget it exceeded: {message}"
+                );
+            }
+            other => panic!("expected a local codec refusal, got {other:?}"),
+        }
+        assert_eq!(
+            pending.pending_count(),
+            0,
+            "the refusal must precede pending-call registration",
+        );
+
+        // Control 1: the SAME body, unprotected, passes every local bound
+        // and is actually sent — it times out rather than being refused.
+        let sent = server
+            .call(
+                TARGET,
+                SERVICE,
+                body,
+                CallOptions {
+                    deadline: Some(Instant::now() + std::time::Duration::from_millis(250)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            !matches!(sent, Err(RpcError::Codec { .. })),
+            "a packet-sized body is deliverable without the proof; got {sent:?}"
+        );
+
+        // Control 2: a protected call with room to spare is not refused
+        // either, so the arm above is about the finalized size and not
+        // about protected calls failing.
+        let small = server
+            .call(TARGET, SERVICE, Bytes::from_static(b"ping"), intent())
+            .await;
+        assert!(
+            !matches!(small, Err(RpcError::Codec { .. })),
+            "a small protected call must finalize; got {small:?}"
+        );
     }
 
     /// Kyra #47 tail (caller/API): the requested proof TTL must be an honest,

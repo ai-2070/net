@@ -145,6 +145,7 @@ async fn settle_one(fx: &Fixture, idx: u64) {
             fx.caller.entity_id().clone(),
             CAPABILITY,
             mock_requirements(AMOUNT),
+            None,
             NOW + idx,
             TTL_NS,
         )
@@ -173,6 +174,7 @@ async fn lifecycle(
             caller_id,
             CAPABILITY,
             mock_requirements(AMOUNT),
+            None,
             NOW + idx,
             TTL_NS,
         )
@@ -192,7 +194,7 @@ async fn lifecycle(
         .await
         .expect("redeem");
     assert!(
-        matches!(redeem, RedeemDecision::Admitted),
+        matches!(redeem, RedeemDecision::Admitted { .. }),
         "lifecycle redeem must admit"
     );
     handler_runs.fetch_add(1, Ordering::SeqCst); // "handler executes" (trivial body)
@@ -211,6 +213,7 @@ async fn replay_witness(fx: &Fixture, idx: u64) {
             caller,
             CAPABILITY,
             mock_requirements(AMOUNT),
+            None,
             NOW + idx,
             TTL_NS,
         )
@@ -229,11 +232,11 @@ async fn replay_witness(fx: &Fixture, idx: u64) {
             .redeem_for_invocation(TOOL_ID, &quote.quote_id, None)
             .await
             .expect("redeem"),
-        RedeemDecision::Admitted
+        RedeemDecision::Admitted { .. }
     ));
     // Replay: redeem again → AlreadyRedeemed; the handler must NOT run again.
     let mut handler_ran_again = false;
-    if let RedeemDecision::Admitted = engine
+    if let RedeemDecision::Admitted { .. } = engine
         .redeem_for_invocation(TOOL_ID, &quote.quote_id, None)
         .await
         .expect("redeem2")

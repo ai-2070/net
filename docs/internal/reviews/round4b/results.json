@@ -1,0 +1,253 @@
+[
+  {
+    "group": "sdk",
+    "exit_code": 0,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--color",
+      "never",
+      "-p",
+      "net-mesh-sdk",
+      "--features",
+      "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures",
+      "--test",
+      "a2a_admission_identity",
+      "--test",
+      "review_round3_provider",
+      "-E",
+      "binary(a2a_admission_identity) or test(review_)",
+      "--no-tests=fail",
+      "--retries",
+      "0",
+      "--no-fail-fast",
+      "-j",
+      "4"
+    ],
+    "outcomes": [
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_failed_durability_barrier_is_ambiguous_not_untouched"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_free_inline_claim_cannot_launch_on_a_slot_a_competitor_took"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_decision_opens_only_on_the_incarnation_it_names"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_free_inline_hold_keeps_its_slot_from_insert_to_claim"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_generation_is_never_reused_after_a_prune_and_a_restart"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_superseded_redemption_is_retained_against_its_own_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_ambiguous_key_resolves_only_the_incarnation_it_names"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_gate_barrier_prune_and_reprepare_cannot_replace_a_deciding_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_aborted_mutation_completes_its_write_under_its_own_guards"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity concurrent_admissions_of_distinct_tasks_cannot_pass_a_ceiling_of_one"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_installed_org_identity_refuses_an_unauthorized_target_locally"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_installed_org_identity_reaches_a_protected_a2a_lifecycle"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity concurrent_submits_converge_on_the_deciders_retryable_verdict"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_round3_provider review_free_capacity_survives_old_competitor_reacquisition"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_round3_provider review_paid_capacity_survives_old_competitor_reacquisition"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity two_same_stem_journals_never_share_a_temp_file"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_decision_holds_its_capacity_slot_across_an_expiring_reservation"
+      ]
+    ],
+    "summary": [
+      "     Summary [   2.084s] 17 tests run: 17 passed, 15 skipped"
+    ]
+  },
+  {
+    "group": "payments",
+    "exit_code": 0,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--color",
+      "never",
+      "-p",
+      "net-payments",
+      "--all-features",
+      "--test",
+      "a2a_caller_identity",
+      "--test",
+      "review_round3_caller",
+      "--test",
+      "review_repair_expiry",
+      "--test",
+      "review_a2a_caller",
+      "-E",
+      "binary(a2a_caller_identity) or test(review_) or test(=a_later_authoritative_success_survives_a_duplicates_ambiguity) or test(=a_lost_pay_reply_is_resumed_by_resending_the_identical_payload)",
+      "--no-tests=fail",
+      "--retries",
+      "0",
+      "--no-fail-fast",
+      "-j",
+      "4"
+    ],
+    "outcomes": [
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_defaulted_generation_matches_only_the_row_it_was_read_from"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_quote_bound_to_another_purchase_is_refused_before_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_correctly_bound_quote_is_purchased_and_redeemed"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_later_authoritative_success_survives_a_duplicates_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_resolved_disposition_keeps_a_late_settlement_findable"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_live_task_that_spells_an_archive_id_cannot_overwrite_the_retained_charge"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_retained_charge_and_a_live_attempt_are_closed_independently"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_retired_paid_submit_is_terminal_with_its_evidence_kept"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_settlement_is_retained_over_a_siblings_exposed_refusal"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliation"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_exposed_payment_survives_caller_death_and_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_unstructured_rejected_ack_does_not_strand_a_paid_purchase"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity concurrent_submitters_of_a_retryable_refusal_both_keep_the_purchase_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity retaining_a_charge_cannot_overwrite_a_live_task_that_spells_its_archive_id"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_paying_survives_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_lost_pay_reply_is_resumed_by_resending_the_identical_payload"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_lost_reply_recovers_after_quote_expiry"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_wrong_input_hash_is_refused_before_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_redeem_recovery_survives_engine_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_stale_signer_cannot_pay_unapproved_replacement_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_later_authoritative_success_survives_a_duplicates_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_expired_in_flight_payment_is_not_proven_unpaid"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_retained_success_cannot_be_downgraded_by_late_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::review_round3_caller review_late_settlement_preserves_a_live_operator_disposition"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_superseded_key_cannot_overwrite_a_live_purchase"
+      ],
+      [
+        "PASS",
+        "net-payments::review_round3_caller a_later_authoritative_success_survives_a_duplicates_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::review_round3_caller review_late_settlement_preserves_arbitrary_operator_evidence"
+      ],
+      [
+        "PASS",
+        "net-payments::review_round3_caller review_prior_format_archive_is_still_exactly_addressable"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_expired_quote_with_a_live_settlement_answers_ambiguity"
+      ]
+    ],
+    "summary": [
+      "     Summary [   2.568s] 29 tests run: 29 passed, 43 skipped"
+    ]
+  }
+]

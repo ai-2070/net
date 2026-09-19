@@ -48,9 +48,12 @@ impl PaymentFlow for CallerPaymentFlow {
             CallerDecision::Denied { policy_reason } => {
                 PaymentFlowDecision::Denied { policy_reason }
             }
-            CallerDecision::Failed { message, retryable } => {
-                PaymentFlowDecision::Failed { message, retryable }
-            }
+            // The MCP decision vocabulary carries no quote id on a
+            // failure; the staged verbs are where a resumable caller
+            // reads it.
+            CallerDecision::Failed {
+                message, retryable, ..
+            } => PaymentFlowDecision::Failed { message, retryable },
         }
     }
 }

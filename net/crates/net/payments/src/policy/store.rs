@@ -64,6 +64,15 @@ pub fn default_payment_engine_path() -> Option<PathBuf> {
     default_store_file("payment-engine.json")
 }
 
+/// The per-user default A2A purchase-attempt path:
+/// `<local data>/net-mesh/a2a-purchases.json` — the caller-side durable
+/// record of one authoritative purchase attempt per intent key
+/// (`flow::a2a`). Beside `payment-policy.json` on purpose: the attempt
+/// and the spend reservation it holds are read together during recovery.
+pub fn default_a2a_purchase_path() -> Option<PathBuf> {
+    default_store_file("a2a-purchases.json")
+}
+
 fn default_store_file(name: &str) -> Option<PathBuf> {
     dirs::data_local_dir()
         .or_else(dirs::home_dir)

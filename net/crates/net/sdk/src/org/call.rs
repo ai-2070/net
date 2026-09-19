@@ -801,6 +801,82 @@ impl OrgClient {
         .into())
     }
 
+    /// Plan a proof intent for an **exact provider node**, instead of for
+    /// whichever authorized provider selection prefers.
+    ///
+    /// The A2A verbs are direct-addressed by node id and cannot be
+    /// re-routed: a reservation, the quote computed against it and the
+    /// payment that settled it all belong to one provider and are worth
+    /// nothing anywhere else. "The lowest authorized provider id" is
+    /// therefore the wrong question for them, and
+    /// [`Self::plan`]'s deterministic selection would happily mint a
+    /// proof for a *different* provider of the same service.
+    ///
+    /// Everything else is that pipeline unchanged and deliberately not
+    /// forked: one coherent capture, the stage-3 temporal recheck, mode
+    /// classification, exact grant matching, and the final currentness
+    /// comparison standing between selection and the mint. Nothing is
+    /// sent here.
+    pub(crate) fn plan_for_node(
+        &self,
+        service: &str,
+        target_node_id: u64,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
+        let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
+        let mut considered = 0usize;
+        for _ in 0..COLD_PLAN_ATTEMPTS {
+            let capture = match self.capture_private(&capability) {
+                Ok(capture) => capture,
+                Err(refusal) => return Err(cold_refusal_error(&capability, refusal, considered)),
+            };
+            // HOLD-3: derive into an INERT value, never `?`, so a stale
+            // negative cannot escape a superseded view either.
+            let (candidates, seen) = self.derive_captured(&capability, &capture);
+            let selected: Result<AuthorizedOrgCandidate, OrgSdkError> =
+                candidates.and_then(|candidates| {
+                    self.select_node_candidate(&capability, &candidates, target_node_id, seen)
+                        .cloned()
+                });
+            if !self.node.org_cold_authority_is_current(capture.authority()) {
+                considered = seen;
+                continue;
+            }
+            return selected.map(|candidate| self.intent_for(&candidate));
+        }
+        Err(OrgDiscoveryError::NoAuthorizedProvider {
+            capability: hex_capability(&capability),
+            considered,
+        }
+        .into())
+    }
+
+    /// [`Self::select_candidate`] narrowed to one transport target: the
+    /// same direct-session rule, applied to the provider the caller
+    /// named rather than to the first authorized one.
+    fn select_node_candidate<'a>(
+        &self,
+        capability: &CapabilityAuthorityId,
+        candidates: &'a [AuthorizedOrgCandidate],
+        target_node_id: u64,
+        considered: usize,
+    ) -> Result<&'a AuthorizedOrgCandidate, OrgSdkError> {
+        match candidates
+            .iter()
+            .find(|c| c.provider.node_id() == target_node_id)
+        {
+            Some(candidate) if candidate.direct => Ok(candidate),
+            Some(candidate) => Err(OrgDiscoveryError::ProviderNotDirect {
+                provider: candidate.provider.clone(),
+            }
+            .into()),
+            None => Err(OrgDiscoveryError::NoAuthorizedProvider {
+                capability: hex_capability(capability),
+                considered,
+            }
+            .into()),
+        }
+    }
+
     /// One coherent capture of the private planes for `capability`, over exactly
     /// the audiences this credential set holds DISCOVER on.
     ///

@@ -329,6 +329,7 @@ async fn the_unchanged_engine_settles_through_the_http_client() {
             caller.entity_id().clone(),
             "fixture-provider/fixture-tool",
             requirements(),
+            None,
             1_000_000_000_000_000,
             60_000_000_000,
         )
@@ -363,6 +364,7 @@ async fn the_unchanged_engine_settles_through_the_http_client() {
             caller.entity_id().clone(),
             "fixture-provider/fixture-tool",
             requirements(),
+            None,
             1_000_000_000_000_100,
             60_000_000_000,
         )

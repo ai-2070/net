@@ -70,6 +70,7 @@ async fn settled_world(required_tier: VerificationTier) -> (World, PaymentDecisi
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )
@@ -542,6 +543,7 @@ async fn the_recorded_settle_payer_reaches_the_checker_when_the_payload_names_no
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )
@@ -642,6 +644,7 @@ async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )
@@ -754,6 +757,7 @@ async fn accept_eip155_inner(
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )

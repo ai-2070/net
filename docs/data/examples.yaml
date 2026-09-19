@@ -230,3 +230,47 @@ examples:
       expect: "RESULT ok providers=2 moved=1 served=2"
       timeout_s: 120
       not_wired: {}
+
+  - id: a2a-paid
+    skill: net-event-bus
+    title: Paid agent-to-agent admission
+    route: prepare (no money) · unpaid submit refused · purchase · submit · ran once, charged once
+    dir: .claude/skills/net-event-bus/examples
+    # Rust in skills.yml, Python in ci.yml's python-tests job, each riding the
+    # job that already holds the artifacts. Both stand up a real provider (one
+    # PaymentEngine behind the quote/pay wire AND the admission gate, a durable
+    # journal on disk) and a real caller (spend policy, durable purchase store)
+    # on two live mesh nodes over loopback UDP.
+    level: run
+    files:
+      rust: a2a_paid.rs
+      python: a2a_paid.py
+    absent:
+      typescript: >-
+        Node has no paid A2A surface in either direction: paid serving is an
+        explicit non-goal of the admission slice (no consumer), and the caller
+        verbs are not bound either. `submitTask` is free-path only. Writing
+        this example would mean writing the binding first.
+      go: >-
+        There is no Go A2A surface of any kind — free or paid. Neither the
+        binding nor the C ABI exposes a task verb.
+      c: >-
+        Same as Go: no A2A in the C ABI. The paid flow additionally needs the
+        payments caller state machine, which has no C surface.
+    run:
+      # Asserts the two properties the whole design exists for, read out of
+      # production artifacts: the executor's own run counter and the provider's
+      # billing log. A state label alone would not distinguish one run from
+      # three, so the counter is asserted with multiplicity.
+      #
+      # END-ANCHORED, and that anchor is load-bearing. The runner applies this
+      # with `grep -qE` (run-skill-examples.sh `assert_run`), which matches a
+      # SUBSTRING of a line: unanchored, `charges=10` and `charges=100` satisfy
+      # a pattern whose entire purpose is to pin the count at one. `charges=` is
+      # the last field both examples print
+      # (`paid task ran once: task=<id> charges=<n>`), so `$` is exactly the
+      # boundary — measured: anchored matches `charges=1` and rejects
+      # `charges=10`.
+      expect: "paid task ran once: .*charges=1$"
+      timeout_s: 120
+      not_wired: {}

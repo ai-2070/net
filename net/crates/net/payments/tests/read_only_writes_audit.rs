@@ -90,7 +90,14 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
 
     // Settle a quote (a Fresh claim + completion → durable writes).
     let quote = engine
-        .issue_quote(caller.entity_id().clone(), CAP, mock_reqs("2500"), NOW, TTL)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAP,
+            mock_reqs("2500"),
+            None,
+            NOW,
+            TTL,
+        )
         .unwrap();
     let p1 = payload(&quote, &quote.quote_id);
     assert!(matches!(
@@ -149,6 +156,7 @@ async fn accept_read_only_denial_is_clean_but_fresh_admission_persists() {
             caller.entity_id().clone(),
             CAP,
             mock_reqs("2500"),
+            None,
             NOW + 1000,
             TTL,
         )
@@ -208,7 +216,14 @@ async fn accept_verify_rejected_still_persists_claim_and_release() {
     // First verify_rejected: the claim (a Fresh write) + release write the
     // store into existence — `ino` panics if nothing was persisted.
     let q1 = engine
-        .issue_quote(caller.entity_id().clone(), CAP, mock_reqs("2500"), NOW, TTL)
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAP,
+            mock_reqs("2500"),
+            None,
+            NOW,
+            TTL,
+        )
         .unwrap();
     let p1 = payload(&q1, &q1.quote_id);
     assert!(matches!(
@@ -236,6 +251,7 @@ async fn accept_verify_rejected_still_persists_claim_and_release() {
             caller.entity_id().clone(),
             CAP,
             mock_reqs("2500"),
+            None,
             NOW + 1000,
             TTL,
         )

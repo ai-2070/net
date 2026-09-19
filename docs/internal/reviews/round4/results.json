@@ -1,0 +1,1137 @@
+[
+  {
+    "group": "sdk",
+    "exit_code": 0,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--color",
+      "never",
+      "-p",
+      "net-mesh-sdk",
+      "--features",
+      "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures",
+      "--test",
+      "a2a_admission_journal",
+      "--test",
+      "a2a_paid_admission",
+      "--test",
+      "a2a_call_bounds",
+      "--test",
+      "a2a_task_ownership",
+      "--test",
+      "a2a_admission_identity",
+      "--test",
+      "review_a2a_provider",
+      "--test",
+      "review_a2a_wire",
+      "--test",
+      "review_repair_provider",
+      "-E",
+      "not test(=review_aborted_startup_writer_cannot_outlive_its_owner)",
+      "--no-tests=fail",
+      "--retries",
+      "0",
+      "--no-fail-fast",
+      "-j",
+      "4"
+    ],
+    "log": "C:\\Users\\chief\\AppData\\Local\\Temp\\a2a-rereview-84d1784\\sdk.log",
+    "outcomes": [
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_failed_durability_barrier_is_ambiguous_not_untouched"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_free_inline_claim_cannot_launch_on_a_slot_a_competitor_took"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_decision_opens_only_on_the_incarnation_it_names"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_free_inline_hold_keeps_its_slot_from_insert_to_claim"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_generation_is_never_reused_after_a_prune_and_a_restart"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_superseded_redemption_is_retained_against_its_own_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_ambiguous_key_resolves_only_the_incarnation_it_names"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_gate_barrier_prune_and_reprepare_cannot_replace_a_deciding_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_aborted_mutation_completes_its_write_under_its_own_guards"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity concurrent_admissions_of_distinct_tasks_cannot_pass_a_ceiling_of_one"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_installed_org_identity_refuses_an_unauthorized_target_locally"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity an_installed_org_identity_reaches_a_protected_a2a_lifecycle"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_failed_write_leaves_the_journal_untouched"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity concurrent_submits_converge_on_the_deciders_retryable_verdict"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_gate_denial_note_does_not_change_state"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_second_open_in_the_same_process_is_refused"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_second_owner_is_excluded_after_a_journal_replacement"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_retired_result_still_answers_ledger_has"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal an_unpaid_reservation_is_pruned_after_reservation_retention_only"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal a_successor_owner_surfaces_paid_not_started_and_outcome_unknown_without_relaunching"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal claim_launch_writes_the_launched_state_and_the_ledger_atomically"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal capacity_counts_only_in_flight_admissions"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal the_memory_store_and_the_journal_agree_on_the_transition_table"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal every_transition_outside_the_table_is_a_conflict"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_journal unresolved_paid_launched_and_reconcile_records_survive_result_retention"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_brief_inside_every_field_bound_can_still_exceed_the_joint_budget"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_brief_at_the_wire_limit_round_trips"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_brief_over_the_wire_limit_is_refused_locally_and_never_sent"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity two_same_stem_journals_never_share_a_temp_file"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_brief_past_the_packet_cliff_is_refused_instead_of_vanishing"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_catalog_larger_than_one_packet_is_discovered_across_pages"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_proof_over_the_request_header_bound_is_refused_before_the_call"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_service_announcing_an_undeliverable_prompt_bound_refuses_to_serve"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds an_offer_too_large_to_discover_refuses_to_serve"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_healthy_peer_answers_well_inside_the_deadline"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_admission_identity a_decision_holds_its_capacity_slot_across_an_expiring_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds prepare_refuses_an_over_limit_brief_before_reserving"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds an_over_long_refusal_reason_is_bounded_and_still_delivered"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds an_undeliverable_status_record_is_refused_with_its_sizes"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds the_announced_prompt_ceiling_is_usable_over_the_wire"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_failed_claim_write_never_launches_and_a_retry_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_bearer_submit_is_refused_binding_required"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_configured_service_runs_without_a_gate_or_journal"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_prepared_reservation_is_deleted_when_preflight_fails_at_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_direct_submit_that_passes_preflight_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_service_refuses_pricing"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_retired_retry_is_still_an_in_body_rejection"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_service_without_a_journal_runs_preflight_on_direct_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_free_service_without_a_journal_enforces_capacity_on_direct_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_gate_denial_keeps_the_reservation_and_a_valid_retry_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_service_refuses_to_start_with_undiscoverable_pricing_terms"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_service_refuses_to_start_without_a_gate"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_service_refuses_to_start_without_a_journal"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_service_refuses_to_start_without_pricing"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_record_refuses_a_different_quote_header"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_record_resumes_without_a_second_redeem"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_submit_redeems_once_and_runs_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_paid_submit_without_a_reservation_is_refused_before_the_gate"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_restart_after_claim_surfaces_outcome_unknown_and_never_reruns"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_restart_with_a_reconcile_record_keeps_refusing_until_resolved"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_restart_after_payment_before_claim_surfaces_paid_not_started_and_resumes_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_retry_after_result_retention_never_relaunches_or_redeems"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_reused_proof_from_another_peer_is_refused_and_never_launches"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission a_stale_revision_is_rejected_before_payment"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission an_org_admitted_catalog_registers_as_protected"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission an_altered_brief_under_the_same_id_is_rejected_before_payment"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission an_identical_retry_returns_the_original_task_without_a_second_redeem"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission another_peer_cannot_read_or_cancel_a_paid_task"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission describe_a2a_lists_offers_with_pricing_and_bounds"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission concurrent_identical_submits_converge_on_one_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission legacy_serve_a2a_ignores_the_service_and_revision_fields"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission prepare_is_idempotent_and_returns_the_same_admission_id"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission prepare_on_a_paid_record_returns_the_same_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission prepare_refuses_a_different_brief_under_the_same_id"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission every_handler_path_performs_only_its_table_transition"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission status_cancel_prepare_and_describe_are_uncharged"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission the_offers_retention_governs_the_task_record"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_task_ownership a_third_peer_cannot_read_or_cancel_another_submitters_task"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_task_ownership reusing_an_id_for_different_work_is_refused"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission prepare_reports_busy_at_max_in_flight_and_frees_on_expiry"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_task_ownership two_submitters_may_use_the_same_task_id"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_failed_claim_write_never_launches_and_a_retry_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_bearer_submit_is_refused_binding_required"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_paid_admission the_owner_outlives_a_running_executor"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_configured_service_runs_without_a_gate_or_journal"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_prepared_reservation_is_deleted_when_preflight_fails_at_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_service_refuses_pricing"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_direct_submit_that_passes_preflight_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_service_without_a_journal_runs_preflight_on_direct_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_free_service_without_a_journal_enforces_capacity_on_direct_submit"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_gate_denial_keeps_the_reservation_and_a_valid_retry_launches_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_service_refuses_to_start_without_a_gate"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_service_refuses_to_start_without_a_journal"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_service_refuses_to_start_without_pricing"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_record_refuses_a_different_quote_header"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_record_resumes_without_a_second_redeem"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_submit_redeems_once_and_runs_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_paid_submit_without_a_reservation_is_refused_before_the_gate"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_restart_after_claim_surfaces_outcome_unknown_and_never_reruns"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_restart_after_payment_before_claim_surfaces_paid_not_started_and_resumes_once"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_restart_with_a_reconcile_record_keeps_refusing_until_resolved"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_retry_after_result_retention_never_relaunches_or_redeems"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_revoked_preflight_with_headers_enters_reconciliation_not_unpaid_rejection"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_revoked_preflight_without_headers_is_an_unpaid_rejection_and_keeps_the_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_reused_proof_from_another_peer_is_refused_and_never_launches"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider a_stale_revision_is_rejected_before_payment"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider an_org_admitted_catalog_registers_as_protected"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider an_altered_brief_under_the_same_id_is_rejected_before_payment"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider an_identical_retry_returns_the_original_task_without_a_second_redeem"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider an_unpaid_submit_to_a_paid_service_is_refused_before_the_executor"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider another_peer_cannot_read_or_cancel_a_paid_task"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider describe_a2a_lists_offers_with_pricing_and_bounds"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider concurrent_identical_submits_converge_on_one_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider legacy_serve_a2a_ignores_the_service_and_revision_fields"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider prepare_is_idempotent_and_returns_the_same_admission_id"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider prepare_on_a_paid_record_returns_the_same_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider every_handler_path_performs_only_its_table_transition"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider prepare_refuses_a_different_brief_under_the_same_id"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider prepare_rejects_invalid_oversized_or_unauthorized_briefs_without_reserving"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider review_distinct_prepares_cannot_overbook_one_slot"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider prepare_reports_busy_at_max_in_flight_and_frees_on_expiry"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider review_stale_financial_transition_rejects_replacement_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider status_cancel_prepare_and_describe_are_uncharged"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider the_offers_retention_governs_the_task_record"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_wire review_accepted_description_is_discoverable"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_wire review_short_description_control"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_decision_opens_only_on_the_incarnation_it_names"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_failed_durability_barrier_is_ambiguous_not_untouched"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_gate_barrier_prune_and_reprepare_cannot_replace_a_deciding_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_generation_is_never_reused_after_a_prune_and_a_restart"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_superseded_redemption_is_retained_against_its_own_admission"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider an_aborted_mutation_completes_its_write_under_its_own_guards"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_a2a_provider the_owner_outlives_a_running_executor"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider an_installed_org_identity_refuses_an_unauthorized_target_locally"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider concurrent_admissions_of_distinct_tasks_cannot_pass_a_ceiling_of_one"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider an_installed_org_identity_reaches_a_protected_a2a_lifecycle"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider concurrent_submits_converge_on_the_deciders_retryable_verdict"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider review_pre_pin_stale_clock_cannot_reacquire_an_occupied_slot"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider review_provider_resolution_refuses_ambiguous_incarnations"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider a_decision_holds_its_capacity_slot_across_an_expiring_reservation"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider two_same_stem_journals_never_share_a_temp_file"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::review_repair_provider review_operator_replacement_cannot_retarget_a_live_launch"
+      ],
+      [
+        "PASS",
+        "net-mesh-sdk::a2a_call_bounds a_delivered_request_that_is_never_answered_times_out"
+      ]
+    ],
+    "summary": [
+      "     Summary [  31.870s] 147 tests run: 147 passed, 1 skipped"
+    ]
+  },
+  {
+    "group": "payments",
+    "exit_code": 0,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--color",
+      "never",
+      "-p",
+      "net-payments",
+      "--all-features",
+      "--test",
+      "a2a_caller_purchase",
+      "--test",
+      "a2a_caller_identity",
+      "--test",
+      "review_a2a_caller",
+      "--test",
+      "review_repair_expiry",
+      "--test",
+      "a2a_paid_end_to_end",
+      "--test",
+      "a2a_task_redeem",
+      "--test",
+      "engine_retention",
+      "--no-tests=fail",
+      "--retries",
+      "0",
+      "--no-fail-fast",
+      "-j",
+      "4"
+    ],
+    "log": "C:\\Users\\chief\\AppData\\Local\\Temp\\a2a-rereview-84d1784\\payments.log",
+    "outcomes": [
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_defaulted_generation_matches_only_the_row_it_was_read_from"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_quote_bound_to_another_purchase_is_refused_before_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_correctly_bound_quote_is_purchased_and_redeemed"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_later_authoritative_success_survives_a_duplicates_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_resolved_disposition_keeps_a_late_settlement_findable"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_live_task_that_spells_an_archive_id_cannot_overwrite_the_retained_charge"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_retained_charge_and_a_live_attempt_are_closed_independently"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_retired_paid_submit_is_terminal_with_its_evidence_kept"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_settlement_is_retained_over_a_siblings_exposed_refusal"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliation"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_exposed_payment_survives_caller_death_and_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_unstructured_rejected_ack_does_not_strand_a_paid_purchase"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity concurrent_submitters_of_a_retryable_refusal_both_keep_the_purchase_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_conflicting_commitment_under_the_same_key_is_rejected"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_caller_restart_mid_purchase_resumes_the_stored_attempt"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity retaining_a_charge_cannot_overwrite_a_live_task_that_spells_its_archive_id"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_lost_pay_reply_is_resumed_by_resending_the_identical_payload"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_retryable_submit_refusal_keeps_the_attempt_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_operator_rejection_of_a_held_quote_is_an_unexposed_refusal"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_oversize_brief_is_a_permanent_local_refusal_not_a_transport_retry"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase an_unexposed_refusal_releases_and_may_prepare_again"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase concurrent_purchases_send_one_payload"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase concurrent_prepares_converge_on_one_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase prepare_task_moves_no_money_and_reserves_no_spend"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase purchase_consumes_the_prepared_quote_not_a_fresh_one"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase purchase_never_requotes_while_an_attempt_is_unresolved"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase the_task_gate_refuses_a_proof_bought_for_another_reservation"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase two_processes_share_one_attempt"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase unresolved_financial_attempts_are_never_pruned"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end a_caller_restart_between_pay_and_submit_resumes_from_the_purchase_store"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_identity an_expired_quote_with_a_live_settlement_answers_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase every_caller_transition_outside_the_table_is_a_conflict"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end a_lost_pay_reply_is_reconciled_without_a_second_quote_or_charge"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end a_lost_submit_reply_is_reconciled_by_resubmitting_the_same_proof"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_caller_purchase a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem a_bearer_task_redeem_is_binding_required_even_when_the_engine_allows_bearer_tools"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem a_quote_carries_the_purchase_hash_into_its_id"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end a_pending_approval_resumes_after_approve_payment_for_the_same_purchase_only"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem a_second_purchase_hash_on_a_redeemed_quote_is_already_redeemed"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end prepare_then_purchase_then_submit_runs_the_task_once"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem an_approved_quote_resumes_only_for_its_own_purchase_hash"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_paid_end_to_end a_provider_restart_between_redeem_and_claim_reconciles_the_original_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem redeem_for_task_is_idempotent_for_the_same_purchase_hash"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_longer_window_is_honored"
+      ],
+      [
+        "PASS",
+        "net-payments::a2a_task_redeem redeem_for_task_refuses_a_mismatched_purchase_hash"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_payload_guard_owned_by_another_quote_survives_the_prune"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_record_frozen_after_redemption_is_never_pruned"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_pruned_quote_cannot_recreate_lifecycle_state"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_second_sweep_is_a_no_op"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_retired_settlement_transaction_is_still_rejected_later"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_terminal_record_survives_until_the_horizon"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention an_unredeemed_record_is_never_pruned"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention an_observed_tier_record_retires_on_the_same_clock_as_a_final_one"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention accepting_a_payment_sweeps_eligible_records"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention a_sweep_reports_every_record_it_retires"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention compaction_is_on_by_default_at_six_hours"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention legacy_records_without_an_expiry_are_never_pruned"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention none_disables_compaction_entirely"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention the_payload_guard_retires_with_its_record"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention zero_is_refused_and_normalized_to_the_default"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_conflicting_commitment_under_the_same_key_is_rejected"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention tombstones_are_permanent_under_every_retention_setting"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_caller_restart_mid_purchase_resumes_the_stored_attempt"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_late_paid_submit_becomes_paid_unexecutable_and_keeps_its_evidence"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_lost_pay_reply_is_resumed_by_resending_the_identical_payload"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_pending_settlement_purchase_stays_unknown_then_resolves_to_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_retryable_submit_refusal_keeps_the_attempt_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller an_expired_unpaid_quote_is_requoted_only_through_prepare_with_the_same_admission_id"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller an_expired_awaiting_approval_quote_requires_fresh_approval_after_reprepare"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller an_operator_rejection_of_a_held_quote_is_an_unexposed_refusal"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller an_unexposed_refusal_releases_and_may_prepare_again"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller concurrent_purchases_send_one_payload"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller concurrent_prepares_converge_on_one_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller prepare_task_moves_no_money_and_reserves_no_spend"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller purchase_consumes_the_prepared_quote_not_a_fresh_one"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller purchase_never_requotes_while_an_attempt_is_unresolved"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_lost_reply_recovers_after_quote_expiry"
+      ],
+      [
+        "PASS",
+        "net-payments::engine_retention crossing_the_store_size_threshold_warns_exactly_once"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_paying_survives_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_redeem_recovery_survives_engine_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_wrong_input_hash_is_refused_before_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller review_stale_signer_cannot_pay_unapproved_replacement_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller two_processes_share_one_attempt"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller the_task_gate_refuses_a_proof_bought_for_another_reservation"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller unresolved_financial_attempts_are_never_pruned"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller unknown_recovers_automatically_through_the_stored_payment_never_a_new_quote"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_defaulted_generation_matches_only_the_row_it_was_read_from"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_correctly_bound_quote_is_purchased_and_redeemed"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_quote_bound_to_another_purchase_is_refused_before_payment"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_retired_paid_submit_is_terminal_with_its_evidence_kept"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_later_authoritative_success_survives_a_duplicates_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller every_caller_transition_outside_the_table_is_a_conflict"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry an_exposed_payment_survives_caller_death_and_retention"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry a_settled_purchase_whose_key_was_recreated_is_retained_for_reconciliation"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry an_unstructured_rejected_ack_does_not_strand_a_paid_purchase"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry concurrent_submitters_of_a_retryable_refusal_both_keep_the_purchase_paid"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_expired_in_flight_payment_is_not_proven_unpaid"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_retained_success_cannot_be_downgraded_by_late_ambiguity"
+      ],
+      [
+        "PASS",
+        "net-payments::review_repair_expiry review_superseded_key_cannot_overwrite_a_live_purchase"
+      ],
+      [
+        "PASS",
+        "net-payments::review_a2a_caller a_stale_preparing_lease_is_taken_over_and_a_live_one_is_not"
+      ]
+    ],
+    "summary": [
+      "     Summary [   5.724s] 107 tests run: 107 passed, 0 skipped"
+    ]
+  },
+  {
+    "group": "c8",
+    "exit_code": 0,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--color",
+      "never",
+      "-p",
+      "net-mesh",
+      "--lib",
+      "--features",
+      "net redex redex-disk cortex netdb meshdb meshos dataforts nat-traversal port-mapping tool batched-ingress cli regex",
+      "-E",
+      "test(a_protected_call_refuses_a_finalized_frame_over_one_packet)",
+      "--no-tests=fail",
+      "--retries",
+      "0",
+      "--no-fail-fast",
+      "-j",
+      "4"
+    ],
+    "log": "C:\\Users\\chief\\AppData\\Local\\Temp\\a2a-rereview-84d1784\\c8.log",
+    "outcomes": [
+      [
+        "PASS",
+        "net-mesh adapter::net::mesh_rpc::roster_fallback_tests::a_protected_call_refuses_a_finalized_frame_over_one_packet"
+      ]
+    ],
+    "summary": [
+      "     Summary [   0.040s] 1 test run: 1 passed, 5976 skipped"
+    ]
+  }
+]
