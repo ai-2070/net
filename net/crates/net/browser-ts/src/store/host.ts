@@ -292,8 +292,32 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
   async function emit(out: readonly Outbound[]): Promise<void> {
     for (const frame of out) {
       if (closed) return;
+      const payload = encoder.encode(frame.frame);
       const stream = await replyStream(frame.peer);
-      await stream.send(encoder.encode(frame.frame));
+      try {
+        await stream.send(payload);
+      } catch (error) {
+        // A HELD STREAM HANDLE DOES NOT SURVIVE ITS SESSION.
+        //
+        // When a pair is promoted from relayed to direct (§9 step 4)
+        // the session is REPLACED, and every stream opened on the
+        // predecessor is refused: "stale stream handle: opened on
+        // incarnation N … reopen the stream". A store that cached
+        // one therefore stopped delivering the moment its pair got
+        // better — silently, because the send is a promise nobody
+        // awaited. Measured: the Stage 7 direct-path witness
+        // promoted the pair, the anchor's per-pair counter went
+        // exactly flat, and the replica never saw the commit.
+        //
+        // So a failed send drops the handle and reopens ONCE. Not a
+        // retry loop: if the second attempt fails the failure is
+        // real and belongs to the caller.
+        replies.delete(frame.peer);
+        pendingReplies.delete(frame.peer);
+        dropped['reopened-stream'] = (dropped['reopened-stream'] ?? 0) + 1;
+        const reopened = await replyStream(frame.peer);
+        await reopened.send(payload);
+      }
     }
   }
 

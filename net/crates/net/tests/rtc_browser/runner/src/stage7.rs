@@ -9,7 +9,7 @@
 //! that chunks ride the shared reliability/reassembly code intact
 //! under loss, duplication and reorder."
 //!
-//! So these five witnesses put the store on the transport the rest of
+//! So these six witnesses put the store on the transport the rest of
 //! this harness exercises, in two isolated browsing contexts of a real
 //! engine. **CI runs them on CHROMIUM**: that leg passes `--stage7`,
 //! its floor is 52 and all five names are pinned REQUIRED
@@ -72,15 +72,18 @@
 //! (`Step5::NodeCounters`), because which side is silent about a loss
 //! is the diagnosis.
 //!
-//! ## The five witnesses, in the order they run
+//! ## The six witnesses, in the order they run
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. an action crosses, executes once, and its result comes back;
 //! 3. the same install, through injected loss **and** reorder;
 //! 4. a duplicated wire message moves the view exactly once AND
 //!    costs the replica no upstream word;
-//! 5. and store traffic moves the anchor's per-pair forwarding
-//!    counter while the pair is relayed.
+//! 5. store traffic moves the anchor's per-pair forwarding counter
+//!    while the pair is relayed;
+//! 6. and the SAME traffic leaves that counter exactly flat once the
+//!    pair is direct — the other half of the plan's criterion, which
+//!    is a pair of readings and not one.
 //!
 //! **These numbers are the EXECUTION order**, matching the `// --- N`
 //! section comments below, and they are the numbering every sentence
@@ -89,7 +92,7 @@
 //! it, twice.
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
-//! 3 duplicate, 4 counter — and stays that way because each record
+//! 3 duplicate, 4 routed, 5 direct — and stays that way because each record
 //! names its position by index, so reordering the array would
 //! silently retarget records (the same reason Stage 5's list is
 //! append-only). An earlier header mixed the two numberings and so
@@ -97,19 +100,22 @@
 //! leaving a witness red is that the record can be trusted, and the
 //! review caught this one.
 //!
-//! **The sixth property is NOT here**, and its absence is deliberate
-//! rather than forgotten: "the same traffic leaves that counter flat
-//! once the pair is direct" needs a direct session, a direct session
-//! needs `peer_offer`, and that needs the peer's signed announcement.
-//! An announcement is FLOODED to the nodes connected when it is made
-//! and is never replayed to one that arrives later, so a stage that
-//! opens its contexts after Stage 5 and Stage 6 cannot discover
-//! anything — measured, not assumed: querying Stage 6's own tag from
-//! these tabs returns an empty array too. Stage 6 witnesses 10 and 11
-//! already hold the flat-when-direct property on the raw stream
-//! surface; holding it on STORE traffic needs this stage to own the
-//! pair from the start, which is a change to the harness's topology
-//! and not a change to the store.
+//! **The sixth property is here now**, and what unblocked it was the
+//! identity separation: these contexts could not discover each other
+//! while Stage 7's two entity secrets were Stage 6 slice 3's, and
+//! without discovery there is no `peer_offer` and so no direct pair.
+//! Witness 6 promotes the pair through the PUBLIC page loop and then
+//! re-reads the same counter the routed witness read.
+//!
+//! It also found a defect no in-process suite could: a promotion
+//! REPLACES the session, and both halves of the store were caching a
+//! stream handle opened on its predecessor. The counter went
+//! perfectly flat and the replica never saw the commit — flat for
+//! the wrong reason, which is exactly what the plan's "a flat
+//! counter alone is not success" is about. Both sides now reopen
+//! once on a failed send (`host.ts`, `join.ts`), witnessed in
+//! `test/store/hosted.test.ts` with a double that stales a handle
+//! the way the leaf does.
 //!
 //! The last two are the plan's "flat for direct, increasing for
 //! routed" criterion, measured on STORE traffic rather than on the raw
@@ -127,7 +133,7 @@
 use net::adapter::net::MeshNode;
 
 use crate::stage5::{Script5, Step5};
-use crate::stage6::{discover, leaf_of, routing_id, Leaf};
+use crate::stage6::{discover, leaf_of, routing_id, stat_bool, Leaf};
 use crate::{Ledger, StepResult};
 
 /// Entries in the hosted document.
@@ -142,12 +148,15 @@ const ENTRIES: u32 = 700;
 /// chunk budget from (`MAX_EVENT_SIZE`).
 const MAX_EVENT_BYTES: u32 = 8104;
 
-pub const WITNESSES: [&str; 5] = [
+pub const WITNESSES: [&str; 6] = [
     "stage7_store_snapshot_installs_over_the_real_stream",
     "stage7_store_snapshot_installs_through_injected_loss_and_reorder",
     "stage7_an_action_round_trip_crosses_the_real_transport",
     "stage7_a_duplicated_store_frame_moves_the_view_once",
     "stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed",
+    // Appended, never inserted: every record above names its
+    // position by index.
+    "stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct",
 ];
 
 /// The tabs this stage drives, on their own isolated contexts.
@@ -737,6 +746,131 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             routed_after.hp,
             routed_after.ph,
             why(&routed_commit)
+        ),
+    );
+
+    // --- 6. direct: the same traffic, and the counter does NOT move -
+    //
+    // The plan's criterion is a PAIR of readings, not one: flat for
+    // direct AND increasing for routed, both with delivery
+    // receiver-observed. Witness 5 above holds the routed half on
+    // this very pair with this very commit shape, which is what
+    // makes the flat reading here mean something — a counter that
+    // never moved for any reason would satisfy "flat" and say
+    // nothing at all.
+    //
+    // ROUTING IS READ FROM THE LEAF, not from candidate labels: the
+    // attempt's own typed outcome plus `peerAttempt`'s `direct` flag
+    // are the §9 promotion's result, and a `host`/`srflx` label on a
+    // candidate is not a claim about where packets went.
+    //
+    // SIGNALLING IS A DIFFERENT COUNTER and is reported, never
+    // conflated: `forwarded_app_packets` excludes
+    // `SUBPROTOCOL_RTC_SIGNAL` by construction (`mesh.rs`'s transit
+    // arm), which is exactly why "flat" can be a claim about
+    // application data while the pair is still signalling.
+    let accept = script.spawn(
+        tab_player,
+        Step5::PeerAccept {
+            id: 0,
+            session: session.clone(),
+            peer_hex: host.node_hex.clone(),
+        },
+    );
+    let connected = script
+        .run(
+            tab_host,
+            Step5::PeerConnect {
+                id: 0,
+                session: session.clone(),
+                peer_hex: player.node_hex.clone(),
+            },
+        )
+        .await;
+    let accepted = accept.await;
+    let host_outcome = stat_str(&connected, "outcome");
+    let player_outcome = stat_str(&accepted, "outcome");
+    let host_attempt = script
+        .run(
+            tab_host,
+            Step5::PeerAttempt {
+                id: 0,
+                session: session.clone(),
+                peer_hex: player.node_hex.clone(),
+            },
+        )
+        .await;
+    let player_attempt = script
+        .run(
+            tab_player,
+            Step5::PeerAttempt {
+                id: 0,
+                session: session.clone(),
+                peer_hex: host.node_hex.clone(),
+            },
+        )
+        .await;
+    let both_direct = host_outcome.as_deref() == Some("direct")
+        && player_outcome.as_deref() == Some("direct")
+        && stat_bool(&host_attempt, "direct")
+        && stat_bool(&player_attempt, "direct");
+
+    let direct_before = Forwarded::read(anchor, &host, &player);
+    let direct_commit = script
+        .run(
+            tab_host,
+            Step5::StoreCommit {
+                id: 0,
+                handle: "dup".to_string(),
+                entries: None,
+                tick: Some(99),
+                duplicate_every: 0,
+                settle_ms: 500,
+            },
+        )
+        .await;
+    let direct_seen = script
+        .run(
+            tab_player,
+            Step5::StoreState {
+                id: 0,
+                handle: "dup".to_string(),
+            },
+        )
+        .await;
+    let direct_after = Forwarded::read(anchor, &host, &player);
+    let direct_delivered = stat_u64(&direct_seen, "tick") == Some(99);
+    // EXACT equality, both directions, not "did not grow much".
+    let stayed_flat = direct_after.hp == direct_before.hp && direct_after.ph == direct_before.ph;
+    ledger.record(
+        WITNESSES[5],
+        both_direct && direct_commit.ok && direct_delivered && stayed_flat,
+        format!(
+            "STORE TRAFFIC LEAVES THE ANCHOR'S PER-PAIR COUNTER FLAT ONCE THE PAIR IS \
+             DIRECT, and the pair's own routed reading above is what makes that a \
+             claim. The pair was promoted through the PUBLIC page loop — \
+             `connectPeer` on the host reported {host_outcome:?} and `acceptPeer` on \
+             the player {player_outcome:?}, and each leaf's own attempt says its \
+             session is direct (host={}, player={}) — so routing is read from the \
+             §9 promotion's result, never from a candidate's `host`/`srflx` label. \
+             Then the SAME commit shape as witness 5: (host→player, player→host) went \
+             from ({}, {}) to ({}, {}) — asserted EXACTLY equal, not merely small — \
+             while the replica's own document moved to tick {:?}. Delivery is \
+             receiver-observed for the same reason as above: a flat counter with \
+             nothing delivered is the trivial way to pass this, and the plan says so. \
+             Signalling rides a DIFFERENT counter and is not read here: \
+             `forwarded_app_packets` excludes `SUBPROTOCOL_RTC_SIGNAL` in the anchor's \
+             transit arm, which is what lets \"flat\" be a statement about application \
+             data while the pair keeps signalling. {} {}",
+            stat_bool(&host_attempt, "direct"),
+            stat_bool(&player_attempt, "direct"),
+            direct_before.hp,
+            direct_before.ph,
+            direct_after.hp,
+            direct_after.ph,
+            stat_u64(&direct_seen, "tick"),
+            why(&direct_commit),
+            why(&direct_seen)
         ),
     );
 

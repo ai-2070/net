@@ -5750,6 +5750,7 @@ jobs:
           stage7_an_action_round_trip_crosses_the_real_transport
           stage7_a_duplicated_store_frame_moves_the_view_once
           stage7_store_traffic_moves_the_anchors_per_pair_counter_when_routed
+          stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "browser matrix stage 7" --mode literal \
@@ -5759,7 +5760,7 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=52; extra="$STAGE7" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=53; extra="$STAGE7" ;;
               firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
@@ -5794,7 +5795,7 @@ jobs:
             # Chromium also carries the five Stage 7 store witnesses;
             # Firefox does not (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
-          (+ 5 Stage 7 on chromium)"
+          (+ 6 Stage 7 on chromium)"
           done
 
       # WebKit's verdicts are surfaced, never gated.

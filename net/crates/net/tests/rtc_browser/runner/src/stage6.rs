@@ -1204,7 +1204,7 @@ fn stat_u64(result: &StepResult, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn stat_bool(result: &StepResult, key: &str) -> bool {
+pub(crate) fn stat_bool(result: &StepResult, key: &str) -> bool {
     result
         .stats
         .as_ref()

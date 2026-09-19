@@ -103,6 +103,9 @@ function mesh() {
   const delivered: { to: string; from: string; bytes: Uint8Array }[] = [];
   let partitioned = false;
   const silenced = new Set<string>();
+  /** Per node: how many streams it has opened, and which one is stale. */
+  const opens = new Map<string, number>();
+  const stale = new Map<string, number>();
   /** Drop the Nth frame a node sends, once. */
   const drops = new Map<string, number>();
   const seen = new Map<string, number>();
@@ -162,8 +165,19 @@ function mesh() {
           throw new Error('openStream: a stream id is derived from the label, never passed');
         }
         const streamId = derivedStreamId(options.label ?? '');
+        // Which OPEN this is, so a test can stale exactly the first
+        // handle a side holds — what a session replacement does.
+        const generation = (opens.get(self) ?? 0) + 1;
+        opens.set(self, generation);
         const stream: TransportStream = {
           send: bytes => {
+            if (stale.get(self) === generation) {
+              // The real refusal's shape: the leaf rejects a stream
+              // opened on a session that has been replaced.
+              throw new Error(
+                `session: stale stream handle: opened on incarnation ${String(generation)}; reopen the stream`,
+              );
+            }
             deliver(target, self, bytes, streamId);
           },
           close: () => {},
@@ -226,6 +240,13 @@ function mesh() {
         .filter(message => message.k === 'no' && message.q === undefined && message.code === 'closed'),
     partition: (value: boolean) => {
       partitioned = value;
+    },
+    /**
+     * Make this node's CURRENT stream refuse every send, exactly as
+     * the leaf refuses one opened on a replaced session.
+     */
+    staleCurrentStream: (node: string) => {
+      stale.set(node, opens.get(node) ?? 0);
     },
     /** Lose the Nth frame this node sends. */
     dropNth: (node: string, nth: number) => {
@@ -1332,6 +1353,51 @@ describe('a join whose manifest is lost', () => {
     expect(net.kinds(HOST_NODE).filter(k => k === 'join')).toHaveLength(MAX_JOIN_REASKS + 1);
     await store.close();
     await host.close();
+  });
+});
+
+describe('a stream that its session replaced', () => {
+  it('is reopened, on both sides, and delivery continues', async () => {
+    // What a promotion to DIRECT does (§9 step 4): the session is
+    // REPLACED, and every stream opened on the predecessor is refused
+    // — "stale stream handle: opened on incarnation N; reopen the
+    // stream". Both sides cached one, so a store stopped delivering
+    // the moment its pair got BETTER, silently, because the send is a
+    // promise nobody awaited.
+    //
+    // Measured on the real transport first: the Stage 7 direct-path
+    // witness promoted the pair, the anchor's per-pair counter went
+    // exactly flat, and the replica never saw the commit.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    expect(joined.getState().hull).toBe(FULL.hull);
+
+    // Both sides' current handles go stale, as a replacement makes
+    // them.
+    net.staleCurrentStream(HOST_NODE);
+    net.staleCurrentStream(CALLER_NODE);
+
+    // The HOST's half: a commit still reaches the replica.
+    host.setState({ ...host.getState(), hull: 61 });
+    await flush(40);
+    expect(joined.getState().hull).toBe(61);
+    expect(host.counters()['reopened-stream']).toBe(1);
+
+    // The REPLICA's half: a correlated action still crosses and
+    // answers, which needs its own upstream stream. `fire` subtracts
+    // its power, so the ANSWER is what the host computed after the
+    // write — 61 - 2 — and the host's own document says so too.
+    const result = await joined.act('fire', { power: 2 });
+    expect(result.shot).toBe(59);
+    expect(host.getState().hull).toBe(59);
+
+    // And it is ONE reopen per side, not a reopen per frame.
+    time.advance(1_000);
+    await flush(20);
+    host.setState({ ...host.getState(), hull: 62 });
+    await flush(40);
+    expect(joined.getState().hull).toBe(62);
+    expect(host.counters()['reopened-stream']).toBe(1);
   });
 });
 

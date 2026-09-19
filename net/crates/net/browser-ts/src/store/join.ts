@@ -216,8 +216,23 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   async function send(frames: readonly string[]): Promise<void> {
     for (const frame of frames) {
       if (closed) return;
+      const payload = encoder.encode(frame);
       const open = await stream();
-      await open.send(encoder.encode(frame));
+      try {
+        await open.send(payload);
+      } catch (error) {
+        // A HELD STREAM HANDLE DOES NOT SURVIVE ITS SESSION. When a
+        // pair is promoted from relayed to direct (§9 step 4) the
+        // session is REPLACED and streams opened on the predecessor
+        // are refused as stale — so a replica that cached one stopped
+        // talking the moment its pair got better. Drop it and reopen
+        // ONCE; a second failure is real and reaches the caller
+        // through `fail`.
+        upstream = null;
+        opening = null;
+        const reopened = await stream();
+        await reopened.send(payload);
+      }
     }
   }
 
