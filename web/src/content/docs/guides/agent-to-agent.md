@@ -251,7 +251,7 @@ and a durable journal beside it:
 |---|---|
 | Rust | `serve_a2a_configured`, `describe_a2a`, `prepare_a2a`, `submit_task_paid` |
 | Python | serve with `PaymentProvider.serve_a2a_configured`; buy with `CapabilityGateway.prepare_task` / `purchase_task` / `submit_task` |
-| Node / TypeScript | **Requester only** — paid serving is deferred; free behavior unchanged |
+| Node / TypeScript | **Not available** — neither serving nor purchasing is bound. `submitTask` is the free verb only; there is no `describeA2a`, no prepare/purchase pair, and no `submitTaskPaid`. |
 | Go | **Not available** |
 
 ## See also

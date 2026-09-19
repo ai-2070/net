@@ -107,8 +107,11 @@ create_exception!(
     _net,
     RpcServerError,
     RpcError,
-    "Server returned a non-Ok status. The exception args carry the status code \
-     (u16) and diagnostic message."
+    "Server returned a non-Ok status. `args` carries ONE formatted diagnostic \
+     string, `nrpc:server_error: status=0x… message=…` — not a `(status, \
+     message)` pair. `net.mesh_rpc` parses the code back out of that text; if \
+     you need it structurally, match on the prefix rather than indexing \
+     `args[1]`. (`RpcAppError` is the one that carries two values.)"
 );
 
 create_exception!(

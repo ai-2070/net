@@ -85,7 +85,7 @@ Payment and admission refusals are the `ERR_PAYMENT` application error with one 
 
 **Wire**
 
-- **`TaskState` gains `interrupted`**, configured path only. See above: older Rust requesters cannot decode it; the bindings pass it through.
+- **`TaskState` gains `interrupted`**, configured path only. Older requesters fail to decode it — Rust builds **and previously built Python/Node bindings alike**, because the decode happens in the embedded Rust `TaskState` before any JSON is produced. Only a binding built from this release or later passes the tag through. (An earlier draft of this note said the bindings were transparently forward-compatible; see the correction above.)
 - Everything else is additive and decodes on an older build: the two new uncharged services, the two optional `TaskBrief` fields (`service`, `revision`) that a legacy free server ignores, the two payment request headers, and the optional signed `QuoteRequest.input_hash`.
 
 **Rust API consumers**
@@ -101,7 +101,7 @@ Payment and admission refusals are the `ERR_PAYMENT` application error with one 
 
 **Node / TypeScript**
 
-- `submitTask` accepts an optional `taskId`. **Paid serving is deferred** — there is no consumer for it yet, and free behavior is unchanged.
+- `submitTask` accepts an optional `taskId`, plus optional `service` / `revision` addressing a catalog entry. Those two are **free-path only**: a catalog's paid entry refuses the uncharged submit verb with `ERR_PAYMENT` / `missing_quote` before the executor runs. **Paid A2A is deferred in both directions** — no serving, and no caller verbs either (`describeA2a`, prepare/purchase and `submitTaskPaid` have no Node twin). Free behavior is unchanged.
 
 **Go**
 
