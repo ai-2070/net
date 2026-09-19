@@ -106,6 +106,8 @@ function mesh() {
   /** Per node: how many streams it has opened, and which one is stale. */
   const opens = new Map<string, number>();
   const stale = new Map<string, number>();
+  /** Nodes whose every send fails for a reason a reopen cannot fix. */
+  const permanent = new Set<string>();
   /** Drop the Nth frame a node sends, once. */
   const drops = new Map<string, number>();
   const seen = new Map<string, number>();
@@ -171,6 +173,11 @@ function mesh() {
         opens.set(self, generation);
         const stream: TransportStream = {
           send: bytes => {
+            if (permanent.has(self)) {
+              // NOT a stale handle: the leaf's own wording for a
+              // permanent refusal, which a new stream cannot repair.
+              throw new Error('event too large: 9000 bytes exceeds the 8104 ceiling');
+            }
             if (stale.get(self) === generation) {
               // The real refusal's shape: the leaf rejects a stream
               // opened on a session that has been replaced.
@@ -248,6 +255,12 @@ function mesh() {
     staleCurrentStream: (node: string) => {
       stale.set(node, opens.get(node) ?? 0);
     },
+    /** Every send from this node fails permanently. */
+    failPermanently: (node: string) => {
+      permanent.add(node);
+    },
+    /** How many streams this node has opened. */
+    opensOf: (node: string) => opens.get(node) ?? 0,
     /** Lose the Nth frame this node sends. */
     dropNth: (node: string, nth: number) => {
       drops.set(node, nth);
@@ -1398,6 +1411,63 @@ describe('a stream that its session replaced', () => {
     await flush(40);
     expect(joined.getState().hull).toBe(62);
     expect(host.counters()['reopened-stream']).toBe(1);
+  });
+});
+
+describe('reopening a stream that its session replaced', () => {
+  it('opens exactly ONE replacement when several sends fail at once', async () => {
+    // A session replacement fails every send in flight, and on a host
+    // `emit` runs fire-and-forget per frame while a replica's alive
+    // timer, tick re-ask and `act` can all be in flight at once. The
+    // first version of this repair had the second failure clear the
+    // in-flight open the first had registered, so TWO streams were
+    // opened on one derived label: the loser was orphaned, and on the
+    // real leaf a second open of that label FENCES the id terminally
+    // — the defect the repair exists to remove, reached from the
+    // repair itself. Review probes measured 2 opens on both sides.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    const hostOpens = net.opensOf(HOST_NODE);
+    const callerOpens = net.opensOf(CALLER_NODE);
+
+    net.staleCurrentStream(HOST_NODE);
+    net.staleCurrentStream(CALLER_NODE);
+
+    // TWO frames per side, issued in one turn, so both fail before
+    // either reopen can finish.
+    host.setState({ ...host.getState(), hull: 71 });
+    host.setState({ ...host.getState(), hull: 72 });
+    joined.input('helm', { heading: 1 });
+    joined.input('helm', { heading: 2 });
+    await flush(60);
+
+    expect(net.opensOf(HOST_NODE)).toBe(hostOpens + 1);
+    expect(net.opensOf(CALLER_NODE)).toBe(callerOpens + 1);
+    expect(host.counters()['reopened-stream']).toBe(1);
+    // And the traffic still arrived: one reopen, not zero.
+    expect(joined.getState().hull).toBe(72);
+  });
+
+  it('opens nothing for a failure a reopen cannot repair', async () => {
+    // An oversized payload or a fenced id is permanent. Reopening for
+    // it consumed a stream handle PER FRAME — against a budget of 256
+    // per owner — and delivered nothing. Review probe: 5 frames, 5
+    // streams, view unmoved.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    const before = net.opensOf(HOST_NODE);
+    net.failPermanently(HOST_NODE);
+
+    for (let i = 0; i < 5; i += 1) {
+      host.setState({ ...host.getState(), hull: 30 + i });
+      await flush(10);
+    }
+
+    expect(net.opensOf(HOST_NODE)).toBe(before);
+    expect(host.counters()['reopened-stream'] ?? 0).toBe(0);
+    // The replica's view did not move, which is the honest outcome:
+    // the frames were undeliverable either way.
+    expect(joined.getState().hull).toBe(FULL.hull);
   });
 });
 

@@ -26,7 +26,7 @@
  * established, and nothing here claims it is.
  */
 
-import { StoreError } from './errors.js';
+import { isStaleStream, StoreError } from './errors.js';
 import { StoreOwner, type Dispatched, type OwnerDeps, type Outbound } from './owner.js';
 import type { ActionSpec, Cancel, InputSpec } from './types.js';
 import { encodeMessage, type Hex } from './wire.js';
@@ -297,6 +297,10 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       try {
         await stream.send(payload);
       } catch (error) {
+        // Reopen for the stale-handle refusal and nothing else: see
+        // `isStaleStream`. A permanent failure that reopened per
+        // frame consumed a stream handle per frame.
+        if (!isStaleStream(error)) throw error;
         // A HELD STREAM HANDLE DOES NOT SURVIVE ITS SESSION.
         //
         // When a pair is promoted from relayed to direct (§9 step 4)
@@ -312,9 +316,23 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
         // So a failed send drops the handle and reopens ONCE. Not a
         // retry loop: if the second attempt fails the failure is
         // real and belongs to the caller.
-        replies.delete(frame.peer);
-        pendingReplies.delete(frame.peer);
-        dropped['reopened-stream'] = (dropped['reopened-stream'] ?? 0) + 1;
+        // ONE reopen per peer per failure generation. `emit` runs
+        // fire-and-forget once per dispatched frame, so on a session
+        // replacement several emits to one peer fail at once — and
+        // the first version had the second failure delete the
+        // in-flight promise the first reopen registered, opening a
+        // SECOND reply stream for the same peer, orphaning the loser
+        // and fencing the derived id on the real leaf.
+        if (replies.get(frame.peer) === stream) {
+          replies.delete(frame.peer);
+          pendingReplies.delete(frame.peer);
+          dropped['reopened-stream'] = (dropped['reopened-stream'] ?? 0) + 1;
+          try {
+            stream.close();
+          } catch {
+            // Already gone; the point was not to leave it open.
+          }
+        }
         const reopened = await replyStream(frame.peer);
         await reopened.send(payload);
       }

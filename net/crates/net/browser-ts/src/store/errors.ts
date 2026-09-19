@@ -76,3 +76,19 @@ export class StoreError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * Whether a send failed because its stream belongs to a session that
+ * has been replaced — the ONE failure a reopen repairs.
+ *
+ * The leaf names it (`leaf/src/session.rs`): "stale stream handle:
+ * opened on incarnation N; reopen the stream". It is matched on the
+ * message because that is what crosses the wasm boundary; everything
+ * else — an oversized payload, a fenced id, a closed node — is
+ * permanent, and reopening for it burns a stream handle per frame.
+ */
+export function isStaleStream(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('stale stream handle');
+}
+

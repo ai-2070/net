@@ -703,6 +703,9 @@ pub enum Step5 {
         /// Entries only the `command` audience may read, so an
         /// audience change has something to withhold.
         command_entries: u32,
+        /// Refuse every ACTION and INPUT: a policy that admits
+        /// everything cannot witness a refused write.
+        refuse_writes: bool,
         max_event_bytes: u32,
     },
     /// Arm the loss / reorder / duplication hooks on ONE page.
@@ -764,6 +767,9 @@ pub enum Step5 {
         id: u64,
         handle: String,
         by: i64,
+        /// Report a refusal as an OUTCOME (code, and the replica's
+        /// own view) instead of failing the step.
+        expect_refusal: bool,
         settle_ms: u64,
         timeout_ms: u64,
     },

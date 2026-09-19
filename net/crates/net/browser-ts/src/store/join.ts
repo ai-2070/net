@@ -23,7 +23,7 @@
  */
 
 import { StoreCore } from './core.js';
-import { StoreError } from './errors.js';
+import { isStaleStream, StoreError } from './errors.js';
 import { peerHexOf, samePeer, type StoreTransport, type TransportFrame, type TransportStream } from './host.js';
 import { StoreReplica, type Request } from './replica.js';
 import type {
@@ -225,11 +225,31 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         // pair is promoted from relayed to direct (§9 step 4) the
         // session is REPLACED and streams opened on the predecessor
         // are refused as stale — so a replica that cached one stopped
-        // talking the moment its pair got better. Drop it and reopen
-        // ONCE; a second failure is real and reaches the caller
-        // through `fail`.
-        upstream = null;
-        opening = null;
+        // talking the moment its pair got better.
+        //
+        // Reopen for THAT refusal and nothing else. An oversized
+        // payload or a fenced id cannot be repaired by a new stream,
+        // and the first version reopened for every failure: five
+        // undeliverable frames consumed five stream handles and
+        // released none, against a per-owner budget of 256.
+        if (!isStaleStream(error)) throw error;
+        // ONE reopen per failure generation. `stream()` returns an
+        // in-flight open, so a concurrent failure JOINS this reopen
+        // instead of replacing it — the first version cleared the
+        // sibling's `opening` and issued a second `openStream` on the
+        // same derived label, which orphans the loser and, on the real
+        // leaf, FENCES the id terminally. That is the very defect this
+        // repair exists to remove, reachable from the repair itself.
+        if (upstream === open) {
+          upstream = null;
+          opening = null;
+          try {
+            open.close();
+          } catch {
+            // A stream that cannot be closed is already gone; the
+            // point was not to leave it open.
+          }
+        }
         const reopened = await stream();
         await reopened.send(payload);
       }
