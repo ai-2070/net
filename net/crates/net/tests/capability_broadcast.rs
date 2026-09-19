@@ -864,10 +864,11 @@ async fn in_window_announce_flushes_at_window_end() {
     let a = build_node_with(|cfg| cfg.with_min_announce_interval(window)).await;
     let b = build_node().await;
     handshake(&a, &b).await;
-    // The flush task holds a `Weak<MeshNode>` — same constraint as
-    // the re-announce loop, so upgrade the bare `start()` from
-    // `handshake` to `start_arc`. Idempotent.
-    a.start_arc();
+    // No second start: `handshake` starts both nodes through the one
+    // entry point, which populates the `Weak<MeshNode>` the flush task
+    // holds. This test used to have to re-start `a` through its `Arc`
+    // because a bare start could not schedule the flush at all — the
+    // in-window announce below was discarded outright.
 
     let a_id = a.node_id();
 
@@ -912,7 +913,6 @@ async fn in_window_burst_coalesces_to_newest() {
     let a = build_node_with(|cfg| cfg.with_min_announce_interval(window)).await;
     let b = build_node().await;
     handshake(&a, &b).await;
-    a.start_arc();
 
     let a_id = a.node_id();
 

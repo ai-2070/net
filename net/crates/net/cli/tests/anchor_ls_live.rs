@@ -180,9 +180,9 @@ async fn join_start_and_announce(
             .expect("udp handshake");
         accept.await.expect("accept task").expect("accept");
     }
-    daemon.start_arc();
+    daemon.start();
     for peer in peers {
-        peer.start_arc();
+        peer.start();
     }
     let directory = serve_anchor_directory(daemon_mesh).expect("serve the anchor directory");
     for peer in peers {

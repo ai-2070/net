@@ -87,3 +87,190 @@ examples:
       expect: "loses events silently"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------------------ wave 1
+  # Four services a developer already runs — a registry, a broker-backed job
+  # queue, an object store, a config service — each rebuilt on the substrate in
+  # one file with no service process to deploy. Rust is the reference binding;
+  # the ports are tracked, not silently missing.
+
+  - id: service-registry
+    skill: net-event-bus
+    title: The service registry you no longer run
+    route: providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: registry.rs
+      typescript: registry.ts
+      python: registry.py
+      go: registry.go
+      c: registry.c
+    absent:
+    run:
+      # Asserted on the last line's fields, not a transcript: node ids are
+      # nondeterministic, the counts are the contract.
+      expect: "RESULT ok providers=3 joined=1 best_moved=1"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: job-queue
+    skill: net-event-bus
+    title: The job queue you no longer run
+    route: append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: jobqueue.rs
+      typescript: jobqueue.ts
+      python: jobqueue.py
+      go: jobqueue.go
+      c: jobqueue.c
+    absent:
+    run:
+      expect: "RESULT ok jobs=6 done=6 retried=1 duplicates=0"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: object-store
+    skill: net-event-bus
+    title: The object store you no longer run
+    route: store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: objectstore.rs
+      typescript: objectstore.ts
+      python: objectstore.py
+      go: objectstore.go
+      c: objectstore.c
+    absent:
+    run:
+      expect: "RESULT ok dedup=1 readback=1 bytes=64"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: live-config
+    skill: net-event-bus
+    title: The config service you no longer run
+    route: register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: liveconfig.rs
+      typescript: liveconfig.ts
+      python: liveconfig.py
+      go: liveconfig.go
+      c: liveconfig.c
+    absent:
+    run:
+      expect: "RESULT ok subscribers=2 applied=2 version=2"
+      timeout_s: 120
+      not_wired: {}
+
+  # ------------------------------------------------------------------ wave 2
+  # Two more routes, both portable to every binding without a caveat: a local
+  # append-only log with a consumer-owned offset, and a channel whose access
+  # boundary is a scoped credential rather than an open roster.
+
+  - id: event-log
+    skill: net-event-bus
+    title: The event log you no longer run
+    route: append records to a local log · replay them all · a consumer checkpoint · replay from the offset
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: eventlog.rs
+      typescript: eventlog.ts
+      python: eventlog.py
+      go: eventlog.go
+      c: eventlog.c
+    absent: {}
+    run:
+      expect: "RESULT ok records=8 replayed=8 resumed=3"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: token-channel
+    skill: net-event-bus
+    title: Scoped credentials, not an open channel
+    route: a channel gated on token roots · a subscribe-only token bound to one entity · refused bare, admitted with it
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: tokenchannel.rs
+      typescript: tokenchannel.ts
+      python: tokenchannel.py
+      go: tokenchannel.go
+      c: tokenchannel.c
+    absent: {}
+    run:
+      expect: "RESULT ok granted=1 refused=1"
+      timeout_s: 120
+      not_wired: {}
+
+  # ------------------------------------------------------------------ wave 3
+  # One route, and a negative result worth more than the other two candidates.
+  # All five bindings.
+
+  - id: service-failover
+    skill: net-event-bus
+    title: The sidecar you no longer run
+    route: two providers behind one service name · the caller addresses the service, never a node id · the answering provider dies · the next call lands on the survivor
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: failover.rs
+      typescript: failover.ts
+      python: failover.py
+      go: failover.go
+      c: failover.c
+    absent: {}
+    run:
+      expect: "RESULT ok providers=2 moved=1 served=2"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: a2a-paid
+    skill: net-event-bus
+    title: Paid agent-to-agent admission
+    route: prepare (no money) · unpaid submit refused · purchase · submit · ran once, charged once
+    dir: .claude/skills/net-event-bus/examples
+    # Rust in skills.yml, Python in ci.yml's python-tests job, each riding the
+    # job that already holds the artifacts. Both stand up a real provider (one
+    # PaymentEngine behind the quote/pay wire AND the admission gate, a durable
+    # journal on disk) and a real caller (spend policy, durable purchase store)
+    # on two live mesh nodes over loopback UDP.
+    level: run
+    files:
+      rust: a2a_paid.rs
+      python: a2a_paid.py
+    absent:
+      typescript: >-
+        Node has no paid A2A surface in either direction: paid serving is an
+        explicit non-goal of the admission slice (no consumer), and the caller
+        verbs are not bound either. `submitTask` is free-path only. Writing
+        this example would mean writing the binding first.
+      go: >-
+        There is no Go A2A surface of any kind — free or paid. Neither the
+        binding nor the C ABI exposes a task verb.
+      c: >-
+        Same as Go: no A2A in the C ABI. The paid flow additionally needs the
+        payments caller state machine, which has no C surface.
+    run:
+      # Asserts the two properties the whole design exists for, read out of
+      # production artifacts: the executor's own run counter and the provider's
+      # billing log. A state label alone would not distinguish one run from
+      # three, so the counter is asserted with multiplicity.
+      #
+      # END-ANCHORED, and that anchor is load-bearing. The runner applies this
+      # with `grep -qE` (run-skill-examples.sh `assert_run`), which matches a
+      # SUBSTRING of a line: unanchored, `charges=10` and `charges=100` satisfy
+      # a pattern whose entire purpose is to pin the count at one. `charges=` is
+      # the last field both examples print
+      # (`paid task ran once: task=<id> charges=<n>`), so `$` is exactly the
+      # boundary — measured: anchored matches `charges=1` and rejects
+      # `charges=10`.
+      expect: "paid task ran once: .*charges=1$"
+      timeout_s: 120
+      not_wired: {}

@@ -126,8 +126,8 @@ async fn anchor_and_provisional_client() -> (
 ) {
     let anchor = node(Some(anchor_config())).await;
     let client = node(Some(rtc_config())).await;
-    anchor.start_arc();
-    client.start_arc();
+    anchor.start();
+    client.start();
     let (id_anchor, _id_client) = connect_rtc_loopback(&anchor, &client)
         .await
         .expect("DataChannel + Noise");
@@ -375,7 +375,7 @@ async fn a_proxy_socket_cannot_become_the_authenticated_adjacency_a_relay_needs(
         .await
         .expect("MeshNode::new"),
     );
-    peer.start_arc();
+    peer.start();
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),

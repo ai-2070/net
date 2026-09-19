@@ -10,7 +10,7 @@ fn config(anchor:bool)->MeshNodeConfig {
  let mut c=MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(),[0x5c;32]).with_session_timeout(Duration::from_secs(60));
  c.socket_buffers=SocketBufferConfig::for_testing();c.rtc=Some(RtcConfig{serve_bootstrap:anchor,ice_deadline:Duration::from_secs(2),..RtcConfig::new().with_bind_addr("127.0.0.1:0".parse().unwrap())});c
 }
-async fn node(anchor:bool)->Arc<MeshNode>{let n=Arc::new(MeshNode::new(EntityKeypair::generate(),config(anchor)).await.unwrap());n.start_arc();n}
+async fn node(anchor:bool)->Arc<MeshNode>{let n=Arc::new(MeshNode::new(EntityKeypair::generate(),config(anchor)).await.unwrap());n.start();n}
 async fn transit(installed:bool)->bool {
  let anchor=node(true).await;let client=node(false).await;
  let (id,_)=if installed {connect_rtc_loopback(&client,&anchor).await.unwrap()}else{open_rtc_channel(&client,&anchor).await.unwrap()};
@@ -123,7 +123,7 @@ async fn kyra_engine_must_install_without_loopback_noise_fixture(){
   let id=left.node_id();let other=right.clone();let accept=tokio::spawn(async move{other.accept(id).await});
   left.connect(right.local_addr(),right.public_key(),right.node_id()).await.unwrap();accept.await.unwrap().unwrap();
  }
- a.start_arc();r.start_arc();b.start_arc();
+ a.start();r.start();b.start();
  a.connect_via(r.local_addr(),b.public_key(),b.node_id()).await.unwrap();
  assert!(!a.peer_is_direct(b.node_id()));
  let old=a.peer_session_id(b.node_id()).unwrap();a.offer_direct_path(b.node_id()).await.unwrap();

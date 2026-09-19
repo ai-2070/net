@@ -173,9 +173,26 @@ edition = "2021"
 [dependencies]
 # Publishes as net-mesh-sdk, imports as net_sdk.
 net-sdk = { package = "net-mesh-sdk", path = "$ROOT/net/crates/net/sdk" }
+# The paid A2A example composes the SDK's admission path with the payments
+# lifecycle, so the harness carries net-payments with the mesh feature (the
+# quote/pay wire + MeshPaymentChannel). Its sdk feature requirements, net and
+# cortex, are already in net-mesh-sdk's default set, so this adds one crate to
+# the build rather than widening the SDK's.
+#
+# NO BACKTICKS ANYWHERE IN THIS HEREDOC. It is unquoted (<<EOF) so that $ROOT
+# expands, which means a backtick pair in a COMMENT is command substitution:
+# an earlier draft of this comment wrote the feature name in backticks and the
+# shell tried to run it, emitting "mesh: command not found" and writing a
+# manifest with the comment silently mangled.
+net-payments = { path = "$ROOT/net/crates/net/payments", features = ["mesh"] }
+async-trait = "0.1"
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures = "0.3"
+# Channel publish takes `bytes::Bytes`; the SDK re-exports the config types but
+# not the payload type, so an example that registers a channel needs this crate.
+bytes = "1"
 EOF
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
@@ -198,23 +215,101 @@ fi
 # not that net_sdk imports, that referenced members exist, or that signatures
 # match. `--follow-imports=silent` resolves the SDK for types without reporting
 # the SDK's own pre-existing errors, which are not this example's problem.
+#
+# RUN FROM A SCRATCH DIRECTORY, NOT THE REPO ROOT. mypy puts its working
+# directory on the module search path, and this repo has a `net/` SOURCE
+# directory at its root. With cwd here, `import net` resolves to that as an
+# empty namespace package, and an example using the low-level binding fails
+# with `Module "net" has no attribute "NetMesh"` — a shadow, not a defect in
+# the example. Measured: identical invocation, exit 1 from the repo root and
+# exit 0 from a scratch dir.
+#
+# BOTH LAYERS ARE ON MYPYPATH: `sdk-py/src` for the `net_sdk` wrapper and
+# `bindings/python/python` for the low-level `net` binding, whose `_net.pyi`
+# is the real type surface. That second entry is what makes an example using
+# the binding actually type-checked rather than silently `Any` under
+# `--ignore-missing-imports` — which is all it was before, because `net` was
+# unresolvable once the shadow above was removed.
+#
+# It is only safe to point here because the stub is now complete and clean:
+# it had declared 174 of the module's 209 exports, three names were USED as
+# annotations while undefined (`ServeHandle`, `WriteToken`,
+# `MigrationPhasesIter`), `list`/`tuple` were shadowed by same-named methods
+# inside four classes, and two overload implementations were illegal in a
+# stub file. All fixed; `mypy _net.pyi` is zero errors. If you add a pyo3
+# export, declare it here too or this check starts reporting it.
 echo "==> Python — type check against the SDK source"
 PY_FILES=$(files_for python)
 if [ -z "$PY_FILES" ]; then
   ok "no Python examples in the manifest"
 elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>&1; then
   MYPY=$(command -v mypy || echo "$PYTHON -m mypy")
-  while IFS=$'\t' read -r path id; do
-    [ -z "$path" ] && continue
-    if MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
-         --ignore-missing-imports --follow-imports=silent --no-error-summary \
-         --cache-dir "$WORK/mypy-cache" "$ROOT/$path" >"$WORK/py-$id.log" 2>&1; then
-      ok "$id: $(basename "$path")"
-    else
-      note "$id: $(basename "$path")"
-      sed 's/^/      /' "$WORK/py-$id.log" | head -25
-    fi
-  done <<< "$PY_FILES"
+  # TWO public surfaces, both resolved from source:
+  #
+  #   sdk-py/src                  -> `net_sdk` (the published wrapper)
+  #   bindings/python/python      -> `net` (the binding, which carries its own
+  #                                  `_net.pyi` beside `_net.py`)
+  #
+  # The second is not optional. The mesh-based examples import `net`, which the
+  # skills document — `nrpc.md` writes `from net import NetMesh`, and `apis.md`
+  # states Python's mesh channels live on `net.NetMesh`, not
+  # `net_sdk.MeshNode`. With only the first on MYPYPATH, `net` resolved from
+  # whatever the machine had installed (a stale local build, or an unrelated
+  # `net` package), and the check reported `Module "net" has no attribute
+  # "NetMesh"` for seven of nine examples on a developer machine while passing
+  # in CI. A check whose verdict depends on the developer's site-packages is
+  # worse than no check: it was read as a binding gap for as long as it lasted.
+  #
+  # Note this also means the binding's own stub must type-check — MYPYPATH
+  # modules are treated as source, so their errors are reported rather than
+  # silenced by `--follow-imports=silent`. That is the wanted behaviour: the
+  # stub ships in the wheel, and nine errors in it (three undefined names, an
+  # invalid overload pair, a shadowed builtin) were found by adding this path.
+  mkdir -p "$WORK/mypy-cwd"
+  # MYPYPATH IS BUILT BY THE INTERPRETER, NOT BY STRING CONCATENATION. It is
+  # split on `os.pathsep`, which is `;` on Windows — and a Windows path opens
+  # with `C:`, so `:` could not be the separator there even in principle.
+  # Joined with a literal `:`, mypy under Git Bash saw ONE nonexistent root,
+  # resolved neither `net_sdk` nor `net`, and `--ignore-missing-imports` then
+  # turned every SDK reference in the examples into `Any`: a green run that
+  # type-checked nothing. CI is Linux, so CI never saw it — which is exactly
+  # why it could sit here. On Linux this produces the byte-identical string it
+  # always did.
+  #
+  # `"$PYTHON"` and the roots as ARGUMENTS, not `py`: Git Bash rewrites a
+  # POSIX-looking argument into a native path before handing it to a native
+  # executable, which is the same translation `"$ROOT/$path"` already relies on
+  # when it reaches mypy. `py` suppresses that conversion deliberately, and an
+  # env var is never converted at all — so routing the roots through argv is
+  # what makes them resolvable on the same terms as the file being checked.
+  #
+  # The interpreter also confirms both roots EXIST, because an unresolvable
+  # root is silent under `--ignore-missing-imports` — the failure mode above
+  # reports success, so it has to be checked rather than inferred from a tick.
+  mypypath_err="$TMP/mypypath.err"
+  MYPY_PATH=$("$PYTHON" -c 'import os, sys
+roots = sys.argv[1:]
+bad = [r for r in roots if not os.path.isdir(r)]
+if bad:
+    sys.exit("MYPYPATH root(s) do not resolve for this interpreter: " + ", ".join(bad))
+print(os.pathsep.join(roots))' \
+    "$ROOT/net/crates/net/sdk-py/src" \
+    "$ROOT/net/crates/net/bindings/python/python" 2>"$mypypath_err")
+  if [ $? -ne 0 ] || [ -z "$MYPY_PATH" ]; then
+    note "python: $(cat "$mypypath_err") — the examples would type-check against Any, not the SDK"
+  else
+    while IFS=$'\t' read -r path id; do
+      [ -z "$path" ] && continue
+      if ( cd "$WORK/mypy-cwd" && MYPYPATH="$MYPY_PATH" $MYPY \
+             --ignore-missing-imports --follow-imports=silent --no-error-summary \
+             --cache-dir "$WORK/mypy-cache" "$ROOT/$path" ) >"$WORK/py-$id.log" 2>&1; then
+        ok "$id: $(basename "$path")"
+      else
+        note "$id: $(basename "$path")"
+        sed 's/^/      /' "$WORK/py-$id.log" | head -25
+      fi
+    done <<< "$PY_FILES"
+  fi
 else
   skip "no mypy available"
 fi

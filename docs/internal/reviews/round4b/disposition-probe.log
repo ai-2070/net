@@ -1,0 +1,34 @@
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+    Blocking waiting for file lock on build directory
+   Compiling net-payments v0.36.0 (C:\Users\chief\AppData\Local\Temp\net-a2a-review-1067c6f\net\crates\net\payments)
+    Finished `test` profile [unoptimized] target(s) in 1m 49s
+────────────
+ Nextest run ID dc9bdbab-eee6-4f30-b18e-9bac789b1ead with nextest profile: default
+    Starting 1 test across 1 binary (15 tests skipped)
+        FAIL [   0.143s] (1/1) net-payments::review_round4_disposition review_existing_archive_inherits_live_disposition_on_late_success
+  stdout ───
+
+    running 1 test
+    test review_existing_archive_inherits_live_disposition_on_late_success ... FAILED
+
+    failures:
+
+    failures:
+        review_existing_archive_inherits_live_disposition_on_late_success
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.13s
+
+  stderr ───
+    same generation: live=Resolved, archive=PaidUnexecutable
+
+    thread 'review_existing_archive_inherits_live_disposition_on_late_success' (84500) panicked at payments\tests\review_round4_disposition.rs:1895:5:
+    assertion `left == right` failed: existing archive bypassed the live disposition of the same charge
+      left: PaidUnexecutable
+     right: Resolved
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.144s] 1 test run: 0 passed, 1 failed, 15 skipped
+        FAIL [   0.143s] (1/1) net-payments::review_round4_disposition review_existing_archive_inherits_live_disposition_on_late_success
+error: test run failed

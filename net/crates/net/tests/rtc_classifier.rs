@@ -160,9 +160,9 @@ async fn an_ice_pair_schedules_the_upgrade_attempt() {
 
     connect_udp(&a, &r).await;
     connect_udp(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
 
     // Both ends announce `transport:rtc`, which is what makes the
     // pair classify `Ice`.

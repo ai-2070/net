@@ -52,7 +52,7 @@ async fn kyra_long_lived_anchor() -> Arc<MeshNode> {
         ..rtc_config()
     });
     let node = Arc::new(MeshNode::new(EntityKeypair::generate(), cfg).await.unwrap());
-    node.start_arc();
+    node.start();
     node
 }
 

@@ -44,8 +44,8 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
     });
     accept.expect("accept");
     connect.expect("connect");
-    server.inner().start();
-    caller.inner().start();
+    server.start();
+    caller.start();
 }
 
 /// A provider serving the payment wire over real loopback UDP, and

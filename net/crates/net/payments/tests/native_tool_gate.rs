@@ -38,6 +38,7 @@ async fn paid_quote_id(engine: &Arc<PaymentEngine>, caller: &EntityKeypair) -> S
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )

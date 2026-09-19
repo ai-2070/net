@@ -522,7 +522,7 @@ mod natsim {
             node.accept(info.node_id).await.expect("accept joiner");
         }
 
-        node.start_arc();
+        node.start();
         node.reclassify_nat().await;
         node.announce_capabilities(CapabilitySet::new())
             .await
@@ -612,7 +612,7 @@ mod natsim {
             public_infos.push(info);
         }
 
-        node.start_arc();
+        node.start();
         // Classify against the two publics (distinct public IPs → real
         // cone-vs-symmetric discrimination), then announce class+reflex.
         //

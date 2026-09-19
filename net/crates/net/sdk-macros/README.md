@@ -1,13 +1,14 @@
 # net-mesh-sdk-macros
 
 Procedural macros for [`net-mesh-sdk`](../sdk). Currently ships the
-`#[tool]` attribute macro — the Rust equivalent of the `@tool`
-decorators in the Node / Python bindings.
+`#[tool]` attribute macro — the Rust equivalent of the `serveTool`
+(Node) and `serve_tool` (Python) registration helpers in the other
+bindings.
 
 Use through the SDK's `macros` feature:
 
 ```toml
-net-mesh-sdk = { version = "0.24", features = ["tool", "macros"] }
+net-mesh-sdk = { version = "0.36", features = ["tool", "macros"] }
 ```
 
 Then:

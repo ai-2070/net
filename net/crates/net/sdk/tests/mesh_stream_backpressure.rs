@@ -55,8 +55,8 @@ async fn test_sdk_surfaces_backpressure_variant() {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 
     let a = Arc::new(a);
     // v2 wire-bytes accounting: each packet on the wire costs
@@ -128,8 +128,8 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     });
     r1.unwrap();
     r2.unwrap();
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 
     let a = Arc::new(a);
     // v2 wire-bytes window: 512 bytes ≈ 5 × (80 B overhead + small

@@ -283,7 +283,7 @@ fn main() {
                             .redeem_for_invocation(TOOL_ID, &qid, None)
                             .await
                             .expect("redeem_for_invocation");
-                        let admitted = matches!(d, RedeemDecision::Admitted);
+                        let admitted = matches!(d, RedeemDecision::Admitted { .. });
                         if admitted {
                             // The bench "runs the handler" only for Admitted.
                             handler.fetch_add(1, Ordering::SeqCst);

@@ -234,6 +234,25 @@ squat obvious ids to deny another.
 The wire format is unchanged; this is entirely server-side, so a peer
 on an older build still interoperates.
 
+**The relay caveat is now a named choice, not only a limit.** Ownership
+here is the *deliverer*, so under a deployment that terminates and
+reissues nRPC through a relay the relay owns everything it forwards
+(see "What 'authenticated peer' means everywhere above"). A later
+release makes that selection explicit: a catalog-driven A2A service
+(`Mesh::serve_a2a_configured`) is configured with an `A2aPrincipal`,
+and the two variants are exactly the two postures this document
+describes —
+
+| `A2aPrincipal` | Owner | Topology it is sound under |
+|---|---|---|
+| `SessionPeer` | `TaskOwner::Peer(session_peer)` — this default | **direct sessions only**; a relay is the deliverer and owns what it forwards |
+| `OrgAdmitted(OrgAccess)` | `TaskOwner::Entity(admitted.caller)` | end-to-end: the A2A verbs register as PROTECTED, so `RpcContext::org_admission` is present and the owner is a verified `EntityId` |
+
+Where a task is also *paid*, `OrgAdmitted` additionally enforces that
+the payer the payment gate attributed the charge to is the admitted
+caller; a mismatch is refused. If a relay sits in your path and task
+attribution matters, `OrgAdmitted` — not an allowlist — is the answer.
+
 ## 9. The Python wheel unwinds instead of aborting
 
 Not a fail-closed change — the opposite, and it belongs here because it
@@ -327,7 +346,8 @@ it. That is the documented limit of public nRPC attribution rather than
 a gap in any of these repairs — end-to-end provenance needs a PROTECTED
 service (`RpcContext::org_admission`, a verified four-party identity)
 or an application-level signature over a transcript that binds the
-destination.
+destination. For A2A specifically, that PROTECTED posture has a name
+and a config field: `A2aPrincipal::OrgAdmitted` (§8).
 
 Direct authenticated sessions — the ordinary case, and the one the
 acceptance tests exercise — carry the boundary you would expect.

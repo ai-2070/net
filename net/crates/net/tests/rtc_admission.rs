@@ -88,8 +88,8 @@ async fn anchor_and_provisional_client() -> (
 ) {
     let anchor = node(Some(anchor_config())).await;
     let client = node(Some(rtc_config())).await;
-    anchor.start_arc();
-    client.start_arc();
+    anchor.start();
+    client.start();
     let (id_anchor, _id_client) = connect_rtc_loopback(&anchor, &client)
         .await
         .expect("DataChannel + Noise");
@@ -342,12 +342,12 @@ async fn the_provisional_cap_closes_and_reclaims() {
         ..rtc_config()
     }))
     .await;
-    anchor.start_arc();
+    anchor.start();
 
     let first = node(Some(rtc_config())).await;
     let second = node(Some(rtc_config())).await;
-    first.start_arc();
-    second.start_arc();
+    first.start();
+    second.start();
     let _ = connect_rtc_loopback(&anchor, &first)
         .await
         .expect("first provisional session");
@@ -533,8 +533,8 @@ async fn a_provisional_rejecter_never_triggers_a_corrective_reannounce() {
 async fn a_non_bootstrap_node_installs_rtc_sessions_as_admitted() {
     let a = node(Some(rtc_config())).await;
     let b = node(Some(rtc_config())).await;
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     let _ = connect_rtc_loopback(&a, &b).await.expect("rtc pair");
     assert!(
         !a.peer_is_provisional(b.node_id()),
@@ -1590,9 +1590,9 @@ async fn a_claimant_is_not_promoted_by_another_peers_enrollment() {
     let anchor = node(Some(anchor_config())).await;
     let claimant = node(Some(rtc_config())).await;
     let joiner = node(Some(rtc_config())).await;
-    anchor.start_arc();
-    claimant.start_arc();
-    joiner.start_arc();
+    anchor.start();
+    claimant.start();
+    joiner.start();
     connect_rtc_loopback(&anchor, &claimant)
         .await
         .expect("DataChannel + Noise");

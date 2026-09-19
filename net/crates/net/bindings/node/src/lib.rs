@@ -1524,6 +1524,15 @@ mod mesh_bindings {
                 if reason == "Some(TooManyChannels)" {
                     return Error::from_reason("channel: too many channels".to_string());
                 }
+                if reason == "Some(IdentityNotEstablished)" {
+                    // Distinct from `unauthorized`: the credential was
+                    // never evaluated. The publisher has no
+                    // authenticated entity for this session's peer to
+                    // bind the chain's leaf to.
+                    return Error::from_reason(
+                        "channel: identity not established for this session".to_string(),
+                    );
+                }
                 return Error::from_reason(format!("channel: rejected ({})", reason));
             }
         }
@@ -1576,6 +1585,13 @@ mod mesh_bindings {
         /// `register_channel` inserts here; the node's membership ACL
         /// path reads from this same registry.
         channel_configs: Arc<net::adapter::net::ChannelConfigRegistry>,
+        /// Rotating start shard for [`Self::poll`]. Without it the
+        /// sweep restarts at shard 0 on every call and stops once
+        /// `limit` is filled, so a continuously-fed shard 0 starves
+        /// every later shard — the same invisibility the shard-0-only
+        /// poll had, in a thinner disguise. Mirrors the Rust SDK's
+        /// `Mesh::recv` cursor.
+        recv_cursor: Arc<std::sync::atomic::AtomicU16>,
         /// The immutable named-export map resolved at `create()`
         /// (SSDK §3.3) — the checked map this binding retains beside
         /// its `Arc<MeshNode>`, exactly as the plan orders. Empty when
@@ -1746,6 +1762,7 @@ mod mesh_bindings {
                 // the napi runtime.
                 runtime: tokio::runtime::Handle::current(),
                 channel_configs,
+                recv_cursor: Arc::new(std::sync::atomic::AtomicU16::new(0)),
                 #[cfg(feature = "org")]
                 subnet_exports,
             })
@@ -1837,7 +1854,7 @@ mod mesh_bindings {
         /// tokio runtime — `MeshNode::start()` spawns background
         /// tasks via `tokio::spawn` and panics outside a reactor.
         ///
-        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// Uses `start` (like the C FFI and the Rust SDK) so
         /// the Arc-scoped lifecycle loops run too: periodic
         /// capability re-announce (with the reflex-diff
         /// re-classify trigger) and — when `autoDirectUpgrade`
@@ -1846,7 +1863,7 @@ mod mesh_bindings {
         pub async fn start(&self) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            node.start_arc();
+            node.start();
             Ok(())
         }
 
@@ -1911,23 +1928,47 @@ mod mesh_bindings {
             Ok(Self::map_events(result.events))
         }
 
-        /// Poll for received events across **every** shard.
+        /// Poll for received events across **every** shard, starting
+        /// from a rotating one.
         ///
         /// This polled shard 0 only. Inbound traffic is placed on
         /// `stream_id % numShards`, so at the default of four shards
         /// a caller silently saw only the stream ids congruent to 0 —
         /// three quarters of ordinary stream ids were unreadable
         /// through this binding.
+        ///
+        /// Sweeping ascending from 0 and stopping at `limit` is that
+        /// same invisibility in a thinner disguise: a shard 0 that can
+        /// fill the limit by itself means shards 1..n are never
+        /// reached, so a quiet stream stays unread for as long as the
+        /// busy one keeps up. The start shard advances once per call,
+        /// which bounds that wait at `numShards` calls. Consequence
+        /// worth knowing: events are not returned in shard order, and
+        /// the starting shard differs between calls — pair
+        /// `pollShard` with `shardForStream` when you want one stream
+        /// rather than a merge.
         #[napi]
         pub async fn poll(&self, limit: u32) -> Result<Vec<StoredEvent>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let shards = node.num_shards().max(1);
+            // `fetch_add` wraps at u16::MAX; `start` is reduced modulo
+            // `shards` at use, so a wrap costs at most one round of
+            // fairness.
+            let start = self
+                .recv_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % shards;
             let mut events = Vec::new();
-            for shard in 0..shards {
+            for offset in 0..shards {
                 if events.len() >= limit as usize {
                     break;
                 }
+                // One definition of the arithmetic, shared with the
+                // Rust SDK's `Mesh::recv` — see `rotating_shard` for
+                // why the obvious `(start + offset) % shards` is wrong
+                // in `u16`.
+                let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit as usize - events.len();
                 let result = node
                     .poll_shard(shard, None, remaining)

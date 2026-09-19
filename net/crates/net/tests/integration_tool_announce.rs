@@ -610,9 +610,9 @@ async fn local_caps_generation_tracks_registry_mutations() {
     );
 }
 
-/// Handshake with the host started via `start_arc` — the RT-3
+/// Handshake with the host started via `start` — the RT-3
 /// change-driven announcer (like the re-announce keep-alive)
-/// captures `self_weak` at spawn time, so `start_arc` must be the
+/// captures `self_weak` at spawn time, so `start` must be the
 /// FIRST start call; a bare `start()` first would spawn the loop
 /// with no weak and park it.
 async fn handshake_pair_host_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
@@ -629,7 +629,7 @@ async fn handshake_pair_host_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
         .await
         .expect("accept task panicked")
         .expect("accept failed");
-    host.start_arc();
+    host.start();
     peer.start();
 }
 
@@ -699,10 +699,10 @@ async fn registry_burst_coalesces_into_one_announce() {
 }
 
 /// Handshake with the host started via a bare `start()` FIRST and
-/// then `start_arc()` — the ordering that RT-3 review Finding 7 flags.
+/// then `start()` — the ordering that RT-3 review Finding 7 flags.
 /// `start()` is idempotent, so the second call cannot respawn the
 /// loops; the change-driven announcer (and keep-alive) must therefore
-/// pick up the weak handle `start_arc` installs rather than having
+/// pick up the weak handle `start` installs rather than having
 /// snapshotted `None` at spawn.
 async fn handshake_pair_host_bare_then_arc(host: &Arc<MeshNode>, peer: &Arc<MeshNode>) {
     let host_id = host.node_id();
@@ -718,19 +718,19 @@ async fn handshake_pair_host_bare_then_arc(host: &Arc<MeshNode>, peer: &Arc<Mesh
         .await
         .expect("accept task panicked")
         .expect("accept failed");
-    // The buggy ordering: bare start first, then start_arc.
+    // The buggy ordering: bare start first, then start.
     host.start();
-    host.start_arc();
+    host.start();
     peer.start();
 }
 
 /// RT-3 review Finding 7: a registry mutation after `start()` then
-/// `start_arc()` must still auto-announce. Pre-fix, the change-driven
+/// `start()` must still auto-announce. Pre-fix, the change-driven
 /// announcer snapshotted `self_weak` at spawn (during the bare
 /// `start()`, when it was `None`) and parked forever, so the tool
 /// never propagated.
 #[tokio::test]
-async fn registry_change_announces_after_bare_start_then_start_arc() {
+async fn registry_change_announces_after_bare_start_then_start() {
     let host = build_node().await;
     let peer = build_node().await;
     handshake_pair_host_bare_then_arc(&host, &peer).await;
@@ -745,7 +745,7 @@ async fn registry_change_announces_after_bare_start_then_start_arc() {
         )
         .await,
         "peer never saw the tool — the change-driven announcer parked \
-         because start() ran before start_arc()",
+         because start() ran before start()",
     );
 }
 

@@ -67,6 +67,7 @@ async fn pay_once(s: &Setup, nonce: &str, issued_ns: u64) -> PaymentDecision {
             s.caller.entity_id().clone(),
             CAPABILITY,
             requirements(),
+            None,
             issued_ns,
             60_000_000_000,
         )
@@ -117,6 +118,7 @@ async fn idempotent_retries_do_not_duplicate_log_records() {
             s.caller.entity_id().clone(),
             CAPABILITY,
             requirements(),
+            None,
             NOW,
             60_000_000_000,
         )

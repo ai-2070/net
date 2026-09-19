@@ -4,6 +4,8 @@ import { basename, join, resolve } from "node:path";
 import title from "title";
 import GithubSlugger from "github-slugger";
 import { DOCS_ORDER } from "@/docs.order";
+import { buildDocIndex, resolveDocLink, type DocIndex, type DocPage } from "./doc-index";
+import { KEYWORD_LINKS } from "./keyword-links";
 
 // Docs are co-located with the source tree now (MDX-capable). Both `.md`
 // and `.mdx` files are accepted; the renderer picks parsing mode per file.
@@ -1022,6 +1024,110 @@ export function getClientDocTree(): ClientDocTree {
     rootFiles: t.rootFiles.map(toClientFile),
     folders: t.folders.map(toClientFolder),
   };
+}
+
+// ---- Keyword links --------------------------------------------------------
+//
+// The addressable pages, indexed once for the keyword auto-linker. See
+// `lib/doc-index.ts` for the shape and `lib/keyword-links.ts` for the curated
+// term map; this is only the walk that produces the input.
+//
+// Renditions are excluded (a `DocFile` carrying `rendition`): they are one
+// language's reading of a page that already has a neutral URL, so a keyword
+// should point at the neutral page and let the reader pick a language. A
+// projected page's own bare URL stays — it is that neutral page.
+function collectDocPages(tree: DocTree): DocPage[] {
+  const pages: DocPage[] = [];
+
+  const addFile = (file: DocFile): void => {
+    if (file.rendition) return;
+    pages.push({
+      slug: file.slug.join("/"),
+      url: `/docs/${file.slug.join("/")}`,
+      title: file.title,
+    });
+  };
+
+  const walk = (folder: DocFolder): void => {
+    // A folder renders at one URL whether it has a README or not.
+    pages.push({
+      slug: folder.slug.join("/"),
+      url: `/docs/${folder.slug.join("/")}`,
+      title: folder.title,
+    });
+    for (const child of folder.children) {
+      if (child.kind === "file") addFile(child);
+      else walk(child);
+    }
+  };
+
+  if (tree.rootReadme) {
+    pages.push({ slug: "", url: "/docs", title: tree.rootReadme.title });
+  }
+  for (const file of tree.rootFiles) addFile(file);
+  for (const folder of tree.folders) walk(folder);
+
+  return pages;
+}
+
+let cachedDocIndex: DocIndex | null = null;
+
+/** Slug → page, for keyword links and the assertion below.
+ *
+ * Memoized in production alongside the tree; re-walked in dev so a renamed page
+ * re-points its keywords on the next request. */
+export function getDocIndex(): DocIndex {
+  if (!IS_DEV && cachedDocIndex) return cachedDocIndex;
+  const index = buildDocIndex(collectDocPages(getDocTree()));
+  if (!IS_DEV) cachedDocIndex = index;
+  return index;
+}
+
+// Build-time proof that the curated keyword map is live: every slug resolves,
+// and no term is listed twice. Matching is case-insensitive, so the duplicate
+// check is too — two entries differing only in casing would make which spellings
+// exist depend on array order. Run from `generateStaticParams` so a rename that
+// orphans a keyword fails the build instead of rendering a dead link.
+//
+// It also witnesses the documented slug form against the real index: `_` and `-`
+// are interchangeable WITHIN a segment, so an underscored spelling of a real
+// slug must reach the same page. A regex is not proof and the contract is easy
+// to "simplify" into splitting on `_` (which would break every underscore-named
+// page, e.g. `RELEASE_v0.36_PARANOID.md`); this is the cheap guard against that,
+// and it needs no test harness because the tree is already in hand.
+export function assertKeywordLinksResolve(): void {
+  const index = getDocIndex();
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const { term, slug } of KEYWORD_LINKS) {
+    const key = term.toLowerCase();
+    if (seen.has(key)) {
+      problems.push(`"${term}" is listed more than once in KEYWORD_LINKS`);
+      continue;
+    }
+    seen.add(key);
+    if (!resolveDocLink(index, slug)) {
+      problems.push(`"${term}" → "${slug}" matches no docs page`);
+    }
+  }
+
+  const hyphenated = [...index.bySlug.values()].find((p) => p.slug.includes("-"));
+  if (hyphenated) {
+    const underscored = hyphenated.slug.replace(/-/g, "_");
+    const alt = resolveDocLink(index, underscored);
+    if (alt?.page.url !== hyphenated.url) {
+      problems.push(
+        `"${underscored}" does not reach ${hyphenated.url} — ` +
+          `"_" must be interchangeable with "-" within a segment`,
+      );
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `keyword links cannot resolve:\n  ${problems.join("\n  ")}`,
+    );
+  }
 }
 
 // The version the docs describe — derived, not typed.

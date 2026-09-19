@@ -52,8 +52,9 @@ use tokio::time::Instant as UpgradeInstant;
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
 use super::identity::{
-    EntityId, EntityKeypair, PermissionToken, RevocationRegistry, TokenCache, TokenChain,
-    TokenScope,
+    decode_identity_proof, encode_identity_proof, proof_transcript, verify_proof, EntityId,
+    EntityKeypair, IdentityChallengeStore, IdentityProofMsg, IdentityProofReject, PermissionToken,
+    RevocationRegistry, TokenCache, TokenChain, TokenScope, SUBPROTOCOL_IDENTITY_PROOF,
 };
 use super::pool::PacketBuilder;
 
@@ -151,7 +152,7 @@ const GRANT_EVENTS_PER_PACKET: usize =
 /// **The tag only reaches a peer once this node actually broadcasts a
 /// capability announcement.** A node advertises when the application
 /// calls [`MeshNode::announce_capabilities`], and — for a node started
-/// via [`MeshNode::start_arc`] — on the reannounce loop's cadence
+/// via [`MeshNode::start`] — on the reannounce loop's cadence
 /// (`capability_reannounce_interval`). A node started via the bare
 /// [`MeshNode::start`] that never announces will not advertise this
 /// tag, so its peers keep the legacy cumulative-ACK + NACK path toward
@@ -2394,6 +2395,36 @@ struct DispatchCtx {
     /// ample slack for scheduling and clock jitter, and short enough
     /// that a peer that goes away leaves nothing worth evicting.
     membership_dedupe_ttl: Duration,
+    /// Verifier-side one-use challenges for the identity-proof
+    /// exchange (`SUBPROTOCOL_IDENTITY_PROOF`). Bounded and
+    /// self-evicting; dropped wholesale on peer failure/eviction so
+    /// no attempt outlives the incarnation it was issued on.
+    identity_challenges: Arc<IdentityChallengeStore>,
+    /// In-flight identity-proof legs keyed by the correlation nonce
+    /// the prover minted, valued `(expected peer, reply sender)`.
+    /// Same peer-auth discipline as `pending_membership_acks`: only
+    /// the node the request went to may answer it.
+    pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
+    /// `node_id → session_id` on which that peer PROVED possession of
+    /// the entity pinned for it.
+    ///
+    /// Distinct from the pin. `peer_entity_ids` is installed by TOFU
+    /// from a capability announcement whose signature covers no nonce
+    /// and no session, from bytes that are broadcast mesh-wide — and
+    /// NKpsk0 leaves the initiator anonymous, so holding the PSK is
+    /// enough to occupy a routing id and replay someone else's
+    /// announcement into it. "We have a pin for this node id" is
+    /// therefore not "this session's peer holds that key".
+    ///
+    /// Token admission needs the second claim, because a credential's
+    /// leaf names an entity, so it reads through this map. Written
+    /// ONLY by the paths that verify a signature over a fresh
+    /// verifier challenge bound to this incarnation — the
+    /// identity-proof exchange and verified subnet admission — on both
+    /// the fresh-install and already-matching outcomes, so re-proving
+    /// after a reconnect restores readiness without changing the pin.
+    /// Entries are dropped where the pin is dropped.
+    peer_identity_sessions: Arc<DashMap<u64, u64>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Populated by `MeshNode::probe_reflex`; the dispatch branch
     /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
@@ -2702,6 +2733,23 @@ pub(crate) struct MembershipAck {
     pub reason: Option<AckReason>,
 }
 
+/// One leg of an identity-proof exchange, handed back to the prover
+/// through the pending oneshot.
+#[derive(Debug, Clone)]
+pub(crate) enum IdentityProofReply {
+    /// The verifier minted a challenge: its claimed entity plus the
+    /// one-use nonce to sign.
+    Challenge {
+        verifier: EntityId,
+        challenge: [u8; 32],
+    },
+    /// The verifier's verdict on a presented proof.
+    Verdict {
+        accepted: bool,
+        reject: Option<IdentityProofReject>,
+    },
+}
+
 /// Configuration for a MeshNode.
 #[derive(Debug, Clone)]
 pub struct MeshNodeConfig {
@@ -2790,6 +2838,29 @@ pub struct MeshNodeConfig {
     ///
     /// `1` restores the pre-fix single-shot behavior.
     pub membership_max_attempts: u32,
+    /// Total wall time a token-bearing subscribe may spend
+    /// establishing this node's identity with the publisher before it
+    /// gives up and sends the Subscribe anyway.
+    ///
+    /// The identity-proof exchange is two round trips on the same
+    /// fire-and-forget UDP control plane as channel membership, so
+    /// `identity_proof_max_attempts` retransmissions share this one
+    /// budget exactly as membership attempts share
+    /// `membership_ack_timeout`. Bounded on purpose: preparation is a
+    /// convenience the runtime performs for the caller, never a new
+    /// way for a subscribe to hang. A peer that does not answer (an
+    /// older build with no such subprotocol) costs this much latency
+    /// once per session and then falls through to the ordinary
+    /// subscribe, which either succeeds on an already-established
+    /// binding or comes back with
+    /// `AckReason::IdentityNotEstablished`.
+    pub identity_proof_timeout: Duration,
+    /// How many times each leg of the identity-proof exchange is put
+    /// on the wire, **counting the first transmission**. Same
+    /// rationale as `membership_max_attempts`: one dropped datagram
+    /// on a control plane with no retransmit window should not cost
+    /// the whole budget.
+    pub identity_proof_max_attempts: u32,
     /// Drop inbound `CapabilityAnnouncement` packets whose signature
     /// is missing. Defaults to `true` because the cap data feeds
     /// channel-auth (`can_publish` / `can_subscribe` cap filters)
@@ -2830,7 +2901,7 @@ pub struct MeshNodeConfig {
     /// re-announce on their own cadence). Default 150 s (→ 300 s TTL,
     /// matching the announce default).
     ///
-    /// The loop runs only for nodes started via [`MeshNode::start_arc`]
+    /// The loop runs only for nodes started via [`MeshNode::start`]
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
@@ -2926,7 +2997,7 @@ pub struct MeshNodeConfig {
     /// and `local_announcement` are updated so self-queries + late-
     /// joiner session-open pushes reflect the latest caps, and one
     /// trailing-edge flush re-broadcasts the newest announcement at
-    /// window end (RT-1; needs [`MeshNode::start_arc`], else the
+    /// window end (RT-1; needs [`MeshNode::start`], else the
     /// in-window broadcast is dropped as before). Rate-limits apps
     /// that re-announce in tight loops.
     pub min_announce_interval: Duration,
@@ -2959,7 +3030,7 @@ pub struct MeshNodeConfig {
     /// [`MeshNode::announce_capabilities`] calls, session-open
     /// pushes, and the re-announce keep-alive). Like the keep-alive
     /// loop, the announcer runs only for nodes started via
-    /// [`MeshNode::start_arc`]. Default 100 ms.
+    /// [`MeshNode::start`]. Default 100 ms.
     pub announce_debounce: Duration,
     /// Minimum gap between event-triggered pingwaves (RT-4,
     /// REALTIME_ROUTING_AND_DISCOVERY_PLAN). Topology changes —
@@ -3234,6 +3305,11 @@ impl MeshNodeConfig {
             max_channels_per_peer: 1024,
             membership_ack_timeout: Duration::from_secs(5),
             membership_max_attempts: 3,
+            // Two legs inside one budget, sized so the whole
+            // preparation is comfortably shorter than the
+            // membership ack timeout it precedes.
+            identity_proof_timeout: Duration::from_secs(2),
+            identity_proof_max_attempts: 3,
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
             admission_replay: super::behavior::org_admission_replay::AdmissionReplayConfig::default(
@@ -12243,6 +12319,25 @@ pub struct MeshNode {
     /// nonce)`. Shared with `DispatchCtx` via `Arc` clone; see the
     /// field of the same name there and [`MembershipRejection`].
     membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// Verifier-side identity-proof challenges. Shared with
+    /// `DispatchCtx` via `Arc` clone; see the field of the same name
+    /// there.
+    identity_challenges: Arc<IdentityChallengeStore>,
+    /// In-flight identity-proof legs keyed by correlation nonce.
+    /// Shared with `DispatchCtx` so the dispatcher can complete the
+    /// prover's oneshots.
+    pending_identity_proofs: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
+    /// `node_id → session_id` at which each peer's entity pin was
+    /// established. Shared with `DispatchCtx`; see the field of the
+    /// same name there for why token admission reads through it.
+    peer_identity_sessions: Arc<DashMap<u64, u64>>,
+    /// Prover-side memo: `verifier node_id → session_id` on which
+    /// this node last completed an identity proof with that peer.
+    /// Keyed on the incarnation precisely so a reconnect re-proves
+    /// rather than assuming the far side still remembers us — the
+    /// session id is derived from the handshake hash, so a new
+    /// session is a new value on both sides.
+    proven_identity_sessions: Arc<DashMap<u64, u64>>,
     /// In-flight reflex probes keyed by the responder's `node_id`.
     /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
     /// can complete oneshots without routing back through
@@ -12954,18 +13049,18 @@ pub struct MeshNode {
     ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
     /// Whether the node has been started
     started: AtomicBool,
-    /// Weak self-reference, set by [`Self::start_arc`] when the node is
+    /// Weak self-reference, set by [`Self::start`] when the node is
     /// driven through an `Arc`. The capability re-announce loop upgrades it
     /// each tick to call `announce_capabilities` (the broadcast goes
     /// through `&self` per-peer sends, so it needs an owned `Arc`). Unset
     /// on a bare [`Self::start`] of a non-`Arc` node, in which case the
     /// loop is a no-op. Set-once.
-    /// Weak self-handle set by [`Self::start_arc`]. Wrapped in `Arc`
+    /// Weak self-handle set by [`Self::start`]. Wrapped in `Arc`
     /// so the `self_weak`-dependent background loops (re-announce
     /// keep-alive, RT-3 change announcer) can hold the *holder* and
     /// re-read it each iteration instead of snapshotting it at spawn.
     /// That makes a bare [`Self::start`] followed by a later
-    /// [`Self::start_arc`] work — the loops pick up the weak once it
+    /// [`Self::start`] work — the loops pick up the weak once it
     /// is set, rather than parking forever (RT-3 review Finding 7).
     self_weak: Arc<std::sync::OnceLock<std::sync::Weak<MeshNode>>>,
     /// Number of `accept()` calls currently awaiting
@@ -13355,6 +13450,14 @@ impl MeshNode {
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_fold_failure = capability_fold.clone();
+        // Identity-proof state, created here for the same reason: the
+        // failure closure needs its own handles so a dead peer's
+        // outstanding challenges and its entity-pin session record go
+        // with the pin itself.
+        let identity_challenges = Arc::new(IdentityChallengeStore::new());
+        let identity_challenges_failure = identity_challenges.clone();
+        let peer_identity_sessions: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
+        let peer_identity_sessions_failure = peer_identity_sessions.clone();
         // Created here (not in the struct literal) so the failure
         // callback can drop a dead peer's retained subscribe chains —
         // otherwise the entries leak until an explicit unsubscribe that
@@ -13718,6 +13821,13 @@ impl MeshNode {
             // in depth plus prompt reclamation, not the invariant.
             subnet_challenges_failure.forget_peer(node_id);
             subnet_contexts_failure.forget_peer(node_id);
+            // Same boundary for identity readiness. The pin removal
+            // below is the real invariant; dropping the challenges and
+            // the pin's session record here keeps the three in
+            // lockstep so a reconnecting node starts from "identity
+            // not established" rather than from a half-cleared state.
+            identity_challenges_failure.forget_peer(node_id);
+            peer_identity_sessions_failure.remove(&node_id);
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
@@ -14177,6 +14287,10 @@ impl MeshNode {
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
             membership_dedupe: Arc::new(DashMap::new()),
+            identity_challenges,
+            pending_identity_proofs: Arc::new(DashMap::new()),
+            peer_identity_sessions,
+            proven_identity_sessions: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -15955,7 +16069,7 @@ impl MeshNode {
         // So park it on the node's own refused-release ledger, which is exactly
         // what the in-crate path does, and let the refresh worker retry it on
         // its cadence. This needs an `Arc<MeshNode>`, which only a node started
-        // through `start_arc` has (`self_weak`); a bare node cannot park, and
+        // through `start` has (`self_weak`); a bare node cannot park, and
         // says so rather than pretending it released something.
         let owner = self
             .self_weak
@@ -15968,7 +16082,7 @@ impl MeshNode {
                 "sensing lease: release REFUSED and this node has no shared handle to \
                  park the still-live ticket on, so the holder is LEAKED — the row and \
                  its upstream registration will outlive every owner. Start the node \
-                 through `start_arc`, or use `try_release_sensing_interest_lease`, \
+                 through `start`, or use `try_release_sensing_interest_lease`, \
                  which hands the live ticket back"
             );
             return;
@@ -19630,6 +19744,14 @@ impl MeshNode {
                     Ok(true)
                 }
             };
+            // Verified subnet admission is a session-bound identity
+            // proof in its own right (the subject signs this
+            // verifier's fresh challenge), so it establishes identity
+            // readiness for token admission — on the matching-pin path
+            // too, which is how a re-admitted peer refreshes it.
+            if outcome.is_ok() {
+                self.peer_identity_sessions.insert(from_node, session_id);
+            }
             let published = matches!(outcome, Ok(true));
             (outcome, published)
         })?;
@@ -20689,7 +20811,7 @@ impl MeshNode {
         // stale emission must also be REBUILT under the new key. Wake an
         // immediate re-announce so a fresh emission is published; until it lands,
         // the send path keeps the stale scoped envelopes off the wire.
-        // Best-effort — only a node started via `start_arc` (populated
+        // Best-effort — only a node started via `start` (populated
         // `self_weak`) inside a runtime can spawn; a bare node reconciles on its
         // next explicit announce.
         if let Some(weak) = self.self_weak.get().cloned() {
@@ -20794,7 +20916,7 @@ impl MeshNode {
     /// fresh, coherent emission (public + owner + granted). Rebuilds from the
     /// CURRENT live baseline (`None`), never a captured one — a captured baseline
     /// would reintroduce the RT-3 stale-baseline race (Kyra OA3-4b1 B2). Only a
-    /// node started via `start_arc` (populated `self_weak`) inside a runtime can
+    /// node started via `start` (populated `self_weak`) inside a runtime can
     /// spawn; a bare node reconciles on its next explicit announce, and until the
     /// rebuild lands the send-path pointer check keeps the stale granted envelopes
     /// off the wire.
@@ -24108,37 +24230,65 @@ impl MeshNode {
     /// which the dispatcher would race the responder for the
     /// inbound msg1.
     ///
-    /// Note: this does NOT enable the periodic capability re-announce
-    /// (which keeps the node's entry alive in its own and peers' folds
-    /// past one TTL) — that needs an owned `Arc` to re-broadcast. Drive
-    /// the node through [`Self::start_arc`] (as the SDK / FFI do) to get
-    /// it; a bare `start` is for short-lived / test nodes.
+    /// Takes the node's `Arc` because several lifecycle loops have to
+    /// outlive the call: the periodic capability re-announce (which
+    /// keeps this node's entry alive in its own and every peer's fold
+    /// past one announcement TTL), the change-driven announcer, and the
+    /// trailing-edge flush that carries an announcement made inside the
+    /// `min_announce_interval` window. Each is a spawned task holding a
+    /// `Weak<MeshNode>`, so none of them can keep a dropped node alive
+    /// — but all of them need an `Arc` to exist in the first place.
     ///
-    /// **The same missing `Arc` also drops in-window announcements.**
-    /// [`Self::announce_capabilities`] rate-limits the broadcast to
-    /// `min_announce_interval` (10 s default) and normally coalesces a
-    /// within-window call into a trailing-edge flush at the end of the
-    /// window. That flush is a spawned task, so it needs the owned `Arc`
-    /// too — under a bare `start` there is nothing to schedule, and the
-    /// call is **silently dropped while still returning `Ok(())`**. With
-    /// no re-announce loop either, the change then never reaches peers
-    /// at all: they keep serving the previous announcement's tags,
-    /// reflex, and `nat:*` class until something else triggers an
-    /// out-of-window announce.
+    /// This used to be two entry points, and the difference was a trap.
+    /// A bare `start(&self)` left `self_weak` unset, and an
+    /// announcement made inside the rate-limit window was then
+    /// **silently discarded while still returning `Ok(())`** — with no
+    /// re-announce loop either, the change reached peers only if some
+    /// later out-of-window announce happened to carry it. That reads
+    /// exactly like a stale peer-side fold and is not one, and it bit
+    /// hardest on state peers act on rather than display: a NAT
+    /// reclassification publishes a new `nat:*` tag, and a peer still
+    /// reading the old one computes the wrong pair action for the
+    /// direct-path upgrade. One start removes the failure mode instead
+    /// of documenting it.
     ///
-    /// This bites hardest on state peers act on rather than merely
-    /// display — a NAT reclassification publishes a new `nat:*` tag, and
-    /// a peer still reading the old one computes the wrong pair action
-    /// for the direct-path upgrade. Under `start_arc` the flush fires
-    /// and the new class propagates promptly. A test that forces a class
-    /// and re-announces on a bare-`start` node observes neither, which
-    /// reads convincingly like a stale-fold bug and is not one: set the
-    /// class *before* the first announce (see `force_nat_class_for_test`),
-    /// or drive the node with [`Self::start_arc`].
-    pub fn start(&self) {
+    /// Idempotent.
+    pub fn start(self: &Arc<Self>) {
+        // Store the weak BEFORE the loops below are spawned — the
+        // re-announce and change-announcer tasks read this holder each
+        // iteration. `set` only fails if already set (a re-start); the
+        // existing weak is equally valid, so ignore the result.
+        let _ = self.self_weak.set(Arc::downgrade(self));
+        // Only a start that actually TRANSITIONED the node spawns the
+        // upgrade scanner. `start` is documented idempotent and
+        // `start_inner` also refuses while an `accept()` is in flight —
+        // spawning unconditionally meant each repeated or refused call
+        // added another detached scan loop, multiplying upgrade probes
+        // on a node that never started once.
+        let transitioned = self.start_inner();
+        // Background direct-path upgrade scan loop (Stage 3). The loop
+        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
+        // on a real transition is cheap. Detached like the other
+        // lifecycle loops — it exits on `shutdown_notify`.
+        #[cfg(feature = "nat-traversal")]
+        if transitioned {
+            let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+        }
+        #[cfg(not(feature = "nat-traversal"))]
+        let _ = transitioned;
+    }
+
+    /// Everything `start` does that needs only `&self`. Split out so
+    /// the `Arc` wiring above happens exactly once, before any loop
+    /// that reads it is spawned.
+    ///
+    /// Returns whether this call is the one that moved the node from
+    /// stopped to started — `false` for an idempotent re-start and for
+    /// a refusal against an in-flight `accept()`.
+    fn start_inner(&self) -> bool {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
-            return; // already started
+            return false; // already started
         }
         // After flipping `started`, observe `accept_in_flight`.
         // If any accept is mid-handshake, roll back and refuse.
@@ -24157,7 +24307,7 @@ impl MeshNode {
                  refusing to start the dispatch loop to avoid racing the \
                  responder handshake. Retry start() after accept() returns."
             );
-            return;
+            return false;
         }
 
         let recv_handle = self.spawn_receive_loop();
@@ -24185,7 +24335,9 @@ impl MeshNode {
                      was already running; ignoring the duplicate start. \
                      This usually indicates start() was invoked twice."
                 );
-                return;
+                // The router was already running, so this call did not
+                // complete a transition either.
+                return false;
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
@@ -24284,31 +24436,7 @@ impl MeshNode {
                 tasks.push(h);
             }
         }
-    }
-
-    /// Start the node through its `Arc`, enabling the periodic capability
-    /// re-announce on top of everything [`Self::start`] does. The
-    /// re-announce re-broadcasts this node's capabilities every
-    /// [`MeshNodeConfig::capability_reannounce_interval`], keeping its
-    /// entry alive in its own fold (so its callee-side nRPC gate doesn't
-    /// expire its own services) AND in every peer's fold (so it stays
-    /// discoverable) past one announcement TTL. Production entry points
-    /// (the SDK, the FFI) call this; a bare [`Self::start`] omits the
-    /// re-announce (fine for short-lived / test nodes). Idempotent.
-    pub fn start_arc(self: &Arc<Self>) {
-        // Store the weak before `start` spawns the re-announce loop, which
-        // captures it. `set` only fails if already set (a re-start) — the
-        // existing weak is equally valid, so ignore the result.
-        let _ = self.self_weak.set(Arc::downgrade(self));
-        self.start();
-        // Background direct-path upgrade scan loop (Stage 3). The loop
-        // itself no-ops unless `auto_direct_upgrade` is set, so spawning
-        // unconditionally is cheap; keeping it here means any Arc-held
-        // node started via `start_arc` gets upgrades when enabled.
-        // Detached like the other lifecycle loops — it exits on
-        // `shutdown_notify`.
-        #[cfg(feature = "nat-traversal")]
-        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+        true
     }
 
     /// The ONE production path that constructs a [`RoutingSupervisor`] and
@@ -25253,11 +25381,11 @@ impl MeshNode {
     /// for peers.) `Duration::MAX` disables the loop.
     ///
     /// Re-broadcasting needs an owned `Arc` (the per-peer sends go through
-    /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start_arc`]
+    /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start`]
     /// each tick — using a `Weak` (not `Arc`) so the task doesn't keep the
     /// node alive. The loop holds the shared `self_weak` OnceLock (not a
     /// snapshot) and re-reads it each tick, so a bare [`Self::start`]
-    /// followed by a later [`Self::start_arc`] enables re-announce rather
+    /// followed by a later [`Self::start`] enables re-announce rather
     /// than parking the loop forever (RT-3 review Finding 7); until the
     /// weak is set the tick is a harmless no-op.
     fn spawn_capability_reannounce_loop(&self) -> JoinHandle<()> {
@@ -25281,8 +25409,8 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         // Re-read the weak each tick: `None` = not started
-                        // via `start_arc` (yet); keep ticking so a later
-                        // `start_arc` enables the loop.
+                        // via `start` (yet); keep ticking so a later
+                        // `start` enables the loop.
                         let Some(weak) = self_weak.get() else { continue };
                         let Some(node) = weak.upgrade() else { break };
                         // Decision 8, trigger 2: if the observed
@@ -25325,13 +25453,13 @@ impl MeshNode {
     ///
     /// The loop holds the shared `self_weak` OnceLock and re-reads it
     /// each cycle rather than snapshotting it at spawn, so a bare
-    /// [`Self::start`] followed by a later [`Self::start_arc`] enables
+    /// [`Self::start`] followed by a later [`Self::start`] enables
     /// the announcer instead of parking it forever (RT-3 review
     /// Finding 7). A change that fires before the weak is set is NOT
     /// consumed: the loop parks (re-checking every
-    /// [`Self::CHANGE_ANNOUNCE_START_ARC_POLL`]) until `start_arc` installs
+    /// [`Self::CHANGE_ANNOUNCE_START_ARC_POLL`]) until `start` installs
     /// the weak, then announces the current baseline — so a mutation
-    /// landing between a bare `start()` and a later `start_arc()`
+    /// landing between a bare `start()` and a later `start()`
     /// survives instead of being marked-seen-and-dropped (RT-3 review
     /// P2). Consuming before the weak check dropped it permanently.
     ///
@@ -25339,11 +25467,11 @@ impl MeshNode {
     /// (`capability_reannounce_ttl`) so a change-driven entry
     /// survives until the keep-alive refreshes it.
     ///
-    /// Poll cadence for the "wait until `start_arc` installs the weak"
+    /// Poll cadence for the "wait until `start` installs the weak"
     /// park. Only ticks when a change is pending AND the node was
-    /// bare-`start()`ed without `start_arc` yet — a narrow, transient
+    /// bare-`start()`ed without `start` yet — a narrow, transient
     /// window — so the cost is a single sleeping timer, and the announce
-    /// latency after `start_arc` is bounded by this.
+    /// latency after `start` is bounded by this.
     const CHANGE_ANNOUNCE_START_ARC_POLL: Duration = Duration::from_millis(200);
 
     fn spawn_capability_announce_on_change_loop(&self) -> JoinHandle<()> {
@@ -25377,14 +25505,14 @@ impl MeshNode {
                         }
                         // Resolve the node BEFORE consuming the change.
                         // A mutation that lands between a bare `start()`
-                        // and a later `start_arc()` must survive for
-                        // start_arc's announcer — the old order called
+                        // and a later `start()` must survive for
+                        // start's announcer — the old order called
                         // `borrow_and_update` first, marking it seen, so
                         // when `self_weak` was still `None` the change
                         // was dropped permanently (until the next
                         // reannounce or another mutation). Park here,
                         // WITHOUT consuming, re-checking the weak until
-                        // start_arc installs it.
+                        // start installs it.
                         let node = loop {
                             match self_weak.get() {
                                 Some(weak) => match weak.upgrade() {
@@ -25955,6 +26083,9 @@ impl MeshNode {
             pending_membership_acks: self.pending_membership_acks.clone(),
             membership_dedupe: self.membership_dedupe.clone(),
             membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
+            identity_challenges: self.identity_challenges.clone(),
+            pending_identity_proofs: self.pending_identity_proofs.clone(),
+            peer_identity_sessions: self.peer_identity_sessions.clone(),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: self.pending_reflex_probes.clone(),
             #[cfg(feature = "nat-traversal")]
@@ -26966,7 +27097,7 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     fn spawn_provisional_reclaim_loop(&self) {
         let Some(weak) = self.self_weak.get().cloned() else {
-            // A node started without `start_arc` has no weak self;
+            // A node that was never started has no weak self;
             // its provisional sessions are reclaimed on close and
             // on shutdown, and the Stage 3 harness never creates
             // any (it serves no bootstrap).
@@ -29362,6 +29493,22 @@ impl MeshNode {
             return;
         }
 
+        // Identity proof: ChallengeRequest / Challenge / Proof /
+        // Verdict. Establishes the `node_id → EntityId` binding token
+        // admission needs, on a session whose peer has not announced
+        // anything and may never intend to.
+        //
+        // `from_node` is the AEAD-resolved session peer, never a wire
+        // field — every identity decision below keys on it. Each event
+        // is one independent leg, so iterating the frame is safe.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_IDENTITY_PROOF {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_identity_proof_message(&payload, from_node, ctx);
+            }
+            return;
+        }
+
         // Capability announcement: signed, versioned capability metadata.
         // Feeds the local `CapabilityIndex`; never responded to.
         //
@@ -31221,6 +31368,8 @@ impl MeshNode {
         // ordinary close path does.
         #[cfg(feature = "webrtc")]
         let rtc_reassembly_evict = Arc::clone(&self.rtc_reassembly);
+        let identity_challenges_evict = self.identity_challenges.clone();
+        let peer_identity_sessions_evict = self.peer_identity_sessions.clone();
         // Eviction is a peer-state transition like any other and runs
         // through the same handle as the installers.
         let peer_transitions_evict = self.peer_transitions.clone();
@@ -32013,6 +32162,13 @@ impl MeshNode {
                                     &rtc_reassembly_evict,
                                     &old_info.session,
                                 );
+                                // Identity readiness, same lockstep.
+                                // A reconnect under this node_id must
+                                // re-authenticate its entity rather
+                                // than inherit the dead
+                                // incarnation's record.
+                                identity_challenges_evict.forget_peer(node_id);
+                                peer_identity_sessions_evict.remove(&node_id);
                                 true
                             });
                                     // An eviction that declined (the
@@ -32562,15 +32718,6 @@ impl MeshNode {
     /// receiver.
     pub fn local_caps_generation(&self) -> u64 {
         *self.local_caps_changed.borrow()
-    }
-
-    /// Test seam: fire the RT-2 local-caps change signal as if a local
-    /// registry mutation happened, without standing up the cortex/tool
-    /// registries. Drives the change-driven announce loop in unit tests.
-    #[cfg(test)]
-    pub(crate) fn test_bump_local_caps_changed(&self) {
-        self.local_caps_changed
-            .send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Monotonic capability-version counter — the version stamped into
@@ -33238,6 +33385,12 @@ impl MeshNode {
     /// The publisher verifies the chain roots at one of the channel's
     /// `token_roots` and binds to the subscriber's entity before
     /// admitting the subscribe.
+    ///
+    /// # Identity prerequisite
+    ///
+    /// See [`Self::subscribe_channel_with_chain`] — this call shares
+    /// its identity-readiness contract, including the automatic
+    /// preparation.
     pub async fn subscribe_channel_with_token(
         &self,
         publisher_node_id: u64,
@@ -33255,12 +33408,46 @@ impl MeshNode {
     /// and the leaf must be bound to this node's entity. See
     /// [`TokenChain::verify_authorizes`] for the full contract the
     /// publisher applies.
+    ///
+    /// # Identity prerequisite
+    ///
+    /// A credential's leaf names an [`EntityId`], so the publisher can
+    /// only evaluate it once it has an **authenticated** binding from
+    /// this node's routing id to that entity. The issuer's signature
+    /// does not supply it: it attests who *received* the grant, never
+    /// that whoever presented the bytes owns that identity. Neither
+    /// does the session AEAD, which authenticates an X25519 static key
+    /// with no derivation to the ed25519 entity.
+    ///
+    /// This call therefore establishes the binding first, via
+    /// [`Self::prove_identity_to`], unless it is already established
+    /// on this session incarnation. The preparation is **bounded** by
+    /// `MeshNodeConfig::identity_proof_timeout` and is best-effort: if
+    /// the publisher does not participate (an older build), the
+    /// Subscribe still goes out and either succeeds on a binding
+    /// proven some other way — verified subnet admission is the only
+    /// other path that authenticates possession against a fresh
+    /// challenge on this session — or comes back rejected with
+    /// [`AckReason::IdentityNotEstablished`], which is a distinct
+    /// answer from `Unauthorized` and means "prove who you are", not
+    /// "your credential is bad".
+    ///
+    /// A capability announcement does **not** substitute. It pins, but
+    /// its signature covers no nonce and no session and its bytes are
+    /// broadcast mesh-wide, so it cannot stand in for
+    /// proof-of-possession on this incarnation. Advertising
+    /// capabilities is therefore not a prerequisite here, and never
+    /// was a sufficient one: a consumer with no services to publish
+    /// never needs to touch the discovery plane to use a credential
+    /// issued to it.
     pub async fn subscribe_channel_with_chain(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
         chain: TokenChain,
     ) -> Result<(), AdapterError> {
+        self.prepare_identity_for_credential(publisher_node_id)
+            .await;
         self.send_membership_request(
             publisher_node_id,
             channel,
@@ -33309,6 +33496,14 @@ impl MeshNode {
     /// [`PermissionToken`]. Same auth flow as
     /// [`Self::subscribe_channel_with_token`], queue-group
     /// semantics from [`Self::subscribe_channel_in_queue_group`].
+    ///
+    /// # Identity prerequisite
+    ///
+    /// Same as [`Self::subscribe_channel_with_chain`], and it matters
+    /// twice here: under
+    /// [`QueueGroupPolicy::TokenBound`](super::channel::QueueGroupPolicy::TokenBound)
+    /// the group grant IS this request's subscribe authority, so an
+    /// unproven identity cannot join the group at all.
     pub async fn subscribe_channel_in_queue_group_with_token(
         &self,
         publisher_node_id: u64,
@@ -33316,6 +33511,8 @@ impl MeshNode {
         queue_group: String,
         token: PermissionToken,
     ) -> Result<(), AdapterError> {
+        self.prepare_identity_for_credential(publisher_node_id)
+            .await;
         self.send_membership_request(
             publisher_node_id,
             channel,
@@ -33324,6 +33521,299 @@ impl MeshNode {
             Some(queue_group),
         )
         .await
+    }
+
+    /// `true` when `peer_node_id` has authenticated its `EntityId` to
+    /// THIS node on the current session incarnation.
+    ///
+    /// This is the readiness token admission requires. It is a
+    /// per-incarnation claim on purpose: a stale binding from a
+    /// previous session says only "we once knew this peer's entity",
+    /// which is not "this session's peer has authenticated it".
+    pub fn peer_identity_established(&self, peer_node_id: u64) -> bool {
+        let Some(live) = self.peer_session_id(peer_node_id) else {
+            return false;
+        };
+        self.peer_entity_ids.contains_key(&peer_node_id)
+            && self
+                .peer_identity_sessions
+                .get(&peer_node_id)
+                .is_some_and(|recorded| *recorded.value() == live)
+    }
+
+    /// Prove this node's `EntityId` to `verifier_node_id` over the
+    /// existing encrypted session, so that node can evaluate
+    /// credentials whose leaf binds to this identity.
+    ///
+    /// Two round trips: the verifier mints a one-use nonce, this node
+    /// signs a transcript over `(domain, verifier entity, own entity,
+    /// own routing id, session incarnation, nonce)`, the verifier
+    /// checks it against its own view and installs the binding. The
+    /// signature is therefore proof-of-possession of this node's
+    /// ed25519 secret, bound to one verifier, one session, and one
+    /// nonce.
+    ///
+    /// Call it directly only to front-load the cost, or to establish
+    /// identity for something other than a channel credential — the
+    /// token-bearing subscribe APIs already do this for you. Repeat
+    /// calls on an established session are cheap no-ops; a reconnect
+    /// re-proves, because the binding is not inheritable across
+    /// incarnations.
+    ///
+    /// # Errors
+    ///
+    /// `AdapterError::Connection` when there is no session, the local
+    /// keypair is public-only (nothing to sign with), the verifier
+    /// refused (the refusal reason is in the message), or the exchange
+    /// did not complete inside
+    /// `MeshNodeConfig::identity_proof_timeout`.
+    pub async fn prove_identity_to(&self, verifier_node_id: u64) -> Result<(), AdapterError> {
+        // Read per exchange below, not once here: the retry can span a
+        // reconnect, and a proof signed over the previous incarnation's
+        // id is refused as `BadSignature` — the transcript binds the
+        // session deliberately, so a stale capture turns the recovery
+        // path into a guaranteed failure.
+        let live_session = || {
+            self.peer_session_id(verifier_node_id).ok_or_else(|| {
+                AdapterError::Connection(format!(
+                    "no session to identity verifier {:#x}",
+                    verifier_node_id
+                ))
+            })
+        };
+        // Fail fast when there is no session at all, so the caller gets
+        // that answer rather than a challenge timeout.
+        live_session()?;
+
+        // Two exchanges at most, and the documented budget covers both:
+        // each exchange is two legs, so a leg gets a quarter of it.
+        //
+        // The second exchange exists because the proof leg retransmits.
+        // A challenge is consumed by the attempt that presents it, so if
+        // the verifier admitted a proof and its `Verdict` was lost, the
+        // retransmit lands on a spent nonce and comes back
+        // `NoChallenge` — reporting failure for an identity the verifier
+        // has in fact established. Rather than caching verdicts on the
+        // verifier (state whose whole purpose is to answer a message
+        // that was already sent), the prover simply starts a fresh
+        // exchange: the re-proof takes the already-pinned-and-matching
+        // path and is accepted.
+        const MAX_EXCHANGES: u32 = 2;
+        let per_leg = self.config.identity_proof_timeout / (2 * MAX_EXCHANGES);
+        let attempts = self.config.identity_proof_max_attempts.max(1);
+
+        let mut last_reject = None;
+        for exchange in 0..MAX_EXCHANGES {
+            // The incarnation this exchange signs over, and the one the
+            // memo below is keyed on.
+            let session_id = live_session()?;
+            let challenge_reply = self
+                .identity_proof_leg(verifier_node_id, per_leg, attempts, |nonce| {
+                    IdentityProofMsg::ChallengeRequest { nonce }
+                })
+                .await?;
+            let (verifier, challenge) = match challenge_reply {
+                IdentityProofReply::Challenge {
+                    verifier,
+                    challenge,
+                } => (verifier, challenge),
+                IdentityProofReply::Verdict { reject, .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} refused to issue a challenge: {}",
+                        verifier_node_id,
+                        reject.map_or("no reason given".to_string(), |r| r.to_string()),
+                    )));
+                }
+            };
+
+            // The verifier's entity is CLAIMED at this point, and it is
+            // sound to sign over: the verifier re-derives the transcript
+            // from its own real entity before checking the signature, so
+            // a verifier that lied gets a proof bound to an identity it
+            // cannot present anywhere.
+            let transcript = proof_transcript(
+                &verifier,
+                self.entity_id(),
+                self.node_id,
+                session_id,
+                &challenge,
+            );
+            let signature = self
+                .identity
+                .try_sign(&transcript)
+                .map_err(|e| {
+                    AdapterError::Connection(format!(
+                        "cannot prove identity without a signing key: {e}"
+                    ))
+                })?
+                .to_bytes();
+            let subject = self.entity_id().clone();
+
+            let verdict = self
+                .identity_proof_leg(verifier_node_id, per_leg, attempts, move |nonce| {
+                    IdentityProofMsg::Proof {
+                        nonce,
+                        subject: subject.clone(),
+                        challenge,
+                        signature,
+                    }
+                })
+                .await?;
+            match verdict {
+                IdentityProofReply::Verdict { accepted: true, .. } => {
+                    // Memoized against the incarnation it was proven on,
+                    // so a reconnect (a fresh handshake hash, therefore
+                    // a fresh session id on both sides) re-proves
+                    // instead of assuming the far side still holds the
+                    // binding.
+                    self.proven_identity_sessions
+                        .insert(verifier_node_id, session_id);
+                    return Ok(());
+                }
+                // The one retryable refusal: the nonce was spent, which
+                // on a retransmitting leg usually means our own earlier
+                // proof was consumed and its verdict lost.
+                IdentityProofReply::Verdict {
+                    reject: Some(IdentityProofReject::NoChallenge),
+                    ..
+                } if exchange + 1 < MAX_EXCHANGES => {
+                    last_reject = Some(IdentityProofReject::NoChallenge);
+                    continue;
+                }
+                IdentityProofReply::Verdict { reject, .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} refused the proof: {}",
+                        verifier_node_id,
+                        reject.map_or("no reason given".to_string(), |r| r.to_string()),
+                    )));
+                }
+                IdentityProofReply::Challenge { .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} answered a proof with a challenge",
+                        verifier_node_id
+                    )));
+                }
+            }
+        }
+        Err(AdapterError::Connection(format!(
+            "identity verifier {:#x} refused every exchange: {}",
+            verifier_node_id,
+            last_reject.map_or("no reason given".to_string(), |r| r.to_string()),
+        )))
+    }
+
+    /// Establish identity with `verifier_node_id` if this session has
+    /// not already done so, swallowing failure.
+    ///
+    /// Called by the token-bearing subscribe paths. Deliberately
+    /// infallible from the caller's point of view: preparation is a
+    /// convenience, and turning "the publisher runs an older build"
+    /// into a hard subscribe error would break meshes that establish
+    /// identity by other means. What a failure costs is the bounded
+    /// `identity_proof_timeout`, once per session, after which the
+    /// Subscribe proceeds and the publisher's own answer —
+    /// [`AckReason::IdentityNotEstablished`] versus
+    /// [`AckReason::Unauthorized`] — tells the caller which half of
+    /// the problem they have.
+    async fn prepare_identity_for_credential(&self, verifier_node_id: u64) {
+        let Some(live) = self.peer_session_id(verifier_node_id) else {
+            // No session: let the membership request produce the
+            // "no session to publisher" error, which is the accurate
+            // one.
+            return;
+        };
+        if self
+            .proven_identity_sessions
+            .get(&verifier_node_id)
+            .is_some_and(|proven| *proven.value() == live)
+        {
+            return;
+        }
+        if let Err(e) = self.prove_identity_to(verifier_node_id).await {
+            tracing::debug!(
+                verifier = format!("{:#x}", verifier_node_id),
+                error = %e,
+                "identity preparation for a token-bearing subscribe did not \
+                 complete; sending the Subscribe anyway"
+            );
+        }
+    }
+
+    /// One request/reply leg of the identity-proof exchange.
+    ///
+    /// Mirrors `send_membership_request_typed`: a random correlation
+    /// nonce (a predictable one would let any session peer satisfy an
+    /// in-flight leg with a forged reply), the pending entry bound to
+    /// the node being addressed, and `attempts` retransmissions
+    /// sharing one `budget` because this rides the same
+    /// fire-and-forget UDP control plane with no retransmit window.
+    /// Every attempt reuses the nonce, so a duplicate reply is
+    /// discarded rather than mistaken for a second exchange.
+    async fn identity_proof_leg(
+        &self,
+        verifier_node_id: u64,
+        budget: Duration,
+        attempts: u32,
+        build: impl Fn(u64) -> IdentityProofMsg,
+    ) -> Result<IdentityProofReply, AdapterError> {
+        let mut nonce_bytes = [0u8; 8];
+        if let Err(e) = getrandom::fill(&mut nonce_bytes) {
+            return Err(AdapterError::Connection(format!(
+                "identity proof nonce generation failed: {e}"
+            )));
+        }
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        let bytes = encode_identity_proof(&build(nonce));
+
+        let (tx, mut rx) = oneshot::channel::<IdentityProofReply>();
+        // RAII, not manual removal on each exit path. The awaits below
+        // are cancellation points: a caller that drops this future —
+        // `tokio::select!`, a timeout around the subscribe, a dropped
+        // task — would otherwise leave the nonce in the map forever,
+        // and a caller that retries grows it without bound. Drop runs
+        // on every path including unwind, so the success path needs no
+        // special case either (the dispatcher's `remove_if` may already
+        // have taken it; removing an absent key is a no-op).
+        struct PendingLeg {
+            map: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
+            nonce: u64,
+        }
+        impl Drop for PendingLeg {
+            fn drop(&mut self) {
+                self.map.remove(&self.nonce);
+            }
+        }
+        let _pending = PendingLeg {
+            map: self.pending_identity_proofs.clone(),
+            nonce,
+        };
+        self.pending_identity_proofs
+            .insert(nonce, (verifier_node_id, tx));
+
+        let per_attempt = budget / attempts.max(1);
+        let mut reply = None;
+        for _ in 0..attempts {
+            self.send_subprotocol_to_node(verifier_node_id, SUBPROTOCOL_IDENTITY_PROOF, &bytes)
+                .await?;
+            match tokio::time::timeout(per_attempt, &mut rx).await {
+                Ok(Ok(r)) => {
+                    reply = Some(r);
+                    break;
+                }
+                Ok(Err(_)) => {
+                    return Err(AdapterError::Connection(
+                        "identity proof reply channel closed".into(),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+        reply.ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "identity proof timeout ({:?}, {} attempts) with verifier {:#x}",
+                budget, attempts, verifier_node_id
+            ))
+        })
     }
 
     /// Claim the one corrective re-announce allowed for `target`.
@@ -33762,6 +34252,340 @@ impl MeshNode {
                 }
             }
         }
+    }
+
+    /// Dispatch one leg of the identity-proof exchange
+    /// (`SUBPROTOCOL_IDENTITY_PROOF`).
+    ///
+    /// Verifier legs (`ChallengeRequest`, `Proof`) answer on the wire;
+    /// prover legs (`Challenge`, `Verdict`) complete the pending
+    /// oneshot that [`MeshNode::prove_identity_to`] is waiting on.
+    ///
+    /// `from_node` is the session-resolved peer. Nothing in this path
+    /// trusts a wire-claimed routing id, and the only thing a claimed
+    /// `EntityId` buys the sender is the obligation to sign for it.
+    fn handle_identity_proof_message(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let msg = match decode_identity_proof(payload) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "identity proof decode failed");
+                return;
+            }
+        };
+
+        match msg {
+            IdentityProofMsg::ChallengeRequest { nonce } => {
+                // A peer already throttled for auth failures does not
+                // get to spin the challenge mill. `Busy` is the honest
+                // answer: retryable, and it says nothing about
+                // identity.
+                if Self::is_auth_throttled(from_node, ctx) {
+                    Self::send_identity_proof_frame(
+                        from_node,
+                        &IdentityProofMsg::Verdict {
+                            nonce,
+                            accepted: false,
+                            reject: Some(IdentityProofReject::Busy),
+                        },
+                        ctx,
+                    );
+                    return;
+                }
+                let Some(session_id) = Self::live_session_id(from_node, ctx) else {
+                    return;
+                };
+                let Some(challenge) =
+                    ctx.identity_challenges
+                        .issue(from_node, session_id, Instant::now())
+                else {
+                    Self::send_identity_proof_frame(
+                        from_node,
+                        &IdentityProofMsg::Verdict {
+                            nonce,
+                            accepted: false,
+                            reject: Some(IdentityProofReject::Busy),
+                        },
+                        ctx,
+                    );
+                    return;
+                };
+                Self::send_identity_proof_frame(
+                    from_node,
+                    &IdentityProofMsg::Challenge {
+                        nonce,
+                        verifier: ctx.signing_identity.entity_id().clone(),
+                        challenge,
+                    },
+                    ctx,
+                );
+            }
+            IdentityProofMsg::Proof {
+                nonce,
+                subject,
+                challenge,
+                signature,
+            } => {
+                let outcome =
+                    Self::admit_identity_proof(from_node, &subject, &challenge, &signature, ctx);
+                if let Err(reject) = outcome {
+                    // Only the two unambiguous forgeries charge the
+                    // shared auth-failure budget. `NoChallenge` /
+                    // `WrongSession` / `PinConflict` are races or
+                    // availability events, and throttling a peer for
+                    // losing a race is how a retry loop becomes an
+                    // outage.
+                    if matches!(
+                        reject,
+                        IdentityProofReject::BadSignature | IdentityProofReject::SubjectMismatch
+                    ) {
+                        Self::record_auth_failure(from_node, ctx);
+                    }
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        reject = %reject,
+                        "identity proof refused"
+                    );
+                }
+                Self::send_identity_proof_frame(
+                    from_node,
+                    &IdentityProofMsg::Verdict {
+                        nonce,
+                        accepted: outcome.is_ok(),
+                        reject: outcome.err(),
+                    },
+                    ctx,
+                );
+            }
+            IdentityProofMsg::Challenge {
+                nonce,
+                verifier,
+                challenge,
+            } => {
+                Self::complete_identity_proof_leg(
+                    nonce,
+                    from_node,
+                    IdentityProofReply::Challenge {
+                        verifier,
+                        challenge,
+                    },
+                    ctx,
+                );
+            }
+            IdentityProofMsg::Verdict {
+                nonce,
+                accepted,
+                reject,
+            } => {
+                Self::complete_identity_proof_leg(
+                    nonce,
+                    from_node,
+                    IdentityProofReply::Verdict { accepted, reject },
+                    ctx,
+                );
+            }
+        }
+    }
+
+    /// The live session incarnation for `from_node`, or `None` when no
+    /// session exists. Read and released in one expression so no peer-map
+    /// guard is alive across the identity-pin transition below (which
+    /// takes the same map).
+    fn live_session_id(from_node: u64, ctx: &DispatchCtx) -> Option<u64> {
+        ctx.peers
+            .get(&from_node)
+            .map(|p| p.value().session.session_id())
+    }
+
+    /// `true` when this session's peer has PROVEN possession of the
+    /// entity pinned for `from_node`, on the incarnation that is live
+    /// right now.
+    ///
+    /// Not the same question as "is there a pin". The pin carries no
+    /// incarnation, is installed by TOFU from a signed announcement
+    /// whose signature covers no session and no nonce, and survives a
+    /// peer re-entering the map under the same `node_id`. Token
+    /// admission needs the stronger claim, because a credential's leaf
+    /// names an entity and NKpsk0 leaves the initiator anonymous.
+    fn identity_session_current(from_node: u64, ctx: &DispatchCtx) -> bool {
+        let Some(live) = Self::live_session_id(from_node, ctx) else {
+            return false;
+        };
+        ctx.peer_identity_sessions
+            .get(&from_node)
+            .is_some_and(|recorded| *recorded.value() == live)
+    }
+
+    /// Record that `from_node` proved possession of its entity on the
+    /// live session incarnation.
+    ///
+    /// Written ONLY by the two paths that verify a signature over a
+    /// fresh verifier challenge bound to this incarnation: the
+    /// identity-proof exchange and verified subnet admission. Both
+    /// write it on the already-pinned-and-matching outcome as well as
+    /// on a fresh install — re-proving on a new incarnation is exactly
+    /// how a reconnected peer restores readiness without the pin's
+    /// value ever changing.
+    ///
+    /// The capability-announcement path deliberately does NOT call
+    /// this; see the note at its pin site.
+    fn mark_identity_session(from_node: u64, session_id: u64, ctx: &DispatchCtx) {
+        ctx.peer_identity_sessions.insert(from_node, session_id);
+    }
+
+    /// Verify a presented proof and, if it holds, install the
+    /// `from_node → subject` binding for this session incarnation.
+    ///
+    /// Order is load-bearing:
+    ///
+    /// 1. **Consume the challenge first**, so the nonce is spent by the
+    ///    attempt itself and a captured proof cannot retry it.
+    /// 2. Verify subject/routing-id agreement and the signature.
+    /// 3. Compare-and-install the pin atomically. A conflicting pin is
+    ///    refused and never overwritten — a deliberate 64-bit routing
+    ///    collision is an availability event, never credential
+    ///    aliasing. (The same discipline as `admit_subnet_session`.)
+    ///
+    /// The session record is written on BOTH the fresh-install and the
+    /// already-pinned-and-matching paths: re-proving on a new
+    /// incarnation is exactly how a reconnected peer re-establishes
+    /// readiness without the pin ever changing value.
+    fn admit_identity_proof(
+        from_node: u64,
+        subject: &EntityId,
+        challenge: &[u8; 32],
+        signature: &[u8; 64],
+        ctx: &DispatchCtx,
+    ) -> Result<(), IdentityProofReject> {
+        let session_id =
+            Self::live_session_id(from_node, ctx).ok_or(IdentityProofReject::WrongSession)?;
+        if !ctx
+            .identity_challenges
+            .consume(from_node, session_id, challenge, Instant::now())
+        {
+            return Err(IdentityProofReject::NoChallenge);
+        }
+        verify_proof(
+            ctx.signing_identity.entity_id(),
+            subject,
+            from_node,
+            session_id,
+            challenge,
+            signature,
+        )?;
+
+        // The pin and the republication it causes are ONE serialized
+        // transition — the same commit the announcement and subnet
+        // paths take, for the same reason: no projection build may
+        // publish between its revalidation and its store while this
+        // lands.
+        commit_peer_transition(
+            &ctx.session_routing,
+            &ctx.routing_registry,
+            &ctx.peers,
+            &ctx.peer_entity_ids,
+            || {
+                let outcome = match ctx.peer_entity_ids.entry(from_node) {
+                    dashmap::mapref::entry::Entry::Occupied(slot) => {
+                        if slot.get() != subject {
+                            tracing::warn!(
+                                from_node = format!("{from_node:#x}"),
+                                "identity: proof refused — a different entity is \
+                                 already pinned to this routing id"
+                            );
+                            Err(IdentityProofReject::PinConflict)
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(subject.clone());
+                        // Mirror into the origin_hash reverse index on
+                        // the same first-write-wins terms as the
+                        // announcement path, so a proven identity is
+                        // resolvable by wire origin hash too.
+                        let _ = ctx
+                            .origin_hash_to_node
+                            .entry(subject.origin_hash())
+                            .or_insert(from_node);
+                        Ok(true)
+                    }
+                };
+                if outcome.is_ok() {
+                    Self::mark_identity_session(from_node, session_id, ctx);
+                }
+                let published = matches!(outcome, Ok(true));
+                (outcome, published)
+            },
+        )
+        .map(|_installed| ())
+    }
+
+    /// Hand an inbound `Challenge` / `Verdict` to the prover waiting on
+    /// `nonce`.
+    ///
+    /// Peer-auth gate identical to the membership ack path: the pending
+    /// entry records the node the request went to, and only that node
+    /// may answer it. Without it, any session peer that guessed the
+    /// nonce could satisfy an in-flight exchange with a forged
+    /// challenge (steering the transcript) or a forged verdict.
+    fn complete_identity_proof_leg(
+        nonce: u64,
+        from_node: u64,
+        reply: IdentityProofReply,
+        ctx: &DispatchCtx,
+    ) {
+        let took = ctx
+            .pending_identity_proofs
+            .remove_if(&nonce, |_, (expected, _)| *expected == from_node);
+        match took {
+            Some((_, (_expected, tx))) => {
+                let _ = tx.send(reply);
+            }
+            None => {
+                tracing::trace!(
+                    nonce,
+                    from = format!("{:#x}", from_node),
+                    "identity proof reply with no matching pending leg (duplicate, \
+                     timed out, or not from the addressed verifier)"
+                );
+            }
+        }
+    }
+
+    /// Put one identity-proof message on the wire to `to_node`.
+    /// Best-effort: a peer that has gone away or is partitioned off
+    /// simply leaves the requester to hit its own bound.
+    fn send_identity_proof_frame(to_node: u64, msg: &IdentityProofMsg, ctx: &DispatchCtx) {
+        let Some(peer_entry) = ctx.peers.get(&to_node) else {
+            return;
+        };
+        let dest_addr = peer_entry.value().addr();
+        if ctx.partition_filter.contains(&dest_addr) {
+            return;
+        }
+        let dest_sess = peer_entry.value().session.clone();
+        let sink = ctx.sink.clone();
+        let bytes = Bytes::from(encode_identity_proof(msg));
+        drop(peer_entry);
+
+        tokio::spawn(async move {
+            let pool = dest_sess.thread_local_pool();
+            let mut builder = pool.get();
+            let stream_id = SUBPROTOCOL_IDENTITY_PROOF as u64;
+            let seq = {
+                let stream = dest_sess.get_or_create_stream(stream_id);
+                stream.next_tx_seq()
+            };
+            let events = vec![bytes];
+            let packet = builder.build_subprotocol(
+                stream_id,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_IDENTITY_PROOF,
+            );
+            let _ = sink.send(&packet, dest_addr).await;
+        });
     }
 
     /// Dispatch an inbound `CapabilityAnnouncement` into the local
@@ -38394,6 +39218,32 @@ impl MeshNode {
                                 .or_insert(from_node);
                             Ok(true)
                         };
+                    // NOTE: this path pins, and deliberately does NOT
+                    // establish identity READINESS for token admission.
+                    //
+                    // The announcement's signature covers
+                    // `(node_id, entity_id, version, caps)` — no nonce,
+                    // no session id — and announcements are broadcast
+                    // and forwarded, so the bytes are public to the
+                    // mesh. Meanwhile NKpsk0 leaves the INITIATOR
+                    // anonymous (see `subnet::auth`: the pin "can
+                    // corroborate identity but cannot substitute for
+                    // proof-of-possession") and `peer_node_id` is
+                    // caller-supplied on the direct path / self-declared
+                    // in msg1 on the routed one. So a PSK holder can
+                    // take a routing-id slot and replay a victim's
+                    // announcement to install the victim's entity.
+                    // Recording "this announcement arrived on session X"
+                    // would not make its signature a proof bound to
+                    // session X — it would only relabel the same
+                    // assumption.
+                    //
+                    // Readiness is therefore written only by paths that
+                    // prove possession against a fresh verifier
+                    // challenge on this incarnation: the identity-proof
+                    // exchange and verified subnet admission. Every
+                    // other consumer of the pin (RPC caller identity,
+                    // sensing roots, routing eligibility) is unchanged.
                     let published = matches!(outcome, Ok(true));
                     (outcome, published)
                 },
@@ -39810,26 +40660,77 @@ impl MeshNode {
         };
 
         // Peer entity — load-bearing for `require_token`: the chain's
-        // leaf subject must bind to this AEAD-verified handshake
-        // identity. Missing entity + require_token = reject.
-        let Some(peer_entity) = ctx
-            .peer_entity_ids
-            .get(&from_node)
-            .map(|e| e.value().clone())
-        else {
+        // leaf subject must bind to an AUTHENTICATED identity for this
+        // peer, established on THIS session incarnation.
+        //
+        // Two distinct things are being asked, and conflating them was
+        // the defect this reports honestly:
+        //
+        // - "Do we know who this peer is?" — the pin exists and was
+        //   established on the live session (a signed hop-0
+        //   announcement, verified subnet admission, or an identity
+        //   proof). A stale record means the peer reconnected without
+        //   re-authenticating, and an attacker holding only the Noise
+        //   static must not inherit the real owner's entity across
+        //   that boundary.
+        // - "Does their credential authorize this?" — the chain
+        //   checks, below.
+        //
+        // The first failing is `IdentityNotEstablished`, not
+        // `Unauthorized`: it is a missing prerequisite the peer can
+        // supply (`prove_identity_to`), and reporting it as a
+        // credential rejection is what sent operators looking for a
+        // token bug and landed them on an announce-and-poll warm-up.
+        let identity_current = Self::identity_session_current(from_node, ctx);
+        let pinned_entity = if identity_current {
+            ctx.peer_entity_ids
+                .get(&from_node)
+                .map(|e| e.value().clone())
+        } else {
+            None
+        };
+        let Some(peer_entity) = pinned_entity else {
             if cfg.token_required() {
-                return (false, Some(AckReason::Unauthorized));
+                // A peer that presented NOTHING is unauthorized on the
+                // credential axis and should be told so — inviting it
+                // to prove an identity it never used would be the same
+                // misdirection in the opposite direction. Identity
+                // readiness is reported only when it is actually the
+                // blocker: a credential was presented and cannot be
+                // evaluated.
+                if presented_chain.is_none() {
+                    return (false, Some(AckReason::Unauthorized));
+                }
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    channel = channel.as_str(),
+                    pinned = ctx.peer_entity_ids.contains_key(&from_node),
+                    "auth: a credential was presented but this session's peer has \
+                     no authenticated entity to bind it to; the peer must prove \
+                     its identity first"
+                );
+                return (false, Some(AckReason::IdentityNotEstablished));
             }
             // A restricted queue-group policy cannot be satisfied by a
             // peer we have not pinned, whichever policy it is: `Deny`
             // admits nobody, and `TokenBound` needs a chain whose leaf
-            // binds to an AEAD-verified entity, which is precisely what
+            // binds to an authenticated entity, which is precisely what
             // is missing here. Falling through to the cap-only path
             // below would answer a different question with a dummy id
             // and admit the join — the second way `Deny` could be
             // bypassed on a channel with no other gates.
             if queue_group_gated {
-                return (false, Some(AckReason::Unauthorized));
+                // `Deny` is a policy verdict, and a peer that
+                // presented no credential fails on the credential
+                // axis — neither should invite a retry after proving
+                // an identity that would change nothing.
+                let identity_is_the_blocker =
+                    cfg.queue_group_policy != QueueGroupPolicy::Deny && presented_chain.is_some();
+                return if identity_is_the_blocker {
+                    (false, Some(AckReason::IdentityNotEstablished))
+                } else {
+                    (false, Some(AckReason::Unauthorized))
+                };
             }
             // Cap-filter-only mode without a known entity — run the
             // cap match with a dummy id. The token gate is skipped
@@ -41383,7 +42284,7 @@ impl MeshNode {
     /// it was broadcast.** Calls inside the `min_announce_interval`
     /// window (10 s default) coalesce into one trailing-edge flush at
     /// the end of the window — and on a node started with
-    /// [`Self::start`] rather than [`Self::start_arc`] there is no owned
+    /// [`Self::start`] rather than [`Self::start`] there is no owned
     /// `Arc` to schedule that flush with, so the broadcast is dropped
     /// outright. See [`Self::start`] for why that combination makes a
     /// changed announcement look like a stale peer-side fold.
@@ -42091,19 +42992,13 @@ impl MeshNode {
                         if gate.deferred_scheduled {
                             return Ok(AnnounceOutcome::Coalesced);
                         }
-                        // Bare-start node (no `start_arc`): there is no
-                        // owned `Arc` for a flush task to hold — same
-                        // constraint as the re-announce loop. Preserve
-                        // the pre-RT-1 drop semantics (peers see the
-                        // change on the next out-of-window announce or
-                        // the keep-alive).
-                        if self.self_weak.get().is_none() {
-                            tracing::debug!(
-                                "capability: in-window announce not deferred \
-                             (node not started via start_arc)"
-                            );
-                            return Ok(AnnounceOutcome::Coalesced);
-                        }
+                        // No bare-start arm any more: `start` takes the
+                        // node's `Arc` and populates `self_weak` before
+                        // anything can announce, so the trailing-edge
+                        // flush is always schedulable. This used to be
+                        // the one place an accepted announcement could
+                        // be discarded outright while the caller was
+                        // told `Ok(())`.
                         gate.deferred_scheduled = true;
                         // New deferral claim → new generation. The
                         // flush task captures this and re-checks it, so
@@ -48436,59 +49331,6 @@ mod reclassify_override_race_tests {
         );
     }
 
-    /// RT-3 review P2: a capability mutation that lands between a bare
-    /// `start()` and a later `start_arc()` must survive. The change loop
-    /// used to `borrow_and_update` (mark the signal seen) BEFORE checking
-    /// whether `self_weak` was installed, so a mutation in that window
-    /// was dropped permanently until the next reannounce. The landed
-    /// Finding-7 test called `start_arc` before mutating, so it missed
-    /// this ordering.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bare_start_then_mutate_then_start_arc_still_announces() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let cfg = MeshNodeConfig::new(addr, [0x23u8; 32])
-            // Enable the change-driven announcer with a snappy debounce…
-            .with_announce_debounce(Duration::from_millis(20))
-            // …and DISABLE the keep-alive reannounce so the ONLY thing
-            // that can bump capability_version after start_arc is the
-            // change-driven announce we are testing.
-            .with_capability_reannounce_interval(Duration::MAX);
-        let node = Arc::new(
-            MeshNode::new(EntityKeypair::generate(), cfg)
-                .await
-                .expect("MeshNode::new"),
-        );
-
-        // Bare start: spawns the change loop with `self_weak` still None.
-        node.start();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // A local-caps mutation lands BEFORE start_arc.
-        node.test_bump_local_caps_changed();
-        // Give the loop time to (pre-fix) consume + drop the signal.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let v_before = node.capability_version.load(Ordering::Relaxed);
-
-        // Enable the Arc-started announcer. The parked mutation must now
-        // drive an announce, bumping capability_version.
-        node.start_arc();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut announced = false;
-        while tokio::time::Instant::now() < deadline {
-            if node.capability_version.load(Ordering::Relaxed) > v_before {
-                announced = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            announced,
-            "the mutation made between bare start() and start_arc() was dropped — \
-             capability_version never advanced after start_arc"
-        );
-    }
-
     /// Regression for the capability re-announce loop. A node's own
     /// capability self-entry TTL-expires and the fold sweeper reaps it,
     /// after which (a) its callee-side nRPC gate denies its own services
@@ -48510,7 +49352,7 @@ mod reclassify_override_race_tests {
         node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
             .await
             .expect("announce");
-        node.start_arc();
+        node.start();
 
         let v0 = node.capability_version.load(Ordering::Relaxed);
         // Past the 120 ms TTL and a fold sweep tick.
@@ -48545,7 +49387,7 @@ mod reclassify_override_race_tests {
         node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
             .await
             .expect("announce");
-        node.start_arc();
+        node.start();
 
         tokio::time::sleep(Duration::from_millis(750)).await;
         let present = node
@@ -59859,6 +60701,498 @@ mod stream_handle_contract_tests {
         assert!(
             resent[0].flags.contains(PacketFlags::RELIABLE),
             "the retained descriptor must carry the flags the packet was built with"
+        );
+    }
+}
+
+/// Identity readiness for token admission — the prerequisite is an
+/// authenticated `node_id → EntityId` binding on the LIVE session, not
+/// a capability announcement and not the credential's own subject
+/// claim.
+///
+/// These witnesses drive the production decision functions
+/// (`admit_identity_proof`, `authorize_subscribe`) directly, because
+/// the one thing the transport will not do on request is hand the same
+/// pair a second session incarnation: `routed_rotation_outcome`
+/// deliberately refuses to rotate a live session. Sessions are
+/// therefore installed here, and everything that decides anything is
+/// the real code path.
+#[cfg(test)]
+mod identity_readiness_tests {
+    use super::*;
+    use crate::adapter::net::ChannelConfig;
+
+    const CHANNEL: &str = "lab/gated";
+
+    fn session(session_id: u64) -> Arc<NetSession> {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        Arc::new(NetSession::new(
+            crate::adapter::net::crypto::SessionKeys {
+                tx_key: [0x11u8; 32],
+                rx_key: [0x22u8; 32],
+                session_id,
+                remote_static_pub: [0x33u8; 32],
+                route_hop_tx_key: [0x44u8; 32],
+                route_hop_rx_key: [0x55u8; 32],
+            },
+            PeerAddr::Udp(addr),
+            4,
+            false,
+        ))
+    }
+
+    /// Install (or replace) `peer`'s session with one carrying
+    /// `session_id` — a fresh incarnation for the same routing id, i.e.
+    /// what a reconnect leaves behind.
+    fn install_incarnation(node: &MeshNode, peer: u64, session_id: u64) {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        node.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: session(session_id),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
+    async fn publisher() -> (Arc<MeshNode>, EntityKeypair) {
+        let keypair = EntityKeypair::generate();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = MeshNode::new(keypair.clone(), MeshNodeConfig::new(addr, [0x42u8; 32]))
+            .await
+            .expect("MeshNode::new");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        registry.insert(
+            ChannelConfig::new(ChannelId::new(ChannelName::new(CHANNEL).expect("name")))
+                .with_token_roots(vec![keypair.entity_id().clone()]),
+        );
+        node.set_channel_configs(registry);
+        node.set_token_cache(Arc::new(TokenCache::new()));
+        (Arc::new(node), keypair)
+    }
+
+    /// Run the real proof-admission path for `prover` on its live
+    /// session, with a challenge the verifier actually minted.
+    fn prove(
+        node: &MeshNode,
+        ctx: &DispatchCtx,
+        prover: &EntityKeypair,
+    ) -> Result<(), IdentityProofReject> {
+        let peer = prover.node_id();
+        let session_id = node.peer_session_id(peer).expect("live session");
+        let challenge = node
+            .identity_challenges
+            .issue(peer, session_id, Instant::now())
+            .expect("challenge");
+        let transcript = proof_transcript(
+            node.entity_id(),
+            prover.entity_id(),
+            peer,
+            session_id,
+            &challenge,
+        );
+        let signature = prover.sign(&transcript).to_bytes();
+        MeshNode::admit_identity_proof(peer, prover.entity_id(), &challenge, &signature, ctx)
+    }
+
+    /// A SUBSCRIBE chain for `subject`, signed by the channel root.
+    fn credential_for(root: &EntityKeypair, subject: &EntityId) -> Vec<u8> {
+        let channel = ChannelName::new(CHANNEL).expect("name");
+        TokenChain::single(PermissionToken::issue(
+            root,
+            subject.clone(),
+            TokenScope::SUBSCRIBE,
+            channel.hash(),
+            300,
+            0,
+        ))
+        .to_bytes()
+    }
+
+    fn subscribe_verdict(
+        ctx: &DispatchCtx,
+        peer: u64,
+        credential: Option<&[u8]>,
+    ) -> (bool, Option<AckReason>) {
+        let channel = ChannelName::new(CHANNEL).expect("name");
+        MeshNode::authorize_subscribe(&channel, peer, credential, None, ctx)
+    }
+
+    /// The headline: a proof establishes readiness for the incarnation
+    /// it ran on, a new incarnation does NOT inherit it, and re-proving
+    /// restores it.
+    ///
+    /// The middle assertion is the whole reconnect requirement. The pin
+    /// deliberately still holds the right entity there — an attacker
+    /// who obtained only the transport static would reconnect into
+    /// exactly that state — so admitting on the strength of the pin
+    /// alone is the defect, not a convenience.
+    #[tokio::test]
+    async fn a_new_incarnation_does_not_inherit_identity_readiness() {
+        let (node, root) = publisher().await;
+        let subscriber = EntityKeypair::generate();
+        let peer = subscriber.node_id();
+        let credential = credential_for(&root, subscriber.entity_id());
+        let ctx = node.dispatch_ctx();
+
+        install_incarnation(&node, peer, 0xA1);
+        prove(&node, &ctx, &subscriber).expect("a genuine proof must be admitted");
+        assert!(node.peer_identity_established(peer));
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&credential)),
+            (true, None),
+            "a proven identity plus a valid credential is admitted"
+        );
+
+        // Reconnect: same routing id, new session.
+        install_incarnation(&node, peer, 0xA2);
+        assert!(
+            node.peer_entity_ids.contains_key(&peer),
+            "premise: the pin itself survives — readiness is what must not"
+        );
+        assert!(
+            !node.peer_identity_established(peer),
+            "a new incarnation must not inherit the previous one's \
+             authenticated identity"
+        );
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&credential)),
+            (false, Some(AckReason::IdentityNotEstablished)),
+            "the same credential must not be admitted on an incarnation that \
+             has not authenticated the identity it binds to"
+        );
+
+        prove(&node, &ctx, &subscriber).expect("re-proving on the new incarnation");
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&credential)),
+            (true, None),
+            "re-authenticating restores admission"
+        );
+    }
+
+    /// Identity readiness is not a way to launder someone else's grant:
+    /// a fully proven peer presenting a credential issued to a
+    /// different entity is refused on the CREDENTIAL axis.
+    #[tokio::test]
+    async fn a_proven_identity_cannot_present_another_entitys_credential() {
+        let (node, root) = publisher().await;
+        let subscriber = EntityKeypair::generate();
+        let bystander = EntityKeypair::generate();
+        let peer = subscriber.node_id();
+        let ctx = node.dispatch_ctx();
+
+        install_incarnation(&node, peer, 0xB1);
+        prove(&node, &ctx, &subscriber).expect("proof");
+
+        let stolen = credential_for(&root, bystander.entity_id());
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&stolen)),
+            (false, Some(AckReason::Unauthorized)),
+            "the issuer's signature proves who RECEIVED the grant, not who is \
+             presenting it — and the refusal must name the credential, since \
+             this peer's identity is established"
+        );
+    }
+
+    /// Presenting nothing is a credential failure, not a readiness one.
+    /// Reporting `IdentityNotEstablished` here would send the caller to
+    /// prove an identity it never used.
+    #[tokio::test]
+    async fn a_subscribe_with_no_credential_is_unauthorized_not_unready() {
+        let (node, _root) = publisher().await;
+        let peer = EntityKeypair::generate().node_id();
+        let ctx = node.dispatch_ctx();
+        install_incarnation(&node, peer, 0xC1);
+
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, None),
+            (false, Some(AckReason::Unauthorized)),
+            "a token-gated channel with no credential presented is unauthorized"
+        );
+    }
+
+    /// The proof is proof-of-possession, and the challenge is
+    /// single-use. Neither a foreign signature nor a replay of a
+    /// consumed nonce establishes anything.
+    #[tokio::test]
+    async fn a_forged_proof_establishes_nothing() {
+        let (node, _root) = publisher().await;
+        let subscriber = EntityKeypair::generate();
+        let attacker = EntityKeypair::generate();
+        let peer = subscriber.node_id();
+        let ctx = node.dispatch_ctx();
+        install_incarnation(&node, peer, 0xD1);
+
+        let session_id = node.peer_session_id(peer).expect("session");
+        let challenge = node
+            .identity_challenges
+            .issue(peer, session_id, Instant::now())
+            .expect("challenge");
+        // Claims the subscriber's entity; signs with a key it holds.
+        let transcript = proof_transcript(
+            node.entity_id(),
+            subscriber.entity_id(),
+            peer,
+            session_id,
+            &challenge,
+        );
+        let forged = attacker.sign(&transcript).to_bytes();
+        assert_eq!(
+            MeshNode::admit_identity_proof(peer, subscriber.entity_id(), &challenge, &forged, &ctx),
+            Err(IdentityProofReject::BadSignature),
+        );
+        assert!(
+            !node.peer_identity_established(peer),
+            "a refused proof must leave readiness untouched"
+        );
+
+        // The nonce was spent by the attempt, so even the genuine
+        // holder cannot reuse it.
+        let genuine = subscriber.sign(&transcript).to_bytes();
+        assert_eq!(
+            MeshNode::admit_identity_proof(
+                peer,
+                subscriber.entity_id(),
+                &challenge,
+                &genuine,
+                &ctx
+            ),
+            Err(IdentityProofReject::NoChallenge),
+            "a consumed challenge is not reusable, whoever presents it"
+        );
+    }
+
+    /// A signed, hop-0 capability announcement PINS, and deliberately
+    /// does not establish readiness for token admission.
+    ///
+    /// The announcement's signature covers `(node_id, entity_id,
+    /// version, caps)` — no nonce, no session id — and announcements
+    /// are broadcast and forwarded, so the bytes are public. NKpsk0
+    /// leaves the initiator anonymous and `peer_node_id` is
+    /// caller-supplied on the direct path, so a PSK holder can take a
+    /// routing-id slot and replay a victim's announcement. Recording
+    /// "this arrived on session X" would relabel that assumption, not
+    /// remove it. The credential gate therefore waits for a proof.
+    #[tokio::test]
+    async fn an_announcement_pins_but_does_not_authenticate_for_token_admission() {
+        let (node, root) = publisher().await;
+        let subscriber = EntityKeypair::generate();
+        let peer = subscriber.node_id();
+        let ctx = node.dispatch_ctx();
+        install_incarnation(&node, peer, 0xF1);
+
+        // The exact shape the examples used as a warm-up: an empty,
+        // signed, directly-delivered announcement, through the real
+        // inbound handler.
+        let mut ann = super::super::behavior::capability::CapabilityAnnouncement::new(
+            peer,
+            subscriber.entity_id().clone(),
+            1,
+            super::super::behavior::capability::CapabilitySet::new(),
+        )
+        .with_ttl(300);
+        ann.sign(&subscriber);
+        MeshNode::handle_capability_announcement(&ann.to_bytes(), peer, &ctx);
+
+        assert_eq!(
+            node.peer_entity_ids.get(&peer).map(|e| e.value().clone()),
+            Some(subscriber.entity_id().clone()),
+            "premise: the announcement still installs the pin every other \
+             consumer of `peer_entity_ids` reads",
+        );
+        assert!(
+            !node.peer_identity_established(peer),
+            "an announcement carries no proof of possession bound to this \
+             session, so it must not satisfy the credential gate",
+        );
+        let credential = credential_for(&root, subscriber.entity_id());
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&credential)),
+            (false, Some(AckReason::IdentityNotEstablished)),
+        );
+
+        // The proof is what closes it — on the same session, with the
+        // pin already in place and matching.
+        prove(&node, &ctx, &subscriber).expect("proof over an existing matching pin");
+        assert_eq!(
+            subscribe_verdict(&ctx, peer, Some(&credential)),
+            (true, None)
+        );
+    }
+
+    /// A routing id already bound to a different entity is not
+    /// re-bindable by proof. An availability event, never credential
+    /// aliasing.
+    #[tokio::test]
+    async fn a_proof_cannot_displace_an_established_pin() {
+        let (node, _root) = publisher().await;
+        let subscriber = EntityKeypair::generate();
+        let peer = subscriber.node_id();
+        let ctx = node.dispatch_ctx();
+        install_incarnation(&node, peer, 0xE1);
+
+        // Somebody else already owns this routing id's pin.
+        node.peer_entity_ids
+            .insert(peer, EntityKeypair::generate().entity_id().clone());
+        assert_eq!(
+            prove(&node, &ctx, &subscriber).unwrap_err(),
+            IdentityProofReject::PinConflict,
+        );
+        assert!(!node.peer_identity_established(peer));
+    }
+}
+
+/// Lifecycle invariants that a cubic review pass found broken and that
+/// nothing else pins.
+///
+/// Both properties here are about work the node schedules on the
+/// caller's behalf: one that must happen exactly once, and one that
+/// must be cleaned up even when the caller walks away.
+#[cfg(test)]
+mod lifecycle_regression_tests {
+    use super::*;
+
+    async fn node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x71u8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    /// `start` is documented idempotent, and it spawns the
+    /// direct-upgrade scanner. It used to spawn unconditionally, so
+    /// every repeated call added another detached scan loop to a node
+    /// that started once — upgrade probes multiplying with each call.
+    ///
+    /// The spawn is gated on this predicate, so this is the observable
+    /// that decides it: exactly one call reports the transition.
+    #[tokio::test]
+    async fn only_the_first_start_reports_a_transition() {
+        let node = node().await;
+        assert!(
+            node.start_inner(),
+            "the first start moves the node from stopped to started"
+        );
+        for _ in 0..3 {
+            assert!(
+                !node.start_inner(),
+                "an idempotent re-start must not report a transition — the \
+                 upgrade scanner is spawned on this answer"
+            );
+        }
+    }
+
+    /// A start refused because an `accept()` is mid-handshake has not
+    /// started anything either, so it must not schedule the scanner.
+    /// The refusal path rolls `started` back, which made it easy to
+    /// miss: the node looks stopped afterwards, but the spawn had
+    /// already happened.
+    #[tokio::test]
+    async fn a_start_refused_against_an_inflight_accept_reports_no_transition() {
+        let node = node().await;
+        // Stand in for an accept that is mid-handshake.
+        node.accept_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !node.start_inner(),
+            "a refused start must not report a transition"
+        );
+        assert!(
+            !node.started.load(Ordering::SeqCst),
+            "the refusal rolls the flag back, so a later start can succeed"
+        );
+
+        node.accept_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            node.start_inner(),
+            "once the accept completes, start transitions normally"
+        );
+    }
+
+    /// The identity-proof leg registers a pending nonce and awaits a
+    /// reply. Every await in it is a cancellation point, and the
+    /// removals used to sit on the exit paths — so a caller that
+    /// dropped the future (a `select!`, an outer timeout, a cancelled
+    /// task) left the nonce behind, and a caller that retried grew the
+    /// map without bound.
+    ///
+    /// Dropping the future mid-flight is exactly the case no exit path
+    /// covers, which is why the guard is RAII.
+    #[tokio::test]
+    async fn a_cancelled_identity_proof_leg_leaves_no_pending_entry() {
+        let node = node().await;
+        // A peer the send path can reach. Without one,
+        // `send_subprotocol_to_node` fails immediately and the leg
+        // returns instead of parking — the test would then assert
+        // nothing about cancellation. Nobody is listening at the
+        // address, so no reply ever arrives and the leg waits out its
+        // budget.
+        let peer = 0xDEAD_BEEFu64;
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        node.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    crate::adapter::net::crypto::SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: 0x9001,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+        // `Box::pin`, not `tokio::pin!`: the latter shadows the future
+        // with a `Pin<&mut _>` borrow, so dropping that name drops the
+        // borrow and leaves the future itself alive to the end of
+        // scope — the test would pass without the guard existing.
+        let mut leg = Box::pin(node.identity_proof_leg(
+            peer,
+            Duration::from_secs(30),
+            1,
+            |nonce| IdentityProofMsg::ChallengeRequest { nonce },
+        ));
+
+        // Poll it once so the pending entry is registered, then drop.
+        let polled = tokio::time::timeout(Duration::from_millis(50), &mut leg).await;
+        assert!(polled.is_err(), "premise: the leg cannot complete here");
+        assert_eq!(
+            node.pending_identity_proofs.len(),
+            1,
+            "premise: the leg registered its nonce"
+        );
+
+        drop(leg);
+        assert!(
+            node.pending_identity_proofs.is_empty(),
+            "a dropped leg must release its nonce — otherwise a cancelled \
+             or retried caller grows this map for the node's lifetime"
         );
     }
 }

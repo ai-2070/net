@@ -10,6 +10,7 @@ import {
   getPrevNextByLanguage,
   assertEveryAdaptivePageDetected,
   assertNoCrossLanguageNeighbours,
+  assertKeywordLinksResolve,
   navChildren,
   renditionPath,
   boundaryPath,
@@ -50,6 +51,9 @@ export function generateStaticParams(): Array<{ slug: string[] }> {
   // problem and sends the reader into the order config.
   assertEveryAdaptivePageDetected();
   assertNoCrossLanguageNeighbours();
+  // The curated keyword map is data, not markdown, so `check-doc-links` cannot
+  // see it. This is where a stale slug fails the build.
+  assertKeywordLinksResolve();
   return getAllSlugs().map((slug) => ({ slug }));
 }
 
@@ -558,6 +562,9 @@ export default async function DocPage({ params }: PageProps) {
   const { slug } = await params;
   const resolved = resolveDoc(slug);
   if (!resolved) notFound();
+  // The route as the reader sees it. Keyword links pointing at this page are
+  // suppressed, so the article never links to itself.
+  const pagePath = `/docs${slug.length ? `/${slug.join("/")}` : ""}`;
 
   if (resolved.kind === "folder-index") {
     return (
@@ -628,6 +635,7 @@ export default async function DocPage({ params }: PageProps) {
             source={composed.source}
             format="md"
             baseDir={lensInPath ? slug.slice(0, -1) : folder.slug}
+            path={pagePath}
           />
           {parity ? (
             <ParityRow
@@ -679,6 +687,7 @@ export default async function DocPage({ params }: PageProps) {
           source={source}
           format={resolved.file.ext}
           baseDir={resolved.file.slug.slice(0, -1)}
+          path={pagePath}
         />
         <DocsPrevNextBottom neighbours={neighbours} />
       </main>

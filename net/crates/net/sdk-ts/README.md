@@ -14,7 +14,9 @@ leave the node that holds them: the machine with the secret runs the work.
 ```typescript
 // Find something that can do the job, then do it — no registry, no config.
 const peers = node.findNodes({ requireTags: ['gpu'], minVramGb: 16 });
-const resp = await callTool(node, 'summarize', { text });
+const rpc = node.rpc();
+const resp = await callTool(rpc, 'summarize', { text });
+rpc.raw.close();   // release the handle before node.shutdown()
 ```
 
 ## Why this instead of a queue
@@ -104,12 +106,14 @@ for await (const change of watchTools(node, { signal: controller.signal })) {
 }
 ```
 
-**Invoke** — `callTool` finds a provider for the name and calls it:
+**Invoke** — `callTool` takes the RPC handle, finds a provider for the name, and calls it:
 
 ```typescript
 import { callTool } from '@net-mesh/sdk';
 
-const resp = await callTool(node, 'web_search', { query: 'how does the fold work' });
+const rpc = node.rpc();
+const resp = await callTool(rpc, 'web_search', { query: 'how does the fold work' });
+rpc.raw.close();   // release before node.shutdown()
 ```
 
 For services rather than tools, nRPC gives you the same shape with deadlines,
@@ -227,8 +231,11 @@ The bus surface — `NetNode`, `EventStream`, capabilities, identity, predicates
 
 ```bash
 cd net/crates/net/bindings/node
-napi build --platform --release --features "cortex netdb redex-disk meshdb meshos"
+napi build --platform --release --no-default-features --features "cortex meshdb meshos"
 ```
+
+`--no-default-features` is load-bearing: without it the crate's full default
+set stays on and nothing is slimmed.
 
 ## What's in the box
 
@@ -247,14 +254,16 @@ napi build --platform --release --features "cortex netdb redex-disk meshdb mesho
 | MCP bridge — wrap an MCP server, or serve the mesh as MCP | [Wrap MCP](https://ai2070.net/docs/guides/wrap-mcp-server), [Expose as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp) |
 | Organizations — capabilities only your org can discover | [Private capabilities](https://ai2070.net/docs/guides/private-capabilities) |
 | Security — identity, delegable tokens, subnets | [Identity](https://ai2070.net/docs/concepts/identity), [Security model](https://ai2070.net/docs/concepts/security-model) |
-| Errors — all 32 classes and their hierarchy | [Errors](https://ai2070.net/docs/sdk/typescript/errors) |
+| Errors — the error classes and how to branch on them | [Errors](https://ai2070.net/docs/sdk/typescript/errors) |
 | Redis Streams dedup | [Deduplication](https://ai2070.net/docs/reference/redis-dedup) |
 
-## Links
+## Where to go next
 
-[Docs](https://ai2070.net/docs) ·
-[Quickstart](https://ai2070.net/docs/sdk/typescript/quickstart) ·
-[Concepts](https://ai2070.net/docs/concepts/architecture) ·
+1. [Quickstart](https://ai2070.net/docs/sdk/typescript/quickstart) — install both packages and connect two nodes.
+2. [Discover and invoke](https://ai2070.net/docs/guides/discover-and-invoke) — announce a tool and call it by capability.
+3. [Production deployment](https://ai2070.net/docs/guides/production-deployment) — run the mesh beyond a single host.
+4. [Errors](https://ai2070.net/docs/sdk/typescript/errors) — the error hierarchy, then [@net-mesh/sdk on npm](https://www.npmjs.com/package/@net-mesh/sdk) for the typed surface.
+
 [GitHub](https://github.com/ai-2070/net)
 
 ## License

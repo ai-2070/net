@@ -1358,7 +1358,7 @@ async fn spawn_node(rtc: Option<RtcConfig>) -> Arc<MeshNode> {
             .await
             .expect("MeshNode::new"),
     );
-    node.start_arc();
+    node.start();
     node
 }
 

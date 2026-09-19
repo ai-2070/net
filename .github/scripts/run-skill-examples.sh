@@ -142,6 +142,20 @@ edition = "2021"
 [dependencies]
 # Publishes as net-mesh-sdk, imports as net_sdk.
 net-sdk = { package = "net-mesh-sdk", path = "$ROOT/net/crates/net/sdk" }
+# The paid A2A example composes the SDK's admission path with the payments
+# lifecycle, so the harness carries net-payments with the mesh feature (the
+# quote/pay wire + MeshPaymentChannel). Its sdk feature requirements, net and
+# cortex, are already in net-mesh-sdk's default set, so this adds one crate to
+# the build rather than widening the SDK's.
+#
+# NO BACKTICKS ANYWHERE IN THIS HEREDOC. It is unquoted (<<EOF) so that $ROOT
+# expands, which means a backtick pair in a COMMENT is command substitution:
+# an earlier draft of this comment wrote the feature name in backticks and the
+# shell tried to run it, emitting "mesh: command not found" and writing a
+# manifest with the comment silently mangled.
+net-payments = { path = "$ROOT/net/crates/net/payments", features = ["mesh"] }
+async-trait = "0.1"
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures = "0.3"

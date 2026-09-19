@@ -9,6 +9,9 @@ import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import { Children, isValidElement } from "react";
 import type { ReactNode, AnchorHTMLAttributes } from "react";
 import { CodeBlock } from "@/components/CodeBlock";
+import { getDocIndex } from "@/lib/docs";
+import { KEYWORD_LINKS } from "@/lib/keyword-links";
+import remarkKeywordLinks from "@/lib/remark-keyword-links";
 
 // Custom Shiki theme keyed to the site palette so code blends with the
 // rest of the page (lime strings, cyan keywords, off-white identifiers,
@@ -367,14 +370,18 @@ function makeAnchor(baseDir: readonly string[] = []) {
 
     if (href.startsWith("/") || href.startsWith("#")) {
       return (
-        <Link href={href} className={LINK_CLASS}>
+        <Link href={href} className={LINK_CLASS} title={props.title}>
           {props.children}
         </Link>
       );
     }
     if (href.startsWith("./") || href.startsWith("../")) {
       return (
-        <Link href={resolveRelativeHref(href, baseDir)} className={LINK_CLASS}>
+        <Link
+          href={resolveRelativeHref(href, baseDir)}
+          className={LINK_CLASS}
+          title={props.title}
+        >
           {props.children}
         </Link>
       );
@@ -731,12 +738,16 @@ export function DocsContent({
   source,
   format = "md",
   baseDir,
+  path,
 }: {
   source: string;
   format?: "md" | "mdx";
   /** Directory the source file lives in, as slug segments — used to resolve
    *  any relative link the author left behind. */
   baseDir?: readonly string[];
+  /** Route this content is rendered at (`/docs/…`). Keywords pointing at this
+   *  page are left unlinked, so a page never links to itself. */
+  path?: string;
 }) {
   const components = baseDir?.length
     ? { ...mdxComponents, a: makeAnchor(baseDir) }
@@ -748,7 +759,17 @@ export function DocsContent({
         options={{
           mdxOptions: {
             format,
-            remarkPlugins: [remarkGfm],
+            remarkPlugins: [
+              remarkGfm,
+              [
+                remarkKeywordLinks,
+                {
+                  index: getDocIndex(),
+                  keywords: KEYWORD_LINKS,
+                  currentPath: path,
+                },
+              ],
+            ],
             rehypePlugins: [
               rehypeSlug,
               [rehypePrettyCode, prettyCodeOptions],

@@ -51,6 +51,7 @@ async fn mint_settled(engine: &Arc<PaymentEngine>, caller: &EntityKeypair) -> St
             caller.entity_id().clone(),
             CAPABILITY,
             requirements,
+            None,
             NOW,
             60_000_000_000,
         )
@@ -130,7 +131,7 @@ async fn redemption_denials_do_not_rewrite_the_store_but_admission_does() {
         .redeem_for_invocation(TOOL_ID, &quote_id, None)
         .await
         .expect("redeem valid");
-    assert!(matches!(d, RedeemDecision::Admitted));
+    assert!(matches!(d, RedeemDecision::Admitted { .. }));
     let ino_admitted = ino(&state_path);
     assert_ne!(
         ino_admitted, ino_settled,

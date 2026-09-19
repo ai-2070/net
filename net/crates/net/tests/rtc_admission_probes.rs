@@ -31,7 +31,7 @@ async fn node(anchor: bool) -> Arc<MeshNode> {
             .await
             .unwrap(),
     );
-    n.start_arc();
+    n.start();
     n
 }
 async fn transit(installed: bool) -> bool {
@@ -395,9 +395,9 @@ async fn kyra_engine_must_install_without_loopback_noise_fixture() {
             .unwrap();
         accept.await.unwrap().unwrap();
     }
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     a.connect_via(r.local_addr(), b.public_key(), b.node_id())
         .await
         .unwrap();

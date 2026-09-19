@@ -80,9 +80,9 @@ async fn an_announced_anchor_is_listed_with_its_addresses_and_a_plain_peer_is_no
             .expect("udp handshake");
         accept.await.expect("accept task").expect("accept");
     }
-    anchor.start_arc();
-    observer.start_arc();
-    plain.start_arc();
+    anchor.start();
+    observer.start();
+    plain.start();
     // An announcement is emitted when a node announces; `start` alone
     // schedules the re-announce loop, whose first tick is far outside
     // a test's patience.
@@ -150,8 +150,8 @@ async fn a_mesh_with_no_anchors_lists_none() {
         .await
         .expect("udp handshake");
     accept.await.expect("accept task").expect("accept");
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     for n in [&a, &b] {
         n.announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
             .await

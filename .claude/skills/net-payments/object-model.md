@@ -117,7 +117,7 @@ pub struct PaymentQuote {
     pub provider: EntityId,                        // issues + signs
     pub caller: EntityId,                          // per-caller: issuance asserts admission
     pub capability: String,
-    pub input_hash: Option<String>,                // blake3 of invocation input (currently always None)
+    pub input_hash: Option<String>,                // blake3 hex of the exact unit of work, or None for capability-level pricing
     pub requirements: X402Carry<PaymentRequirements>, // INSTANTIATED, byte-preserved — what binds
     pub asset_registry: RegistryRef,               // verification uses THIS revision, never "latest"
     pub issued_at_ns: u64,
@@ -136,6 +136,13 @@ PaymentQuote::is_expired_at(now_ns)
 `input_hash` → **quote-small-invoke-big fails verification** when an input was
 bound. `check_integrity` recomputes both `terms_hash` and `quote_id` from
 content — swapping in cheaper requirements is caught even before the signature.
+
+**`input_hash` is no longer always `None`.** A paid A2A task quotes with the
+provider's reservation purchase hash in this field, which is how one payment
+admits one reservation of one brief and nothing else (`a2a.md`). A present
+value must be exactly one lowercase-hex blake3 digest — an empty or off-shape
+string hashes into `terms_hash` identically to absence, so it is refused at
+issuance rather than allowed to collide with the unbound quote.
 
 ## 3. `net.settlement.ref@1` — around the x402 settle response (`core/settlement_ref.rs`)
 

@@ -83,6 +83,11 @@ pub mod stream;
 pub mod testing;
 #[cfg(feature = "tool")]
 pub mod tool;
+// The A2A task admission seam (the provider gate + the caller's payment
+// evidence for `Mesh::serve_a2a_configured`). Ungated for the same reason
+// as `tool_payment` below, and one more: a FREE A2A service must never
+// link a payments crate to serve work it gives away.
+pub mod a2a_payment;
 // The native tool payment seam (wire constants + the provider gate for
 // `Mesh::serve_tool_paid`). Deliberately ungated: implementors of the
 // gate (net-payments) need the trait without pulling the full `tool`
@@ -204,6 +209,13 @@ pub mod revocation;
 // mesh wiring (serve + client) is `mesh_a2a` (gated net + cortex).
 #[cfg(feature = "net")]
 pub mod a2a;
+// Durable (and in-memory) admission records for the configured A2A
+// serving path: one owner per journal, CAS transitions over the D2
+// state table, a launch ledger that outlives the result, and the three
+// retention classes. Gated with `a2a` above — it persists that
+// module's owner, brief and task-state types.
+#[cfg(feature = "net")]
+pub mod a2a_journal;
 // The subnet AUTHORITY facade (SUBNET_AUTH_SDK_PLAN.md): named exports,
 // the admin surface, DTOs, and the stable `subnet:` error envelope.
 // Topology/discovery compatibility stays in `subnets` below.
@@ -248,6 +260,17 @@ pub use ::net::config::{BatchConfig, ScalingPolicy};
 pub use ::net::consumer::Ordering;
 pub use ::net::event::{Event, RawEvent, StoredEvent};
 pub use ::net::Filter;
+
+/// `bytes::Bytes`, re-exported because this SDK's public signatures
+/// are written in it — `Mesh::publish`, `publish_many`, every stream
+/// send — so a consumer cannot call them without the type.
+///
+/// Leaving it out meant every user added a direct `bytes` dependency
+/// and had to keep its version in step with ours, or hit a
+/// two-versions-of-one-type mismatch that reads as a nonsense
+/// signature error. Re-exporting makes the version we compiled
+/// against the one they get.
+pub use ::bytes::Bytes;
 
 // Feature-gated re-exports.
 #[cfg(feature = "redis")]

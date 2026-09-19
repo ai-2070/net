@@ -1106,7 +1106,7 @@ async fn spawn_anchor() -> Arc<MeshNode> {
             .await
             .expect("MeshNode::new"),
     );
-    node.start_arc();
+    node.start();
     node
 }
 

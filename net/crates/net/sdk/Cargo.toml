@@ -174,7 +174,13 @@ str0m = { version = "0.23.1", optional = true, default-features = false, feature
 # is cfg'd `any(test, feature = "fixtures")` in net-mesh — and the
 # dependency's `test` cfg is never active when the SDK is the crate
 # under test, so the feature is the only way to reach the seam.
-net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixtures", "webrtc"] }
+# `webrtc` is deliberately NOT listed here. It is an opt-in feature
+# (`webrtc = ["net/webrtc"]` below), and the RTC test targets are
+# gated on it (`enrollment_over_rtc`, `rtc_bootstrap_listener`,
+# `acme_cold_start`) — listing it on the dev-dep would enable
+# `net-mesh/webrtc` for every crate in a `cargo test --workspace`
+# build, i.e. on by default in practice.
+net = { package = "net-mesh", version = "0.36.0", path = "..", features = ["fixtures"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # Isolated temp dirs for the pin-store file tests.
 tempfile = "3"

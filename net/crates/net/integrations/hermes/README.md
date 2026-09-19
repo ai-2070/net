@@ -2,8 +2,15 @@
 
 A first-party [Hermes](https://github.com/NousResearch/hermes-agent) plugin that
 lets an agent reach capabilities running on your **other machines** — the ones
-you published there with `net wrap` — as five `net_*` tools, with local consent
+you published there with `net wrap` — as eleven `net_*` tools, with local consent
 and pin approval.
+
+The eleven tools are three families: the five capability/pin meta-tools
+(`net_search_capabilities`, `net_describe_capability`, `net_invoke_capability`,
+`net_list_pinned_capabilities`, `net_request_pin`), three operator
+device-enrollment tools (`net_mesh_invite` / `net_mesh_devices` /
+`net_mesh_revoke`), and three agent-to-agent task-handoff tools
+(`net_a2a_submit` / `net_a2a_status` / `net_a2a_cancel`).
 
 It embeds a **first-class Net node in-process** via `net-mesh-sdk` (no daemon,
 no MCP shim): the node joins your mesh, and the tools drive the SDK's
@@ -24,6 +31,12 @@ at all; this plugin is what native integration adds.)
 | `net_invoke_capability` | Invoke through the consent gate. Returns structured `status`: `ok` / `requires_approval` / `validation_error` / `denied` / `not_found` / … — never raises. |
 | `net_list_pinned_capabilities` | Approved + pending pins from the shared store. |
 | `net_request_pin` | Records a **pending** approval request (grants nothing; a human approves out of band). |
+| `net_mesh_invite` | Mint a single-use, short-lived invite string to enroll a new device in your operator mesh; returns the root fingerprint to confirm out of band. Operator action — needs your root identity. |
+| `net_mesh_devices` | List the devices enrolled in your operator mesh — name, id, tags, enrollment time, revoked flag. Your device inventory, not remote capabilities. |
+| `net_mesh_revoke` | Revoke a device by `device_id`, raising its revocation floor so its delegations stop being honored. Requires your root identity. |
+| `net_a2a_submit` | Hand a long/parallel job to another agent on your mesh (by routing node id), passing context as artifact refs. Returns a `task_id` to poll. |
+| `net_a2a_status` | Check a handed-off A2A task's state (requested/accepted/running/completed/failed/cancelled); a completed task carries its result artifact ref. |
+| `net_a2a_cancel` | Cancel a handed-off A2A task; returns whether it was still in flight. |
 
 ## Enable
 
@@ -94,5 +107,7 @@ isolated node. Run from `net/crates/net/bindings/python` with the built wheel:
 by pytest) that drives the plugin through Hermes's *real* `PluginContext` ->
 `tools.registry` -> `get_definitions` in a Hermes checkout — see its docstring
 for the recipe (needs an ABI-matched `net-mesh` wheel). Verified passing: the
-five tools register into the real registry and survive Hermes's model-facing
-assembly, and the embedded node builds + tears down in Hermes's interpreter.
+plugin registers all eleven tools (the registration test asserts the full set),
+the five capability meta-tools are confirmed in the real registry and survive
+Hermes's model-facing assembly, and the embedded node builds + tears down in
+Hermes's interpreter.

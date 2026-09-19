@@ -1510,9 +1510,9 @@ async fn deferred_flush_after_self_floor_carries_no_owner_cert() {
     let b = build_node().await;
     handshake(&a, &b).await;
     // The trailing-edge flush task holds a `Weak<MeshNode>`; it is
-    // only schedulable on `start_arc`-started nodes (idempotent on
+    // only schedulable on `start`-started nodes (idempotent on
     // top of `start`, per capability_broadcast.rs).
-    a.start_arc();
+    a.start();
 
     let dir = scratch_dir("deferred-flush");
     let cert1 =

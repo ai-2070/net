@@ -1990,8 +1990,8 @@ async fn test_mesh_node_two_node_data_exchange() {
         .with_heartbeat_interval(Duration::from_millis(500))
         .with_session_timeout(Duration::from_secs(10));
 
-    let node_a = MeshNode::new(identity_a, config_a).await.unwrap();
-    let node_b = MeshNode::new(identity_b, config_b).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(identity_a, config_a).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(identity_b, config_b).await.unwrap());
 
     // Get B's Noise public key (Curve25519, not ed25519)
     let pubkey_b = *node_b.public_key();
@@ -2065,9 +2065,9 @@ async fn test_mesh_node_triangle() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk_config(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk_config(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk_config(addr_c)).await.unwrap());
 
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
@@ -2162,9 +2162,9 @@ async fn test_mesh_node_relay_through_middle() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk_config(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk_config(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk_config(addr_c)).await.unwrap());
 
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
@@ -2265,9 +2265,9 @@ async fn test_mesh_relay_preserves_payload_integrity() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -2344,8 +2344,8 @@ async fn test_mesh_relay_tamper_detected() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_c = *c.public_key();
 
     // A↔C session (for encryption keys)
@@ -2428,8 +2428,8 @@ async fn test_mesh_node_failure_detection() {
             .with_session_timeout(Duration::from_millis(500))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -2491,9 +2491,9 @@ async fn test_mesh_node_reroute_on_failure() {
             .with_session_timeout(Duration::from_secs(5))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -2602,9 +2602,9 @@ async fn test_mesh_node_reroute_no_data_loss() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -2791,8 +2791,8 @@ async fn test_migration_snapshot_over_wire() {
         },
     ));
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *node_b.public_key();
 
     node_b.set_migration_handler(handler_b);
@@ -2951,9 +2951,9 @@ async fn test_migration_full_lifecycle_over_wire() {
         nid_c,
     ));
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
@@ -3059,8 +3059,8 @@ async fn test_partition_detection_via_filter() {
             .with_session_timeout(Duration::from_millis(500))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *node_b.public_key();
 
     let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
@@ -3141,8 +3141,8 @@ async fn test_partition_healing() {
             .with_session_timeout(Duration::from_millis(500))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *node_b.public_key();
 
     let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
@@ -3229,9 +3229,9 @@ async fn test_partition_asymmetric_three_node() {
             .with_session_timeout(Duration::from_secs(5))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
@@ -3350,9 +3350,9 @@ async fn test_mesh_node_auto_reroute() {
             .with_session_timeout(Duration::from_millis(600))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
@@ -3480,9 +3480,9 @@ async fn test_mesh_node_auto_reroute_recovery() {
             .with_session_timeout(Duration::from_millis(600))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
@@ -3596,9 +3596,9 @@ async fn test_proximity_graph_pingwave_discovery() {
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
@@ -3672,9 +3672,9 @@ async fn test_mesh_handshake_via_relay() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -3768,9 +3768,9 @@ async fn test_mesh_handshake_relay_bidirectional() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -3870,8 +3870,8 @@ async fn test_stream_multiplex_two_streams_same_peer() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -3965,8 +3965,8 @@ async fn test_stream_open_close_idempotency() {
             .with_handshake(3, Duration::from_secs(3))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -4052,8 +4052,8 @@ async fn test_regression_send_on_stream_rejects_closed_stream() {
             .with_num_shards(2)
             .with_handshake(3, Duration::from_secs(3))
     };
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -4170,8 +4170,8 @@ async fn test_regression_send_on_stream_refuses_oversize_event_rather_than_dropp
             .with_num_shards(2)
             .with_handshake(3, Duration::from_secs(3))
     };
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -4316,10 +4316,10 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
-    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
+    let d = Arc::new(MeshNode::new(id_d, mk(addr_d)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
     let pub_d = *d.public_key();
@@ -4409,9 +4409,9 @@ async fn test_regression_dv_path_to_returns_multi_hop() {
             .with_heartbeat_interval(Duration::from_millis(200))
             .with_session_timeout(Duration::from_secs(30))
     };
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -4484,16 +4484,18 @@ async fn test_regression_pingwave_from_unregistered_source_is_dropped() {
     let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     let attacker_addr: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
-    let a = MeshNode::new(
-        id_a,
-        MeshNodeConfig::new(addr_a, psk)
-            .with_num_shards(2)
-            .with_handshake(3, Duration::from_secs(3))
-            .with_heartbeat_interval(Duration::from_millis(500))
-            .with_session_timeout(Duration::from_secs(30)),
-    )
-    .await
-    .unwrap();
+    let a = Arc::new(
+        MeshNode::new(
+            id_a,
+            MeshNodeConfig::new(addr_a, psk)
+                .with_num_shards(2)
+                .with_handshake(3, Duration::from_secs(3))
+                .with_heartbeat_interval(Duration::from_millis(500))
+                .with_session_timeout(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap(),
+    );
     a.start();
 
     // Bind a raw UDP socket that has NOT completed any handshake with A.
@@ -4634,10 +4636,10 @@ async fn test_regression_handshake_relay_multi_hop_via_routing_table() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
-    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
+    let d = Arc::new(MeshNode::new(id_d, mk(addr_d)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
     let pub_d = *d.public_key();
@@ -4746,9 +4748,9 @@ async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
             .with_session_timeout(Duration::from_secs(30))
     };
 
-    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let c = Arc::new(MeshNode::new(id_c, mk(addr_c)).await.unwrap());
     let pub_b = *b.public_key();
     let pub_c = *c.public_key();
 
@@ -4842,8 +4844,8 @@ async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
             // pingwaves, which is what the parse-guard legs assume.
             .with_event_pingwave_min_gap(Duration::MAX)
     };
-    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk_config(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk_config(addr_b)).await.unwrap());
     let pub_b = *node_b.public_key();
 
     let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
@@ -4910,7 +4912,8 @@ use net::adapter::net::{ChannelName, OnFailure, PublishConfig, Reliability};
 
 /// Helper: build three nodes connected in a star (A as publisher, B and C
 /// as subscribers). Returns the three nodes plus their node_ids.
-async fn setup_publisher_with_two_subscribers() -> (MeshNode, MeshNode, MeshNode, u64, u64, u64) {
+async fn setup_publisher_with_two_subscribers(
+) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, u64, u64, u64) {
     let ports = find_ports(3).await;
     let psk = [0x42u8; 32];
 
@@ -4934,9 +4937,9 @@ async fn setup_publisher_with_two_subscribers() -> (MeshNode, MeshNode, MeshNode
             .with_session_timeout(Duration::from_secs(10))
     };
 
-    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk_config(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk_config(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk_config(addr_c)).await.unwrap());
 
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
@@ -5147,7 +5150,7 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
     };
 
     let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -5247,7 +5250,7 @@ async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
     };
 
     let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {
@@ -5326,7 +5329,7 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
     };
 
     let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
-    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
     let pub_b = *b.public_key();
 
     let (r1, r2) = tokio::join!(b.accept(nid_a), async {

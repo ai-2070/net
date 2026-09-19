@@ -319,3 +319,17 @@ impl PyOrgClient {
         false
     }
 }
+
+impl PyOrgClient {
+    /// The live client, for installing as another surface's caller
+    /// identity (`NetMesh.set_a2a_org_caller`,
+    /// `CapabilityGateway.set_a2a_org_caller`). `None` once closed.
+    ///
+    /// A snapshot, like every other read here: the installed `Arc` keeps
+    /// the audience lease and the node reference alive for as long as the
+    /// A2A surface holds it, so a `close()` that lands afterwards cannot
+    /// tear a call in flight.
+    pub(crate) fn shared(&self) -> Option<Arc<net_sdk::org::OrgClient>> {
+        self.inner.load_full()
+    }
+}

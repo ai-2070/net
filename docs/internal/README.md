@@ -6,6 +6,8 @@ security audits, and performance analyses. **Not** user documentation.
 | Folder | What's in it |
 |---|---|
 | [`plans/`](plans/) | Design and implementation plans, one per feature track. Written before the work, amended as it lands. |
+| [`reviews/`](reviews/) | Staged-change review and final packets — disposition maps, and the evidence stated at the strength it actually reaches. |
+| [`audits/`](audits/) | Focused audit records, one slice per file, each with source SHA, date, and verdict. |
 | [`misc/`](misc/) | Code reviews, bug audits, security audits, perf audits — dated, point-in-time findings with resolutions. |
 | [`performance/`](performance/) | Benchmark analyses and hot-path studies. |
 
@@ -24,10 +26,11 @@ the code, or the docs below, for what is true today.**
 
 ## Why this is outside the crate
 
-These files used to live at `net/crates/net/docs/{plans,misc,performance}/`.
-The `net-mesh` crate declares no `include`/`exclude`, so `cargo package` swept
-all 244 of them — 7 MB of internal review history, including security audits —
-into every publish to crates.io, where they were browsable on docs.rs.
+The `plans/`, `misc/` and `performance/` trees used to live at
+`net/crates/net/docs/{plans,misc,performance}/`. The `net-mesh` crate declares
+no `include`/`exclude`, so `cargo package` swept all of them — megabytes of
+internal review history, including security audits — into every publish to
+crates.io, where they were browsable on docs.rs.
 
 Moving them out of the crate directory fixes that at the source: nothing here
 is reachable by `cargo package`, so no `exclude` list has to be maintained in

@@ -110,8 +110,8 @@ async fn signalling_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
         .await
         .expect("udp handshake");
     accept.await.expect("accept task").expect("accept");
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     (a, b)
 }
 
@@ -134,9 +134,9 @@ async fn routed_trio() -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let b = node(Some(rtc_config())).await;
     connect_udp(&a, &r).await;
     connect_udp(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     let b_pub = *b.public_key();
     a.connect_via(r.local_addr(), &b_pub, b.node_id())
         .await
@@ -313,7 +313,7 @@ async fn the_dialog_bound_holds_and_a_reject_ends_the_dialog() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_without_rtc_emits_no_stage4_fields() {
     let plain = node(None).await;
-    plain.start_arc();
+    plain.start();
     plain
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
@@ -350,7 +350,7 @@ async fn an_rtc_node_announces_its_noise_key_and_transport_tag() {
         ..rtc_config()
     }))
     .await;
-    rtc_node.start_arc();
+    rtc_node.start();
     rtc_node
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
@@ -406,7 +406,7 @@ async fn an_anchor_announces_only_a_stun_endpoint_it_serves() {
         ..rtc_config().with_stun_addr("127.0.0.1:0".parse().expect("addr"))
     }))
     .await;
-    bound_only.start_arc();
+    bound_only.start();
     bound_only
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
@@ -432,7 +432,7 @@ async fn an_anchor_announces_only_a_stun_endpoint_it_serves() {
         ..rtc_config().with_stun_addr("127.0.0.1:0".parse().expect("addr"))
     }))
     .await;
-    overridden.start_arc();
+    overridden.start();
     assert_eq!(
         overridden.rtc_public_stun_addr(),
         Some("203.0.113.9:3478".parse().expect("addr"))
@@ -459,7 +459,7 @@ async fn an_anchor_announces_only_a_stun_endpoint_it_serves() {
     // And the announcement of an anchor with no second socket at
     // all carries no such field — absence, not a blank.
     let plain = node(Some(rtc_config())).await;
-    plain.start_arc();
+    plain.start();
     plain
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
@@ -1072,8 +1072,8 @@ async fn unhurried_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
         .await
         .expect("udp handshake");
     accept.await.expect("accept task").expect("accept");
-    a.start_arc();
-    b.start_arc();
+    a.start();
+    b.start();
     (a, b)
 }
 

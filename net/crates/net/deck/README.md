@@ -46,7 +46,7 @@ The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, re
 | `DATAFORTS`  | Replica & placement: desired vs actual, migrations, pulls, eviction, 5-axis score.  |
 | `BLOBS`      | Object inventory across every wired adapter — heat, ancestry, shard layout.         |
 | `MIGRATIONS` | In-flight + recent migrations with byte progress and stall detection.               |
-| `REPLICAS`   | Replica density by artifact, drift, placement stability.                            |
+| `CHAINS`     | Replica density by artifact, drift, placement stability.                            |
 | `GROUPS`     | Replica / fork / standby groupings.                                                 |
 | `SUBNETS`    | Subnet membership and gateway routing.                                              |
 | `GATEWAYS`   | Gateway daemons — bridges into the mesh from outside transports.                    |
@@ -54,7 +54,6 @@ The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, re
 | `NRPC`       | Live nRPC call tail — request / response / failure stream across the cluster.       |
 | `LOGS`       | High-speed log matrix — node → daemon → line, with filter + follow.                 |
 | `AUDIT`      | RedEX-committed operator audit ledger.                                              |
-| `FAILURES`   | Recent failures across daemons, migrations, blob pulls.                             |
 
 ![Deck — NODES](https://github.com/ai-2070/net/blob/master/images/net-deck-3.png?raw=true)
 ![Deck — DATAFORTS](https://github.com/ai-2070/net/blob/master/images/net-deck-5.png?raw=true)
@@ -67,14 +66,16 @@ Every admin action propagates as a signed event on the admin chain via RedEX:
 - enter / exit maintenance
 - drop replicas, invalidate placement
 - restart daemons, clear avoid lists
-- ICE: force-drain, force-evict, force-restart, force-cutover, freeze / thaw
+- ICE: freeze / thaw cluster, flush avoid-lists, force-evict-replica, force-restart-daemon, force-cutover, kill-migration
 
 Before an ICE action commits, Deck runs a **blast-radius** simulation —
-*"This action affects 4 nodes, 12 replicas, and 2 daemons. Continue?"* — then signs with the operator key loaded from the maintenance node. Multi-operator signing and lockout timers are available for the high-authority break-glass paths.
+*"This action affects 4 nodes, 12 replicas, and 2 daemons. Continue?"* — then signs with the operator key loaded from the maintenance node.
+
+Operator signatures are verified against an `AdminVerifier` `OperatorRegistry` — the built-in runtime (the single-node default and the `--features demo` cluster) wires a single operator keypair at threshold 1. Multi-operator M-of-N verification requires a populated registry and a raised threshold.
 
 ## Bookmarks (multi-cluster)
 
-Saved cluster contexts live at `$XDG_CONFIG_HOME/deck/bookmarks.toml` (or the platform equivalent — see [`dirs`](https://docs.rs/dirs)). First-run with no config dir yields an empty store; a malformed file is surfaced via stderr.
+Saved cluster contexts live at `$XDG_CONFIG_HOME/net-deck/bookmarks.toml` (or the platform equivalent — see [`dirs`](https://docs.rs/dirs)). First-run with no config dir yields an empty store; a corrupt file is renamed aside (`<path>.corrupt-<ms>`) and an empty store returned.
 
 ## License
 

@@ -325,6 +325,21 @@ operations:
       status: not exposed
     C:
       status: not exposed
+- operation: A2A — paid task admission (prepare → purchase → submit)
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_a2a_configured
+    Node / TS:
+      status: not exposed
+    Python:
+      status: supported
+      mode: core-only
+      anchor: serve_a2a_configured
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
 - operation: Organization capability auth
   bindings:
     Rust:

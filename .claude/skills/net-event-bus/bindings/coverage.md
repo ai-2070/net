@@ -99,6 +99,7 @@ A mode is written after the status: `supported · core-only`.
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
+| A2A — paid task admission (prepare → purchase → submit) | supported | not exposed | supported · core-only | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Subnet gateway provisioning | supported | supported | supported | supported | supported |
 | Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
@@ -141,6 +142,7 @@ should not infer one binding's API from another's.
 | nRPC — typed request/response + streaming | `call_typed` | `TypedMeshRpc` | `call_streaming` | `NewTypedMeshRpc` | `net_rpc_call` |
 | Gang-claim scheduler | `claim_island` | `claimIsland` | `claim_island` | `ClaimIsland` | `net_mesh_claim_island` |
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
+| A2A — paid task admission (prepare → purchase → submit) | `serve_a2a_configured` | — | `serve_a2a_configured` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
 | Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExported` | `net_subnet_serve_exported` |

@@ -1176,7 +1176,7 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
             .await
             .map_err(|e| format!("anchor MeshNode::new: {e}"))?,
     );
-    anchor.start_arc();
+    anchor.start();
     println!(
         "[runner] anchor node {:016x} rtc {rtc_bind}",
         anchor.node_id()

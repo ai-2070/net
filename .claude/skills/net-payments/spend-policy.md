@@ -95,13 +95,25 @@ in the model.** The operator surface:
 engine.approve(quote_id).await?;   // -> bool (flipped a pending approval)
 engine.reject(quote_id).await?;    // -> bool
 engine.pending().await?;           // -> Vec<String>  (quote_ids awaiting approval)
-engine.approved_quote(capability).await?;   // -> Option<(quote_id, quote_bytes)>  (held, for re-run)
+engine.approved_quote(capability).await?;   // -> Option<(quote_id, quote_bytes)>  (any hold for the capability — first by quote id)
+engine.approved_quote_for_input(capability, input_hash).await?;  // the same, matched EXACTLY on Option<&str> — None included
 engine.clear_approval(quote_id).await?;
 ```
 
 After `approve`, the caller flow's next `run` picks up the held approved quote
 via `approved_quote()` and redeems it — no re-quote. `ApprovalState` is
 `Pending | Approved`; `ApprovalRecord { state, capability, quote_b64 }`.
+
+**A capability-level hold and an input-bound hold are different purchases.**
+`approved_quote` answers with whichever hold sorts first by quote id, which is
+fine for a door where one capability has at most one purchase in flight and
+wrong as soon as two can be open. `approved_quote_for_input` matches
+`input_hash` exactly, `None` included, so a flow buying one specific unit of
+work (a paid A2A task, `a2a.md`) neither returns nor clears a sibling
+purchase's approved hold — that hold is still valid for *its* purchase. Only
+this purchase's own expired or unparseable hold is cleared. Approvals key on
+`quote_id`, so re-quoting the same work invalidates the hold the previous
+quote carried.
 
 **Reachable from Python.** These operator verbs are now thin wrappers on
 the `CapabilityGateway`: `approve_payment(quote_id)` / `reject_payment(quote_id)`

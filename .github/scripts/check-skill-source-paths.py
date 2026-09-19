@@ -227,7 +227,7 @@ def candidates(cite: str, skill_dir: str):
     a perfectly good reference reads as broken.
     """
     for root in [*ROOTS, skill_dir + "/"]:
-        target = os.path.normpath(root + cite)
+        target = os.path.normpath(root + cite).replace(os.sep, "/")
         if cite.endswith("/"):
             target += "/"
         yield (root or "<repo root>"), target

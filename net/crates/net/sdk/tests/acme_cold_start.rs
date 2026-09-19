@@ -84,7 +84,7 @@ async fn anchor() -> Arc<MeshNode> {
             .await
             .expect("MeshNode::new"),
     );
-    node.start_arc();
+    node.start();
     node
 }
 

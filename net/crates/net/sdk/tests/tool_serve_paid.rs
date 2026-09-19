@@ -128,8 +128,8 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: SocketAddr) {
     );
     r1.expect("accept");
     r2.expect("connect");
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 }
 
 /// A server refusal, both renderings: the wire status + human message,

@@ -9,6 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "net-mesh-sdk"
 version = "0.36.0"
 description = "Ergonomic Python SDK for the Net mesh network"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 requires-python = ">=3.10"

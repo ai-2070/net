@@ -22,7 +22,7 @@ real    0m12.4s
 
 The `atomic: true` field confirms the target was renamed into place from a
 sibling temp directory — on any failure the existing target is left
-untouched (see `docs/cli/TRANSFER.md` §4 and `FETCH_DIR_ATOMIC_PLAN.md`).
+untouched (see `../../cli/TRANSFER.md` §4).
 
 ## Runnable end-to-end proof
 
@@ -68,5 +68,5 @@ net transfer recv-dir \
   --psk-hex <hex>
 ```
 
-See `docs/cli/TRANSFER.md` for the full flag reference, atomicity
+See `../../cli/TRANSFER.md` for the full flag reference, atomicity
 guarantees, and failure-mode recovery.

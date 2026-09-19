@@ -515,9 +515,9 @@ async fn rate_limit_reset_cancels_pending_deferred_flush() {
     );
     let b = build_mesh_plain().await;
     connect_pair(&a, &b).await;
-    // The flush task needs the owned-Arc path; start_arc must be
+    // The flush task needs the owned-Arc path; start must be
     // the first start call.
-    a.start_arc();
+    a.start();
     b.start();
     let a_id = a.node_id();
 
@@ -582,7 +582,7 @@ async fn deferral_after_reset_still_flushes_new_content() {
     );
     let b = build_mesh_plain().await;
     connect_pair(&a, &b).await;
-    a.start_arc();
+    a.start();
     b.start();
     let a_id = a.node_id();
 

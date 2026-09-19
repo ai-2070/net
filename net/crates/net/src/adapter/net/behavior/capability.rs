@@ -676,7 +676,7 @@ pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
 /// a capability announcement** — same caveat as
 /// `ACK_RANGES_CAPABILITY_TAG`: a node that never calls
 /// `MeshNode::announce_capabilities` (and is not on the
-/// `start_arc` reannounce loop) does not advertise it, and its
+/// `MeshNode::start` reannounce loop) does not advertise it, and its
 /// peers keep refusing over-cap events toward it. That is the safe
 /// direction to fail in.
 pub const FRAGMENT_REASSEMBLY_TAG: &str = "net.stream.fragment_reassembly@1";

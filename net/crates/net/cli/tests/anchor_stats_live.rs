@@ -84,7 +84,7 @@ async fn anchor_stats_reports_the_ledger_with_its_denominator_and_its_residual()
         .await
         .expect("anchor mesh");
     let daemon = Arc::clone(mesh.node());
-    daemon.start_arc();
+    daemon.start();
     let _ice_stats =
         net_sdk::rtc_bootstrap::serve_anchor_ice_stats(&mesh).expect("serve the ICE stats service");
 
@@ -210,7 +210,7 @@ async fn anchor_stats_on_a_node_without_rtc_reports_no_ledger_rather_than_zeros(
         .await
         .expect("plain mesh");
     let daemon = Arc::clone(mesh.node());
-    daemon.start_arc();
+    daemon.start();
     let _ice_stats =
         net_sdk::rtc_bootstrap::serve_anchor_ice_stats(&mesh).expect("serve the ICE stats service");
 

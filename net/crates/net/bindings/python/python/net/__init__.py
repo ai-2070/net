@@ -940,15 +940,27 @@ else:
     __all__.append("LocalPublicationHandle")
 
 # Agent-to-agent task handoff (Hermes V2 Phase 3, the `a2a` feature): the
-# return-value type of `NetMesh.serve_a2a`. The submit/status/cancel client
-# surface lives on the `NetMesh` handle.
+# return-value type of `NetMesh.serve_a2a` /
+# `PaymentProvider.serve_a2a_configured`, plus the paid-submission refusal.
+# The submit/status/cancel/describe/prepare client surface lives on the
+# `NetMesh` and `CapabilityGateway` handles.
 try:
-    from ._net import A2aServeHandle
+    from ._net import A2aServeHandle, PaymentRefused
 except ImportError:
-    # `a2a` feature not compiled in; the symbol stays undefined.
+    # `a2a` feature not compiled in; the symbols stay undefined.
     pass
 else:
-    __all__.append("A2aServeHandle")
+    __all__.extend(["A2aServeHandle", "PaymentRefused"])
+
+# Paid A2A serving (`A2A_PAID_ADMISSION_PLAN.md` WS-E): the refusal that keeps
+# two providers off one admission journal. Needs `a2a` AND `payments`.
+try:
+    from ._net import JournalOwnedElsewhere
+except ImportError:
+    # `a2a` + `payments` not both compiled in; the symbol stays undefined.
+    pass
+else:
+    __all__.append("JournalOwnedElsewhere")
 
 # Organization capability auth (OSDK-L Workstream P, the `org` feature):
 # `OrgCredentials`, `OrgClient`, `serve_org`, and the `OrgError` family from
