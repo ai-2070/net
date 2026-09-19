@@ -124,13 +124,22 @@ cargo clippy --all-features --all-targets -- \
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # Per-crate rustdoc. The bare `cargo doc` above documents the ROOT crate only,
-# so a doc comment in any of these three is unchecked by it.
+# so a doc comment in any of these four is unchecked by it.
 #
-# The first two feature lists are ci.yml's "Documentation" job, verbatim — that
-# job rustdocs the root plus net-cli, net-deck, net-aggregator-daemon,
-# net-mesh-sdk, net-mesh-sdk-macros, net-rpc-ffi, net-org-ffi, net-mesh-mcp and
-# net-payments. It does NOT document `net-python`, and nothing else in CI does
-# either — so the third command has no CI counterpart to match and this local
+# The first three feature lists are ci.yml's "Documentation" job, verbatim —
+# that job rustdocs the root plus net-cli, net-deck, net-aggregator-daemon,
+# net-mesh-sdk, net-mesh-sdk-macros, net-rpc-ffi, net-org-ffi, net-mesh-mcp,
+# net-mesh-wire and net-payments (ten `-p` steps).
+#
+# `net-mesh-wire` is the tokio-free wire layer the core depends on, and it is
+# NOT reachable from the root `cargo doc` above — the root documents only
+# itself. A dangling intra-doc link in wire therefore reaches CI green-looking
+# locally; that has happened (a `crate::adapter::...` link, where `crate` is
+# `net_wire` and the core crate depends on wire, not the reverse, so no such
+# path can ever resolve). CI pins `--features json`; match it.
+#
+# It does NOT document `net-python`, and nothing else in CI does
+# either — so the last command has no CI counterpart to match and this local
 # run is the only rustdoc gate the pyo3 binding has. Its feature list is
 # maintained by hand from the `python-tests` job's `maturin develop` set, minus
 # `extension-module`, which is a maturin link-mode feature and not a code
@@ -139,8 +148,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 # `nat-traversal` and `port-mapping`, so neither list subsumes the other and
 # both are hand-maintained. Keep it in step with that
 # step if the build set changes.
-RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps --features full
-RUSTDOCFLAGS="-D warnings" cargo doc -p net-payments --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk  --no-deps --features full
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-payments  --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-wire --no-deps --features json
 RUSTDOCFLAGS="-D warnings" cargo doc -p net-python  --no-deps \
   --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org
 ```
