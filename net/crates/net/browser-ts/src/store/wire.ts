@@ -630,11 +630,22 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       const hasS = Object.prototype.hasOwnProperty.call(body, 's');
       // A `no` carrying neither names nothing (brief §1.12).
       if (!hasQ && !hasH) return refuse('payload', 'no-names-nothing');
-      // A `q`-less `no` is the **unsolicited expiry notice** and
-      // nothing else (brief §1.12): it is `closed`, it names the
-      // handle it is about, and it carries no action sequence. These
-      // are relationships inside one frame, so they belong here —
-      // unlike "is this `q` outstanding", which needs handle state.
+      // A `q`-less `no` is an **unsolicited notice about a handle**,
+      // and there are exactly TWO (brief §1.12): `closed`, the
+      // expiry notice, and `owner-lost`, the owner's goodbye. Both
+      // name the handle they are about and neither carries an action
+      // sequence. These are relationships inside one frame, so they
+      // belong here — unlike "is this `q` outstanding", which needs
+      // handle state.
+      //
+      // `owner-lost` was added because the two are NOT the same
+      // event and the replica must not treat them alike: `closed`
+      // means the lease lapsed and the replica rejoins, while
+      // `owner-lost` is terminal — the incarnation that held the
+      // document is gone. Spelling a host's `close()` as `closed`
+      // would have every replica rejoin a store that no longer
+      // exists, or silently attach to a SUCCESSOR's different
+      // document under the same name.
       //
       // Admitting a `q`-less `forbidden` offered a refusal that named
       // no request to attribute it to, and a `q`-less `s` named an
@@ -642,7 +653,9 @@ function buildMessage(k: MessageKind, body: JsonObject): DecodeResult {
       // "Names a handle" needs no separate check here: a `q`-less
       // frame without `h` is already refused above as naming nothing.
       if (!hasQ) {
-        if (code !== 'closed') return refuse('payload', 'unsolicited-no-must-be-closed');
+        if (code !== 'closed' && code !== 'owner-lost') {
+          return refuse('payload', 'unsolicited-no-must-be-closed-or-owner-lost');
+        }
         if (hasS) return refuse('payload', 'unsolicited-no-carries-no-sequence');
       }
       const out: { -readonly [K in keyof NoMessage]: NoMessage[K] } = {

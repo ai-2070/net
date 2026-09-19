@@ -692,11 +692,14 @@ await probe('real_package_refuses_a_non_finite_source_value', () => {
 
 await probe('real_package_holds_the_unsolicited_refusal_shape', () => {
   eq(decodeIn({ k: 'no', h: H32, code: 'forbidden' }, 'replica').reason,
-    'unsolicited-no-must-be-closed', 'a q-less forbidden');
+    'unsolicited-no-must-be-closed-or-owner-lost', 'a q-less forbidden');
   eq(decodeIn({ k: 'no', h: H32, code: 'closed', s: '1' }, 'replica').reason,
     'unsolicited-no-carries-no-sequence', 'a q-less action sequence');
-  // Controls.
+  // Controls: the TWO notices a q-less refusal may carry, in the
+  // SHIPPED bundle — `closed` is the expiry notice and `owner-lost`
+  // is a closing owner's goodbye.
   eq(decodeIn({ k: 'no', h: H32, code: 'closed' }, 'replica').ok, true, 'the expiry notice');
+  eq(decodeIn({ k: 'no', h: H32, code: 'owner-lost' }, 'replica').ok, true, 'the goodbye');
   eq(decodeIn({ k: 'no', q: Q16, h: H32, code: 'forbidden' }, 'replica').ok, true, 'correlated');
 });
 

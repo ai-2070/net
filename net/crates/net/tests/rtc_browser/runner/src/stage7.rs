@@ -9,10 +9,12 @@
 //! that chunks ride the shared reliability/reassembly code intact
 //! under loss, duplication and reorder."
 //!
-//! So these eight witnesses put the store on the transport the rest of
-//! this harness exercises, in two isolated browsing contexts of a real
-//! engine. **CI gates them on CHROMIUM**: that leg passes `--stage7`,
-//! its floor is 55 and all eight names are pinned REQUIRED (`ci.yml`).
+//! So these ten witnesses put the store on the transport the rest of
+//! this harness exercises, in isolated browsing contexts of a real
+//! engine — eight on one measured pair plus a third participant, and
+//! two more on a pair of their own (`refusals`). **CI gates them on
+//! CHROMIUM**: that leg passes `--stage7`, its floor is 57 and all
+//! ten names are pinned REQUIRED (`ci.yml`).
 //!
 //! **Firefox RUNS them, recorded, and does not gate them.** They had
 //! never executed on that engine at all — this workstation cannot
@@ -32,8 +34,8 @@
 //! They are still off by DEFAULT, which is what a local run gets
 //! without the flag.
 //!
-//! Local status (Chromium, `--stage7`): **55 witnesses, 0 failed** —
-//! all eight below pass, and this stage disturbs no other, which it
+//! Local status (Chromium, `--stage7`): **57 witnesses, 0 failed** —
+//! all ten below pass, and this stage disturbs no other, which it
 //! did until its two identities were found to be Stage 6 slice 3's
 //! (see `SECRET_HOST_ENTITY`).
 //!
@@ -90,7 +92,7 @@
 //! (`Step5::NodeCounters`), because which side is silent about a loss
 //! is the diagnosis.
 //!
-//! ## The eight witnesses, in the order they run
+//! ## The ten witnesses, in the order they run
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. an action crosses, executes once, and its result comes back;
@@ -107,6 +109,14 @@
 //! 8. and the SAME traffic leaves the per-pair counter exactly flat
 //!    once the pair is direct — the other half of the plan's
 //!    criterion, which is a pair of readings and not one.
+//!
+//! Then, on a pair of contexts of their own, criterion 3's last two
+//! clauses (`refusals`):
+//!
+//! 9. an unauthorized write is refused with a typed `forbidden`
+//!    while the same replica is still served; and
+//! 10. a handle whose owner was REPLACED is refused `owner-lost`,
+//!    and the successor adopts nothing.
 //!
 //! ## The "unexplained ZERO", answered
 //!
@@ -128,39 +138,53 @@
 //! precisely because an emptied document satisfies every reading
 //! about the NARROWED replica — which is how this hid.
 //!
-//! ## What is NOT here, and what trying established
+//! ## Criterion 3's refusal clauses, and why they are elsewhere
 //!
-//! Criterion 3's remaining clauses — a REFUSED unauthorized write
-//! and a stale handle from a REPLACED owner — were written, ran
-//! green, and are NOT in this file. Adding them put two more stores
-//! and their joins on this page, and the §9 promotion below then
-//! stopped completing: the offerer reported `iceTimeout` while the
-//! answerer reported `no verified offer from 0x… is waiting`, i.e.
-//! the offer never arrived. Moving those stores to the third
-//! participant, closing every finished store first, re-announcing
-//! and re-discovering before the attempt, and attempting twice all
-//! failed to restore it.
+//! They were first written onto the measured pair above, where they
+//! ran green — but they put two more stores and their joins on those
+//! pages, and the §9 promotion witness 8 depends on then stopped
+//! completing: the offerer reported `iceTimeout` while the answerer
+//! reported `no verified offer from 0x… is waiting`, i.e. the offer
+//! never arrived. Moving those stores to the third participant,
+//! closing every finished store first, re-announcing and
+//! re-discovering before the attempt, and attempting twice all
+//! failed to restore it. Three green witnesses would have gone red
+//! to buy two, which is a trade this stage does not make.
 //!
-//! So the promotion does not survive a page hosting six stores, and
-//! that is a finding about §9 signalling under store load rather
-//! than about the store. Three witnesses that depend on it (the
-//! flat-counter reading, and a resume after the replacement) would
-//! have gone red to buy two that do not, which is a trade this
-//! stage does not make: the two clauses stay unwitnessed HERE and
-//! named, and their own topology is the next slice.
+//! So they now run in `refusals`, on their own pair of contexts with
+//! their own session, capability tag and identities, AFTER the
+//! measured pair's pages are closed. That is not a workaround for
+//! the promotion: no promotion is involved there at all, and the
+//! measured pair is already gone. The run that established this
+//! reports 57/0 with witness 8 promoting on attempt 1, so the load
+//! that broke it is load on the SIGNALLING PAIR's own pages, not
+//! store count per se — the isolating experiment that would say
+//! which is still not run, and this file does not claim to know.
 //!
-//! What their run DID establish, before being removed: an
-//! unauthorized `bump` came back refused with code `forbidden` while
-//! the replica read normally and the authority's tick stayed 0; and
-//! a replica holding a handle from a CLOSED owner had its write
-//! refused while the successor's document stayed at 0 with no handle
-//! for it. Both are executed facts, not claims — they are simply not
-//! standing evidence, because the file that produced them is not the
-//! file that ships.
+//! **What witness 10 found, which nothing in process had.** Its
+//! first run read `indeterminate` — "the store did not answer before
+//! the deadline" — where `closed` was expected. A host that closed
+//! took its answer with it: §1.6's rule that a caller learns why
+//! rather than inferring it from silence had been applied to lease
+//! EXPIRY and not to CLOSURE, so every replica of a closed host
+//! waited out its own 20-second deadline and then could only say it
+//! did not know. A closing owner now says goodbye to every handle it
+//! holds (`owner.farewell`, awaited by `close()` and sent only on
+//! streams already open), spelled `owner-lost` rather than `closed`
+//! because the two are different events — `closed` is the notice a
+//! replica REJOINS on, and rejoining here would have silently
+//! attached the caller to a SUCCESSOR's different document under the
+//! handle it already had. Five inverses in
+//! `browser-ts/test/store/hosted.test.ts` and
+//! `test/store/wire.test.ts`; the awaited-ness of the goodbye needed
+//! a late-flushing send in the double before it could discriminate
+//! at all.
 //!
-//! 8 is LAST because a promotion replaces the session, and a store
-//! that opens a new stream on it afterwards is refused by a fenced
-//! stream id. Everything that opens one runs before it.
+//! 8 is LAST ON THIS PAIR because a promotion replaces the session,
+//! and a store that opens a new stream on it afterwards is refused
+//! by a fenced stream id. Everything that opens one runs before it —
+//! and 9 and 10 run after it on contexts of their own, which is why
+//! they are unaffected by that fence.
 //!
 //! **These numbers are the EXECUTION order**, matching the `// --- N`
 //! section comments below, and they are the numbering every sentence
@@ -169,7 +193,8 @@
 //! it, twice.
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
-//! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect — and stays that way because each record
+//! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect, 8
+//! unauthorized, 9 replaced — and stays that way because each record
 //! names its position by index, so reordering the array would
 //! silently retarget records (the same reason Stage 5's list is
 //! append-only). An earlier header mixed the two numberings and so
@@ -226,7 +251,7 @@ const ENTRIES: u32 = 700;
 /// chunk budget from (`MAX_EVENT_SIZE`).
 const MAX_EVENT_BYTES: u32 = 8104;
 
-pub const WITNESSES: [&str; 8] = [
+pub const WITNESSES: [&str; 10] = [
     "stage7_store_snapshot_installs_over_the_real_stream",
     "stage7_store_snapshot_installs_through_injected_loss_and_reorder",
     "stage7_an_action_round_trip_crosses_the_real_transport",
@@ -237,10 +262,14 @@ pub const WITNESSES: [&str; 8] = [
     "stage7_store_traffic_leaves_the_counter_flat_once_the_pair_is_direct",
     "stage7_narrowing_an_audience_withholds_only_that_replicas_view",
     "stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle",
+    // Criterion 3's last two clauses, on their OWN topology — see
+    // `refusals` for why they are not on the pair above.
+    "stage7_an_unauthorized_write_is_refused_while_the_replica_still_reads",
+    "stage7_a_handle_from_a_replaced_owner_is_refused",
 ];
 
 /// The tabs this stage drives, on their own isolated contexts.
-pub const TABS: [&str; 3] = [TAB_HOST, TAB_PLAYER, TAB_SECOND];
+pub const TABS: [&str; 5] = [TAB_HOST, TAB_PLAYER, TAB_SECOND, TAB_OWNER, TAB_CLIENT];
 
 const TAB_HOST: &str = "s7host";
 const TAB_PLAYER: &str = "s7player";
@@ -254,17 +283,30 @@ const TAB_PLAYER: &str = "s7player";
 /// browser participants"), so the topology is the honest one rather
 /// than a workaround.
 const TAB_SECOND: &str = "s7second";
+/// The refusal topology's two contexts — its own pair, own session,
+/// own capability tag, own identities.
+const TAB_OWNER: &str = "s7owner";
+const TAB_CLIENT: &str = "s7client";
 const PAGE_HOST: &str = "stage7-host";
 const PAGE_PLAYER: &str = "stage7-player";
 const PAGE_SECOND: &str = "stage7-second";
 const CTX_HOST: &str = "stage7-ctx-host";
 const CTX_PLAYER: &str = "stage7-ctx-player";
 const CTX_SECOND: &str = "stage7-ctx-second";
+const PAGE_OWNER: &str = "stage7-owner";
+const PAGE_CLIENT: &str = "stage7-client";
+const CTX_OWNER: &str = "stage7-ctx-owner";
+const CTX_CLIENT: &str = "stage7-ctx-client";
 
 /// One capability tag, so each leaf can discover the other's signed
 /// announcement — which is what installs the relayed session the
 /// store's `openStream({peer})` needs.
 const STORE_TAG: &str = "stage7.store";
+
+/// The refusal topology's own tag, so its two leaves discover each
+/// other and nothing else — a shared tag would have the refusal
+/// client discovering the measured pair's host as well.
+const REFUSAL_TAG: &str = "stage7.refusal";
 
 /// Entries the host projects ONLY to the `command` audience.
 ///
@@ -292,6 +334,13 @@ const SECRET_SECOND_ENTITY: &str =
     "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4";
 const SECRET_SECOND_NOISE: &str =
     "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
+const SECRET_OWNER_ENTITY: &str =
+    "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2";
+const SECRET_OWNER_NOISE: &str = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3";
+const SECRET_CLIENT_ENTITY: &str =
+    "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2";
+const SECRET_CLIENT_NOISE: &str =
+    "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3";
 
 /// What this stage needs from the runner.
 pub struct Cx7<'a> {
@@ -508,9 +557,11 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         session: session.clone(),
         handle: handle.to_string(),
         label: format!("store/stage7/{handle}"),
+        store: None,
         entries: ENTRIES,
         command_entries,
         max_event_bytes: MAX_EVENT_BYTES,
+        refuse_writes: false,
     };
     let host_store = |handle: &str| host_store_with(handle, 0);
     let join_as = |handle: &str, store: &str, audience: &[&str]| Step5::StoreJoin {
@@ -1441,5 +1492,399 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let _ = cx.driver.close_page(PAGE_HOST).await;
     let _ = cx.driver.close_page(PAGE_PLAYER).await;
     let _ = cx.driver.close_page(PAGE_SECOND).await;
+
+    // Criterion 3's last two clauses, on contexts of their own, after
+    // the pair above is gone.
+    refusals(&cx, ledger).await;
     Ok(())
+}
+
+/// Criterion 3's refusal clauses, on a topology of their own.
+///
+/// **Why a separate topology at all.** These two were first written
+/// onto the pair above, and they ran green there — but they put two
+/// more stores and two more joins on those pages, and the §9
+/// promotion witness 8 depends on then stopped completing (the
+/// offerer reported `iceTimeout`, the answerer `no verified offer
+/// from 0x… is waiting`). Three green witnesses would have gone red
+/// to buy two, which is not a trade this stage makes. So they get
+/// their own pair of contexts, their own session, their own
+/// capability tag and their own identities, and they run AFTER the
+/// measured pair's pages are closed — no promotion is involved here,
+/// and nothing above can be disturbed by what happens below.
+///
+/// **What each one reads.** Never "the step failed": the refusal's
+/// typed CODE, plus the authority's own document, plus — for the
+/// authorization clause — a later host commit ARRIVING at the same
+/// replica. A refusal that came from a dead transport would satisfy
+/// "the write did not land" and say nothing about policy, so the
+/// replica has to still be served for the claim to be about
+/// authorization. Both witnesses carry a positive control in the
+/// same run: the replacement clause writes SUCCESSFULLY through the
+/// handle first, so "refused" is a statement about the replacement
+/// and not about the handle never having worked.
+async fn refusals(cx: &Cx7<'_>, ledger: &mut Ledger) {
+    let mut script = Script5::new(cx.tabs.clone(), 3_000_000);
+    let session = "refuse".to_string();
+    let fail = |ledger: &mut Ledger, detail: String| {
+        for name in &WITNESSES[8..] {
+            ledger.record(name, false, detail.clone());
+        }
+    };
+
+    for (page, tab, ctx) in [
+        (PAGE_OWNER, TAB_OWNER, CTX_OWNER),
+        (PAGE_CLIENT, TAB_CLIENT, CTX_CLIENT),
+    ] {
+        let url = format!("{}/leaf5.html?tab={tab}", cx.page_origin);
+        if let Err(reason) = cx.driver.open_page_in(page, &url, Some(ctx)).await {
+            fail(
+                ledger,
+                format!("a Stage 7 refusal context would not open: {reason}"),
+            );
+            return;
+        }
+    }
+
+    let connect = |entity: &str, noise: &str| Step5::Connect {
+        id: 0,
+        session: session.clone(),
+        credential: cx.credential.clone(),
+        bootstrap_url: cx.bootstrap_url.clone(),
+        origin: cx.origin.clone(),
+        anchor_rtc_addr: cx.anchor_rtc_addr.clone(),
+        stun: cx.stun.clone(),
+        entity_secret_hex: Some(entity.to_string()),
+        noise_secret_hex: Some(noise.to_string()),
+        use_session: false,
+        capabilities: vec![REFUSAL_TAG.to_string()],
+        subscriptions: Vec::new(),
+        lock_scope: None,
+        expect_failure: false,
+    };
+    let owner_connected = script
+        .run(TAB_OWNER, connect(SECRET_OWNER_ENTITY, SECRET_OWNER_NOISE))
+        .await;
+    let client_connected = script
+        .run(
+            TAB_CLIENT,
+            connect(SECRET_CLIENT_ENTITY, SECRET_CLIENT_NOISE),
+        )
+        .await;
+    let (owner, client) = match (leaf_of(&owner_connected), leaf_of(&client_connected)) {
+        (Some(o), Some(c)) if o.node_id != c.node_id => (o, c),
+        _ => {
+            fail(
+                ledger,
+                format!(
+                    "the refusal contexts are not two connected leaves: owner={} client={}",
+                    why(&owner_connected),
+                    why(&client_connected)
+                ),
+            );
+            return;
+        }
+    };
+
+    // Two DISTINCT nodes, printed: the refusal clauses are about one
+    // node's policy over another's write, and a topology that
+    // collapsed to one node would refuse nothing and prove nothing.
+    println!(
+        "[stage7] refusal topology: owner={} client={}",
+        owner.node_hex, client.node_hex
+    );
+
+    // Discovery is a precondition of the store, not decoration: a
+    // replica cannot `openStream({peer})` without a session, and the
+    // relayed one is installed by the discovery path.
+    for tab in [TAB_OWNER, TAB_CLIENT] {
+        let announced = script
+            .run(
+                tab,
+                Step5::Announce {
+                    id: 0,
+                    session: session.clone(),
+                    capabilities: vec![REFUSAL_TAG.to_string()],
+                },
+            )
+            .await;
+        if !announced.ok {
+            println!("[stage7] {tab} could not announce: {}", why(&announced));
+        }
+    }
+    let found = discover(
+        &mut script,
+        TAB_CLIENT,
+        &owner.node_hex,
+        &session,
+        REFUSAL_TAG,
+    )
+    .await;
+    if found.is_none() {
+        fail(
+            ledger,
+            format!(
+                "the refusal client never discovered the owner {}, so it has no session \
+                 to open a store stream on",
+                owner.node_hex
+            ),
+        );
+        return;
+    }
+
+    let host_of = |handle: &str, store: Option<&str>, refuse_writes: bool| Step5::StoreHost {
+        id: 0,
+        session: session.clone(),
+        handle: handle.to_string(),
+        // The SUCCESSOR answers at its predecessor's label, because
+        // the id the leaf derives from it is what a replica's cached
+        // stream is addressed to.
+        label: format!("store/stage7r/{}", store.unwrap_or(handle)),
+        store: store.map(str::to_string),
+        entries: ENTRIES,
+        command_entries: COMMAND_ENTRIES,
+        max_event_bytes: MAX_EVENT_BYTES,
+        refuse_writes,
+    };
+    let join_of = |handle: &str| Step5::StoreJoin {
+        id: 0,
+        session: session.clone(),
+        handle: handle.to_string(),
+        store: handle.to_string(),
+        label: format!("store/stage7r/{handle}"),
+        host_hex: owner.node_hex.clone(),
+        audience: vec!["crew".to_string()],
+        key: "harness".to_string(),
+        max_event_bytes: MAX_EVENT_BYTES,
+        drop_every: 0,
+        reorder_every: 0,
+        duplicate_every: 0,
+        timeout_ms: 30_000,
+    };
+
+    // --- 9. an unauthorized write is refused, and reads continue ---
+    let hosted = script.run(TAB_OWNER, host_of("policy", None, true)).await;
+    let joined = script.run(TAB_CLIENT, join_of("policy")).await;
+    let refused = script
+        .run(
+            TAB_CLIENT,
+            Step5::StoreAct {
+                id: 0,
+                handle: "policy".to_string(),
+                by: 5,
+                settle_ms: 300,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    let owner_after_refusal = script
+        .run(
+            TAB_OWNER,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "policy".to_string(),
+            },
+        )
+        .await;
+    // The replica is STILL SERVED: a host write after the refusal has
+    // to arrive, or "the write did not land" is a statement about a
+    // broken transport.
+    let after = script
+        .run(
+            TAB_OWNER,
+            Step5::StoreCommit {
+                id: 0,
+                handle: "policy".to_string(),
+                entries: None,
+                tick: Some(42),
+                duplicate_every: 0,
+                settle_ms: 500,
+            },
+        )
+        .await;
+    let client_reads = script
+        .run(
+            TAB_CLIENT,
+            Step5::StoreState {
+                id: 0,
+                handle: "policy".to_string(),
+            },
+        )
+        .await;
+    let code = stat_str(&refused, "code");
+    let authority_unmoved = stat_u64(&owner_after_refusal, "tick") == Some(0);
+    let still_reading = stat_u64(&client_reads, "tick") == Some(42);
+    ledger.record(
+        WITNESSES[8],
+        hosted.ok
+            && joined.ok
+            && !refused.ok
+            && code.as_deref() == Some("forbidden")
+            && authority_unmoved
+            && after.ok
+            && still_reading,
+        format!(
+            "AN UNAUTHORIZED WRITE IS REFUSED, WITH A TYPED CODE, AND THE REPLICA IS \
+             STILL SERVED. The owner's `authorize` permits reads and refuses every \
+             write, so the replica JOINED and installed a document — and its \
+             `bump {{by: 5}}` came back refused with code {code:?} (asserted equal to \
+             `forbidden`, not merely \"it threw\"). The AUTHORITY's own document is \
+             where the refusal is confirmed: tick {:?}, asserted 0, so the action did \
+             not execute rather than executing and failing to answer. Then the owner \
+             committed tick 42 and the SAME replica read {:?} — which is what makes \
+             this a claim about authorization: a refusal from a dead transport or an \
+             unreachable store satisfies every other reading here. {} {} {}",
+            stat_u64(&owner_after_refusal, "tick"),
+            stat_u64(&client_reads, "tick"),
+            why(&refused),
+            why(&after),
+            why(&client_reads)
+        ),
+    );
+
+    // --- 10. a handle from a REPLACED owner is refused --------------
+    let hosted_heir = script
+        .run(TAB_OWNER, host_of("heirloom", None, false))
+        .await;
+    let joined_heir = script.run(TAB_CLIENT, join_of("heirloom")).await;
+    // THE CONTROL, and it runs first: the very same handle writes
+    // successfully while its owner is alive. Without it, "the write
+    // was refused after the replacement" is satisfied by a handle
+    // that never worked at all.
+    let accepted = script
+        .run(
+            TAB_CLIENT,
+            Step5::StoreAct {
+                id: 0,
+                handle: "heirloom".to_string(),
+                by: 3,
+                settle_ms: 300,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    let before_replacement = script
+        .run(
+            TAB_OWNER,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "heirloom".to_string(),
+            },
+        )
+        .await;
+    // The owner goes away, and a SUCCESSOR takes the same store name
+    // and the same label — which is the only way the replica's next
+    // frame reaches anything at all.
+    let retired = script
+        .run(
+            TAB_OWNER,
+            Step5::StoreClose {
+                id: 0,
+                handle: "heirloom".to_string(),
+                settle_ms: 400,
+            },
+        )
+        .await;
+    let successor = script
+        .run(TAB_OWNER, host_of("heir", Some("heirloom"), false))
+        .await;
+    let stale_write = script
+        .run(
+            TAB_CLIENT,
+            Step5::StoreAct {
+                id: 0,
+                handle: "heirloom".to_string(),
+                by: 4,
+                settle_ms: 400,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+    let successor_state = script
+        .run(
+            TAB_OWNER,
+            Step5::StoreCounts {
+                id: 0,
+                handle: "heir".to_string(),
+            },
+        )
+        .await;
+    let stale_code = stat_str(&stale_write, "code");
+    let control_moved = accepted.ok && stat_u64(&before_replacement, "tick") == Some(3);
+    let successor_unmoved = stat_u64(&successor_state, "tick") == Some(0);
+    let nothing_bound = stat_u64(&successor_state, "handles") == Some(0);
+    ledger.record(
+        WITNESSES[9],
+        hosted_heir.ok
+            && joined_heir.ok
+            && control_moved
+            && retired.ok
+            && successor.ok
+            && !stale_write.ok
+            && stale_code.as_deref() == Some("owner-lost")
+            && successor_unmoved
+            && nothing_bound,
+        format!(
+            "A HANDLE FROM A REPLACED OWNER IS REFUSED, AND THE SUCCESSOR ADOPTS \
+             NOTHING. First the CONTROL, through the same handle and while its owner \
+             was alive: `bump {{by: 3}}` was accepted and moved the authority to tick \
+             {:?} (asserted 3) — so what follows is about the REPLACEMENT and not \
+             about a handle that never worked. Then the owner closed and a successor \
+             took the same store name and the same stream label, and the replica's \
+             held handle wrote again: refused with code {stale_code:?} (asserted \
+             `owner-lost`). THAT CODE IS THIS RUN'S DOING: the first version asserted \
+             `closed` and read `indeterminate` — \"the store did not answer before the \
+             deadline\" — because a host that closed took its answer with it, and the \
+             replica's only signal was a 20-second silence. §1.6's rule is that a \
+             caller learns why rather than inferring it from silence, and it had been \
+             applied to lease EXPIRY and not to closure. A closing owner now says \
+             goodbye to every handle it holds (`owner.farewell`, awaited by \
+             `close()`), spelled `owner-lost` rather than `closed` because the two are \
+             different events: `closed` is the expiry notice a replica REJOINS on, and \
+             rejoining here would have silently attached this caller to the \
+             SUCCESSOR's different document under the handle it already had. The \
+             successor's own document is at tick {:?} (asserted 0) and \
+             it holds {:?} handles (asserted 0) — it did not inherit the predecessor's \
+             binding, which is the half that matters: a successor that ADOPTED the \
+             handle would have executed the write and every \"refused\" reading would \
+             still be about something else. {} {} {}",
+            stat_u64(&before_replacement, "tick"),
+            stat_u64(&successor_state, "tick"),
+            stat_u64(&successor_state, "handles"),
+            why(&accepted),
+            why(&stale_write),
+            why(&successor_state)
+        ),
+    );
+
+    for (tab, handle) in [
+        (TAB_CLIENT, "policy"),
+        (TAB_CLIENT, "heirloom"),
+        (TAB_OWNER, "policy"),
+        (TAB_OWNER, "heir"),
+    ] {
+        let _ = script
+            .run(
+                tab,
+                Step5::StoreClose {
+                    id: 0,
+                    handle: handle.to_string(),
+                    settle_ms: 0,
+                },
+            )
+            .await;
+    }
+    for tab in [TAB_OWNER, TAB_CLIENT] {
+        let _ = script
+            .run(
+                tab,
+                Step5::Close {
+                    id: 0,
+                    session: session.clone(),
+                },
+            )
+            .await;
+    }
+    let _ = cx.driver.close_page(PAGE_OWNER).await;
+    let _ = cx.driver.close_page(PAGE_CLIENT).await;
 }

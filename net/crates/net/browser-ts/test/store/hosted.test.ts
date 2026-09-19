@@ -110,6 +110,8 @@ function mesh() {
   const permanent = new Set<string>();
   /** Nodes whose next send is HELD, to be settled by the test. */
   const holding = new Set<string>();
+  /** Nodes whose sends resolve on a later turn, not synchronously. */
+  const flushLate = new Set<string>();
   /** Nodes whose next OPEN is held, and the streams they closed. */
   const holdingOpen = new Set<string>();
   const heldOpens: { node: string; settle: () => void }[] = [];
@@ -178,8 +180,27 @@ function mesh() {
         // handle a side holds — what a session replacement does.
         const generation = (opens.get(self) ?? 0) + 1;
         opens.set(self, generation);
+        // A REAL stream cannot carry a frame after it is closed, and
+        // the double used to: every send delivered synchronously, so
+        // "closed the stream, then flushed a frame on it" was
+        // indistinguishable from "flushed, then closed".
+        let shut = false;
         const stream: TransportStream = {
           send: bytes => {
+            if (flushLate.has(self)) {
+              // The send RESOLVES on a later turn, the way a real
+              // one does — and a stream closed in between refuses it.
+              return new Promise<void>((resolve, reject) => {
+                setTimeout(() => {
+                  if (shut) {
+                    reject(new Error('session: stream closed'));
+                    return;
+                  }
+                  deliver(target, self, bytes, streamId);
+                  resolve();
+                }, 0);
+              });
+            }
             if (holding.has(self)) {
               holding.delete(self);
               // The send is in flight and unresolved: whatever the
@@ -217,6 +238,7 @@ function mesh() {
             deliver(target, self, bytes, streamId);
           },
           close: () => {
+            shut = true;
             closes.set(self, (closes.get(self) ?? 0) + 1);
           },
         };
@@ -300,6 +322,10 @@ function mesh() {
     },
     /** How many streams this node has opened. */
     opensOf: (node: string) => opens.get(node) ?? 0,
+    /** Make this node's sends flush on a later turn. */
+    flushLate: (node: string) => {
+      flushLate.add(node);
+    },
     /** Hold this node's next OPEN, unresolved. */
     holdNextOpen: (node: string) => {
       holdingOpen.add(node);
@@ -1614,8 +1640,12 @@ describe('a store that closed while a send was in flight', () => {
     await flush(30);
 
     expect(net.opensOf(HOST_NODE)).toBe(opensBefore);
-    // The receiver never advanced: a closed host does not deliver.
-    expect(joined.getState().hull).toBe(installed);
+    // The DELTA never reached the receiver — read from what was
+    // delivered, not from the replica's document, because the host's
+    // goodbye clears that document by design. And the goodbye itself
+    // DID arrive, so "no delta" is not "nothing was delivered".
+    expect(net.kinds(CALLER_NODE)).not.toContain('delta');
+    expect(net.kinds(CALLER_NODE)).toContain('no');
     await joined.close();
   });
 
@@ -1897,19 +1927,102 @@ describe('the host’s own surface', () => {
     expect(host.getState().hull).toBe(3);
   });
 
-  it('stops serving once closed', async () => {
-    const { host, joined, time } = wired();
+  it('says goodbye when it closes, and the next write is refused at once', async () => {
+    // This test used to pin the DEFECT: the write came back
+    // `indeterminate` — "the store did not answer before the
+    // deadline" — and only after 10 seconds of advanced time, which
+    // is exactly what a replica of a closed host saw over the real
+    // transport. §1.6's rule is that a caller learns why rather than
+    // inferring it from silence, and it had been applied to expiry
+    // and not to closure.
+    const { net, host, joined } = wired();
     await joined.ready();
     const hull = host.getState().hull;
+    const joinsBefore = net.kinds(HOST_NODE).filter(kind => kind === 'join').length;
 
     await host.close();
+    // NO `time.advance` anywhere below: promptness is part of the
+    // claim. A deadline-driven answer cannot satisfy this.
     const after = joined.act('fire', { power: 4 }).catch((error: { code?: string }) => error.code);
     await flush();
 
     // A closed host executes nothing, whatever arrives.
     expect(host.getState().hull).toBe(hull);
-    time.advance(10_000);
-    await expect(after).resolves.toBe('indeterminate');
+    await expect(after).resolves.toBe('owner-lost');
+    // Terminal, not an expiry: the replica does not rejoin, and its
+    // view is gone rather than stale-but-readable.
+    expect(joined.getStatus().phase).toBe('closed');
+    expect(net.kinds(HOST_NODE).filter(kind => kind === 'join')).toHaveLength(joinsBefore);
+  });
+
+  it('hands a replaced owner’s handle nothing to write with', async () => {
+    // Criterion 3's replacement clause, in process: the owner closes
+    // and a SUCCESSOR takes the same store name on the same node, so
+    // the replica's next frame reaches a live store that never
+    // issued its handle. What must not happen is the successor
+    // adopting it — and what must not happen either is the replica
+    // silently rejoining the successor's DIFFERENT document under
+    // the handle it already had.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    // THE CONTROL, first: the same handle writes successfully while
+    // its owner is alive, so "refused" below is about the
+    // replacement and not about a handle that never worked.
+    await expect(joined.act('fire', { power: 1 })).resolves.toEqual({ shot: 9 });
+
+    await host.close();
+    const successor = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: {
+        fire: (input, context) => {
+          const hull = context.getState().hull - input.power;
+          context.setState({ hull });
+          return { shot: hull };
+        },
+      },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    const refused = await joined
+      .act('fire', { power: 5 })
+      .then(() => 'EXECUTED')
+      .catch((error: { code?: string }) => error.code);
+
+    expect(refused).toBe('owner-lost');
+    // The successor's document is untouched and it issued no handle:
+    // a successor that ADOPTED the binding would have executed the
+    // write, and every "refused" reading would be about something
+    // else.
+    expect(successor.getState().hull).toBe(10);
+    expect(successor.counts().handles).toBe(0);
+    await successor.close();
+    await joined.close();
+  });
+
+  it('does not outrun its own goodbye', async () => {
+    // The goodbye is AWAITED, and this is what the await buys: with
+    // sends that flush on a later turn — which is what a real
+    // transport does — a `void`ed farewell is still queued when
+    // `close()` tears the stream down, so the frame is refused and
+    // the replica learns nothing. The two spellings are
+    // indistinguishable under a synchronous double, which is why the
+    // double now has a late-flushing mode.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    net.flushLate(HOST_NODE);
+
+    await host.close();
+    const after = joined.act('fire', { power: 4 }).catch((error: { code?: string }) => error.code);
+    await flush(10);
+
+    await expect(after).resolves.toBe('owner-lost');
   });
 
   it('reports the bounds a host has to watch', async () => {

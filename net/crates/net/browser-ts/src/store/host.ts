@@ -505,6 +505,28 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     counters: () => ({ ...owner.snapshotCounters(), ...dropped }),
     close: async () => {
       if (closed) return;
+      // The goodbye goes out BEFORE `closed` is set and before the
+      // streams are closed: `emit` refuses to send from a closed
+      // store, and a farewell on a closed stream reaches nobody.
+      // Awaited, because `close()` returns a promise precisely so a
+      // caller can know the store is gone — and a `void`ed farewell
+      // would race the teardown it is announcing.
+      // Only to a peer this host ALREADY has a reply stream for —
+      // the same rule the expiry notice follows, and for a second
+      // reason here: `close()` AWAITS the goodbye, so opening a
+      // stream for it would make closure wait on a stream open that
+      // may never resolve. A witness held one open and `close()`
+      // hung for five seconds.
+      const goodbye = owner.farewell().filter(out => replies.has(out.peer));
+      if (goodbye.length > 0) {
+        try {
+          await emit(goodbye);
+        } catch {
+          // A replica whose transport is already gone needs no
+          // notice, and a host that cannot say goodbye still closes.
+          dropped['farewell-failed'] = (dropped['farewell-failed'] ?? 0) + 1;
+        }
+      }
       closed = true;
       stopSweep();
       unsubscribe();

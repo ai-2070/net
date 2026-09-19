@@ -1891,7 +1891,9 @@ async function execute(step) {
       try {
         host = pkg.hostStore({
           // WHICH store of this definition: this page hosts three.
-          store: step.handle,
+          // A SUCCESSOR names the store its predecessor served while
+          // being a different local handle, so the two can differ.
+          store: step.store || step.handle,
           definition,
           transport: node,
           // One label per store, not one per definition: the id the
@@ -1901,7 +1903,12 @@ async function execute(step) {
           streamId: step.label || undefined,
           initialState: initial,
           maxEventBytes: step.max_event_bytes || 8104,
-          authorize: () => true,
+          // A policy, when the witness asks for one: reads are
+          // served and every WRITE is refused. A host that permits
+          // everything cannot witness a refusal, and a host that
+          // refused everything could not tell an authorization
+          // refusal from an unreachable store.
+          authorize: step.refuse_writes ? request => request.type === 'read' : () => true,
           // A REAL projection, because an audience that withholds
           // nothing cannot witness an audience change. Entries named
           // `cmd-*` belong to the `command` audience; everything else

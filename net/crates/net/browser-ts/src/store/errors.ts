@@ -21,6 +21,13 @@
  * - `indeterminate` — submitted, and no response established the outcome.
  * - `owner-lost` — the store incarnation ended. Terminal: there is no
  *   handle to obtain, because the owner that held the document is gone.
+ *   A closing host SAYS this, unsolicited, to every handle it holds
+ *   (`owner.farewell`) — silence is not an answer, and a replica whose
+ *   host closed used to learn nothing until its own deadline fired and
+ *   reported `indeterminate`. It is deliberately NOT `closed`: that
+ *   one is the expiry notice a replica rejoins on, and rejoining an
+ *   owner that is gone either hangs or silently attaches the caller to
+ *   a SUCCESSOR's different document under the handle it already had.
  * - `closed` — **this handle is unusable**: unknown, expired, fenced by
  *   the owner, or bound to another peer. Deliberately one code for all
  *   four, so a refusal cannot disclose whether a handle exists. It is

@@ -447,6 +447,13 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       }),
     act: async (name, input) => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
+      // The OWNER is gone, which is not the same as "no handle yet":
+      // a terminal `owner-lost` discards the handle, and reporting
+      // that as `not-ready` would tell a caller to wait for a world
+      // that is never coming.
+      if (replica.state === 'closed') {
+        throw new StoreError('owner-lost', 'the store owner closed this handle');
+      }
       const h = replica.handle;
       if (h === null) throw new StoreError('not-ready', 'no handle yet: the join has not been answered');
       sequence += 1n;

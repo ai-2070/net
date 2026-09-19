@@ -475,15 +475,29 @@ describe('A3 — the encoder refuses before serialization can hide the value', (
   });
 });
 
-describe('A4 — a q-less refusal is the expiry notice and nothing else', () => {
-  it('refuses a q-less refusal that is not `closed`', () => {
+describe('A4 — a q-less refusal is a handle notice and nothing else', () => {
+  it('refuses a q-less refusal that is neither notice', () => {
     const result = refused({ v: 1, k: 'no', h: H, code: 'forbidden' }, 'replica');
-    expect(result.reason).toBe('unsolicited-no-must-be-closed');
+    expect(result.reason).toBe('unsolicited-no-must-be-closed-or-owner-lost');
     // Nothing could attribute it to a request.
-    for (const code of ['capacity', 'not-ready', 'owner-lost', 'action-rejected'] as const) {
+    for (const code of ['capacity', 'not-ready', 'action-rejected'] as const) {
       expect(refused({ v: 1, k: 'no', h: H, code }, 'replica').reason).toBe(
-        'unsolicited-no-must-be-closed',
+        'unsolicited-no-must-be-closed-or-owner-lost',
       );
+    }
+  });
+
+  it('admits the two notices, and they are DIFFERENT events', () => {
+    // `closed` is expiry — the replica rejoins on it. `owner-lost` is
+    // the owner's goodbye and is terminal. Admitting only the first
+    // forced a closing host to spell its departure as an expiry, and
+    // a replica cannot rejoin an owner that is gone.
+    for (const code of ['closed', 'owner-lost'] as const) {
+      expect(accepted({ v: 1, k: 'no', h: H, code }, 'replica')).toEqual({
+        k: 'no',
+        h: H,
+        code,
+      });
     }
   });
 

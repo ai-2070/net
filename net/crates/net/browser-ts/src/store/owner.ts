@@ -818,6 +818,38 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     return expired;
   }
 
+  /**
+   * Say goodbye, once, to every replica this owner is serving.
+   *
+   * §1.6's doctrine is that a caller learns why rather than inferring
+   * it from silence, and it was applied to EXPIRY (`sweep`) and not
+   * to closure: a host that closed took its answer with it, so every
+   * bound replica's next write reached a store that no longer
+   * existed and the caller's only signal was a deadline — the
+   * `indeterminate` "the store did not answer before the deadline",
+   * measured over the real transport.
+   *
+   * The code is `owner-lost`, not `closed`, and the difference is
+   * the whole semantics: `closed` is the expiry notice and the
+   * replica REJOINS on it, which after a close would either hang or
+   * silently attach the caller to a SUCCESSOR's different document
+   * under the same handle. `owner-lost` is terminal — this
+   * incarnation held the document and is gone — so the replica's
+   * view is cleared, `ready()` rejects, and rejoining is the
+   * caller's decision to make explicitly.
+   *
+   * Every handle is forgotten here, so the frames are a one-shot:
+   * a second call has nothing to say.
+   */
+  farewell(): readonly Outbound[] {
+    const out: Outbound[] = [];
+    for (const [h, handle] of [...this.handles]) {
+      this.forget(h);
+      out.push(this.no(handle.peer, h, 'owner-lost', null));
+    }
+    return out;
+  }
+
   /** This owner's incarnation, which every manifest carries. */
   get incarnationHex(): Hex {
     return this.incarnation;

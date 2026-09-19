@@ -699,11 +699,28 @@ pub enum Step5 {
         /// The stream label. One per store: two stores sharing one
         /// label share the id the leaf derives from it.
         label: String,
+        /// The store NAME the host declares, which is what a joining
+        /// replica addresses. Defaults to `handle` on the page.
+        ///
+        /// They differ for exactly one reason: a SUCCESSOR owner of
+        /// the same store, which has to answer at the name and label
+        /// its predecessor used while being a different local handle.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store: Option<String>,
         entries: u32,
         /// Entries only the `command` audience may read, so an
         /// audience change has something to withhold.
         command_entries: u32,
         max_event_bytes: u32,
+        /// Refuse every WRITE — actions and inputs — while still
+        /// answering reads.
+        ///
+        /// `authorize` is the owner's policy hook, and a host that
+        /// permits everything cannot witness a refusal. Reads stay
+        /// permitted deliberately: "the write was refused" is only a
+        /// claim about authorization if the same replica is
+        /// otherwise being served.
+        refuse_writes: bool,
     },
     /// Arm the loss / reorder / duplication hooks on ONE page.
     ///
