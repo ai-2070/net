@@ -18,6 +18,53 @@ The repository is **polyglot with one Rust core**:
 - `web/` — Next.js docs/marketing site (docs content lives in `web/src/content/docs/`).
 - `docs/` — design docs (`docs/internal/` plans/audits, `docs/misc/`). Crate-level design docs in `net/crates/net/docs/` (BEHAVIOR.md, SENSING.md, ORGANIZATIONS.md, TRANSPORT.md, etc.).
 
+## CodeGraph
+
+This project has a CodeGraph knowledge graph index (`.codegraph/`). CodeGraph is a tree-sitter-parsed database of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
+
+### Access paths
+
+Two surfaces, one engine:
+
+- **MCP tool** — a harness wired to the codegraph MCP server (`codegraph serve --mcp`) exposes `codegraph_explore`; OMP registers it as `mcp__codegraph_explore` (route `xd://mcp__codegraph_explore`). Prefer it for the explore/trace question — identical output to the CLI with no shell round-trip. Only `explore` is exposed by default; `CODEGRAPH_MCP_TOOLS=explore,node,callers,callees,impact,search,status,files` widens the set.
+- **CLI** — always available, and the only way to reach the rest of the table below.
+
+### CLI usage reference
+
+Verified against the installed CLI (`codegraph --help`); there is no `search`, `trace`, or `affected <symbol>` subcommand.
+
+| Question | Command |
+|---|---|
+| "Find a symbol by name" | `codegraph query <name>` (`-k <kind>`, `-l <limit>`, `-j`) |
+| "Show a symbol's source + call trail" | `codegraph node <name>` (`-f <file>` to disambiguate) |
+| "Read a file with line numbers + dependents" | `codegraph node -f <file>` (`--offset`, `--limit`, `--symbols-only`) |
+| "Find callers of a function" | `codegraph callers <symbol>` |
+| "Find callees a function calls" | `codegraph callees <symbol>` |
+| "Explore an area / trace flow" | `codegraph explore <query...>` (`--max-files`) |
+| "Impact analysis for symbol Z" | `codegraph impact <symbol>` (`-d <depth>`) |
+| "Which tests do these changed files affect?" | `codegraph affected <files...>` (`--stdin`, `-d`, `-f <glob>`) |
+| "What files exist under path/" | `codegraph files --filter <dir>` (`--pattern <glob>`, `--format tree\|flat\|grouped`) |
+| "Build context for a task" | `codegraph context <task...>` |
+| "Is the index healthy?" | `codegraph status` |
+| "Pick up changes since last index" | `codegraph sync` |
+| "Indexing is blocked by a stale lock" | `codegraph unlock` |
+
+### Rules of thumb
+
+- **Structural question → codegraph; literal text → grep.** Definitions, callers, callees, flows, "where is X", pre-edit surveys are codegraph's. String constants, `ci.yml` pins, YAML/TOML keys, comments, and docs are grep's — codegraph indexes symbols, not prose, and is the wrong tool for them.
+- **Trust codegraph for routine lookups** — it is a full AST parse, and re-grepping every result wastes context. Two exceptions where a grep cross-check IS required, because codegraph under-reports silently:
+  - **Ambiguous names** (see the next bullet): `callers`/`impact` answer for ONE definition with no warning. Measured here: `codegraph callers reserve_island` returns **1** against ~30 real callsites, because four definitions share the name and `callers` has no `-f` flag. `node -f <file>` does report all four.
+  - **Before acting on "no callers"** to delete, rename, or change a signature. An empty result is not evidence of absence.
+- **Polyglot name collisions are the norm here**: one API exists as a Rust core fn, an FFI `net_mesh_*` shim, and Rust/TS/Python SDK methods, so `query` returns several definitions with the same name. Read the paths before picking one — `node -f <file>` disambiguates.
+- **When tracing a flow**, use `mcp__codegraph_explore` (or `codegraph explore <query...>`) — one call returns relevant symbols' source plus call paths. `node <symbol>` gives the caller/callee trail for a single hop-by-hop walk.
+- **Editing from codegraph output**: it returns line numbers but no `[file#TAG]` snapshot anchor, and the `edit` tool requires one. Explore to locate → `read` the named range for its anchor → edit. Codegraph's "do not re-read these files" instruction does not apply before an edit.
+- **Staleness is the daemon's, not the CLI's.** With the daemon live, edits land in under a second — new symbols, shifted line numbers, and deletions all verified. With it stopped, results go stale **silently**: `status` still says "up to date" and `query` gives no warning. The daemon is spawned by the MCP server, so a CLI-only shell session may have none — run `codegraph sync` if results contradict a file you just edited.
+- **Rebuilding requires stopping the daemon first.** `codegraph index` fails with `EPERM … database file is in use` while it holds `codegraph.db`. Stop it with `codegraph daemon` (interactive picker), then reindex — a full rebuild of this repo is ~6s.
+
+### If `.codegraph/` doesn't exist
+
+Run `codegraph init` — indexing runs by default. Add `-y` for non-interactive/CI bootstraps, and `codegraph index` to rebuild from scratch later.
+
 ## Essential commands
 
 All Rust commands run from `net/crates/net/` (the workspace root).
@@ -200,46 +247,3 @@ The reverse holds on a Windows workstation: no local command compiles `#[cfg(uni
 - Design docs: `net/crates/net/docs/*.md` (behavior, capabilities, channels, transport, subnets, storage/cortex, organizations, identity).
 - Internal plans/audits: `docs/internal/` (plans, reviews, performance, audits).
 - Skill examples that CI actually executes: `.claude/skills/net-event-bus/examples/` (guarded by ci.yml paths — editing them re-runs the jobs that hold the maturin wheel and libnet cdylib).
-
-## CodeGraph
-
-This project has a CodeGraph knowledge graph index (`.codegraph/`). CodeGraph is a tree-sitter-parsed database of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
-
-### Access paths
-
-Two surfaces, one engine:
-
-- **MCP tool** — a harness wired to the codegraph MCP server (`codegraph serve --mcp`) exposes `codegraph_explore`; OMP registers it as `mcp__codegraph_explore` (route `xd://mcp__codegraph_explore`). Prefer it for the explore/trace question — identical output to the CLI with no shell round-trip. Only `explore` is exposed by default; `CODEGRAPH_MCP_TOOLS=explore,node,callers,callees,impact,search,status,files` widens the set.
-- **CLI** — always available, and the only way to reach the rest of the table below.
-
-### CLI usage reference
-
-Verified against the installed CLI (`codegraph --help`); there is no `search`, `trace`, or `affected <symbol>` subcommand.
-
-| Question | Command |
-|---|---|
-| "Find a symbol by name" | `codegraph query <name>` (`-k <kind>`, `-l <limit>`, `-j`) |
-| "Show a symbol's source + call trail" | `codegraph node <name>` (`-f <file>` to disambiguate) |
-| "Read a file with line numbers + dependents" | `codegraph node -f <file>` (`--offset`, `--limit`, `--symbols-only`) |
-| "Find callers of a function" | `codegraph callers <symbol>` |
-| "Find callees a function calls" | `codegraph callees <symbol>` |
-| "Explore an area / trace flow" | `codegraph explore <query...>` (`--max-files`) |
-| "Impact analysis for symbol Z" | `codegraph impact <symbol>` (`-d <depth>`) |
-| "Which tests do these changed files affect?" | `codegraph affected <files...>` (`--stdin`, `-d`, `-f <glob>`) |
-| "What files exist under path/" | `codegraph files --filter <dir>` (`--pattern <glob>`, `--format tree\|flat\|grouped`) |
-| "Build context for a task" | `codegraph context <task...>` |
-| "Is the index healthy?" | `codegraph status` |
-| "Pick up changes since last index" | `codegraph sync` |
-| "Indexing is blocked by a stale lock" | `codegraph unlock` |
-
-### Rules of thumb
-
-- **Use codegraph first** for structural questions (definitions, callers, callees, flows). It's faster and more accurate than grep.
-- **Trust codegraph results** — they come from a full AST parse. Do NOT re-verify with grep.
-- **Polyglot name collisions are the norm here**: one API exists as a Rust core fn, an FFI `net_mesh_*` shim, and Rust/TS/Python SDK methods, so `query` returns several definitions with the same name. Read the paths before picking one — `node -f <file>` disambiguates.
-- **When tracing a flow**, use `mcp__codegraph_explore` (or `codegraph explore <query...>`) — one call returns relevant symbols' source plus call paths. `node <symbol>` gives the caller/callee trail for a single hop-by-hop walk.
-- **Index lag**: the file watcher debounces ~500ms behind writes. If you get stale results, run `codegraph sync` first, or check `codegraph status`.
-
-### If `.codegraph/` doesn't exist
-
-Run `codegraph init` — indexing runs by default. Add `-y` for non-interactive/CI bootstraps, and `codegraph index` to rebuild from scratch later.
