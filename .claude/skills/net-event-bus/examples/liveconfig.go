@@ -26,6 +26,10 @@ var pskHex = strings.Repeat("42", 32)
 
 const deliver = 5 * time.Second
 
+// Both subscribers are in the roster before the first publish, because
+// SubscribeChannel blocks on the publisher's ack.
+const subscribers = 2
+
 func reserveAddr() string {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -87,32 +91,71 @@ func parse(payload []byte) (int, string, bool) {
 	return version, mode, true
 }
 
+// checkDelivery fails loudly when a revision did not reach every subscriber.
+// The publisher's own report is the evidence, so read it instead of assuming
+// the fan-out worked.
+func checkDelivery(version int, report *mesh.PublishReport) {
+	if report.Attempted != subscribers {
+		log.Fatalf("v%d: roster held %d subscribers, expected %d",
+			version, report.Attempted, subscribers)
+	}
+	if report.Delivered != report.Attempted || len(report.Errors) > 0 {
+		log.Fatalf("v%d: delivered to %d of %d subscribers, errors: %v",
+			version, report.Delivered, report.Attempted, report.Errors)
+	}
+}
+
+// checkApplied fails loudly unless this subscriber applied both revisions with
+// the modes the publisher sent. The final line claims exactly that, so it is
+// checked before it is printed: a revision that never arrived is a failure,
+// not a quieter success.
+func checkApplied(name string, applied map[int]string) {
+	for _, revision := range []struct {
+		version int
+		mode    string
+	}{{1, "blue"}, {2, "green"}} {
+		if applied[revision.version] != revision.mode {
+			log.Fatalf("subscriber %s never applied v%d=%s: %v",
+				name, revision.version, revision.mode, applied)
+		}
+	}
+}
+
 // drain polls every shard. A published event lands on the shard derived from
 // its stream id, so a consumer drains all of them — Go has no async iterator.
-func drain(node *mesh.MeshNode, applied map[int]string) int {
+//
+// A quiet poll is not the end of the stream: two revisions published
+// back-to-back can land one poll apart, so the only reason to stop early is
+// holding every revision in expect.
+func drain(node *mesh.MeshNode, applied map[int]string, expect []int) int {
 	deadline := time.Now().Add(deliver)
 	seen := 0
-	for time.Now().Before(deadline) {
-		quiet := true
+	for {
 		for shard := uint16(0); shard < 4; shard++ {
+			// A failed receive is not an empty shard. Swallowing it would make
+			// "nothing was delivered" and "we never looked" the same answer.
 			events, err := node.RecvShard(shard, 64)
 			if err != nil {
-				continue
+				log.Fatalf("recv shard %d: %v", shard, err)
 			}
 			for _, event := range events {
-				quiet = false
 				seen++
 				if version, mode, ok := parse(event.Payload); ok {
 					applied[version] = mode
 				}
 			}
 		}
-		if quiet && seen > 0 {
-			break
+		complete := true
+		for _, version := range expect {
+			if _, ok := applied[version]; !ok {
+				complete = false
+			}
+		}
+		if complete || !time.Now().Before(deadline) {
+			return seen
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return seen
 }
 
 func main() {
@@ -166,14 +209,24 @@ func main() {
 
 	first := publish(1, "blue")
 	fmt.Printf("published v1 to %d of %d subscribers\n", first.Delivered, first.Attempted)
+	checkDelivery(1, first)
 
 	second := publish(2, "green")
 	fmt.Printf("published v2 to %d of %d subscribers\n", second.Delivered, second.Attempted)
+	checkDelivery(2, second)
 
+	// Both revisions are expected on both subscribers, so drain until each has
+	// them rather than until a poll comes back quiet.
 	appliedOne := map[int]string{}
 	appliedTwo := map[int]string{}
-	drain(one, appliedOne)
-	drain(two, appliedTwo)
+	drain(one, appliedOne, []int{1, 2})
+	drain(two, appliedTwo, []int{1, 2})
+
+	fmt.Printf("subscriber one applied:    %v\n", appliedOne)
+	fmt.Printf("subscriber two applied:    %v\n", appliedTwo)
+
+	checkApplied("one", appliedOne)
+	checkApplied("two", appliedTwo)
 
 	applied := 0
 	for _, appliedMap := range []map[int]string{appliedOne, appliedTwo} {
@@ -181,8 +234,6 @@ func main() {
 			applied++
 		}
 	}
-	fmt.Printf("subscriber one applied:    %v\n", appliedOne)
-	fmt.Printf("subscriber two applied:    %v\n", appliedTwo)
 	fmt.Printf("roster at publish time:    %d\n", second.Attempted)
 
 	fmt.Printf("RESULT ok subscribers=%d applied=%d version=2\n", second.Attempted, applied)

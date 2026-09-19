@@ -1,14 +1,19 @@
 /*
  * The job queue you no longer run (C).
  *
- * A producer, two workers, and a durable job log — three in-process mesh
- * nodes over loopback UDP plus a local append-only log. Jobs are appended to
- * the log (the queue), dispatched to a worker over nRPC, and a worker that
- * fails a job is retried on its peer. Nothing is re-executed, and the log is
- * the record you reconcile from.
+ * A producer, two workers, and an append-only job log — three in-process
+ * mesh nodes over loopback UDP plus a local log. Jobs are appended to the
+ * log (the queue), dispatch reads them back out of it, and a worker that
+ * *refuses* a job re-issues it to its peer. Nothing is re-executed, and the
+ * results log is the record you reconcile from.
+ *
+ * Both logs live in memory for the life of the process — that is all this
+ * route needs, and all it claims. Surviving a restart is a directory passed
+ * to `net_redex_new` plus `{"persistent":true}` in the open-file config.
  *
  * Mirrors examples/jobqueue.rs. The Rust `local_addr()` has no C binding, so
- * each node binds a chosen free loopback port instead of ":0".
+ * each node reserves an ephemeral loopback port for itself before binding
+ * (see `reserve_addr`) rather than trusting a hard-coded one.
  *
  * Build: gcc jobqueue.c -lnet -lpthread -ldl -lm && ./a.out
  *
@@ -18,10 +23,13 @@
 #include "net.go.h"
 #include "net_rpc.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static const char *PSK_HEX =
@@ -29,19 +37,55 @@ static const char *PSK_HEX =
 
 enum { JOBS = 6, POISON = 3 };
 
+/* A typed handler signals an application status by prefixing its `out_err`
+ * with `nrpc:app_error:0x<code>:`; the wire status comes back to the caller
+ * as `server_error: status=0x<code> message=...`. 0x8001 is the cross-binding
+ * NRPC_TYPED_HANDLER_ERROR — see net/crates/net/sdk/src/mesh_rpc.rs. */
+#define REFUSAL_APP_ERROR "nrpc:app_error:0x8001:"
+#define REFUSAL_STATUS "status=0x8001"
+
 static void seed_hex(char *out, unsigned char b) {
     for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", b);
     out[64] = '\0';
 }
 
-static int build(unsigned char seed_byte, unsigned port, net_meshnode_t **out) {
+/* Ask the kernel for a free loopback port instead of naming one: bind a UDP
+ * socket to port 0, read back what it was given, and close it again. A
+ * hard-coded port fails whenever something else already holds it, and two
+ * copies of this example could never run at once. The node re-binds the port
+ * immediately below, which is how the sibling ports get the same property out
+ * of `local_addr()`. */
+static int reserve_addr(char *out, size_t out_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t sa_len = sizeof sa;
+    if (bind(fd, (struct sockaddr *)&sa, sa_len) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sa_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(out, out_len, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    close(fd);
+    return 0;
+}
+
+/* Builds a node on a freshly reserved port and reports the address back, so
+ * the handshakes below have something to connect to. */
+static int build(unsigned char seed_byte, net_meshnode_t **out, char *addr_out,
+                 size_t addr_len) {
+    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed[65];
     seed_hex(seed, seed_byte);
     char cfg[512];
     snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"127.0.0.1:%u\",\"psk_hex\":\"%s\","
+             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
              "\"identity_seed_hex\":\"%s\"}",
-             port, PSK_HEX, seed);
+             addr_out, PSK_HEX, seed);
     return net_mesh_new(cfg, out);
 }
 
@@ -127,9 +171,12 @@ static int rpc_dispatch(uint64_t handler_id, const uint8_t *req_ptr,
     unsigned job_id = parse_job_id(req_ptr, req_len);
 
     if (worker == 1 && job_id == POISON) {
-        /* A typed application refusal, not a transport error. The caller
-         * decides to retry; the substrate never does it silently. */
-        *out_err = dup_cstr("server_error: worker refused job 3");
+        /* The `nrpc:app_error:` prefix is what makes this a typed
+         * application refusal rather than the generic Internal a bare
+         * message maps to — and it is returned BEFORE the job does any
+         * work, which is what makes re-issuing it safe. The caller decides
+         * to retry; the substrate never does it silently. */
+        *out_err = dup_cstr(REFUSAL_APP_ERROR "worker 1 refused job 3");
         return -1;
     }
 
@@ -143,14 +190,34 @@ static int rpc_dispatch(uint64_t handler_id, const uint8_t *req_ptr,
     return 0;
 }
 
+/* `net_redex_file_read_range` hands back a JSON array whose entries each
+ * carry `"payload_hex":"<hex>"`. Decode the next payload into `out` and
+ * advance `*cursor` past it; returns 0 once the array is exhausted. Both
+ * the queue replay and the results reconcile walk a log this way. */
+static int next_payload(const char **cursor, char *out, size_t cap) {
+    static const char needle[] = "\"payload_hex\":\"";
+    const char *p = strstr(*cursor, needle);
+    if (!p) return 0;
+    p += sizeof needle - 1;
+    const char *end = strchr(p, '"');
+    if (!end) return 0;
+    size_t hlen = (size_t)(end - p);
+    size_t o = 0;
+    for (size_t i = 0; i + 1 < hlen && o + 1 < cap; i += 2) {
+        char byte[3] = {p[i], p[i + 1], '\0'};
+        out[o++] = (char)strtoul(byte, NULL, 16);
+    }
+    out[o] = '\0';
+    *cursor = end + 1;
+    return 1;
+}
+
 int main(void) {
     net_meshnode_t *producer = NULL, *w1 = NULL, *w2 = NULL;
-    if (build(0x71, 39031, &producer) != 0) { fprintf(stderr, "build producer failed\n"); return 1; }
-    if (build(0x72, 39032, &w1) != 0) { fprintf(stderr, "build w1 failed\n"); return 1; }
-    if (build(0x73, 39033, &w2) != 0) { fprintf(stderr, "build w2 failed\n"); return 1; }
-
-    const char *producer_addr = "127.0.0.1:39031";
-    const char *w1_addr = "127.0.0.1:39032";
+    char producer_addr[32], w1_addr[32], w2_addr[32];
+    if (build(0x71, &producer, producer_addr, sizeof producer_addr) != 0) { fprintf(stderr, "build producer failed\n"); return 1; }
+    if (build(0x72, &w1, w1_addr, sizeof w1_addr) != 0) { fprintf(stderr, "build w1 failed\n"); return 1; }
+    if (build(0x73, &w2, w2_addr, sizeof w2_addr) != 0) { fprintf(stderr, "build w2 failed\n"); return 1; }
 
     if (handshake(producer, w1, producer_addr) != 0) { fprintf(stderr, "p<->w1 failed\n"); return 1; }
     if (handshake(producer, w2, producer_addr) != 0) { fprintf(stderr, "p<->w2 failed\n"); return 1; }
@@ -211,7 +278,9 @@ int main(void) {
         return 1;
     }
 
-    /* The queue: a local append-only log, one record per submitted job. */
+    /* The queue: a local append-only log, one record per submitted job. A
+     * NULL persistent dir selects the in-memory manager — these logs are the
+     * queue for as long as the process lives, and no longer. */
     net_redex_t *redex = net_redex_new(NULL);
     net_redex_file_t *queue = NULL, *results = NULL;
     if (!redex ||
@@ -232,11 +301,30 @@ int main(void) {
         printf("queued job %u at seq %llu\n", id, (unsigned long long)seq);
     }
 
-    /* Dispatch round-robin; a refusal re-issues the same job to the other. */
+    /* Dispatch. The work list comes back out of the queue log, not out of
+     * the loop that wrote it — the log IS the queue. */
+    char *queue_json = NULL;
+    size_t queue_json_len = 0;
+    if (net_redex_file_read_range(queue, 0, net_redex_file_len(queue),
+                                  &queue_json, &queue_json_len) != 0) {
+        fprintf(stderr, "queue read_range failed\n");
+        return 1;
+    }
+    unsigned queued[JOBS];
+    int queued_count = 0;
+    const char *qp = queue_json;
+    char qrec[128];
+    while (queued_count < JOBS && next_payload(&qp, qrec, sizeof qrec)) {
+        if (strncmp(qrec, "job:", 4) == 0) {
+            queued[queued_count++] = (unsigned)strtoul(qrec + 4, NULL, 10);
+        }
+    }
+    if (queue_json) net_free_string(queue_json);
+
     uint64_t targets[2] = {w1_id, w2_id};
     int retried = 0;
-    for (unsigned id = 1; id <= JOBS; id++) {
-        unsigned index = id - 1;
+    for (int index = 0; index < queued_count; index++) {
+        unsigned id = queued[index];
         uint64_t primary = targets[index % 2];
         uint64_t secondary = targets[(index + 1) % 2];
         char body[32];
@@ -249,8 +337,18 @@ int main(void) {
                               (const uint8_t *)body, (size_t)n, 5000, 0,
                               &resp, &resp_len, &err);
         if (rc != 0) {
-            if (err) net_rpc_free_cstring(err);
-            /* The rust worker id 1 is the one that refuses job 3. */
+            /* ONLY the typed refusal is re-issued. A timeout or a transport
+             * fault means the call failed, not that the job did — the worker
+             * may have run it already, and re-issuing would execute it
+             * twice. Those are fatal here; duplicates=0 is a claim this
+             * guard earns. */
+            if (!err || !strstr(err, REFUSAL_STATUS)) {
+                fprintf(stderr, "job %u failed on 0x%llx, not refused: %s\n",
+                        id, (unsigned long long)primary, err ? err : "?");
+                if (err) net_rpc_free_cstring(err);
+                return 1;
+            }
+            net_rpc_free_cstring(err);
             retried++;
             printf("job %u refused by 0x%llx; re-issuing to 0x%llx\n", id,
                    (unsigned long long)primary, (unsigned long long)secondary);
@@ -290,8 +388,9 @@ int main(void) {
         }
     }
 
-    /* Reconcile from the logs, not from memory. A job id with one result
-     * record ran exactly once. */
+    /* Reconcile from the results log, not from a counter kept beside the
+     * dispatch loop: the completion count is whatever the log says. A job id
+     * with one result record ran exactly once. */
     int result_counts[JOBS + 2];
     for (int i = 0; i < JOBS + 2; i++) result_counts[i] = 0;
 
@@ -302,26 +401,13 @@ int main(void) {
         fprintf(stderr, "read_range failed\n");
         return 1;
     }
-    /* Each event JSON carries "payload_hex":"<hex of done:id:worker>". */
-    const char *needle = "\"payload_hex\":\"";
-    const char *p = results_json;
-    while ((p = strstr(p, needle)) != NULL) {
-        p += strlen(needle);
-        const char *end = strchr(p, '"');
-        if (!end) break;
-        char text[128];
-        size_t hlen = (size_t)(end - p);
-        size_t o = 0;
-        for (size_t i = 0; i + 1 < hlen && o < sizeof(text) - 1; i += 2) {
-            char byte[3] = {p[i], p[i + 1], '\0'};
-            text[o++] = (char)strtoul(byte, NULL, 16);
-        }
-        text[o] = '\0';
+    const char *rp = results_json;
+    char text[128];
+    while (next_payload(&rp, text, sizeof text)) {
         if (strncmp(text, "done:", 5) == 0) {
             unsigned id = (unsigned)strtoul(text + 5, NULL, 10);
             if (id >= 1 && id <= JOBS) result_counts[id]++;
         }
-        p = end + 1;
     }
     if (results_json) net_free_string(results_json);
 

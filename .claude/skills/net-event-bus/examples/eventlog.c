@@ -24,7 +24,8 @@
 
 /* Records appended to the log. */
 #define RECORDS 8
-/* Where the consumer left off, in sequence numbers. */
+/* The consumer's checkpoint: the next sequence it has NOT processed.
+ * Records 0..4 are done, so it resumes at 5. */
 #define CHECKPOINT 5
 
 /*
@@ -82,10 +83,12 @@ int main(void) {
         return 1;
     }
 
-    /* The consumer's offset is application state: it stores the sequence it
-     * last processed and asks for everything after it. Nothing is committed
-     * on the log's side, which is why a second consumer with a different
-     * checkpoint costs the log nothing. */
+    /* The consumer's checkpoint is application state: it holds the next
+     * sequence the consumer has not processed, and the consumer reads from
+     * there. `read_range` is half-open — `[start, end)` — so the checkpoint
+     * is the start bound verbatim: no `+ 1`, and no record replayed twice.
+     * Nothing is committed on the log's side, which is why a second consumer
+     * with a different checkpoint costs the log nothing. */
     char *resumed_json = NULL;
     size_t resumed_len = 0;
     if (net_redex_file_read_range(log, CHECKPOINT, total, &resumed_json,

@@ -8,7 +8,8 @@
  * factor to configure — the address *is* the data.
  *
  * Mirrors examples/objectstore.rs. The Rust `local_addr()` has no C binding,
- * so each node binds a chosen free loopback port instead of ":0".
+ * so each node reserves an ephemeral loopback port for itself before binding
+ * (see `reserve_addr`) rather than trusting a hard-coded one.
  *
  * Build: gcc objectstore.c -lnet -lpthread -ldl -lm && ./a.out
  *
@@ -18,10 +19,13 @@
 #include "net.go.h"
 #include "net_transport.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static const char *PSK_HEX =
@@ -41,14 +45,43 @@ static void seed_hex(char *out, unsigned char b) {
     out[64] = '\0';
 }
 
-static int build(unsigned char seed_byte, unsigned port, net_meshnode_t **out) {
+/* Ask the kernel for a free loopback port instead of naming one: bind a UDP
+ * socket to port 0, read back what it was given, and close it again. A
+ * hard-coded port fails whenever something else already holds it, and two
+ * copies of this example could never run at once. The node re-binds the port
+ * immediately below, which is how the sibling ports get the same property out
+ * of `local_addr()`. */
+static int reserve_addr(char *out, size_t out_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t sa_len = sizeof sa;
+    if (bind(fd, (struct sockaddr *)&sa, sa_len) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sa_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(out, out_len, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    close(fd);
+    return 0;
+}
+
+/* Builds a node on a freshly reserved port and reports the address back, so
+ * the handshake below has something to connect to. */
+static int build(unsigned char seed_byte, net_meshnode_t **out, char *addr_out,
+                 size_t addr_len) {
+    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed[65];
     seed_hex(seed, seed_byte);
     char cfg[512];
     snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"127.0.0.1:%u\",\"psk_hex\":\"%s\","
+             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
              "\"identity_seed_hex\":\"%s\"}",
-             port, PSK_HEX, seed);
+             addr_out, PSK_HEX, seed);
     return net_mesh_new(cfg, out);
 }
 
@@ -99,10 +132,10 @@ static void print_hex(const char *label, const uint8_t *bytes, size_t n) {
 
 int main(void) {
     net_meshnode_t *holder = NULL, *reader = NULL;
-    if (build(0x91, 39041, &holder) != 0) { fprintf(stderr, "build holder failed\n"); return 1; }
-    if (build(0x92, 39042, &reader) != 0) { fprintf(stderr, "build reader failed\n"); return 1; }
+    char holder_addr[32], reader_addr[32];
+    if (build(0x91, &holder, holder_addr, sizeof holder_addr) != 0) { fprintf(stderr, "build holder failed\n"); return 1; }
+    if (build(0x92, &reader, reader_addr, sizeof reader_addr) != 0) { fprintf(stderr, "build reader failed\n"); return 1; }
 
-    const char *holder_addr = "127.0.0.1:39041";
     if (handshake(holder, reader, holder_addr) != 0) {
         fprintf(stderr, "holder<->reader failed\n");
         return 1;
@@ -165,20 +198,28 @@ int main(void) {
     int same = (out_len == sizeof PAYLOAD && out &&
                 memcmp(out, PAYLOAD, sizeof PAYLOAD) == 0);
 
-    /* Content addressing means the second store is a no-op that produces the
-     * same address: identical bytes cannot occupy two identities.
-     *
-     * Note: the URI is part of the encoded ref, so the address identity here
-     * is "same uri + same bytes => same ref". */
+    /* Content addressing means storing the same bytes again is a local no-op
+     * that produces the same address: identical bytes cannot occupy two
+     * identities. Store through the same adapter — a second adapter would
+     * write its own copy and prove nothing about deduplication — and under a
+     * different URI, because the URI travels inside the encoded ref: two
+     * names for identical bytes encode differently while hashing the same.
+     * So the hash is the thing that must agree, not the ref. */
     uint8_t *ref2 = NULL;
     size_t ref2_len = 0;
-    if (net_mesh_blob_adapter_publish(store_r, (const uint8_t *)uri, strlen(uri),
-                                      PAYLOAD, sizeof PAYLOAD, &ref2,
-                                      &ref2_len) != 0) {
+    const char *other_uri = "mesh:another/name/entirely";
+    if (net_mesh_blob_adapter_publish(store_h, (const uint8_t *)other_uri,
+                                      strlen(other_uri), PAYLOAD,
+                                      sizeof PAYLOAD, &ref2, &ref2_len) != 0) {
         fprintf(stderr, "second publish failed\n");
         return 1;
     }
-    int dedup = (ref_len == ref2_len && memcmp(ref, ref2, ref_len) == 0) ? 1 : 0;
+    uint8_t address2[32];
+    if (net_blob_ref_hash(ref2, ref2_len, address2) != 0) {
+        fprintf(stderr, "net_blob_ref_hash failed\n");
+        return 1;
+    }
+    int dedup = memcmp(address, address2, sizeof address) == 0 ? 1 : 0;
 
     printf("read back from the mesh:  %zu bytes\n", out_len);
     printf("same bytes:               %s\n", same ? "true" : "false");

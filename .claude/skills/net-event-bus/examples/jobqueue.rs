@@ -1,10 +1,15 @@
 //! The job queue you no longer run.
 //!
-//! A producer, two workers, and a durable job log — three in-process mesh nodes
-//! over loopback UDP plus a local append-only log. Jobs are appended to the log
-//! (the queue), dispatched to a worker over nRPC, and a worker that fails a job
-//! is retried on its peer. Nothing is re-executed, and the log is the record you
-//! reconcile from.
+//! A producer, two workers, and an append-only job log — three in-process mesh
+//! nodes over loopback UDP plus a local log. Jobs are appended to the log (the
+//! queue), dispatch reads them back out of it, and a worker that *refuses* a
+//! job re-issues it to its peer. Nothing is re-executed, and the results log is
+//! the record you reconcile from.
+//!
+//! Both logs live in memory for the life of the process — that is all this
+//! route needs, and all it claims. Surviving a restart is two more arguments:
+//! `Redex::new().with_persistent_dir(dir)` and
+//! `RedexFileConfig::new().with_persistent(true)`.
 //!
 //! Run (from a crate whose `examples/` holds this file):
 //!
@@ -18,7 +23,7 @@ use std::time::Duration;
 
 use net_sdk::cortex::{Redex, RedexFileConfig};
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_rpc::{CallOptionsTyped, Codec};
+use net_sdk::mesh_rpc::{CallOptionsTyped, Codec, RpcError, NRPC_TYPED_HANDLER_ERROR};
 use net_sdk::{ChannelName, Identity};
 use serde::{Deserialize, Serialize};
 
@@ -93,8 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which one ran the job.
     let _serve_one = w1.serve_rpc_typed("run", Codec::Json, move |job: Job| async move {
         if job.id == POISON {
-            // A typed application refusal, not a transport error. The caller
-            // decides to retry; the substrate never does it silently.
+            // A typed application refusal — `Err(String)` from a typed handler
+            // arrives at the caller as `ServerError`/`NRPC_TYPED_HANDLER_ERROR`,
+            // not as a transport fault. It is issued BEFORE the job does any
+            // work, which is what makes re-issuing it safe.
             return Err(format!("worker {w1_id:#x} refused job {}", job.id));
         }
         Ok(Done {
@@ -109,8 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     })?;
 
-    // The queue: a local append-only log, one record per submitted job. This is
-    // the durability the broker used to provide.
+    // The queue: a local append-only log, one record per submitted job.
+    // `Redex::new()` is the in-memory manager — these logs are the queue for
+    // as long as the process lives, and no longer.
     let redex = Redex::new();
     let queue = redex.open_file(
         &ChannelName::new("jobs/queue").expect("channel"),
@@ -126,11 +134,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("queued job {id} at seq {seq}");
     }
 
-    // Dispatch. Round-robin across the workers; a refusal re-issues the same
-    // job to the other one.
+    // Dispatch. The work list comes back out of the queue log, not out of the
+    // loop that wrote it — the log IS the queue. Round-robin across the
+    // workers; a refusal re-issues that job to the other one.
+    let queued: Vec<u64> = queue
+        .read_range(0, queue.len() as u64)
+        .iter()
+        .filter_map(|event| {
+            let text = std::str::from_utf8(&event.payload).ok()?;
+            text.strip_prefix("job:")?.parse::<u64>().ok()
+        })
+        .collect();
+
     let targets = vec![w1_id, w2_id];
     let mut retried = 0usize;
-    for (index, id) in (1..=JOBS).enumerate() {
+    for (index, id) in queued.into_iter().enumerate() {
         let primary = targets[index % targets.len()];
         let secondary = targets[(index + 1) % targets.len()];
         let job = Job { id };
@@ -140,20 +158,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             Ok(done) => done,
-            Err(_) => {
+            // ONLY the typed refusal is re-issued. A timeout or a transport
+            // fault means the call failed, not that the job did — the worker
+            // may have run it already, and re-issuing would execute it twice.
+            // Those propagate; `duplicates=0` is a claim this match arm earns.
+            Err(RpcError::ServerError { status, .. }) if status == NRPC_TYPED_HANDLER_ERROR => {
                 retried += 1;
                 println!("job {id} refused by {primary:#x}; re-issuing to {secondary:#x}");
                 producer
                     .call_typed::<Job, Done>(secondary, "run", &job, CallOptionsTyped::default())
                     .await?
             }
+            Err(other) => return Err(other.into()),
         };
         results.append(format!("done:{}:{}", done.id, done.worker).as_bytes())?;
     }
 
-    // Reconcile from the logs, not from memory. Replaying the queue is how a
-    // restarted dispatcher knows what was outstanding; the results log is how it
-    // knows what was finished. A job id with one result record ran exactly once.
+    // Reconcile from the results log, not from a counter kept beside the
+    // dispatch loop: the completion count is whatever the log says. A job id
+    // with one result record ran exactly once.
     let mut done: BTreeMap<u64, usize> = BTreeMap::new();
     for event in results.read_range(0, results.len() as u64) {
         if let Ok(text) = std::str::from_utf8(&event.payload) {

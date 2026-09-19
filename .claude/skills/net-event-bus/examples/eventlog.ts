@@ -15,7 +15,8 @@ import { Redex } from '@net-mesh/sdk';
 
 /** Records appended to the log. */
 const RECORDS = 8;
-/** Where the consumer left off, in sequence numbers. */
+/** The consumer's checkpoint: the next sequence it has *not* processed.
+ *  Records 0..4 are done, so it resumes at 5. */
 const CHECKPOINT = 5n;
 
 async function main(): Promise<void> {
@@ -31,10 +32,12 @@ async function main(): Promise<void> {
   // broker to hand them back.
   const all = log.readRange(0n, log.len());
 
-  // The consumer's offset is application state: it stores the sequence it
-  // last processed and asks for everything after it. Nothing is committed
-  // on the log's side, which is why a second consumer with a different
-  // checkpoint costs the log nothing.
+  // The consumer's checkpoint is application state: it holds the next
+  // sequence the consumer has not processed, and the consumer reads from
+  // there. `readRange` is half-open — `[start, end)` — so the checkpoint is
+  // the start bound verbatim: no `+ 1`, and no record replayed twice.
+  // Nothing is committed on the log's side, which is why a second consumer
+  // with a different checkpoint costs the log nothing.
   const resumed = log.readRange(CHECKPOINT, log.len());
 
   // Replay is a read, not a transformation: the same range yields the same

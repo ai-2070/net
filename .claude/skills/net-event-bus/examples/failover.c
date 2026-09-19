@@ -11,7 +11,8 @@
  * sibling.
  *
  * Mirrors examples/failover.rs. The Rust `local_addr()` has no C binding, so
- * each node binds a chosen free loopback port instead of ":0".
+ * each node reserves an ephemeral loopback port for itself before binding
+ * (see `reserve_addr`) rather than trusting a hard-coded one.
  *
  * Build: gcc failover.c -lnet -lpthread -ldl -lm && ./a.out
  *
@@ -21,10 +22,13 @@
 #include "net.go.h"
 #include "net_rpc.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static const char *PSK_HEX =
@@ -38,14 +42,43 @@ static void seed_hex(char *out, unsigned char b) {
     out[64] = '\0';
 }
 
-static int build(unsigned char seed_byte, unsigned port, net_meshnode_t **out) {
+/* Ask the kernel for a free loopback port instead of naming one: bind a UDP
+ * socket to port 0, read back what it was given, and close it again. A
+ * hard-coded port fails whenever something else already holds it, and two
+ * copies of this example could never run at once. The node re-binds the port
+ * immediately below, which is how the sibling ports get the same property out
+ * of `local_addr()`. */
+static int reserve_addr(char *out, size_t out_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t sa_len = sizeof sa;
+    if (bind(fd, (struct sockaddr *)&sa, sa_len) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sa_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(out, out_len, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    close(fd);
+    return 0;
+}
+
+/* Builds a node on a freshly reserved port and reports the address back, so
+ * the handshakes below have something to connect to. */
+static int build(unsigned char seed_byte, net_meshnode_t **out, char *addr_out,
+                 size_t addr_len) {
+    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed[65];
     seed_hex(seed, seed_byte);
     char cfg[512];
     snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"127.0.0.1:%u\",\"psk_hex\":\"%s\","
+             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
              "\"identity_seed_hex\":\"%s\"}",
-             port, PSK_HEX, seed);
+             addr_out, PSK_HEX, seed);
     return net_mesh_new(cfg, out);
 }
 
@@ -188,11 +221,10 @@ static int call_service(MeshRpcHandle *rpc, unsigned units, uint64_t deadline_ms
 
 int main(void) {
     net_meshnode_t *caller = NULL, *p1 = NULL, *p2 = NULL;
-    if (build(0xC1, 39061, &caller) != 0) { fprintf(stderr, "build caller failed\n"); return 1; }
-    if (build(0xC2, 39062, &p1) != 0) { fprintf(stderr, "build p1 failed\n"); return 1; }
-    if (build(0xC3, 39063, &p2) != 0) { fprintf(stderr, "build p2 failed\n"); return 1; }
-
-    const char *caller_addr = "127.0.0.1:39061";
+    char caller_addr[32], p1_addr[32], p2_addr[32];
+    if (build(0xC1, &caller, caller_addr, sizeof caller_addr) != 0) { fprintf(stderr, "build caller failed\n"); return 1; }
+    if (build(0xC2, &p1, p1_addr, sizeof p1_addr) != 0) { fprintf(stderr, "build p1 failed\n"); return 1; }
+    if (build(0xC3, &p2, p2_addr, sizeof p2_addr) != 0) { fprintf(stderr, "build p2 failed\n"); return 1; }
 
     if (handshake(caller, p1, caller_addr) != 0) { fprintf(stderr, "c<->p1 failed\n"); return 1; }
     if (handshake(caller, p2, caller_addr) != 0) { fprintf(stderr, "c<->p2 failed\n"); return 1; }

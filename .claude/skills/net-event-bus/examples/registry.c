@@ -8,7 +8,8 @@
  * announcement to any address.
  *
  * Mirrors examples/registry.rs. The Rust `local_addr()` has no C binding, so
- * each node binds a chosen free loopback port instead of ":0".
+ * each node reserves an ephemeral loopback port for itself before binding
+ * (see `reserve_addr`) rather than trusting a hard-coded one.
  *
  * Build: gcc registry.c -lnet -lpthread -ldl -lm && ./a.out
  *
@@ -17,10 +18,13 @@
 
 #include "net.go.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 /* 32 bytes exactly — a PSK, not a passphrase. Every node in a mesh shares it. */
@@ -38,15 +42,43 @@ static void seed_hex(char *out, unsigned char b) {
     out[64] = '\0';
 }
 
-/* Bind a node to a chosen loopback port with a distinct identity seed. */
-static int build(unsigned char seed_byte, unsigned port, net_meshnode_t **out) {
+/* Ask the kernel for a free loopback port instead of naming one: bind a UDP
+ * socket to port 0, read back what it was given, and close it again. A
+ * hard-coded port fails whenever something else already holds it, and two
+ * copies of this example could never run at once. The node re-binds the port
+ * immediately below, which is how the sibling ports get the same property out
+ * of `local_addr()`. */
+static int reserve_addr(char *out, size_t out_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t sa_len = sizeof sa;
+    if (bind(fd, (struct sockaddr *)&sa, sa_len) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sa_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(out, out_len, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    close(fd);
+    return 0;
+}
+
+/* Bind a node to a freshly reserved loopback port with a distinct identity
+ * seed, and report the address back for the handshakes below. */
+static int build(unsigned char seed_byte, net_meshnode_t **out, char *addr_out,
+                 size_t addr_len) {
+    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed[65];
     seed_hex(seed, seed_byte);
     char cfg[512];
     snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"127.0.0.1:%u\",\"psk_hex\":\"%s\","
+             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
              "\"identity_seed_hex\":\"%s\"}",
-             port, PSK_HEX, seed);
+             addr_out, PSK_HEX, seed);
     return net_mesh_new(cfg, out);
 }
 
@@ -142,23 +174,15 @@ int main(void) {
     const char *caps_b = "{\"hardware\":{\"memory_gb\":64},\"tags\":[\"api\"]}";
     const char *caps_c = "{\"hardware\":{\"memory_gb\":256},\"tags\":[\"api\"]}";
 
-    /* Distinct ports per node; the C binding exposes no `local_addr`, so
-     * these are chosen (not kernel-assigned). */
-    const unsigned PORT_A = 39011, PORT_B = 39012, PORT_C = 39013,
-                   PORT_CALLER = 39014;
-
     net_meshnode_t *a = NULL, *b = NULL, *c = NULL, *caller = NULL;
-    if (build(0xA1, PORT_A, &a) != 0) { fprintf(stderr, "build a failed\n"); return 1; }
-    if (build(0xB2, PORT_B, &b) != 0) { fprintf(stderr, "build b failed\n"); return 1; }
-    if (build(0xC3, PORT_C, &c) != 0) { fprintf(stderr, "build c failed\n"); return 1; }
-    if (build(0xD4, PORT_CALLER, &caller) != 0) {
+    char addr_a[32], addr_b[32], addr_c[32], addr_caller[32];
+    if (build(0xA1, &a, addr_a, sizeof addr_a) != 0) { fprintf(stderr, "build a failed\n"); return 1; }
+    if (build(0xB2, &b, addr_b, sizeof addr_b) != 0) { fprintf(stderr, "build b failed\n"); return 1; }
+    if (build(0xC3, &c, addr_c, sizeof addr_c) != 0) { fprintf(stderr, "build c failed\n"); return 1; }
+    if (build(0xD4, &caller, addr_caller, sizeof addr_caller) != 0) {
         fprintf(stderr, "build caller failed\n");
         return 1;
     }
-
-    const char *addr_a = "127.0.0.1:39011";
-    const char *addr_b = "127.0.0.1:39012";
-    const char *addr_caller = "127.0.0.1:39014";
 
     /* Every accept() completes before any start() — the dispatch loop races
      * the responder handshake otherwise. */

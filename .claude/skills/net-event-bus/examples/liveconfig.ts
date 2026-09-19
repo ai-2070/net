@@ -14,13 +14,17 @@
 //!
 //! Expected final line: `RESULT ok subscribers=2 applied=2 version=2`
 
-import { MeshNode } from '@net-mesh/sdk';
+import { MeshNode, type PublishReport } from '@net-mesh/sdk';
 
 /** 64 hex characters = 32 bytes. Every node in a mesh shares it. */
 const PSK = '42'.repeat(32);
 
 /** How long we wait for a published revision to land in a subscriber's shards. */
 const DELIVER_MS = 5_000;
+
+/** Both subscribers are in the roster before the first publish, because
+ * `subscribeChannel` resolves on the publisher's ack. */
+const SUBSCRIBERS = 2;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -71,25 +75,53 @@ function parse(payload: string): [number, string] | null {
 }
 
 /**
+ * A revision that did not reach every subscriber is not a config update. The
+ * publisher's own report is the evidence, so read it instead of assuming the
+ * fan-out worked.
+ */
+function checkDelivery(version: number, report: PublishReport): void {
+  if (report.attempted !== SUBSCRIBERS) {
+    throw new Error(
+      `v${version}: roster held ${report.attempted} subscribers, expected ${SUBSCRIBERS}`,
+    );
+  }
+  if (report.delivered !== report.attempted || report.errors.length > 0) {
+    const detail = report.errors.map((e) => `${e.nodeId}: ${e.message}`).join('; ');
+    throw new Error(
+      `v${version}: delivered to ${report.delivered} of ${report.attempted} subscribers [${detail}]`,
+    );
+  }
+}
+
+/**
  * Drain every shard the bus could have routed a channel event to. Published
  * events land on the shard derived from the stream id, so a consumer polls all
  * of them — `recv` is that sweep, and `recvShard` is the targeted read.
+ *
+ * A quiet sweep is not the end of the stream: two revisions published
+ * back-to-back can land one poll apart, so the only reason to stop early is
+ * holding every revision in `expect`.
  */
-async function drain(node: MeshNode, applied: Map<number, string>): Promise<number> {
+async function drain(
+  node: MeshNode,
+  applied: Map<number, string>,
+  expect: number[],
+): Promise<number> {
   const deadline = Date.now() + DELIVER_MS;
   let seen = 0;
-  while (Date.now() < deadline) {
-    let quiet = true;
+  for (;;) {
+    // A failed receive is not an empty shard, so a `recv` rejection is left to
+    // propagate: "nothing was delivered" and "we never looked" are different.
     for (const event of await node.recv(64)) {
-      quiet = false;
       seen += 1;
       const revision = parse(event.rawBytes.toString('utf8'));
       if (revision !== null) applied.set(revision[0], revision[1]);
     }
-    if (quiet && seen > 0) break;
+    if (expect.every((version) => applied.has(version)) || Date.now() >= deadline) {
+      return seen;
+    }
     await sleep(20);
   }
-  return seen;
 }
 
 async function main(): Promise<void> {
@@ -121,21 +153,44 @@ async function main(): Promise<void> {
     reliability: 'reliable',
   });
   console.log(`published v1 to ${report.delivered} of ${report.attempted} subscribers`);
+  checkDelivery(1, report);
 
   report = await publisher.publish(channel, Buffer.from('v=2;mode=green'), {
     reliability: 'reliable',
   });
   console.log(`published v2 to ${report.delivered} of ${report.attempted} subscribers`);
+  checkDelivery(2, report);
 
+  // Both revisions are expected on both subscribers, so drain until each has
+  // them rather than until a poll comes back quiet.
   const one = new Map<number, string>();
   const two = new Map<number, string>();
-  await drain(s1, one);
-  await drain(s2, two);
-
-  const applied = [one, two].filter((seen) => seen.has(2)).length;
+  await drain(s1, one, [1, 2]);
+  await drain(s2, two, [1, 2]);
 
   console.log(`subscriber one applied:    ${JSON.stringify([...one])}`);
   console.log(`subscriber two applied:    ${JSON.stringify([...two])}`);
+
+  // The final line claims both subscribers applied both revisions, with the
+  // modes the publisher sent. Check that before claiming it: a revision that
+  // never arrived is a failure, not a quieter success.
+  for (const [name, seen] of [
+    ['one', one],
+    ['two', two],
+  ] as const) {
+    for (const [version, mode] of [
+      [1, 'blue'],
+      [2, 'green'],
+    ] as const) {
+      if (seen.get(version) !== mode) {
+        throw new Error(
+          `subscriber ${name} never applied v${version}=${mode}: ${JSON.stringify([...seen])}`,
+        );
+      }
+    }
+  }
+
+  const applied = [one, two].filter((seen) => seen.has(2)).length;
 
   // Worth pinning: the publisher's roster is what fan-out costs. Zero
   // subscribers is a no-op, not a queue that later has to be drained.

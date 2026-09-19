@@ -19,7 +19,8 @@ use net_sdk::ChannelName;
 
 /// Records appended to the log.
 const RECORDS: usize = 8;
-/// Where the consumer left off, in sequence numbers.
+/// The consumer's checkpoint: the next sequence it has *not* processed.
+/// Records 0..=4 are done, so it resumes at 5.
 const CHECKPOINT: u64 = 5;
 
 #[tokio::main(flavor = "current_thread")]
@@ -39,10 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // broker to hand them back.
     let all = log.read_range(0, log.len() as u64);
 
-    // The consumer's offset is application state: it stores the sequence it
-    // last processed and asks for everything after it. Nothing is committed
-    // on the log's side, which is why a second consumer with a different
-    // checkpoint costs the log nothing.
+    // The consumer's checkpoint is application state: it holds the next
+    // sequence the consumer has not processed, and the consumer reads from
+    // there. `read_range` is half-open — `[start, end)` — so the checkpoint
+    // is the start bound verbatim: no `+ 1`, and no record replayed twice.
+    // Nothing is committed on the log's side, which is why a second consumer
+    // with a different checkpoint costs the log nothing.
     let resumed = log.read_range(CHECKPOINT, log.len() as u64);
 
     // Replay is a read, not a transformation: the same range yields the same

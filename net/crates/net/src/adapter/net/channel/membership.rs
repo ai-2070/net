@@ -363,6 +363,29 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 ACK_REASON_RATE_LIMITED => Some(AckReason::RateLimited),
                 ACK_REASON_TOO_MANY_CHANNELS => Some(AckReason::TooManyChannels),
                 ACK_REASON_IDENTITY_NOT_ESTABLISHED => Some(AckReason::IdentityNotEstablished),
+                // Forward compatibility, and ONLY on a rejection. A
+                // newer publisher may refuse for a reason this build
+                // has no name for; rejecting the whole frame turns a
+                // clean "no" into an ack timeout, which is strictly
+                // less useful to the caller and indistinguishable from
+                // a dead peer. The verdict — `accepted = false` — was
+                // already decoded strictly above, so the outcome is
+                // never in doubt; only its label is.
+                //
+                // An unknown byte alongside `accepted = true` is still
+                // rejected: there is no such thing as an accepted
+                // request with a reason, so that combination means the
+                // sender and this decoder disagree about the frame, and
+                // guessing would be how an unparsed field becomes an
+                // admission.
+                _ if !accepted => {
+                    tracing::debug!(
+                        reason_byte,
+                        "membership ack: unknown rejection reason from a newer \
+                         peer; treating as a rejection with no reason"
+                    );
+                    None
+                }
                 other => return Err(MembershipCodecError::UnknownType(other)),
             };
             // Same strict-trailer rejection on the ACK
@@ -505,6 +528,43 @@ mod tests {
             let decoded = decode(&bytes).unwrap();
             assert_eq!(decoded, msg);
         }
+    }
+
+    /// A rejection whose reason this build has no name for is still a
+    /// rejection. Erroring the frame instead would turn a newer peer's
+    /// clean "no" into an ack timeout — the failure mode that made
+    /// adding `IdentityNotEstablished` a wire-compat hazard for older
+    /// subscribers in the first place.
+    #[test]
+    fn an_unknown_rejection_reason_decodes_as_a_reasonless_rejection() {
+        let mut buf = vec![MSG_ACK];
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.push(0); // accepted = false
+        buf.push(0xEE); // a reason code from some future version
+        assert_eq!(
+            decode(&buf).expect("an unknown rejection reason must still decode"),
+            MembershipMsg::Ack {
+                nonce: 7,
+                accepted: false,
+                reason: None,
+            },
+        );
+    }
+
+    /// …but the leniency is scoped to rejections. An unknown byte
+    /// beside `accepted = true` means the sender and this decoder
+    /// disagree about the frame, and guessing is how an unparsed field
+    /// becomes an admission.
+    #[test]
+    fn an_unknown_reason_on_an_accepted_ack_is_still_rejected() {
+        let mut buf = vec![MSG_ACK];
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.push(1); // accepted = true
+        buf.push(0xEE);
+        assert!(matches!(
+            decode(&buf),
+            Err(MembershipCodecError::UnknownType(0xEE))
+        ));
     }
 
     #[test]

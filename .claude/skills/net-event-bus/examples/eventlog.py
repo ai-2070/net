@@ -21,7 +21,8 @@ from net import Redex
 
 # Records appended to the log.
 RECORDS = 8
-# Where the consumer left off, in sequence numbers.
+# The consumer's checkpoint: the next sequence it has *not* processed.
+# Records 0..4 are done, so it resumes at 5.
 CHECKPOINT = 5
 
 
@@ -38,10 +39,13 @@ def main() -> None:
         # broker to hand them back.
         all_events = log.read_range(0, len(log))
 
-        # The consumer's offset is application state: it stores the sequence it
-        # last processed and asks for everything after it. Nothing is committed
-        # on the log's side, which is why a second consumer with a different
-        # checkpoint costs the log nothing.
+        # The consumer's checkpoint is application state: it holds the next
+        # sequence the consumer has not processed, and the consumer reads
+        # from there. ``read_range`` is half-open — ``[start, end)`` — so the
+        # checkpoint is the start bound verbatim: no ``+ 1``, and no record
+        # replayed twice. Nothing is committed on the log's side, which is
+        # why a second consumer with a different checkpoint costs the log
+        # nothing.
         resumed = log.read_range(CHECKPOINT, len(log))
 
         # Replay is a read, not a transformation: the same range yields the same

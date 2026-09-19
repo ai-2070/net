@@ -92,9 +92,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let readback = fetch_blob(&reader, holder.inner().node_id(), &first).await?;
     let same = readback.as_ref() == PAYLOAD.as_slice();
 
-    // Content addressing means the second store is a no-op that produces the
-    // same address: identical bytes cannot occupy two identities.
-    let second = publish_blob_ref(&*reader_store, "mesh:another/name/entirely", &PAYLOAD).await?;
+    // Content addressing means storing the same bytes again is a local no-op
+    // that produces the same address: identical bytes cannot occupy two
+    // identities. Store through the same adapter — `reader_store` is a
+    // separate log and would write its own copy, proving nothing about
+    // deduplication — and under a different URI, because the URI travels
+    // inside the encoded ref: two names for identical bytes encode
+    // differently while hashing the same. So the hash is what must agree.
+    let second = publish_blob_ref(&*holder_store, "mesh:another/name/entirely", &PAYLOAD).await?;
     let dedup = usize::from(first.small_hash() == second.small_hash());
 
     // A BlobRef round-trips through bytes, which is how one rides inside an

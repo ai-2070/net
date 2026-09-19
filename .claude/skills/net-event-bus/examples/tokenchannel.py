@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 import time
 
-from net import Identity, NetMesh
+from net import ChannelAuthError, Identity, NetMesh
 
 # 64 hex characters = 32 bytes. Every node in a mesh shares it.
 PSK = "42" * 32
@@ -108,20 +108,24 @@ def main() -> None:
         print("issued a subscribe-only token to the subscriber")
 
         # Without it: refused. The publisher answers and says no, which is a
-        # different outcome from "the publisher never answered".
+        # different outcome from "the publisher never answered" — so catch the
+        # authorization rejection alone. A transport failure is not a refusal,
+        # and swallowing one here would print `refused=1` for a mesh that never
+        # made a decision.
         try:
             subscriber.subscribe_channel(publisher.node_id, CHANNEL)
             refused = False
-        except Exception:  # noqa: BLE001 - a refusal is the expected outcome
+        except ChannelAuthError:
             refused = True
         print(f"bare subscribe refused:            {str(refused).lower()}")
 
         # With it: admitted. The credential is presented on the subscribe
-        # request itself, not negotiated once per connection.
+        # request itself, not negotiated once per connection. Only a denial
+        # counts as `granted=False`; anything else propagates.
         try:
             subscriber.subscribe_channel(publisher.node_id, CHANNEL, token=token)
             granted = True
-        except Exception:  # noqa: BLE001 - a denial surfaces as granted=False
+        except ChannelAuthError:
             granted = False
         print(f"token-carrying subscribe admitted: {str(granted).lower()}")
 

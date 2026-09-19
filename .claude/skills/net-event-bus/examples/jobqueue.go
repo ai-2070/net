@@ -1,10 +1,14 @@
 // The job queue you no longer run (Go).
 //
-// A producer, two workers, and a durable job log — three in-process mesh nodes
-// over loopback UDP plus a local append-only log. Jobs are appended to the log
-// (the queue), dispatched to a worker over nRPC, and a worker that fails a job
-// is re-issued to its peer. Nothing is re-executed, and the log is the record
-// you reconcile from.
+// A producer, two workers, and an append-only job log — three in-process mesh
+// nodes over loopback UDP plus a local log. Jobs are appended to the log (the
+// queue), dispatch reads them back out of it, and a worker that *refuses* a
+// job re-issues it to its peer. Nothing is re-executed, and the results log is
+// the record you reconcile from.
+//
+// Both logs live in memory for the life of the process — that is all this
+// route needs, and all it claims. Surviving a restart is two more arguments:
+// NewRedex(dir) and &RedexFileConfig{Persistent: true}.
 //
 // Run: go run jobqueue.go
 //
@@ -13,9 +17,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +35,10 @@ const jobs = 6
 
 // Job 3 is refused by the first worker that sees it, so the retry is observable.
 const poison = 3
+
+// The wire status rides in the message the binding formats:
+// `server_error: status=0x8001 message=...`.
+var refusalStatus = fmt.Sprintf("status=0x%04x", mesh.NrpcTypedHandlerError)
 
 type job struct {
 	ID int `json:"id"`
@@ -87,9 +97,13 @@ func handshake(responder, initiator *mesh.MeshNode, responderAddr string) {
 func workerHandler(workerHex string, refusePoison bool) func(job) (done, error) {
 	return func(j job) (done, error) {
 		if refusePoison && j.ID == poison {
-			// A typed application refusal, not a transport error. The caller
+			// AppError so the refusal reaches the caller as a typed
+			// application status rather than the generic Internal a bare
+			// error maps to — and it is returned BEFORE the job does any
+			// work, which is what makes re-issuing it safe. The caller
 			// decides to retry; the substrate never does it silently.
-			return done{}, fmt.Errorf("worker %s refused job %d", workerHex, j.ID)
+			return done{}, mesh.AppError(mesh.NrpcTypedHandlerError,
+				[]byte(fmt.Sprintf("worker %s refused job %d", workerHex, j.ID)))
 		}
 		return done{ID: j.ID, Worker: workerHex}, nil
 	}
@@ -134,7 +148,8 @@ func main() {
 	twoHex := fmt.Sprintf("0x%x", twoID)
 
 	// The queue: a local append-only log, one record per submitted job. An
-	// empty persistent dir selects the in-memory manager.
+	// empty persistent dir selects the in-memory manager — these logs are the
+	// queue for as long as the process lives, and no longer.
 	redex := mesh.NewRedex("")
 	defer redex.Free()
 	queue, err := redex.OpenFile("jobs/queue", &mesh.RedexFileConfig{})
@@ -187,10 +202,29 @@ func main() {
 	}
 	defer serveTwo.Close()
 
+	// Dispatch. The work list comes back out of the queue log, not out of the
+	// loop that wrote it — the log IS the queue.
+	queuedEvents, err := queue.ReadRange(0, queue.Len())
+	if err != nil {
+		log.Fatalf("read queue: %v", err)
+	}
+	queued := []int{}
+	for _, event := range queuedEvents {
+		rest, ok := strings.CutPrefix(string(event.Payload), "job:")
+		if !ok {
+			continue
+		}
+		id, err := strconv.Atoi(rest)
+		if err != nil {
+			log.Fatalf("queue record %q is not a job id: %v", rest, err)
+		}
+		queued = append(queued, id)
+	}
+
 	targets := []uint64{oneID, twoID}
 	retried := 0
-	for index := range jobs {
-		current := job{ID: index + 1}
+	for index, id := range queued {
+		current := job{ID: id}
 		primary := index % len(targets)
 		secondary := (index + 1) % len(targets)
 
@@ -202,6 +236,15 @@ func main() {
 
 		result, err := call(targets[primary])
 		if err != nil {
+			// ONLY the typed refusal is re-issued. A timeout or a transport
+			// fault means the call failed, not that the job did — the worker
+			// may have run it already, and re-issuing would execute it twice.
+			// Those are fatal here; duplicates=0 is a claim this guard earns.
+			var rpcErr *mesh.RpcError
+			if !errors.As(err, &rpcErr) || rpcErr.Kind != mesh.RpcKindServerError ||
+				!strings.Contains(rpcErr.Message, refusalStatus) {
+				log.Fatalf("job %d failed on 0x%x, not refused: %v", current.ID, targets[primary], err)
+			}
 			retried++
 			fmt.Printf("job %d refused by 0x%x; re-issuing to 0x%x\n", current.ID, targets[primary], targets[secondary])
 			result, err = call(targets[secondary])
@@ -214,8 +257,9 @@ func main() {
 		}
 	}
 
-	// Reconcile from the logs, not from memory. A job id with one result record
-	// ran exactly once.
+	// Reconcile from the results log, not from a counter kept beside the
+	// dispatch loop: the completion count is whatever the log says. A job id
+	// with one result record ran exactly once.
 	events, err := results.ReadRange(0, results.Len())
 	if err != nil {
 		log.Fatalf("read results: %v", err)

@@ -12,7 +12,8 @@
  * connection.
  *
  * Mirrors examples/tokenchannel.rs. The Rust `local_addr()` has no C binding,
- * so each node binds a chosen free loopback port instead of ":0".
+ * so each node reserves an ephemeral loopback port for itself before binding
+ * (see `reserve_addr`) rather than trusting a hard-coded one.
  *
  * Build: gcc tokenchannel.c -lnet -lpthread -ldl -lm && ./a.out
  *
@@ -21,10 +22,13 @@
 
 #include "net.go.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 /* 32 bytes exactly — a PSK, not a passphrase. Every node in a mesh shares it. */
@@ -44,15 +48,43 @@ static void hex_of(const uint8_t *bytes, size_t n, char *out) {
     out[n * 2] = '\0';
 }
 
-/* Bind a node to a chosen loopback port with a distinct identity seed. */
-static int build(const uint8_t seed[32], unsigned port, net_meshnode_t **out) {
+/* Ask the kernel for a free loopback port instead of naming one: bind a UDP
+ * socket to port 0, read back what it was given, and close it again. A
+ * hard-coded port fails whenever something else already holds it, and two
+ * copies of this example could never run at once. The node re-binds the port
+ * immediately below, which is how the sibling ports get the same property out
+ * of `local_addr()`. */
+static int reserve_addr(char *out, size_t out_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t sa_len = sizeof sa;
+    if (bind(fd, (struct sockaddr *)&sa, sa_len) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sa_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(out, out_len, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    close(fd);
+    return 0;
+}
+
+/* Bind a node to a freshly reserved loopback port with a distinct identity
+ * seed, and report the address back for the handshake below. */
+static int build(const uint8_t seed[32], net_meshnode_t **out, char *addr_out,
+                 size_t addr_len) {
+    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed_hex[65];
     hex_of(seed, 32, seed_hex);
     char cfg[512];
     snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"127.0.0.1:%u\",\"psk_hex\":\"%s\","
+             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
              "\"identity_seed_hex\":\"%s\"}",
-             port, PSK_HEX, seed_hex);
+             addr_out, PSK_HEX, seed_hex);
     return net_mesh_new(cfg, out);
 }
 
@@ -97,8 +129,6 @@ static int handshake(net_meshnode_t *responder, net_meshnode_t *initiator,
 
 int main(void) {
     const char *channel = "config/gated";
-    const unsigned PORT_PUBLISHER = 39051, PORT_SUBSCRIBER = 39052;
-    const char *publisher_addr = "127.0.0.1:39051";
 
     uint8_t publisher_seed[32], subscriber_seed[32];
     seed_bytes(publisher_seed, 0xE1);
@@ -115,11 +145,14 @@ int main(void) {
     }
 
     net_meshnode_t *publisher = NULL, *subscriber = NULL;
-    if (build(publisher_seed, PORT_PUBLISHER, &publisher) != 0) {
+    char publisher_addr[32], subscriber_addr[32];
+    if (build(publisher_seed, &publisher, publisher_addr,
+              sizeof publisher_addr) != 0) {
         fprintf(stderr, "build publisher failed\n");
         return 1;
     }
-    if (build(subscriber_seed, PORT_SUBSCRIBER, &subscriber) != 0) {
+    if (build(subscriber_seed, &subscriber, subscriber_addr,
+              sizeof subscriber_addr) != 0) {
         fprintf(stderr, "build subscriber failed\n");
         return 1;
     }

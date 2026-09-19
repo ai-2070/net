@@ -1,10 +1,14 @@
 """The job queue you no longer run.
 
-A producer, two workers, and a durable job log — three in-process mesh nodes
-over loopback UDP plus a local append-only log. Jobs are appended to the log
-(the queue), dispatched to a worker over nRPC, and a worker that fails a job is
-re-issued to its peer. Nothing is re-executed, and the log is the record you
-reconcile from.
+A producer, two workers, and an append-only job log — three in-process mesh
+nodes over loopback UDP plus a local log. Jobs are appended to the log (the
+queue), dispatch reads them back out of it, and a worker that *refuses* a job
+re-issues it to its peer. Nothing is re-executed, and the results log is the
+record you reconcile from.
+
+Both logs live in memory for the life of the process — that is all this route
+needs, and all it claims. Surviving a restart is two more arguments:
+``Redex(persistent_dir=...)`` and ``open_file(name, persistent=True)``.
 
 Run:
 
@@ -21,7 +25,16 @@ from collections.abc import Callable
 from typing import Any
 
 from net import NetMesh, Redex
-from net.mesh_rpc import TypedMeshRpc
+from net.mesh_rpc import (
+    NRPC_TYPED_HANDLER_ERROR,
+    RpcAppError,
+    RpcServerError,
+    TypedMeshRpc,
+)
+
+# The wire status rides in the message the binding formats:
+# ``nrpc:server_error: status=0x8001 message=...``.
+REFUSAL_STATUS = f"status=0x{NRPC_TYPED_HANDLER_ERROR:04x}"
 
 # 64 hex characters = 32 bytes. Every node in a mesh shares it.
 PSK = "42" * 32
@@ -73,9 +86,15 @@ def worker_handler(
 
     def run(job: dict[str, Any]) -> dict[str, Any]:
         if refuse_poison and job["id"] == POISON:
-            # A typed application refusal, not a transport error. The caller
-            # decides to retry; the substrate never does it silently.
-            raise RuntimeError(f"worker {worker_hex} refused job {job['id']}")
+            # `RpcAppError` so the refusal reaches the caller as a typed
+            # application status rather than the generic `Internal` a bare
+            # `raise` maps to — and it is raised BEFORE the job does any work,
+            # which is what makes re-issuing it safe. The caller decides to
+            # retry; the substrate never does it silently.
+            raise RpcAppError(
+                NRPC_TYPED_HANDLER_ERROR,
+                f"worker {worker_hex} refused job {job['id']}",
+            )
         return {"id": job["id"], "worker": worker_hex}
 
     return run
@@ -107,7 +126,9 @@ def main() -> None:
         one_hex = f"0x{one_id:x}"
         two_hex = f"0x{two_id:x}"
 
-        # The queue: a local append-only log, one record per submitted job.
+        # The queue: a local append-only log, one record per submitted job. A
+        # `Redex` with no `persistent_dir` is the in-memory manager — these
+        # logs are the queue for as long as the process lives, and no longer.
         redex = Redex()
         queue = redex.open_file("jobs/queue")
         results = redex.open_file("jobs/results")
@@ -116,6 +137,14 @@ def main() -> None:
             for job_id in range(1, JOBS + 1):
                 seq = queue.append(f"job:{job_id}".encode())
                 print(f"queued job {job_id} at seq {seq}")
+
+            # Dispatch. The work list comes back out of the queue log, not out
+            # of the loop that wrote it — the log IS the queue.
+            queued: list[int] = []
+            for event in queue.read_range(0, len(queue)):
+                text = event.payload.decode("utf-8", "replace")
+                if text.startswith("job:"):
+                    queued.append(int(text[len("job:") :]))
 
             one_rpc = TypedMeshRpc.from_mesh(one)
             two_rpc = TypedMeshRpc.from_mesh(two)
@@ -126,18 +155,25 @@ def main() -> None:
             with one_rpc.serve(
                 "run", worker_handler(one_hex, refuse_poison=True)
             ), two_rpc.serve("run", worker_handler(two_hex, refuse_poison=False)):
-                for index in range(JOBS):
-                    job = {"id": index + 1}
+                for index, job_id in enumerate(queued):
+                    job = {"id": job_id}
                     primary = index % len(targets)
                     secondary = (index + 1) % len(targets)
                     try:
                         done = client.call(
                             targets[primary], "run", job, opts={"deadline_ms": 5000}
                         )
-                    except Exception:  # noqa: BLE001 - a refusal is retried
+                    except RpcServerError as error:
+                        # ONLY the typed refusal is re-issued. A timeout or a
+                        # transport fault means the call failed, not that the
+                        # job did — the worker may have run it already, and
+                        # re-issuing would execute it twice. Those propagate;
+                        # `duplicates=0` is a claim this guard earns.
+                        if REFUSAL_STATUS not in str(error):
+                            raise
                         retried += 1
                         print(
-                            f"job {job['id']} refused by 0x{targets[primary]:x}; "
+                            f"job {job_id} refused by 0x{targets[primary]:x}; "
                             f"re-issuing to 0x{targets[secondary]:x}"
                         )
                         done = client.call(
@@ -145,8 +181,9 @@ def main() -> None:
                         )
                     results.append(f"done:{done['id']}:{done['worker']}".encode())
 
-            # Reconcile from the logs, not from memory. A job id with one result
-            # record ran exactly once.
+            # Reconcile from the results log, not from a counter kept beside
+            # the dispatch loop: the completion count is whatever the log says.
+            # A job id with one result record ran exactly once.
             counts: dict[str, int] = {}
             for event in results.read_range(0, len(results)):
                 text = event.payload.decode("utf-8", "replace")

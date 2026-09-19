@@ -527,7 +527,11 @@ func (m *MeshNode) ServeBlobTransfer(adapter *MeshBlobAdapter) error {
 // This is the cross-node half of the blob surface:
 // MeshBlobAdapter.Fetch reads only what this node already holds.
 func (m *MeshNode) FetchBlob(holderID uint64, hash []byte) ([]byte, error) {
-	if len(hash) < 32 {
+	// Exact, not a lower bound. The C side reads 32 bytes from the
+	// pointer, so an over-long slice silently fetches whatever its
+	// first 32 bytes address — a prefix of the caller's input naming
+	// a different object, with no error anywhere.
+	if len(hash) != 32 {
 		return nil, fmt.Errorf(
 			"%w: hash must be 32 bytes, got %d", ErrTransferInvalidArgument, len(hash))
 	}

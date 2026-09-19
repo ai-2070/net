@@ -22485,22 +22485,36 @@ impl MeshNode {
         // iteration. `set` only fails if already set (a re-start); the
         // existing weak is equally valid, so ignore the result.
         let _ = self.self_weak.set(Arc::downgrade(self));
-        self.start_inner();
+        // Only a start that actually TRANSITIONED the node spawns the
+        // upgrade scanner. `start` is documented idempotent and
+        // `start_inner` also refuses while an `accept()` is in flight —
+        // spawning unconditionally meant each repeated or refused call
+        // added another detached scan loop, multiplying upgrade probes
+        // on a node that never started once.
+        let transitioned = self.start_inner();
         // Background direct-path upgrade scan loop (Stage 3). The loop
         // itself no-ops unless `auto_direct_upgrade` is set, so spawning
-        // unconditionally is cheap. Detached like the other lifecycle
-        // loops — it exits on `shutdown_notify`.
+        // on a real transition is cheap. Detached like the other
+        // lifecycle loops — it exits on `shutdown_notify`.
         #[cfg(feature = "nat-traversal")]
-        let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+        if transitioned {
+            let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+        }
+        #[cfg(not(feature = "nat-traversal"))]
+        let _ = transitioned;
     }
 
     /// Everything `start` does that needs only `&self`. Split out so
     /// the `Arc` wiring above happens exactly once, before any loop
     /// that reads it is spawned.
-    fn start_inner(&self) {
+    ///
+    /// Returns whether this call is the one that moved the node from
+    /// stopped to started — `false` for an idempotent re-start and for
+    /// a refusal against an in-flight `accept()`.
+    fn start_inner(&self) -> bool {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
-            return; // already started
+            return false; // already started
         }
         // After flipping `started`, observe `accept_in_flight`.
         // If any accept is mid-handshake, roll back and refuse.
@@ -22519,7 +22533,7 @@ impl MeshNode {
                  refusing to start the dispatch loop to avoid racing the \
                  responder handshake. Retry start() after accept() returns."
             );
-            return;
+            return false;
         }
 
         let recv_handle = self.spawn_receive_loop();
@@ -22534,7 +22548,9 @@ impl MeshNode {
                      was already running; ignoring the duplicate start. \
                      This usually indicates start() was invoked twice."
                 );
-                return;
+                // The router was already running, so this call did not
+                // complete a transition either.
+                return false;
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
@@ -22633,6 +22649,7 @@ impl MeshNode {
                 tasks.push(h);
             }
         }
+        true
     }
 
     /// The ONE production path that constructs a [`RoutingSupervisor`] and
@@ -29720,84 +29737,118 @@ impl MeshNode {
             )));
         };
 
-        // Split the one budget across the two legs, the same way
-        // membership splits its ack timeout across retransmissions:
-        // the documented bound is what the caller actually waits.
-        let per_leg = self.config.identity_proof_timeout / 2;
+        // Two exchanges at most, and the documented budget covers both:
+        // each exchange is two legs, so a leg gets a quarter of it.
+        //
+        // The second exchange exists because the proof leg retransmits.
+        // A challenge is consumed by the attempt that presents it, so if
+        // the verifier admitted a proof and its `Verdict` was lost, the
+        // retransmit lands on a spent nonce and comes back
+        // `NoChallenge` — reporting failure for an identity the verifier
+        // has in fact established. Rather than caching verdicts on the
+        // verifier (state whose whole purpose is to answer a message
+        // that was already sent), the prover simply starts a fresh
+        // exchange: the re-proof takes the already-pinned-and-matching
+        // path and is accepted.
+        const MAX_EXCHANGES: u32 = 2;
+        let per_leg = self.config.identity_proof_timeout / (2 * MAX_EXCHANGES);
         let attempts = self.config.identity_proof_max_attempts.max(1);
 
-        let challenge_reply = self
-            .identity_proof_leg(verifier_node_id, per_leg, attempts, |nonce| {
-                IdentityProofMsg::ChallengeRequest { nonce }
-            })
-            .await?;
-        let (verifier, challenge) = match challenge_reply {
-            IdentityProofReply::Challenge {
-                verifier,
-                challenge,
-            } => (verifier, challenge),
-            IdentityProofReply::Verdict { reject, .. } => {
-                return Err(AdapterError::Connection(format!(
-                    "identity verifier {:#x} refused to issue a challenge: {}",
-                    verifier_node_id,
-                    reject.map_or("no reason given".to_string(), |r| r.to_string()),
-                )));
-            }
-        };
-
-        // The verifier's entity is CLAIMED at this point, and it is
-        // sound to sign over: the verifier re-derives the transcript
-        // from its own real entity before checking the signature, so a
-        // verifier that lied gets a proof bound to an identity it
-        // cannot present anywhere.
-        let transcript = proof_transcript(
-            &verifier,
-            self.entity_id(),
-            self.node_id,
-            session_id,
-            &challenge,
-        );
-        let signature = self
-            .identity
-            .try_sign(&transcript)
-            .map_err(|e| {
-                AdapterError::Connection(format!(
-                    "cannot prove identity without a signing key: {e}"
-                ))
-            })?
-            .to_bytes();
-        let subject = self.entity_id().clone();
-
-        let verdict = self
-            .identity_proof_leg(verifier_node_id, per_leg, attempts, move |nonce| {
-                IdentityProofMsg::Proof {
-                    nonce,
-                    subject: subject.clone(),
+        let mut last_reject = None;
+        for exchange in 0..MAX_EXCHANGES {
+            let challenge_reply = self
+                .identity_proof_leg(verifier_node_id, per_leg, attempts, |nonce| {
+                    IdentityProofMsg::ChallengeRequest { nonce }
+                })
+                .await?;
+            let (verifier, challenge) = match challenge_reply {
+                IdentityProofReply::Challenge {
+                    verifier,
                     challenge,
-                    signature,
+                } => (verifier, challenge),
+                IdentityProofReply::Verdict { reject, .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} refused to issue a challenge: {}",
+                        verifier_node_id,
+                        reject.map_or("no reason given".to_string(), |r| r.to_string()),
+                    )));
                 }
-            })
-            .await?;
-        match verdict {
-            IdentityProofReply::Verdict { accepted: true, .. } => {
-                // Memoized against the incarnation it was proven on,
-                // so a reconnect (a fresh handshake hash, therefore a
-                // fresh session id on both sides) re-proves instead of
-                // assuming the far side still holds the binding.
-                self.proven_identity_sessions
-                    .insert(verifier_node_id, session_id);
-                Ok(())
+            };
+
+            // The verifier's entity is CLAIMED at this point, and it is
+            // sound to sign over: the verifier re-derives the transcript
+            // from its own real entity before checking the signature, so
+            // a verifier that lied gets a proof bound to an identity it
+            // cannot present anywhere.
+            let transcript = proof_transcript(
+                &verifier,
+                self.entity_id(),
+                self.node_id,
+                session_id,
+                &challenge,
+            );
+            let signature = self
+                .identity
+                .try_sign(&transcript)
+                .map_err(|e| {
+                    AdapterError::Connection(format!(
+                        "cannot prove identity without a signing key: {e}"
+                    ))
+                })?
+                .to_bytes();
+            let subject = self.entity_id().clone();
+
+            let verdict = self
+                .identity_proof_leg(verifier_node_id, per_leg, attempts, move |nonce| {
+                    IdentityProofMsg::Proof {
+                        nonce,
+                        subject: subject.clone(),
+                        challenge,
+                        signature,
+                    }
+                })
+                .await?;
+            match verdict {
+                IdentityProofReply::Verdict { accepted: true, .. } => {
+                    // Memoized against the incarnation it was proven on,
+                    // so a reconnect (a fresh handshake hash, therefore
+                    // a fresh session id on both sides) re-proves
+                    // instead of assuming the far side still holds the
+                    // binding.
+                    self.proven_identity_sessions
+                        .insert(verifier_node_id, session_id);
+                    return Ok(());
+                }
+                // The one retryable refusal: the nonce was spent, which
+                // on a retransmitting leg usually means our own earlier
+                // proof was consumed and its verdict lost.
+                IdentityProofReply::Verdict {
+                    reject: Some(IdentityProofReject::NoChallenge),
+                    ..
+                } if exchange + 1 < MAX_EXCHANGES => {
+                    last_reject = Some(IdentityProofReject::NoChallenge);
+                    continue;
+                }
+                IdentityProofReply::Verdict { reject, .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} refused the proof: {}",
+                        verifier_node_id,
+                        reject.map_or("no reason given".to_string(), |r| r.to_string()),
+                    )));
+                }
+                IdentityProofReply::Challenge { .. } => {
+                    return Err(AdapterError::Connection(format!(
+                        "identity verifier {:#x} answered a proof with a challenge",
+                        verifier_node_id
+                    )));
+                }
             }
-            IdentityProofReply::Verdict { reject, .. } => Err(AdapterError::Connection(format!(
-                "identity verifier {:#x} refused the proof: {}",
-                verifier_node_id,
-                reject.map_or("no reason given".to_string(), |r| r.to_string()),
-            ))),
-            IdentityProofReply::Challenge { .. } => Err(AdapterError::Connection(format!(
-                "identity verifier {:#x} answered a proof with a challenge",
-                verifier_node_id
-            ))),
         }
+        Err(AdapterError::Connection(format!(
+            "identity verifier {:#x} refused every exchange: {}",
+            verifier_node_id,
+            last_reject.map_or("no reason given".to_string(), |r| r.to_string()),
+        )))
     }
 
     /// Establish identity with `verifier_node_id` if this session has
@@ -29864,26 +29915,41 @@ impl MeshNode {
         let bytes = encode_identity_proof(&build(nonce));
 
         let (tx, mut rx) = oneshot::channel::<IdentityProofReply>();
+        // RAII, not manual removal on each exit path. The awaits below
+        // are cancellation points: a caller that drops this future —
+        // `tokio::select!`, a timeout around the subscribe, a dropped
+        // task — would otherwise leave the nonce in the map forever,
+        // and a caller that retries grows it without bound. Drop runs
+        // on every path including unwind, so the success path needs no
+        // special case either (the dispatcher's `remove_if` may already
+        // have taken it; removing an absent key is a no-op).
+        struct PendingLeg {
+            map: Arc<DashMap<u64, (u64, oneshot::Sender<IdentityProofReply>)>>,
+            nonce: u64,
+        }
+        impl Drop for PendingLeg {
+            fn drop(&mut self) {
+                self.map.remove(&self.nonce);
+            }
+        }
+        let _pending = PendingLeg {
+            map: self.pending_identity_proofs.clone(),
+            nonce,
+        };
         self.pending_identity_proofs
             .insert(nonce, (verifier_node_id, tx));
 
         let per_attempt = budget / attempts.max(1);
         let mut reply = None;
         for _ in 0..attempts {
-            if let Err(e) = self
-                .send_subprotocol_to_node(verifier_node_id, SUBPROTOCOL_IDENTITY_PROOF, &bytes)
-                .await
-            {
-                self.pending_identity_proofs.remove(&nonce);
-                return Err(e);
-            }
+            self.send_subprotocol_to_node(verifier_node_id, SUBPROTOCOL_IDENTITY_PROOF, &bytes)
+                .await?;
             match tokio::time::timeout(per_attempt, &mut rx).await {
                 Ok(Ok(r)) => {
                     reply = Some(r);
                     break;
                 }
                 Ok(Err(_)) => {
-                    self.pending_identity_proofs.remove(&nonce);
                     return Err(AdapterError::Connection(
                         "identity proof reply channel closed".into(),
                     ));
@@ -29891,14 +29957,12 @@ impl MeshNode {
                 Err(_) => continue,
             }
         }
-        let Some(reply) = reply else {
-            self.pending_identity_proofs.remove(&nonce);
-            return Err(AdapterError::Connection(format!(
+        reply.ok_or_else(|| {
+            AdapterError::Connection(format!(
                 "identity proof timeout ({:?}, {} attempts) with verifier {:#x}",
                 budget, attempts, verifier_node_id
-            )));
-        };
-        Ok(reply)
+            ))
+        })
     }
 
     /// Claim the one corrective re-announce allowed for `target`.

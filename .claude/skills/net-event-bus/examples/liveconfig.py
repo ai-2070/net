@@ -27,6 +27,10 @@ PSK = "42" * 32
 
 DELIVER_S = 5.0
 
+# Both subscribers are in the roster before the first publish, because
+# subscribe_channel blocks on the publisher's ack.
+SUBSCRIBERS = 2
+
 
 def build(seed: int) -> NetMesh:
     return NetMesh(
@@ -78,32 +82,51 @@ def parse(text: str) -> tuple[int, str] | None:
     return (version, mode)
 
 
-def drain(node: NetMesh, applied: dict[int, str]) -> int:
+def check_delivery(version: int, report: dict) -> None:
+    """A revision that did not reach every subscriber is not a config update.
+
+    The publisher's own report is the evidence, so read it instead of assuming
+    the fan-out worked.
+    """
+    if report["attempted"] != SUBSCRIBERS:
+        raise RuntimeError(
+            f"v{version}: roster held {report['attempted']} subscribers, "
+            f"expected {SUBSCRIBERS}"
+        )
+    if report["delivered"] != report["attempted"] or report["errors"]:
+        raise RuntimeError(
+            f"v{version}: delivered to {report['delivered']} of "
+            f"{report['attempted']} subscribers, errors: {report['errors']}"
+        )
+
+
+def drain(node: NetMesh, applied: dict[int, str], expect: tuple[int, ...]) -> int:
     """Drain every shard the bus could have routed a channel event to.
 
     Published events land on the shard derived from the stream id, so a consumer
     polls all of them — the low-level binding's ``poll_shard`` is the receive
-    half that the ergonomic wrapper does not expose.
+    half that the ergonomic wrapper does not expose. An empty shard is an empty
+    list, so a raised error means the receive itself failed: it propagates
+    rather than passing for "nothing arrived".
+
+    A quiet poll is not the end of the stream: two revisions published
+    back-to-back can land one poll apart, so the only reason to stop early is
+    holding every revision in ``expect``.
     """
     deadline = time.monotonic() + DELIVER_S
     seen = 0
-    while time.monotonic() < deadline:
-        quiet = True
+    while True:
         for shard in range(4):
-            try:
-                events = node.poll_shard(shard, 64)
-            except Exception:  # noqa: BLE001 - an empty shard is not fatal
-                continue
-            for event in events:
-                quiet = False
+            for event in node.poll_shard(shard, 64):
                 seen += 1
                 parsed = parse(event.raw)
                 if parsed is not None:
                     applied[parsed[0]] = parsed[1]
-        if quiet and seen > 0:
-            break
+        if all(version in applied for version in expect):
+            return seen
+        if time.monotonic() >= deadline:
+            return seen
         time.sleep(0.02)
-    return seen
 
 
 def main() -> None:
@@ -127,20 +150,40 @@ def main() -> None:
         one.subscribe_channel(publisher.node_id, "config/edge")
         two.subscribe_channel(publisher.node_id, "config/edge")
 
-        first = publisher.publish("config/edge", b"v=1;mode=blue")
+        first = publisher.publish(
+            "config/edge", b"v=1;mode=blue", reliability="reliable"
+        )
         print(f"published v1 to {first['delivered']} of {first['attempted']} subscribers")
+        check_delivery(1, first)
 
-        second = publisher.publish("config/edge", b"v=2;mode=green")
+        second = publisher.publish(
+            "config/edge", b"v=2;mode=green", reliability="reliable"
+        )
         print(f"published v2 to {second['delivered']} of {second['attempted']} subscribers")
+        check_delivery(2, second)
 
+        # Both revisions are expected on both subscribers, so drain until each
+        # has them rather than until a poll comes back quiet.
         applied_one: dict[int, str] = {}
         applied_two: dict[int, str] = {}
-        drain(one, applied_one)
-        drain(two, applied_two)
+        drain(one, applied_one, (1, 2))
+        drain(two, applied_two, (1, 2))
 
-        applied = sum(1 for applied_map in (applied_one, applied_two) if 2 in applied_map)
         print(f"subscriber one applied:    {sorted(applied_one.items())}")
         print(f"subscriber two applied:    {sorted(applied_two.items())}")
+
+        # The final line claims both subscribers applied both revisions, with
+        # the modes the publisher sent. Check that before claiming it: a
+        # revision that never arrived is a failure, not a quieter success.
+        for name, applied_map in (("one", applied_one), ("two", applied_two)):
+            for version, mode in ((1, "blue"), (2, "green")):
+                if applied_map.get(version) != mode:
+                    raise RuntimeError(
+                        f"subscriber {name} never applied v{version}={mode}: "
+                        f"{sorted(applied_map.items())}"
+                    )
+
+        applied = sum(1 for applied_map in (applied_one, applied_two) if 2 in applied_map)
         print(f"roster at publish time:    {second['attempted']}")
 
         print(

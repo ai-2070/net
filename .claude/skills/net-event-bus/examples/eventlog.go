@@ -23,7 +23,8 @@ import (
 // Records appended to the log.
 const records = 8
 
-// Where the consumer left off, in sequence numbers.
+// The consumer's checkpoint: the next sequence it has NOT processed.
+// Records 0..4 are done, so it resumes at 5.
 const checkpoint = 5
 
 func main() {
@@ -51,10 +52,12 @@ func main() {
 		log.Fatalf("read range: %v", err)
 	}
 
-	// The consumer's offset is application state: it stores the sequence it
-	// last processed and asks for everything after it. Nothing is committed
-	// on the log's side, which is why a second consumer with a different
-	// checkpoint costs the log nothing.
+	// The consumer's checkpoint is application state: it holds the next
+	// sequence the consumer has not processed, and the consumer reads from
+	// there. ReadRange is half-open — [start, end) — so the checkpoint is
+	// the start bound verbatim: no +1, and no record replayed twice.
+	// Nothing is committed on the log's side, which is why a second consumer
+	// with a different checkpoint costs the log nothing.
 	resumed, err := logFile.ReadRange(checkpoint, logFile.Len())
 	if err != nil {
 		log.Fatalf("read range: %v", err)

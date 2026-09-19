@@ -11,7 +11,7 @@
 //
 // Expected final line: `RESULT ok granted=1 refused=1`
 
-import { Identity, MeshNode } from '@net-mesh/sdk';
+import { ChannelAuthError, Identity, MeshNode } from '@net-mesh/sdk';
 import type { TokenScope } from '@net-mesh/sdk';
 
 /** 32 bytes exactly — a PSK, not a passphrase. Every node in a mesh shares it.
@@ -103,19 +103,29 @@ async function main(): Promise<void> {
   console.log('issued a subscribe-only token to the subscriber');
 
   // Without it: refused. The publisher answers and says no, which is a
-  // different outcome from "the publisher never answered".
+  // different outcome from "the publisher never answered" — so catch the
+  // authorization rejection alone. A transport failure is not a refusal, and
+  // swallowing one here would print `refused=1` for a mesh that never made a
+  // decision.
   const refused = await subscriber
     .subscribeChannel(publisher.nodeId(), channel)
     .then(() => false)
-    .catch(() => true);
+    .catch((err: unknown) => {
+      if (err instanceof ChannelAuthError) return true;
+      throw err;
+    });
   console.log(`bare subscribe refused:            ${refused}`);
 
   // With it: admitted. The credential is presented on the subscribe request
-  // itself, not negotiated once per connection.
+  // itself, not negotiated once per connection. Only a denial counts as
+  // `granted=false`; anything else propagates.
   const granted = await subscriber
     .subscribeChannel(publisher.nodeId(), channel, { token })
     .then(() => true)
-    .catch(() => false);
+    .catch((err: unknown) => {
+      if (err instanceof ChannelAuthError) return false;
+      throw err;
+    });
   console.log(`token-carrying subscribe admitted: ${granted}`);
 
   console.log(

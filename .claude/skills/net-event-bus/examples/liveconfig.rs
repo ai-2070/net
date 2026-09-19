@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{
-    ChannelConfig, ChannelId, ChannelName, PublishConfig, Reliability, Visibility,
+    ChannelConfig, ChannelId, ChannelName, PublishConfig, PublishReport, Reliability, Visibility,
 };
 use net_sdk::Identity;
 
@@ -29,6 +29,10 @@ const PSK: [u8; 32] = [0x42; 32];
 
 /// How long we wait for a published revision to land in a subscriber's shards.
 const DELIVER: Duration = Duration::from_secs(5);
+
+/// Both subscribers are in the roster before the first publish, because
+/// `subscribe_channel` blocks on the publisher's ack.
+const SUBSCRIBERS: usize = 2;
 
 async fn build(seed_byte: u8) -> Mesh {
     MeshBuilder::new("127.0.0.1:0", &PSK)
@@ -74,31 +78,56 @@ fn parse(payload: &[u8]) -> Option<(u64, String)> {
     Some((version?, mode?))
 }
 
+/// A revision that did not reach every subscriber is not a config update. The
+/// publisher's own report is the evidence, so read it instead of assuming the
+/// fan-out worked.
+fn check_delivery(version: u64, report: &PublishReport) -> Result<(), String> {
+    if report.attempted != SUBSCRIBERS {
+        return Err(format!(
+            "v{version}: roster held {} subscribers, expected {SUBSCRIBERS}",
+            report.attempted
+        ));
+    }
+    if !report.all_delivered() {
+        return Err(format!(
+            "v{version}: delivered to {} of {} subscribers, errors: {:?}",
+            report.delivered, report.attempted, report.errors
+        ));
+    }
+    Ok(())
+}
+
 /// Drain every shard the bus could have routed a channel event to. Published
 /// events land on the shard derived from the stream id, so a consumer polls all
 /// of them.
-async fn drain(node: &Mesh, applied: &mut BTreeMap<u64, String>) -> usize {
+///
+/// A quiet sweep is not the end of the stream: two revisions published
+/// back-to-back can land one poll apart, so the only reason to stop early is
+/// holding every revision in `expect`.
+async fn drain(
+    node: &Mesh,
+    applied: &mut BTreeMap<u64, String>,
+    expect: &[u64],
+) -> Result<usize, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + DELIVER;
     let mut seen = 0;
-    while Instant::now() < deadline {
-        let mut quiet = true;
+    loop {
         for shard in 0..4u16 {
-            if let Ok(events) = node.recv_shard(shard, 64).await {
-                for event in events {
-                    quiet = false;
-                    seen += 1;
-                    if let Some((version, mode)) = parse(&event.raw) {
-                        applied.insert(version, mode);
-                    }
+            // A failed receive is not an empty shard. Swallowing it would make
+            // "nothing was delivered" and "we never looked" the same answer.
+            for event in node.recv_shard(shard, 64).await? {
+                seen += 1;
+                if let Some((version, mode)) = parse(&event.raw) {
+                    applied.insert(version, mode);
                 }
             }
         }
-        if quiet && seen > 0 {
-            break;
+        if expect.iter().all(|version| applied.contains_key(version)) || Instant::now() >= deadline
+        {
+            return Ok(seen);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    seen
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -147,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "published v1 to {} of {} subscribers",
         report.delivered, report.attempted
     );
+    check_delivery(1, &report)?;
 
     // Revision 2, delivered the same way.
     let report = publisher
@@ -163,19 +193,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "published v2 to {} of {} subscribers",
         report.delivered, report.attempted
     );
+    check_delivery(2, &report)?;
 
+    // Both revisions are expected on both subscribers, so drain until each has
+    // them rather than until a poll comes back quiet.
     let mut one = BTreeMap::new();
     let mut two = BTreeMap::new();
-    drain(&s1, &mut one).await;
-    drain(&s2, &mut two).await;
-
-    let applied = [&one, &two]
-        .iter()
-        .filter(|applied| applied.get(&2).is_some())
-        .count();
+    drain(&s1, &mut one, &[1, 2]).await?;
+    drain(&s2, &mut two, &[1, 2]).await?;
 
     println!("subscriber one applied:    {one:?}");
     println!("subscriber two applied:    {two:?}");
+
+    // The final line claims both subscribers applied both revisions, with the
+    // modes the publisher sent. Check that before claiming it: a revision that
+    // never arrived is a failure, not a quieter success.
+    for (name, applied) in [("one", &one), ("two", &two)] {
+        for (version, mode) in [(1u64, "blue"), (2u64, "green")] {
+            if applied.get(&version).map(String::as_str) != Some(mode) {
+                return Err(format!(
+                    "subscriber {name} never applied v{version}={mode}: {applied:?}"
+                )
+                .into());
+            }
+        }
+    }
+
+    let applied = [&one, &two]
+        .iter()
+        .filter(|applied| applied.contains_key(&2))
+        .count();
 
     // Worth pinning: the publisher's roster is what fan-out costs. Zero
     // subscribers is a no-op, not a queue that later has to be drained.

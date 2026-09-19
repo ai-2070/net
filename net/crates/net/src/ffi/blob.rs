@@ -1159,7 +1159,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
         } else {
             unsafe { std::slice::from_raw_parts(data, data_len) }
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let data_owned = data_slice.to_vec();
         let result = block_on(async move { (*adapter).store(&blob_ref, &data_owned).await });
         match result {
@@ -1227,12 +1227,15 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_publish(
         } else {
             unsafe { std::slice::from_raw_parts(data, data_len) }
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let data_owned = data_slice.to_vec();
         let result = block_on(async move {
-            // `adapter` is `ManuallyDrop<Arc<MeshBlobAdapter>>`; two derefs reach
-            // the adapter itself, which is what implements `BlobAdapter`.
-            publish_blob_ref(&**adapter, uri, &data_owned).await
+            // `Arc::clone` on the `ManuallyDrop<Arc<..>>` field, never
+            // `.clone()`: the latter clones the WRAPPER, so the bumped
+            // strong count is never released and every call leaks one
+            // reference to the adapter. One deref then reaches the
+            // adapter itself, which is what implements `BlobAdapter`.
+            publish_blob_ref(&*adapter, uri, &data_owned).await
         });
         match result {
             Ok(blob_ref) => {
@@ -1325,7 +1328,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
             Ok(Some(b)) => b,
             _ => return NET_ERR_BLOB_DECODE,
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
         match result {
             // Allocate with the same explicit `Layout::array::<u8>(len)`
@@ -1372,7 +1375,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
             Ok(Some(b)) => b,
             _ => return NET_ERR_BLOB_DECODE,
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let result = block_on(async move { (*adapter).exists(&blob_ref).await });
         match result {
             Ok(present) => {
@@ -1408,7 +1411,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
                 Some(op) => op,
                 None => return ptr::null_mut(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             let body = (*adapter).prometheus_text();
             match std::ffi::CString::new(body) {
                 Ok(s) => s.into_raw(),
@@ -1440,7 +1443,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         if (*adapter).overflow_enabled() {
             1
         } else {
@@ -1469,7 +1472,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         if (*adapter).overflow_active() {
             1
         } else {
@@ -1501,7 +1504,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
                 Some(op) => op,
                 None => return ptr::null_mut(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             let cfg = (*adapter).overflow_config();
             let json = overflow_to_json(cfg);
             match std::ffi::CString::new(json) {
@@ -1536,7 +1539,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
                 Some(op) => op,
                 None => return NetError::NullPointer.into(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             (*adapter).set_overflow_enabled(enabled != 0);
             0
         },
@@ -1574,7 +1577,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         (*adapter).set_overflow_config(cfg);
         0
     })

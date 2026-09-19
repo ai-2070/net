@@ -35,9 +35,13 @@ SERVICE = "work"
 # The roster keeps listing the dead provider until the capability fold
 # converges, so the first post-death attempt may be spent on the corpse.
 # Rust has ``call_service_typed_with_retry``; this binding does not, so the
-# loop is written by hand: up to 6 attempts, ~250 ms apart.
+# loop is written by hand: up to 6 attempts, ~250 ms apart, each bounded by a
+# short call deadline. The deadline is the half that matters — a call to a
+# corpse does not fail, it waits, so a generous one turns six quick retries
+# into half a minute of nothing happening.
 RETRY_ATTEMPTS = 6
 RETRY_INTERVAL_S = 0.25
+CALL_DEADLINE_MS = 500
 
 
 def build(seed: int) -> NetMesh:
@@ -122,7 +126,7 @@ def main() -> None:
 
             # Call the service, not a host.
             first = caller_rpc.call_service(
-                SERVICE, {"units": 2}, opts={"deadline_ms": 5000}
+                SERVICE, {"units": 2}, opts={"deadline_ms": 1000}
             )
             print(f"first call served by:  {first['served_by']:#x}")
 
@@ -143,7 +147,7 @@ def main() -> None:
             for _ in range(RETRY_ATTEMPTS):
                 try:
                     second = caller_rpc.call_service(
-                        SERVICE, {"units": 5}, opts={"deadline_ms": 5000}
+                        SERVICE, {"units": 5}, opts={"deadline_ms": CALL_DEADLINE_MS}
                     )
                     break
                 except Exception as error:  # noqa: BLE001 - the corpse is retried

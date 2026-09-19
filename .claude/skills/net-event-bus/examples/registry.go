@@ -100,10 +100,10 @@ func main() {
 	_ = addrC
 
 	// Every accept() completes before any start().
-	handshake(b, a, addrB)             // A <-> B
-	handshake(a, caller, addrA)        // A <-> caller
-	handshake(caller, b, addrCaller)   // B <-> caller
-	handshake(caller, c, addrCaller)   // C <-> caller
+	handshake(b, a, addrB)           // A <-> B
+	handshake(a, caller, addrA)      // A <-> caller
+	handshake(caller, b, addrCaller) // B <-> caller
+	handshake(caller, c, addrCaller) // C <-> caller
 
 	for _, n := range []*mesh.MeshNode{a, b, c, caller} {
 		if err := n.Start(); err != nil {
