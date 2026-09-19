@@ -84,7 +84,7 @@ futures-channel = "0.3"
 serde_json = { version = "1", features = ["preserve_order"] }
 # Credential decoding (`net-bootstrap:` + URL-safe unpadded base64)
 # and the base64 the event JSON carries byte payloads in.
-base64 = "0.22"
+base64 = "0.23"
 # Overwrite the identity scalars when the at-rest value drops
 # (`identity::IdentitySecrets`). A volatile write plus a compiler
 # fence, which is the part a plain assignment cannot promise; the
