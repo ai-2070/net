@@ -443,6 +443,18 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
           resolve();
           return;
         }
+        // A TERMINAL replica answers now. `settleReady` only runs
+        // when a frame arrives, and nothing arrives for a store whose
+        // owner is gone — so a `ready()` called AFTER the goodbye
+        // landed was pushed onto a queue nobody would ever drain. A
+        // review probe found it by asking a terminal replica for
+        // `ready()` and waiting: the caller is left inferring the
+        // answer from silence, which is the defect this whole
+        // mechanism exists to remove.
+        if (replica.state === 'closed') {
+          reject(new StoreError('owner-lost', 'the store owner closed this handle'));
+          return;
+        }
         readyWaiters.push({ resolve, reject });
       }),
     act: async (name, input) => {

@@ -121,8 +121,11 @@
 //!
 //! 10. an unauthorized write is refused with a typed `forbidden`
 //!     while the same replica is still served; and
-//! 11. a handle whose owner was REPLACED is refused `owner-lost`,
-//!     and the successor adopts nothing.
+//! 11. a write through a handle whose owner was REPLACED is refused
+//!     `owner-lost`, promptly and with a typed code — the ADOPTION
+//!     half is witnessed in process instead, because once the
+//!     goodbye lands the replica refuses locally and no frame
+//!     reaches the successor at all.
 //!
 //! ## The "unexplained ZERO", answered
 //!
@@ -1921,10 +1924,10 @@ async fn refusals(cx: &Cx7<'_>, ledger: &mut Ledger) {
             && successor_unmoved
             && nothing_bound,
         format!(
-            "A HANDLE FROM A REPLACED OWNER IS REFUSED, AND THE SUCCESSOR ADOPTS \
-             NOTHING. First the CONTROL, through the same handle and while its owner \
-             was alive: `bump {{by: 3}}` was accepted and moved the authority to tick \
-             {:?} (asserted 3) — so what follows is about the REPLACEMENT and not \
+            "A WRITE THROUGH A REPLACED OWNER'S HANDLE IS REFUSED, PROMPTLY AND WITH \
+             A TYPED CODE. First the CONTROL, through the same handle and while its \
+             owner was alive: `bump {{by: 3}}` was accepted and moved the authority to \
+             tick {:?} (asserted 3) — so what follows is about the REPLACEMENT and not \
              about a handle that never worked. Then the owner closed and a successor \
              took the same store name and the same stream label, and the replica's \
              held handle wrote again: refused with code {stale_code:?} (asserted \
@@ -1938,12 +1941,17 @@ async fn refusals(cx: &Cx7<'_>, ledger: &mut Ledger) {
              `close()`), spelled `owner-lost` rather than `closed` because the two are \
              different events: `closed` is the expiry notice a replica REJOINS on, and \
              rejoining here would have silently attached this caller to the \
-             SUCCESSOR's different document under the handle it already had. The \
-             successor's own document is at tick {:?} (asserted 0) and \
-             it holds {:?} handles (asserted 0) — it did not inherit the predecessor's \
-             binding, which is the half that matters: a successor that ADOPTED the \
-             handle would have executed the write and every \"refused\" reading would \
-             still be about something else. {} {} {}",
+             SUCCESSOR's different document under the handle it already had. WHAT \
+             THESE NEXT TWO READINGS ARE NOT: the successor's document is at tick {:?} \
+             and it holds {:?} handles, both asserted 0 — and neither is evidence that \
+             a successor would REFUSE a handle it never issued, because the goodbye \
+             makes this replica terminal and `act` throws locally before a frame is \
+             built. A review probe measured exactly that: zero frames on the wire \
+             across the write. Adoption is witnessed where a write really does reach a \
+             successor — `refuses a handle the successor never issued, when no goodbye \
+             arrived` in `browser-ts/test/store/hosted.test.ts`, where the farewell \
+             cannot be delivered, the frame crosses, and the refusal is `closed`. {} \
+             {} {}",
             stat_u64(&before_replacement, "tick"),
             stat_u64(&successor_state, "tick"),
             stat_u64(&successor_state, "handles"),

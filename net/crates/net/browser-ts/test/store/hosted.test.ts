@@ -106,8 +106,16 @@ function mesh() {
   /** Per node: how many streams it has opened, and which one is stale. */
   const opens = new Map<string, number>();
   const stale = new Map<string, number>();
-  /** Nodes whose every send fails for a reason a reopen cannot fix. */
-  const permanent = new Set<string>();
+  /**
+   * `sender->target` pairs whose sends fail permanently, and pairs
+   * whose sends NEVER SETTLE.
+   *
+   * Per pair rather than per node, because the property under test is
+   * that one replica's dead transport does not silence another's:
+   * a node-wide flag cannot express "A is gone, B is fine".
+   */
+  const permanentTo = new Set<string>();
+  const neverSettles = new Set<string>();
   /** Nodes whose next send is HELD, to be settled by the test. */
   const holding = new Set<string>();
   /** Nodes whose sends resolve on a later turn, not synchronously. */
@@ -223,7 +231,14 @@ function mesh() {
                 });
               });
             }
-            if (permanent.has(self)) {
+            if (neverSettles.has(`${self}->${target}`)) {
+              // A transport that accepted the frame and will never
+              // say what became of it. Nothing to reject, nothing to
+              // resolve: whoever awaits this waits forever unless
+              // they bounded it themselves.
+              return new Promise<void>(() => {});
+            }
+            if (permanentTo.has(`${self}->${target}`)) {
               // NOT a stale handle: the leaf's own wording for a
               // permanent refusal, which a new stream cannot repair.
               throw new Error('event too large: 9000 bytes exceeds the 8104 ceiling');
@@ -316,12 +331,29 @@ function mesh() {
     staleCurrentStream: (node: string) => {
       stale.set(node, opens.get(node) ?? 0);
     },
-    /** Every send from this node fails permanently. */
-    failPermanently: (node: string) => {
-      permanent.add(node);
-    },
     /** How many streams this node has opened. */
     opensOf: (node: string) => opens.get(node) ?? 0,
+    /** Fail every send from `node` to `peer`, permanently. */
+    failPermanently: (node: string, peer: string) => {
+      permanentTo.add(`${node}->${peer}`);
+    },
+    /** Accept every send from `node` to `peer` and never settle it. */
+    neverSettle: (node: string, peer: string) => {
+      neverSettles.add(`${node}->${peer}`);
+    },
+    /** Stop failing this node's sends, so a successor can serve. */
+    repair: (node: string) => {
+      for (const pair of [...permanentTo]) {
+        if (pair.startsWith(`${node}->`)) permanentTo.delete(pair);
+      }
+    },
+    /** The unsolicited refusals delivered to `node`, by code. */
+    noticesTo: (node: string) =>
+      delivered
+        .filter(entry => entry.to === node)
+        .map(entry => JSON.parse(new TextDecoder().decode(entry.bytes)) as Record<string, unknown>)
+        .filter(frame => frame['k'] === 'no' && frame['q'] === undefined)
+        .map(frame => String(frame['code'])),
     /** Make this node's sends flush on a later turn. */
     flushLate: (node: string) => {
       flushLate.add(node);
@@ -1542,7 +1574,7 @@ describe('reopening a stream that its session replaced', () => {
     const { net, joined } = wired();
     await joined.ready();
     const before = net.opensOf(CALLER_NODE);
-    net.failPermanently(CALLER_NODE);
+    net.failPermanently(CALLER_NODE, HOST_NODE);
 
     // Five upstream frames the transport cannot carry. `input` is
     // fire-and-forget, so this is the replica's own send path.
@@ -1562,7 +1594,7 @@ describe('reopening a stream that its session replaced', () => {
     const { net, host, joined } = wired();
     await joined.ready();
     const before = net.opensOf(HOST_NODE);
-    net.failPermanently(HOST_NODE);
+    net.failPermanently(HOST_NODE, CALLER_NODE);
 
     for (let i = 0; i < 5; i += 1) {
       host.setState({ ...host.getState(), hull: 30 + i });
@@ -1955,7 +1987,7 @@ describe('the host’s own surface', () => {
     expect(net.kinds(HOST_NODE).filter(kind => kind === 'join')).toHaveLength(joinsBefore);
   });
 
-  it('hands a replaced owner’s handle nothing to write with', async () => {
+  it('refuses locally, and costs the wire nothing, once the owner has said goodbye', async () => {
     // Criterion 3's replacement clause, in process: the owner closes
     // and a SUCCESSOR takes the same store name on the same node, so
     // the replica's next frame reaches a live store that never
@@ -1990,18 +2022,24 @@ describe('the host’s own surface', () => {
       schedule: time.schedule,
     });
 
+    const framesBefore = net.kinds(HOST_NODE).length;
     const refused = await joined
       .act('fire', { power: 5 })
       .then(() => 'EXECUTED')
       .catch((error: { code?: string }) => error.code);
 
     expect(refused).toBe('owner-lost');
-    // The successor's document is untouched and it issued no handle:
-    // a successor that ADOPTED the binding would have executed the
-    // write, and every "refused" reading would be about something
-    // else.
+    // LOCAL, and that is the claim. A review probe showed the
+    // earlier version of this test asserting a property it did not
+    // exercise: the goodbye makes the replica terminal, so `act`
+    // throws before a frame is built and "the successor adopted
+    // nothing" is satisfied by a replica that SENT nothing. What is
+    // true here is that the refusal costs the wire nothing —
+    // adoption is witnessed where a write really does reach the
+    // successor ('refuses a handle the successor never issued, when
+    // no goodbye arrived').
+    expect(net.kinds(HOST_NODE)).toHaveLength(framesBefore);
     expect(successor.getState().hull).toBe(10);
-    expect(successor.counts().handles).toBe(0);
     await successor.close();
     await joined.close();
   });
@@ -2023,6 +2061,217 @@ describe('the host’s own surface', () => {
     await flush(10);
 
     await expect(after).resolves.toBe('owner-lost');
+  });
+
+  it('tells every replica goodbye, even when one transport is dead', async () => {
+    // A review probe found the goodbye batch aborting on its first
+    // permanent failure: `emit` is a sequential loop that rethrows,
+    // `close()` caught it once, and every handle behind the dead one
+    // was forgotten by `farewell()` WITHOUT being told — falling back
+    // to the ten-second `indeterminate` this mechanism exists to
+    // remove. One counter read 1 no matter how many were skipped.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    const second = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(OTHER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'bob',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await second.ready();
+
+    // The FIRST replica's transport dies for a reason no reopen
+    // repairs, after both are bound.
+    net.failPermanently(HOST_NODE, CALLER_NODE);
+    await host.close();
+    await flush(20);
+
+    // The second replica was told, and says so without a clock.
+    expect(net.noticesTo(OTHER_NODE)).toContain('owner-lost');
+    await expect(second.act('fire', { power: 1 }).catch((e: { code?: string }) => e.code)).resolves.toBe(
+      'owner-lost',
+    );
+    // The loss is counted per handle, not once per batch.
+    expect(host.counters()['farewell-failed']).toBe(1);
+    await joined.close();
+    await second.close();
+  });
+
+  it('never opens a stream while tearing streams down', async () => {
+    // The stated invariant — "only to a peer this host ALREADY has a
+    // reply stream for" — was not established by filtering on
+    // `replies`: `emit`'s stale-handle reopen runs INSIDE the send,
+    // so a stream staled by a §9 promotion (the promotion Stage 7
+    // performs) had `close()` open a new one, measured 1 → 2. With
+    // the open HELD, closure never returned at all.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    const opensBefore = net.opensOf(HOST_NODE);
+    net.staleCurrentStream(HOST_NODE);
+    net.holdNextOpen(HOST_NODE);
+
+    const settled = await Promise.race([
+      host.close().then(() => 'closed'),
+      new Promise(resolve => {
+        setTimeout(() => resolve('HUNG'), 750);
+      }),
+    ]);
+
+    expect(settled).toBe('closed');
+    expect(net.opensOf(HOST_NODE)).toBe(opensBefore);
+    await joined.close();
+  });
+
+  it('closes on a deadline when a send never settles', async () => {
+    // A transport that accepts the frame and never says what became
+    // of it. The goodbye is awaited, so without a bound this is a
+    // page that can never finish tearing down.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    net.neverSettle(HOST_NODE, CALLER_NODE);
+
+    const settled = await Promise.race([
+      host.close().then(() => 'closed'),
+      new Promise(resolve => {
+        setTimeout(() => resolve('HUNG'), 750);
+      }),
+    ]);
+
+    expect(settled).toBe('closed');
+    expect(host.counters()['farewell-failed']).toBe(1);
+    await joined.close();
+  });
+
+  it('says goodbye exactly once under two concurrent closes', async () => {
+    // `close()` returns a promise and teardown calls it twice in
+    // ordinary use. The guard tested a flag set only after the
+    // awaited goodbye, so the second call re-entered, found
+    // `farewell()` spent, and closed the reply streams out from
+    // under the frames in flight: ZERO goodbyes delivered.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    net.flushLate(HOST_NODE);
+
+    await Promise.all([host.close(), host.close()]);
+    await flush(20);
+
+    expect(net.noticesTo(CALLER_NODE).filter(code => code === 'owner-lost')).toHaveLength(1);
+    await expect(joined.act('fire', { power: 1 }).catch((e: { code?: string }) => e.code)).resolves.toBe(
+      'owner-lost',
+    );
+    await joined.close();
+  });
+
+  it('admits no join once it has begun to close', async () => {
+    // `unsubscribe()` used to run AFTER the awaited goodbye, so for
+    // the whole duration of the farewell the host still dispatched
+    // arrivals: a join landing in that window was admitted and BOUND
+    // and then got nothing — its manifest dropped by the post-close
+    // reclaim, and the goodbye batch computed before its handle
+    // existed. The window was ~zero until `close()` awaited anything.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    net.flushLate(HOST_NODE);
+
+    const closing = host.close();
+    const late = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(OTHER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'late',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await closing;
+    await flush(20);
+
+    // The join was sent — so this is about admission, not delivery —
+    // and nothing was bound for it.
+    expect(net.kinds(HOST_NODE)).toContain('join');
+    expect(host.counts().handles).toBe(0);
+    await late.close();
+    await joined.close();
+  });
+
+  it('refuses a handle the successor never issued, when no goodbye arrived', async () => {
+    // Criterion 3's adoption clause, made DISCRIMINATING. Once the
+    // farewell lands the replica is terminal and refuses locally, so
+    // no frame reaches the successor at all and "the successor
+    // adopted nothing" is satisfied by a replica that sent nothing —
+    // a review probe showed exactly that (0 frames on the wire).
+    //
+    // Here the goodbye CANNOT be delivered, so the replica still
+    // believes it holds a handle, and its write really does reach a
+    // successor that never issued it.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    net.failPermanently(HOST_NODE, CALLER_NODE);
+    await host.close();
+    net.repair(HOST_NODE);
+
+    const successor = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: {
+        fire: (input, context) => {
+          const hull = context.getState().hull - input.power;
+          context.setState({ hull });
+          return { shot: hull };
+        },
+      },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    const framesBefore = net.kinds(HOST_NODE).length;
+    const refused = await joined
+      .act('fire', { power: 5 })
+      .then(() => 'EXECUTED')
+      .catch((error: { code?: string }) => error.code);
+
+    // The write REACHED the successor — without this the refusal
+    // below would be a local guard again.
+    expect(net.kinds(HOST_NODE).length).toBeGreaterThan(framesBefore);
+    // One code for unknown, expired, fenced and mis-bound alike.
+    expect(refused).toBe('closed');
+    expect(successor.getState().hull).toBe(10);
+    expect(successor.counts().handles).toBe(0);
+    await successor.close();
+    await joined.close();
+  });
+
+  it('answers ready() at once when the owner is already gone', async () => {
+    // `settleReady` runs only when a frame arrives, and nothing
+    // arrives for a store whose owner is gone: a `ready()` asked
+    // AFTER the goodbye landed was pushed onto a queue nobody would
+    // drain, and the caller was left with silence. No clock is
+    // advanced here — an answer that needed one would not be an
+    // answer to this.
+    const { host, joined } = wired();
+    await joined.ready();
+    await host.close();
+    await flush(10);
+
+    const code = await Promise.race([
+      joined.ready().then(() => 'RESOLVED').catch((e: { code?: string }) => e.code),
+      new Promise(resolve => {
+        setTimeout(() => resolve('HUNG'), 250);
+      }),
+    ]);
+
+    expect(code).toBe('owner-lost');
+    await joined.close();
   });
 
   it('reports the bounds a host has to watch', async () => {

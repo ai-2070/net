@@ -34,6 +34,25 @@ import { encodeMessage, type Hex } from './wire.js';
 /** How often a host expires handles whose lease has run out (§2). */
 export const HOST_SWEEP_MS = 5_000;
 
+/**
+ * How long `close()` will wait for one goodbye to flush.
+ *
+ * A page tearing down cannot wait forever to be polite, and a
+ * transport whose `send` never settles would otherwise make `close()`
+ * never return — a review probe held one and measured exactly that.
+ * Short, because the alternative to a bounded wait is a hang, and the
+ * frame is not retried afterwards: a farewell that missed its window
+ * is a counted loss.
+ *
+ * HALF A SECOND, not two: the first version chose two and a review
+ * probe — which allowed 750 ms for `close()` to return — read that as
+ * an unbounded close, and it was right to. A page tearing down has an
+ * unload budget under a second, and a frame that has not flushed on a
+ * live DataChannel in 500 ms is not going to matter to the replica
+ * that was going to receive it.
+ */
+export const FAREWELL_DEADLINE_MS = 500;
+
 /** One frame, as the transport carries it. */
 export type Frame = Uint8Array;
 
@@ -266,6 +285,8 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
   const pendingReplies = new Map<string, Promise<TransportStream>>();
   const dropped: Record<string, number> = {};
   let closed = false;
+  /** The one teardown in flight, so a second `close()` joins it. */
+  let closing: Promise<void> | null = null;
 
   async function replyStream(peer: string): Promise<TransportStream> {
     const open = replies.get(peer);
@@ -487,6 +508,114 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     dispatched(owner.resumeDeferred(now));
   }, HOST_SWEEP_MS);
 
+  /**
+   * Say goodbye, then go — in that order, and with each half owned.
+   *
+   * Every rule here is a repaired defect, all five found by review
+   * probes against the built package:
+   *
+   * 1. **Stop serving FIRST.** `unsubscribe()` used to run after the
+   *    awaited goodbye, so for the whole duration of the farewell
+   *    the host still dispatched arrivals: a `join` landing in that
+   *    window was ADMITTED and BOUND, and then got nothing — its
+   *    manifest dropped by the post-close reclaim, and the goodbye
+   *    batch computed before its handle existed. The window was ~zero
+   *    until `close()` awaited anything; awaiting opened it.
+   * 2. **One frame per handle, independently.** `emit` is a
+   *    sequential loop that rethrows the first permanent failure, so
+   *    one replica with a dead transport silenced every handle behind
+   *    it: they were forgotten by `farewell()` without being told,
+   *    and fell back to the ten-second `indeterminate` this whole
+   *    mechanism exists to remove.
+   * 3. **On the stream that already exists, never a new one.** The
+   *    previous filter (`replies.has(peer)`) did not establish that:
+   *    `emit`'s stale-handle reopen lives INSIDE it, so a reply
+   *    stream staled by a §9 promotion — the promotion this stage
+   *    performs — had `close()` OPEN a stream while tearing streams
+   *    down (measured: opens 1 → 2).
+   * 4. **Bounded.** A send that never settles must not make closure
+   *    never return.
+   * 5. **Latched** by the caller above.
+   *
+   * Every undelivered goodbye is counted, one per handle, because a
+   * single `farewell-failed` for an aborted batch said nothing about
+   * how many replicas were skipped.
+   */
+  async function shutdown(): Promise<void> {
+    // Serving stops here, before a single goodbye is composed: after
+    // this line nothing new can be admitted, so the set of handles
+    // owed a farewell cannot grow while one is being sent.
+    closed = true;
+    stopSweep();
+    unsubscribe();
+
+    const goodbye = owner.farewell();
+    await Promise.all(
+      goodbye.map(async out => {
+        const stream = replies.get(out.peer);
+        if (stream === undefined) {
+          // No stream and none opened: a peer with no live reply
+          // stream is unreachable, and opening one from the teardown
+          // path is defect 3 above.
+          dropped['farewell-unreachable'] = (dropped['farewell-unreachable'] ?? 0) + 1;
+          return;
+        }
+        try {
+          await bounded(Promise.resolve(stream.send(encoder.encode(out.frame))));
+        } catch {
+          // This replica's transport is gone. Counted, and the next
+          // replica is still told.
+          dropped['farewell-failed'] = (dropped['farewell-failed'] ?? 0) + 1;
+        }
+      }),
+    );
+
+    for (const stream of replies.values()) stream.close();
+    replies.clear();
+    pendingReplies.clear();
+    // The name is free again, so a successor may take it.
+    addressesByTransport.get(options.transport)?.delete(address);
+  }
+
+  /**
+   * The goodbye, with a deadline.
+   *
+   * A transport whose `send` never settles would otherwise make
+   * `close()` never return, and a page tearing down cannot wait
+   * forever to be polite. The frame is not retried: a farewell that
+   * missed its window is a counted loss, not a queue.
+   */
+  function bounded(work: Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const expire = (): void => {
+        done();
+        reject(new StoreError('timeout', 'the farewell did not flush before the deadline'));
+      };
+      // TWO clocks, and both are needed. The injected `schedule` is
+      // what a deterministic test advances, so a witness can prove
+      // the bound without waiting two real seconds — but a caller
+      // that injects a clock and never advances it would then have
+      // an UNBOUNDED close, which is the defect. Real time is
+      // therefore the floor and the injected clock is the fast path.
+      const cancel = schedule(expire, FAREWELL_DEADLINE_MS);
+      const timer = setTimeout(expire, FAREWELL_DEADLINE_MS);
+      const done = (): void => {
+        cancel();
+        clearTimeout(timer);
+      };
+      work.then(
+        () => {
+          done();
+          resolve();
+        },
+        error => {
+          done();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        },
+      );
+    });
+  }
+
   return {
     authority: options.transport.nodeIdHex() ?? owner.incarnationHex,
     getState: () => owner.getState(),
@@ -503,38 +632,17 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       deferred: owner.deferredCount,
     }),
     counters: () => ({ ...owner.snapshotCounters(), ...dropped }),
-    close: async () => {
-      if (closed) return;
-      // The goodbye goes out BEFORE `closed` is set and before the
-      // streams are closed: `emit` refuses to send from a closed
-      // store, and a farewell on a closed stream reaches nobody.
-      // Awaited, because `close()` returns a promise precisely so a
-      // caller can know the store is gone — and a `void`ed farewell
-      // would race the teardown it is announcing.
-      // Only to a peer this host ALREADY has a reply stream for —
-      // the same rule the expiry notice follows, and for a second
-      // reason here: `close()` AWAITS the goodbye, so opening a
-      // stream for it would make closure wait on a stream open that
-      // may never resolve. A witness held one open and `close()`
-      // hung for five seconds.
-      const goodbye = owner.farewell().filter(out => replies.has(out.peer));
-      if (goodbye.length > 0) {
-        try {
-          await emit(goodbye);
-        } catch {
-          // A replica whose transport is already gone needs no
-          // notice, and a host that cannot say goodbye still closes.
-          dropped['farewell-failed'] = (dropped['farewell-failed'] ?? 0) + 1;
-        }
-      }
-      closed = true;
-      stopSweep();
-      unsubscribe();
-      for (const stream of replies.values()) stream.close();
-      replies.clear();
-      pendingReplies.clear();
-      // The name is free again, so a successor may take it.
-      addressesByTransport.get(options.transport)?.delete(address);
+    close: () => {
+      // LATCHED. `close()` returns a promise and teardown paths call
+      // it twice (an explicit close plus an unload/dispose): the
+      // previous guard tested a flag set only AFTER the awaited
+      // goodbye, so a second call re-entered, found `farewell()`
+      // already spent — it is a one-shot — and closed the reply
+      // streams out from under the frames still in flight. A review
+      // probe measured ZERO goodbyes delivered under a concurrent
+      // close where one call delivers one.
+      closing ??= shutdown();
+      return closing;
     },
   };
 }
