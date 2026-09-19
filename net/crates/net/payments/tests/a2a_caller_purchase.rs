@@ -40,11 +40,11 @@ use net_payments::engine::{AdmitAll, PaymentEngine, RedeemDecision};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::flow::a2a::{
     A2aCallerFlow, A2aPrepareError, A2aProviderChannel, A2aPurchase, A2aPurchaseFile,
-    A2aPurchaseStore, A2aSubmit, AttemptResolution, PurchaseAttempt, PurchaseError, PurchaseKey,
-    PurchaseState, StateTag, PREPARE_LEASE_NS,
+    A2aPurchaseStore, A2aSubmit, AttemptIdentity, AttemptResolution, PurchaseAttempt,
+    PurchaseError, PurchaseKey, PurchaseState, StateTag, PREPARE_LEASE_NS,
 };
 use net_payments::flow::mesh::EngineTaskAdmissionGate;
-use net_payments::flow::signer::ExternalSvmSigner;
+use net_payments::flow::signer::{ExternalSvmSigner, SignerError};
 use net_payments::flow::{ChannelError, Clock, InProcessProvider, PayResponse, ProviderChannel};
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 use net_payments::policy::store::mutate_json;
@@ -275,8 +275,11 @@ enum PayMode {
     /// The engine processes it and the provider answers "settled, but
     /// confidence pending".
     PendingOnce,
-    /// The provider claims a rejection while holding the authorization
-    /// it was handed. The engine is never told.
+    /// The engine **settles** the authorization — the money really
+    /// moves, a billing event is minted — and the provider answers
+    /// "rejected" anyway. A caller cannot tell that from a refusal that
+    /// settled nothing, which is the whole reason an exposed refusal is
+    /// financially ambiguous.
     RejectAlways,
 }
 
@@ -353,7 +356,12 @@ impl ProviderChannel for ScriptedChannel {
         match mode {
             PayMode::Forward => self.inner.pay(quote_bytes, payload).await,
             PayMode::SwallowOnce => {
-                let _landed = self.inner.pay(quote_bytes, payload).await;
+                // Only a reply the engine really produced can be lost. A
+                // genuine channel failure is reported as itself, with the
+                // injection left armed: dressing it up as the injected
+                // fault would make a broken engine indistinguishable from
+                // the fault under test.
+                self.inner.pay(quote_bytes, payload).await?;
                 self.set_mode(PayMode::Forward);
                 Err(ChannelError {
                     message: "the pay reply was lost in transit".to_string(),
@@ -361,16 +369,28 @@ impl ProviderChannel for ScriptedChannel {
                 })
             }
             PayMode::PendingOnce => {
-                let _landed = self.inner.pay(quote_bytes, payload).await;
+                self.inner.pay(quote_bytes, payload).await?;
                 self.set_mode(PayMode::Forward);
                 Ok(PayResponse::PendingTier {
                     reached: "observed".to_string(),
                     required: "confirmed(3)".to_string(),
                 })
             }
-            PayMode::RejectAlways => Ok(PayResponse::Rejected {
-                reason: "provider says no".to_string(),
-            }),
+            PayMode::RejectAlways => {
+                // Settle first, refuse second. A rejection that never
+                // reached the engine would leave nothing exposed — the
+                // ambiguity witness would then be about a string, not
+                // about money that moved while the caller was told no.
+                let settled = self.inner.pay(quote_bytes, payload).await;
+                assert!(
+                    matches!(settled, Ok(PayResponse::Served { .. })),
+                    "an exposed refusal is staged on top of a settlement the engine \
+                     really performed, got {settled:?}"
+                );
+                Ok(PayResponse::Rejected {
+                    reason: "provider says no".to_string(),
+                })
+            }
         }
     }
 }
@@ -429,8 +449,29 @@ impl net_payments::facilitator::Facilitator for SvmFacilitator {
     }
 }
 
+/// What the caller's wallet does the next time it is asked to sign.
+///
+/// Signing is the one window in `buy` that a production caller really
+/// spends *between* reading its attempt and writing the outcome of a
+/// refusal: an externally held key is a remote call. So it is where a
+/// sibling's settlement is staged — deterministically, without a sleep
+/// and without a second thread racing the first.
+enum WalletScript {
+    /// Sign, as every other row in the exact-SVM world does.
+    Sign,
+    /// Before declining to sign, drive the live record of this key to
+    /// `Paid` under the **same** incarnation: the sibling attempt that
+    /// consumed the authorization and settled while this caller was out
+    /// at the wallet.
+    SettleThenRefuse {
+        key: PurchaseKey,
+        identity: AttemptIdentity,
+    },
+}
+
 struct World {
     flow: A2aCallerFlow,
+    wallet: Arc<parking_lot::Mutex<WalletScript>>,
     payments: Arc<net_payments::flow::CallerPaymentFlow>,
     tasks: Arc<ScriptedTasks>,
     channel: Arc<ScriptedChannel>,
@@ -455,6 +496,17 @@ impl World {
 
     fn key(&self, task_id: &str) -> PurchaseKey {
         PurchaseKey::new(self.caller.entity_id(), NODE, task_id)
+    }
+
+    /// Arm the wallet: the next signing request settles *this attempt's
+    /// own incarnation* out from under the caller and then declines, so
+    /// the caller's unexposed refusal is decided before the settlement
+    /// and written after it.
+    fn settle_under_the_wallet(&self, attempt: &PurchaseAttempt) {
+        *self.wallet.lock() = WalletScript::SettleThenRefuse {
+            key: attempt.key.clone(),
+            identity: attempt.identity(),
+        };
     }
 
     async fn attempt(&self, task_id: &str) -> PurchaseAttempt {
@@ -634,6 +686,9 @@ async fn build_world(profile: SpendProfile, svm: bool) -> World {
     };
 
     let caller = Arc::new(EntityKeypair::generate());
+    let store_path = dir.path().join("a2a-purchases.json");
+    let store = Arc::new(A2aPurchaseStore::new(&store_path));
+    let wallet = Arc::new(parking_lot::Mutex::new(WalletScript::Sign));
     let mut payments = net_payments::flow::CallerPaymentFlow::new(
         caller.clone(),
         SpendPolicyEngine::new(&spend_path, profile),
@@ -642,17 +697,55 @@ async fn build_world(profile: SpendProfile, svm: bool) -> World {
         clock.clone(),
     );
     if svm {
+        let scripted = wallet.clone();
+        let wallet_store = store.clone();
+        let wallet_clock = clock.clone();
         payments = payments.with_signer(
             "solana",
             Arc::new(ExternalSvmSigner::new(SVM_PAY_TO, move |_intent| {
-                Box::pin(async move { Ok("cGFydGlhbGx5LXNpZ25lZC1zdm0=".to_string()) })
+                let script = scripted.clone();
+                let store = wallet_store.clone();
+                let clock = wallet_clock.clone();
+                Box::pin(async move {
+                    // Consumed, so a staged sibling runs once and the
+                    // retry (if any) meets an ordinary wallet.
+                    let staged = std::mem::replace(&mut *script.lock(), WalletScript::Sign);
+                    match staged {
+                        WalletScript::Sign => Ok("cGFydGlhbGx5LXNpZ25lZC1zdm0=".to_string()),
+                        WalletScript::SettleThenRefuse { key, identity } => {
+                            // The sibling: it claims this very incarnation
+                            // and settles it, through the same locked store
+                            // verbs production uses, while this caller is
+                            // still out at the wallet.
+                            store
+                                .transition_exact(
+                                    &key,
+                                    &[StateTag::Quoted],
+                                    &identity,
+                                    sample_state(StateTag::Paying),
+                                    clock.now_ns(),
+                                )
+                                .await
+                                .expect("the sibling claims the attempt");
+                            store
+                                .transition_exact(
+                                    &key,
+                                    &[StateTag::Paying],
+                                    &identity,
+                                    sample_state(StateTag::Paid),
+                                    clock.now_ns(),
+                                )
+                                .await
+                                .expect("the sibling settles it");
+                            Err(SignerError::new("the wallet declined to sign"))
+                        }
+                    }
+                })
             })),
         );
     }
     let payments = Arc::new(payments);
     let tasks = Arc::new(ScriptedTasks::new(offer.clone()));
-    let store_path = dir.path().join("a2a-purchases.json");
-    let store = Arc::new(A2aPurchaseStore::new(&store_path));
     let flow = A2aCallerFlow::new(
         payments.clone(),
         tasks.clone(),
@@ -662,6 +755,7 @@ async fn build_world(profile: SpendProfile, svm: bool) -> World {
 
     World {
         flow,
+        wallet,
         payments,
         tasks,
         channel,
@@ -1489,6 +1583,12 @@ async fn child_probe() -> ! {
 /// self-contained transfer authorization is not proof the money stayed
 /// put. The reservation stands, the attempt is ambiguous, and nothing
 /// re-quotes.
+///
+/// Staged as the worst case rather than as a label: the authorization
+/// goes all the way through the provider's real engine and settles —
+/// the charge is in the provider's billing log — and only then does the
+/// provider answer "rejected". "The money may have moved" is therefore
+/// a fact of this schedule, not an assumption about one.
 #[tokio::test]
 async fn an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_attempt_ambiguous() {
     let w = svm_world().await;
@@ -1515,6 +1615,12 @@ async fn an_exposed_bearer_refusal_keeps_the_spend_reservation_and_marks_the_att
         w.channel.pay_sends(),
         1,
         "the authorization really was exposed"
+    );
+    assert_eq!(
+        w.billed().await,
+        1,
+        "and the provider banked it: the refusal is a claim about a \
+         settlement that happened"
     );
     assert_eq!(
         w.reserved_today().await,
@@ -1655,6 +1761,77 @@ async fn an_unexposed_refusal_releases_and_may_prepare_again() {
         w.reserved_today().await,
         SVM_AMOUNT,
         "and now the budget is held — for the purchase that happened"
+    );
+}
+
+/// An unexposed refusal that loses its write to **its own purchase
+/// settling** reports the payment, not a retryable failure.
+///
+/// The schedule is real: a sibling attempt on the same intent key can
+/// consume the authorization and settle between this caller deciding to
+/// refuse (spend policy said no, or the operator's hold is no longer
+/// held, or — as staged here — the wallet declined) and this caller
+/// writing that refusal. The record under the key is then `Paid`, the
+/// refusal's compare-and-swap loses, and the *only* wrong answer is
+/// `Failed { retryable: true }`: it invites a retry against a charge
+/// that already landed.
+///
+/// Staged, not raced: the sibling's claim-and-settle happens inside the
+/// wallet's signing call, which is exactly where a production caller
+/// waits on an externally held key, and through the same locked store
+/// verbs production uses. No sleep, no second thread, and the decision
+/// is provably taken before the settlement — the wallet is only reached
+/// after the refusal's `from` state was read.
+#[tokio::test]
+async fn an_unexposed_refusal_that_loses_to_its_own_settlement_reports_the_payment() {
+    let w = svm_world().await;
+    w.flow
+        .prepare_task(NODE, &w.offer, &brief("t-refusal-race"))
+        .await
+        .expect("prepare");
+    let quoted = w.attempt("t-refusal-race").await;
+    w.settle_under_the_wallet(&quoted);
+
+    let bought = w.flow.purchase_task(NODE, "t-refusal-race").await;
+    let A2aPurchase::Paid {
+        task_id,
+        proof,
+        billing,
+    } = &bought
+    else {
+        panic!(
+            "a purchase that settled must never be reported as a failure, retryable \
+             least of all — a retry here pays twice: {bought:?}"
+        );
+    };
+    assert_eq!(task_id, "t-refusal-race");
+
+    let settled = w.attempt("t-refusal-race").await;
+    let PurchaseState::Paid {
+        proof: recorded,
+        billing: recorded_billing,
+    } = &settled.state
+    else {
+        panic!(
+            "the refusal must not have landed on the settled record, got {:?}",
+            settled.state
+        );
+    };
+    assert_eq!(
+        (proof, billing),
+        (recorded, recorded_billing),
+        "the proof handed back is the record's own — this caller converged on the \
+         settlement rather than inventing an outcome"
+    );
+    assert_eq!(
+        settled.identity(),
+        quoted.identity(),
+        "and it is the same incarnation the refusal was decided against"
+    );
+    assert_eq!(
+        w.channel.pay_sends(),
+        0,
+        "this caller never authored or sent a payload of its own"
     );
 }
 

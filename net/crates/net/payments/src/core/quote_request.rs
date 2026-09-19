@@ -71,6 +71,38 @@ pub use super::versioning::TAG_QUOTE_REQUEST;
 /// liability.
 pub const MAX_REQUEST_LIFETIME_NS: u64 = 60_000_000_000;
 
+/// The exact length of a hex-encoded 32-byte blake3 digest.
+pub const INPUT_HASH_HEX_LEN: usize = 64;
+
+/// Is `value` exactly one 32-byte blake3 digest, lowercase hex?
+///
+/// `input_hash` is the one caller-supplied field that reaches the quote
+/// **id**: [`PaymentQuote::derive_terms_hash`] folds it into
+/// `terms_hash` by writing the bare string, and absence is written as
+/// the empty string. So `Some("")` hashes to precisely what `None`
+/// hashes to — an "input-bound" quote and a capability-level quote from
+/// the same caller at the same instant derive the *same quote id*, and
+/// whichever is issued second silently re-describes the first.
+///
+/// The transcript is not where that can be fixed: domain-separating
+/// absence would move `terms_hash` for every unbound quote ever issued
+/// and break the pinned cross-language golden vectors. So the malformed
+/// value is refused at the door instead, in the shape the field is
+/// documented to carry and nothing else.
+///
+/// **Lowercase only.** `hex::encode` produces lowercase; accepting
+/// mixed case would let one input hash be spelled 2^64 ways, each a
+/// distinct `terms_hash` and therefore a distinct quote for the same
+/// unit of work.
+///
+/// [`PaymentQuote::derive_terms_hash`]: crate::core::quote::PaymentQuote::derive_terms_hash
+pub fn is_input_hash_shaped(value: &str) -> bool {
+    value.len() == INPUT_HASH_HEX_LEN
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The caller-signed request for a quote.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuoteRequest {
@@ -106,6 +138,13 @@ pub struct QuoteRequest {
     /// A2A admission path relies on: the caller's binding signature over
     /// `quote_id ‖ tool_id` transitively proves the payer authorized *this
     /// purchase of this work*.
+    ///
+    /// **Shape is enforced, not assumed.** [`Self::verify`] refuses any
+    /// present value that is not exactly one lowercase-hex blake3
+    /// digest (see [`is_input_hash_shaped`]) — an empty or off-shape
+    /// hash is indistinguishable from *absence* inside `terms_hash`,
+    /// so accepting one would let a caller mint a "bound" quote that
+    /// shares its id with an unbound one.
     ///
     /// [`PaymentQuote::input_hash`]: crate::core::quote::PaymentQuote::input_hash
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +194,12 @@ pub enum QuoteRequestError {
          guard — refusing rather than letting one identity take issuance away from every other"
     )]
     CallerReplayQuotaExhausted { capacity: usize },
+    #[error(
+        "quote request binds a malformed input hash — an input binding must be exactly one \
+         32-byte blake3 digest as {expected} lowercase hex characters; an empty or off-shape \
+         value is indistinguishable from an unbound quote in the terms transcript"
+    )]
+    MalformedInputHash { expected: usize },
 }
 
 impl QuoteRequest {
@@ -187,7 +232,11 @@ impl QuoteRequest {
     /// Bind this request to one exact invocation input (blake3 hex).
     ///
     /// The provider stamps it onto the issued quote, so the quote id
-    /// itself commits to the work being bought.
+    /// itself commits to the work being bought — which is exactly why
+    /// the value has to *be* a digest. A provider refuses anything
+    /// [`is_input_hash_shaped`] rejects, so binding a non-digest here
+    /// produces a request that will not verify rather than a quote
+    /// that collides with an unbound one.
     pub fn with_input_hash(mut self, input_hash: impl Into<String>) -> Self {
         self.input_hash = Some(input_hash.into());
         self
@@ -282,6 +331,19 @@ impl QuoteRequest {
             return Err(QuoteRequestError::NonceTooLong {
                 max: MAX_NONCE_BYTES,
             });
+        }
+        // Same "shape first" reasoning, plus a correctness one this time.
+        // An `input_hash` that is empty — or any other non-digest string —
+        // folds into `terms_hash` exactly as *absence* does, so honouring
+        // it would let one caller mint an input-bound quote sharing its id
+        // with an unbound capability-level quote. Refused before the
+        // signature work and before any quote exists.
+        if let Some(hash) = &request.input_hash {
+            if !is_input_hash_shaped(hash) {
+                return Err(QuoteRequestError::MalformedInputHash {
+                    expected: INPUT_HASH_HEX_LEN,
+                });
+            }
         }
         // The signature is verified against `request.caller` — the identity
         // the request claims. That is the whole point: holding the key is
@@ -731,6 +793,86 @@ mod tests {
             QuoteRequest::verify(&stripped_bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0),
             Err(QuoteRequestError::Envelope(EnvelopeError::BadSignature))
         ));
+    }
+
+    /// An input binding reaches the **quote id**, and the terms
+    /// transcript writes absence as the empty string — so `Some("")` is
+    /// byte-for-byte `None` there, and an "input-bound" quote would
+    /// share its id with the capability-level quote for the same caller
+    /// and instant. The transcript cannot be domain-separated (it is
+    /// pinned by the cross-language golden vectors), so the collision is
+    /// made unpresentable instead: a request carrying anything that is
+    /// not one lowercase-hex blake3 digest is refused, and refused
+    /// *before* the provider is asked for a quote.
+    #[test]
+    fn a_request_binding_a_non_digest_input_hash_never_reaches_a_quote() {
+        let caller = EntityKeypair::generate();
+        let provider = EntityKeypair::generate().entity_id().clone();
+        let signed_with = |hash: &str| {
+            let nonce =
+                QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW, 0);
+            let mut req = QuoteRequest::new(
+                provider.clone(),
+                caller.entity_id().clone(),
+                CAPABILITY,
+                TEMPLATE,
+                NOW,
+                30_000_000_000,
+                nonce,
+            )
+            .with_input_hash(hash);
+            req.sign_with(&caller).expect("sign");
+            canonical_bytes(&req).expect("canonical")
+        };
+
+        // Control: a real digest is still accepted, signature and all —
+        // so the refusals below are about the shape, not about binding.
+        let digest = "a1".repeat(32);
+        assert_eq!(
+            QuoteRequest::verify(
+                &signed_with(&digest),
+                &provider,
+                CAPABILITY,
+                TEMPLATE,
+                NOW + 1,
+                0
+            )
+            .expect("a well-formed binding verifies")
+            .input_hash
+            .as_deref(),
+            Some(digest.as_str()),
+        );
+
+        let truncated = "a1".repeat(16);
+        let overlong = "a1".repeat(33);
+        let uppercase = format!("{}A", "a".repeat(63));
+        let non_hex = format!("{}g", "a".repeat(63));
+        let padded = format!("{} ", "a".repeat(63));
+        for bad in [
+            // The one that collides with an unbound quote.
+            "",
+            truncated.as_str(),
+            overlong.as_str(),
+            // Accepting mixed case would make one input two quote ids.
+            uppercase.as_str(),
+            non_hex.as_str(),
+            padded.as_str(),
+        ] {
+            assert_eq!(
+                QuoteRequest::verify(
+                    &signed_with(bad),
+                    &provider,
+                    CAPABILITY,
+                    TEMPLATE,
+                    NOW + 1,
+                    0
+                ),
+                Err(QuoteRequestError::MalformedInputHash {
+                    expected: INPUT_HASH_HEX_LEN
+                }),
+                "a {bad:?} binding must be refused before any quote is issued",
+            );
+        }
     }
 
     #[test]

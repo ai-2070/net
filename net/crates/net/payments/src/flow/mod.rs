@@ -859,11 +859,12 @@ impl CallerPaymentFlow {
     /// returning it. **No money moves and no budget is reserved here**,
     /// which is what makes it safe to call merely to display a price.
     ///
-    /// The held-quote path is per-purchase: an approval is for the exact
-    /// quote a human saw, so a hold whose `input_hash` is not the one
-    /// being resumed is left alone (it is still valid for *its* purchase)
-    /// and this call quotes fresh. Only an expired or unparseable hold is
-    /// cleared.
+    /// The held-quote path is per-purchase, and *keyed* per purchase:
+    /// the store is asked for the hold bound to this exact
+    /// `input_hash`, so a sibling purchase's approved hold is neither
+    /// returned nor disturbed (it is still valid for *its* purchase)
+    /// and cannot mask this one's. Only this purchase's own expired or
+    /// unparseable hold is cleared.
     ///
     /// The returned quote's `input_hash` must **equal** the requested
     /// one, exactly. Verifying signature, parties, capability,
@@ -912,7 +913,17 @@ impl CallerPaymentFlow {
         // -- [2] the quote: an approved held quote first (the human's
         //    approval applies to the exact quote they saw — this is the
         //    retry-after-approval path), else a fresh provider-signed one.
-        let held = match self.spend.approved_quote(capability).await {
+        // Asked for by *purchase*, not by capability. Two A2A purchases
+        // of one capability can both be held and both be approved; a
+        // capability-only lookup answers with whichever quote id sorts
+        // first, so the purchase that is not it declines to ride a hold
+        // that is not its own (correct) and then quotes fresh — leaving
+        // its own granted approval on file and asking the human again.
+        let held = match self
+            .spend
+            .approved_quote_for_input(capability, input_hash)
+            .await
+        {
             Ok(held) => held,
             Err(e) => {
                 return Err(CallerDecision::Failed {
@@ -927,9 +938,12 @@ impl CallerPaymentFlow {
         if let Some((held_id, held_bytes)) = held {
             match PaymentQuote::from_json_bytes(&held_bytes) {
                 Ok(held_quote) if !held_quote.is_expired_at(self.clock.now_ns()) => {
-                    // An approval authorizes ONE purchase. A live hold for
-                    // a different input is somebody else's approved work:
-                    // leave it on file and quote fresh for this one.
+                    // The lookup already selected on the record's
+                    // denormalized binding; this re-reads it off the
+                    // provider-**signed** envelope, which is the only
+                    // copy an edited policy file cannot lie about. A
+                    // hold that disagrees is not this purchase's, so
+                    // it is left on file rather than ridden.
                     if held_quote.input_hash.as_deref() == input_hash {
                         approval_id = Some(held_id);
                         resumed = Some(held_bytes);
@@ -1076,10 +1090,18 @@ impl CallerPaymentFlow {
     /// Where the operator approval for `quote_id` stands.
     ///
     /// A staged caller parked on an approval needs the three-way answer
-    /// (see [`ApprovalOutcome`]): `Gone` is a *rejection*, which is
-    /// proof no money moved on that quote, and re-running
-    /// [`reserve_spend`](Self::reserve_spend) would instead record a new
-    /// pending hold and hide it.
+    /// (see [`ApprovalOutcome`]), because re-running
+    /// [`reserve_spend`](Self::reserve_spend) would record a *new*
+    /// pending hold and hide whatever the operator decided.
+    ///
+    /// **`Gone` means the hold is no longer on file — not that the
+    /// operator said no.** A hold is also removed when the payment it
+    /// authorized lands ([`Self::clear_approval`] on the paid path), so
+    /// a caller whose sibling attempt paid while it was parked reads
+    /// `Gone` for a purchase that succeeded. Treating `Gone` as a
+    /// rejection on its own therefore contradicts the record: the
+    /// caller's own purchase state is the authority on whether money
+    /// moved, and this answer only says no approval is being held.
     pub async fn approval_state(&self, quote_id: &str) -> Result<ApprovalOutcome, SpendError> {
         self.spend.approval_state(quote_id).await
     }
@@ -1198,6 +1220,14 @@ impl CallerPaymentFlow {
     /// settle regardless of what it reports back, so its "rejected" is
     /// not proof and the reservation stands — exactly as on transport
     /// ambiguity.
+    ///
+    /// A failure that happens **before the wire** is a different case
+    /// and releases unconditionally: if the stored payload will not
+    /// even decode, nothing was ever sent, so no scheme's bearer
+    /// authorization is outstanding and the claim would otherwise sit
+    /// against `max_per_day` with nothing left to release it. (The
+    /// quote itself failing to decode is the one path that cannot
+    /// release — there is no quote to identify the claim by.)
     pub async fn pay_exact(&self, quote_bytes: &[u8], payload_bytes: &[u8]) -> CallerDecision {
         let quote = match PaymentQuote::from_json_bytes(quote_bytes) {
             Ok(q) => q,
@@ -1213,11 +1243,25 @@ impl CallerPaymentFlow {
         {
             Ok(p) => p,
             Err(e) => {
+                // Terminal, and terminal *before the wire*: the bytes
+                // never became a request, so no authorization reached
+                // the provider and nothing can settle. That is a
+                // stronger guarantee than the `Rejected` arm's — which
+                // has to keep the reservation because a provider
+                // holding a bearer authorization could settle it while
+                // claiming otherwise — so this release is
+                // unconditional, not gated on the scheme.
+                //
+                // Without it the claim is orphaned: `release_spend` is
+                // never called for this attempt, the quote is dead, and
+                // the amount stays committed against `max_per_day`
+                // until retention ages the counter out days later.
+                self.release(&quote, self.clock.now_ns()).await;
                 return CallerDecision::Failed {
                     quote_id: Some(quote.quote_id.clone()),
                     message: format!("stored payment payload is not a valid x402 payload: {e}"),
                     retryable: false,
-                }
+                };
             }
         };
         let quote_id = quote.quote_id.clone();
@@ -1456,6 +1500,122 @@ pub fn exact_evm_authorization_for_quote(
         valid_after,
         valid_before,
         nonce,
+    }
+}
+
+#[cfg(test)]
+mod reservation_release_tests {
+    use super::*;
+    use crate::core::canonical::canonical_bytes;
+    use crate::core::registry::default_mock_registry;
+    use crate::core::terms::PricingTerms;
+    use crate::engine::AdmitAll;
+    use crate::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+    use crate::policy::spend::SpendProfile;
+
+    const NOW: u64 = 1_000_000_000_000_000;
+    const CAPABILITY: &str = "prov/tool";
+
+    struct FixedClock(u64);
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn requirements() -> X402Carry<PaymentRequirements> {
+        X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "mock-provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author requirements")
+    }
+
+    /// A staged caller persists its authored payload and re-enters
+    /// `pay_exact` with it. If what comes back does not decode, the
+    /// attempt is terminal **before the wire** — no authorization
+    /// reached the provider, so unlike a provider's claimed rejection
+    /// this really is proof the money stayed put.
+    ///
+    /// The reservation has to go back. Nothing else will ever release
+    /// it: the quote is dead, the caller is told `retryable: false`,
+    /// and the amount would sit against `max_per_day` until retention
+    /// ages the counter out days later — a wallet quietly losing budget
+    /// to payments it never made.
+    #[tokio::test]
+    async fn a_payload_that_never_left_the_process_hands_the_reservation_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider_keys = Arc::new(EntityKeypair::generate());
+        let registry = default_mock_registry(provider_keys.entity_id().clone());
+        let engine = Arc::new(
+            PaymentEngine::new(
+                provider_keys.clone(),
+                Arc::new(MockFacilitator::new()),
+                Arc::new(AdmitAll),
+                registry.clone(),
+                dir.path().join("engine.json"),
+            )
+            .expect("engine"),
+        );
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(NOW));
+        let terms = PricingTerms::new(
+            provider_keys.entity_id().clone(),
+            CAPABILITY,
+            vec![requirements()],
+            registry.reference().expect("registry ref"),
+        );
+        let terms_json =
+            String::from_utf8(canonical_bytes(&terms).expect("canonical")).expect("utf8");
+        // dev/test auto-allows the mock spend, so a reservation is
+        // actually taken — which is the precondition under test.
+        let flow = CallerPaymentFlow::new(
+            Arc::new(EntityKeypair::generate()),
+            SpendPolicyEngine::new(dir.path().join("spend-policy.json"), SpendProfile::DevTest),
+            registry,
+            Arc::new(InProcessProvider::new(engine, clock.clone())),
+            clock,
+        );
+
+        let bound = flow
+            .quote_bound(CAPABILITY, &terms_json, None)
+            .await
+            .expect("quote");
+        assert!(matches!(
+            flow.reserve_spend(&bound.quote).await.expect("reserve"),
+            SpendDecision::Allowed
+        ));
+        assert!(
+            flow.spend_reservation_held(&bound.quote.quote_id)
+                .await
+                .expect("read back"),
+            "setup: the budget must actually be claimed"
+        );
+
+        let decision = flow
+            .pay_exact(&bound.quote_bytes, b"{\"not\":\"an x402 payload\"}")
+            .await;
+        assert!(
+            matches!(
+                decision,
+                CallerDecision::Failed {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "a corrupt stored payload is terminal: {decision:?}"
+        );
+        assert!(
+            !flow
+                .spend_reservation_held(&bound.quote.quote_id)
+                .await
+                .expect("read back"),
+            "a payment that never left the process must not keep holding budget"
+        );
     }
 }
 

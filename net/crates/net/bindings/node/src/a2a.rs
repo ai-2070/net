@@ -264,8 +264,21 @@ impl NetMesh {
     /// submission idempotent on a provider that keeps durable admission
     /// records: the caller that lost a reply re-submits the *same* id and
     /// converges on the original admission instead of starting a second
-    /// one. `service` + `revision` (both or neither) name a catalog entry
-    /// on such a provider; a provider serving this free path ignores both.
+    /// one.
+    ///
+    /// `service` + `revision` (both or neither) name a catalog entry on
+    /// such a provider, and address that catalog's **free** entries only:
+    /// this is the uncharged submit verb. Naming a *paid* entry is refused
+    /// by the provider (`ERR_PAYMENT`, schematic reason `missing_quote`)
+    /// before the executor runs, because a paid admission needs a quote id
+    /// and a signed binding — and buying one is Rust/Python only
+    /// (`submit_task_paid` has no Node twin; paid A2A serving and
+    /// purchasing are out of scope for this binding). That refusal is the
+    /// provider's to make: pricing lives in its catalog, so this binding
+    /// cannot tell a free entry from a paid one without a `describeA2a`
+    /// round-trip it does not expose, and it therefore does not pretend to
+    /// reject the pair client-side. A provider serving the legacy free
+    /// path ignores both fields.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_task(

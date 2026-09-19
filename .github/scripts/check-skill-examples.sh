@@ -242,17 +242,50 @@ if [ -z "$PY_FILES" ]; then
 elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>&1; then
   MYPY=$(command -v mypy || echo "$PYTHON -m mypy")
   mkdir -p "$WORK/mypy-cwd"
-  while IFS=$'\t' read -r path id; do
-    [ -z "$path" ] && continue
-    if ( cd "$WORK/mypy-cwd" && MYPYPATH="$ROOT/net/crates/net/sdk-py/src:$ROOT/net/crates/net/bindings/python/python" $MYPY \
-           --ignore-missing-imports --follow-imports=silent --no-error-summary \
-           --cache-dir "$WORK/mypy-cache" "$ROOT/$path" ) >"$WORK/py-$id.log" 2>&1; then
-      ok "$id: $(basename "$path")"
-    else
-      note "$id: $(basename "$path")"
-      sed 's/^/      /' "$WORK/py-$id.log" | head -25
-    fi
-  done <<< "$PY_FILES"
+  # MYPYPATH IS BUILT BY THE INTERPRETER, NOT BY STRING CONCATENATION. It is
+  # split on `os.pathsep`, which is `;` on Windows — and a Windows path opens
+  # with `C:`, so `:` could not be the separator there even in principle.
+  # Joined with a literal `:`, mypy under Git Bash saw ONE nonexistent root,
+  # resolved neither `net_sdk` nor `net`, and `--ignore-missing-imports` then
+  # turned every SDK reference in the examples into `Any`: a green run that
+  # type-checked nothing. CI is Linux, so CI never saw it — which is exactly
+  # why it could sit here. On Linux this produces the byte-identical string it
+  # always did.
+  #
+  # `"$PYTHON"` and the roots as ARGUMENTS, not `py`: Git Bash rewrites a
+  # POSIX-looking argument into a native path before handing it to a native
+  # executable, which is the same translation `"$ROOT/$path"` already relies on
+  # when it reaches mypy. `py` suppresses that conversion deliberately, and an
+  # env var is never converted at all — so routing the roots through argv is
+  # what makes them resolvable on the same terms as the file being checked.
+  #
+  # The interpreter also confirms both roots EXIST, because an unresolvable
+  # root is silent under `--ignore-missing-imports` — the failure mode above
+  # reports success, so it has to be checked rather than inferred from a tick.
+  mypypath_err="$TMP/mypypath.err"
+  MYPY_PATH=$("$PYTHON" -c 'import os, sys
+roots = sys.argv[1:]
+bad = [r for r in roots if not os.path.isdir(r)]
+if bad:
+    sys.exit("MYPYPATH root(s) do not resolve for this interpreter: " + ", ".join(bad))
+print(os.pathsep.join(roots))' \
+    "$ROOT/net/crates/net/sdk-py/src" \
+    "$ROOT/net/crates/net/bindings/python/python" 2>"$mypypath_err")
+  if [ $? -ne 0 ] || [ -z "$MYPY_PATH" ]; then
+    note "python: $(cat "$mypypath_err") — the examples would type-check against Any, not the SDK"
+  else
+    while IFS=$'\t' read -r path id; do
+      [ -z "$path" ] && continue
+      if ( cd "$WORK/mypy-cwd" && MYPYPATH="$MYPY_PATH" $MYPY \
+             --ignore-missing-imports --follow-imports=silent --no-error-summary \
+             --cache-dir "$WORK/mypy-cache" "$ROOT/$path" ) >"$WORK/py-$id.log" 2>&1; then
+        ok "$id: $(basename "$path")"
+      else
+        note "$id: $(basename "$path")"
+        sed 's/^/      /' "$WORK/py-$id.log" | head -25
+      fi
+    done <<< "$PY_FILES"
+  fi
 else
   skip "no mypy available"
 fi

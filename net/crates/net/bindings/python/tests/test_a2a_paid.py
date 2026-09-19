@@ -453,12 +453,10 @@ def test_serve_a2a_configured_refuses_a_price_it_cannot_enforce(tmp_path):
         mesh.shutdown()
 
 
-def test_a_second_provider_on_the_same_journal_is_refused(tmp_path, paid):
-    """Two writers over one set of admission records would each believe they
-    may launch the same paid work. Driven from a **separate process** — the
-    in-process registry alone would not prove the on-disk lock."""
-    provider, _caller = paid
-    script = """
+# The rival owner, driven as a **separate process**: the in-process registry
+# alone would not prove the on-disk journal lock. Shared by the two journal
+# ownership witnesses below.
+_RIVAL_OWNER_SCRIPT = """
 import json, sys
 import net
 
@@ -497,6 +495,14 @@ try:
 finally:
     mesh.shutdown()
 """
+
+
+def test_a_second_provider_on_the_same_journal_is_refused(tmp_path, paid):
+    """Two writers over one set of admission records would each believe they
+    may launch the same paid work. Driven from a **separate process** — the
+    in-process registry alone would not prove the on-disk lock."""
+    provider, _caller = paid
+    script = _RIVAL_OWNER_SCRIPT
     # Control first: the live owner is this process's provider.
     assert provider.handle.serving is True
     out = subprocess.run(
@@ -523,6 +529,91 @@ finally:
     assert "SERVED" in out2.stdout, out2.stdout + out2.stderr
 
 
+def test_stopping_the_serve_handle_releases_the_journal_with_the_provider_alive(
+    tmp_path,
+):
+    """Stop serving, keep the provider object, and a replacement owner must
+    still be able to open the journal.
+
+    Pins the weak-`SharedAdmissionStore` repair in
+    ``bindings/python/src/payment_provider.rs``: that store owns the
+    journal's ``Arc<JournalOwner>`` and therefore its ``.owner`` fs2 lock, so
+    a provider retaining it strongly kept the lock held after its handle
+    stopped, with no verb left to release it.
+
+    ``test_a_second_provider_on_the_same_journal_is_refused`` also reaches
+    SERVED, but only after dropping ``provider.provider`` as well, so it
+    cannot tell a released lock from one that is merely unreachable. Here the
+    provider stays alive and reachable — which is the real operator sequence:
+    stop serving, then keep reading billing and resolving admissions off the
+    same object.
+    """
+    mesh = _mesh()
+    mesh.start()
+    provider = Provider(tmp_path, mesh)
+    try:
+        # Control: while the handle serves, the journal is owned.
+        assert provider.handle.serving is True
+        held = subprocess.run(
+            [sys.executable, "-c", _RIVAL_OWNER_SCRIPT, provider.journal_path],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert held.returncode == 0, f"subprocess failed: {held.stderr}"
+        assert "REFUSED:JournalOwnedElsewhere" in held.stdout, (
+            held.stdout + held.stderr
+        )
+
+        # Serving stops. The provider object does NOT go away.
+        provider.handle.stop()
+        provider.handle = None
+        gc.collect()
+        assert provider.provider is not None, (
+            "the sequence under test is a provider that outlives its handle"
+        )
+
+        taken = subprocess.run(
+            [sys.executable, "-c", _RIVAL_OWNER_SCRIPT, provider.journal_path],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert taken.returncode == 0, f"subprocess failed: {taken.stderr}"
+        assert "SERVED" in taken.stdout, (
+            "stopping the handle must release the journal's owner lock even while "
+            "the provider object is alive: " + taken.stdout + taken.stderr
+        )
+    finally:
+        provider.close()
+
+
+def test_the_operator_queue_refuses_once_no_serve_handle_is_live(tmp_path):
+    """The same repair from the caller's side: with the admission store held
+    weakly, the operator queue must *say* the journal is closed once nothing
+    serves, rather than answering out of a journal whose lock it no longer
+    holds.
+
+    Without this, the release above is invisible from Python: the verbs would
+    keep answering and an operator would have no way to tell a serving
+    provider from a stopped one.
+    """
+    mesh = _mesh()
+    mesh.start()
+    provider = Provider(tmp_path, mesh)
+    try:
+        assert provider.unresolved() == [], "the queue answers while a handle serves"
+        live = provider.provider
+        provider.handle.stop()
+        provider.handle = None
+        gc.collect()
+        with pytest.raises(ValueError) as closed:
+            live.a2a_unresolved()
+        assert "journal" in str(closed.value), str(closed.value)
+    finally:
+        provider.close()
+
+
 # ---------------------------------------------------------------------------
 # Validation before money
 # ---------------------------------------------------------------------------
@@ -540,31 +631,47 @@ def test_prepare_rejects_an_oversized_brief_before_any_quote_exists(tmp_path):
         },
     )
 
-    reply = caller.prepare("x" * 200)  # max_prompt_bytes is 64
+    try:
+        reply = caller.prepare("x" * 200)  # max_prompt_bytes is 64
+        assert reply["status"] == "rejected", reply
+        assert reply["retryable"] is False
+
+        # The point of validating at prepare: there is nothing to reconcile,
+        # because nothing was ever quoted or reserved. No purchase attempt was
+        # left behind, no billing event exists, and the provider has no
+        # unresolved admission.
+        assert caller.attempts() == []
+        assert provider.billing() == []
+        assert provider.unresolved() == []
+
+        # Positive control: a brief inside the bounds DOES prepare and quote.
+        ok = caller.prepare("summarize this")
+        assert ok["status"] == "ok", ok
+        assert ok["quote"]["amount"] == AMOUNT
+        assert ok["quote"]["network"] == "mock:net"
+        assert ok["quote"]["asset"] == "musd"
+        assert ok["quote"]["quote_id"]
+        assert ok["quote"]["expires_at_ns"] > 0
+        # Read-only on the money side: a quote is not a payment.
+        assert provider.billing() == []
+    finally:
+        caller.close()
+        provider.close()
+
+
+def test_preparing_a_service_the_catalog_does_not_name_is_rejected_not_busy(paid):
+    """An unknown ``service`` is a dead end, not a transport hiccup.
+
+    Pins the prepare-status repair in ``bindings/python/src/a2a_paid.rs``:
+    answered as ``busy`` it was ``retryable``, so a caller (and
+    ``Caller.prepare``'s own loop) kept coming back for an offer the
+    provider's catalog will never name.
+    """
+    _provider, caller = paid
+    reply = caller.prepare("summarize this", service="no-such-service")
     assert reply["status"] == "rejected", reply
-    assert reply["retryable"] is False
-
-    # The point of validating at prepare: there is nothing to reconcile,
-    # because nothing was ever quoted or reserved. No purchase attempt was
-    # left behind, no billing event exists, and the provider has no
-    # unresolved admission.
-    assert caller.attempts() == []
-    assert provider.billing() == []
-    assert provider.unresolved() == []
-
-    # Positive control: a brief inside the bounds DOES prepare and quote.
-    ok = caller.prepare("summarize this")
-    assert ok["status"] == "ok", ok
-    assert ok["quote"]["amount"] == AMOUNT
-    assert ok["quote"]["network"] == "mock:net"
-    assert ok["quote"]["asset"] == "musd"
-    assert ok["quote"]["quote_id"]
-    assert ok["quote"]["expires_at_ns"] > 0
-    # Read-only on the money side: a quote is not a payment.
-    assert provider.billing() == []
-
-    caller.close()
-    provider.close()
+    assert reply["retryable"] is False, reply
+    assert "no-such-service" in reply["message"], reply
 
 
 def test_prepare_is_a_complete_handle_and_moves_no_money(paid):

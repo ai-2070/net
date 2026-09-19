@@ -62,6 +62,25 @@ const AMOUNT: u128 = 2_500;
 /// pricing staleness.
 const QUOTE_TTL_NS: u64 = 3_600_000_000_000;
 
+/// The engine's in-flight reclaim window, **set by this file** (see
+/// `world_with_quote_ttl`) rather than inherited from the engine's
+/// default. The live-claim row below is the one schedule whose meaning
+/// is decided by this number, and a default the engine is free to
+/// retune would decide it silently: the engine answers a duplicate
+/// `InProgress` both while the claim is fresh *and* after it has gone
+/// stale under an expired quote, so nothing in the test's outcome would
+/// report the drift.
+const IN_FLIGHT_TTL_NS: u64 = 300_000_000_000;
+/// A quote priced to lapse well inside [`IN_FLIGHT_TTL_NS`] — the only
+/// way a quote can expire while its claim is still live.
+const LAPSING_QUOTE_TTL_NS: u64 = IN_FLIGHT_TTL_NS / 5;
+/// How far the live-claim row advances its clock: past the quote's
+/// death, and far short of the reclaim window.
+const PAST_LAPSED_QUOTE_NS: u64 = LAPSING_QUOTE_TTL_NS + 1_000_000_000;
+/// The staging is a compile-time fact, not a comment.
+const _: () = assert!(LAPSING_QUOTE_TTL_NS < PAST_LAPSED_QUOTE_NS);
+const _: () = assert!(PAST_LAPSED_QUOTE_NS < IN_FLIGHT_TTL_NS);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -423,6 +442,11 @@ async fn world(park_settlement: bool, park_submit: bool) -> World {
 /// [`world`], with the provider's quote lifetime set by the caller — for
 /// the one schedule that needs a quote to lapse *inside* the engine's
 /// in-flight window rather than long past it.
+///
+/// That window is [`IN_FLIGHT_TTL_NS`], set here rather than inherited:
+/// the engine reads the test clock (`InProcessProvider::pay` hands it
+/// `clock.now_ns()`), so the relation between a quote's life and the
+/// reclaim window is entirely this file's to state.
 async fn world_with_quote_ttl(
     park_settlement: bool,
     park_submit: bool,
@@ -455,7 +479,8 @@ async fn world_with_quote_ttl(
             dir.path().join("engine.json"),
         )
         .expect("engine")
-        .with_billing_log(billing.clone()),
+        .with_billing_log(billing.clone())
+        .with_in_flight_ttl_ns(IN_FLIGHT_TTL_NS),
     );
     let channel = Arc::new(ScriptedChannel::new(
         InProcessProvider::new(engine.clone(), clock.clone()).with_quote_ttl_ns(quote_ttl_ns),
@@ -1290,14 +1315,22 @@ async fn a_retired_paid_submit_is_terminal_with_its_evidence_kept() {
 /// **new** settlement; it cannot retroactively describe one already
 /// admitted.
 ///
-/// Staged by pricing the quote's life (60s) below the engine's in-flight
-/// window (300s), which is the only way a quote can expire while its
-/// claim is still fresh. The reviewer's own expiry probe advances far
-/// past both, so it exercises the lapsed-claim arm; this row is the
-/// live-claim one, and only the order of the two guards answers it.
+/// Staged by pricing the quote's life ([`LAPSING_QUOTE_TTL_NS`]) below
+/// the engine's in-flight window ([`IN_FLIGHT_TTL_NS`], which this file
+/// sets), which is the only way a quote can expire while its claim is
+/// still fresh. The reviewer's own expiry probe advances far past both,
+/// so it exercises the lapsed-claim arm; this row is the live-claim one,
+/// and only the order of the two guards answers it.
+///
+/// Both halves of the staging are *checked*, not assumed, because the
+/// engine's answer cannot report either: a duplicate under a stale claim
+/// and an expired quote is also told `InProgress`, and so is one under
+/// an unexpired quote. So the clock relation is a compile-time assert on
+/// the constants, and the quote's death is read back off the record
+/// before the duplicate is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_quote_with_a_live_settlement_answers_ambiguity() {
-    let w = world_with_quote_ttl(true, false, 60_000_000_000).await;
+    let w = world_with_quote_ttl(true, false, LAPSING_QUOTE_TTL_NS).await;
     w.flow
         .prepare_task(NODE, &w.offer, &brief("t-live-expiry"))
         .await
@@ -1312,8 +1345,20 @@ async fn an_expired_quote_with_a_live_settlement_answers_ambiguity() {
     .expect("the payment reached the facilitator");
     assert_eq!(w.state("t-live-expiry").await, StateTag::Paying);
 
-    // Past the quote's expiry, well short of the in-flight reclaim TTL.
-    w.clock.advance(61_000_000_000);
+    // Past the quote's expiry, well short of the in-flight reclaim TTL
+    // (`PAST_LAPSED_QUOTE_NS` is pinned between the two).
+    w.clock.advance(PAST_LAPSED_QUOTE_NS);
+    let lapsed_at = w
+        .attempt("t-live-expiry")
+        .await
+        .quote_expires_at_ns
+        .expect("a quote with a life");
+    assert!(
+        w.clock.now_ns() > lapsed_at,
+        "the quote this duplicate re-sends against really has lapsed: \
+         now {} vs expiry {lapsed_at}",
+        w.clock.now_ns()
+    );
     let duplicate = w.flow.purchase_task(NODE, "t-live-expiry").await;
     assert!(
         matches!(duplicate, A2aPurchase::Unknown { .. }),
@@ -1671,6 +1716,32 @@ async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
         .await
         .expect("operator resolution");
     assert_eq!(closed.state.tag(), StateTag::Resolved);
+    // Where that disposition lives is the assumption the rest of this
+    // schedule rests on, so it is asserted rather than inferred: the
+    // archive row holds it, and the live purchase under the same key
+    // and generation is untouched. Without these two, an operator exit
+    // that resolved the LIVE row instead would read identically — the
+    // late evidence below would simply inherit the disposition from
+    // there (`retain_superseded` seeds the archive from a live
+    // `Resolved` row of the same incarnation) and every assertion after
+    // it would still hold.
+    assert_eq!(
+        w.flow
+            .superseded_attempt(NODE, "t-late-settlement", &charged.generation)
+            .await
+            .expect("archive read")
+            .expect("the archive holds this incarnation")
+            .state
+            .tag(),
+        StateTag::Resolved,
+        "the operator's disposition is the archive row's"
+    );
+    assert_eq!(
+        w.attempt("t-late-settlement").await.state,
+        charged.state,
+        "and the live purchase is exactly as it was: the superseded exit \
+         cannot reach it"
+    );
 
     // The settlement the operator never saw finally lands.
     let after = w
@@ -1704,6 +1775,12 @@ async fn a_resolved_disposition_keeps_a_late_settlement_findable() {
     assert!(
         late.get("billing").is_some_and(|b| !b.is_null()),
         "with the billing event: {late}"
+    );
+    assert_eq!(
+        w.attempt("t-late-settlement").await.state,
+        charged.state,
+        "the late settlement landed in the archive and nowhere else — the \
+         live row is still the charge it always was"
     );
 
     // A weaker late outcome knows less than the disposition and is

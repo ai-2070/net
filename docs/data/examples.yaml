@@ -119,6 +119,15 @@ examples:
       # production artifacts: the executor's own run counter and the provider's
       # billing log. A state label alone would not distinguish one run from
       # three, so the counter is asserted with multiplicity.
-      expect: "paid task ran once: .*charges=1"
+      #
+      # END-ANCHORED, and that anchor is load-bearing. The runner applies this
+      # with `grep -qE` (run-skill-examples.sh `assert_run`), which matches a
+      # SUBSTRING of a line: unanchored, `charges=10` and `charges=100` satisfy
+      # a pattern whose entire purpose is to pin the count at one. `charges=` is
+      # the last field both examples print
+      # (`paid task ran once: task=<id> charges=<n>`), so `$` is exactly the
+      # boundary — measured: anchored matches `charges=1` and rejects
+      # `charges=10`.
+      expect: "paid task ran once: .*charges=1$"
       timeout_s: 120
       not_wired: {}

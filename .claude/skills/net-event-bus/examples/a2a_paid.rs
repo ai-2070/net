@@ -35,7 +35,7 @@ use net_payments::core::terms::PricingTerms;
 use net_payments::engine::{AdmitAll, PaymentEngine};
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::flow::a2a::{
-    A2aCallerFlow, A2aPurchase, A2aPurchaseStore, A2aSubmit, MeshA2aChannel,
+    A2aCallerFlow, A2aPrepareError, A2aPurchase, A2aPurchaseStore, A2aSubmit, MeshA2aChannel,
 };
 use net_payments::flow::mesh::{serve_payments, EngineTaskAdmissionGate, MeshPaymentChannel};
 use net_payments::flow::{CallerPaymentFlow, Clock, InProcessProvider, SystemClock};
@@ -46,10 +46,11 @@ use net_sdk::a2a::{
     A2aBounds, A2aOffer, CancelToken, TaskBrief, TaskExecutor, TaskRegistry, TaskState,
 };
 use net_sdk::a2a_journal::A2aAdmissionJournal;
-use net_sdk::a2a_payment::TaskAdmissionGate;
+use net_sdk::a2a_payment::{TaskAdmissionGate, TaskPaymentProof};
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_a2a::{A2aServiceConfig, A2aServicePolicy, A2A_TASK_SERVICE};
+use net_sdk::mesh_a2a::{A2aFlowError, A2aServiceConfig, A2aServicePolicy, A2A_TASK_SERVICE};
 use net_sdk::meshos::EntityKeypair;
+use net_sdk::tool_payment::TAG_PAYMENT_FAILURE;
 
 const PSK: [u8; 32] = [0x5au8; 32];
 const SERVICE: &str = "summarize";
@@ -78,6 +79,21 @@ async fn node() -> Mesh {
         .build()
         .await
         .expect("mesh")
+}
+
+/// The prepare outcomes worth re-sending: they reserved nothing and quoted
+/// nothing, so a second attempt costs nothing and may land. A round trip
+/// that never arrived, a provider at capacity, a contended prepare lease,
+/// a retryable quote failure. Every other arm is a decision — re-sending it
+/// buys the same answer again.
+fn prepare_is_retryable(e: &A2aPrepareError) -> bool {
+    matches!(
+        e,
+        A2aPrepareError::Transport(_)
+            | A2aPrepareError::Busy
+            | A2aPrepareError::InFlight { .. }
+            | A2aPrepareError::Quote { retryable: true, .. }
+    )
 }
 
 /// Complete a real noise handshake, then start both nodes.
@@ -242,12 +258,55 @@ async fn main() {
         .with_service(SERVICE, REV);
 
     // 1. PREPARE — validate, preflight, reserve capacity, mint the admission
-    //    id, quote. No money moves here.
-    let prepared = flow
-        .prepare_task(provider_node, &offer, &brief)
-        .await
-        .expect("prepare");
+    //    id, quote. No money moves here. Bounded retry, and only on the
+    //    outcomes that left no record behind: a peer still propagating this
+    //    caller's reply route answers a first call with exactly those.
+    let mut prepared = None;
+    let mut last = String::new();
+    for _ in 0..40 {
+        match flow.prepare_task(provider_node, &offer, &brief).await {
+            Ok(p) => {
+                prepared = Some(p);
+                break;
+            }
+            Err(e) if prepare_is_retryable(&e) => last = e.to_string(),
+            Err(fatal) => panic!("prepare refused, and a re-send cannot change it: {fatal}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let prepared = prepared.unwrap_or_else(|| panic!("prepare never reached the provider: {last}"));
     println!("prepared: no money moved yet");
+
+    // A RESERVATION IS NOT AN ADMISSION. That prepare reserved capacity and
+    // minted an admission id for this exact work, and a submit carrying no
+    // payment is STILL refused before the executor — with the provider's
+    // machine-actionable failure schematic on the reply rather than a prose
+    // error string. This is what "didn't pay" looks like on the wire: the
+    // real handle, an empty proof.
+    let unpaid = TaskPaymentProof {
+        quote_id: String::new(),
+        binding_sig: Vec::new(),
+    };
+    match caller_mesh.submit_task_paid(&prepared, &unpaid).await {
+        // Optional by type, and the assertion is the point: a refusal MAY
+        // arrive with no schematic, and one that does is a much weaker
+        // answer — prose a caller has to parse.
+        Err(A2aFlowError::PaymentRefused {
+            schematic: Some(schematic),
+            ..
+        }) => {
+            assert_eq!(schematic.object, TAG_PAYMENT_FAILURE, "{schematic:?}");
+            assert!(!schematic.handler_executed, "{schematic:?}");
+            println!(
+                "unpaid submit refused at {}: {} (executor never ran)",
+                schematic.stage, schematic.reason
+            );
+        }
+        Ok(ack) => panic!("a paid service must refuse unpaid work, answered {ack:?}"),
+        Err(other) => panic!("the provider's failure schematic did not survive: {other}"),
+    }
+    let before = executor.runs.load(Ordering::SeqCst);
+    assert_eq!(before, 0, "the executor ran before anyone paid: {before} runs");
 
     // 2. PURCHASE — consumes THAT quote, against that one reservation. Never
     //    re-quote a live attempt: a fresh quote for the same work is a second
@@ -263,7 +322,6 @@ async fn main() {
         A2aSubmit::Accepted { .. } => {}
         other => panic!("submit was not accepted: {other:?}"),
     }
-    let _ = prepared;
 
     // Poll the observable the claim is about, never a fixed sleep.
     let mut completed = false;

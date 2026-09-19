@@ -269,13 +269,17 @@ impl ProviderChannel for WirePayments {
     ) -> Result<PayResponse, ChannelError> {
         self.payloads.lock().push(payload.bytes().to_vec());
         let mode = *self.mode.lock();
-        // The provider always sees the payment; only the reply is lost.
         let landed = self.inner.pay(quote_bytes, payload).await;
         match mode {
             PayMode::Forward => landed,
             PayMode::SwallowOnce => {
+                // Only a reply the provider really produced can be lost.
+                // If the call failed for a real reason, that failure is
+                // the truth: report it as itself and leave the injection
+                // armed, or a genuine channel fault would masquerade as
+                // the one under test.
+                let _processed_by_the_provider = landed?;
                 *self.mode.lock() = PayMode::Forward;
-                let _processed_by_the_provider = landed;
                 Err(ChannelError {
                     message: "the pay reply was lost in transit".to_string(),
                     retryable: true,
@@ -338,7 +342,10 @@ impl A2aProviderChannel for WireTasks {
             "a paid submission carries the quote it paid and the caller's binding"
         );
         let acked = self.inner.submit(prepared, proof).await;
-        if self.lose_submit_reply.swap(false, Ordering::SeqCst) {
+        // Same discipline as the lost pay reply: only an ack the provider
+        // really produced can go missing. A real submit failure is
+        // returned as itself, with the injection still armed.
+        if acked.is_ok() && self.lose_submit_reply.swap(false, Ordering::SeqCst) {
             let _processed_by_the_provider = acked;
             return Err(A2aFlowError::Transport(
                 "the submit reply was lost in transit".to_string(),

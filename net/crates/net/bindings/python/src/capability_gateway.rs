@@ -1166,6 +1166,10 @@ impl PyCapabilityGateway {
     /// :meth:`submit_task` take back, and nothing is re-derived from it.
     ///
     /// ``busy`` means nothing was reserved and nothing was quoted — retry.
+    /// It covers the transient cases only: a describe or prepare that never
+    /// answered, and a provider at capacity. A service the provider's
+    /// catalog does not name is ``rejected``, not ``busy`` — that will never
+    /// become true by waiting, so retrying it is an infinite loop.
     /// ``conflict`` means this id already names other work on this
     /// provider; ``rejected`` and ``retired`` are dead ends.
     ///

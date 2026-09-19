@@ -74,6 +74,14 @@ def handshake(connector: NetMesh, acceptor: NetMesh) -> None:
     thread.join(timeout=5)
     if errors:
         raise errors[0]
+    # A join that TIMED OUT is not a completed handshake. Without this the
+    # example sails on with no session and fails much later with a routing
+    # error that names neither the handshake nor this thread.
+    if thread.is_alive():
+        raise RuntimeError(
+            "the accept side is still blocked 5s after connect returned: the "
+            "noise handshake never completed, so nothing below is routable"
+        )
 
 
 def main() -> None:

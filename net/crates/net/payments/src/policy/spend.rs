@@ -190,6 +190,23 @@ pub struct ApprovalRecord {
     /// Capability the quote binds (display form), for redemption lookup.
     #[serde(default)]
     pub capability: String,
+    /// The quote's input binding, denormalized out of `quote_b64` for
+    /// the same reason `capability` is: redemption lookup.
+    ///
+    /// An approval authorizes **one purchase**, and two concurrent
+    /// purchases of the same capability differ only here. Without it
+    /// the only key is the capability, so a resuming caller is handed
+    /// whichever hold sorts first by quote id — which may be the other
+    /// purchase's. It then leaves that hold alone (correctly) and
+    /// quotes fresh, so its *own* granted approval is never found and
+    /// the human is asked a second time for work they already
+    /// authorized.
+    ///
+    /// Defaulted for stores written before the field existed: those
+    /// records are all capability-level quotes, which is exactly what
+    /// `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
     /// The quote envelope's canonical bytes, base64.
     #[serde(default)]
     pub quote_b64: String,
@@ -344,6 +361,7 @@ impl SpendPolicyEngine {
 
         let quote_id = quote.quote_id.clone();
         let capability = quote.capability.clone();
+        let input_hash = quote.input_hash.clone();
         let day = now_ns / NS_PER_DAY;
         let requirements_asset = requirements.asset.clone();
         let counter_key = format!("{day}|{network}|{requirements_asset}");
@@ -440,6 +458,7 @@ impl SpendPolicyEngine {
                                 ApprovalRecord {
                                     state: ApprovalState::Pending,
                                     capability: capability.clone(),
+                                    input_hash: input_hash.clone(),
                                     quote_b64: base64::engine::general_purpose::STANDARD
                                         .encode(bytes),
                                 },
@@ -764,26 +783,71 @@ impl SpendPolicyEngine {
         })
     }
 
-    /// An approved-but-unredeemed held quote for `capability`, if any:
-    /// `(quote_id, canonical quote bytes)`. The flow redeems this before
-    /// requesting a fresh quote, so the human's approval applies to the
-    /// exact quote they saw.
+    /// *Any* approved-but-unredeemed held quote for `capability`, if
+    /// any: `(quote_id, canonical quote bytes)`.
+    ///
+    /// For a door where one capability has at most one live purchase in
+    /// flight and the caller re-checks what it got against its own
+    /// demand. A caller that can have **several** concurrent purchases
+    /// of one capability must use
+    /// [`Self::approved_quote_for_input`] instead: with more than one
+    /// hold on file this answers with whichever quote id sorts first,
+    /// which is not necessarily the purchase asking.
     pub async fn approved_quote(
         &self,
         capability: &str,
     ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
+        self.find_approved(capability, None).await
+    }
+
+    /// The approved-but-unredeemed hold for **this exact purchase** —
+    /// `capability` *and* the input binding — if any.
+    ///
+    /// An approval authorizes one purchase, so "is there an approval
+    /// for this capability" is the wrong question whenever two of them
+    /// can be open at once: the capability-only lookup returns the
+    /// first hold by quote id, a caller resuming a different purchase
+    /// correctly declines to ride it, and then quotes fresh — leaving
+    /// its own granted approval on file, unfound, and asking the human
+    /// again for work they already approved.
+    ///
+    /// `input_hash` is matched exactly, `None` included: a
+    /// capability-level hold and a bound one are different purchases.
+    pub async fn approved_quote_for_input(
+        &self,
+        capability: &str,
+        input_hash: Option<&str>,
+    ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
+        self.find_approved(capability, Some(input_hash)).await
+    }
+
+    /// Shared scan behind the two lookups above. `required_input` is
+    /// `None` to accept any hold for the capability, or `Some(binding)`
+    /// to demand that exact binding (itself `Option`, since absence is
+    /// a legitimate binding).
+    async fn find_approved(
+        &self,
+        capability: &str,
+        required_input: Option<Option<&str>>,
+    ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
         use base64::Engine as _;
         let state: SpendPolicyFile = load_json(&self.path).await?;
         for (quote_id, record) in &state.approvals {
-            if record.state == ApprovalState::Approved
-                && record.capability == capability
-                && !record.quote_b64.is_empty()
+            if record.state != ApprovalState::Approved
+                || record.capability != capability
+                || record.quote_b64.is_empty()
             {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&record.quote_b64)
-                    .map_err(|e| SpendError::Malformed(e.to_string()))?;
-                return Ok(Some((quote_id.clone(), bytes)));
+                continue;
             }
+            if let Some(wanted) = required_input {
+                if record.input_hash.as_deref() != wanted {
+                    continue;
+                }
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&record.quote_b64)
+                .map_err(|e| SpendError::Malformed(e.to_string()))?;
+            return Ok(Some((quote_id.clone(), bytes)));
         }
         Ok(None)
     }
@@ -898,5 +962,113 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("nope"));
+    }
+
+    /// Two purchases of one capability can both be held and both be
+    /// approved. An approval authorizes exactly **one** purchase, so
+    /// the lookup has to be keyed by one too.
+    ///
+    /// Keyed only by capability it cannot be: that query answers with
+    /// whichever hold sorts first by quote id, so the purchase that is
+    /// not it correctly declines to ride a stranger's approval and then
+    /// quotes fresh — abandoning its own granted approval on file and
+    /// asking the human a second time for work they already authorized.
+    #[tokio::test]
+    async fn an_approved_hold_is_found_by_the_purchase_it_authorizes() {
+        use crate::facilitator::mock::{MOCK_NETWORK, MOCK_SCHEME};
+        use crate::x402::requirements::PaymentRequirements;
+        use crate::x402::X402Carry;
+        use net::adapter::net::identity::EntityKeypair;
+
+        const NOW: u64 = 1_000_000_000_000_000;
+        const CAPABILITY: &str = "prov/tool";
+        const PURCHASE_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+        const PURCHASE_B: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Production holds every mock spend for a human decision, which
+        // is the state this is about.
+        let engine = SpendPolicyEngine::new(
+            dir.path().join("spend-policy.json"),
+            SpendProfile::Production,
+        );
+        let provider = EntityKeypair::generate();
+        let registry = crate::core::registry::default_mock_registry(provider.entity_id().clone());
+        let caller = EntityKeypair::generate().entity_id().clone();
+        let requirements = || {
+            X402Carry::author(&PaymentRequirements {
+                scheme: MOCK_SCHEME.into(),
+                network: MOCK_NETWORK.into(),
+                amount: "2500".into(),
+                asset: "musd".into(),
+                pay_to: "mock-provider-settle-addr".into(),
+                max_timeout_seconds: 60,
+                extra: None,
+            })
+            .expect("author requirements")
+        };
+        let purchase = |input_hash: &str| {
+            let mut quote = PaymentQuote::new(
+                provider.entity_id().clone(),
+                caller.clone(),
+                CAPABILITY,
+                Some(input_hash.to_string()),
+                requirements(),
+                registry.reference().expect("registry ref"),
+                NOW,
+                NOW + 60_000_000_000,
+            );
+            // Signed, because what the store holds is the
+            // provider-signed envelope and the resuming caller verifies
+            // it before riding it.
+            crate::core::canonical::SignedEnvelope::sign_with(&mut quote, &provider)
+                .expect("sign quote");
+            quote
+        };
+
+        let a = purchase(PURCHASE_A);
+        let b = purchase(PURCHASE_B);
+        assert_ne!(a.quote_id, b.quote_id, "two purchases, two quotes");
+        for quote in [&a, &b] {
+            assert!(
+                matches!(
+                    engine
+                        .check_and_reserve(quote, &registry, NOW)
+                        .await
+                        .expect("reserve"),
+                    SpendDecision::RequiresPaymentApproval { .. }
+                ),
+                "the production profile must hold a mock spend for approval"
+            );
+            assert!(engine.approve(&quote.quote_id).await.expect("approve"));
+        }
+
+        // Each purchase is handed back its own hold — id and envelope.
+        // With both approved, a capability-only key can satisfy at most
+        // one of these two, whichever way it breaks the tie.
+        for quote in [&a, &b] {
+            let (id, bytes) = engine
+                .approved_quote_for_input(CAPABILITY, quote.input_hash.as_deref())
+                .await
+                .expect("lookup")
+                .expect("this purchase's own approval is on file");
+            assert_eq!(id, quote.quote_id);
+            assert_eq!(
+                PaymentQuote::from_json_bytes(&bytes)
+                    .expect("the held envelope verifies")
+                    .input_hash
+                    .as_deref(),
+                quote.input_hash.as_deref(),
+                "the bytes handed back must be the ones the human approved",
+            );
+        }
+
+        // And absence is a binding like any other, not a wildcard: a
+        // capability-level purchase must not inherit a bound hold.
+        assert!(engine
+            .approved_quote_for_input(CAPABILITY, None)
+            .await
+            .expect("lookup")
+            .is_none());
     }
 }

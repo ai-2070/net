@@ -2528,6 +2528,28 @@ impl A2aCallerFlow {
             )
             .await
         {
+            // A conflict here is not automatically a failure. A sibling
+            // attempt on the same purchase can consume the operator's
+            // approval and settle between this caller reading `Gone` from
+            // the spend engine and writing its refusal — at which point
+            // `Gone` meant "the hold is no longer held", not "the operator
+            // rejected it", and the record under the key is already `Paid`.
+            //
+            // Reporting a retryable failure for a purchase that succeeded
+            // is the worst answer available: it invites a retry against a
+            // charge that already landed. So converge on the record, the
+            // same way the settle path does when its own CAS loses.
+            if let Ok(Some(live)) = self.store.attempt(key).await {
+                if live.identity() == attempt.identity() {
+                    if let PurchaseState::Paid { proof, billing } = live.state {
+                        return A2aPurchase::Paid {
+                            task_id: key.task_id.clone(),
+                            proof,
+                            billing,
+                        };
+                    }
+                }
+            }
             return A2aPurchase::Failed {
                 quote_id: attempt.quote_id.clone(),
                 message: e.to_string(),

@@ -531,16 +531,40 @@ pub(crate) fn parse_prepared(prepared_json: &str) -> PyResult<PreparedTask> {
     })
 }
 
+/// Why an offer lookup produced no offer.
+///
+/// The two arms are different **actions**, not two spellings of one
+/// failure. A catalog that never answered may answer the next call. A
+/// catalog that answered *without* this service will keep answering
+/// without it until the provider is reconfigured, so there is nothing
+/// for a caller to wait for. Collapsing them told an operator to retry
+/// forever against a service that does not exist.
+enum OfferLookup {
+    /// `describe_a2a` never produced a catalog — transport, no route, a
+    /// provider at capacity.
+    Unanswered(String),
+    /// The provider answered its catalog, and `service` is not in it.
+    NotServed(String),
+}
+
 /// The offer for `service` out of what the provider serves.
-async fn offer_for(mesh: &Mesh, provider_node: u64, service: &str) -> Result<A2aOffer, String> {
+async fn offer_for(
+    mesh: &Mesh,
+    provider_node: u64,
+    service: &str,
+) -> Result<A2aOffer, OfferLookup> {
     let offers = mesh
         .describe_a2a(provider_node)
         .await
-        .map_err(|e| format!("describe_a2a: {e}"))?;
+        .map_err(|e| OfferLookup::Unanswered(format!("describe_a2a: {e}")))?;
     offers
         .into_iter()
         .find(|o| o.service_id == service)
-        .ok_or_else(|| format!("provider {provider_node} serves no service named {service:?}"))
+        .ok_or_else(|| {
+            OfferLookup::NotServed(format!(
+                "provider {provider_node} serves no service named {service:?}"
+            ))
+        })
 }
 
 /// Project the stored attempt's quote onto the caller-visible price.
@@ -565,9 +589,14 @@ fn quote_json(attempt: &PurchaseAttempt) -> Value {
     })
 }
 
-/// `{"status": ..., "message": ...}` for an outcome with no typed arm.
-fn status_json(status: &str, message: impl std::fmt::Display) -> String {
-    json!({ "status": status, "message": message.to_string(), "retryable": true }).to_string()
+/// `{"status": ..., "message": ..., "retryable": ...}` for an outcome
+/// with no typed arm.
+///
+/// `retryable` is passed in rather than assumed: it is the field a
+/// caller actually acts on, and two outcomes reported under one status
+/// line do not have to share the answer.
+fn status_json(status: &str, message: impl std::fmt::Display, retryable: bool) -> String {
+    json!({ "status": status, "message": message.to_string(), "retryable": retryable }).to_string()
 }
 
 /// `prepare_task`: validate + reserve + quote, moving no money.
@@ -580,9 +609,14 @@ pub(crate) async fn do_prepare(
 ) -> String {
     let offer = match offer_for(mesh, provider_node, &service).await {
         Ok(offer) => offer,
-        // Nothing was reserved and nothing was quoted, so the action is
-        // the one `busy` prescribes: retry.
-        Err(e) => return status_json("busy", e),
+        // Nothing was reserved and nothing was quoted either way; what
+        // differs is whether a retry can ever change the answer. A
+        // catalog that did not answer is `busy`. A catalog that
+        // answered without this service is a dead end — the same
+        // `rejected` the wire gives for a service the provider refuses
+        // or does not price.
+        Err(OfferLookup::Unanswered(message)) => return status_json("busy", message, true),
+        Err(OfferLookup::NotServed(message)) => return status_json("rejected", message, false),
     };
     let brief = brief.with_service(offer.service_id.clone(), offer.revision.clone());
     let task_id = brief.task_id.clone();
@@ -591,7 +625,7 @@ pub(crate) async fn do_prepare(
             let quote = match flow.stored_attempt(provider_node, &task_id).await {
                 Ok(Some(attempt)) => quote_json(&attempt),
                 Ok(None) => Value::Null,
-                Err(e) => return status_json("conflict", format!("purchase store: {e}")),
+                Err(e) => return status_json("conflict", format!("purchase store: {e}"), true),
             };
             json!({ "status": "ok", "prepared": prepared, "quote": quote }).to_string()
         }
@@ -741,37 +775,77 @@ pub(crate) async fn do_submit(flow: &A2aCallerFlow, provider_node: u64, task_id:
 /// the exit that writes only the archive. A queue whose rows cannot be
 /// told apart is a queue an operator cannot act on.
 ///
-/// The label is the record's **class**, read from the archive listing —
-/// never inferred from the generation. A retained charge can share both
-/// the key *and* the incarnation with the live row: when a sibling
-/// publishes a terminal verdict on the live record and a settlement then
-/// lands, the settlement is retained under that same incarnation. A
-/// generation comparison would call both rows live and leave the
-/// archived charge unaddressable — the same defect one layer up.
+/// The label is the **class of the map each row was read out of**, and
+/// each row is read out of that map by the class-addressed verb that
+/// closes it: `stored_attempt` for the live class, `retained_attempts`
+/// for the archive. It is never recovered afterwards by comparing a row
+/// against the archive listing.
+///
+/// Recovering it by value would be unsound twice over. The two listings
+/// are two separate loads of one file — a store built for cross-process
+/// siblings — so a write or a prune landing between them leaves an
+/// archive row that no longer equals what the queue read, and that
+/// charge is then labelled live: an operator's key-only call closes the
+/// live attempt instead, and the archived charge stays open with
+/// nothing left pointing at it. And equality cannot separate the
+/// classes even within one load, because no field of a record says
+/// which map holds it — the archive entry for an incarnation is seeded
+/// from that incarnation's live disposition, so the two are built to
+/// agree rather than to differ. One store read per key, each through
+/// the verb that addresses exactly one class, is the price of a label
+/// that cannot be wrong.
 pub(crate) async fn do_attempts(flow: &A2aCallerFlow) -> PyResult<String> {
-    let attempts = mine(flow).await?;
-    let mut archive = flow
+    let mut rows: Vec<Value> = Vec::new();
+    for (provider_node, task_id) in my_keys(flow).await? {
+        if let Some(live) = flow
+            .stored_attempt(provider_node, &task_id)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?
+        {
+            rows.push(attempt_row(&live, false)?);
+        }
+    }
+    let archive = flow
         .retained_attempts()
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("a2a purchase store: {e}")))?;
-    let mut rows: Vec<Value> = Vec::with_capacity(attempts.len());
-    for attempt in &attempts {
-        // Matched by value and consumed, so two rows equal in every
-        // field still produce exactly as many `retained` labels as the
-        // archive holds.
-        let retained = archive.iter().position(|a| a == attempt);
-        if let Some(at) = retained {
-            archive.swap_remove(at);
+    for attempt in &archive {
+        // The identity filter `mine` applies, applied to the archive
+        // too: it is one file as well, and a charge a different caller
+        // identity paid for is not this gateway's to show or to close.
+        if attempt.key == flow.key(attempt.key.provider_node, &attempt.key.task_id) {
+            rows.push(attempt_row(attempt, true)?);
         }
-        let mut row = serde_json::to_value(attempt)
-            .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempt: {e}")))?;
-        if let Value::Object(fields) = &mut row {
-            fields.insert("retained".to_string(), Value::Bool(retained.is_some()));
-        }
-        rows.push(row);
     }
     serde_json::to_string(&rows)
         .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempts: {e}")))
+}
+
+/// One attempt as a queue row: its stored fields, plus the `retained`
+/// label the class it was read from decided.
+fn attempt_row(attempt: &PurchaseAttempt, retained: bool) -> PyResult<Value> {
+    let mut row = serde_json::to_value(attempt)
+        .map_err(|e| PyRuntimeError::new_err(format!("encode purchase attempt: {e}")))?;
+    if let Value::Object(fields) = &mut row {
+        fields.insert("retained".to_string(), Value::Bool(retained));
+    }
+    Ok(row)
+}
+
+/// The `(provider node, task id)` of every key this flow's caller
+/// identity owns, deduplicated, in the order the store lists them.
+///
+/// A key is the only thing taken from the class-blind listing — never a
+/// class, which is what the listing cannot answer.
+async fn my_keys(flow: &A2aCallerFlow) -> PyResult<Vec<(u64, String)>> {
+    let mut keys: Vec<(u64, String)> = Vec::new();
+    for attempt in mine(flow).await? {
+        let key = (attempt.key.provider_node, attempt.key.task_id);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 /// The stored attempts belonging to this flow's caller identity.

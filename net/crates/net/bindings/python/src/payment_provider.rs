@@ -366,16 +366,28 @@ mod provider {
         /// Keeps the `net.payments.quote/pay` services registered on the node.
         _serve: PaymentServeHandle,
         /// The admission store the configured A2A serving path writes
-        /// through, retained so the operator verbs (`a2a_unresolved` /
-        /// `a2a_resolve`) can reach it. `None` until
+        /// through, held **weakly** so the operator verbs
+        /// (`a2a_unresolved` / `a2a_resolve`) can reach it for exactly as
+        /// long as something is serving. `None` until
         /// `serve_a2a_configured` has been called — the journal is opened
         /// there, not at construction, because opening it takes exclusive
         /// ownership and a provider that serves no tasks should not hold a
         /// lock.
         ///
+        /// Weak, not a clone, because this handle *is* the journal's
+        /// ownership: a strong reference here would keep the `.owner`
+        /// lock held after the serve handle stopped, and the next
+        /// provider over that path would be refused with
+        /// `JournalOwnedElsewhere` by a provider that no longer serves
+        /// anything — with no verb to release it short of dropping the
+        /// provider itself. The serve handle holds the only strong
+        /// reference, so stopping it releases the journal and these
+        /// verbs then say so instead of reading a store nothing writes.
+        ///
         /// `parking_lot::Mutex` because pyo3 hands out `&self`.
         #[cfg(feature = "a2a")]
-        a2a_store: parking_lot::Mutex<Option<net_sdk::a2a_journal::SharedAdmissionStore>>,
+        a2a_store:
+            parking_lot::Mutex<Option<std::sync::Weak<dyn net_sdk::a2a_journal::AdmissionStore>>>,
     }
 
     #[pymethods]
@@ -753,7 +765,9 @@ mod provider {
                 principal,
                 preflight,
             )?;
-            *self.a2a_store.lock() = Some(store);
+            // Weak: the handle that is returned owns the journal, and
+            // the `.owner` lock is released when it stops.
+            *self.a2a_store.lock() = Some(Arc::downgrade(&store));
             Ok(handle)
         }
 
@@ -817,12 +831,23 @@ mod provider {
     #[cfg(feature = "a2a")]
     impl PyPaymentProvider {
         /// The admission store, or a loud error naming what to call first.
+        ///
+        /// Upgraded rather than cloned: the store lives exactly as long
+        /// as the serve handle, so an absent one is either "never
+        /// served" or "the handle stopped", and both mean there is no
+        /// open journal for an operator verb to read.
         fn a2a_store(&self) -> PyResult<net_sdk::a2a_journal::SharedAdmissionStore> {
-            self.a2a_store.lock().clone().ok_or_else(|| {
+            let store = self
+                .a2a_store
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            store.ok_or_else(|| {
                 PyValueError::new_err(
                     "no A2A admission journal is open — call \
-                     serve_a2a_configured(...) first; it opens the journal and \
-                     takes exclusive ownership of it",
+                     serve_a2a_configured(...) first and keep the handle it \
+                     returns alive; it opens the journal and takes exclusive \
+                     ownership of it for as long as that handle serves",
                 )
             })
         }

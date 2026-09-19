@@ -152,19 +152,36 @@ buy = json.loads(gw.purchase_task(prepared))
 if buy["status"] == "requires_payment_approval":
     gw.approve_payment(buy["quote_id"])      # operator decision
     buy = json.loads(gw.purchase_task(prepared))
-if buy["status"] != "paid":
+for _ in range(8):
+    # `unknown` is a lost pay reply, not a refusal. The SAME stored payment
+    # resolves it — this call re-sends it, it does not buy a second time.
+    if buy["status"] != "unknown":
+        break
+    time.sleep(0.2)
+    buy = json.loads(gw.purchase_task(prepared))
+if buy["status"] != "paid":                  # denied | failed | unknown
     # denied + funds_ambiguous=True is NOT proven non-payment: an operator
-    # resolves it with gw.a2a_resolve_attempt(...). Do not retry it.
+    # resolves it with gw.a2a_resolve_attempt(...). Do not retry it. An
+    # `unknown` still standing here is the same kind of money: resolve the
+    # attempt, never prepare a second one.
     raise SystemExit(f"not paid: {buy['status']} {buy.get('policy_reason')}")
 
 # 3. Submit — the stored proof, byte-identical on every retry.
-ack = json.loads(gw.submit_task(prepared))
-if ack["status"] == "retry":                 # e.g. journal_unavailable, Busy
+for _ in range(8):                           # e.g. journal_unavailable, Busy
     ack = json.loads(gw.submit_task(prepared))
-print(ack["status"], ack["task_id"])         # accepted | retry | unexecutable
+    if ack["status"] != "retry":
+        break
+    time.sleep(0.2)
+if ack["status"] != "accepted":              # retry | unexecutable
+    # Nothing was admitted, so there is no task to poll: `task_status` would
+    # answer `None` forever. `unexecutable` keeps its evidence — the exit is
+    # gw.a2a_resolve_attempt(...), never a fresh prepare.
+    raise SystemExit(f"not accepted: {ack['status']} {ack.get('message')}")
+print("accepted", ack["task_id"])
 ```
 
-Then poll `mesh.task_status(provider_node_id, ack["task_id"])` as usual.
+Only now is there a task to watch: poll
+`mesh.task_status(provider_node_id, ack["task_id"])` until it is terminal.
 
 The snippet above is the caller half against an already-running provider. For
 a complete, **runnable** version that stands up both sides — provider with a

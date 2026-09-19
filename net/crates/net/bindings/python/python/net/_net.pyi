@@ -3500,7 +3500,10 @@ class CapabilityGateway:
         ``busy`` means nothing was reserved and nothing was quoted — retry (it
         also covers a transport failure and a contended concurrent prepare).
         ``conflict`` means this id already names other work on this provider;
-        ``rejected`` and ``retired`` are dead ends.
+        ``rejected`` and ``retired`` are dead ends. A ``service`` the
+        provider's catalog does not name is ``rejected``, not ``busy``: the
+        provider answered with its offers and this was not among them, so no
+        amount of retrying changes the answer.
 
         Exactly one attempt per ``(caller, provider, task_id)`` does the work:
         a concurrent call that finds a live prepare awaits it and returns the
@@ -5005,8 +5008,12 @@ class RpcTimeoutError(RpcError):
     has already published a CANCEL to the server."""
 
 class RpcServerError(RpcError):
-    """Server returned a non-Ok status. The exception args carry the status
-    code (u16) and diagnostic message."""
+    """Server returned a non-Ok status. ``args`` is the single formatted
+    message ``"nrpc:server_error: status=0x<hhhh> message=<message>"`` —
+    the status is *in* that string, not a second argument. Parse it out of
+    ``str(exc)`` (which is what ``net.mesh_rpc.default_retryable`` does);
+    the formatter at ``bindings/python/src/mesh_rpc.rs::rpc_error_to_pyerr``
+    is the authoritative spec."""
 
 class RpcTransportError(RpcError):
     """Underlying transport / publish failure (encryption, congestion, etc.).

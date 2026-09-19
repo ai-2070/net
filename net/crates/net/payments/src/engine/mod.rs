@@ -50,6 +50,7 @@ use crate::core::billing_event::BillingEvent;
 use crate::core::canonical::{EnvelopeError, ExtraFields, SignedEnvelope};
 use crate::core::idempotency::IdempotencyScope;
 use crate::core::quote::PaymentQuote;
+use crate::core::quote_request::{is_input_hash_shaped, INPUT_HASH_HEX_LEN};
 use crate::core::registry::{AssetRegistry, RegistryError, RegistryRef};
 use crate::core::units::AtomicAmount;
 use crate::core::verification::{
@@ -76,6 +77,16 @@ pub enum EngineError {
     X402(#[from] X402Error),
     #[error("admission denied: {0}")]
     AdmissionDenied(String),
+    /// A quote was asked for with an input binding that is not a
+    /// digest. Fail-closed at issuance: an empty or off-shape
+    /// `input_hash` hashes into `terms_hash` exactly as absence does,
+    /// so accepting one would issue a "bound" quote whose id collides
+    /// with the unbound quote for the same capability.
+    #[error(
+        "quote input binding is malformed — it must be exactly one 32-byte blake3 digest as \
+         {expected} lowercase hex characters, or absent for a capability-level quote"
+    )]
+    MalformedInputHash { expected: usize },
     #[error("engine state inconsistent: {0}")]
     State(String),
     /// The billing log could not record an emitted event. Loud and
@@ -988,6 +999,15 @@ impl PaymentEngine {
     /// other than the work that was bought. `None` is the capability-level
     /// (static pricing) shape and produces exactly the quote earlier
     /// builds issued.
+    ///
+    /// **A present binding must be a digest**, and is refused before the
+    /// quote is constructed. `terms_hash` writes the binding as a bare
+    /// string with absence written as the empty string, so `Some("")`
+    /// derives the *same* `terms_hash` — and therefore the same quote id
+    /// — as `None`. Rejecting off-shape values at this single issuance
+    /// gate is what keeps a bound quote and a capability-level quote from
+    /// ever colliding; the transcript itself cannot be domain-separated
+    /// without moving every unbound quote id ever issued.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_quote(
         &self,
@@ -998,6 +1018,16 @@ impl PaymentEngine {
         now_ns: u64,
         ttl_ns: u64,
     ) -> Result<PaymentQuote, EngineError> {
+        // Before admission, before the registry, before anything is
+        // constructed: this is a pure shape check on a caller-supplied
+        // value that reaches the quote id.
+        if let Some(hash) = input_hash {
+            if !is_input_hash_shaped(hash) {
+                return Err(EngineError::MalformedInputHash {
+                    expected: INPUT_HASH_HEX_LEN,
+                });
+            }
+        }
         self.admission
             .admit(&caller, capability)
             .map_err(EngineError::AdmissionDenied)?;
@@ -2817,6 +2847,126 @@ impl PaymentEngine {
         )?;
         AtomicAmount::parse(&requirements.view().amount)
             .map_err(|e| EngineError::State(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod input_binding_tests {
+    use super::*;
+    use crate::core::registry::default_mock_registry;
+    use crate::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+
+    const NOW: u64 = 1_000_000_000_000_000;
+    const TTL: u64 = 60_000_000_000;
+    const CAPABILITY: &str = "prov/tool";
+
+    fn requirements() -> X402Carry<PaymentRequirements> {
+        X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "mock-provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author requirements")
+    }
+
+    /// `terms_hash` folds the input binding in as a bare string and
+    /// writes *absence* as the empty string, so `Some("")` derives the
+    /// same terms hash — and for one caller at one instant the same
+    /// **quote id** — as `None`: a purchase-bound quote and a
+    /// capability-level quote become the same envelope, and the second
+    /// issuance silently re-describes the first.
+    ///
+    /// The transcript is not repairable (domain-separating absence
+    /// would move every unbound quote id ever issued, and the golden
+    /// vectors pin them), so the collision is made unreachable at the
+    /// single gate that mints provider quotes.
+    #[test]
+    fn an_empty_input_binding_is_refused_before_a_quote_exists() {
+        let keys = Arc::new(EntityKeypair::generate());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = PaymentEngine::new(
+            keys.clone(),
+            Arc::new(MockFacilitator::new()),
+            Arc::new(AdmitAll),
+            default_mock_registry(keys.entity_id().clone()),
+            dir.path().join("engine.json"),
+        )
+        .expect("engine");
+        let caller = EntityKeypair::generate().entity_id().clone();
+
+        // The collision, stated as the fact it is rather than assumed:
+        // in the transcript, an empty binding *is* absence.
+        assert_eq!(
+            PaymentQuote::derive_terms_hash(
+                CAPABILITY,
+                None,
+                requirements().bytes(),
+                &engine.registry_ref
+            ),
+            PaymentQuote::derive_terms_hash(
+                CAPABILITY,
+                Some(""),
+                requirements().bytes(),
+                &engine.registry_ref
+            ),
+            "an empty binding must be indistinguishable from absence — that is the hazard",
+        );
+
+        // So no such quote can be issued. Nothing is constructed and
+        // nothing is signed: the answer is an error, not an envelope.
+        let overlong = "a1".repeat(33);
+        let uppercase = format!("{}A", "a".repeat(63));
+        let non_hex = format!("{}g", "a".repeat(63));
+        for bad in [
+            "",
+            "a1",
+            overlong.as_str(),
+            uppercase.as_str(),
+            non_hex.as_str(),
+        ] {
+            match engine.issue_quote(
+                caller.clone(),
+                CAPABILITY,
+                requirements(),
+                Some(bad),
+                NOW,
+                TTL,
+            ) {
+                Err(EngineError::MalformedInputHash { expected }) => {
+                    assert_eq!(expected, INPUT_HASH_HEX_LEN)
+                }
+                other => panic!(
+                    "a {bad:?} binding must be refused, got {:?}",
+                    other.map(|q| q.quote_id)
+                ),
+            }
+        }
+
+        // ...while the two legitimate shapes still issue, and still
+        // derive different ids at the same instant — which is what the
+        // rejected empty string was collapsing.
+        let unbound = engine
+            .issue_quote(caller.clone(), CAPABILITY, requirements(), None, NOW, TTL)
+            .expect("a capability-level quote still issues");
+        let bound = engine
+            .issue_quote(
+                caller,
+                CAPABILITY,
+                requirements(),
+                Some(&"a1".repeat(32)),
+                NOW,
+                TTL,
+            )
+            .expect("a digest-bound quote still issues");
+        assert_eq!(unbound.input_hash, None);
+        assert_ne!(
+            unbound.quote_id, bound.quote_id,
+            "a bound and an unbound quote must never be one envelope"
+        );
     }
 }
 
