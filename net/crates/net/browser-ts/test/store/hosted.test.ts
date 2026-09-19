@@ -16,7 +16,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { defineStore } from '../../src/store/definition.js';
-import { hostStore, type StoreTransport, type TransportFrame, type TransportStream } from '../../src/store/host.js';
+import {
+  FAREWELL_DEADLINE_MS,
+  hostStore,
+  type StoreTransport,
+  type TransportFrame,
+  type TransportStream,
+} from '../../src/store/host.js';
 import { joinStore } from '../../src/store/join.js';
 import { MAX_OUTSTANDING } from '../../src/store/join.js';
 import type { Cancel } from '../../src/store/types.js';
@@ -120,6 +126,8 @@ function mesh() {
   const holding = new Set<string>();
   /** Nodes whose sends resolve on a later turn, not synchronously. */
   const flushLate = new Set<string>();
+  /** Nodes whose streams THROW from `close()`, as a consumer's may. */
+  const closeThrows = new Set<string>();
   /** Nodes whose next OPEN is held, and the streams they closed. */
   const holdingOpen = new Set<string>();
   const heldOpens: { node: string; settle: () => void }[] = [];
@@ -255,6 +263,11 @@ function mesh() {
           close: () => {
             shut = true;
             closes.set(self, (closes.get(self) ?? 0) + 1);
+            if (closeThrows.has(self)) {
+              // `TransportStream.close(): void` is consumer-supplied,
+              // and a channel already torn down by the peer throws.
+              throw new Error('transport: channel already torn down');
+            }
           },
         };
         if (holdingOpen.has(self)) {
@@ -354,6 +367,10 @@ function mesh() {
         .map(entry => JSON.parse(new TextDecoder().decode(entry.bytes)) as Record<string, unknown>)
         .filter(frame => frame['k'] === 'no' && frame['q'] === undefined)
         .map(frame => String(frame['code'])),
+    /** Make this node's stream `close()` throw. */
+    throwOnClose: (node: string) => {
+      closeThrows.add(node);
+    },
     /** Make this node's sends flush on a later turn. */
     flushLate: (node: string) => {
       flushLate.add(node);
@@ -2271,6 +2288,93 @@ describe('the host’s own surface', () => {
     ]);
 
     expect(code).toBe('owner-lost');
+    await joined.close();
+  });
+
+  it('frees the name and settles even when a stream close throws', async () => {
+    // `TransportStream.close()` is consumer-supplied and may throw —
+    // this file's other two call sites already catch it. The
+    // teardown loop did not, so one throwing stream abandoned
+    // `replies.clear()` and the address release: the store name
+    // stayed taken on that transport for ever, and the latch cached
+    // the rejection, so every later `close()` returned the same
+    // rejected promise. A review probe measured close#1/#2/#3 all
+    // rejected and the successor refused `invalid-data`.
+    const net = mesh();
+    const time = timeline();
+    // ONE transport object, because the address registry is keyed on
+    // it: a fresh `node()` per host would free nothing and prove
+    // nothing (the reviewer's own first probe was wrong this way).
+    const transport = net.node(HOST_NODE);
+    const spawn = (): ReturnType<typeof hostStore<Ship, Actions, Inputs>> =>
+      hostStore<Ship, Actions, Inputs>({
+        definition: ship,
+        transport,
+        initialState: FULL,
+        maxEventBytes: MAX_EVENT_BYTES,
+        authorize: () => true,
+        project: state => state,
+        actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+        inputs: { helm: () => {} },
+        now: time.now,
+        schedule: time.schedule,
+      });
+
+    const host = spawn();
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'ada',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await joined.ready();
+    net.throwOnClose(HOST_NODE);
+
+    // Closure RESOLVES, twice — the second call is the unload path
+    // the latch exists for, and a cached rejection would surface
+    // here.
+    await expect(host.close()).resolves.toBeUndefined();
+    await expect(host.close()).resolves.toBeUndefined();
+    expect(host.counters()['stream-close-failed']).toBe(1);
+    // And the name is free: a successor constructs on the SAME
+    // transport, which is refused outright while the name is taken.
+    const successor = spawn();
+    expect(successor.getState().hull).toBe(10);
+    await joined.close();
+  });
+
+  it('settles on the injected clock alone, without spending real time', async () => {
+    // The deadline is bounded on two clocks and only the real one
+    // was witnessed: a reviewer deleted the injected half and all
+    // three farewell witnesses stayed green, because the deadline
+    // witness races a real 750 ms timer and never advances its
+    // clock. This one is the other half — the injected clock is
+    // advanced and real time never approaches FAREWELL_DEADLINE_MS,
+    // so removing `schedule` from `bounded` leaves nothing to settle
+    // the close.
+    const { net, time, host, joined } = wired();
+    await joined.ready();
+    net.neverSettle(HOST_NODE, CALLER_NODE);
+
+    const began = Date.now();
+    const closing = host.close().then(() => 'closed');
+    await flush(5);
+    time.advance(FAREWELL_DEADLINE_MS + 100);
+    const settled = await Promise.race([
+      closing,
+      new Promise(resolve => {
+        setTimeout(() => resolve('HUNG'), 250);
+      }),
+    ]);
+
+    expect(settled).toBe('closed');
+    // Well under the deadline in REAL time: an answer that waited
+    // for the wall clock would not be an answer to this.
+    expect(Date.now() - began).toBeLessThan(FAREWELL_DEADLINE_MS);
     await joined.close();
   });
 

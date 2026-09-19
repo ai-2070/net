@@ -570,7 +570,26 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       }),
     );
 
-    for (const stream of replies.values()) stream.close();
+    for (const stream of replies.values()) {
+      try {
+        stream.close();
+      } catch {
+        // Already gone; the point was not to leave it open — the
+        // same catch `emit` and `replyStream` use, and `close()` is
+        // a CONSUMER-supplied method on `TransportStream`, so this
+        // file's own standard is that it may throw.
+        //
+        // Unwrapped, one throwing stream abandoned everything below:
+        // the name stayed taken on that transport for ever, so no
+        // successor could host it, and the latch cached the
+        // rejection — every later `close()` returned the same
+        // rejected promise, which is the exact "explicit close plus
+        // an unload/dispose" pattern the latch exists to serve. Each
+        // stream is closed on its own for the same reason the
+        // goodbyes are sent on their own.
+        dropped['stream-close-failed'] = (dropped['stream-close-failed'] ?? 0) + 1;
+      }
+    }
     replies.clear();
     pendingReplies.clear();
     // The name is free again, so a successor may take it.
