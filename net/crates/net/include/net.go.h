@@ -1745,6 +1745,25 @@ int net_mesh_blob_adapter_set_overflow_enabled(
 int net_mesh_blob_adapter_set_overflow_config(
     const net_mesh_blob_adapter_t* handle, const char* config_json);
 
+/* ---- Blob transfer over the mesh (mirrors net_transport.h) ----
+ *
+ * The engine must be installed on BOTH nodes: a fetch needs it just as
+ * much as a serve does. A fetch addresses the blob by its raw 32-byte
+ * BLAKE3 hash, not by the encoded ref — get one from an encoded ref
+ * with net_blob_ref_hash above.
+ */
+int net_serve_blob_transfer(const net_meshnode_t* node,
+                            const net_mesh_blob_adapter_t* adapter);
+
+int net_fetch_blob(const net_meshnode_t* node,
+                   uint64_t holder_id,
+                   const uint8_t* hash,
+                   uint8_t** out_bytes,
+                   size_t* out_len);
+
+/* Free a buffer returned by net_fetch_blob. */
+void net_transport_free_buffer(uint8_t* ptr, size_t len);
+
 /* ============================================================
  * Capability aggregation — Phase 6c of
  * `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.

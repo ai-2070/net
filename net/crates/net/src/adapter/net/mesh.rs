@@ -28865,15 +28865,6 @@ impl MeshNode {
         *self.local_caps_changed.borrow()
     }
 
-    /// Test seam: fire the RT-2 local-caps change signal as if a local
-    /// registry mutation happened, without standing up the cortex/tool
-    /// registries. Drives the change-driven announce loop in unit tests.
-    #[cfg(test)]
-    pub(crate) fn test_bump_local_caps_changed(&self) {
-        self.local_caps_changed
-            .send_modify(|g| *g = g.wrapping_add(1));
-    }
-
     /// Monotonic capability-version counter — the version stamped into
     /// the most recent `CapabilityAnnouncement`. Every
     /// `announce_capabilities_with` call bumps it, broadcast and
