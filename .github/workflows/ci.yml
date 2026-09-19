@@ -5764,13 +5764,16 @@ jobs:
             --source net/crates/net/tests/rtc_browser/runner/src/stage6.rs \
             --source net/crates/net/tests/rtc_browser/runner/src/stage7.rs \
             $REQUIRED
-          # The TEN store witnesses, required on the engine that runs
-          # them. They carry the plan's B2' composition gate — the
+          # The ELEVEN Stage 7 witnesses, required on the engine that
+          # runs them. They carry the plan's B2' composition gate — the
           # store's chunker on the REAL stream transport, under
           # injected loss and reorder — the property that a
           # duplicated wire message moves a view exactly once, and
           # criterion 3's two refusal clauses, which run on a
-          # topology of their own (`stage7.rs`'s `refusals`).
+          # topology of their own (`stage7.rs`'s `refusals`), and
+          # criterion 4's media clause — data-only use asks for no
+          # camera or microphone, measured with an instrument the
+          # witness proves fires.
           STAGE7="
           stage7_store_snapshot_installs_over_the_real_stream
           stage7_store_snapshot_installs_through_injected_loss_and_reorder
@@ -5782,6 +5785,7 @@ jobs:
           stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle
           stage7_an_unauthorized_write_is_refused_while_the_replica_still_reads
           stage7_a_handle_from_a_replaced_owner_is_refused
+          stage7_data_only_use_asks_for_no_media_permission
           "
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
             --label "browser matrix stage 7" --mode literal \
@@ -5791,7 +5795,7 @@ jobs:
             # Floors are PER ENGINE: Chromium runs the store stage,
             # Firefox does not (see the harness step above).
             case "$engine" in
-              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=57; extra="$STAGE7" ;;
+              chromium) log="$RUNNER_TEMP/rtcb.log"; floor=58; extra="$STAGE7" ;;
               firefox)  log="$RUNNER_TEMP/rtcb-firefox.log"; floor=47; extra="" ;;
             esac
             # Prove the parser finds a KNOWN line before believing
@@ -5826,7 +5830,7 @@ jobs:
             # Chromium also carries the Stage 7 store witnesses;
             # Firefox does not gate them (see the harness step).
             echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
-          (+ 8 Stage 7 on chromium)"
+          (+ 11 Stage 7 on chromium)"
           done
 
       # The recorded Firefox + Stage 7 leg, PRINTED and never gated.
@@ -5856,7 +5860,8 @@ jobs:
             stage7_narrowing_an_audience_withholds_only_that_replicas_view \
             stage7_a_reconnect_recovers_without_replaying_and_a_leave_frees_the_handle \
             stage7_an_unauthorized_write_is_refused_while_the_replica_still_reads \
-            stage7_a_handle_from_a_replaced_owner_is_refused; do
+            stage7_a_handle_from_a_replaced_owner_is_refused \
+            stage7_data_only_use_asks_for_no_media_permission; do
             if grep -q "^RTCB PASS $required " "$log"; then
               echo "[firefox+stage7] PASS $required"
             else

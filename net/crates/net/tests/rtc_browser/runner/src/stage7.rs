@@ -9,12 +9,12 @@
 //! that chunks ride the shared reliability/reassembly code intact
 //! under loss, duplication and reorder."
 //!
-//! So these ten witnesses put the store on the transport the rest of
-//! this harness exercises, in isolated browsing contexts of a real
-//! engine — eight on one measured pair plus a third participant, and
+//! So these eleven witnesses put the store on the transport the rest
+//! of this harness exercises, in isolated browsing contexts of a real
+//! engine — nine on one measured pair plus a third participant, and
 //! two more on a pair of their own (`refusals`). **CI gates them on
-//! CHROMIUM**: that leg passes `--stage7`, its floor is 57 and all
-//! ten names are pinned REQUIRED (`ci.yml`).
+//! CHROMIUM**: that leg passes `--stage7`, its floor is 58 and all
+//! eleven names are pinned REQUIRED (`ci.yml`).
 //!
 //! **Firefox RUNS them, recorded, and does not gate them.** They had
 //! never executed on that engine at all — this workstation cannot
@@ -34,8 +34,8 @@
 //! They are still off by DEFAULT, which is what a local run gets
 //! without the flag.
 //!
-//! Local status (Chromium, `--stage7`): **57 witnesses, 0 failed** —
-//! all ten below pass, and this stage disturbs no other, which it
+//! Local status (Chromium, `--stage7`): **58 witnesses, 0 failed** —
+//! all eleven below pass, and this stage disturbs no other, which it
 //! did until its two identities were found to be Stage 6 slice 3's
 //! (see `SECRET_HOST_ENTITY`).
 //!
@@ -92,7 +92,7 @@
 //! (`Step5::NodeCounters`), because which side is silent about a loss
 //! is the diagnosis.
 //!
-//! ## The ten witnesses, in the order they run
+//! ## The eleven witnesses, in the order they run
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. an action crosses, executes once, and its result comes back;
@@ -110,13 +110,19 @@
 //!    once the pair is direct — the other half of the plan's
 //!    criterion, which is a pair of readings and not one.
 //!
+//! 9. data-only use asked for no camera and no microphone, read on
+//!    the pages that did the whole path and with the instrument
+//!    proved to fire — criterion 4's other clause, which nothing
+//!    measured before: the harness passing without a prompt is an
+//!    absence, not a reading.
+//!
 //! Then, on a pair of contexts of their own, criterion 3's last two
 //! clauses (`refusals`):
 //!
-//! 9. an unauthorized write is refused with a typed `forbidden`
-//!    while the same replica is still served; and
-//! 10. a handle whose owner was REPLACED is refused `owner-lost`,
-//!    and the successor adopts nothing.
+//! 10. an unauthorized write is refused with a typed `forbidden`
+//!     while the same replica is still served; and
+//! 11. a handle whose owner was REPLACED is refused `owner-lost`,
+//!     and the successor adopts nothing.
 //!
 //! ## The "unexplained ZERO", answered
 //!
@@ -149,17 +155,31 @@
 //! closing every finished store first, re-announcing and
 //! re-discovering before the attempt, and attempting twice all
 //! failed to restore it. Three green witnesses would have gone red
-//! to buy two, which is a trade this stage does not make.
+//! to buy two, which is a trade this stage does not make, so they
+//! were removed and named.
 //!
-//! So they now run in `refusals`, on their own pair of contexts with
-//! their own session, capability tag and identities, AFTER the
-//! measured pair's pages are closed. That is not a workaround for
-//! the promotion: no promotion is involved there at all, and the
-//! measured pair is already gone. The run that established this
-//! reports 57/0 with witness 8 promoting on attempt 1, so the load
-//! that broke it is load on the SIGNALLING PAIR's own pages, not
-//! store count per se — the isolating experiment that would say
-//! which is still not run, and this file does not claim to know.
+//! **That failure does not reproduce at this head, and the claim it
+//! carried is withdrawn.** The reproduction was run: two extra
+//! stores hosted on `tab_host` and joined on `tab_player`
+//! immediately before witness 8 — five stores and five joins on the
+//! measured pair, the shape that used to break it — and the pair
+//! promoted on attempt 1 for a run of 57/0. So "the promotion does
+//! not survive a page hosting six stores" was a statement about a
+//! head, not about §9, and no mechanism was ever identified for it.
+//! What landed in between is where a cause would have to be looked
+//! for — streams claimed per transport, `join.store` on the wire,
+//! and the separated identities, all of which had stores on one page
+//! adopting each other's stream ids and re-asking — but this file
+//! asserts none of that, because a refuted reproduction identifies
+//! no mechanism either.
+//!
+//! They run in `refusals` regardless, and that is now a positive
+//! choice rather than a workaround: witness 8 REPLACES the measured
+//! pair's session, so anything opening a stream on it afterwards is
+//! refused by a fenced stream id, and the plan's criterion asks for
+//! independent browser participants. Own contexts, own session, own
+//! capability tag, own identities, after the measured pair's pages
+//! are closed.
 //!
 //! **What witness 10 found, which nothing in process had.** Its
 //! first run read `indeterminate` — "the store did not answer before
@@ -180,7 +200,7 @@
 //! a late-flushing send in the double before it could discriminate
 //! at all.
 //!
-//! 8 is LAST ON THIS PAIR because a promotion replaces the session,
+//! The promotion is LAST ON THIS PAIR because it replaces the session,
 //! and a store that opens a new stream on it afterwards is refused
 //! by a fenced stream id. Everything that opens one runs before it —
 //! and 9 and 10 run after it on contexts of their own, which is why
@@ -194,7 +214,8 @@
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
 //! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect, 8
-//! unauthorized, 9 replaced — and stays that way because each record
+//! unauthorized, 9 replaced, 10 media — and stays that way because
+//! each record
 //! names its position by index, so reordering the array would
 //! silently retarget records (the same reason Stage 5's list is
 //! append-only). An earlier header mixed the two numberings and so
@@ -251,7 +272,7 @@ const ENTRIES: u32 = 700;
 /// chunk budget from (`MAX_EVENT_SIZE`).
 const MAX_EVENT_BYTES: u32 = 8104;
 
-pub const WITNESSES: [&str; 10] = [
+pub const WITNESSES: [&str; 11] = [
     "stage7_store_snapshot_installs_over_the_real_stream",
     "stage7_store_snapshot_installs_through_injected_loss_and_reorder",
     "stage7_an_action_round_trip_crosses_the_real_transport",
@@ -266,6 +287,9 @@ pub const WITNESSES: [&str; 10] = [
     // `refusals` for why they are not on the pair above.
     "stage7_an_unauthorized_write_is_refused_while_the_replica_still_reads",
     "stage7_a_handle_from_a_replaced_owner_is_refused",
+    // Criterion 4's media clause, read on the pages that did the
+    // whole path — bootstrap, relay, ICE, promotion, store traffic.
+    "stage7_data_only_use_asks_for_no_media_permission",
 ];
 
 /// The tabs this stage drives, on their own isolated contexts.
@@ -1456,6 +1480,78 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             stat_u64(&direct_seen, "tick"),
             why(&direct_commit),
             why(&direct_seen)
+        ),
+    );
+
+    // --- 11. data-only: no camera, no microphone -------------------
+    //
+    // The plan's criterion 4 asks for two things: that data-only use
+    // requires no camera/microphone permission, and that the
+    // permission STATE is recorded. Neither was measured — the whole
+    // harness passing without a prompt was the only evidence, and "no
+    // prompt appeared" is an absence nobody reads.
+    //
+    // It is read HERE, on the pages that did the entire path
+    // (bootstrap, enrollment, discovery, relayed session, ICE, the §9
+    // promotion above and every store frame), and before they are
+    // closed. A reading taken on a fresh page would be about a page
+    // that had done nothing.
+    //
+    // THE CONTROL IS THE POINT: three zeros from an instrument that
+    // was never installed read exactly like three zeros from a page
+    // that asked for nothing, so the player's audit then CALLS
+    // `getUserMedia` and `addTransceiver` and re-reads the counters.
+    // Permission state is REPORTED, never asserted: Firefox answers
+    // no `permissions.query` for media at all, and "this engine does
+    // not expose it" is a fact about the engine rather than a failure.
+    let host_media = script
+        .run(
+            tab_host,
+            Step5::MediaAudit {
+                id: 0,
+                control: false,
+            },
+        )
+        .await;
+    let player_media = script
+        .run(
+            tab_player,
+            Step5::MediaAudit {
+                id: 0,
+                control: true,
+            },
+        )
+        .await;
+    let asked_nothing = |result: &StepResult| {
+        stat_u64(result, "gum") == Some(0)
+            && stat_u64(result, "add_track") == Some(0)
+            && stat_u64(result, "add_transceiver") == Some(0)
+    };
+    let instrument_fires = stat_u64(&player_media, "control_gum").unwrap_or(0) >= 1
+        && stat_u64(&player_media, "control_transceiver").unwrap_or(0) >= 1;
+    ledger.record(
+        WITNESSES[10],
+        host_media.ok
+            && player_media.ok
+            && asked_nothing(&host_media)
+            && asked_nothing(&player_media)
+            && instrument_fires,
+        format!(
+            "DATA-ONLY USE ASKED FOR NO CAMERA AND NO MICROPHONE, MEASURED, AND THE              INSTRUMENT IS PROVED TO FIRE. Both pages wrapped every media entry point              at LOAD — `mediaDevices.getUserMedia`, the legacy `navigator.getUserMedia`,              and `RTCPeerConnection.prototype.addTrack`/`addTransceiver` — before a leaf              existed. After bootstrap, discovery, a relayed session, ICE, the §9              promotion and every store frame above, the host page reads              (getUserMedia={:?}, addTrack={:?}, addTransceiver={:?}) and the player page              ({:?}, {:?}, {:?}) — all asserted 0. Then the player CALLED both entry              points: getUserMedia={:?} addTransceiver={:?}, asserted >= 1, because three              zeros from a wrapper that was never installed read identically to three              zeros from a page that asked for nothing. PERMISSION STATE, recorded and              not asserted — the criterion asks for it to be recorded, and an engine that              does not expose `permissions.query` for media (Firefox) is a fact about the              engine: host camera={:?} microphone={:?}, player camera={:?} microphone={:?}.              {} {}",
+            stat_u64(&host_media, "gum"),
+            stat_u64(&host_media, "add_track"),
+            stat_u64(&host_media, "add_transceiver"),
+            stat_u64(&player_media, "gum"),
+            stat_u64(&player_media, "add_track"),
+            stat_u64(&player_media, "add_transceiver"),
+            stat_u64(&player_media, "control_gum"),
+            stat_u64(&player_media, "control_transceiver"),
+            stat_str(&host_media, "camera"),
+            stat_str(&host_media, "microphone"),
+            stat_str(&player_media, "camera"),
+            stat_str(&player_media, "microphone"),
+            why(&host_media),
+            why(&player_media)
         ),
     );
 

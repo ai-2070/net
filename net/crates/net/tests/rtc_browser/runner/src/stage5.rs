@@ -818,6 +818,16 @@ pub enum Step5 {
         /// released: a `leave` is a frame and has to cross first.
         settle_ms: u64,
     },
+    /// What this page asked of the user's camera and microphone.
+    ///
+    /// `control` makes the page CALL both media entry points after
+    /// the reading, so the witness can prove the counters move —
+    /// zeros from an instrument that was never installed read
+    /// identically to zeros from a page that asked for nothing.
+    MediaAudit {
+        id: u64,
+        control: bool,
+    },
     Close {
         id: u64,
         session: String,
@@ -851,6 +861,7 @@ impl Step5 {
             | Self::ReentryReport { id, .. }
             | Self::StoreFaults { id, .. }
             | Self::StoreFaultsReport { id, .. }
+            | Self::MediaAudit { id, .. }
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }
@@ -905,6 +916,7 @@ impl Step5 {
             | Self::ReentryReport { id, .. }
             | Self::StoreFaults { id, .. }
             | Self::StoreFaultsReport { id, .. }
+            | Self::MediaAudit { id, .. }
             | Self::StoreHost { id, .. }
             | Self::StoreJoin { id, .. }
             | Self::StoreState { id, .. }

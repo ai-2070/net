@@ -90,6 +90,48 @@ const reentry = new Map();
 /// whichever one happened to be registered first.
 const streams = new Map();
 
+/// Every media entry point this page could reach, COUNTED — wrapped
+/// here, at load, before a leaf exists or a single `RTCPeerConnection`
+/// is constructed.
+///
+/// The plan's criterion 4 says data-only use requires no camera or
+/// microphone permission and that the permission state is recorded.
+/// Nothing measured either: the whole harness passing without a media
+/// prompt was the only evidence, and "no prompt appeared" is an
+/// absence nobody read. These counters make it a reading, and the
+/// witness proves the instrument FIRES before believing its zeros.
+const mediaCalls = { gum: 0, addTrack: 0, addTransceiver: 0 };
+(() => {
+  const devices = navigator.mediaDevices;
+  if (devices && typeof devices.getUserMedia === 'function') {
+    const inner = devices.getUserMedia.bind(devices);
+    devices.getUserMedia = (...args) => {
+      mediaCalls.gum += 1;
+      return inner(...args);
+    };
+  }
+  // The legacy spelling too: a page that reached it would still be
+  // asking for a device.
+  if (typeof navigator.getUserMedia === 'function') {
+    const legacy = navigator.getUserMedia.bind(navigator);
+    navigator.getUserMedia = (...args) => {
+      mediaCalls.gum += 1;
+      return legacy(...args);
+    };
+  }
+  const proto = typeof RTCPeerConnection === 'function' ? RTCPeerConnection.prototype : null;
+  if (proto) {
+    for (const name of ['addTrack', 'addTransceiver']) {
+      const inner = proto[name];
+      if (typeof inner !== 'function') continue;
+      proto[name] = function wrapped(...args) {
+        mediaCalls[name] += 1;
+        return inner.apply(this, args);
+      };
+    }
+  }
+})();
+
 /// The stores this page hosts and joins, by runner-chosen handle.
 const hosts = new Map();
 const joins = new Map();
@@ -2303,6 +2345,59 @@ async function execute(step) {
       // handles needs this settle rather than a lucky schedule.
       if (step.settle_ms) await new Promise(resolve => setTimeout(resolve, step.settle_ms));
       return { ok: true };
+    }
+
+    // What this page asked of the user's devices, and what the
+    // browser says about the two permissions. `control` proves the
+    // instrument fires: it CALLS both entry points and reports the
+    // counters again, so a run of zeros is a measurement rather than
+    // a wrapper that was never installed.
+    case 'media_audit': {
+      const before = { ...mediaCalls };
+      let camera = 'unsupported';
+      let microphone = 'unsupported';
+      try {
+        camera = (await navigator.permissions.query({ name: 'camera' })).state;
+      } catch {
+        // Firefox does not answer `permissions.query` for media at
+        // all, and "the engine does not expose it" is the honest
+        // reading rather than a failure.
+      }
+      try {
+        microphone = (await navigator.permissions.query({ name: 'microphone' })).state;
+      } catch {
+        // As above.
+      }
+      let control = null;
+      if (step.control) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          for (const track of stream.getTracks()) track.stop();
+        } catch {
+          // A DENIED or absent camera still counts the CALL, which
+          // is the only thing being proved here.
+        }
+        try {
+          const pc = new RTCPeerConnection();
+          pc.addTransceiver('video');
+          pc.close();
+        } catch {
+          // Same: the wrapper counted before anything could throw.
+        }
+        control = { ...mediaCalls };
+      }
+      return {
+        ok: true,
+        stats: {
+          gum: before.gum,
+          add_track: before.addTrack,
+          add_transceiver: before.addTransceiver,
+          camera,
+          microphone,
+          control_gum: control === null ? null : control.gum,
+          control_transceiver: control === null ? null : control.addTransceiver,
+        },
+      };
     }
 
     case 'done':
