@@ -13,7 +13,7 @@
 //! Shape:
 //!   * `min_announce_interval` is deliberately long, so the post-revocation
 //!     announce lands squarely inside the window;
-//!   * the node is started with `start()`, NOT `start_arc()` — the deferral arm
+//!   * the node is started with `start()`, NOT `start()` — the deferral arm
 //!     is a silent drop on that shape, so nothing can rescue a coalesced send;
 //!   * the revocation is a real `ServeHandle` retirement, not a synthetic bump.
 //!

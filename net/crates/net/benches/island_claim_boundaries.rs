@@ -308,9 +308,9 @@ async fn w1_2_bare_wake_needs_exact_holder() {
 /// won.
 async fn w3_api_won_not_remote_visibility() {
     let claimant = node().await;
-    claimant.start_arc();
+    claimant.start();
     let observer = node().await; // deliberately NOT connected
-    observer.start_arc();
+    observer.start();
     let island = 0x2C03u64;
     let co = install_counter(&observer, island);
     let out = claimant
@@ -345,9 +345,9 @@ async fn w3_api_won_not_remote_visibility() {
 /// count stays 0 → the exact barrier returns false).
 async fn w4_missing_delivery_fails() {
     let claimant = node().await;
-    claimant.start_arc();
+    claimant.start();
     let observer = node().await; // NOT connected
-    observer.start_arc();
+    observer.start();
     let island = 0x2C04u64;
     let co = install_counter(&observer, island);
     claimant
@@ -402,9 +402,9 @@ async fn w7_raw_chain_no_routed_row() {
     let b = node().await;
     connect(&a, &r).await;
     connect(&r, &b).await;
-    a.start_arc();
-    r.start_arc();
-    b.start_arc();
+    a.start();
+    r.start();
+    b.start();
     warm_pair(&a, &b).await;
     let cb = install_counter(&b, 0);
     assert!(
@@ -425,7 +425,7 @@ async fn w8_reset_failure_blocks_timing() {
         ClaimOutcome::Won
     );
     let o = node().await;
-    o.start_arc();
+    o.start();
     apply_reserve(o.reservation_fold(), &EntityKeypair::generate(), island, 1);
     let h2 = h.clone();
     let o2 = o.clone();

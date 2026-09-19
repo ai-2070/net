@@ -87,3 +87,146 @@ examples:
       expect: "loses events silently"
       timeout_s: 120
       not_wired: {}
+
+  # ------------------------------------------------------------------ wave 1
+  # Four services a developer already runs — a registry, a broker-backed job
+  # queue, an object store, a config service — each rebuilt on the substrate in
+  # one file with no service process to deploy. Rust is the reference binding;
+  # the ports are tracked, not silently missing.
+
+  - id: service-registry
+    skill: net-event-bus
+    title: The service registry you no longer run
+    route: providers announce a capability · a caller discovers and ranks them locally · a new provider appears and wins the next lookup
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: registry.rs
+      typescript: registry.ts
+      python: registry.py
+      go: registry.go
+      c: registry.c
+    absent:
+    run:
+      # Asserted on the last line's fields, not a transcript: node ids are
+      # nondeterministic, the counts are the contract.
+      expect: "RESULT ok providers=3 joined=1 best_moved=1"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: job-queue
+    skill: net-event-bus
+    title: The job queue you no longer run
+    route: append jobs to a local log · dispatch each over nRPC · a refused job is re-issued to the peer · reconcile from the log
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: jobqueue.rs
+      typescript: jobqueue.ts
+      python: jobqueue.py
+      go: jobqueue.go
+      c: jobqueue.c
+    absent:
+    run:
+      expect: "RESULT ok jobs=6 done=6 retried=1 duplicates=0"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: object-store
+    skill: net-event-bus
+    title: The object store you no longer run
+    route: store bytes · mint a content address · fetch them from another node · store the same bytes again for the same address
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: objectstore.rs
+      typescript: objectstore.ts
+      python: objectstore.py
+      go: objectstore.go
+      c: objectstore.c
+    absent:
+    run:
+      expect: "RESULT ok dedup=1 readback=1 bytes=64"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: live-config
+    skill: net-event-bus
+    title: The config service you no longer run
+    route: register a channel · subscribers join by name · the publisher pushes two revisions · each applies them locally
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: liveconfig.rs
+      typescript: liveconfig.ts
+      python: liveconfig.py
+      go: liveconfig.go
+      c: liveconfig.c
+    absent:
+    run:
+      expect: "RESULT ok subscribers=2 applied=2 version=2"
+      timeout_s: 120
+      not_wired: {}
+
+  # ------------------------------------------------------------------ wave 2
+  # Two more routes, both portable to every binding without a caveat: a local
+  # append-only log with a consumer-owned offset, and a channel whose access
+  # boundary is a scoped credential rather than an open roster.
+
+  - id: event-log
+    skill: net-event-bus
+    title: The event log you no longer run
+    route: append records to a local log · replay them all · a consumer checkpoint · replay from the offset
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: eventlog.rs
+      typescript: eventlog.ts
+      python: eventlog.py
+      go: eventlog.go
+      c: eventlog.c
+    absent: {}
+    run:
+      expect: "RESULT ok records=8 replayed=8 resumed=3"
+      timeout_s: 120
+      not_wired: {}
+
+  - id: token-channel
+    skill: net-event-bus
+    title: Scoped credentials, not an open channel
+    route: a channel gated on token roots · a subscribe-only token bound to one entity · refused bare, admitted with it
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: tokenchannel.rs
+      typescript: tokenchannel.ts
+      python: tokenchannel.py
+      go: tokenchannel.go
+      c: tokenchannel.c
+    absent: {}
+    run:
+      expect: "RESULT ok granted=1 refused=1"
+      timeout_s: 120
+      not_wired: {}
+
+  # ------------------------------------------------------------------ wave 3
+  # One route, and a negative result worth more than the other two candidates.
+  # All five bindings.
+
+  - id: service-failover
+    skill: net-event-bus
+    title: The sidecar you no longer run
+    route: two providers behind one service name · the caller addresses the service, never a node id · the answering provider dies · the next call lands on the survivor
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: failover.rs
+      typescript: failover.ts
+      python: failover.py
+      go: failover.go
+      c: failover.c
+    absent: {}
+    run:
+      expect: "RESULT ok providers=2 moved=1 served=2"
+      timeout_s: 120
+      not_wired: {}

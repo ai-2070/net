@@ -88,8 +88,8 @@ async fn probe_reflex_returns_source_address() {
     let a = build_mesh(&psk).await;
     let b = build_mesh(&psk).await;
     connect_pair(&a, &b).await;
-    a.inner().start();
-    b.inner().start();
+    a.start();
+    b.start();
 
     let a_bind = a.local_addr();
     let observed = a.probe_reflex(b.node_id()).await.expect("probe_reflex");
@@ -104,7 +104,7 @@ async fn probe_reflex_returns_source_address() {
 async fn probe_reflex_unknown_peer_surfaces_stable_kind() {
     let psk = [0x42u8; 32];
     let a = build_mesh(&psk).await;
-    a.inner().start();
+    a.start();
 
     let err = a
         .probe_reflex(0xDEAD_BEEF_FEED_CAFE)
@@ -135,9 +135,9 @@ async fn reclassify_populates_open_on_localhost() {
     connect_pair(&a, &b).await;
     connect_pair(&a, &c).await;
     connect_pair(&b, &c).await;
-    a.inner().start();
-    b.inner().start();
-    c.inner().start();
+    a.start();
+    b.start();
+    c.start();
 
     a.reclassify_nat().await;
 
@@ -252,10 +252,10 @@ async fn connect_direct_open_pair_via_sdk() {
     connect_pair(&a, &x).await;
     connect_pair(&b, &x).await;
     connect_pair(&r, &x).await;
-    a.inner().start();
-    r.inner().start();
-    b.inner().start();
-    x.inner().start();
+    a.start();
+    r.start();
+    b.start();
+    x.start();
 
     a.reclassify_nat().await;
     b.reclassify_nat().await;

@@ -2,7 +2,8 @@
 //
 // Sits on top of the raw napi `MeshRpc` class (in index.js):
 // translates typed JS objects to/from JSON-encoded Buffers,
-// re-throws errors as typed `RpcError` subclasses, and provides
+// leaves errors as prefixed plain `Error`s for the caller to
+// classify (see the convention note below), and provides
 // pure-JS implementations of the resilience policies that mirror
 // the Rust SDK's defaults.
 //
@@ -617,9 +618,17 @@ export class TypedMeshRpc {
 
   /**
    * Direct-addressed typed call. Encodes `req` as JSON, calls,
-   * decodes the response. Throws an `RpcError` subclass on
-   * failure (matched by the napi prefix → JS class mapping in
-   * `errors.js`).
+   * decodes the response.
+   *
+   * **Rejects with a plain `Error` carrying an `nrpc:<kind>:`
+   * prefix, not a typed `RpcError`** — call `classifyError(e)`
+   * from `@net-mesh/core/errors` at the catch site to get the
+   * subclass. See the convention note at the top of this module
+   * for why the typing happens in the consumer's module context
+   * rather than here. This said "throws an `RpcError` subclass",
+   * which is what the mapping produces, not what this method
+   * does: callers who believed it found `err.name === 'Error'`
+   * and `err.status === undefined`.
    *
    * Pass `opts.signal` (AbortSignal) for caller-driven
    * cancellation. The wrapper mints a cancel token via the raw
@@ -652,7 +661,8 @@ export class TypedMeshRpc {
   /**
    * Service-discovery typed call. Resolves `service` against the
    * local capability index, picks a target per the routing
-   * policy, calls. Throws an `RpcError` subclass on failure.
+   * policy, calls. Same error convention as {@link call}: a
+   * prefixed plain `Error`, classified by the caller.
    */
   async callService<Req = unknown, Resp = unknown>(
     service: string,

@@ -1192,6 +1192,7 @@ jobs:
           --test channel_auth
           --test channel_auth_hardening
           --test channel_auth_origin_binding
+          --test channel_identity_readiness
           --test connect_post_start
           --test handshake_retry_resync
           --test failure_detector_matrix
@@ -2860,7 +2861,14 @@ jobs:
         # reachable one. This job builds `--no-default-features`, so it
         # still has to be listed, and test_payment_http.py's rows depend on
         # it (they skip cleanly if the class is absent).
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,extension-module
+        # `dataforts` (the blob CAS) is in the default feature set, so the
+        # published wheel carries it — this job's `--no-default-features`
+        # build did not, which left `BlobRef` / `blob_publish` /
+        # `MeshBlobAdapter` untested in Python and made a blob example
+        # unrunnable here. Listed so the tested artifact matches the
+        # shipped one; `check-python-wheel-features.py` proves release
+        # still covers this list.
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,dataforts,extension-module
 
       # `--timeout-method=thread` is critical for this FFI-heavy
       # suite: the default `signal` method only works while Python

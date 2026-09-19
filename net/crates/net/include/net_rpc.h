@@ -490,6 +490,13 @@ int net_rpc_find_service_nodes(
     uint64_t** out_ptr, size_t* out_count,
     char** out_err);
 
+/* Forward declarations for the streaming handles. These are used by the
+ * function-pointer typedefs below, and without them a translation unit that
+ * includes only `net_rpc.h` fails to parse ("unknown type name"): the
+ * definitions live in the streaming block further down. */
+typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
+typedef struct RpcResponseSinkHandleC  RpcResponseSinkHandleC;
+
 /* Function pointer the Go side registers via
  * net_rpc_set_streaming_handler_dispatcher. Called once per
  * inbound streaming REQUEST; handler reads the request body once
@@ -895,9 +902,6 @@ void net_rpc_duplex_stream_free(DuplexStreamHandleC* handle);
  *     returns OK/Err. No terminal body — the substrate fold
  *     emits the terminator after the Go handler returns.
  * ========================================================================= */
-
-typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
-typedef struct RpcResponseSinkHandleC  RpcResponseSinkHandleC;
 
 /* Go-registered dispatcher signatures. */
 typedef int (*RpcClientStreamingHandlerFn)(

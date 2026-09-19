@@ -331,8 +331,8 @@ async fn reannounce_loop_corrects_drifted_reflex_before_publish() {
     let y = build_node().await;
     connect_pair(&a, &x).await;
     connect_pair(&a, &y).await;
-    // start_arc: the re-announce loop needs the self-weak.
-    a.start_arc();
+    // start: the re-announce loop needs the self-weak.
+    a.start();
     x.start();
     y.start();
 

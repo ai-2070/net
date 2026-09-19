@@ -162,8 +162,8 @@ async fn local_source_migration_reaches_complete_and_transfers_state() {
     target_rt.start().await.unwrap();
 
     // Start both meshes' receive loops.
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     // Daemon identity — only the source needs to know it. The
@@ -235,7 +235,7 @@ async fn migration_to_unconnected_peer_fails_target_unavailable() {
         .register_factory("counter", counter_factory())
         .unwrap();
     pair.source_rt.start().await.unwrap();
-    pair.source_rt.mesh().inner().start();
+    pair.source_rt.mesh().start();
 
     let identity = Identity::generate();
     let origin_hash = identity.keypair().origin_hash();
@@ -314,8 +314,8 @@ async fn migration_opts_transport_identity_false_skips_envelope() {
         .unwrap();
     pair.source_rt.start().await.unwrap();
     pair.target_rt.start().await.unwrap();
-    pair.source_rt.mesh().inner().start();
-    pair.target_rt.mesh().inner().start();
+    pair.source_rt.mesh().start();
+    pair.target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -377,8 +377,8 @@ async fn migration_to_target_without_origin_factory_surfaces_factory_not_found()
         .unwrap();
     pair.source_rt.start().await.unwrap();
     pair.target_rt.start().await.unwrap();
-    pair.source_rt.mesh().inner().start();
-    pair.target_rt.mesh().inner().start();
+    pair.source_rt.mesh().start();
+    pair.target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -436,8 +436,8 @@ async fn auto_retry_succeeds_after_target_becomes_ready() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     // Flip the target's readiness predicate OFF before the source
@@ -513,8 +513,8 @@ async fn auto_retry_gives_up_with_not_ready_timeout() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     target_rt.simulate_not_ready(true);
@@ -584,8 +584,8 @@ async fn expect_migration_envelope_supplies_keypair_with_no_placeholder() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     // Source spawns with a real identity; target NEVER sees it.
@@ -640,8 +640,8 @@ async fn expect_migration_without_envelope_fails_cleanly() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let real_identity = Identity::generate();
@@ -708,8 +708,8 @@ async fn migration_to_node_without_compute_runtime_surfaces_compute_not_supporte
         .register_factory("counter", counter_factory())
         .unwrap();
     source_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    bare_target.inner().start();
+    source_rt.mesh().start();
+    bare_target.start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -770,8 +770,8 @@ async fn migration_opts_retry_disabled_surfaces_factory_not_found_immediately() 
         .unwrap();
     pair.source_rt.start().await.unwrap();
     pair.target_rt.start().await.unwrap();
-    pair.source_rt.mesh().inner().start();
-    pair.target_rt.mesh().inner().start();
+    pair.source_rt.mesh().start();
+    pair.target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -840,8 +840,8 @@ async fn migration_opts_retry_disabled_surfaces_not_ready_verbatim() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     // Target stays in simulated-not-ready throughout.
@@ -928,8 +928,8 @@ async fn duplicate_spawn_preserves_migratability() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -1052,8 +1052,8 @@ async fn local_source_migration_drives_full_chain_through_self_loopback() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -1129,7 +1129,7 @@ async fn wait_without_timeout_survives_120_virtual_seconds() {
     // inbound, but nothing is dispatched — so the `SnapshotReady`
     // A sends below never drives B into the restore path, and the
     // orchestrator on A sits at phase=Snapshot indefinitely.
-    source_rt.mesh().inner().start();
+    source_rt.mesh().start();
 
     let identity = Identity::generate();
     let origin_hash = identity.keypair().origin_hash();
@@ -1226,8 +1226,8 @@ async fn transport_identity_strict_rejects_when_peer_static_unknown() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let target_node_id = target_rt.mesh().inner().node_id();
@@ -1305,8 +1305,8 @@ async fn transport_identity_false_proceeds_unsealed_under_nkpsk0_responder_sourc
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();
@@ -1374,8 +1374,8 @@ async fn start_migration_clears_stale_failure_cache_entry() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
+    source_rt.mesh().start();
+    target_rt.mesh().start();
     sleep(Duration::from_millis(100)).await;
 
     let identity = Identity::generate();

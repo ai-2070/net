@@ -22,6 +22,7 @@
 #![cfg(feature = "net")]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
@@ -94,9 +95,9 @@ async fn old_relay_fallback_selects_and_traverses_the_real_routed_path() {
     let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
     let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
 
-    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
-    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
-    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+    let node_a = Arc::new(MeshNode::new(id_a, mk_config(addr_a)).await.unwrap());
+    let node_b = Arc::new(MeshNode::new(id_b, mk_config(addr_b)).await.unwrap());
+    let node_c = Arc::new(MeshNode::new(id_c, mk_config(addr_c)).await.unwrap());
 
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();

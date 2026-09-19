@@ -60,6 +60,10 @@ use crate::adapter::net::dataforts::{
     BlobRef as InnerBlobRef, MeshBlobAdapter as InnerMeshBlobAdapter,
     OverflowConfig as InnerOverflowConfig,
 };
+// The mint. `net_mesh_blob_adapter_store` needs a *pre-encoded* ref, so
+// without this a C or Go producer can fetch a blob it cannot create.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+use crate::adapter::net::dataforts::publish_blob_ref;
 
 use super::NetError;
 
@@ -1155,12 +1159,135 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
         } else {
             unsafe { std::slice::from_raw_parts(data, data_len) }
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let data_owned = data_slice.to_vec();
         let result = block_on(async move { (*adapter).store(&blob_ref, &data_owned).await });
         match result {
             Ok(()) => 0,
             Err(e) => err_to_code(&e),
+        }
+    })
+}
+
+/// Mint a content address for `data` and store it: compute the
+/// BLAKE3 hash of the bytes, build the `BlobRef`, persist through
+/// the adapter, and write the *encoded* ref to `*out_ref` /
+/// `*out_ref_len` for the caller.
+///
+/// This is the producer half that [`net_mesh_blob_adapter_store`]
+/// cannot provide: `store` requires an already-encoded ref, so
+/// without this a C or Go producer has no way to create one.
+/// `store` remains the path for writing under a ref minted
+/// elsewhere.
+///
+/// Returns `0` on success (caller frees `*out_ref` via
+/// [`net_blob_free_buffer`]), `NET_ERR_BLOB_*` on adapter-side
+/// error, `NET_ERR_BLOB_UNSUPPORTED_SCHEME` when the URI's scheme
+/// is not one the adapter accepts, or `NetError::NullPointer` /
+/// `InvalidUtf8` for input validation.
+///
+/// # Safety
+/// `handle` is a valid `MeshBlobAdapterHandle*`. `uri_ptr` points
+/// to `uri_len` readable bytes; `data` points to `data_len`
+/// readable bytes (or is null when `data_len` is 0). `out_ref` and
+/// `out_ref_len` are non-null and writable.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_publish(
+    handle: *const MeshBlobAdapterHandle,
+    uri_ptr: *const u8,
+    uri_len: usize,
+    data: *const u8,
+    data_len: usize,
+    out_ref: *mut *mut u8,
+    out_ref_len: *mut usize,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_publish", null_rc, || {
+        if handle.is_null() || uri_ptr.is_null() || out_ref.is_null() || out_ref_len.is_null() {
+            return NetError::NullPointer.into();
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if uri_len > isize::MAX as usize || data_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
+        let h = unsafe { &*handle };
+        // Bail (same shape as null handle) if `_free` has begun.
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let uri_bytes = unsafe { std::slice::from_raw_parts(uri_ptr, uri_len) };
+        let uri = match std::str::from_utf8(uri_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return NetError::InvalidUtf8.into(),
+        };
+        let data_slice = if data.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, data_len) }
+        };
+        let adapter = Arc::clone(&h.inner);
+        let data_owned = data_slice.to_vec();
+        let result = block_on(async move {
+            // `Arc::clone` on the `ManuallyDrop<Arc<..>>` field, never
+            // `.clone()`: the latter clones the WRAPPER, so the bumped
+            // strong count is never released and every call leaks one
+            // reference to the adapter. One deref then reaches the
+            // adapter itself, which is what implements `BlobAdapter`.
+            publish_blob_ref(&*adapter, uri, &data_owned).await
+        });
+        match result {
+            Ok(blob_ref) => {
+                let encoded = blob_ref.encode();
+                unsafe { write_bytes_out(&encoded, out_ref, out_ref_len) }
+            }
+            Err(e) => err_to_code(&e),
+        }
+    })
+}
+
+/// Copy the 32-byte BLAKE3 hash out of an encoded `BlobRef`.
+///
+/// The fetch side of the transport ABI (`net_fetch_blob`) addresses a
+/// blob by its raw hash, while a published ref crosses as the encoded
+/// wire form — so a producer that only holds the encoded ref cannot
+/// name what it just stored. This is the join between the two.
+///
+/// Writes exactly 32 bytes to `out_hash` (caller-allocated) and
+/// returns `0`; returns `NET_ERR_BLOB_DECODE` for a malformed or
+/// non-small ref (a manifest/tree ref has no single content hash —
+/// use its root hash accessor instead).
+///
+/// # Safety
+/// `encoded` points to `encoded_len` readable bytes; `out_hash`
+/// points to at least 32 writable bytes.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_ref_hash(
+    encoded: *const u8,
+    encoded_len: usize,
+    out_hash: *mut u8,
+) -> c_int {
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_blob_ref_hash", null_rc, || {
+        if encoded.is_null() || out_hash.is_null() {
+            return NetError::NullPointer.into();
+        }
+        if encoded_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
+        let slice = unsafe { std::slice::from_raw_parts(encoded, encoded_len) };
+        let blob_ref = match InnerBlobRef::decode(slice) {
+            Ok(Some(b)) => b,
+            _ => return NET_ERR_BLOB_DECODE,
+        };
+        match blob_ref.small_hash() {
+            Some(hash) => {
+                unsafe { std::ptr::copy_nonoverlapping(hash.as_ptr(), out_hash, hash.len()) };
+                0
+            }
+            None => NET_ERR_BLOB_DECODE,
         }
     })
 }
@@ -1201,7 +1328,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
             Ok(Some(b)) => b,
             _ => return NET_ERR_BLOB_DECODE,
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
         match result {
             // Allocate with the same explicit `Layout::array::<u8>(len)`
@@ -1248,7 +1375,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
             Ok(Some(b)) => b,
             _ => return NET_ERR_BLOB_DECODE,
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         let result = block_on(async move { (*adapter).exists(&blob_ref).await });
         match result {
             Ok(present) => {
@@ -1284,7 +1411,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
                 Some(op) => op,
                 None => return ptr::null_mut(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             let body = (*adapter).prometheus_text();
             match std::ffi::CString::new(body) {
                 Ok(s) => s.into_raw(),
@@ -1316,7 +1443,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         if (*adapter).overflow_enabled() {
             1
         } else {
@@ -1345,7 +1472,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         if (*adapter).overflow_active() {
             1
         } else {
@@ -1377,7 +1504,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
                 Some(op) => op,
                 None => return ptr::null_mut(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             let cfg = (*adapter).overflow_config();
             let json = overflow_to_json(cfg);
             match std::ffi::CString::new(json) {
@@ -1412,7 +1539,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
                 Some(op) => op,
                 None => return NetError::NullPointer.into(),
             };
-            let adapter = h.inner.clone();
+            let adapter = Arc::clone(&h.inner);
             (*adapter).set_overflow_enabled(enabled != 0);
             0
         },
@@ -1450,7 +1577,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
             Some(op) => op,
             None => return NetError::NullPointer.into(),
         };
-        let adapter = h.inner.clone();
+        let adapter = Arc::clone(&h.inner);
         (*adapter).set_overflow_config(cfg);
         0
     })

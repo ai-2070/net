@@ -1219,10 +1219,74 @@ impl ShardRef {
     }
 }
 
+/// The shard a rotating sweep visits at `offset` when it started at
+/// `start`, out of `shards`.
+///
+/// Exists so the two fair-sweep implementations — the Rust SDK's
+/// `Mesh::recv` and the Node binding's `poll` — share one definition
+/// of the arithmetic instead of each writing `(start + offset) %
+/// shards`. That expression is wrong in `u16`: both operands reach
+/// `shards - 1`, so their sum overflows once `shards` passes 32768,
+/// which debug-panics and in release wraps to an index that revisits
+/// some shards while never reaching others — the starvation the
+/// rotation exists to prevent, reintroduced at the top of the range.
+///
+/// `shards == 0` is treated as one shard, matching the `.max(1)` both
+/// callers apply before iterating.
+#[inline]
+pub fn rotating_shard(start: u16, offset: u16, shards: u16) -> u16 {
+    let shards = u32::from(shards.max(1));
+    ((u32::from(start) + u32::from(offset)) % shards) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A sweep must visit every shard exactly once, from any start.
+    /// That is the whole property the rotation buys: without it a busy
+    /// low-numbered shard can fill the caller's limit and the quiet
+    /// ones are never polled.
+    #[test]
+    fn a_rotating_sweep_is_a_permutation_of_every_shard() {
+        for shards in [1u16, 2, 4, 7, 256] {
+            let visited: Vec<u16> = (0..shards).map(|o| rotating_shard(3, o, shards)).collect();
+            let mut sorted = visited.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                shards as usize,
+                "a sweep of {shards} shards visited {visited:?} — not each shard once",
+            );
+        }
+    }
+
+    /// The regression: `(start + offset) % shards` in `u16` overflows
+    /// once `shards` passes 32768, because both operands reach
+    /// `shards - 1`. Debug builds panicked inside `poll`; release
+    /// builds wrapped to an index that revisited shards and skipped
+    /// others. The largest possible shard count is the sharp case.
+    #[test]
+    fn the_widest_shard_count_neither_panics_nor_repeats() {
+        let shards = u16::MAX;
+        let start = shards - 1;
+
+        // The sum that used to overflow: (65534 + 65534).
+        assert_eq!(rotating_shard(start, start, shards), shards - 2);
+        // Wrapping across the end of the ring lands back at the start.
+        assert_eq!(rotating_shard(start, 1, shards), 0);
+        assert_eq!(rotating_shard(start, 0, shards), start);
+    }
+
+    /// Callers `.max(1)` before iterating; the helper agrees rather
+    /// than dividing by zero if one of them ever forgets.
+    #[test]
+    fn zero_shards_behaves_as_one() {
+        assert_eq!(rotating_shard(0, 0, 0), 0);
+        assert_eq!(rotating_shard(5, 9, 0), 0);
+    }
 
     #[test]
     fn test_shard_push_pop() {

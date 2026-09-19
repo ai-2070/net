@@ -176,6 +176,9 @@ net-sdk = { package = "net-mesh-sdk", path = "$ROOT/net/crates/net/sdk" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures = "0.3"
+# Channel publish takes `bytes::Bytes`; the SDK re-exports the config types but
+# not the payload type, so an example that registers a channel needs this crate.
+bytes = "1"
 EOF
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
@@ -204,9 +207,34 @@ if [ -z "$PY_FILES" ]; then
   ok "no Python examples in the manifest"
 elif command -v mypy >/dev/null 2>&1 || "$PYTHON" -c "import mypy" >/dev/null 2>&1; then
   MYPY=$(command -v mypy || echo "$PYTHON -m mypy")
+  # TWO public surfaces, both resolved from source:
+  #
+  #   sdk-py/src                  -> `net_sdk` (the published wrapper)
+  #   bindings/python/python      -> `net` (the binding, which carries its own
+  #                                  `_net.pyi` beside `_net.py`)
+  #
+  # The second is not optional. The mesh-based examples import `net`, which the
+  # skills document — `nrpc.md` writes `from net import NetMesh`, and `apis.md`
+  # states Python's mesh channels live on `net.NetMesh`, not
+  # `net_sdk.MeshNode`. With only the first on MYPYPATH, `net` resolved from
+  # whatever the machine had installed (a stale local build, or an unrelated
+  # `net` package), and the check reported `Module "net" has no attribute
+  # "NetMesh"` for seven of nine examples on a developer machine while passing
+  # in CI. A check whose verdict depends on the developer's site-packages is
+  # worse than no check: it was read as a binding gap for as long as it lasted.
+  #
+  # Note this also means the binding's own stub must type-check — MYPYPATH
+  # modules are treated as source, so their errors are reported rather than
+  # silenced by `--follow-imports=silent`. That is the wanted behaviour: the
+  # stub ships in the wheel, and nine errors in it (three undefined names, an
+  # invalid overload pair, a shadowed builtin) were found by adding this path.
+  # mypy splits MYPYPATH with `os.pathsep` — `:` on POSIX, `;` on Windows —
+  # so derive it rather than assuming the POSIX form.
+  MYPY_SEP=$("$PYTHON" -c 'import os; print(os.pathsep)')
+  MYPYPATH="$ROOT/net/crates/net/sdk-py/src$MYPY_SEP$ROOT/net/crates/net/bindings/python/python"
   while IFS=$'\t' read -r path id; do
     [ -z "$path" ] && continue
-    if MYPYPATH="$ROOT/net/crates/net/sdk-py/src" $MYPY \
+    if MYPYPATH="$MYPYPATH" $MYPY \
          --ignore-missing-imports --follow-imports=silent --no-error-summary \
          --cache-dir "$WORK/mypy-cache" "$ROOT/$path" >"$WORK/py-$id.log" 2>&1; then
       ok "$id: $(basename "$path")"

@@ -442,7 +442,7 @@ async fn intake_all_visible() {
 // ============================================================================
 // CPB-3 — RT-3 registry mutation -> remote visibility, two policy modes
 // (C4/C5). Driven by a real tool-registry mutation (tool_registry().insert),
-// which fires the local-caps change signal and settles through start_arc()'s
+// which fires the local-caps change signal and settles through start()'s
 // change-driven auto-announcer — NOT an explicit announce. So the measured
 // latency INCLUDES the RT-3 debounce (and, in default-policy, the rate-limit
 // floor). Feature "tool"; otherwise this whole section is cfg'd out and the
@@ -485,7 +485,7 @@ async fn run_rt3(label: &str, cfg: &BenchConfig, iters: u64, warmup: u64) {
         let descriptor = tool_descriptor(&tool_id);
         let t0 = Instant::now();
         // The RT-3 trigger: a registry mutation, not an explicit announce. The
-        // change-driven announcer (running because of start_arc) debounces then
+        // change-driven announcer (running because of start) debounces then
         // announces; the measured latency includes that policy window.
         a.tool_registry().insert(descriptor);
         let visible = tokio::time::timeout(

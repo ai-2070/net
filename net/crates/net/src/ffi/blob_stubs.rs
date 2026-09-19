@@ -66,6 +66,28 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_blob_adapter_publish(
+    _handle: *const MeshBlobAdapterHandle,
+    _uri_ptr: *const u8,
+    _uri_len: usize,
+    _data: *const u8,
+    _data_len: usize,
+    _out_ref: *mut *mut u8,
+    _out_ref_len: *mut usize,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_blob_ref_hash(
+    _encoded: *const u8,
+    _encoded_len: usize,
+    _out_hash: *mut u8,
+) -> c_int {
+    NET_ERR_FEATURE_NOT_BUILT
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     _handle: *const MeshBlobAdapterHandle,
     _blob_ref_bytes: *const u8,

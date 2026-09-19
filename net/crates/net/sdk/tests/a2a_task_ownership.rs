@@ -48,9 +48,9 @@ async fn connect_all(executor: &Mesh, callers: &[&Mesh]) {
         connected.expect("connect");
     }
     for caller in callers {
-        caller.inner().start();
+        caller.start();
     }
-    executor.inner().start();
+    executor.start();
 }
 
 /// Runs until cancelled, so the RED has something live to try to stop.

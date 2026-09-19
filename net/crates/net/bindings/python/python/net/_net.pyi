@@ -554,6 +554,175 @@ class NetDb:
     def snapshot(self) -> bytes: ...
     def close(self) -> None: ...
 
+class WorkflowTaskState:
+    """Materialized lifecycle state of one workflow task."""
+
+    step: int
+    status: str  # "submitted" | "running" | "waiting" | "blocked" | "done" | "failed"
+    attempts: int
+
+class WorkflowStatusCounts:
+    """Roll-up of workflow task counts per status."""
+
+    submitted: int
+    running: int
+    waiting: int
+    blocked: int
+    done: int
+    failed: int
+
+class WorkflowAdapter:
+    """Typed task-lifecycle adapter — a single-writer RedEX chain folded
+    into per-task `{ step, status, attempts }`.
+
+    Every mutator appends one event and returns its sequence number; hand
+    that seq to `wait_for_seq` to block until the fold has caught up. A
+    terminal task (`done` / `failed`) is never moved again.
+    """
+
+    @staticmethod
+    def open(
+        redex: Redex, origin_hash: int, persistent: bool = False
+    ) -> "WorkflowAdapter": ...
+    @staticmethod
+    def open_from_snapshot(
+        redex: Redex,
+        origin_hash: int,
+        state_bytes: bytes,
+        last_seq: Optional[int] = None,
+        persistent: bool = False,
+    ) -> "WorkflowAdapter":
+        """Open from a `snapshot()` pair, skipping replay through `last_seq`."""
+        ...
+    def submit(self, id: int) -> int:
+        """Submit a new task — enters at step 0, `submitted`."""
+        ...
+    def transition(self, id: int, status: str) -> int:
+        """Set a task's status. Raises `CortexError` on an unknown status."""
+        ...
+    def start(self, id: int) -> int:
+        """Mark the task `running`."""
+        ...
+    def wait(self, id: int) -> int:
+        """Park the task `waiting`."""
+        ...
+    def block(self, id: int) -> int:
+        """Park the task `blocked`."""
+        ...
+    def complete(self, id: int) -> int:
+        """Mark the task `done` (terminal success)."""
+        ...
+    def fail(self, id: int) -> int:
+        """Mark the task `failed` (terminal failure)."""
+        ...
+    def advance(self, id: int) -> int:
+        """Advance the step cursor: bumps `step`, resets `attempts`."""
+        ...
+    def retry(self, id: int) -> int:
+        """Retry the current step. Never resurrects a `done` task."""
+        ...
+    def delete(self, id: int) -> int:
+        """Delete a task, reclaiming its whole linked subtree."""
+        ...
+    def link(self, parent: int, child: int) -> int:
+        """Record a parent->child lineage edge (idempotent)."""
+        ...
+    def request_cancel(self, id: int) -> int:
+        """Request cancellation — a worker-observed signal, not a kill."""
+        ...
+    def get(self, id: int) -> Optional[WorkflowTaskState]:
+        """Current state for `id`, or `None` if the task is unknown."""
+        ...
+    def is_cancel_requested(self, id: int) -> bool: ...
+    def subtree(self, id: int) -> List[int]:
+        """`id` plus all transitive descendants — the `delete` subtree."""
+        ...
+    def status_counts(self) -> WorkflowStatusCounts: ...
+    def snapshot(self) -> Tuple[bytes, Optional[int]]:
+        """Capture a state snapshot as `(state_bytes, last_seq)` — the pair
+        `open_from_snapshot` takes back."""
+        ...
+    def fan_out(self, group: "ShardGroup") -> int:
+        """Submit every shard task in `group`; returns the last append seq."""
+        ...
+    def try_join(self, group: "ShardGroup") -> "JoinResult":
+        """Submit the reduce once every shard is done, surface failed shards,
+        or report pending. Idempotent — safe to poll."""
+        ...
+    def wait_for_seq(self, seq: int) -> None:
+        """Block until every event up through `seq` has folded. Releases the
+        GIL for the wait; raises `CortexError` if the fold task stopped."""
+        ...
+
+class ShardGroup:
+    """A map-reduce shard group: the shard task ids plus the reduce task id.
+
+    Hand it to `WorkflowAdapter.fan_out` to submit every shard, then poll
+    `WorkflowAdapter.try_join` until the reduce is submitted.
+    """
+
+    def __init__(self, shards: List[int], reduce: int) -> None: ...
+
+class JoinResult:
+    """Outcome of a `WorkflowAdapter.try_join`.
+
+    `kind` is `submitted` (the reduce was appended at `seq`),
+    `already_submitted`, `pending` (shards still in flight), or `failed`.
+    `seq` is populated only for `submitted`, `failed` only for `failed`.
+    """
+
+    kind: str  # "submitted" | "already_submitted" | "pending" | "failed"
+    seq: Optional[int]
+    failed: Optional[List[int]]
+
+class TriggerAction:
+    """A fired trigger's action: `kind` is `submit` or `start`, `id` the task
+    the caller should act on. The engine itself starts nothing."""
+
+    kind: str  # "submit" | "start"
+    id: int
+
+class TriggerEngine:
+    """The pure trigger engine, bound to a `WorkflowAdapter` whose state it
+    reads itself.
+
+    Arm a dependency, then drive the engine with `on_task_change` /
+    `on_tick`; each returns the `TriggerAction`s that fired for the caller
+    to apply. `action_kind` is `submit` or `start` — anything else raises
+    `CortexError`.
+    """
+
+    def __init__(self, wf: WorkflowAdapter) -> None: ...
+    def arm_after_task(self, task: int, action_kind: str, action_id: int) -> None:
+        """Fire the action once `task` is done."""
+        ...
+    def arm_if_result(
+        self, task: int, key: str, value: str, action_kind: str, action_id: int
+    ) -> None:
+        """Fire the action once `task` is done AND its recorded result `key`
+        equals `value` — record it first via `record_result`."""
+        ...
+    def record_result(self, task: int, key: str, value: str) -> None:
+        """Record `task`'s result `key = value` for `arm_if_result`."""
+        ...
+    def arm_after_terminal(self, task: int, action_kind: str, action_id: int) -> None:
+        """Fire the action once `task` reaches done OR failed."""
+        ...
+    def on_task_change(self, task: int, tick: int = 0) -> List[TriggerAction]:
+        """`task` changed: evaluate the triggers waiting on it against the
+        bound adapter's current state; returns the actions that fired."""
+        ...
+    def arm_at_tick(self, tick: int, action_kind: str, action_id: int) -> None:
+        """Fire the action once the clock reaches `tick`."""
+        ...
+    def on_tick(self, now: int) -> List[TriggerAction]:
+        """The clock advanced to `now`: fire and disarm every `AtTick`
+        trigger whose deadline has passed."""
+        ...
+    def armed_count(self) -> int:
+        """Total armed (not-yet-fired) triggers."""
+        ...
+
 class CortexError(Exception):
     """Raised by CortEX adapter operations (tasks, memories) on
     adapter-level failures: `adapter closed`, `fold stopped at seq N`,
@@ -899,6 +1068,14 @@ class NetMesh:
         """Fan one payload to every subscriber. Returns a
         `PublishReport` dict: `{attempted, delivered, errors}` where
         `errors` is a list of `{node_id, message}`."""
+        ...
+
+    def poll_shard(self, shard_id: int, limit: int) -> list[StoredEvent]:
+        """Drain one ingestion shard, up to `limit` events.
+
+        The receive half of the channel surface: a published event lands
+        on the shard derived from its stream id, so a consumer polls
+        every shard. `StoredEvent.raw` is the payload itself."""
         ...
 
     def announce_capabilities(self, caps: dict) -> None:
@@ -2054,18 +2231,166 @@ class BlobError(Exception):
     """Dataforts blob-layer error."""
 
 class BlobRef:
-    """Content-addressed pointer to a blob payload (substrate-resolved)."""
+    """Content-addressed pointer to a blob payload (substrate-resolved).
+
+    ``blob_publish`` returns the *encoded* form; parse it with
+    :meth:`from_encoded` to read the hash or URI.
+    """
+
+    @property
+    def version(self) -> int: ...
+    @property
+    def uri(self) -> str: ...
+    @property
+    def hash(self) -> bytes:
+        """32-byte BLAKE3 content hash."""
+        ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def is_tree(self) -> bool: ...
+    @property
+    def is_chunked(self) -> bool: ...
+    def encode(self) -> bytes:
+        """The wire form that rides inside an event payload."""
+        ...
+    @staticmethod
+    def from_encoded(data: bytes) -> Optional["BlobRef"]:
+        """Parse an encoded ref. ``None`` when ``data`` is not one."""
+        ...
 
 class MeshBlobAdapter:
     """Substrate-owned blob adapter; publish / resolve through the mesh."""
+
+    def __init__(
+        self,
+        redex: "Redex",
+        adapter_id: str,
+        *,
+        persistent: bool = False,
+        overflow: Optional[object] = None,
+        tree_node_cache_bytes: Optional[int] = None,
+    ) -> None: ...
+    @property
+    def adapter_id(self) -> str: ...
+    def store(self, blob_ref: "BlobRef", data: bytes) -> None:
+        """Store ``data`` under ``blob_ref`` (BLAKE3-verified)."""
+        ...
+    def fetch(self, blob_ref: "BlobRef") -> bytes:
+        """Read the bytes back."""
+        ...
+    def exists(self, blob_ref: "BlobRef") -> bool: ...
 
 def register_blob_adapter(adapter_id: str, adapter: object) -> None: ...
 def register_filesystem_blob_adapter(adapter_id: str, root: str) -> None: ...
 def unregister_blob_adapter(adapter_id: str) -> None: ...
 def blob_adapter_ids() -> List[str]: ...
 def blob_adapter_registered(adapter_id: str) -> bool: ...
-def blob_publish(adapter_id: str, payload: bytes) -> bytes: ...
-def blob_resolve(blob_ref: bytes) -> bytes: ...
+def blob_publish(adapter_id: str, uri: str, data: bytes) -> bytes:
+    """Store ``data`` under ``uri`` and return the encoded address."""
+    ...
+def blob_resolve(adapter_id: str, payload: bytes) -> bytes:
+    """Resolve an encoded address back to its bytes."""
+    ...
+
+# ---- Blob + directory transfer (`transport.rs`) -----------------------------
+#
+# Node-driven transfer over the fairscheduler stream transport. Present iff
+# the module was built with the ``dataforts`` feature.
+
+class TransferError(Exception):
+    """Raised on transfer operations: content not found, holder-discovery
+    failure, hash mismatch, engine-not-installed, manifest decode, unsafe
+    path, or transport failures."""
+
+class TransferControl:
+    """Transfer control frame (requester -> holder): "send me the chunk
+    addressed by ``hash``".
+
+    ``encode()`` emits the postcard wire form, byte-identical across every
+    language tier.
+    """
+
+    @staticmethod
+    def request(hash: bytes) -> "TransferControl":
+        """Build a ``Request`` for the 32-byte BLAKE3 content ``hash``.
+        Raises ``ValueError`` unless ``hash`` is exactly 32 bytes."""
+        ...
+    @property
+    def hash(self) -> bytes:
+        """The 32-byte content hash this control requests."""
+        ...
+    def encode(self) -> bytes: ...
+    @staticmethod
+    def decode(bytes: bytes) -> "TransferControl":
+        """Decode postcard wire bytes. Raises ``ValueError`` on a frame this
+        build cannot parse."""
+        ...
+    def __repr__(self) -> str: ...
+
+class TransferHeader:
+    """Transfer header (holder -> requester): the first data-plane frame,
+    declaring the total length (``Found``) or that the holder lacks the
+    chunk (``NotFound``)."""
+
+    @staticmethod
+    def found(total_len: int) -> "TransferHeader":
+        """``Found`` — ``total_len`` bytes of chunk data follow."""
+        ...
+    @staticmethod
+    def not_found() -> "TransferHeader":
+        """``NotFound`` — the holder does not have the chunk."""
+        ...
+    @property
+    def is_found(self) -> bool: ...
+    @property
+    def total_len(self) -> Optional[int]:
+        """The declared total length for a ``Found`` header, else ``None``."""
+        ...
+    def encode(self) -> bytes: ...
+    @staticmethod
+    def decode(bytes: bytes) -> "TransferHeader":
+        """Decode postcard wire bytes. Raises ``ValueError`` on a frame this
+        build cannot parse."""
+        ...
+    def __repr__(self) -> str: ...
+
+def transfer_stream_id(nonce: int) -> int:
+    """Construct a transfer stream id from a per-transfer ``nonce``."""
+    ...
+def is_transfer_stream_id(stream_id: int) -> bool:
+    """True iff ``stream_id`` is a blob-transfer stream id."""
+    ...
+def next_transfer_stream_id() -> int:
+    """Allocate a fresh, process-unique transfer stream id."""
+    ...
+def serve_blob_transfer(mesh: NetMesh, adapter: MeshBlobAdapter) -> None:
+    """Install the blob-transfer engine on ``mesh`` over ``adapter``.
+    Required before the node can serve chunks OR fetch them. Idempotent."""
+    ...
+def fetch_blob(mesh: NetMesh, holder_id: int, blob_ref: BlobRef) -> bytes:
+    """Fetch a whole blob from the known holder ``holder_id``, returning the
+    reassembled, BLAKE3-verified bytes. Tree refs are not supported by the
+    transport bindings and raise ``TransferError``."""
+    ...
+def fetch_blob_discovered(mesh: NetMesh, blob_ref: BlobRef) -> bytes:
+    """Like :func:`fetch_blob`, but discovers the holder among connected
+    peers. When no peer serves the content the ``TransferError`` message is
+    tagged ``all peers failed``, distinguishing it from a named-holder
+    miss."""
+    ...
+def store_dir(mesh: NetMesh, adapter: MeshBlobAdapter, root: str) -> BlobRef:
+    """Store the local directory at ``root`` as content-addressed blobs in
+    ``adapter``, returning the directory-manifest ref a receiver hands to
+    :func:`fetch_dir`."""
+    ...
+def fetch_dir(
+    mesh: NetMesh, source_id: int, manifest_ref: BlobRef, dest: str
+) -> Tuple[int, int]:
+    """Fetch the directory whose manifest is ``manifest_ref`` from
+    ``source_id`` and reconstruct it under ``dest``. Returns
+    ``(files_written, bytes_written)``."""
+    ...
 
 # ---- Compute / daemon runtime (`compute.rs`) --------------------------------
 
@@ -2456,6 +2781,377 @@ class FoldQueryClient:
     def __repr__(self) -> str: ...
 
 # =============================================================================
+# nRPC — the synchronous surface (`mesh_rpc.rs`). Present iff the module was
+# built with the `cortex` feature (the wheel default). The `Async*` siblings
+# share the same MeshNode and live in the section below; `ServeHandle` is
+# shared by both and is declared there.
+# =============================================================================
+
+class RpcError(Exception):
+    """Base class for every nRPC failure. Catch it to handle any failure,
+    or drill down to the concrete subclass. Messages carry the cross-binding
+    ``nrpc:<kind>: `` prefix, so one regex matches Python, Node and Go."""
+
+class RpcNoRouteError(RpcError):
+    """The caller cannot reach the target — the node id is unknown to the
+    local mesh, the reply-channel registry is at its cap, or a dispatcher
+    hash collision precluded a fresh registration. NOT retried by the
+    default retry policy."""
+
+class RpcTimeoutError(RpcError):
+    """The caller's deadline elapsed before the server responded. The
+    caller side has already published CANCEL to the server."""
+
+class RpcServerError(RpcError):
+    """The server returned a non-Ok status. The message carries the status
+    code and the server's diagnostic text."""
+
+class RpcTransportError(RpcError):
+    """Underlying transport / publish failure (encryption, congestion, ...).
+    Distinct from :class:`RpcNoRouteError`; the default retry policy DOES
+    retry these because they are typically transient."""
+
+class RpcCodecError(RpcError):
+    """Local serialization failure — the typed wrapper could not encode the
+    request or could not decode the response. A caller-fixable local bug;
+    NOT retried by the default retry policy."""
+
+class RpcAppError(RpcError):
+    """Raise this inside a serve handler to return an application-defined
+    status code: ``RpcAppError(code, body)`` becomes an Application status
+    carrying ``body``, instead of collapsing into the generic Internal
+    mapping."""
+
+class RpcCancelledError(RpcError):
+    """The unary call was cancelled mid-flight via :meth:`Cancellable.cancel`.
+    CANCEL has been published to the server. NOT retried by the default
+    retry policy."""
+
+class RpcCapabilityDeniedError(RpcError):
+    """The capability-auth gate denied the call: the target's signed
+    announcement either omits the requested ``nrpc:<service>`` tag, or lists
+    it with allow-lists the caller does not match. NOT retried — only a
+    fresh, more permissive announcement from the target changes the
+    verdict."""
+
+class Cancellable:
+    """Caller-side cancel token.
+
+    Pass it as ``opts={'cancel': cancel}`` to any call; calling
+    :meth:`cancel` from another thread aborts the call mid-flight — CANCEL
+    fires on the wire and the caller observes :class:`RpcCancelledError`
+    for a unary call or stream EOF for a streaming one. Cancelling before
+    the call is issued latches the request, so the next call using this
+    token short-circuits to cancelled.
+    """
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None:
+        """Request cancellation. Idempotent."""
+        ...
+    def is_cancelled(self) -> bool:
+        """``True`` once :meth:`cancel` has been called."""
+        ...
+
+class RpcStream(Iterator[bytes]):
+    """Iterator over a server-streaming call's response chunks.
+
+    ``__next__`` blocks for the next chunk, raises ``StopIteration`` on
+    clean EOF, and raises an :class:`RpcError` subclass on a terminal non-Ok
+    status. Dropping the stream or calling :meth:`close` emits CANCEL.
+    """
+
+    def __iter__(self) -> "RpcStream": ...
+    def __next__(self) -> bytes: ...
+    def grant(self, n: int) -> None:
+        """Grant ``n`` further flow-control credits to the server's pump.
+        No-op unless the call set ``stream_window_initial``."""
+        ...
+    def flow_controlled(self) -> bool:
+        """``True`` if the call set ``stream_window_initial``."""
+        ...
+    def close(self) -> None:
+        """Close the stream, emitting CANCEL to the server. Idempotent."""
+        ...
+
+class ClientStreamCall:
+    """Open client-streaming call. Push chunks with :meth:`send`, then
+    :meth:`finish` to await the terminal response; :meth:`close` fires
+    CANCEL if ``finish`` was never reached. Usable as a context manager."""
+
+    def send(self, body: bytes) -> None: ...
+    def finish(self) -> bytes:
+        """Emit REQUEST_END and await the terminal response. Consumes the
+        call."""
+        ...
+    def call_id(self) -> int: ...
+    def flow_controlled(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "ClientStreamCall": ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
+
+class DuplexSink:
+    """Send half of a split duplex call."""
+
+    def send(self, body: bytes) -> None: ...
+    def finish(self) -> None:
+        """Close the upload direction (emit REQUEST_END)."""
+        ...
+    def call_id(self) -> int: ...
+    def flow_controlled(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "DuplexSink": ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
+
+class DuplexStream(Iterator[bytes]):
+    """Receive half of a split duplex call."""
+
+    def __iter__(self) -> "DuplexStream": ...
+    def __next__(self) -> bytes: ...
+    def call_id(self) -> int: ...
+    def close(self) -> None: ...
+
+class DuplexCall(Iterator[bytes]):
+    """Combined duplex call — iterate it for response chunks while pushing
+    request chunks with :meth:`send`. :meth:`into_split` peels independent
+    sink + stream halves, after which this handle is done and every further
+    ``send`` / ``finish_sending`` / ``next()`` raises :class:`RpcError`."""
+
+    def send(self, body: bytes) -> None: ...
+    def finish_sending(self) -> None:
+        """Close the upload direction (emit REQUEST_END). The response
+        stream stays open."""
+        ...
+    def __iter__(self) -> "DuplexCall": ...
+    def __next__(self) -> bytes: ...
+    def into_split(self) -> Tuple[DuplexSink, DuplexStream]: ...
+    def call_id(self) -> int: ...
+    def flow_controlled(self) -> bool: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "DuplexCall": ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
+
+class RequestStreamRecv(Iterator[bytes]):
+    """Server-side inbound request stream, handed to client-streaming and
+    duplex handlers. Iterate it to drain the caller's chunks."""
+
+    def __iter__(self) -> "RequestStreamRecv": ...
+    def __next__(self) -> bytes: ...
+    @property
+    def caller_origin(self) -> int:
+        """The caller's peer origin hash."""
+        ...
+    @property
+    def call_id(self) -> int:
+        """Substrate-minted call id, stable for the call's lifetime."""
+        ...
+    @property
+    def deadline_ns(self) -> int:
+        """The caller's declared deadline as absolute Unix-nanos; ``0``
+        means no deadline. Handlers MAY observe it to short-circuit work
+        that is already past the wire deadline."""
+        ...
+    @property
+    def headers(self) -> List[Tuple[str, bytes]]:
+        """Initial-REQUEST headers as ``(name, value)`` pairs; names are
+        lowercase per the substrate convention."""
+        ...
+
+class ResponseSinkSend:
+    """Outbound response sink, handed to server-streaming and duplex
+    handlers."""
+
+    def send(self, body: bytes) -> bool:
+        """Emit one chunk; ``True`` on success, ``False`` once the sink has
+        been torn down. Non-blocking by design — it is a ``try_send`` into a
+        bounded queue feeding the response pump, so chunks are dropped when
+        the pump stalls on credit. Pace emits to the REQUEST_GRANT cadence
+        rather than burst-pushing."""
+        ...
+
+class RpcCallEvent:
+    """One observed RPC call boundary, handed to the callback installed via
+    :meth:`MeshRpc.set_observer`. Every attribute is a plain int or str."""
+
+    caller: int
+    callee: int
+    method: str
+    latency_ms: int
+    status_kind: str  # "ok" | "error" | "timeout" | "canceled"
+    status_message: Optional[str]  # populated only when status_kind == "error"
+    request_bytes: int
+    response_bytes: int
+    direction: str  # "outbound" | "inbound"; v1 emits only "outbound"
+    ts_unix_ms: int
+
+class ServiceMetrics:
+    """Per-service caller- and server-side nRPC counters at a point in time.
+    One element of :attr:`RpcMetricsSnapshot.services`."""
+
+    service: str
+    # ---- caller-side ----
+    calls_total: int
+    errors_no_route: int
+    errors_timeout: int
+    errors_server: int
+    errors_transport: int
+    in_flight: int
+    latency_sum_ns: int
+    latency_count: int
+    latency_buckets: List[int]
+    # ---- server-side ----
+    handler_invocations_total: int
+    handler_panics_total: int
+    handler_in_flight: int
+    handler_duration_sum_ns: int
+    handler_duration_count: int
+    handler_duration_buckets: List[int]
+    streaming_chunks_emitted_total: int
+    streaming_chunks_dropped_total: int
+    capability_denied_total: int
+
+class RpcMetricsSnapshot:
+    """Snapshot of the per-service nRPC metrics registry."""
+
+    # One entry per service called at least once since the mesh was
+    # created, sorted by service name.
+    services: List[ServiceMetrics]
+    # Observer events dropped because the observer's bounded buffer was
+    # full. A climbing value means the installed callback cannot keep up
+    # with the dispatch rate — enqueue and drain off a dedicated thread.
+    observer_dropped_total: int
+
+class MeshRpc:
+    """Synchronous nRPC client + server bound to an existing
+    :class:`NetMesh`.
+
+    Construction is cheap (an ``Arc`` clone of the mesh's node + runtime) —
+    build one per mesh and reuse it. Every ``call*`` raises an
+    :class:`RpcError` subclass on failure; every ``serve*`` returns a
+    :class:`ServeHandle` whose ``close()`` unregisters the service while
+    letting in-flight handlers finish.
+
+    ``handler_timeout_ms`` caps the per-call wait for a Python handler and
+    defaults to 60 000. A handler wedged past the cap surfaces to the caller
+    as an Internal status so the in-flight slot is not leaked; ``0`` disables
+    the cap, which lets a stuck handler hold a runtime worker forever.
+    """
+
+    def __init__(self, mesh: NetMesh) -> None: ...
+    def serve(
+        self,
+        service: str,
+        handler: Callable[[bytes], bytes],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> "ServeHandle":
+        """Register a unary handler callable as ``handler(req) -> bytes``."""
+        ...
+    def serve_streaming(
+        self,
+        service: str,
+        handler: Callable[[bytes, ResponseSinkSend], Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> "ServeHandle":
+        """Register a server-streaming handler callable as
+        ``handler(req, sink)``; emit chunks via ``sink.send(bytes)``. The
+        substrate emits the terminal frame when the handler returns."""
+        ...
+    def serve_client_stream(
+        self,
+        service: str,
+        handler: Callable[[RequestStreamRecv], bytes],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> "ServeHandle":
+        """Register a client-streaming handler callable as
+        ``handler(stream) -> bytes``; iterate ``stream`` to drain the
+        caller's chunks and return the terminal response."""
+        ...
+    def serve_duplex(
+        self,
+        service: str,
+        handler: Callable[[RequestStreamRecv, ResponseSinkSend], Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> "ServeHandle":
+        """Register a duplex handler callable as ``handler(stream, sink)``."""
+        ...
+    def call(
+        self,
+        target_node_id: int,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """Direct-addressed unary call — the capability index is NOT
+        consulted. Pass ``opts={'cancel': Cancellable()}`` to let another
+        thread abort the call mid-flight."""
+        ...
+    def call_service(
+        self,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """Service-discovery unary call: resolves ``service`` against the
+        local capability index (``nrpc:<service>`` tags), applies the
+        routing policy, then calls."""
+        ...
+    def call_streaming(
+        self,
+        target_node_id: int,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> RpcStream:
+        """Open a direct-addressed server-streaming call."""
+        ...
+    def call_service_streaming(
+        self,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> RpcStream:
+        """Capability-routed streaming call — :meth:`call_service` routing
+        with :meth:`call_streaming` result shape."""
+        ...
+    def call_client_stream(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> ClientStreamCall:
+        """Open a client-streaming call. The initial REQUEST is published
+        lazily on the first ``send`` (or on ``finish`` for the zero-send
+        path)."""
+        ...
+    def call_duplex(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> DuplexCall:
+        """Open a duplex call. Pass ``opts={'request_window_initial': N}``
+        / ``opts={'stream_window_initial': N}`` for per-direction flow
+        control."""
+        ...
+    def find_service_nodes(self, service: str) -> List[int]:
+        """Every node id currently advertising ``nrpc:<service>`` in the
+        local capability index."""
+        ...
+    def set_observer(
+        self, observer: Optional[Callable[[RpcCallEvent], Any]] = None
+    ) -> None:
+        """Install (a callable) or clear (``None``) the caller-side nRPC
+        observer, replacing any previous one. It fires once per completed
+        outbound RPC off the runtime's blocking pool, and exceptions it
+        raises are swallowed — an observer cannot influence the call. Keep
+        it cheap: enqueue and drain elsewhere."""
+        ...
+    def metrics_snapshot(self) -> RpcMetricsSnapshot:
+        """Snapshot the per-service nRPC metrics registry. Cheap enough to
+        call on every scrape."""
+        ...
+
+# =============================================================================
 # Async siblings — D-3.
 #
 # Each Async* class wraps the same Arc<...> as its sync counterpart.
@@ -2589,6 +3285,22 @@ class AsyncDuplexCall:
     def call_id(self) -> int: ...
     def flow_controlled(self) -> bool: ...
 
+class ServeHandle:
+    """Handle to a registered nRPC service.
+
+    Returned by ``MeshRpc.serve`` / ``AsyncMeshRpc.serve``. In-flight handlers
+    continue to completion on ``close()``, but no new request is dispatched;
+    ``close`` is idempotent, and leaving the ``with`` block closes for you.
+    """
+
+    def close(self) -> None: ...
+    def is_closed(self) -> bool: ...
+    def __enter__(self) -> "ServeHandle": ...
+    def __exit__(
+        self, exc_type: Any, exc_value: Any, traceback: Any
+    ) -> bool: ...
+
+
 class AsyncMeshRpc:
     """Async sibling of :class:`MeshRpc`."""
 
@@ -2620,6 +3332,12 @@ class AsyncMeshRpc:
         request: bytes,
         opts: Optional[Dict[str, Any]] = None,
     ) -> AsyncRpcStream: ...
+    async def call_service_streaming(
+        self,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> AsyncRpcStream: ...
     async def call_client_stream(
         self,
         target_node_id: int,
@@ -2644,8 +3362,32 @@ class AsyncMeshRpc:
         handler: Callable[..., Any],
         handler_timeout_ms: Optional[int] = None,
     ) -> ServeHandle: ...
+    def serve_streaming(
+        self,
+        service: str,
+        handler: Callable[[bytes, ResponseSinkSend], Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> ServeHandle: ...
 
 # ----- T2: cortex -----
+
+class WriteToken:
+    """A durable-write token — the point a stream's fold has reached.
+
+    ``origin_hash`` identifies the stream, ``seq`` the sequence it marks. Hand
+    it to ``wait_for_token`` to block until the fold has reached that point.
+    """
+
+    def __init__(self, origin_hash: int, seq: int) -> None: ...
+    @staticmethod
+    def from_string(s: str) -> "WriteToken": ...
+    @property
+    def origin_hash(self) -> int: ...
+    @property
+    def seq(self) -> int: ...
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
 
 class AsyncMemoryWatchIter:
     """PEP 525 async iterator over a memories watch."""
@@ -2752,6 +3494,13 @@ class AsyncMigrationHandle:
     async def cancel(self) -> None: ...
     def phases(self) -> MigrationPhasesIter: ...
     def __repr__(self) -> str: ...
+
+class MigrationPhasesIter:
+    """Iterator over a migration's phase names (``str``)."""
+
+    def __iter__(self) -> "MigrationPhasesIter": ...
+    def __next__(self) -> str: ...
+
 
 class AsyncDaemonRuntime:
     """Async sibling of :class:`DaemonRuntime`."""
@@ -3119,10 +3868,10 @@ class AsyncPinStore:
     async def reject(self, cap_id: "str | CapabilityId") -> bool: ...
     async def is_approved(self, cap_id: "str | CapabilityId") -> bool: ...
     async def state(self, cap_id: "str | CapabilityId") -> Optional[str]: ...
-    async def approved(self) -> list[str]: ...
-    async def pending(self) -> list[str]: ...
-    async def list(self) -> list[tuple[str, str]]: ...
-    async def snapshot_and_watch(self) -> tuple[list[str], "AsyncPinWatcher"]:
+    async def approved(self) -> List[str]: ...
+    async def pending(self) -> List[str]: ...
+    async def list(self) -> List[Tuple[str, str]]: ...
+    async def snapshot_and_watch(self) -> Tuple[List[str], "AsyncPinWatcher"]:
         """Snapshot the currently-approved capabilities AND subscribe to
         changes, atomically. Returns ``(approved, watcher)`` — promote the
         snapshot, then ``async for change in watcher:`` for subsequent deltas.
@@ -3247,12 +3996,66 @@ class CapabilityGateway:
         delegation_leaf: "Identity",
         delegation_chain: bytes,
     ) -> None: ...
+    # Build a gateway over a started ``mesh``. ``pin_store_path`` should
+    # be the machine-shared pin store so approvals are honored both ways;
+    # omit it to keep consent in-memory (every gated capability then always
+    # requires approval).
+    #
+    # Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
+    # ``delegation_chain`` (a serialized ``DelegationChain``) together to have
+    # every invoke carry a per-invoke signed delegation (Phase 3); a remote
+    # provider running a delegation gate then admits by verified delegation
+    # and audits this gateway's leaf. **Both or neither** — passing exactly
+    # one raises ``ValueError``.
+    #
+    # Pass ``payment_policy_path`` (the machine-shared spend-policy store)
+    # to enable paid capabilities: the invoke gate then clears them through
+    # the Rust payments flow (quote -> spend policy -> x402 payload -> pay
+    # over the mesh). ``payment_profile`` is ``"production"`` (the
+    # fail-closed default: every mock spend holds for approval) or
+    # ``"dev_test"`` (mock auto-allows under the configured limits);
+    # ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
+    # for production-profile demos. Without ``payment_policy_path``, a paid
+    # capability fails closed as a structured ``denied`` — never a silent
+    # unpaid serve. Requires the ``payments`` build feature (the default
+    # wheel has it); passing payment kwargs on a build without it raises
+    # ``ValueError``.
+    #
+    # The payment identity is the node's mesh identity: quotes are issued
+    # to, spend is tracked against, and invocation proofs are signed by the
+    # same ed25519 identity peers see on the mesh.
+    #
+    # Real (non-mock) networks additionally need a settlement signer
+    # *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
+    # address) **and** ``payment_signer`` (both or neither), a callable
+    # ``(typed_data_json: str) -> str`` that forwards the full EIP-712
+    # typed-data document to your wallet / KMS and returns the 65-byte
+    # ``0x…``-hex signature. Only the typed document and the signature
+    # cross the language boundary — there is no way to hand Net a private
+    # key, and the only thing this surface can ask your signer for is a
+    # logged, typed transfer authorization (never raw bytes). Enablement
+    # still requires the network in the spend policy's
+    # ``allowed_networks`` — the signer is capability, not consent.
+    #
+    # Solana and XRPL settlement use the same seam under their own
+    # namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
+    # (a ``(intent_json: str) -> str`` returning the base64 partially-signed
+    # SVM transaction) and ``payment_signer_xrpl_address`` +
+    # ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
+    # blob). Each pair is both-or-neither; an absent pair means that scheme
+    # is simply unavailable. The callable always sees a typed intent JSON,
+    # never key material — identical doctrine to the eip155 seam."""
+    # The payment-bearing form is split the same way, and for the same
+    # reason: a single overload taking both delegation arguments as
+    # optional would re-admit the partial call the pair above exists to
+    # reject, and the runtime `ValueError` would be the first anyone
+    # heard of it.
+    @overload
     def __init__(
         self,
         mesh: "NetMesh",
         pin_store_path: Optional[str] = None,
-        delegation_leaf: Optional["Identity"] = None,
-        delegation_chain: Optional[bytes] = None,
+        *,
         payment_policy_path: Optional[str] = None,
         payment_profile: Optional[str] = None,
         payment_unsafe_mock_auto_allow: bool = False,
@@ -3262,57 +4065,25 @@ class CapabilityGateway:
         payment_signer_svm: Optional[Callable[[str], str]] = None,
         payment_signer_xrpl_address: Optional[str] = None,
         payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None:
-        """Build a gateway over a started ``mesh``. ``pin_store_path`` should
-        be the machine-shared pin store so approvals are honored both ways;
-        omit it to keep consent in-memory (every gated capability then always
-        requires approval).
-
-        Pass ``delegation_leaf`` (the gateway ``Identity`` handle) **and**
-        ``delegation_chain`` (a serialized ``DelegationChain``) together to have
-        every invoke carry a per-invoke signed delegation (Phase 3); a remote
-        provider running a delegation gate then admits by verified delegation
-        and audits this gateway's leaf. **Both or neither** — passing exactly
-        one raises ``ValueError``.
-
-        Pass ``payment_policy_path`` (the machine-shared spend-policy store)
-        to enable paid capabilities: the invoke gate then clears them through
-        the Rust payments flow (quote -> spend policy -> x402 payload -> pay
-        over the mesh). ``payment_profile`` is ``"production"`` (the
-        fail-closed default: every mock spend holds for approval) or
-        ``"dev_test"`` (mock auto-allows under the configured limits);
-        ``payment_unsafe_mock_auto_allow=True`` is the explicit unsafe flag
-        for production-profile demos. Without ``payment_policy_path``, a paid
-        capability fails closed as a structured ``denied`` — never a silent
-        unpaid serve. Requires the ``payments`` build feature (the default
-        wheel has it); passing payment kwargs on a build without it raises
-        ``ValueError``.
-
-        The payment identity is the node's mesh identity: quotes are issued
-        to, spend is tracked against, and invocation proofs are signed by the
-        same ed25519 identity peers see on the mesh.
-
-        Real (non-mock) networks additionally need a settlement signer
-        *reference*: pass ``payment_signer_address`` (the payer's ``0x…``
-        address) **and** ``payment_signer`` (both or neither), a callable
-        ``(typed_data_json: str) -> str`` that forwards the full EIP-712
-        typed-data document to your wallet / KMS and returns the 65-byte
-        ``0x…``-hex signature. Only the typed document and the signature
-        cross the language boundary — there is no way to hand Net a private
-        key, and the only thing this surface can ask your signer for is a
-        logged, typed transfer authorization (never raw bytes). Enablement
-        still requires the network in the spend policy's
-        ``allowed_networks`` — the signer is capability, not consent.
-
-        Solana and XRPL settlement use the same seam under their own
-        namespaces: ``payment_signer_svm_address`` + ``payment_signer_svm``
-        (a ``(intent_json: str) -> str`` returning the base64 partially-signed
-        SVM transaction) and ``payment_signer_xrpl_address`` +
-        ``payment_signer_xrpl`` (returning the hex presigned XRPL ``Payment``
-        blob). Each pair is both-or-neither; an absent pair means that scheme
-        is simply unavailable. The callable always sees a typed intent JSON,
-        never key material — identical doctrine to the eip155 seam."""
-        ...
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        mesh: "NetMesh",
+        pin_store_path: Optional[str],
+        delegation_leaf: "Identity",
+        delegation_chain: bytes,
+        *,
+        payment_policy_path: Optional[str] = None,
+        payment_profile: Optional[str] = None,
+        payment_unsafe_mock_auto_allow: bool = False,
+        payment_signer_address: Optional[str] = None,
+        payment_signer: Optional[Callable[[str], str]] = None,
+        payment_signer_svm_address: Optional[str] = None,
+        payment_signer_svm: Optional[Callable[[str], str]] = None,
+        payment_signer_xrpl_address: Optional[str] = None,
+        payment_signer_xrpl: Optional[Callable[[str], str]] = None,
+    ) -> None: ...
 
     @property
     def pin_store_path(self) -> Optional[str]:
@@ -3390,6 +4161,16 @@ class AsyncCapabilityGateway:
         delegation_leaf: "Identity",
         delegation_chain: bytes,
     ) -> None: ...
+    # Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
+    # ``delegation_chain`` together (both or neither) to sign + attach a
+    # delegation on every invoke (Phase 3); pass ``payment_policy_path``
+    # (+ optional ``payment_profile`` / unsafe flag) to enable paid
+    # capabilities through the payments flow, and
+    # ``payment_signer_address`` + ``payment_signer`` (both or neither)
+    # for real-network settlement — see :class:`CapabilityGateway` for the
+    # signer-reference contract. The signer callable runs on a blocking
+    # worker thread, never on your event loop."""
+    @overload
     def __init__(
         self,
         mesh: "NetMesh",
@@ -3405,17 +4186,8 @@ class AsyncCapabilityGateway:
         payment_signer_svm: Optional[Callable[[str], str]] = None,
         payment_signer_xrpl_address: Optional[str] = None,
         payment_signer_xrpl: Optional[Callable[[str], str]] = None,
-    ) -> None:
-        """Same as :class:`CapabilityGateway` — pass ``delegation_leaf`` +
-        ``delegation_chain`` together (both or neither) to sign + attach a
-        delegation on every invoke (Phase 3); pass ``payment_policy_path``
-        (+ optional ``payment_profile`` / unsafe flag) to enable paid
-        capabilities through the payments flow, and
-        ``payment_signer_address`` + ``payment_signer`` (both or neither)
-        for real-network settlement — see :class:`CapabilityGateway` for the
-        signer-reference contract. The signer callable runs on a blocking
-        worker thread, never on your event loop."""
-        ...
+    ) -> None: ...
+
     @property
     def pin_store_path(self) -> Optional[str]: ...
     async def search(self, query: str) -> str:

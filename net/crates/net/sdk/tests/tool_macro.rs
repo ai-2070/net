@@ -99,8 +99,8 @@ async fn macro_register_serves_tool_and_round_trips_call() {
     );
     r1.expect("accept");
     r2.expect("connect");
-    host.inner().start();
-    caller.inner().start();
+    host.start();
+    caller.start();
 
     // Register via the macro-generated function. Returns a
     // `ToolServeHandle` the caller is expected to keep alive for

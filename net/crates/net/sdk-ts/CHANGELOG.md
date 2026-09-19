@@ -49,6 +49,28 @@ install time.
 
 ### Added
 
+- **`MeshNode.recv(limit)`, `.recvShard(shardId, limit)`, `.numShards()` and
+  `.shardForStream(streamId)`** — the receive half of the mesh, previously
+  reachable only by dropping to `@net-mesh/core`.
+
+  The SDK wrapped `registerChannel`, `subscribeChannel` and `publish` but
+  forwarded none of the native binding's poll verbs, so a subscriber could
+  join a publisher's roster and had no supported way to read a delivered
+  payload. Rust (`recv_shard`) and Python (`poll_shard`) already had one.
+
+  ```typescript
+  await subscriber.subscribeChannel(publisherId, 'config/edge');
+  for (const event of await subscriber.recv(64)) {
+    apply(event.rawBytes);
+  }
+  ```
+
+  `recv` sweeps every shard starting from a rotating one, so a busy shard
+  cannot starve a quiet one and events are not returned in shard order. Pair
+  `recvShard` with `shardForStream` when you want one stream instead of the
+  merge. Payload bytes are on `rawBytes`; `raw` is the UTF-8 view and is empty
+  for binary payloads.
+
 - **`MeshNode.findBestNode(requirement)` and `.findBestNodeScoped(requirement,
   scope)`** — single-winner capability discovery, previously Rust, Go and C
   only.

@@ -1683,6 +1683,12 @@ typedef struct net_mesh_blob_adapter_s net_mesh_blob_adapter_t;
 /* Free a buffer the adapter returned via `*out_data` (fetch path). */
 void net_blob_free_buffer(uint8_t* ptr, size_t len);
 
+/* Copy the 32-byte BLAKE3 hash out of an encoded BlobRef, into a
+ * caller-allocated 32-byte buffer. The fetch path (net_fetch_blob)
+ * addresses a blob by its raw hash while a published ref crosses as
+ * the encoded wire form, so this is the join between the two. */
+int net_blob_ref_hash(const uint8_t* encoded, size_t encoded_len, uint8_t* out_hash);
+
 net_mesh_blob_adapter_t* net_mesh_blob_adapter_new(
     net_redex_t* redex,
     const char* adapter_id,
@@ -1698,6 +1704,20 @@ int net_mesh_blob_adapter_store(
     size_t blob_ref_len,
     const uint8_t* data,
     size_t data_len
+);
+
+/* Mint a content address for `data` (BLAKE3), store it through the
+ * adapter, and write the encoded BlobRef to *out_ref/*out_ref_len for
+ * the caller to free via net_blob_free_buffer. This is the producer
+ * half: net_mesh_blob_adapter_store needs an already-encoded ref. */
+int net_mesh_blob_adapter_publish(
+    const net_mesh_blob_adapter_t* handle,
+    const uint8_t* uri_ptr,
+    size_t uri_len,
+    const uint8_t* data,
+    size_t data_len,
+    uint8_t** out_ref,
+    size_t* out_ref_len
 );
 
 int net_mesh_blob_adapter_fetch(
@@ -1724,6 +1744,25 @@ int net_mesh_blob_adapter_set_overflow_enabled(
     const net_mesh_blob_adapter_t* handle, int enabled);
 int net_mesh_blob_adapter_set_overflow_config(
     const net_mesh_blob_adapter_t* handle, const char* config_json);
+
+/* ---- Blob transfer over the mesh (mirrors net_transport.h) ----
+ *
+ * The engine must be installed on BOTH nodes: a fetch needs it just as
+ * much as a serve does. A fetch addresses the blob by its raw 32-byte
+ * BLAKE3 hash, not by the encoded ref — get one from an encoded ref
+ * with net_blob_ref_hash above.
+ */
+int net_serve_blob_transfer(const net_meshnode_t* node,
+                            const net_mesh_blob_adapter_t* adapter);
+
+int net_fetch_blob(const net_meshnode_t* node,
+                   uint64_t holder_id,
+                   const uint8_t* hash,
+                   uint8_t** out_bytes,
+                   size_t* out_len);
+
+/* Free a buffer returned by net_fetch_blob. */
+void net_transport_free_buffer(uint8_t* ptr, size_t len);
 
 /* ============================================================
  * Capability aggregation — Phase 6c of

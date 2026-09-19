@@ -96,16 +96,26 @@ done <<< "$TS_FILES"
 INCLUDE=${INCLUDE%, }
 
 # `extends` the SDK's own tsconfig so `types: ["node"]` and the installed
-# @types/node resolve naturally. Two overrides are load-bearing: `rootDir` must
-# widen to `..` (the example and `bindings/node/*.ts` both sit outside `src/`),
-# and `baseUrl` is deliberately absent — TypeScript 6 makes it a hard error, and
-# the `paths` below are already relative to this file.
+# @types/node resolve naturally. Three overrides are load-bearing: `rootDir`
+# must widen to `..` (the example and `bindings/node/*.ts` both sit outside
+# `src/`); `baseUrl` is deliberately absent — TypeScript 6 makes it a hard
+# error, and the `paths` below are already relative to this file; and `lib`
+# rises to ES2024.
+#
+# That last one is a deliberate split. The SDK publishes against ES2022
+# because that is the floor it promises consumers, but the examples document
+# usage on the Node 24 toolchain this repo pins, where ES2024 library
+# surface (`Promise.withResolvers`, used by `tokenchannel.ts`) is present at
+# runtime. `lib` is a type-level declaration only, so widening it here
+# changes nothing about what the SDK emits or what it asks of consumers — it
+# stops the examples being held to a floor they do not run on.
 cat > "$SDK_TS/tsconfig.skill-example.json" <<JSON
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
     "rootDir": "..",
+    "lib": ["ES2024"],
     "paths": {
       "@net-mesh/sdk": ["./src/index.ts"],
       "@net-mesh/core": ["../bindings/node/index.d.ts"],

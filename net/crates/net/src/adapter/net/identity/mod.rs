@@ -7,6 +7,7 @@
 mod entity;
 mod envelope;
 mod origin;
+mod proof;
 mod state;
 mod token;
 
@@ -15,6 +16,12 @@ pub use envelope::{
     EnvelopeError, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE, IDENTITY_ENVELOPE_VERSION,
 };
 pub use origin::OriginStamp;
+pub use proof::{
+    decode as decode_identity_proof, encode as encode_identity_proof, proof_transcript,
+    verify_proof, IdentityChallengeStore, IdentityProofCodecError, IdentityProofMsg,
+    IdentityProofReject, IDENTITY_CHALLENGE_TTL, MAX_IDENTITY_CHALLENGES_PER_PEER,
+    MAX_IDENTITY_CHALLENGE_PEERS, SUBPROTOCOL_IDENTITY_PROOF, TRANSCRIPT_LEN,
+};
 pub use state::{IdentityState, IdentityStateError, IDENTITY_STATE_SIZE, IDENTITY_STATE_VERSION};
 pub use token::{
     PermissionToken, RevocationRegistry, TokenCache, TokenChain, TokenError, TokenScope,

@@ -1086,6 +1086,16 @@ mod mesh_bindings {
                 if reason == "Some(TooManyChannels)" {
                     return super::ChannelError::new_err("channel: too many channels");
                 }
+                if reason == "Some(IdentityNotEstablished)" {
+                    // An auth-axis failure, so `ChannelAuthError` —
+                    // but a distinct one from `unauthorized`: the
+                    // credential was never evaluated, because the
+                    // publisher holds no authenticated entity for this
+                    // session's peer to bind its leaf to.
+                    return super::ChannelAuthError::new_err(
+                        "channel: identity not established for this session",
+                    );
+                }
                 return super::ChannelError::new_err(format!("channel: rejected ({})", reason));
             }
         }
@@ -1636,7 +1646,7 @@ mod mesh_bindings {
 
         /// Start the receive loop and heartbeats.
         ///
-        /// Uses `start_arc` (like the C FFI and the Rust SDK) so
+        /// Uses `start` (like the C FFI and the Rust SDK) so
         /// the Arc-scoped lifecycle loops run too: periodic
         /// capability re-announce (with the reflex-diff
         /// re-classify trigger) and — when `auto_direct_upgrade`
@@ -1650,7 +1660,7 @@ mod mesh_bindings {
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
             let _guard = self.runtime.enter();
-            node.start_arc();
+            node.start();
             Ok(())
         }
 
@@ -3368,14 +3378,14 @@ mod mesh_bindings {
         /// Start the receive loop + heartbeats. Sync — internal
         /// `tokio::spawn`, no network round-trip.
         ///
-        /// `start_arc`, matching the sync `NetMesh.start`: enables
+        /// `start`, matching the sync `NetMesh.start`: enables
         /// the Arc-scoped lifecycle loops (periodic re-announce +
         /// the opt-in background direct-path upgrade).
         fn start(&self) -> PyResult<()> {
             let handle = crate::async_bridge::runtime()
                 .ok_or_else(|| PyRuntimeError::new_err("async bridge not initialized"))?;
             let _guard = handle.enter();
-            self.node.start_arc();
+            self.node.start();
             Ok(())
         }
 
@@ -3946,6 +3956,18 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         // wrapper module on top of these classes.
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
         m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
+        // The sync streaming handles. `net/mesh_rpc.py` imports these six by
+        // name in one `from net._net import (...)`; before they were registered
+        // here, that single import failed and the module's `except ImportError`
+        // left `_RawMeshRpc = None`, so `TypedMeshRpc.from_mesh` raised
+        // "MeshRpc unavailable" for every caller — under a wheel built WITH
+        // `cortex`. Registering the async counterparts alone was not enough.
+        m.add_class::<mesh_rpc::PyClientStreamCall>()?;
+        m.add_class::<mesh_rpc::PyDuplexCall>()?;
+        m.add_class::<mesh_rpc::PyDuplexSink>()?;
+        m.add_class::<mesh_rpc::PyDuplexStream>()?;
+        m.add_class::<mesh_rpc::PyRequestStreamRecv>()?;
+        m.add_class::<mesh_rpc::PyResponseSinkSend>()?;
         m.add_class::<mesh_rpc::PyAsyncRpcStream>()?;
         m.add_class::<mesh_rpc::PyAsyncClientStreamCall>()?;
         m.add_class::<mesh_rpc::PyAsyncDuplexCall>()?;

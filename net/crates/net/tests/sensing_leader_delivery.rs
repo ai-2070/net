@@ -1237,7 +1237,7 @@ async fn fold_withdrawal_reconciles_leader_demand() {
     // ── The membership change: P stops declaring the capability.
     //    (Announce in a retry loop: a bare-`start()` node DROPS an
     //    in-window announce — the RT-1 deferral flush needs
-    //    `start_arc` — so the retries guarantee one out-of-window
+    //    `start` — so the retries guarantee one out-of-window
     //    broadcast actually floods the change.) ──
     let reconciled_at = std::time::Instant::now();
     await_condition(

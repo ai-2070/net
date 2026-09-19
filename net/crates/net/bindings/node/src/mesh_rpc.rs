@@ -284,6 +284,21 @@ fn parse_js_app_error(message: &str) -> Option<(u16, String)> {
     Some((code, body.to_string()))
 }
 
+/// The same parse, applied to the one field that carries the JS
+/// message.
+///
+/// Every caller used to stringify the error first. `napi::Error`'s
+/// `Display` is `"{status:?}, {reason}"`, so the rendered string
+/// begins `"GenericFailure, nrpc:app_error:…"` and the prefix match
+/// never fired — EVERY typed application status thrown by a Node serve
+/// handler silently degraded to `Internal`, including the
+/// decode-failure `0x8000` that `TypedMeshRpc.serve` documents. The
+/// unit tests could not see it: they call `parse_js_app_error` on a
+/// hand-written string, never on a real `napi::Error`.
+fn js_app_error(error: &napi::Error) -> Option<(u16, String)> {
+    parse_js_app_error(&error.reason)
+}
+
 type RpcHandlerTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, napi::Status, false>;
 
 struct NodeRpcHandler {
@@ -331,9 +346,22 @@ impl RpcHandler for NodeRpcHandler {
         let promise = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
+                // A handler that validates its input before doing any
+                // async work throws synchronously, and that is the
+                // most likely place for a typed refusal to come from.
+                // This arm never parsed the marker, so the one shape
+                // the contract most expects — reject early, with a
+                // status — was the one shape guaranteed to arrive as
+                // `Internal`.
+                if let Some((code, body)) = js_app_error(&e) {
+                    return Err(RpcHandlerError::Application {
+                        code,
+                        message: body,
+                    });
+                }
                 return Err(RpcHandlerError::Internal(format!(
                     "JS handler threw synchronously: {e}"
-                )))
+                )));
             }
             Ok(Err(_)) => {
                 return Err(RpcHandlerError::Internal(
@@ -363,8 +391,7 @@ impl RpcHandler for NodeRpcHandler {
                 // body }; otherwise fall through to the generic
                 // Internal mapping. Mirrors the Python binding's
                 // RpcAppError pathway.
-                let msg = e.to_string();
-                if let Some((code, body)) = parse_js_app_error(&msg) {
+                if let Some((code, body)) = js_app_error(&e) {
                     return Err(RpcHandlerError::Application {
                         code,
                         message: body,
@@ -1489,15 +1516,14 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
-                let msg: String = format!("{e}");
-                if let Some((code, body)) = parse_js_app_error(&msg) {
+                if let Some((code, body)) = js_app_error(&e) {
                     return Err(RpcHandlerError::Application {
                         code,
                         message: body,
                     });
                 }
                 Err(RpcHandlerError::Internal(format!(
-                    "JS streaming handler promise rejected: {msg}"
+                    "JS streaming handler promise rejected: {e}"
                 )))
             }
             Err(_) => Err(RpcHandlerError::Internal(format!(
@@ -1571,8 +1597,7 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
         let resp_buf = match tokio::time::timeout_at(deadline, promise).await {
             Ok(Ok(buf)) => buf,
             Ok(Err(e)) => {
-                let msg = e.to_string();
-                if let Some((code, body)) = parse_js_app_error(&msg) {
+                if let Some((code, body)) = js_app_error(&e) {
                     return Err(RpcHandlerError::Application {
                         code,
                         message: body,
@@ -1682,15 +1707,14 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         match settled {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
-                let msg: String = format!("{e}");
-                if let Some((code, body)) = parse_js_app_error(&msg) {
+                if let Some((code, body)) = js_app_error(&e) {
                     return Err(RpcHandlerError::Application {
                         code,
                         message: body,
                     });
                 }
                 Err(RpcHandlerError::Internal(format!(
-                    "JS duplex handler promise rejected: {msg}"
+                    "JS duplex handler promise rejected: {e}"
                 )))
             }
             Err(_) => Err(RpcHandlerError::Internal(format!(
@@ -2397,6 +2421,51 @@ mod tests {
         let (code, body) = parse_js_app_error("nrpc:app_error:0x0001:").expect("empty body");
         assert_eq!(code, 1);
         assert_eq!(body, "");
+    }
+
+    /// The defect the tests above could not see: they feed the parser
+    /// a hand-written string, but production feeds it a `napi::Error`.
+    ///
+    /// `napi::Error`'s `Display` is `"{status:?}, {reason}"`, so every
+    /// call site that stringified the error first handed the parser
+    /// `"GenericFailure, nrpc:app_error:0x8001:…"` — the prefix never
+    /// matched, and EVERY typed application status a Node serve
+    /// handler raised arrived as `Internal`. Observed end-to-end
+    /// before the fix: a caller saw
+    /// `nrpc:server_error: status=0x0006 message=JS handler promise
+    /// rejected: GenericFailure, nrpc:app_error:0x8001:worker one
+    /// refused job 3` where it should have seen the application
+    /// refusal.
+    ///
+    /// So this asserts on the boundary type, not on a string: the
+    /// marker must survive an actual `napi::Error`, and the rendered
+    /// `Display` of that same error must NOT parse — which is what
+    /// makes the test fail if anyone reintroduces `e.to_string()`.
+    #[test]
+    fn a_typed_status_survives_a_real_napi_error() {
+        let error =
+            napi::Error::from_reason("nrpc:app_error:0x8001:{\"error\":\"refused\"}".to_string());
+
+        let (code, body) = js_app_error(&error).expect("the marker must survive a napi::Error");
+        assert_eq!(code, 0x8001);
+        assert_eq!(body, "{\"error\":\"refused\"}");
+
+        assert!(
+            parse_js_app_error(&error.to_string()).is_none(),
+            "regression guard: `Display` prefixes the status, so parsing the \
+             STRINGIFIED error is exactly the bug — if this starts matching, \
+             napi changed its format and `js_app_error` should be revisited, \
+             but a call site must still never stringify first",
+        );
+    }
+
+    /// A rejection that carries no marker is still `Internal`, so the
+    /// fix above widens nothing: only the documented prefix maps to a
+    /// typed status.
+    #[test]
+    fn an_unmarked_napi_error_is_not_an_application_status() {
+        let error = napi::Error::from_reason("TypeError: x is not a function".to_string());
+        assert!(js_app_error(&error).is_none());
     }
 
     /// Anything not matching the canonical shape is rejected;
