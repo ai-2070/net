@@ -14,19 +14,28 @@ decides.** Displaying a price never implies authorization to spend it.
 ```rust
 #[async_trait]
 pub trait ProviderChannel: Send + Sync {
-    async fn quote(&self, caller: &EntityId, capability: &str, template: &X402Carry<PaymentRequirements>) -> Result<Vec<u8>, ChannelError>;
+    async fn quote(&self, caller: &EntityId, provider: &EntityId, capability: &str, template: &X402Carry<PaymentRequirements>, input_hash: Option<&str>) -> Result<Vec<u8>, ChannelError>;
     async fn pay(&self, quote_bytes: &[u8], payload: &X402Carry<PaymentPayload>) -> Result<PayResponse, ChannelError>;
 }
 ```
+
+`provider` is the identity the caller *intends* to pay, read off the announced
+terms — the mesh channel binds it into the signed quote request, so a captured
+request cannot be replayed to a different provider. `input_hash` binds the
+quote to **one exact unit of work** (blake3 hex): it lands in `terms_hash` and
+therefore in the quote id. `None` is the capability-level shape `run()` uses;
+the paid-A2A flow passes the reservation's purchase hash (`a2a.md`).
 
 Two implementations ship:
 
 - `InProcessProvider::new(Arc<PaymentEngine>, Arc<dyn Clock>)` — same-process
   (tests, single-node). Options: `.with_quote_ttl_ns(u64)` (default 60s),
   `.with_required_tier(VerificationTier)` (default `Observed`).
-- `MeshPaymentChannel::new(Arc<Mesh>)` (feature `mesh`) — cross-machine over
-  nRPC. Resolves the provider node id from the `<node_id>/<capability>`
-  segment and calls `net.payments.quote.v1` / `net.payments.pay.v1`.
+- `MeshPaymentChannel::new(Arc<Mesh>, Arc<EntityKeypair>, Arc<dyn Clock>)`
+  (feature `mesh`) — cross-machine over nRPC. It holds the caller **keypair**,
+  not an id, because every quote request is signed; it resolves the provider
+  node id from the `<node_id>/<capability>` segment and calls
+  `net.payments.quote.v1` / `net.payments.pay.v1`.
 
 `ChannelError { message, retryable }`. `PayResponse` is the wire-facing map of
 `PaymentDecision` (`#[serde(tag = "status")]`): `Served {billing_event,
@@ -76,6 +85,15 @@ let decision: CallerDecision = flow.run("prov/fixture-tool", pricing_terms_json)
 8. On success, sign the invocation binding
    (`invocation_binding_transcript(quote_id, tool_id)`) and return it in the
    decision.
+
+`run` is the **one-call** form, for a caller that has nothing to persist
+between the stages. The same lifecycle is also exposed as staged verbs —
+`quote_bound(capability, pricing_terms, input_hash)` → `reserve_spend` →
+`author` → `pay_exact(quote_bytes, payload_bytes)` — so a caller that must make
+the quote and the authored payload durable *before* paying can do so. That is
+exactly what the paid-A2A flow is built from: `A2aCallerFlow` composes these
+verbs over a durable purchase attempt instead of re-implementing them
+(`a2a.md`).
 
 `CallerDecision`:
 

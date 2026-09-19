@@ -113,7 +113,8 @@ bytes with `NET_ERR_BUFFER_TOO_SMALL` **without advancing the cursor** — size 
 
 ## Gaps
 
-`bindings/coverage.md` is authoritative. The one to know: **no A2A**, in any
+`bindings/coverage.md` is authoritative. The one to know: **no A2A** (free or
+paid, serving or calling), in any
 header. Payments likewise — there is no `net_payment_*` or `net_x402_*` symbol
 and no payments cdylib.
 

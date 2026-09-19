@@ -154,6 +154,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "what-net-payments-is",
       "x402-and-net",
       "the-lifecycle",
+      "paid-agent-work",
       "verification-tiers",
       "spend-policy-and-approvals",
       "non-custodial-signing",

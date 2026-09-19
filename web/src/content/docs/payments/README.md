@@ -56,6 +56,7 @@ docs along with the crate.
 - [What Net Payments is (and is not)](/docs/payments/what-net-payments-is)
 - [x402 and Net](/docs/payments/x402-and-net) — the payment wire, and what Net wraps around it
 - [The lifecycle](/docs/payments/the-lifecycle) — quote → verify → settle → serve → bill
+- [Paid agent work](/docs/payments/paid-agent-work) — selling a bounded job over A2A: prepare → purchase → submit
 - [Verification tiers](/docs/payments/verification-tiers) — `observed | confirmed(n) | final`
 - [Spend policy & approvals](/docs/payments/spend-policy-and-approvals)
 - [Non-custodial signing](/docs/payments/non-custodial-signing)

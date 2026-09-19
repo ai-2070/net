@@ -97,6 +97,7 @@ let quote: PaymentQuote = engine.issue_quote(
     caller_entity_id,
     "prov/fixture-tool",
     requirements_carry,     // X402Carry<PaymentRequirements> — an INSTANTIATED template
+    input_hash,             // Option<&str> — blake3 hex binding the quote to ONE unit of work; None = capability-level
     now_ns,
     ttl_ns,                 // quote lifetime; expires_at_ns = now_ns + ttl_ns
 )?;
@@ -106,6 +107,13 @@ Runs admission + registry `check_requirements` (asset allowed, decimals
 cross-check), then builds and **signs** the quote with the provider identity.
 The returned `PaymentQuote` is the binding, provider-signed offer
 (`object-model.md`). Serialize it (`canonical_bytes`) to send to the caller.
+
+A present `input_hash` must be **exactly one lowercase-hex blake3 digest** or
+issuance fails with `EngineError::MalformedInputHash`: an empty or off-shape
+value folds into `terms_hash` precisely as *absence* does, so accepting one
+would mint a "bound" quote sharing its id with the unbound capability-level
+quote. The paid-A2A path is the shipped user of this field — the hash is the
+provider's own reservation (`a2a.md`).
 
 ### 2. Accept payment — verify + settle + chain + bill (one call)
 
@@ -156,7 +164,7 @@ The checker upgrades the chain with `Verified@Confirmed(n)` / `Verified@Final`
 events (`VerifierRef.endpoint = "independent-chain-check:<rpc>"`), and a reorg
 becomes an `Invalidated{reorg}` that freezes the quote. See `verification.md`.
 
-### 4. Serve gate — redeem the quote for its one invocation
+### 4. Serve gate — redeem the quote (two paths, one engine)
 
 ```rust
 let redeem: RedeemDecision = engine.redeem_for_invocation(
@@ -175,6 +183,20 @@ someone who saw the quote id — ed25519 over
 `invocation_binding_transcript(quote_id, tool_id)` (domain-separated,
 length-prefixed). Present-but-invalid rejects; absent degrades to bearer
 (quote-id) redemption.
+
+**`redeem_for_invocation` is the tool path; `redeem_for_task` is the A2A one.**
+An engine redeems for exactly these two, and they are not interchangeable:
+
+| | `redeem_for_invocation(tool_id, quote_id, binding)` | `redeem_for_task(tool_id, quote_id, binding, expected_input_hash)` |
+|---|---|---|
+| Consumed by | `serve_tool_paid` / the MCP gate | `EngineTaskAdmissionGate`, at A2A admission |
+| Binding | `Option<&[u8]>` — absent degrades to bearer | **required** `&[u8]`; no bearer mode ever existed |
+| Input | not compared | must equal the provider's own purchase hash, or `RedeemDenialReason::InputBindingMismatch` (read-only arm, no store write) |
+| Repeat | strictly at-most-once (`AlreadyRedeemed`) | idempotent for that same purchase hash; anything else is `AlreadyRedeemed` |
+
+The task path is idempotent because admission and the provider's admission
+journal are two durable writes in two files; a crash between them must
+reconcile, not charge twice. See `a2a.md`.
 
 ### 5. Inspect / bill
 
@@ -226,6 +248,13 @@ why). `serve_tool_paid` takes an `Arc<dyn ToolPaymentGate>` —
 `redeem(tool_id, quote_id, binding) -> Result<(), GateDenial>`; the request body
 is decoded **before** the gate, so a structurally invalid call is rejected
 without consuming the quote.
+
+**The same rule governs an A2A task catalog**, one level up: each entry is
+explicitly `A2aServicePolicy::Free` or `Paid`, a `Paid` entry with no pricing
+terms is `ServeError::MissingPricingTerms`, a `Free` entry carrying terms is
+`ServeError::UnenforceablePricing`, and a paid catalog with no payment gate or
+no admission journal is `ServeError::A2aPaidMisconfigured` — all at
+`serve_a2a_configured` time, before a single brief arrives (`a2a.md`).
 
 ## The provider gate in the invocation chain
 

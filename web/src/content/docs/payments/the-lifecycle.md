@@ -10,6 +10,11 @@ One `PaymentEngine` runs the provider side of a paid capability; one
 decided in a language binding — the bindings marshal arguments and project
 results; the lifecycle lives in the `net-payments` core.
 
+This is the lifecycle of **one invocation**. Selling a job that outlives the
+call — a bounded task another agent runs — keeps the same envelopes and reorders
+them into prepare → purchase → submit; see
+[Paid agent work](/docs/payments/paid-agent-work).
+
 The snippets on this page are compiled and run in CI as
 [`examples/docs_payments.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/payments/examples/docs_payments.rs),
 which drives the whole loop in one process against the mock facilitator.
