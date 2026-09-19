@@ -151,6 +151,24 @@ publisher answers `AckReason::IdentityNotEstablished` — a distinct verdict fro
 to publish never has to touch the discovery plane to use a credential issued to
 it.
 
+### Rollout: compatibility is deliberately not symmetric
+
+Best-effort preparation covers **new subscriber → old publisher**: the proof
+goes unanswered, costs one bounded timeout, and the Subscribe proceeds against
+whatever the old publisher already accepts.
+
+It does **not** cover the reverse. An **old subscriber → upgraded publisher**
+that establishes identity only by announcing will no longer satisfy the
+credential gate, and will be answered `IdentityNotEstablished`. Verified
+subnet admission is the only other path that satisfies it.
+
+That is the intended tightening, not an oversight: an announcement's signature
+covers no session and no nonce, so accepting it as readiness would leave the
+credential gate resting on the assumption that nobody else can occupy a
+routing id — which NKpsk0's anonymous initiator does not give us. Upgrade
+subscribers before, or together with, the publishers that gate on their
+credentials.
+
 ## Performance
 
 | Operation | Latency |
