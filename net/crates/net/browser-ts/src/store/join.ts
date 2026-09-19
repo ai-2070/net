@@ -339,6 +339,12 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   const stopTick = schedule(() => {
     if (closed) return;
     dispatch(framesOf(replica.tick()));
+    // The tick can produce a TERMINAL: a join nobody ever answered
+    // runs out of re-asks and fences itself. `settleReady` is what
+    // turns that into the caller's typed rejection instead of a
+    // `ready()` that never settles — the silence this module refuses
+    // everywhere else.
+    settleReady(core.getStatus().error ?? null);
   }, TICK_INTERVAL_MS);
 
   dispatch(framesOf([replica.join()]));

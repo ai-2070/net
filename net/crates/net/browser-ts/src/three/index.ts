@@ -10,10 +10,17 @@
  *
  * Nothing here imports `three`. The scene graph is a structural type —
  * anything with `add` and `remove` — and the objects are whatever the
- * caller's `create` returns. `three` is an optional PEER dependency
- * used for types only, so the browser package's bundle does not grow
- * by a renderer, and the same binding drives a Three.js scene, a
+ * caller's `create` returns. So the browser package's bundle does not
+ * grow by a renderer, and the same binding drives a Three.js scene, a
  * canvas, or a test double.
+ *
+ * `three` is **not declared as a dependency of any kind** — not a
+ * peer dependency either, and the manifest says so by having no
+ * `peerDependencies` key. An earlier version of this comment called
+ * it an optional peer dependency, which would have had npm warn on a
+ * missing or mismatched `three`: a promise the manifest does not
+ * make. The types it would have supplied are not needed, because the
+ * ones here are structural.
  *
  * ## What it is for
  *

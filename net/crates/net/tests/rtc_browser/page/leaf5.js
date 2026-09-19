@@ -302,6 +302,8 @@ const reorder = { every: 0, seen: 0, swapped: 0, held: null };
 // store, that is what keeps a duplicated snapshot chunk idempotent
 // and a duplicated delta from moving a view twice.
 const dup = { every: 0, seen: 0, duplicated: 0 };
+/** Per joined store: the frames IT submitted, counted at its transport. */
+const upstream = new Map();
 /// Every message the leaf handed the DataChannel, counted
 /// unconditionally — hooks armed or not.
 ///
@@ -1952,9 +1954,34 @@ async function execute(step) {
       const started = performance.now();
       let joined;
       try {
+        // This store's OWN upstream frames, counted at the transport
+        // it was handed.
+        //
+        // `wire.messages` cannot serve: it is the whole PAGE's
+        // submissions, so three joined stores and their `alive`
+        // renewals all land in one number, and the duplicate witness
+        // read it as store traffic. Wrapping the transport counts
+        // what THIS replica said and nothing else.
+        const sent = { frames: 0 };
+        upstream.set(step.handle, sent);
+        const counting = {
+          nodeIdHex: () => node.nodeIdHex(),
+          onEvent: handler => node.onEvent(handler),
+          connectPeer: node.connectPeer ? peer => node.connectPeer(peer) : undefined,
+          openStream: async options => {
+            const stream = await node.openStream(options);
+            return {
+              send: payload => {
+                sent.frames += 1;
+                return stream.send(payload);
+              },
+              close: () => stream.close(),
+            };
+          },
+        };
         joined = pkg.joinStore({
           definition: storeDefinition(pkg.defineStore),
-          transport: node,
+          transport: counting,
           streamId: step.label || undefined,
           host: step.host_hex,
           audience: step.audience || ['crew'],
@@ -2028,6 +2055,13 @@ async function execute(step) {
           // witness can say "moved ONCE" rather than "ended here".
           applications: applications.count,
           revisions: applications.revisions.slice(-8),
+          // THIS replica's own upstream frames. A replica reacting to
+          // a duplicate — a `resync` for a delta whose base no longer
+          // matches — is upstream traffic, and it is the only thing
+          // that separates "applied once" from "processed the
+          // duplicate and refetched the document": both end at the
+          // same value and both publish once.
+          upstream_frames: (upstream.get(step.handle) || { frames: 0 }).frames,
         },
       };
     }

@@ -21,6 +21,7 @@ import { joinStore } from '../../src/store/join.js';
 import { MAX_OUTSTANDING } from '../../src/store/join.js';
 import type { Cancel } from '../../src/store/types.js';
 import { StoreError } from '../../src/store/errors.js';
+import { MAX_JOIN_REASKS } from '../../src/store/replica.js';
 import { encodeMessage, type Hex } from '../../src/store/wire.js';
 
 const MAX_EVENT_BYTES = 8104;
@@ -473,6 +474,109 @@ describe('a joiner installs the host’s world', () => {
 
     expect(host.counts().handles).toBe(1);
     expect(host.counters()['foreign-stream']).toBe(1);
+    await host.close();
+  });
+
+  it('does not answer a join addressed to a sibling store on the same node', async () => {
+    // One node, two stores of one definition — which Stage 7 hosts
+    // three of. Every hostStore sees every `stream_data` event on the
+    // node, a `join` names no handle, and `key` is the caller's
+    // opaque policy token, so nothing in the frame says which store
+    // it is for. The stream does: both ends derive the same id from
+    // the same label.
+    //
+    // Before the claim table, the SECOND store answered the first
+    // store's join, pinned the first store's id, and was then
+    // permanently unreachable by its own replicas — silent, with a
+    // hung `ready()` and one counter. Review probe B.
+    const net = mesh();
+    const time = timeline();
+    const common = {
+      definition: ship,
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: (state: Ship) => state,
+      actions: { fire: (_input: Actions['fire']['input'], context: { getState: () => Ship }) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    };
+    const transport = net.node(HOST_NODE);
+    const first = hostStore<Ship, Actions, Inputs>({ ...common, transport, streamId: 'store/first' });
+    const join = (q: string) =>
+      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] });
+
+    // The first store learns its stream from its own replica's join.
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('1'));
+    await flush();
+    expect(first.counts().handles).toBe(1);
+
+    // A second store, hosted while the first is live, then another
+    // frame of the FIRST store's traffic.
+    const second = hostStore<Ship, Actions, Inputs>({ ...common, transport, streamId: 'store/second' });
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/first'), join('3'));
+    await flush();
+
+    // The second store issued NOTHING: it is not this join's store.
+    expect(second.counts().handles).toBe(0);
+    expect(second.counters()['other-stores-stream']).toBe(1);
+
+    // And it still serves its OWN traffic, which is the half a
+    // blanket refusal would break.
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/second'), join('4'));
+    await flush();
+    expect(second.counts().handles).toBe(1);
+
+    await first.close();
+    await second.close();
+  });
+
+  it('does not pin its stream from a frame it refuses', async () => {
+    // A node may host stores of DIFFERENT definitions, and each sees
+    // the others' frames. If the first frame a store happens to see
+    // pinned its id regardless of whether the owner accepted it, a
+    // store would claim a stream belonging to another definition
+    // entirely — and then refuse every frame of its own as
+    // `foreign-stream`, for the life of the page.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      streamId: 'store/mine',
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    // Another definition's join, on another definition's stream.
+    net.injectLabelled(
+      HOST_NODE,
+      OTHER_NODE,
+      derivedStreamId('store/someone-else'),
+      encodeMessage({ k: 'join', q: 'a'.repeat(16) as Hex, def: 'other.doc', ver: 1, key: 'x', aud: ['crew'] }),
+    );
+    await flush();
+    expect(host.counts().handles).toBe(0);
+    expect(host.counters()['join-wrong-definition']).toBe(1);
+
+    // Its OWN traffic still works — which is what pinning the
+    // refused frame's stream would have broken.
+    net.injectLabelled(
+      HOST_NODE,
+      OTHER_NODE,
+      derivedStreamId('store/mine'),
+      encodeMessage({ k: 'join', q: 'b'.repeat(16) as Hex, def: 'ship', ver: 1, key: 'x', aud: ['crew'] }),
+    );
+    await flush();
+    expect(host.counts().handles).toBe(1);
+    expect(host.counters()['foreign-stream'] ?? 0).toBe(0);
     await host.close();
   });
 
@@ -992,6 +1096,107 @@ describe('a replica of its own node is refused', () => {
     }
     expect(refused?.code).toBe('invalid-data');
     expect(refused?.message).toContain('cannot join the node it runs on');
+  });
+});
+
+describe('a join whose manifest is lost', () => {
+  const bigCrew = (): Record<string, number> => {
+    const crew: Record<string, number> = {};
+    for (let i = 0; i < 700; i += 1) crew[`crew${String(i)}`] = i;
+    return crew;
+  };
+
+  const hosted = (net: ReturnType<typeof mesh>, time: ReturnType<typeof timeline>) =>
+    hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: { ...FULL, crew: bigCrew() },
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+  const joined = (net: ReturnType<typeof mesh>, time: ReturnType<typeof timeline>, key: string) =>
+    joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key,
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+  it('asks again and installs', async () => {
+    // The case the assembly deadline CANNOT cover: with no manifest
+    // no assembly is opened, so nothing expires. The reviewer's probe
+    // E showed the consequence with production timers — ready()
+    // pending for ever, status stuck at `connecting`, nothing sent
+    // upstream ever again. The manifest is the FIRST frame the host
+    // sends in answer to a join.
+    const net = mesh();
+    const time = timeline();
+    const host = hosted(net, time);
+    net.dropNth(HOST_NODE, 1);
+    const store = joined(net, time, 'manifestless');
+    const ready = store.ready();
+    await flush(40);
+    expect(net.dropped()).toBe(1);
+    expect(store.getStatus().phase).not.toBe('ready');
+
+    // Short of the deadline it does NOT re-ask: a retry that ignores
+    // its own deadline recovers by flooding the owner.
+    for (let i = 0; i < 9; i += 1) {
+      time.advance(1_000);
+      await flush(20);
+    }
+    expect(net.kinds(HOST_NODE).filter(k => k === 'join')).toHaveLength(1);
+
+    for (let i = 0; i < 6; i += 1) {
+      time.advance(1_000);
+      await flush(20);
+    }
+    await ready;
+    expect(Object.keys(store.getState().crew)).toHaveLength(700);
+    // Exactly one more ask, not a ladder per tick.
+    expect(net.kinds(HOST_NODE).filter(k => k === 'join')).toHaveLength(2);
+    await store.close();
+    await host.close();
+  });
+
+  it('answers the caller when nobody ever replies', async () => {
+    // The other half, and the one that makes the retry honest: a
+    // bounded ladder that runs out must TELL the caller. Silence is
+    // what this module refuses to accept elsewhere (§1.6), and a
+    // page waiting on `ready()` cannot distinguish a slow host from
+    // a dead one.
+    const net = mesh();
+    const time = timeline();
+    const host = hosted(net, time);
+    net.silence(HOST_NODE);
+    const store = joined(net, time, 'unanswered');
+    const outcome = store.ready().then(
+      () => 'installed',
+      (error: unknown) => (error as StoreError).code,
+    );
+
+    // Two minutes of deadlines against a ladder of three.
+    for (let i = 0; i < 120; i += 1) {
+      time.advance(1_000);
+      await flush(10);
+    }
+    expect(await outcome).toBe('timeout');
+    expect(store.getStatus().phase).toBe('failed');
+    expect(store.getStatus().error?.code).toBe('timeout');
+    // The first join plus exactly MAX_JOIN_REASKS more, then quiet.
+    expect(net.kinds(HOST_NODE).filter(k => k === 'join')).toHaveLength(MAX_JOIN_REASKS + 1);
+    await store.close();
+    await host.close();
   });
 });
 

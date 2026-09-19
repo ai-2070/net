@@ -42,7 +42,12 @@
  * transport delivers them in order.
  */
 
-import { Assembly, AssemblyTable, type AssemblyManifest } from './assembly.js';
+import {
+  Assembly,
+  ASSEMBLY_DEADLINE_MS,
+  AssemblyTable,
+  type AssemblyManifest,
+} from './assembly.js';
 import { StoreCore } from './core.js';
 import { StoreError, type StoreErrorCode } from './errors.js';
 import type { Decimal, DeltaMessage, Hex, ManifestMessage, SnapMessage } from './wire.js';
@@ -58,6 +63,20 @@ export interface Request {
 
 /** The five states of §1.7a. */
 export type ReplicaState = 'joining' | 'installing' | 'ready' | 'fenced' | 'closed';
+
+/**
+ * How many times an unanswered transition re-asks before the replica
+ * gives the caller a terminal answer.
+ *
+ * Three: enough that a join survives independent losses, few enough
+ * that a store nobody is serving stops asking. Each re-ask abandons
+ * the subscription the owner may have opened for the previous one;
+ * nothing can release it by name, because a replica whose MANIFEST
+ * was lost never learned a handle to release — the owner's own idle
+ * lease (`owner.ts`'s `HANDLE_LEASE_MS`) is what reclaims it, which
+ * is why the ladder is bounded rather than endless.
+ */
+export const MAX_JOIN_REASKS = 3;
 
 /** What one arrival produced. */
 export interface Received {
@@ -106,6 +125,25 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
   #behind = false;
   /** The desired-transition slot: one `q` per shared transition. */
   #slot: Hex | null = null;
+  /**
+   * When the outstanding transition was ASKED for, and how many times
+   * the deadline has re-asked it.
+   *
+   * The assembly deadline covers an assembly that stalls half-built.
+   * It cannot cover a transition that never produced one: a `join`
+   * whose MANIFEST is lost opens nothing, so there is nothing to
+   * expire, and before this the caller's `ready()` never settled and
+   * nothing was ever sent again — the failure was pure silence. A
+   * real browser produced exactly that, and the lost datagram was
+   * 130-200 bytes: the manifest, far too small to be one of the
+   * multi-kilobyte chunks.
+   *
+   * Never cleared: `tick` reads it only for a state with no open
+   * assembly, and every path into `joining` or `installing` stamps it
+   * on entry, so a stale value cannot be read.
+   */
+  #askedAt: number | null = null;
+  #reasks = 0;
   /**
    * Bumped by every caller-initiated transition.
    *
@@ -201,6 +239,8 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     this.#reset();
     const q = this.deps.newQ();
     this.#slot = q;
+    this.#askedAt = this.deps.now();
+    this.#reasks = 0;
     this.#state = 'joining';
     this.deps.core.setStatus({ phase: 'connecting', stale: this.#published() });
     return {
@@ -266,6 +306,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     // slot with a NEW `q`.
     const q = this.deps.newQ();
     this.#slot = q;
+    this.#askedAt = this.deps.now();
     this.#waiters = 1;
     this.#state = 'installing';
     return [{ kind: 'aud', q, frame: encodeMessage({ k: 'aud', q, h, aud: next }) }];
@@ -358,9 +399,37 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
    * `resync`, because recovery is coalesced.
    */
   tick(): readonly Request[] {
-    if (this.#state !== 'installing' || this.#assembly === null) return [];
-    if (!this.#assembly.expired(this.deps.now())) return [];
-    return this.#abandon('assembly-deadline');
+    const now = this.deps.now();
+    if (this.#state === 'installing' && this.#assembly !== null) {
+      if (!this.#assembly.expired(now)) return [];
+      return this.#abandon('assembly-deadline');
+    }
+    // A transition that produced NO assembly, past its deadline: the
+    // manifest that would have opened one never arrived.
+    if (this.#askedAt === null || now - this.#askedAt < ASSEMBLY_DEADLINE_MS) return [];
+    if (this.#state !== 'joining' && this.#state !== 'installing') return [];
+    if (this.#reasks >= MAX_JOIN_REASKS) {
+      // Asked and re-asked, and nothing answered. The caller gets a
+      // terminal answer rather than more silence: `#clearView` is
+      // what carries the error to `getStatus()`, and the fence is
+      // what makes `ready()` settle.
+      this.#askedAt = null;
+      this.#state = 'fenced';
+      this.#slot = null;
+      this.#retireAssembly();
+      this.#clearView(
+        'failed',
+        new StoreError('timeout', 'the store never answered the join'),
+      );
+      return [];
+    }
+    // `join` resets the ladder, because a join is normally the CALLER
+    // asking afresh. This one is the deadline's, so the count is
+    // carried across it deliberately.
+    const spent = this.#reasks;
+    const again = this.join();
+    this.#reasks = spent + 1;
+    return [again];
   }
 
   /** The caller gives up this subscription. Fences it; no view. */
@@ -612,6 +681,7 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     if (h === null) return [];
     const q = this.deps.newQ();
     this.#slot = q;
+    this.#askedAt = this.deps.now();
     this.#state = 'installing';
     this.#skipped = null;
     this.#behind = false;

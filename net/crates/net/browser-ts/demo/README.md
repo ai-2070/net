@@ -199,20 +199,26 @@ the same two halves over a transport double, and the page exposes
 `globalThis.__demo` (`state()`, `scene()`, `steer()`, `fire()`,
 `hostState()`) so a harness can drive it without scraping pixels.
 
-It does **not** establish the stage's remaining acceptance criteria:
+What this DIRECTORY establishes and what it does not, now that
+`?mode=mesh` has been run (see above):
 
-- **Chromium *and* Firefox** on the supported path. Verified here:
-  headless Chromium only.
-- **Direct and forced-fallback** delivery, receiver-observed, with
-  per-pair application forwarding flat for direct and increasing for
-  routed. Nothing in this directory measures that.
-- **Reliable transfer** (the B2′ gate) and the **leader-proxy
-  lifecycle** (the G gate): two tabs sharing an origin's leader, and
-  last-consumer cleanup on a proxied handle.
+- **Mesh mode works**, on two nodes over one real anchor, and the
+  audience projection holds across it — that is the run described
+  above, in two headless Chromium profiles.
+- **Firefox** is NOT verified by this demo. The engine matrix lives in
+  the browser harness (`tests/rtc_browser/run.sh --engine firefox`),
+  which is where CI holds it.
+- **Per-pair forwarding, flat for direct and increasing for routed**,
+  is not measured here either: Stage 6's witnesses 9–11 hold it on the
+  raw stream surface and Stage 7's fifth witness holds the routed half
+  on STORE traffic. Nothing in this directory reads a counter.
+- **Reliable transfer** (the B2′ gate) is held by the Stage 7 harness
+  witness that installs a snapshot through injected loss and reorder,
+  not by anything you can see by opening this page.
 
-Those are transport properties, and `mode=mesh` is written but unrun.
-Until they are established, this is a working demonstration of the
-store — not a demonstration of the mesh.
+So: this is a demonstration of the store, and — in mesh mode — of the
+store composed with the mesh. The transport's own properties are the
+harness's to prove, and it does.
 
 ## The adapter is a package, not demo code
 

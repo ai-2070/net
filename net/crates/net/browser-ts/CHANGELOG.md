@@ -18,6 +18,20 @@ the README on why it is a sibling package rather than a sub-path.
 
 ### Added
 
+- **The game store.** `defineStore()`, `hostStore()` and
+  `joinStore()`: one authoritative document served to replicas over a
+  mesh stream, with audience projections, correlated actions,
+  coalesced inputs, chunked snapshots and a replica that recovers a
+  lost manifest or a stalled assembly by asking again. `StoreError`
+  carries the code a caller branches on. See `demo/README.md` for the
+  worked example and the vocabulary.
+- **`@net-mesh/browser/three`.** `bindEntities()` — a subpath export
+  that reconciles a store's entity map into any scene graph with
+  `add`/`remove`, skipping entities whose reference did not change and
+  removing what left the world. It imports nothing from `three`: the
+  types are structural, so the package gains no renderer dependency
+  and the binding drives a `THREE.Scene` or a test double equally.
+
 - **The package.** `connect()`, `BrowserNode` (`call`, `subscribe`,
   `publish`, `openStream`, `announce`, `query`, `signal`, `enroll`,
   `isEnrolled`, `anchorIdHex`, `nodeIdHex`, `counters`, `close`),

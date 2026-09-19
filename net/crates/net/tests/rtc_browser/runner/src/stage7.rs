@@ -17,70 +17,81 @@
 //! which was simply untrue: the harness's own default run excludes
 //! them by name.
 //!
-//! Local status at the time of writing (Chromium, `--stage7`): 1, 2,
-//! 4 and 5 PASS; 3 does not, and is left failing rather than
-//! softened. The full run is 52 witnesses, 1 failed — this stage no
-//! longer disturbs any other, which it did until its two identities
-//! were found to be slice 3's (see `SECRET_HOST_ENTITY`).
+//! Local status (Chromium, `--stage7`): **52 witnesses, 0 failed** —
+//! all five below pass, and this stage disturbs no other, which it
+//! did until its two identities were found to be Stage 6 slice 3's
+//! (see `SECRET_HOST_ENTITY`).
 //!
-//! What witness 3 has established, which is more than "it fails":
-//! ONE dropped datagram on the host's channel stalls the join past
-//! 30 s. Not a pattern of loss — one packet, out of the seven or so
-//! the join costs. A store-level `resync` cannot repair that,
-//! because a reliable stream with a wire gap holds everything behind
-//! it, so recovery has to come from the transport.
+//! ## How the loss witness came to pass
 //!
-//! Four candidate explanations, and where each stands:
+//! `stage7_store_snapshot_installs_through_injected_loss_and_reorder`
+//! failed for as long as the store had two holes, and the failure
+//! looked like a transport problem the whole time. The hook that
+//! records WHICH datagram it dropped is what ended the guessing: it
+//! was 130–200 bytes on channel `net` — the MANIFEST, an order of
+//! magnitude too small to be one of the 5934-byte chunks.
 //!
-//! 1. *The harness's offer budget refuses the attempt.* REFUTED —
-//!    raised 200 → 2000 per IP per minute, no change. (The offer
-//!    budget stays raised; it is not the cause, and 200 was the
-//!    default for a run with far fewer contexts.)
-//! 2. *Nothing drives the replica's assembly deadline, so no resync
-//!    is ever sent.* TRUE, and fixed (`join.ts` now drives
-//!    `replica.tick()`, with its own red/green witness in
-//!    `test/store/hosted.test.ts`) — but NOT the cause here: the
-//!    browser behaves identically with the clock driven, which is
-//!    what point 3 explains.
-//! 3. *Retransmission needs traffic.* OPEN. `LeafNode::tick` →
-//!    `drive_reliability` is what emits NACKs and due retransmits,
-//!    and it runs only from `pump()` — an API call or an inbound
-//!    packet. There is no periodic tick in the WASM leaf. An
-//!    attempt to test this by keeping the host committing failed to
-//!    test anything: with no installed replica there is no audience,
-//!    so the commits sent nothing. Needs a driver that does not
-//!    depend on the join having succeeded.
-//! 5. *The store could re-ask instead.* TRIED AND REVERTED, and the
-//!    reason is worth keeping. The hook now reports WHICH message it
-//!    lost, and it was 130–200 bytes on channel `net` — the
-//!    MANIFEST, an order of magnitude too small to be one of the
-//!    5934-byte chunks. With no manifest no assembly is ever opened,
-//!    so the assembly deadline has no subject and the replica waits
-//!    on a message that is not coming. A deadline on the transition
-//!    ITSELF (re-`join` after 10 s, bounded to three) made the
-//!    in-process case recover with red inverses either way — and in
-//!    the browser it fixed NOTHING here while breaking witnesses 4
-//!    and 5, because each abandoned join leaves a subscription the
-//!    owner still holds and the next store on that session cannot
-//!    get one. Reverted whole. A re-ask has to release the
-//!    subscription it is replacing, and that is a design question,
-//!    not a patch.
-//! 4. *The anchor does not forward reliability control packets.*
-//!    REFUTED from source — the relay path is header-only routing
-//!    and type-agnostic (`mesh.rs`, the `dest_id != local` arm);
-//!    only signalling is classified, and only to choose a counter.
+//! Two store defects, both found by review probes, both now repaired
+//! with their own red/green witnesses in
+//! `browser-ts/test/store/hosted.test.ts`:
 //!
-//! Both leaves' raw counter ledgers are printed on failure
-//! (`Step5::NodeCounters`) because which side is silent about the
-//! loss is the diagnosis; at the time of writing neither reports a
-//! `stream_failed`, so nothing has given up — it is waiting.
+//! 1. **A lost manifest opened no assembly, so nothing expired.**
+//!    `replica.tick()` covered a stalled assembly and could not cover
+//!    a transition that never produced one: `ready()` never settled,
+//!    nothing was re-sent, and the caller's only signal was silence.
+//!    The join now has its own deadline — a bounded re-ask, then a
+//!    typed `timeout` — so a caller always gets an answer.
+//! 2. **Every host store on a node answered every join it saw.** A
+//!    `join` names no handle and `key` is the caller's opaque policy
+//!    token, so nothing in the frame said which store it was for; a
+//!    store hosted while a sibling was live adopted the sibling's
+//!    stream id and was then unreachable by its own replicas. This
+//!    page hosts THREE stores, so the re-ask in (1) was landing on a
+//!    store that had stolen another's stream — which is why an
+//!    earlier attempt at (1) alone appeared to break witnesses 4 and
+//!    5, and was reverted with the cause recorded as handle capacity.
+//!    That recorded cause was WRONG, and the review said so with the
+//!    arithmetic: `MAX_HANDLES` is 256 per owner and those witnesses
+//!    use a different owner. Streams are now claimed per transport.
+//!
+//! Three candidate explanations were refuted along the way and are
+//! kept so they are not re-run: the harness's offer budget (raised
+//! 200 → 2000 per IP per minute, no change — it stays raised, since
+//! 200 was the default for a run with far fewer contexts); the anchor
+//! not forwarding reliability control packets (refuted from source —
+//! the relay arm is header-only and type-agnostic, `mesh.rs`'s
+//! `dest_id != local` case, where the subprotocol is read only to
+//! choose a counter); and the WASM leaf's lack of a periodic tick
+//! (`LeafNode::tick` → `drive_reliability` runs only from `pump()`,
+//! which is TRUE and remains true — it simply was not what stalled
+//! this join, since the repaired store recovers with the same leaf).
+//!
+//! Both leaves' raw counter ledgers still print when the leg fails
+//! (`Step5::NodeCounters`), because which side is silent about a loss
+//! is the diagnosis.
+//!
+//! ## The five witnesses, in the order they run
 //!
 //! 1. a multi-chunk snapshot installs, receiver-observed;
 //! 2. it still installs through injected loss **and** reorder;
 //! 3. an action crosses, executes once, and its result comes back;
-//! 4. a duplicated wire message moves the view exactly once;
+//! 4. a duplicated wire message moves the view exactly once AND
+//!    costs the replica no upstream word;
 //! 5. and store traffic moves the anchor's per-pair forwarding
 //!    counter while the pair is relayed.
+//!
+//! **These numbers are the EXECUTION order**, matching the `// --- N`
+//! section comments below, and they are the numbering every sentence
+//! in this header uses.
+//!
+//! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
+//! 3 duplicate, 4 counter — and stays that way because each record
+//! names its position by index, so reordering the array would
+//! silently retarget records (the same reason Stage 5's list is
+//! append-only). An earlier header mixed the two numberings and so
+//! named the wrong witness as the red one; the whole value of
+//! leaving a witness red is that the record can be trusted, and the
+//! review caught this one.
 //!
 //! **The sixth property is NOT here**, and its absence is deliberate
 //! rather than forgotten: "the same traffic leaves that counter flat
@@ -181,16 +192,21 @@ pub struct Cx7<'a> {
 
 /// One reading of the anchor's per-pair application forwarding.
 ///
-/// `hp`/`ph` are the pair under test; `signal` is the positive
-/// control. A flat pair counter means nothing on a dead anchor, and
-/// `signal_forwarded` moving is what says the anchor is still relaying
-/// for this pair while their application data has stopped going
-/// through it.
+/// `hp`/`ph` are the pair under test, either direction.
+///
+/// No `signal_forwarded` field: it was declared here as a positive
+/// control for a FLAT window — "the anchor is still relaying for this
+/// pair while their application data has stopped going through it" —
+/// and this stage makes no flat claim. Witness 5 asserts the pair
+/// counter MOVED, which needs no proof that the anchor is alive: a
+/// dead anchor moves nothing. The flat-window claim, and its control,
+/// belong to Stage 6's direct-path witnesses. A documented control
+/// that no oracle reads is worse than none, because the doc tells the
+/// next reader a control is in force.
 #[derive(Debug, Clone, Copy)]
 struct Forwarded {
     hp: u64,
     ph: u64,
-    signal: u64,
 }
 
 impl Forwarded {
@@ -198,7 +214,6 @@ impl Forwarded {
         Self {
             hp: anchor.forwarded_app_packets(routing_id(host), player.node_id),
             ph: anchor.forwarded_app_packets(routing_id(player), host.node_id),
-            signal: anchor.rtc_stats().signal_forwarded(),
         }
     }
 
@@ -386,7 +401,13 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let installed = joined.ok
         && host_digest.is_some()
         && host_digest == replica_digest
-        && stat_u64(&joined, "entries") == Some(u64::from(ENTRIES));
+        && stat_u64(&joined, "entries") == Some(u64::from(ENTRIES))
+        // The premise the detail line argues from, asserted rather
+        // than merely reported: a single-message join would make this
+        // a test of one `send`. It holds by construction of ENTRIES
+        // and MAX_EVENT_BYTES today, and construction is exactly what
+        // a budget change alters.
+        && chunks > 1;
     ledger.record(
         WITNESSES[0],
         installed,
@@ -464,7 +485,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // acknowledgements instead, so a non-zero drop count there said
     // nothing about a chunk — the reviewer's third finding, and the
     // reason this is its own step.
-    let _ = script
+    let armed = script
         .run(
             tab_host,
             Step5::StoreFaults {
@@ -517,6 +538,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let swapped = stat_u64(&faults, "swapped").unwrap_or(0);
     let lossy_digest = stat_str(&joined_lossy, "digest");
     let survived = joined_lossy.ok
+        && armed.ok
         && lossy_digest.is_some()
         && lossy_digest == stat_str(&hosted_lossy, "digest")
         && dropped > 0
@@ -527,8 +549,8 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         format!(
             "THE SNAPSHOT SURVIVES LOSS AND REORDER — the B2′ composition, and the \
              reason the gate exists: the store's chunker has been exercised against a \
-             transport double that cannot lose anything. Here every 3rd outbound \
-             DataChannel message was DROPPED and every 4th held back so the next \
+             transport double that cannot lose anything. Here every 7th outbound \
+             DataChannel message was DROPPED and every 5th held back so the next \
              overtook it, for the whole join. The hooks' own counts come back and are \
              asserted NON-ZERO — a loss witness that dropped nothing is a witness about \
              nothing: dropped={dropped} reordered={swapped}. The document still installed \
@@ -590,35 +612,55 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     let replica_tick = stat_u64(&after, "tick");
     let applications_after = stat_u64(&after, "applications").unwrap_or(0);
     let moves = applications_after.saturating_sub(applications_before);
+    // THIS replica's own UPSTREAM traffic across the window, counted
+    // at the transport it was handed — the page-wide `wire.messages`
+    // cannot serve, because three joined stores and their `alive`
+    // renewals share it. The publication count alone cannot carry
+    // the property either: a
+    // re-applied identical delta and a full resync that reinstalls
+    // the same document BOTH publish exactly once (`core.ts`'s
+    // `#publish` returns early when the next state is the same
+    // object). The review's probe A proved that — with every frame
+    // duplicated the count stayed 1 while the replica sent a
+    // `resync`. What separates "idempotent" from "recovered" is
+    // whether the replica had to say anything at all.
+    let upstream_before = stat_u64(&before_state, "upstream_frames").unwrap_or(0);
+    let upstream_after = stat_u64(&after, "upstream_frames").unwrap_or(0);
+    let replica_sent = upstream_after.saturating_sub(upstream_before);
     let once = joined_dup.ok
         && committed.ok
         && after.ok
         && duplicated > 0
         && replica_tick == Some(41)
         && before_tick != 41
-        && moves == 1;
+        && moves == 1
+        && replica_sent == 0;
     ledger.record(
         WITNESSES[3],
         once,
         format!(
-            "A DUPLICATED FRAME MOVES THE VIEW ONCE — counted, not inferred. Every \
-             outbound message of the host's commit was sent TWICE (duplicated={duplicated}, \
-             asserted non-zero so an inert hook cannot pass this). The oracle is the \
-             number of PUBLICATIONS the replica made: {applications_before} → \
-             {applications_after}, so exactly {moves}. The final value cannot carry this \
-             property — the commit ASSIGNS tick 41, so applying the delta twice, or \
-             recovering to the same document, both end at 41 as well, and the earlier \
-             version of this witness could not tell any of the three apart. Value read \
-             back: {replica_tick:?} from {before_tick}. What makes one publication the \
-             right answer is two things composed: the leaf delivers a retransmitted \
-             duplicate once (`leaf/src/stream.rs`), and the assembler treats a \
-             byte-identical chunk as idempotent. {} {}",
+            "A DUPLICATED FRAME MOVES THE VIEW ONCE AND COSTS NOTHING — counted, not \
+             inferred. Every outbound message of the host's commit was sent TWICE \
+             (duplicated={duplicated}, asserted non-zero so an inert hook cannot pass \
+             this). TWO readings, because neither alone is enough. (a) PUBLICATIONS the \
+             replica made: {applications_before} → {applications_after}, so exactly \
+             {moves} — the final value cannot carry it, since the commit ASSIGNS tick \
+             41 and applying the delta twice ends at 41 too. (b) The replica's own \
+             UPSTREAM messages across the same window: {replica_sent}, asserted ZERO. \
+             (b) exists because (a) cannot tell IDEMPOTENT from RECOVERED: a resync \
+             that reinstalls the same document also publishes once (`core.ts`'s \
+             `#publish` returns early on an unchanged state), and the review's probe A \
+             demonstrated exactly that — the count stayed 1 while the replica sent a \
+             `resync`. A duplicate the leaf absorbed costs the replica no words. Value \
+             read back: {replica_tick:?} from {before_tick}. What makes this the right \
+             answer is the leaf delivering a retransmitted duplicate once \
+             (`leaf/src/stream.rs`). {} {}",
             why(&committed),
             why(&after)
         ),
     );
 
-    // --- 4/5. routed, then direct ----------------------------------
+    // --- 5. routed: the anchor's per-pair counter -------------------
     //
     // The pair is relayed by the anchor until something installs a
     // direct path, so store traffic now is routed by construction.

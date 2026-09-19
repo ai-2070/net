@@ -157,6 +157,37 @@ export interface HostedStoreHandle<S extends object> {
   close(): Promise<void>;
 }
 
+/**
+ * Which live host store owns which stream id, per transport.
+ *
+ * Every `hostStore` on a node receives every `stream_data` event on
+ * that node, and the only thing distinguishing one store's traffic
+ * from another's is the stream it arrives on — the id the leaf derives
+ * from the label BOTH ends pass. Nothing else can: `key` is the
+ * caller's opaque policy token, a `join` names no handle, and two
+ * stores of one definition are indistinguishable by definition id.
+ *
+ * So a store that has learned its id CLAIMS it here, and a store that
+ * has not yet learned one refuses a frame another store has claimed.
+ * Without this, a second store hosted on a live node adopted the
+ * FIRST store's id from the first frame it happened to see, answered a
+ * join that was not addressed to it, and was then permanently
+ * unreachable with its own traffic counted `foreign-stream` — silent,
+ * with a hung `ready()` at the joiner. Found by review probe B.
+ *
+ * Keyed weakly on the transport: two stores on two nodes share
+ * nothing, and a dropped transport takes its claims with it.
+ */
+const claimsByTransport = new WeakMap<StoreTransport, Map<string, object>>();
+
+function claims(transport: StoreTransport): Map<string, object> {
+  const existing = claimsByTransport.get(transport);
+  if (existing !== undefined) return existing;
+  const fresh = new Map<string, object>();
+  claimsByTransport.set(transport, fresh);
+  return fresh;
+}
+
 function randomHex(bytes: number): string {
   const buffer = new Uint8Array(bytes);
   crypto.getRandomValues(buffer);
@@ -212,6 +243,9 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
    * this owner issued.
    */
   let arrivesOn: string | null = null;
+  /** This store's identity in the per-transport claim table. */
+  const token = {};
+  const claimed = claims(options.transport);
   const pendingReplies = new Map<string, Promise<TransportStream>>();
   const dropped: Record<string, number> = {};
   let closed = false;
@@ -287,6 +321,19 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['foreign-stream'] = (dropped['foreign-stream'] ?? 0) + 1;
       return;
     }
+    // Unpinned, and the stream belongs to a live sibling store on
+    // this node: not this store's traffic, and answering it would
+    // steal the sibling's replica.
+    //
+    // No `owns !== token` arm here: unpinned means this store has
+    // claimed nothing, so a claim it finds is always somebody
+    // else's. The arm was written and deleted — a control proved
+    // nothing could distinguish it, which is what unreachable
+    // defence looks like.
+    if (arrivesOn === null && arrived !== undefined && claimed.has(arrived)) {
+      dropped['other-stores-stream'] = (dropped['other-stores-stream'] ?? 0) + 1;
+      return;
+    }
     let text: string;
     try {
       text = decoder.decode(payload);
@@ -303,8 +350,21 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['unusable-peer'] = (dropped['unusable-peer'] ?? 0) + 1;
       return;
     }
-    if (arrived !== undefined) arrivesOn = arrived;
-    dispatched(owner.receive(text, authenticated));
+    // Pin the stream id from a frame the OWNER ACCEPTED, never from
+    // one it then refuses — and never from a stream a SIBLING store
+    // on this node has already claimed.
+    //
+    // A `join` names no handle, so without the claim check every
+    // store on the node answers every join it sees: the store this
+    // one was not addressed to installs a handle, pins the wrong id,
+    // and is then unreachable by its own replicas. See
+    // `claimsByTransport`.
+    const outcome = owner.receive(text, authenticated);
+    if (arrived !== undefined && arrivesOn === null && outcome.refused === null) {
+      arrivesOn = arrived;
+      claimed.set(arrived, token);
+    }
+    dispatched(outcome);
   });
 
   const schedule = options.schedule ?? ((run, ms) => {
@@ -360,6 +420,10 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       for (const stream of replies.values()) stream.close();
       replies.clear();
       pendingReplies.clear();
+      // Release the claim, so a successor store on this node may
+      // take the same label. Only THIS store's claim: a sibling's
+      // stays its own.
+      if (arrivesOn !== null && claimed.get(arrivesOn) === token) claimed.delete(arrivesOn);
     },
   };
 }

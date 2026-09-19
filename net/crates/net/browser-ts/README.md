@@ -135,6 +135,66 @@ generated glue fetches `net_leaf_bg.wasm` beside itself. Override with
 `connect({ wasmModule })`, `connect({ wasmUrl })`, or hand over an
 already-imported module with `connect({ wasm })`.
 
+## The game store, and `./three`
+
+Two more exports, for the case a page has a world rather than a
+request: one node HOSTS an authoritative document and others JOIN
+replicas of it.
+
+```js
+import { defineStore, hostStore, joinStore } from '@net-mesh/browser';
+
+const host = hostStore({
+  definition, transport: node, initialState, maxEventBytes: 8104,
+  authorize: request => request.audience.every(a => a !== 'command'),
+  project: (state, audience) => audience.includes('command') ? state : publicPart(state),
+  actions, inputs,
+});
+
+const replica = joinStore({
+  definition, transport: node, host: hostNodeIdHex,
+  audience: ['crew'], key: 'player', maxEventBytes: 8104,
+});
+await replica.ready();
+```
+
+The host is the authority: an `act` executes there and its result
+comes back correlated to the request; an `input` is coalesced and
+unacknowledged; a `project` decides what each audience may see, and a
+replica cannot read what it was not given. A snapshot is chunked, and
+a replica whose manifest or chunk is lost asks again and then reports
+a typed `timeout` rather than waiting for ever. `StoreError.code` is
+what a caller branches on.
+
+A joiner needs a SESSION with the host, which is what
+`StoreTransport.connectPeer` is for — `connect()`'s node has it;
+`openSession()`'s `MeshSession` does not.
+
+**`@net-mesh/browser/three`** turns a store's entity map into a scene
+graph:
+
+```js
+import { bindEntities } from '@net-mesh/browser/three';
+
+const binding = bindEntities({
+  store: replica, scene, select: state => state.ships,
+  binding: {
+    create: (ship, id) => buildShip(ship, id),
+    update: (object, ship) => object.position.set(ship.x, 0, ship.z),
+    remove: object => object.traverse(disposeOf),
+  },
+});
+```
+
+It imports nothing from `three` — the scene graph is anything with
+`add` and `remove`, the objects are whatever `create` returns, and the
+types are structural — so this package gains no renderer dependency.
+An entity whose reference did not change is not touched, which is the
+point: the store shares the references of subtrees that did not
+change, and a loop over `Object.values(state.entities)` throws that
+away. `demo/` is a worked example, with a networked one in
+`?mode=mesh`.
+
 ## Typed errors
 
 Everything rejects with a `LeafError` subclass mirroring
