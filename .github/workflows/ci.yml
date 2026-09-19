@@ -6673,7 +6673,7 @@ jobs:
 
       - name: Upload harness logs (every engine, gating or not)
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rtc-browser-harness-log
           # Firefox is a GATE, so its log is evidence, not a curiosity —
@@ -6827,7 +6827,7 @@ jobs:
 
       - name: Upload the demo log
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-demo-log
           path: ${{ runner.temp }}/demo.log
