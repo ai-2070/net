@@ -108,6 +108,13 @@ function mesh() {
   const stale = new Map<string, number>();
   /** Nodes whose every send fails for a reason a reopen cannot fix. */
   const permanent = new Set<string>();
+  /** Nodes whose next send is HELD, to be settled by the test. */
+  const holding = new Set<string>();
+  /** Nodes whose next OPEN is held, and the streams they closed. */
+  const holdingOpen = new Set<string>();
+  const heldOpens: { node: string; settle: () => void }[] = [];
+  const closes = new Map<string, number>();
+  const held: { node: string; settle: (fail: boolean) => void }[] = [];
   /** Drop the Nth frame a node sends, once. */
   const drops = new Map<string, number>();
   const seen = new Map<string, number>();
@@ -173,6 +180,28 @@ function mesh() {
         opens.set(self, generation);
         const stream: TransportStream = {
           send: bytes => {
+            if (holding.has(self)) {
+              holding.delete(self);
+              // The send is in flight and unresolved: whatever the
+              // test does next happens BEFORE it settles.
+              return new Promise<void>((resolve, reject) => {
+                held.push({
+                  node: self,
+                  settle: fail => {
+                    if (fail) {
+                      reject(
+                        new Error(
+                          'session: stale stream handle: opened on incarnation 1; reopen the stream',
+                        ),
+                      );
+                      return;
+                    }
+                    deliver(target, self, bytes, streamId);
+                    resolve();
+                  },
+                });
+              });
+            }
             if (permanent.has(self)) {
               // NOT a stale handle: the leaf's own wording for a
               // permanent refusal, which a new stream cannot repair.
@@ -187,8 +216,18 @@ function mesh() {
             }
             deliver(target, self, bytes, streamId);
           },
-          close: () => {},
+          close: () => {
+            closes.set(self, (closes.get(self) ?? 0) + 1);
+          },
         };
+        if (holdingOpen.has(self)) {
+          holdingOpen.delete(self);
+          // The OPEN is unresolved: whatever the test does next
+          // happens before the store can publish this stream.
+          return new Promise<TransportStream>(resolve => {
+            heldOpens.push({ node: self, settle: () => resolve(stream) });
+          });
+        }
         return stream;
       },
       onEvent: (handler): Cancel => {
@@ -261,6 +300,27 @@ function mesh() {
     },
     /** How many streams this node has opened. */
     opensOf: (node: string) => opens.get(node) ?? 0,
+    /** Hold this node's next OPEN, unresolved. */
+    holdNextOpen: (node: string) => {
+      holdingOpen.add(node);
+    },
+    settleHeldOpens: () => {
+      const pending = heldOpens.splice(0, heldOpens.length);
+      for (const entry of pending) entry.settle();
+      return pending.length;
+    },
+    /** Streams this node opened and has not closed. */
+    liveStreams: (node: string) => (opens.get(node) ?? 0) - (closes.get(node) ?? 0),
+    /** Hold this node's NEXT send, unresolved. */
+    holdNextSend: (node: string) => {
+      holding.add(node);
+    },
+    /** Settle every held send: `fail` rejects it as a stale handle. */
+    settleHeld: (fail: boolean) => {
+      const pending = held.splice(0, held.length);
+      for (const entry of pending) entry.settle(fail);
+      return pending.length;
+    },
     /** Lose the Nth frame this node sends. */
     dropNth: (node: string, nth: number) => {
       drops.set(node, nth);
@@ -1448,6 +1508,26 @@ describe('reopening a stream that its session replaced', () => {
     expect(joined.getState().hull).toBe(72);
   });
 
+  it('opens nothing for a REPLICA failure a reopen cannot repair', async () => {
+    // The replica half of the same guard. The review removed
+    // `isStaleStream` from `join.ts` and the WHOLE suite stayed green
+    // — the host half was witnessed and this one was not, so half a
+    // bounded-resource repair was shipped on a claim.
+    const { net, joined } = wired();
+    await joined.ready();
+    const before = net.opensOf(CALLER_NODE);
+    net.failPermanently(CALLER_NODE);
+
+    // Five upstream frames the transport cannot carry. `input` is
+    // fire-and-forget, so this is the replica's own send path.
+    for (let i = 0; i < 5; i += 1) {
+      joined.input('helm', { heading: i });
+      await flush(10);
+    }
+
+    expect(net.opensOf(CALLER_NODE)).toBe(before);
+  });
+
   it('opens nothing for a failure a reopen cannot repair', async () => {
     // An oversized payload or a fenced id is permanent. Reopening for
     // it consumed a stream handle PER FRAME — against a budget of 256
@@ -1468,6 +1548,130 @@ describe('reopening a stream that its session replaced', () => {
     // The replica's view did not move, which is the honest outcome:
     // the frames were undeliverable either way.
     expect(joined.getState().hull).toBe(FULL.hull);
+  });
+});
+
+describe('a store that closed while a send was in flight', () => {
+  it('does not reopen, resend, or leave a stream open — replica side', async () => {
+    // The review's schedule: hold the send, `close()`, THEN reject it
+    // as a stale handle. Before this, the reopen ran after closure —
+    // a new stream stayed open and the held JOIN was delivered and
+    // ADMITTED by the host, reviving a closed replica's transport.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    // Hold the replica's very first send: its `join`.
+    net.holdNextSend(CALLER_NODE);
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'x',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await flush(10);
+    const opensAfterJoin = net.opensOf(CALLER_NODE);
+
+    await joined.close();
+    expect(net.settleHeld(true)).toBe(1);
+    await flush(30);
+
+    // No replacement stream, and the host never saw a join.
+    expect(net.opensOf(CALLER_NODE)).toBe(opensAfterJoin);
+    expect(host.counts().handles).toBe(0);
+    expect(net.kinds(HOST_NODE)).toHaveLength(0);
+    await host.close();
+  });
+
+  it('does not reopen, resend, or leave a stream open — host side', async () => {
+    const { net, host, joined } = wired();
+    await joined.ready();
+    const installed = joined.getState().hull;
+    const opensBefore = net.opensOf(HOST_NODE);
+
+    // Hold the delta this commit produces, close the host, THEN
+    // reject the held send.
+    net.holdNextSend(HOST_NODE);
+    host.setState({ ...host.getState(), hull: 81 });
+    await flush(10);
+    await host.close();
+    expect(net.settleHeld(true)).toBe(1);
+    await flush(30);
+
+    expect(net.opensOf(HOST_NODE)).toBe(opensBefore);
+    // The receiver never advanced: a closed host does not deliver.
+    expect(joined.getState().hull).toBe(installed);
+    await joined.close();
+  });
+
+  it('reclaims a stream whose OPEN resolved after the close', async () => {
+    // The other half of the same race: not a send that fails late,
+    // but an OPEN that succeeds late. Publishing it leaves a live
+    // stream behind a closed store — invisible to every other
+    // assertion, because nothing is ever sent on it.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+
+    // A join arrives, so the host opens a reply stream — held.
+    net.holdNextOpen(HOST_NODE);
+    net.inject(
+      HOST_NODE,
+      OTHER_NODE,
+      encodeMessage({ k: 'join', q: 'e'.repeat(16) as Hex, def: 'ship', ver: 1, store: 'ship', key: 'x', aud: ['crew'] }),
+    );
+    await flush(10);
+
+    await host.close();
+    expect(net.settleHeldOpens()).toBe(1);
+    await flush(20);
+
+    // Nothing this host opened is still open.
+    expect(net.liveStreams(HOST_NODE)).toBe(0);
+  });
+
+  it('still reopens and delivers when it has NOT closed', async () => {
+    // The control: the same held-and-rejected send, without the
+    // close. One reopen, and the frame arrives — so the assertions
+    // above are about CLOSURE and not about holding a send.
+    const { net, host, joined } = wired();
+    await joined.ready();
+    const opensBefore = net.opensOf(HOST_NODE);
+
+    net.holdNextSend(HOST_NODE);
+    host.setState({ ...host.getState(), hull: 82 });
+    await flush(10);
+    expect(net.settleHeld(true)).toBe(1);
+    await flush(40);
+
+    expect(net.opensOf(HOST_NODE)).toBe(opensBefore + 1);
+    expect(joined.getState().hull).toBe(82);
   });
 });
 

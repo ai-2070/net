@@ -205,8 +205,18 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         }),
       )
       .then(open => {
-      upstream = open;
       opening = null;
+      // An open that resolves after `close()` is reclaimed, never
+      // published.
+      if (closed) {
+        try {
+          open.close();
+        } catch {
+          // Already gone.
+        }
+        throw new StoreError('closed', 'the store closed while its stream was opening');
+      }
+      upstream = open;
       return open;
     });
     return opening;
@@ -232,6 +242,12 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         // and the first version reopened for every failure: five
         // undeliverable frames consumed five stream handles and
         // released none, against a per-owner budget of 256.
+        // CLOSURE WINS OVER A LATE REJECTION: the rejection lands
+        // after an await, so `close()` may have happened in
+        // between, and reopening then revives a closed replica's
+        // transport — a review probe watched a held JOIN be sent
+        // and ADMITTED by the host after `close()` resolved.
+        if (closed) return;
         if (!isStaleStream(error)) throw error;
         // ONE reopen per failure generation. `stream()` returns an
         // in-flight open, so a concurrent failure JOINS this reopen

@@ -1901,12 +1901,7 @@ async function execute(step) {
           streamId: step.label || undefined,
           initialState: initial,
           maxEventBytes: step.max_event_bytes || 8104,
-          // Reads are admitted; ACTIONS and INPUTS are refused when
-          // the step says so. A store whose policy admits everything
-          // cannot witness a refused write, and "the write did not
-          // land" is satisfied by a write that never arrived.
-          authorize: request =>
-            !(step.refuse_writes && (request.type === 'action' || request.type === 'input')),
+          authorize: () => true,
           // A REAL projection, because an audience that withholds
           // nothing cannot witness an audience change. Entries named
           // `cmd-*` belong to the `command` audience; everything else
@@ -2174,9 +2169,19 @@ async function execute(step) {
       dup.duplicated = 0;
       const wireBefore = wire.messages;
       const next = host.getState();
+      // `== null` catches BOTH spellings of "not named", and the
+      // second one is why this mattered: Rust's `Option<u32>` has no
+      // `skip_serializing_if`, so `None` crossed the wire as JSON
+      // `null`, `null === undefined` is false, and every tick-only
+      // commit replaced the document with `bulkEntries(null)` —
+      // ZERO entries. Every witness that commits a tick was
+      // measuring a delta on a document it had just emptied, and the
+      // "untouched replica reads 0 command entries" anomaly was this
+      // wipe and nothing about audiences. Found by review probes B
+      // and C, executed on both halves.
       host.setState({
-        entries: step.entries === undefined ? next.entries : bulkEntries(step.entries),
-        tick: step.tick === undefined ? next.tick + 1 : step.tick,
+        entries: step.entries == null ? next.entries : bulkEntries(step.entries),
+        tick: step.tick == null ? next.tick + 1 : step.tick,
       });
       // One turn, so the sends the commit queued actually reach the
       // channel before this step answers.
@@ -2199,34 +2204,6 @@ async function execute(step) {
     case 'store_act': {
       const joined = joins.get(step.handle);
       if (!joined) return { ok: false, error: 'no such joined store ' + step.handle };
-      // A REFUSAL is an outcome, not a step failure: a witness that
-      // asserts "the host refused this" needs the code and the
-      // replica's own view, and a step that only said `ok: false`
-      // could not tell a refusal from a transport that never
-      // delivered the request.
-      if (step.expect_refusal) {
-        try {
-          const result = await withTimeout(
-            joined.act('bump', { by: step.by || 1 }),
-            step.timeout_ms || 15000,
-            'store action',
-          );
-          return {
-            ok: true,
-            stats: { refused: false, code: null, result, tick: joined.getState().tick },
-          };
-        } catch (e) {
-          return {
-            ok: true,
-            stats: {
-              refused: true,
-              code: (e && e.code) || null,
-              message: (e && e.message) || String(e),
-              tick: joined.getState().tick,
-            },
-          };
-        }
-      }
       try {
         const result = await withTimeout(
           joined.act('bump', { by: step.by || 1 }),

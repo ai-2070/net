@@ -281,8 +281,19 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     const opening = Promise.resolve(
       options.transport.openStream({ reliability: 'reliable', peer, label: streamId }),
     ).then(stream => {
-      replies.set(peer, stream);
       pendingReplies.delete(peer);
+      // An open that RESOLVES after `close()` is reclaimed, not
+      // published: publishing it leaves a live stream behind a
+      // closed store, which is the second half of the same defect.
+      if (closed) {
+        try {
+          stream.close();
+        } catch {
+          // Nothing to do: the point was not to leave it open.
+        }
+        throw new StoreError('closed', 'the store closed while its stream was opening');
+      }
+      replies.set(peer, stream);
       return stream;
     });
     pendingReplies.set(peer, opening);
@@ -297,6 +308,13 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       try {
         await stream.send(payload);
       } catch (error) {
+        // CLOSURE WINS OVER A LATE REJECTION. The rejection arrives
+        // after an await, so `close()` can have happened in between:
+        // reopening then revives a closed store's transport — a new
+        // stream stays open and the frame is DELIVERED, which a
+        // review probe measured on both sides (opens 1 → 2, delta
+        // applied at a receiver after the host had closed).
+        if (closed) return;
         // Reopen for the stale-handle refusal and nothing else: see
         // `isStaleStream`. A permanent failure that reopened per
         // frame consumed a stream handle per frame.
@@ -339,12 +357,37 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     }
   }
 
+  /**
+   * A detached send that failed, OWNED.
+   *
+   * `emit` is invoked fire-and-forget — a commit answers every
+   * installed handle and nothing awaits it — so a rejected send has
+   * no caller to reach. Before this it had no owner either: the
+   * promise was `void`ed, and a permanent failure (an oversized
+   * payload, a node that is gone) surfaced as an UNHANDLED
+   * REJECTION. The store's own test run then exited non-zero with
+   * five of them while reporting 667 assertions passed, and CI's
+   * browser-package job failed the same way — a real defect the
+   * runner was right to refuse.
+   *
+   * So the loss is counted where every other undeliverable frame is
+   * counted, and the host stays up: one replica's dead transport is
+   * not the other replicas' problem.
+   */
+  function detached(work: Promise<void>): void {
+    void work.catch(() => {
+      dropped['send-failed'] = (dropped['send-failed'] ?? 0) + 1;
+    });
+  }
+
   function dispatched(result: Dispatched): void {
-    void emit(result.out);
+    detached(emit(result.out));
     // §1.10's large-input path answers later; the transport sends that
     // reply exactly like the synchronous one, or the caller waits on a
     // result that was computed and never sent.
-    if (result.deferred !== null) void result.deferred.then(later => emit(later.out));
+    if (result.deferred !== null) {
+      detached(result.deferred.then(later => emit(later.out)));
+    }
   }
 
   const unsubscribe = options.transport.onEvent(event => {
@@ -428,14 +471,16 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       // rather than inferring it from silence. Only to a peer this host
       // already has a reply stream for — if no session is up, nothing
       // is sent and nothing is retained to announce later.
-      void emit(
-        expired
-          .filter(entry => replies.has(entry.peer))
-          .map(entry => ({
-            peer: entry.peer,
-            h: entry.h,
-            frame: encodeMessage({ k: 'no', h: entry.h, code: 'closed' }),
-          })),
+      detached(
+        emit(
+          expired
+            .filter(entry => replies.has(entry.peer))
+            .map(entry => ({
+              peer: entry.peer,
+              h: entry.h,
+              frame: encodeMessage({ k: 'no', h: entry.h, code: 'closed' }),
+            })),
+        ),
       );
     }
     // A projection may have become available while a control waited.

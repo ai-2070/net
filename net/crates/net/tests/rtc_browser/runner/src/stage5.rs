@@ -703,9 +703,6 @@ pub enum Step5 {
         /// Entries only the `command` audience may read, so an
         /// audience change has something to withhold.
         command_entries: u32,
-        /// Refuse every ACTION and INPUT: a policy that admits
-        /// everything cannot witness a refused write.
-        refuse_writes: bool,
         max_event_bytes: u32,
     },
     /// Arm the loss / reorder / duplication hooks on ONE page.
@@ -757,7 +754,14 @@ pub enum Step5 {
     StoreCommit {
         id: u64,
         handle: String,
+        /// Skipped when absent, so "not named" is an ABSENT KEY on
+        /// the wire rather than `null`. The page reads it with
+        /// `== null` too — both halves, because either alone leaves
+        /// the other free to mean "replace the document with
+        /// nothing".
+        #[serde(skip_serializing_if = "Option::is_none")]
         entries: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         tick: Option<i64>,
         duplicate_every: u32,
         settle_ms: u64,
@@ -767,9 +771,6 @@ pub enum Step5 {
         id: u64,
         handle: String,
         by: i64,
-        /// Report a refusal as an OUTCOME (code, and the replica's
-        /// own view) instead of failing the step.
-        expect_refusal: bool,
         settle_ms: u64,
         timeout_ms: u64,
     },

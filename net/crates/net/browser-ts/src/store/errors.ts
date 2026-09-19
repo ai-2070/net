@@ -81,7 +81,7 @@ export class StoreError extends Error {
  * Whether a send failed because its stream belongs to a session that
  * has been replaced — the ONE failure a reopen repairs.
  *
- * The leaf names it (`leaf/src/session.rs`): "stale stream handle:
+ * The leaf names it (`leaf/src/node.rs`): "stale stream handle:
  * opened on incarnation N; reopen the stream". It is matched on the
  * message because that is what crosses the wasm boundary; everything
  * else — an oversized payload, a fenced id, a closed node — is

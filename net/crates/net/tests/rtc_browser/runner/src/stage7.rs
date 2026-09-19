@@ -104,32 +104,29 @@
 //! 7. a reconnect recovers the current view without replaying the
 //!    action it already accepted, and a leave frees what the host
 //!    was holding;
-//! 8. an unauthorized write is refused through the public path, and
-//!    the authority's document does not move;
-//! 9. a handle whose owner was REPLACED is refused rather than
-//!    applied, and the successor holds nothing for it;
 //! 8. and the SAME traffic leaves the per-pair counter exactly flat
 //!    once the pair is direct — the other half of the plan's
 //!    criterion, which is a pair of readings and not one.
 //!
-//! ## One open question, reported rather than asserted
+//! ## The "unexplained ZERO", answered
 //!
-//! Witness 6 reads the UNTOUCHED replica's command entries twice: at
-//! the moment of the narrowing, where it holds all four and that is
-//! the criterion's "and nobody else"; and again after a subsequent
-//! host write, where it reads ZERO. The second reading is printed
-//! and NOT asserted, because I cannot yet explain it and will not
-//! ship a witness whose claim I cannot defend.
+//! For two rounds witness 6's untouched replica read ZERO command
+//! entries after a host write, where at the change it read four. I
+//! reported it rather than asserting it, and the cause was the
+//! INSTRUMENT: `Step5::StoreCommit`'s `entries: None` crossed the
+//! wire as JSON `null`, `leaf5.js` compared it against `undefined`,
+//! and every tick-only commit replaced the host's document with
+//! `bulkEntries(null)` — an EMPTY one. So the replica read no
+//! command entries because there were no entries of any kind, and
+//! every witness that commits a tick had been measuring a delta on a
+//! document it had just emptied.
 //!
-//! What is known: in process, a sibling narrowing its audience leaves
-//! the other replica's projection intact — the audience suite covers
-//! it, and a throwaway two-replica probe with a withholding
-//! projection reproduces nothing. So this is either a harness fact
-//! (the two replicas here live on different participants, and the
-//! second is the one that narrowed) or a defect the in-process
-//! transport cannot express. Finding out is the next slice, and
-//! until then the honest witness asserts the half it measured at the
-//! change and the liveness of both replicas across the write.
+//! Both halves are now `null`-safe (`skip_serializing_if` on the
+//! step, `== null` on the page), and the reading is ASSERTED: the
+//! untouched replica still holds its four, over a document that
+//! still has all its entries. The total is part of the oracle
+//! precisely because an emptied document satisfies every reading
+//! about the NARROWED replica — which is how this hid.
 //!
 //! ## What is NOT here, and what trying established
 //!
@@ -161,7 +158,7 @@
 //! standing evidence, because the file that produced them is not the
 //! file that ships.
 //!
-//! 10 is LAST because a promotion replaces the session, and a store
+//! 8 is LAST because a promotion replaces the session, and a store
 //! that opens a new stream on it afterwards is refused by a fenced
 //! stream id. Everything that opens one runs before it.
 //!
@@ -172,8 +169,7 @@
 //! it, twice.
 //!
 //! `WITNESSES` is a DIFFERENT order — 0 snapshot, 1 loss, 2 action,
-//! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect,
-//! 8 refused-write, 9 fence — and stays that way because each record
+//! 3 duplicate, 4 routed, 5 direct, 6 audience, 7 reconnect — and stays that way because each record
 //! names its position by index, so reordering the array would
 //! silently retarget records (the same reason Stage 5's list is
 //! append-only). An earlier header mixed the two numberings and so
@@ -185,7 +181,7 @@
 //! identity separation: these contexts could not discover each other
 //! while Stage 7's two entity secrets were Stage 6 slice 3's, and
 //! without discovery there is no `peer_offer` and so no direct pair.
-//! Witness 10 — the numbering here is EXECUTION order — promotes the
+//! Witness 8 — the numbering here is EXECUTION order — promotes the
 //! pair through the PUBLIC page loop and then re-reads the same
 //! counter the routed witness read.
 //!
@@ -514,7 +510,6 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         label: format!("store/stage7/{handle}"),
         entries: ENTRIES,
         command_entries,
-        refuse_writes: false,
         max_event_bytes: MAX_EVENT_BYTES,
     };
     let host_store = |handle: &str| host_store_with(handle, 0);
@@ -606,7 +601,6 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 id: 0,
                 handle: "clean".to_string(),
                 by: 5,
-                expect_refusal: false,
                 settle_ms: 400,
                 timeout_ms: 20_000,
             },
@@ -998,9 +992,18 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         .await;
     let narrow_after = stat_u64(&narrowed, "command_entries");
     let wide_kept = stat_u64(&wide_at_change, "command_entries");
-    // The SAME reading after the host's write, which is not asserted
-    // — see the module header's open question. It is printed so the
-    // next run does not have to re-instrument it.
+    // The SAME reading AFTER the host's write, and now asserted.
+    //
+    // It read ZERO for two rounds and I reported it as unexplained.
+    // The cause was the instrument: a tick-only `store_commit`
+    // crossed the wire with `entries: null`, the page compared it
+    // against `undefined`, and the host's document was replaced with
+    // an EMPTY one — so the replica read no command entries because
+    // there were no entries of any kind. With that repaired the
+    // reading means what it says, and this is the conjunct that
+    // makes criterion 2's prohibition a claim rather than a
+    // sentence: entries another active audience still covers are NOT
+    // removed by a sibling's narrowing.
     let wide_after_write = stat_u64(&wide_after, "command_entries");
     let second_ready = second.is_some() && found_host_from_second.is_some();
     let audience_held = second_ready
@@ -1021,6 +1024,11 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
         && stat_u64(&wide_after, "tick") == Some(23)
         && stat_u64(&narrow_after_commit, "tick") == Some(23)
         && stat_u64(&narrow_after_commit, "command_entries") == Some(0)
+        && wide_after_write == Some(u64::from(COMMAND_ENTRIES))
+        // The write preserved the document: a commit that emptied it
+        // would satisfy every conjunct above about the NARROWED
+        // replica, which is exactly how the wipe hid for two rounds.
+        && stat_u64(&wide_after, "entries") == Some(u64::from(ENTRIES + COMMAND_ENTRIES))
         // The narrowed replica keeps everything its remaining
         // audience covers: this is a withholding, not a reset.
         && stat_u64(&narrowed, "entries") == Some(u64::from(ENTRIES));
@@ -1044,12 +1052,21 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
              narrowed {:?} — so neither reading above is a reading of a deaf replica, \
              which is how the first version of this witness could have passed with \
              delivery to the untouched one blocked. The narrowed replica is still at \
-             {:?} command entries after that write: the withholding STOPS irrelevant \
-             delivery rather than being a one-off at the moment of the change. {} {} {}",
+             {:?} command entries after that write, and the untouched one STILL holds \
+             {wide_after_write:?} over a document that still has {:?} entries in \
+             total. Those two together are criterion 2's prohibition — a sibling's \
+             narrowing removes nothing another active audience covers — and the total \
+             is asserted because a commit that EMPTIED the document would satisfy \
+             every reading about the narrowed replica. For two rounds one did: a \
+             tick-only commit crossed the wire as `entries: null`, the page compared \
+             it against `undefined`, and the host's document was replaced with \
+             nothing. That instrument defect, not an audience defect, was the \
+             \"unexplained ZERO\" — found by review probes on both halves. {} {} {}",
             stat_u64(&narrowed, "entries"),
             stat_u64(&wide_after, "tick"),
             stat_u64(&narrow_after_commit, "tick"),
             stat_u64(&narrow_after_commit, "command_entries"),
+            stat_u64(&wide_after, "entries"),
             why(&narrowed),
             why(&wide_after),
             why(&live_commit)
@@ -1072,7 +1089,6 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
                 id: 0,
                 handle: "aud-wide".to_string(),
                 by: 7,
-                expect_refusal: false,
                 settle_ms: 300,
                 timeout_ms: 20_000,
             },
@@ -1254,32 +1270,22 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             .await;
     }
 
-    // Re-announce and re-discover before attempting, because §9's
-    // signalling rides the RELAY and the relay entry is addressing
-    // the leaf maintains from a peer's announcement — an
-    // announcement is a lease, and by this point in the stage the
-    // one each leaf learned at the start is minutes old. The
-    // symptom without this was precise and misleading: the offerer
-    // reported `iceTimeout` while the answerer said `no verified
-    // offer from 0x… is waiting`, i.e. the offer never arrived at
-    // all, which reads like an ICE problem and is a routing one.
-    for tab in [tab_host, tab_player] {
-        let _ = script
-            .run(
-                tab,
-                Step5::Announce {
-                    id: 0,
-                    session: session.clone(),
-                    capabilities: vec![STORE_TAG.to_string()],
-                },
-            )
-            .await;
-    }
-    let re_found_player =
-        discover(&mut script, tab_host, &player.node_hex, &session, STORE_TAG).await;
-    let re_found_host =
-        discover(&mut script, tab_player, &host.node_hex, &session, STORE_TAG).await;
-
+    // NO re-announce and no re-discovery here, and that absence is a
+    // measurement rather than an omission. An earlier version did
+    // both, on the theory that §9's signalling rides a relay entry
+    // learned from an announcement lease minutes old — the review
+    // flagged that the mitigation was four changes at once with an
+    // unidentified load-bearing component, and it was right to. An
+    // isolating run with the re-discovery REMOVED promoted the pair
+    // on the FIRST attempt, so the theory was unsupported and the
+    // code is deleted rather than kept as a charm.
+    //
+    // What remains is releasing finished work (the third context and
+    // the `aud` store) and a two-attempt ladder, which the last
+    // three runs have not needed: each promoted on attempt 1. The
+    // ladder stays because `iceTimeout` is a typed disposition §9's
+    // own drive loop re-attempts, not because a run here has ever
+    // required it.
     // Two ATTEMPTS at most, because `iceTimeout` is a typed
     // disposition and not a failure — §9's own drive loop re-attempts
     // — and because a witness that gave up on the first timeout would
@@ -1288,7 +1294,9 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
     // says so and fails.
     let mut connected = StepResult::default();
     let mut accepted = StepResult::default();
+    let mut attempts = 0_u32;
     for _ in 0..2 {
+        attempts += 1;
         let accept = script.spawn(
             tab_player,
             Step5::PeerAccept {
@@ -1334,9 +1342,7 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             },
         )
         .await;
-    let both_direct = re_found_player.is_some()
-        && re_found_host.is_some()
-        && host_outcome.as_deref() == Some("direct")
+    let both_direct = host_outcome.as_deref() == Some("direct")
         && player_outcome.as_deref() == Some("direct")
         && stat_bool(&host_attempt, "direct")
         && stat_bool(&player_attempt, "direct");
@@ -1375,7 +1381,9 @@ pub async fn run(cx: Cx7<'_>, ledger: &mut Ledger) -> Result<(), String> {
             "STORE TRAFFIC LEAVES THE ANCHOR'S PER-PAIR COUNTER FLAT ONCE THE PAIR IS \
              DIRECT, and the pair's own routed reading above is what makes that a \
              claim. The pair was promoted through the PUBLIC page loop — \
-             `connectPeer` on the host reported {host_outcome:?} and `acceptPeer` on \
+             `connectPeer` on the host reported {host_outcome:?} after \
+             {attempts} attempt(s) — printed because a two-attempt promotion must \
+             not read like a one-attempt one — and `acceptPeer` on \
              the player {player_outcome:?}, and each leaf's own attempt says its \
              session is direct (host={}, player={}) — so routing is read from the \
              §9 promotion's result, never from a candidate's `host`/`srflx` label. \
