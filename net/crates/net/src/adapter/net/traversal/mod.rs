@@ -448,7 +448,15 @@ impl TraversalError {
 //
 //   0x0D00 — reflex probe (stage 1)
 //   0x0D01 — rendezvous (stage 3)
-//   0x0D02 — reserved for port-mapping metadata (stage 4, optional)
+//   0x0D02 — RTC signalling (`rtc::SUBPROTOCOL_RTC_SIGNAL`, webrtc
+//            feature; registered in docs/SUBPROTOCOLS.md)
+//   0x0D03 — reserved for port-mapping metadata (optional)
+//
+// `0x0D02` was reserved here in a comment for port-mapping metadata
+// that was never allocated and never reached docs/SUBPROTOCOLS.md.
+// Stage 4 allocates it for signalling and moves the port-mapping
+// reservation to 0x0D03 — a reservation nobody implemented is worth
+// less than an id somebody needs.
 //
 // Future traversal primitives take `0x0D0x` ids sequentially.
 

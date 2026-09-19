@@ -19,6 +19,7 @@
 #![allow(deprecated)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use net::adapter::net::PeerAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -898,7 +899,7 @@ fn bench_routing_table(c: &mut Criterion) {
     // Pre-populate with routes
     for i in 0..1000 {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-        table.add_route(i as u64, addr);
+        table.add_route(i as u64, PeerAddr::Udp(addr));
     }
 
     group.bench_function("lookup_hit", |b| {
@@ -927,7 +928,7 @@ fn bench_routing_table(c: &mut Criterion) {
     // operation and the result reflects in-place update, not map growth.
     let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
     group.bench_function("add_route", |b| {
-        b.iter(|| table.add_route(500, addr));
+        b.iter(|| table.add_route(500, PeerAddr::Udp(addr)));
     });
 
     // Stream stats recording
@@ -994,7 +995,7 @@ fn bench_routing_table_concurrent(c: &mut Criterion) {
         let table = Arc::new(RoutingTable::new(0x1234));
         for i in 0..1000 {
             let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            table.add_route(i as u64, addr);
+            table.add_route(i as u64, PeerAddr::Udp(addr));
         }
 
         group.bench_with_input(
@@ -1060,7 +1061,7 @@ fn bench_routing_decision(c: &mut Criterion) {
     // Add some routes
     for i in 0..100 {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-        table.add_route(0x5000 + i as u64, addr);
+        table.add_route(0x5000 + i as u64, PeerAddr::Udp(addr));
     }
 
     // Create a sample packet with routing header
@@ -1123,7 +1124,7 @@ fn bench_stream_multiplexing(c: &mut Criterion) {
         for i in 0..*stream_count {
             let addr: std::net::SocketAddr =
                 format!("127.0.0.1:{}", 9000 + (i % 1000)).parse().unwrap();
-            table.add_route(i as u64, addr);
+            table.add_route(i as u64, PeerAddr::Udp(addr));
         }
 
         group.throughput(Throughput::Elements(*stream_count as u64));
@@ -1351,7 +1352,7 @@ fn bench_multihop_with_routing(c: &mut Criterion) {
             // Add route to next hop
             let next_addr: std::net::SocketAddr =
                 format!("127.0.0.1:{}", 9000 + i + 1).parse().unwrap();
-            table.add_route(0x9999, next_addr); // Final destination
+            table.add_route(0x9999, PeerAddr::Udp(next_addr)); // Final destination
             table
         })
         .collect();
@@ -1412,7 +1413,7 @@ fn bench_multihop_concurrent(c: &mut Criterion) {
         let table = Arc::new(RoutingTable::new(0x1234));
         for i in 0..100 {
             let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            table.add_route(0x5000 + i as u64, addr);
+            table.add_route(0x5000 + i as u64, PeerAddr::Udp(addr));
         }
 
         group.bench_with_input(
@@ -1562,7 +1563,7 @@ fn bench_local_graph(c: &mut Criterion) {
     for i in 0..1000 {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
         let pw = Pingwave::new(0x2000 + i as u64, i as u64, 3);
-        graph.on_pingwave(pw, addr);
+        graph.on_pingwave(pw, PeerAddr::Udp(addr));
     }
 
     group.bench_function("create_pingwave", |b| {
@@ -1576,7 +1577,7 @@ fn bench_local_graph(c: &mut Criterion) {
             let pw = Pingwave::new(0x9999, seq, 3);
             seq += 1;
             let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-            graph.on_pingwave(pw, addr)
+            graph.on_pingwave(pw, PeerAddr::Udp(addr))
         });
     });
 
@@ -1584,7 +1585,7 @@ fn bench_local_graph(c: &mut Criterion) {
     let dup_pw = Pingwave::new(0x2500, 500, 3);
     group.bench_function("on_pingwave_duplicate", |b| {
         let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        b.iter(|| graph.on_pingwave(dup_pw, addr));
+        b.iter(|| graph.on_pingwave(dup_pw, PeerAddr::Udp(addr)));
     });
 
     group.bench_function("get_node", |b| {
@@ -1614,7 +1615,7 @@ fn bench_graph_scaling(c: &mut Criterion) {
             let addr: std::net::SocketAddr =
                 format!("127.0.0.1:{}", 9000 + (i % 1000)).parse().unwrap();
             let pw = Pingwave::new(0x2000 + i as u64, 1, 3);
-            graph.on_pingwave(pw, addr);
+            graph.on_pingwave(pw, PeerAddr::Udp(addr));
         }
 
         group.throughput(Throughput::Elements(*node_count as u64));
@@ -1649,7 +1650,7 @@ fn bench_capability_search(c: &mut Criterion) {
     for i in 0..1000 {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
         let pw = Pingwave::new(0x2000 + i as u64, 1, 3);
-        graph.on_pingwave(pw, addr);
+        graph.on_pingwave(pw, PeerAddr::Udp(addr));
 
         // 20% have GPU
         // 30% have python
@@ -1669,7 +1670,10 @@ fn bench_capability_search(c: &mut Criterion) {
         }
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-        graph.on_capability(CapabilityAd::new(0x2000 + i as u64, 1, caps), addr);
+        graph.on_capability(
+            CapabilityAd::new(0x2000 + i as u64, 1, caps),
+            PeerAddr::Udp(addr),
+        );
     }
 
     group.throughput(Throughput::Elements(1));
@@ -1716,7 +1720,7 @@ fn bench_graph_concurrent(c: &mut Criterion) {
                                     let pw = Pingwave::new(node_id, i as u64, 3);
                                     let addr: std::net::SocketAddr =
                                         format!("127.0.0.1:{}", 9000 + (i % 1000)).parse().unwrap();
-                                    g.on_pingwave(pw, addr);
+                                    g.on_pingwave(pw, PeerAddr::Udp(addr));
                                 }
                             })
                         })
@@ -1810,12 +1814,12 @@ fn bench_failure_detector(c: &mut Criterion) {
     // Pre-populate with nodes
     for i in 0..1000 {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-        detector.heartbeat(i as u64, addr);
+        detector.heartbeat(i as u64, PeerAddr::Udp(addr));
     }
 
     group.bench_function("heartbeat_existing", |b| {
         let addr: std::net::SocketAddr = "127.0.0.1:9500".parse().unwrap();
-        b.iter(|| detector.heartbeat(500, addr));
+        b.iter(|| detector.heartbeat(500, PeerAddr::Udp(addr)));
     });
 
     // Dedicated detector: heartbeat_new inserts a fresh id every iteration,
@@ -1829,7 +1833,7 @@ fn bench_failure_detector(c: &mut Criterion) {
         let mut id = 10000u64;
         let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         b.iter(|| {
-            growth_detector.heartbeat(id, addr);
+            growth_detector.heartbeat(id, PeerAddr::Udp(addr));
             id += 1;
         });
     });
@@ -1970,7 +1974,7 @@ fn bench_failure_scaling(c: &mut Criterion) {
         for i in 0..*node_count {
             let addr: std::net::SocketAddr =
                 format!("127.0.0.1:{}", 9000 + (i % 1000)).parse().unwrap();
-            detector.heartbeat(i as u64, addr);
+            detector.heartbeat(i as u64, PeerAddr::Udp(addr));
         }
 
         group.throughput(Throughput::Elements(*node_count as u64));
@@ -2021,7 +2025,7 @@ fn bench_failure_concurrent(c: &mut Criterion) {
                                     let node_id = (thread_id as u64 * 10000) + i as u64;
                                     let addr: std::net::SocketAddr =
                                         format!("127.0.0.1:{}", 9000 + (i % 1000)).parse().unwrap();
-                                    d.heartbeat(node_id, addr);
+                                    d.heartbeat(node_id, PeerAddr::Udp(addr));
                                 }
                             })
                         })
@@ -2057,7 +2061,7 @@ fn bench_failure_recovery_cycle(c: &mut Criterion) {
         let mut id = 0u64;
         b.iter(|| {
             // Heartbeat
-            detector.heartbeat(id, addr);
+            detector.heartbeat(id, PeerAddr::Udp(addr));
 
             // Simulate failure check (would normally timeout)
             let _ = detector.status(id);
@@ -2069,7 +2073,7 @@ fn bench_failure_recovery_cycle(c: &mut Criterion) {
             }
 
             // Recovery
-            detector.heartbeat(id, addr);
+            detector.heartbeat(id, PeerAddr::Udp(addr));
             mgr.on_recovery(id);
 
             id += 1;

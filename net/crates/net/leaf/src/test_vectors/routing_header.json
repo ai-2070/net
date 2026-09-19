@@ -1,0 +1,11 @@
+{
+  "description": "RoutingHeader::to_bytes / from_bytes. 18 bytes: magic(2)=0x5452 'RT' little-endian | ttl(1) | hop_count(1) | flags(1) | _reserved(1) | src_id(4) | dest_id(8). Every routed-session packet is routing_bytes ++ net_packet.",
+  "fields": {
+    "dest_id": "0xAABBCCDDEEFF0011",
+    "src_id": "0x12345678",
+    "ttl": 16,
+    "hop_count": 0,
+    "flags": "NONE"
+  },
+  "hex": "525410000000785634121100ffeeddccbbaa"
+}

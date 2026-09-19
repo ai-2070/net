@@ -1,0 +1,9 @@
+{
+  "description": "StreamWindow::encode / decode (subprotocol 0x0B00). 24 bytes: stream_id(8) | total_consumed(8) | ack_seq(8), little-endian.",
+  "fields": {
+    "stream_id": "0x00FF00FF00FF00FF",
+    "total_consumed": 123456,
+    "ack_seq": 99
+  },
+  "hex": "ff00ff00ff00ff0040e20100000000006300000000000000"
+}

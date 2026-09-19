@@ -231,6 +231,7 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::net::PeerAddr;
 
     /// Test-only locality probe: returns whatever the test
     /// configured.
@@ -298,7 +299,6 @@ mod tests {
     use crate::adapter::net::behavior::proximity::{
         EnhancedPingwave, ProximityConfig, ProximityGraph,
     };
-    use std::net::SocketAddr;
 
     /// Build `[u8; 32]` graph ids whose first byte is `n` so the
     /// `graph_id_to_node_id` bridge yields a small predictable u64.
@@ -311,7 +311,7 @@ mod tests {
     fn graph_with_one_peer(peer_id: [u8; 32]) -> Arc<ProximityGraph> {
         let my_id = gid(1);
         let graph = Arc::new(ProximityGraph::new(my_id, ProximityConfig::default()));
-        let from_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let pw = EnhancedPingwave::new(peer_id, 1, 3);
         graph.on_pingwave_from(pw, peer_id, from_addr);
         graph

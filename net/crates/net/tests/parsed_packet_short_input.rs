@@ -13,9 +13,8 @@
 #![cfg(feature = "net")]
 
 use bytes::Bytes;
-use std::net::SocketAddr;
 
-use net::adapter::net::ParsedPacket;
+use net::adapter::net::{ParsedPacket, PeerAddr};
 
 /// `transport.rs:15` documents `HEADER_SIZE = 64`. Hard-coded here
 /// rather than pulled from the substrate because the constant isn't
@@ -23,8 +22,8 @@ use net::adapter::net::ParsedPacket;
 /// the API surface for the assertion's benefit.
 const HEADER_SIZE: usize = 64;
 
-fn source() -> SocketAddr {
-    "127.0.0.1:9000".parse().unwrap()
+fn source() -> PeerAddr {
+    PeerAddr::Udp("127.0.0.1:9000".parse().unwrap())
 }
 
 #[test]

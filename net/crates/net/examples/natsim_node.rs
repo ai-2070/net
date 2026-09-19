@@ -18,10 +18,20 @@
 //!   target). Accepts the named joiners in file-coordinated order,
 //!   then serves until killed.
 //! - `joiner`  — a node that dials the publics, classifies,
-//!   announces, and (optionally) drives a punch / upgrade toward a
-//!   target joiner, writing the outcome.
+//!   announces, and (optionally) drives a punch / upgrade / RTC
+//!   upgrade toward a target joiner, writing the outcome.
+//! - `capabilities` — print which optional cargo features this
+//!   binary was built with, so a scenario that needs one can refuse
+//!   before provisioning anything.
+//!
+//! RTC (`webrtc` feature): a joiner given `--rtc-bind` (and, behind
+//! a NAT, `--rtc-public`) runs a second, dedicated RTC socket and
+//! announces `rtc_addr`. `--mode rtc` additionally drives the
+//! client half: a relay-routed session, then `offer_direct_path`
+//! until the peer sits on a `PeerAddr::Rtc` DataChannel.
 //!
 //! Build: `cargo build --example natsim_node --features net,nat-traversal`
+//!        (add `webrtc` for the RTC scenarios)
 //! Not intended to run outside the natsim harness.
 
 #![cfg_attr(not(all(feature = "net", feature = "nat-traversal")), allow(unused))]
@@ -37,7 +47,7 @@ fn main() {
 mod natsim {
 
     use std::collections::HashMap;
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -46,6 +56,100 @@ mod natsim {
     use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
 
     const PSK: [u8; 32] = [0x42u8; 32];
+
+    /// The result of one unsolicited STUN binding request (R8).
+    #[derive(Default)]
+    struct StunProbe {
+        ok: bool,
+        target: Option<String>,
+        mapped: Option<String>,
+        /// The probe socket's OWN tuple, as the kernel bound it.
+        ///
+        /// Recorded so the row can assert the reply against a value
+        /// this process observed rather than against a hardcoded
+        /// address: on this topology the client is un-NAT'd
+        /// (`self_nat_class: Open`), so a faithful
+        /// XOR-MAPPED-ADDRESS must equal this exactly. A reply that
+        /// names any other tuple is describing a different socket —
+        /// which is the defect this field exists to catch.
+        local: Option<String>,
+    }
+
+    /// Send ONE RFC 5389 binding request to `target` **from `local`**,
+    /// and read the response's XOR-MAPPED-ADDRESS.
+    ///
+    /// Deliberately not an ICE check: a check carries `USERNAME`,
+    /// belongs to a session, and never reaches the anchor's bare
+    /// responder — so it could not show that the ADVERTISED address
+    /// is the one being aimed at.
+    ///
+    /// # Why `local` is a parameter and not `0.0.0.0`
+    ///
+    /// The reply's XOR-MAPPED-ADDRESS is a statement about **the
+    /// source tuple the request actually arrived with**, so it says
+    /// something about THIS node only if the request left from this
+    /// node's own address. A wildcard bind delegates that choice to
+    /// the kernel's source-address selection, which picks the
+    /// outgoing device's PRIMARY address — and `setup.sh` puts four
+    /// addresses on `nsim_wan`'s `br0` (`10.99.0.1` first, then
+    /// `.10`, `.11`, and `.12` under `--public-b`). A public joiner
+    /// bound to `10.99.0.12` therefore probed from `10.99.0.1` and
+    /// was told, correctly, about a mapping that was not its own:
+    /// the reply was a statement about a local socket, which is
+    /// precisely what this probe exists not to be. Binding `local`
+    /// makes the reply about the node.
+    #[cfg(feature = "webrtc")]
+    async fn stun_probe(target: &str, local: IpAddr) -> StunProbe {
+        use net::adapter::net::rtc::{parse_xor_mapped_address, STUN_MAGIC_COOKIE};
+
+        let mut probe = StunProbe {
+            target: Some(target.to_string()),
+            ..StunProbe::default()
+        };
+        let Ok(addr) = target.parse::<SocketAddr>() else {
+            return probe;
+        };
+        // This node's own address, ephemeral port. A failed bind is
+        // NOT silently downgraded to a wildcard one: a probe that
+        // could not use this node's address cannot make a statement
+        // about this node's mapping, so `ok: false` is the honest
+        // outcome and the row fails naming it.
+        let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::new(local, 0)).await else {
+            return probe;
+        };
+        // Read back from the socket, not assembled from `local` and a
+        // guess: the port is the kernel's choice and the row compares
+        // the anchor's reply against it.
+        probe.local = socket.local_addr().ok().map(|a| a.to_string());
+        // A binding request is 20 bytes: type, length, cookie, id.
+        let mut request = Vec::with_capacity(20);
+        request.extend_from_slice(&0x0001u16.to_be_bytes());
+        request.extend_from_slice(&0u16.to_be_bytes());
+        request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request.extend_from_slice(&[0x2Au8; 12]);
+        for _ in 0..5 {
+            if socket.send_to(&request, addr).await.is_err() {
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == addr => {
+                    if let Some(mapped) = parse_xor_mapped_address(&buf[..n]) {
+                        probe.ok = true;
+                        probe.mapped = Some(mapped.to_string());
+                        return probe;
+                    }
+                }
+                _ => {}
+            }
+        }
+        probe
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    async fn stun_probe(_target: &str, _local: IpAddr) -> StunProbe {
+        StunProbe::default()
+    }
     /// How long coordination waits (files, reflex visibility) may take.
     const COORD_TIMEOUT: Duration = Duration::from_secs(60);
     // How long a joiner keeps re-running the classification sweep
@@ -54,10 +158,12 @@ mod natsim {
 
     fn usage() -> ! {
         eprintln!(
-            "usage:\n  natsim_node keygen\n  natsim_node public --name N --bind IP:PORT \
+            "usage:\n  natsim_node keygen\n  natsim_node capabilities\n  \
+         natsim_node public --name N --bind IP:PORT \
          --state DIR --joiners a,b [--connect-to x]\n  natsim_node joiner --name N \
          --bind IP:PORT --state DIR --publics r,x [--seed-hex H] [--auto-upgrade] \
-         [--target N --mode punch|upgrade] "
+         [--rtc-bind IP:PORT] [--rtc-public IP:PORT] \
+         [--target N --mode punch|upgrade|rtc] "
         );
         std::process::exit(2);
     }
@@ -118,12 +224,87 @@ mod natsim {
         cfg
     }
 
+    /// The RTC half of a joiner's config, built from `--rtc-bind` /
+    /// `--rtc-public`. `None` when neither is given, which is every
+    /// pre-Stage-4 scenario — a node with `rtc: None` announces none
+    /// of the RTC fields and behaves exactly as before.
+    ///
+    /// `--rtc-public` is what a NAT'd anchor is told about its own
+    /// mapping: the driver advertises it as the host candidate and
+    /// the mesh announces it as `rtc_addr`. A node that is not given
+    /// one does not guess, so a public client simply omits it.
+    #[cfg(feature = "webrtc")]
+    fn rtc_config_from(
+        flags: &HashMap<String, String>,
+    ) -> Option<net::adapter::net::rtc::RtcConfig> {
+        use net::adapter::net::rtc::RtcConfig;
+        let bind: Option<SocketAddr> = flags.get("rtc-bind").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--rtc-bind must be IP:PORT, got {s:?}"))
+        });
+        let public: Option<SocketAddr> = flags.get("rtc-public").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--rtc-public must be IP:PORT, got {s:?}"))
+        });
+        if bind.is_none() && public.is_none() {
+            return None;
+        }
+        let mut cfg = RtcConfig::new();
+        cfg.bind_addr = bind;
+        cfg.public_addr = public;
+        // An anchor publishes an `rtc_addr` so peers can aim at it;
+        // answering a bare binding request on that socket is part of
+        // what publishing it means, and the responder is off by
+        // default (R8: the probe's refusal was over-determined —
+        // the responder was disabled AND the gateway drops
+        // unsolicited inbound; only the second is by design).
+        cfg.serve_stun = true;
+        // **The SECOND announced endpoint (Stage 6 §6.12.2).**
+        //
+        // A separate UDP socket that serves STUN and is never an ICE
+        // peer, announced as `rtc_stun_addr`. Two flags, not one
+        // derived port: `--stun-bind` is where the socket sits and
+        // `--stun-public` is what a NAT'd anchor is told its mapping
+        // is — the same split `--rtc-bind` / `--rtc-public` has, and
+        // for the same reason. A node given neither announces no
+        // second endpoint and behaves exactly as before.
+        cfg.stun_addr = flags.get("stun-bind").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--stun-bind must be IP:PORT, got {s:?}"))
+        });
+        cfg.stun_public_addr = flags.get("stun-public").map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("--stun-public must be IP:PORT, got {s:?}"))
+        });
+        // A real network between the endpoints, not loopback: give ICE
+        // room for the restricted-cone pinhole to open (the anchor's
+        // first outbound check is what makes the client's checks
+        // deliverable), while staying well inside the scenario's own
+        // 120 s verdict budget.
+        cfg.ice_deadline = Duration::from_secs(15);
+        Some(cfg)
+    }
+
     #[derive(serde::Serialize, serde::Deserialize)]
     struct NodeInfo {
         name: String,
         node_id: u64,
         pubkey_hex: String,
         addr: String,
+        /// The `rtc_addr` this node actually **announced**, read back
+        /// from its own emitted `CapabilityAnnouncement` once it has
+        /// announced. Written by the RTC roles only; `#[serde(default)]`
+        /// so every existing scenario's info file still parses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtc_addr: Option<String>,
+        /// The `rtc_stun_addr` this node actually **announced** — the
+        /// separate STUN endpoint of Stage 6 §6.12.2, read back out
+        /// of the same emitted announcement rather than echoed from
+        /// `--stun-public`. A peer that wants to use the anchor as a
+        /// STUN server learns it from here, which is the only place
+        /// the product puts it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtc_stun_addr: Option<String>,
     }
 
     async fn wait_for_file(path: &Path) -> Vec<u8> {
@@ -184,9 +365,41 @@ mod natsim {
         write_atomic(&state.join(marker), b"ok\n");
     }
 
+    /// The RTC counters, for the scenarios that configure an RTC
+    /// socket. Nested under `stats.rtc` rather than flattened so the
+    /// traversal keys every other scenario asserts on keep their
+    /// exact shape.
+    #[cfg(feature = "webrtc")]
+    fn rtc_stats_json(node: &MeshNode) -> serde_json::Value {
+        let s = node.rtc_stats();
+        serde_json::json!({
+            "ice_attempted": s.ice_attempted(),
+            "ice_direct": s.ice_direct(),
+            "ice_relayed": s.ice_relayed(),
+            // Which side lost a signalling frame, if one was lost:
+            // `delivered` is this node's own handler, `forwarded` is
+            // the relay leg, and the two refusal counters name a
+            // cause instead of a silent drop.
+            "signal_delivered": s.signal_delivered(),
+            "signal_forwarded": s.signal_forwarded(),
+            "signal_malformed": s.signal_malformed(),
+            "signal_over_budget": s.signal_over_budget(),
+            "signal_engine_full": s.signal_engine_full(),
+            "signal_unknown_dialog": s.signal_unknown_dialog(),
+            // R8: unsolicited binding requests this node's own STUN
+            // responder answered — a peer aiming at the address we
+            // published, which an ICE check could never demonstrate.
+            "stun_binding_requests": s.stun_binding_requests(),
+        })
+    }
+
     fn stats_json(node: &MeshNode) -> serde_json::Value {
         let s = node.traversal_stats();
-        serde_json::json!({
+        #[cfg_attr(
+            not(feature = "webrtc"),
+            expect(unused_mut, reason = "the RTC block is the only mutation")
+        )]
+        let mut out = serde_json::json!({
             "punches_attempted": s.punches_attempted,
             "punches_succeeded": s.punches_succeeded,
             "punches_failed": s.punches_failed,
@@ -199,7 +412,15 @@ mod natsim {
             "upgrades_deferred_busy": s.upgrades_deferred_busy,
             "port_mapping_active": s.port_mapping_active,
             "port_mapping_renewals": s.port_mapping_renewals,
-        })
+        });
+        // Only for a node that actually runs an RTC driver: a key
+        // that is always present but always zero reads as "RTC did
+        // nothing" on nodes that never had RTC at all.
+        #[cfg(feature = "webrtc")]
+        if node.rtc_driver().is_some() {
+            out["rtc"] = rtc_stats_json(node);
+        }
+        out
     }
 
     /// Park for the rest of the scenario, republishing this node's
@@ -276,6 +497,8 @@ mod natsim {
                 node_id: node.node_id(),
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
+                rtc_addr: None,
+                rtc_stun_addr: None,
             },
         );
 
@@ -330,9 +553,35 @@ mod natsim {
         let auto_upgrade = flags.contains_key("auto-upgrade");
         let target = flags.get("target").cloned();
         let mode = flags.get("mode").cloned().unwrap_or_else(|| "wait".into());
+        // Fail the configuration loudly rather than silently running a
+        // node with no RTC socket: without the feature the flags below
+        // are accepted by `parse_flags` and then do nothing, and the
+        // scenario would fail much later as "offer_direct_path: rtc is
+        // not configured". `run_scenario.sh` pre-flights the same fact
+        // via the `capabilities` role before touching a namespace.
+        #[cfg(not(feature = "webrtc"))]
+        if flags.contains_key("rtc-bind") || flags.contains_key("rtc-public") || mode == "rtc" {
+            eprintln!(
+                "natsim_node: --rtc-bind/--rtc-public/--mode rtc need the `webrtc` \
+                 cargo feature (rebuild with --features net,nat-traversal,webrtc)"
+            );
+            std::process::exit(2);
+        }
 
+        #[cfg_attr(
+            not(feature = "webrtc"),
+            expect(unused_mut, reason = "the RTC half is the only mutation")
+        )]
+        let mut cfg = node_config(bind, auto_upgrade);
+        #[cfg(feature = "webrtc")]
+        let rtc_enabled = {
+            let rtc = rtc_config_from(&flags);
+            let enabled = rtc.is_some();
+            cfg.rtc = rtc;
+            enabled
+        };
         let node = Arc::new(
-            MeshNode::new(keypair_from(&flags), node_config(bind, auto_upgrade))
+            MeshNode::new(keypair_from(&flags), cfg)
                 .await
                 .expect("joiner node"),
         );
@@ -344,6 +593,8 @@ mod natsim {
                 node_id: node.node_id(),
                 pubkey_hex: hex::encode(node.public_key()),
                 addr: bind.to_string(),
+                rtc_addr: None,
+                rtc_stun_addr: None,
             },
         );
 
@@ -403,6 +654,38 @@ mod natsim {
         node.announce_capabilities(CapabilitySet::new())
             .await
             .expect("joiner announce");
+        // Republish this node's identity with the `rtc_addr` it
+        // ACTUALLY announced, read back out of its own emitted
+        // `CapabilityAnnouncement` rather than echoed from the flag.
+        // That is the fact the scenario is about: a NAT'd anchor must
+        // put its *mapped* address on the wire, not the private
+        // address its RTC socket is bound to. The rewrite lands before
+        // the `_ready` marker below, so a peer that waits for the
+        // marker and then re-reads the info file cannot observe the
+        // pre-announce version.
+        #[cfg(feature = "webrtc")]
+        if rtc_enabled {
+            // BOTH announced endpoints, read out of the SAME emitted
+            // announcement. `rtc_stun_addr` is the second one
+            // (§6.12.2); taking it from the announcement rather than
+            // from `--stun-public` is what makes the leg able to
+            // assert the anchor announced its MAPPED address and not
+            // the private socket it binds.
+            let ann = node.local_announcement_for_test();
+            let announced = ann.as_ref().and_then(|a| a.rtc_addr).map(|a| a.to_string());
+            let announced_stun = ann.as_ref().and_then(|a| a.rtc_stun_addr.clone());
+            write_info(
+                &state,
+                &NodeInfo {
+                    name: name.clone(),
+                    node_id: node.node_id(),
+                    pubkey_hex: hex::encode(node.public_key()),
+                    addr: bind.to_string(),
+                    rtc_addr: announced,
+                    rtc_stun_addr: announced_stun,
+                },
+            );
+        }
         write_marker(&state, &format!("{name}_ready"));
 
         let Some(target) = target else {
@@ -494,6 +777,201 @@ mod natsim {
                     "stats": stats_json(&node),
                 })
             }
+            // The client half of the RTC-anchor scenario: a public
+            // native node outside the NAT, reaching a NAT'd anchor
+            // over a DataChannel. Signalling rides the relay-routed
+            // session (`0x0D02`); the only address the client is ever
+            // told for the anchor's RTC socket is the mapped one the
+            // anchor advertises, so an installed `PeerAddr::Rtc`
+            // endpoint IS the proof that the published `rtc_addr`
+            // works through the NAT.
+            #[cfg(feature = "webrtc")]
+            "rtc" => {
+                use net::adapter::net::PeerAddr;
+                let relay_addr: SocketAddr = public_infos[0].addr.parse().unwrap();
+                let started = tokio::time::Instant::now();
+                let connected = node
+                    .connect_via(relay_addr, &t_pk, tinfo.node_id)
+                    .await
+                    .is_ok();
+                let on_relay = node.peer_addr(tinfo.node_id) == Some(relay_addr);
+
+                // §5 Layer 1: the anchor's Noise static arrives in its
+                // signed announcement, and the offerer's half of the
+                // install handshakes against exactly that key. Waiting
+                // for it here keeps an announcement that has not
+                // propagated yet from being reported as an ICE failure.
+                let key_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while node.peer_announced_noise_pubkey(tinfo.node_id) != Some(t_pk)
+                    && tokio::time::Instant::now() < key_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let learned_noise_key =
+                    node.peer_announced_noise_pubkey(tinfo.node_id) == Some(t_pk);
+
+                // The anchor rewrote its info file with the two
+                // endpoints it announced before it wrote
+                // `<target>_ready`, which this initiator already
+                // awaited — so this read cannot observe the
+                // pre-announce version.
+                let anchor_info = wait_for_info(&state, &target).await;
+                let anchor_rtc_addr = anchor_info.rtc_addr;
+                let anchor_stun_addr = anchor_info.rtc_stun_addr;
+
+                // **The SECOND announced endpoint, probed for real
+                // (Stage 6 §6.12.2).**
+                //
+                // One unsolicited binding request from a fresh socket
+                // bound to THIS NODE'S OWN address (`bind.ip()`, the
+                // address its mesh socket uses), aimed at
+                // `rtc_stun_addr` — the address the
+                // ANCHOR ANNOUNCED, not a flag this process was
+                // given. Unlike the `rtc_addr` probe below, this one
+                // is expected to be ANSWERED: an ICE socket behind an
+                // address-restricted cone is reachable only after its
+                // own outbound opens the mapping, while a STUN
+                // endpoint that drops a stranger's first request
+                // could never serve the peers it is announced to, so
+                // `setup.sh --stun-port-a` forwards that single port.
+                //
+                // What the reply establishes is the part local sockets
+                // cannot: the request crossed the gateway to a
+                // private socket, was served, and the response came
+                // back — and its XOR-MAPPED-ADDRESS is this client's
+                // own public tuple as the ANCHOR saw it. Two
+                // externally reachable mappings on one NAT'd anchor,
+                // each observed with its own reply. The source
+                // address is pinned rather than left to the kernel
+                // because otherwise the reply describes whichever of
+                // `br0`'s four addresses won source selection, not
+                // this node — see `stun_probe`.
+                //
+                // Probed BEFORE the binding below, which shadows the
+                // function's own name.
+                let stun_endpoint_probe = match anchor_stun_addr.as_deref() {
+                    Some(addr) => stun_probe(addr, bind.ip()).await,
+                    None => StunProbe::default(),
+                };
+
+                // **R8, evidence half.** One unsolicited binding
+                // request aimed at the announced RTC address, from a
+                // FRESH socket bound to this node's own address for
+                // the same reason as above. Under this topology it is
+                // expected to be dropped, and that is worth recording
+                // rather than asserting: the cone gateway is
+                // address-restricted
+                // by construction (`setup.sh` installs
+                // `iifname gw?-wan udp dport <rtc> ct state new drop`
+                // precisely so the scenario models a restricted NAT
+                // and not a full-cone one). An anchor behind such a
+                // NAT is reachable only after its own outbound check
+                // opens the mapping — so "a stranger can use it as a
+                // STUN server" is false here BY DESIGN, and asserting
+                // it would be asserting the wrong topology.
+                let stun_probe = match anchor_rtc_addr.as_deref() {
+                    Some(addr) => stun_probe(addr, bind.ip()).await,
+                    None => StunProbe::default(),
+                };
+
+                // Offer, then let the dialog's own completion owner
+                // carry it into the fenced install. Retried, not raced:
+                // the §12/C3 quiescence gate can refuse the first
+                // replacement while the fresh routed session still has
+                // unacked frames, and an attempt that loses ICE is one
+                // attempt, not a verdict. The budget is sized so the
+                // FAILING path still writes a verdict inside
+                // `run_scenario.sh`'s 120 s wait: two 20 s attempts
+                // behind the 15 s key wait, plus the classification
+                // sweep before all of it. A scenario that times out
+                // with no outcome file reports nothing but a tail of
+                // logs; one that writes `transport: "udp"` names what
+                // happened.
+                let mut offers = 0u32;
+                let mut on_rtc = false;
+                let attempts_until = tokio::time::Instant::now() + Duration::from_secs(45);
+                while connected && !on_rtc && tokio::time::Instant::now() < attempts_until {
+                    if node.offer_direct_path(tinfo.node_id).await.is_ok() {
+                        offers += 1;
+                    }
+                    // One `ice_deadline` (15 s) plus the Noise install
+                    // and the announcement round trip behind it.
+                    let settle_by = tokio::time::Instant::now() + Duration::from_secs(20);
+                    while tokio::time::Instant::now() < settle_by {
+                        if matches!(node.peer_endpoint(tinfo.node_id), Some(PeerAddr::Rtc(_))) {
+                            on_rtc = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                #[cfg(feature = "webrtc")]
+                let selected = node.rtc_selected_pair(tinfo.node_id).await;
+                #[cfg(not(feature = "webrtc"))]
+                let selected: Option<(SocketAddr, SocketAddr, &'static str)> = None;
+                serde_json::json!({
+                    "mode": "rtc",
+                    "ok": connected,
+                    "started_on_relay": on_relay,
+                    // The whole verdict in one field: `rtc` means the
+                    // session sits on a DataChannel, `udp` means it is
+                    // still on the relay (or a punched path).
+                    "transport": match node.peer_endpoint(tinfo.node_id) {
+                        Some(PeerAddr::Rtc(_)) => "rtc",
+                        Some(_) => "udp",
+                        None => "none",
+                    },
+                    "direct": node.peer_is_direct(tinfo.node_id),
+                    "upgraded": on_rtc,
+                    "offers": offers,
+                    "learned_noise_key": learned_noise_key,
+                    // What the anchor put on the wire. Behind a NAT
+                    // this MUST be the gateway's mapped address, never
+                    // the private address its RTC socket is bound to.
+                    "anchor_rtc_addr": anchor_rtc_addr,
+                    // R8: did an unsolicited binding request to THAT
+                    // address get a well-formed success response, and
+                    // what did it say our mapped address was?
+                    "stun_probe_ok": stun_probe.ok,
+                    "stun_probe_note": "unsolicited inbound is dropped by the \
+                                        address-restricted cone gateway by design; \
+                                        evidence, not a verdict",
+                    "stun_probe_target": stun_probe.target,
+                    "stun_probe_mapped": stun_probe.mapped,
+                    // **The second announced endpoint (§6.12.2).**
+                    // The address the anchor ANNOUNCED for STUN, and
+                    // whether a stranger's binding request to it was
+                    // answered — which is the only way a mapping is
+                    // observed from outside rather than asserted from
+                    // inside. `stun_endpoint_mapped` is this client's
+                    // own public tuple as the anchor saw it, and
+                    // `stun_endpoint_local` is the same tuple as THIS
+                    // process bound it — the client is un-NAT'd here,
+                    // so a faithful reply must equal it exactly, and
+                    // the row asserts that rather than a prefix.
+                    "anchor_stun_addr": anchor_stun_addr,
+                    "stun_endpoint_probe_ok": stun_endpoint_probe.ok,
+                    "stun_endpoint_target": stun_endpoint_probe.target,
+                    "stun_endpoint_mapped": stun_endpoint_probe.mapped,
+                    "stun_endpoint_local": stun_endpoint_probe.local,
+                    // **R8, verdict half.** The address the client's
+                    // ICE stack is actually transmitting to, and
+                    // WHERE IT CAME FROM. `signalled` means it was
+                    // learned from the anchor's announced candidate;
+                    // `peer-reflexive` means it was discovered from
+                    // the anchor's own inbound check and the
+                    // announcement contributed nothing.
+                    "selected_local": selected.as_ref().map(|(l, _, _)| l.to_string()),
+                    "selected_remote": selected.as_ref().map(|(_, r, _)| r.to_string()),
+                    "selected_learned": selected.as_ref().map(|(_, _, k)| *k),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "session_addr": node.peer_addr(tinfo.node_id).map(|a| a.to_string()),
+                    "relay_addr": relay_addr.to_string(),
+                    "self_nat_class": format!("{:?}", node.nat_class()),
+                    "peer_nat_class": format!("{:?}", node.peer_nat_class(tinfo.node_id)),
+                    "stats": stats_json(&node),
+                })
+            }
             other => {
                 eprintln!("natsim_node: unknown mode {other}");
                 std::process::exit(2);
@@ -548,6 +1026,24 @@ mod natsim {
         tracing::trace!(target: "net::adapter::net::selftest", "natsim_node: trace enabled");
     }
 
+    /// `capabilities`: which optional features this binary carries.
+    ///
+    /// A scenario that needs one (today: `webrtc`) pre-flights it and
+    /// refuses before a single namespace is provisioned, instead of
+    /// discovering the gap 120 s later as an empty outcome file. The
+    /// no-feature build never reaches here — its stub `main` exits 2
+    /// with its own message, which the same check catches.
+    fn run_capabilities() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "webrtc": cfg!(feature = "webrtc"),
+                "nat_traversal": cfg!(feature = "nat-traversal"),
+                "fixtures": cfg!(feature = "fixtures"),
+            })
+        );
+    }
+
     pub fn main() {
         init_tracing();
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -561,6 +1057,7 @@ mod natsim {
             let flags = parse_flags(&args[1..]);
             match role.as_str() {
                 "keygen" => run_keygen().await,
+                "capabilities" => run_capabilities(),
                 "public" => run_public(flags).await,
                 "joiner" => run_joiner(flags).await,
                 _ => usage(),

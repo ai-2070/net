@@ -1,0 +1,13 @@
+{
+  "name": "natsim-browser-driver",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Playwright browser-control plane for the Stage 6 NAT conformance matrix. One process per NAT'd network namespace, spoken to over NDJSON on stdio by the natsim-browser-matrix runner.",
+  "dependencies": {
+    "playwright-core": "1.56.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

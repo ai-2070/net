@@ -1,0 +1,109 @@
+### P1 (c) RAW INVERSE — malformed-group cleanup drops an already-acknowledged group's bytes with only a counter, instead of surrendering the stream's ownership
+### repaired snapshot: spikes/s5r3_inverse/repaired/frame.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+--- spikes/s5r3_inverse/repaired/frame.rs	2026-09-15 14:07:42.500842100 +0200
++++ net/crates/net/leaf/src/frame.rs	2026-09-15 14:11:30.456442200 +0200
+@@ -535,7 +535,7 @@
+                 || m.subprotocol_id != partial.first.subprotocol_id
+                 || m.reliable != partial.first.reliable
+         }) {
+-            self.abandon(key);
++            self.groups.remove(&key);
+             counters.drop_for(DropReason::ReassemblyInconsistent);
+             return None;
+         }
+@@ -580,7 +580,7 @@
+                     .iter()
+                     .any(|p| p.offset as usize + p.data.len() > end));
+         if inconsistent {
+-            self.abandon(key);
++            self.groups.remove(&key);
+             counters.drop_for(DropReason::ReassemblyInconsistent);
+             return None;
+         }
+EXIT=1
+
+## mutated run
+$ cd net/crates/net/leaf && cargo test --lib -- a_contradicted_sequenced_group cannot_be_completed_under_another_plane cannot_change_its_mode_between_pieces
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+    Blocking waiting for file lock on build directory
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+warning: method `abandon` is never used
+   --> src\frame.rs:342:8
+    |
+288 | impl Reassembler {
+    | ---------------- method in this implementation
+...
+342 |     fn abandon(&mut self, key: (u64, u16)) {
+    |        ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `net-mesh-leaf` (lib) generated 1 warning
+warning: `net-mesh-leaf` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.69s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 3 tests
+test frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned ... FAILED
+test node::tests::a_fragment_group_cannot_be_completed_under_another_plane ... FAILED
+test node::tests::a_fragment_group_cannot_change_its_mode_between_pieces ... FAILED
+
+failures:
+
+---- frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned stdout ----
+
+thread 'frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned' (43028) panicked at src\frame.rs:1245:9:
+assertion `left == right` failed
+  left: []
+ right: [Abandoned { scope: 2, stream_id: 4 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- node::tests::a_fragment_group_cannot_be_completed_under_another_plane stdout ----
+
+thread 'node::tests::a_fragment_group_cannot_be_completed_under_another_plane' (26540) panicked at src\node.rs:3493:9:
+assertion `left == right` failed: a mixed-plane group must not be dispatched at all, and the head it destroyed was already acknowledged, so the stream ends typed rather than stopping silently
+  left: ([], [])
+ right: ([], [(562949953421337, ReassemblyAbandoned)])
+
+---- node::tests::a_fragment_group_cannot_change_its_mode_between_pieces stdout ----
+
+thread 'node::tests::a_fragment_group_cannot_change_its_mode_between_pieces' (110788) panicked at src\node.rs:3584:9:
+assertion `left == right` failed
+  left: ([], [])
+ right: ([], [(562949953421339, ReassemblyAbandoned)])
+
+
+failures:
+    frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned
+    node::tests::a_fragment_group_cannot_be_completed_under_another_plane
+    node::tests::a_fragment_group_cannot_change_its_mode_between_pieces
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/frame.rs net/crates/net/leaf/src/frame.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run
+$ cd net/crates/net/leaf && cargo test --lib -- a_contradicted_sequenced_group cannot_be_completed_under_another_plane cannot_change_its_mode_between_pieces
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.91s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 3 tests
+test frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned ... ok
+test node::tests::a_fragment_group_cannot_be_completed_under_another_plane ... ok
+test node::tests::a_fragment_group_cannot_change_its_mode_between_pieces ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.02s
+
+EXIT=0

@@ -98,7 +98,7 @@ When running the mesh transport, these surface alongside the bus stats. They liv
 
 ### Per-stream stats — `MeshNode::stream_stats(peer, stream_id)` and `all_stream_stats(peer)`
 
-Source: `net/crates/net/src/adapter/net/stream.rs:164-198`.
+Source: `net/crates/net/wire/src/stream.rs:194-228`.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -122,7 +122,7 @@ The reliable-stream retransmit window has a bounded number of slots. If the tx-c
 - **`ReliableStream::untracked_evictions() -> u64`** — cumulative count of evicted, no-longer-trackable descriptors. Should be `0` in a correctly-sized deployment; a non-zero and climbing value means a window misconfiguration is silently dropping retransmittable data.
 - A **rate-limited `warn!`** fires on the first eviction and every 64th after, so the loss is visible in logs even without scraping.
 
-**Alert on `untracked_evictions > 0`** the same way you alert on `events_dropped` — it is the reliable-stream silent-loss signal, and under default backpressure it is otherwise invisible. Source: `net/crates/net/src/adapter/net/reliability.rs:445`.
+**Alert on `untracked_evictions > 0`** the same way you alert on `events_dropped` — it is the reliable-stream silent-loss signal, and under default backpressure it is otherwise invisible. Source: `net/crates/net/wire/src/reliability.rs:304`.
 
 ### NAT traversal — `mesh.traversal_stats() -> TraversalStatsSnapshot`
 

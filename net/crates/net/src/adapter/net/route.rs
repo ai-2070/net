@@ -1,322 +1,25 @@
 //! Routing primitives for Net multi-hop transport.
 //!
 //! This module provides:
-//! - `RoutingHeader`: Fixed-size header for multi-hop routing
 //! - `RoutingTable`: Stream-to-destination mapping
 //! - `SchedulerStreamStats`: Per-stream statistics for fairness monitoring
+//!
+//! The routing **envelope codec** (`RoutingHeader`, `RouteFlags`,
+//! `ROUTING_MAGIC`, `ROUTING_HEADER_SIZE`) lives in `net-mesh-wire`
+//! since Stage 2 and is re-exported below, so
+//! `crate::adapter::net::route::RoutingHeader` still resolves.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+pub use net_wire::route_codec::{RouteFlags, RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
+// The TTL ceiling keeps its pre-extraction underscore name (renaming a
+// public constant is not a free change); re-exported for the tests and
+// callers that name it.
+#[allow(unused_imports)]
+pub use net_wire::route_codec::_MAX_TTL;
+
+use super::transport::PeerAddr;
 use dashmap::DashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-
-/// Routing header size in bytes.
-///
-/// Layout: `magic(2) | ttl(1) | hop_count(1) | flags(1) | _reserved(1) | src_id(4) | dest_id(8)`
-/// — 18 bytes total. The magic tag at bytes 0-1 unambiguously
-/// distinguishes routing headers from direct Net packets (whose
-/// own magic is `0x4E45`), so the receive-loop discriminator
-/// doesn't depend on `dest_id` happening to not collide with it.
-pub const ROUTING_HEADER_SIZE: usize = 18;
-
-/// Magic bytes identifying a routing header: `[0x52, 0x54]` on the
-/// wire — ASCII "RT" in read order, for "routing". Stored as a u16
-/// little-endian value, that's `0x5452`. Chosen disjoint from the
-/// Net packet magic (`0x4E45`) so the receive-loop can discriminate
-/// on the first two bytes alone.
-pub const ROUTING_MAGIC: u16 = 0x5452;
-
-/// Maximum TTL for multi-hop routing
-pub const _MAX_TTL: u8 = 16;
-
-/// Route flags (bitflags — multiple flags can be set simultaneously)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub struct RouteFlags(u8);
-
-impl RouteFlags {
-    /// No special flags
-    pub const NONE: Self = Self(0x00);
-    /// Control packet (pingwave, capability update)
-    pub const CONTROL: Self = Self(0x01);
-    /// Requires acknowledgment
-    pub const REQUIRES_ACK: Self = Self(0x02);
-    /// Priority packet (skip fairness queue)
-    pub const PRIORITY: Self = Self(0x04);
-    /// Last packet in stream
-    pub const END_OF_STREAM: Self = Self(0x08);
-
-    /// Parse flags from u8.
-    ///
-    /// The `& 0x0F` mask drops the high nibble. Today the defined
-    /// flags fit in the low nibble (`CONTROL`, `REQUIRES_ACK`,
-    /// `PRIORITY`, `END_OF_STREAM`), so 16 distinct wire bytes
-    /// alias to the same `RouteFlags`. **The high nibble is
-    /// reserved**: any future flag added there will be silently
-    /// stripped by old peers running this codepath. When a new flag
-    /// is introduced:
-    ///
-    /// 1. Allocate it in the **low nibble** if any bit is still
-    ///    free, OR
-    /// 2. Widen this mask in the same release that defines the new
-    ///    flag, in lock-step across every peer that decodes routing
-    ///    headers (Rust + cross-language bindings). A skew where
-    ///    one peer reads the bit and another masks it off silently
-    ///    diverges on routing semantics.
-    pub fn from_u8(v: u8) -> Self {
-        // Emit a warn when the high nibble is set so a future
-        // flag's silent strip doesn't go invisible. The doc-
-        // comment above documents the constraint; this log makes
-        // the skew observable in production rather than only
-        // visible via post-mortem code review.
-        if v & 0xF0 != 0 {
-            tracing::warn!(
-                wire_byte = format_args!("0x{:02x}", v),
-                high_nibble = format_args!("0x{:02x}", v & 0xF0),
-                "route flags: high-nibble bits set on inbound wire byte and \
-                 silently stripped — peer may be running a newer schema. \
-                 Widen RouteFlags::from_u8's mask in lock-step before any \
-                 production peer relies on a high-nibble bit."
-            );
-        }
-        Self(v & 0x0F)
-    }
-
-    /// Convert to u8
-    pub fn as_u8(self) -> u8 {
-        self.0
-    }
-
-    /// Check if a flag is set
-    pub fn contains(self, other: Self) -> bool {
-        (self.0 & other.0) == other.0
-    }
-
-    /// Check if this is a control packet
-    pub fn is_control(self) -> bool {
-        self.contains(Self::CONTROL)
-    }
-
-    /// Check if this is a priority packet
-    pub fn is_priority(self) -> bool {
-        self.contains(Self::PRIORITY)
-    }
-}
-
-/// Routing header for multi-hop Net packets.
-///
-/// Layout (18 bytes):
-/// ```text
-/// ┌───────────────────────────────────────────────────────────────────┐
-/// │ magic (2) │ ttl │ hops │ flags │ rsvd │ src_id (4) │ dest_id (8) │
-/// └───────────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// `magic` is always `ROUTING_MAGIC` (ASCII `"RT"` on the wire —
-/// `0x5452` as a little-endian `u16`), distinct from the direct-
-/// packet magic `0x4E45`. The receive-loop discriminator reads bytes
-/// 0-1 alone and dispatches unambiguously — the previous 16-byte
-/// layout put `dest_id` at bytes 0-7, and any recipient whose
-/// `node_id` had low-16-bits equal to the direct-packet magic
-/// (~1 in 65 536) silently mis-classified its own incoming routed
-/// packets as Net packets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct RoutingHeader {
-    /// Final destination node ID (64-bit)
-    pub dest_id: u64,
-    /// Source node ID (truncated to 32-bit for space)
-    pub src_id: u32,
-    /// Time-to-live (decremented at each hop)
-    pub ttl: u8,
-    /// Hop count so far
-    pub hop_count: u8,
-    /// Route flags
-    pub flags: RouteFlags,
-    /// Reserved for future use
-    pub _reserved: u8,
-}
-
-impl RoutingHeader {
-    /// Create a new routing header
-    pub fn new(dest_id: u64, src_id: u32, ttl: u8) -> Self {
-        Self {
-            dest_id,
-            src_id,
-            ttl,
-            hop_count: 0,
-            flags: RouteFlags::NONE,
-            _reserved: 0,
-        }
-    }
-
-    /// Create a control packet header
-    pub fn control(dest_id: u64, src_id: u32, ttl: u8) -> Self {
-        Self {
-            dest_id,
-            src_id,
-            ttl,
-            hop_count: 0,
-            flags: RouteFlags::CONTROL,
-            _reserved: 0,
-        }
-    }
-
-    /// Create a priority packet header
-    pub fn priority(dest_id: u64, src_id: u32, ttl: u8) -> Self {
-        Self {
-            dest_id,
-            src_id,
-            ttl,
-            hop_count: 0,
-            flags: RouteFlags::PRIORITY,
-            _reserved: 0,
-        }
-    }
-
-    /// Serialize to bytes.
-    ///
-    /// The magic tag rides at bytes 0-1 so the receive-loop
-    /// discriminator reads it directly — see `ROUTING_MAGIC`.
-    pub fn to_bytes(&self) -> [u8; ROUTING_HEADER_SIZE] {
-        let mut buf = [0u8; ROUTING_HEADER_SIZE];
-        buf[0..2].copy_from_slice(&ROUTING_MAGIC.to_le_bytes());
-        buf[2] = self.ttl;
-        buf[3] = self.hop_count;
-        buf[4] = self.flags.as_u8();
-        buf[5] = self._reserved;
-        buf[6..10].copy_from_slice(&self.src_id.to_le_bytes());
-        buf[10..18].copy_from_slice(&self.dest_id.to_le_bytes());
-        buf
-    }
-
-    /// Deserialize from bytes. Returns `None` on short input, wrong
-    /// magic, or malformed numeric fields.
-    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < ROUTING_HEADER_SIZE {
-            return None;
-        }
-        let magic = u16::from_le_bytes([buf[0], buf[1]]);
-        if magic != ROUTING_MAGIC {
-            return None;
-        }
-        Some(Self {
-            ttl: buf[2],
-            hop_count: buf[3],
-            flags: RouteFlags::from_u8(buf[4]),
-            _reserved: buf[5],
-            src_id: u32::from_le_bytes(buf[6..10].try_into().ok()?),
-            dest_id: u64::from_le_bytes(buf[10..18].try_into().ok()?),
-        })
-    }
-
-    /// Write to a buffer
-    pub fn write_to(&self, buf: &mut BytesMut) {
-        buf.put_u16_le(ROUTING_MAGIC);
-        buf.put_u8(self.ttl);
-        buf.put_u8(self.hop_count);
-        buf.put_u8(self.flags.as_u8());
-        buf.put_u8(self._reserved);
-        buf.put_u32_le(self.src_id);
-        buf.put_u64_le(self.dest_id);
-    }
-
-    /// Overwrite an existing 18-byte slice with this header, in place.
-    ///
-    /// Distinct from [`Self::write_to`] which appends to the tail of a
-    /// `BytesMut`: this targets the head of an existing buffer (an
-    /// inbound packet's routing-header prefix) so the forwarder can
-    /// flip TTL / increment hop_count without allocating a fresh
-    /// packet. Used by `Router::route_packet`'s `Bytes::try_into_mut`
-    /// fast path — perf #18.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `dst.len() < ROUTING_HEADER_SIZE`. The caller is
-    /// expected to have already validated the slice length via the
-    /// same check that decoded the header.
-    pub fn write_at(&self, dst: &mut [u8]) {
-        assert!(
-            dst.len() >= ROUTING_HEADER_SIZE,
-            "write_at: dst is {} bytes, need {}",
-            dst.len(),
-            ROUTING_HEADER_SIZE,
-        );
-        dst[0..2].copy_from_slice(&ROUTING_MAGIC.to_le_bytes());
-        dst[2] = self.ttl;
-        dst[3] = self.hop_count;
-        dst[4] = self.flags.as_u8();
-        dst[5] = self._reserved;
-        dst[6..10].copy_from_slice(&self.src_id.to_le_bytes());
-        dst[10..18].copy_from_slice(&self.dest_id.to_le_bytes());
-    }
-
-    /// Read from a buffer. Returns `None` on short input or wrong
-    /// magic; fields are consumed only on successful parse.
-    pub fn read_from(buf: &mut Bytes) -> Option<Self> {
-        if buf.remaining() < ROUTING_HEADER_SIZE {
-            return None;
-        }
-        // Peek at magic without advancing so a bad prefix leaves
-        // the cursor intact for callers that want to try another
-        // decoder.
-        let magic = u16::from_le_bytes([buf[0], buf[1]]);
-        if magic != ROUTING_MAGIC {
-            return None;
-        }
-        let _ = buf.get_u16_le();
-        let ttl = buf.get_u8();
-        let hop_count = buf.get_u8();
-        let flags = RouteFlags::from_u8(buf.get_u8());
-        let _reserved = buf.get_u8();
-        let src_id = buf.get_u32_le();
-        let dest_id = buf.get_u64_le();
-        Some(Self {
-            dest_id,
-            src_id,
-            ttl,
-            hop_count,
-            flags,
-            _reserved,
-        })
-    }
-
-    /// Check if TTL is expired
-    #[inline]
-    pub fn is_expired(&self) -> bool {
-        self.ttl == 0
-    }
-
-    /// Decrement TTL and increment hop count (for forwarding)
-    ///
-    /// `hop_count` is `u8`, so on a 256+-hop path the saturating_add
-    /// pins it at 255 and the `hop_count + 2` indirect-route metric
-    /// used downstream undercounts the true distance. Routing
-    /// correctness is preserved — `ttl` (separate, larger) still
-    /// bounds loops — but best-route selection may pick a path with
-    /// bogus metrics. Log once at saturation so an operator can
-    /// notice and reconfigure path lengths or upgrade `hop_count` to
-    /// `u16`. (Changing the wire format is a breaking change held
-    /// off until consumers migrate.)
-    #[inline]
-    pub fn forward(&mut self) -> bool {
-        if self.ttl == 0 {
-            return false;
-        }
-        self.ttl -= 1;
-        if self.hop_count == u8::MAX {
-            tracing::warn!(
-                "RoutingHeader::forward: hop_count saturated at {}; \
-                 indirect-route metrics on this packet are inaccurate",
-                u8::MAX
-            );
-        } else {
-            self.hop_count = self.hop_count.saturating_add(1);
-        }
-        true
-    }
-}
 
 /// Per-stream statistics for fairness monitoring
 #[derive(Debug)]
@@ -413,7 +116,7 @@ impl Default for SchedulerStreamStats {
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     /// Next hop address
-    pub next_hop: SocketAddr,
+    pub next_hop: PeerAddr,
     /// Authenticated identity of the next hop, when the route was
     /// installed with one (`SUBNET_AUTH_PLAN.md` D6).
     ///
@@ -440,7 +143,7 @@ pub struct RouteEntry {
 
 impl RouteEntry {
     /// Create a new route entry with default metric
-    pub fn new(next_hop: SocketAddr) -> Self {
+    pub fn new(next_hop: PeerAddr) -> Self {
         Self {
             next_hop,
             next_hop_id: None,
@@ -451,7 +154,7 @@ impl RouteEntry {
     }
 
     /// Create a route entry with specified metric
-    pub fn with_metric(next_hop: SocketAddr, metric: u16) -> Self {
+    pub fn with_metric(next_hop: PeerAddr, metric: u16) -> Self {
         Self {
             next_hop,
             next_hop_id: None,
@@ -463,7 +166,7 @@ impl RouteEntry {
 
     /// Create an identity-bound route entry usable for protected
     /// forwarding.
-    pub fn authenticated(next_hop: SocketAddr, next_hop_id: u64) -> Self {
+    pub fn authenticated(next_hop: PeerAddr, next_hop_id: u64) -> Self {
         Self {
             next_hop,
             next_hop_id: Some(next_hop_id),
@@ -478,7 +181,7 @@ impl RouteEntry {
     /// adjacent authenticated peer's address, `next_hop_id` that
     /// peer's identity, and the metric ranks it against other learned
     /// paths to the same destination.
-    pub fn authenticated_with_metric(next_hop: SocketAddr, next_hop_id: u64, metric: u16) -> Self {
+    pub fn authenticated_with_metric(next_hop: PeerAddr, next_hop_id: u64, metric: u16) -> Self {
         Self {
             next_hop,
             next_hop_id: Some(next_hop_id),
@@ -494,7 +197,7 @@ impl RouteEntry {
     /// Refuses when `identity` is not the bound one, so a different
     /// peer cannot take over an existing protected route by arriving
     /// at the same place.
-    pub fn rebind_addr(&mut self, identity: u64, new_addr: SocketAddr) -> bool {
+    pub fn rebind_addr(&mut self, identity: u64, new_addr: PeerAddr) -> bool {
         if self.next_hop_id != Some(identity) {
             return false;
         }
@@ -596,7 +299,7 @@ struct DestRoutes {
 /// conditional writer reasons about, and nothing that merely ages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CandidateFingerprint {
-    next_hop: SocketAddr,
+    next_hop: PeerAddr,
     next_hop_id: Option<u64>,
     metric: u16,
     active: bool,
@@ -685,7 +388,7 @@ impl DestRoutes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteCandidateView {
     /// Where this candidate sends.
-    pub next_hop: SocketAddr,
+    pub next_hop: PeerAddr,
     /// Its bound identity — `Some` exactly for the protected candidate.
     pub next_hop_id: Option<u64>,
     /// Metric, for ranking against the other candidate.
@@ -757,9 +460,9 @@ pub struct TransitionOutcome {
     /// Whether an alternate was installed.
     pub installed: bool,
     /// The effective next hop before the transition.
-    pub effective_before: Option<SocketAddr>,
+    pub effective_before: Option<PeerAddr>,
     /// The effective next hop after it.
-    pub effective_after: Option<SocketAddr>,
+    pub effective_after: Option<PeerAddr>,
     /// Whether the destination still resolves for forwarding.
     pub reachable_after: bool,
 }
@@ -929,7 +632,7 @@ impl RoutingTable {
     /// that may later have to undo it can name the exact write rather
     /// than matching on a destination and address a replacement could
     /// already have reused.
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) -> u64 {
+    pub fn add_route(&self, dest_id: u64, next_hop: PeerAddr) -> u64 {
         self.mutate_with_token(dest_id, |d| {
             d.ordinary = Some(RouteEntry::new(next_hop));
         })
@@ -949,7 +652,7 @@ impl RoutingTable {
     /// This writer cannot see, replace, or refresh the protected
     /// candidate: an unauthenticated datagram is not evidence about an
     /// authenticated adjacency, in either direction.
-    pub fn add_route_with_metric(&self, dest_id: u64, next_hop: SocketAddr, metric: u16) {
+    pub fn add_route_with_metric(&self, dest_id: u64, next_hop: PeerAddr, metric: u16) {
         self.mutate(dest_id, |d| match d.ordinary.as_mut() {
             None => d.ordinary = Some(RouteEntry::with_metric(next_hop, metric)),
             Some(e) if metric < e.metric => {
@@ -998,7 +701,7 @@ impl RoutingTable {
     pub fn add_authenticated_route_with_metric(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         next_hop_id: u64,
         metric: u16,
     ) {
@@ -1169,7 +872,7 @@ impl RoutingTable {
     pub fn remove_route_if_from_hop(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         identity: u64,
         sender_is_direct: bool,
     ) -> TransitionOutcome {
@@ -1212,7 +915,7 @@ impl RoutingTable {
     pub fn remove_ordinary_route_if_next_hop_is(
         &self,
         dest_id: u64,
-        expected_next_hop: SocketAddr,
+        expected_next_hop: PeerAddr,
     ) -> bool {
         self.mutate(dest_id, |d| {
             if d.ordinary
@@ -1269,7 +972,7 @@ impl RoutingTable {
     /// (the caller knows exactly what it installed). Withdrawal — a
     /// claim from a REMOTE sender — must use
     /// [`Self::remove_route_if_from_hop`] instead.
-    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
+    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: PeerAddr) -> bool {
         self.mutate(dest_id, |d| {
             let mut removed = false;
             for slot in [&mut d.ordinary, &mut d.protected] {
@@ -1315,7 +1018,7 @@ impl RoutingTable {
     ///   that belongs to someone else's authenticated adjacency.
     /// - A **legacy** entry (no identity) migrates by address match,
     ///   as before — it carries no protected traffic either way.
-    pub fn migrate_next_hop(&self, old: SocketAddr, new: SocketAddr, identity: u64) -> usize {
+    pub fn migrate_next_hop(&self, old: PeerAddr, new: PeerAddr, identity: u64) -> usize {
         if old == new {
             return 0;
         }
@@ -1352,7 +1055,7 @@ impl RoutingTable {
     /// large; call [`Self::set_max_route_age`] to enable expiry). Stale
     /// candidates stay in the map until a periodic [`Self::sweep_stale`]
     /// call removes them.
-    pub fn lookup(&self, dest_id: u64) -> Option<SocketAddr> {
+    pub fn lookup(&self, dest_id: u64) -> Option<PeerAddr> {
         let max_age = self.max_route_age();
         self.routes
             .get(&dest_id)
@@ -1365,7 +1068,7 @@ impl RoutingTable {
     pub fn add_authenticated_route(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         next_hop_id: u64,
     ) -> u64 {
         self.mutate_with_token(dest_id, |d| {
@@ -1381,7 +1084,7 @@ impl RoutingTable {
     /// Reads the protected slot alone: an ordinary candidate, however
     /// good its metric and whoever installed it, resolves to `None`
     /// rather than to an unauthenticated guess.
-    pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, SocketAddr)> {
+    pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, PeerAddr)> {
         let max_age = self.max_route_age();
         self.routes.get(&dest_id).and_then(|d| {
             d.protected_live(max_age)
@@ -1396,7 +1099,7 @@ impl RoutingTable {
         &self,
         dest_id: u64,
         identity: u64,
-        new_addr: SocketAddr,
+        new_addr: PeerAddr,
     ) -> bool {
         self.mutate(dest_id, |d| {
             d.protected
@@ -1438,7 +1141,7 @@ impl RoutingTable {
         &self,
         dest_id: u64,
         observed: RouteObservation,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         provenance: AlternateProvenance,
         metric: u16,
     ) -> Option<TransitionOutcome> {
@@ -1499,7 +1202,7 @@ impl RoutingTable {
         dest_id: u64,
         observed: RouteObservation,
         failed_identity: u64,
-        failed_addr: SocketAddr,
+        failed_addr: PeerAddr,
     ) -> Option<TransitionOutcome> {
         if self.cas_poisoned() {
             return None;
@@ -1555,7 +1258,7 @@ impl RoutingTable {
     pub fn install_metered_if_absent(
         &self,
         dest_id: u64,
-        next_hop: SocketAddr,
+        next_hop: PeerAddr,
         provenance: AlternateProvenance,
         metric: u16,
     ) -> bool {
@@ -1897,189 +1600,14 @@ pub struct AggregateStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_routing_header_roundtrip() {
-        let header = RoutingHeader::new(0x123456789ABCDEF0, 0xDEADBEEF, 8);
-        let bytes = header.to_bytes();
-        let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(header, parsed);
-    }
-
-    /// Pin perf #18: `write_at` writes the same 18 bytes as
-    /// `write_to`, byte-for-byte. The router's
-    /// `Bytes::try_into_mut` fast path uses `write_at` to overwrite
-    /// the inbound packet's header in place; if the two paths
-    /// diverged (e.g. one swapped two fields), forwarded packets
-    /// would carry a malformed header — observable only as a
-    /// silent receive-side drop on the next hop.
-    #[test]
-    fn write_at_matches_write_to_byte_for_byte() {
-        let header = RoutingHeader::new(0xABCD_EF01_2345_6789, 0xDEAD_BEEF, 7);
-
-        // Path A: write_to into a fresh BytesMut.
-        let mut via_write_to = BytesMut::with_capacity(ROUTING_HEADER_SIZE);
-        header.write_to(&mut via_write_to);
-
-        // Path B: write_at into an existing 18-byte slice. Pre-fill
-        // with a sentinel pattern so an under-write would surface.
-        let mut via_write_at = [0xCC; ROUTING_HEADER_SIZE];
-        header.write_at(&mut via_write_at);
-
-        assert_eq!(
-            &via_write_to[..],
-            &via_write_at[..],
-            "write_at must produce the same wire bytes as write_to; \
-             a divergence would silently malform every forwarded packet",
-        );
-    }
-
-    /// Pin: `write_at` panics rather than silently truncates when
-    /// the destination slice is too short. A regression that turned
-    /// the assert into a saturating-write would let the router
-    /// emit an underwritten header into the forward path.
-    #[test]
-    #[should_panic(expected = "write_at")]
-    fn write_at_panics_on_short_slice() {
-        let header = RoutingHeader::new(1, 2, 1);
-        let mut short = [0u8; ROUTING_HEADER_SIZE - 1];
-        header.write_at(&mut short);
-    }
-
-    #[test]
-    fn test_routing_header_magic_at_offset_zero() {
-        // ROUTING_MAGIC must appear at bytes 0-1 regardless of
-        // dest_id / src_id values. The receive-loop discriminator
-        // peeks at bytes 0-1 and relies on this.
-        let header = RoutingHeader::new(0x4E45_4E45_4E45_4E45, 0x4E45_4E45, 8);
-        let bytes = header.to_bytes();
-        assert_eq!(
-            u16::from_le_bytes([bytes[0], bytes[1]]),
-            ROUTING_MAGIC,
-            "magic must live at bytes 0-1 independent of dest_id's own byte pattern",
-        );
-    }
-
-    #[test]
-    fn test_routing_header_rejects_wrong_magic() {
-        // from_bytes must refuse buffers whose bytes 0-1 aren't
-        // ROUTING_MAGIC — this is what lets the receive-loop
-        // discriminator short-circuit cleanly without parsing the
-        // rest of the header.
-        let mut bytes = RoutingHeader::new(0x1234, 0x5678, 4).to_bytes();
-        // Overwrite magic with direct-packet MAGIC.
-        bytes[0..2].copy_from_slice(&0x4E45_u16.to_le_bytes());
-        assert!(RoutingHeader::from_bytes(&bytes).is_none());
-
-        // Overwrite with arbitrary garbage.
-        bytes[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-        assert!(RoutingHeader::from_bytes(&bytes).is_none());
-    }
-
-    #[test]
-    fn test_regression_routing_discriminator_survives_magic_collision_node_id() {
-        // Regression (LOW, BUGS.md): the old 16-byte layout put
-        // `dest_id` at bytes 0-7. When a recipient's own node_id
-        // had low-16-bits equal to 0x4E45 (the direct Net-packet
-        // magic), routed packets to that node were
-        // mis-discriminated as direct packets and silently dropped
-        // at the AEAD layer — 1-in-65 536 node_ids affected.
-        //
-        // The new layout puts ROUTING_MAGIC at bytes 0-1 and
-        // shifts dest_id to bytes 10-17, so the discriminator is
-        // unambiguous for every possible dest_id value.
-        //
-        // This test constructs a header whose dest_id has low-16
-        // bits equal to the old ambiguous value and verifies that
-        // the header still serializes with ROUTING_MAGIC at the
-        // front and round-trips correctly.
-        let ambiguous_dest: u64 = 0xDEAD_BEEF_FFFF_4E45;
-        let header = RoutingHeader::new(ambiguous_dest, 0x1111_2222, 8);
-        let bytes = header.to_bytes();
-        assert_eq!(
-            u16::from_le_bytes([bytes[0], bytes[1]]),
-            ROUTING_MAGIC,
-            "magic at offset 0 must be independent of dest_id",
-        );
-        let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.dest_id, ambiguous_dest);
-        assert_eq!(parsed.src_id, 0x1111_2222);
-        assert_eq!(parsed.ttl, 8);
-    }
-
-    #[test]
-    fn test_routing_header_forward() {
-        let mut header = RoutingHeader::new(0x1234, 0x5678, 3);
-        assert_eq!(header.ttl, 3);
-        assert_eq!(header.hop_count, 0);
-
-        assert!(header.forward());
-        assert_eq!(header.ttl, 2);
-        assert_eq!(header.hop_count, 1);
-
-        assert!(header.forward());
-        assert!(header.forward());
-        assert_eq!(header.ttl, 0);
-        assert_eq!(header.hop_count, 3);
-
-        // Can't forward with TTL=0
-        assert!(!header.forward());
-    }
-
-    #[test]
-    fn test_routing_header_flags() {
-        let control = RoutingHeader::control(0x1234, 0x5678, 2);
-        assert!(control.flags.is_control());
-
-        let priority = RoutingHeader::priority(0x1234, 0x5678, 2);
-        assert!(priority.flags.is_priority());
-    }
-
-    #[test]
-    fn test_route_flags_combined() {
-        // Regression: from_u8 used to match only single-flag values.
-        // Combined flags (e.g., Control | RequiresAck) mapped to None.
-        let combined = RouteFlags::CONTROL.as_u8() | RouteFlags::REQUIRES_ACK.as_u8();
-        let parsed = RouteFlags::from_u8(combined);
-        assert!(
-            parsed.is_control(),
-            "Control bit must survive combined parse"
-        );
-        assert!(
-            parsed.contains(RouteFlags::REQUIRES_ACK),
-            "RequiresAck bit must survive combined parse"
-        );
-
-        let all = RouteFlags::CONTROL.as_u8()
-            | RouteFlags::REQUIRES_ACK.as_u8()
-            | RouteFlags::PRIORITY.as_u8()
-            | RouteFlags::END_OF_STREAM.as_u8();
-        let parsed_all = RouteFlags::from_u8(all);
-        assert!(parsed_all.is_control());
-        assert!(parsed_all.is_priority());
-        assert!(parsed_all.contains(RouteFlags::REQUIRES_ACK));
-        assert!(parsed_all.contains(RouteFlags::END_OF_STREAM));
-    }
-
-    #[test]
-    fn test_route_flags_roundtrip() {
-        // Verify combined flags survive to_bytes/from_bytes roundtrip
-        let mut header = RoutingHeader::new(0x1234, 0x5678, 4);
-        header.flags =
-            RouteFlags::from_u8(RouteFlags::PRIORITY.as_u8() | RouteFlags::REQUIRES_ACK.as_u8());
-
-        let bytes = header.to_bytes();
-        let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
-        assert!(parsed.flags.is_priority());
-        assert!(parsed.flags.contains(RouteFlags::REQUIRES_ACK));
-    }
+    use std::net::SocketAddr;
 
     #[test]
     fn test_routing_table_basic() {
         let table = RoutingTable::new(0x1234);
 
-        let addr1: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let addr2: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr1: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
+        let addr2: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
 
         table.add_route(0x5678, addr1);
         table.add_route(0x9ABC, addr2);
@@ -2095,7 +1623,7 @@ mod tests {
     #[test]
     fn test_routing_table_deactivate() {
         let table = RoutingTable::new(0x1234);
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         table.add_route(0x5678, addr);
         assert_eq!(table.lookup(0x5678), Some(addr));
@@ -2144,8 +1672,8 @@ mod tests {
     #[test]
     fn route_and_stream_counts_track_inserts_and_removals() {
         let table = RoutingTable::new(0x1);
-        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2".parse().unwrap());
 
         table.add_route(0x10, a);
         table.add_route(0x11, b);
@@ -2187,8 +1715,8 @@ mod tests {
     #[test]
     fn test_add_route_with_metric_preserves_better_direct_route() {
         let table = RoutingTable::new(0x1111);
-        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let indirect: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let direct: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let indirect: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         // Direct insert (metric=1).
         table.add_route(0x2222, direct);
@@ -2206,7 +1734,7 @@ mod tests {
         // change, e.g., if the direct peer moved AND announced a
         // shorter path — only achievable for indirect-vs-indirect
         // since direct's metric=1 is already the floor).
-        let better: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let better: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
         table.add_route_with_metric(0x2222, better, 0);
         assert_eq!(
             table.lookup(0x2222),
@@ -2225,8 +1753,8 @@ mod tests {
     #[test]
     fn add_route_with_metric_equal_does_not_overwrite_next_hop() {
         let table = RoutingTable::new(0x1111);
-        let real: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let attacker: SocketAddr = "10.0.0.1:31337".parse().unwrap();
+        let real: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let attacker: PeerAddr = PeerAddr::Udp("10.0.0.1:31337".parse().unwrap());
 
         table.add_route(0x2222, real);
         // Attacker announces same metric as direct; must NOT win.
@@ -2247,9 +1775,9 @@ mod tests {
     #[test]
     fn migrate_next_hop_repoints_matching_routes_only() {
         let table = RoutingTable::new(0x1111);
-        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        let other: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let old: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
+        let new: PeerAddr = PeerAddr::Udp("127.0.0.1:6000".parse().unwrap());
+        let other: PeerAddr = PeerAddr::Udp("127.0.0.1:7000".parse().unwrap());
 
         table.add_route(0xAAA, old); // via the re-handshaking peer
         table.add_route(0xBBB, old); // also via it
@@ -2279,8 +1807,8 @@ mod tests {
     #[test]
     fn migrate_next_hop_is_identity_qualified() {
         let table = RoutingTable::new(0x1111);
-        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let old: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
+        let new: PeerAddr = PeerAddr::Udp("127.0.0.1:6000".parse().unwrap());
         const PEER: u64 = 0x22;
         const OTHER: u64 = 0x33;
 
@@ -2317,9 +1845,9 @@ mod tests {
     #[test]
     fn migrate_next_hop_stale_caller_cannot_roll_back() {
         let table = RoutingTable::new(0x1111);
-        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const P: u64 = 0x22;
 
         table.add_authenticated_route_with_metric(0xAAA, a, P, 3);
@@ -2345,8 +1873,8 @@ mod tests {
     fn another_peer_cannot_refresh_the_installed_route() {
         use std::time::Duration;
         let table = RoutingTable::new(0x1111);
-        let via_a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let via_a: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         const A: u64 = 0xA;
         const B: u64 = 0xB;
         const DEST: u64 = 0xD60;
@@ -2381,8 +1909,8 @@ mod tests {
     fn unauthenticated_writes_cannot_reach_authenticated_route_state() {
         use std::time::Duration;
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_a: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const DEST: u64 = 0xD61;
 
@@ -2439,8 +1967,8 @@ mod tests {
     #[test]
     fn an_ordinary_install_does_not_erase_the_authenticated_candidate() {
         let table = RoutingTable::new(0x1111);
-        let real_hop: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let relay: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let real_hop: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let relay: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         const ADJ: u64 = 0xAD;
         const DEST: u64 = 0xD63;
 
@@ -2465,9 +1993,9 @@ mod tests {
     #[test]
     fn install_if_unchanged_skips_after_an_intervening_write() {
         let table = RoutingTable::new(0x1111);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        let d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
+        let d: PeerAddr = PeerAddr::Udp("127.0.0.1:4000".parse().unwrap());
         const DEST: u64 = 0xD64;
 
         table.add_route(DEST, b);
@@ -2497,8 +2025,8 @@ mod tests {
     #[test]
     fn install_metered_if_absent_declines_once_anything_exists() {
         let table = RoutingTable::new(0x1111);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const DEST: u64 = 0xD65;
 
         assert!(table.install_metered_if_absent(DEST, b, AlternateProvenance::Protected(0xB), 1));
@@ -2517,8 +2045,8 @@ mod tests {
     #[test]
     fn remove_route_if_from_hop_is_identity_qualified() {
         let table = RoutingTable::new(0x1111);
-        let x: SocketAddr = "127.0.0.1:1000".parse().unwrap();
-        let y: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let x: PeerAddr = PeerAddr::Udp("127.0.0.1:1000".parse().unwrap());
+        let y: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         const B: u64 = 0xB;
         const C: u64 = 0xC;
 
@@ -2582,8 +2110,8 @@ mod tests {
     #[test]
     fn withdrawal_outcome_distinguishes_candidate_loss_from_unreachability() {
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const DEST: u64 = 0xD70;
 
@@ -2620,8 +2148,8 @@ mod tests {
     #[test]
     fn add_authenticated_route_with_metric_binds_upgrades_and_refuses() {
         let table = RoutingTable::new(0x1111);
-        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let via_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let via_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         const B: u64 = 0xB;
         const C: u64 = 0xC;
         const DEST: u64 = 0xD57;
@@ -2681,8 +2209,8 @@ mod tests {
         use std::time::Duration;
 
         let table = RoutingTable::new(0x1111);
-        let addr_a: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_a: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         table.add_route(0x2222, addr_a);
         table.add_route(0x3333, addr_b);
@@ -2729,8 +2257,8 @@ mod tests {
     #[test]
     fn a_recreated_destination_refuses_a_pre_removal_observation() {
         let table = RoutingTable::new(0x1111);
-        let addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let newer: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         table.add_route(0x2222, addr);
         let stale = table.observe(0x2222).expect("present");
@@ -2768,8 +2296,8 @@ mod tests {
         // it only removes when the current next_hop still matches the
         // address the caller wrote.
         let table = RoutingTable::new(0x1111);
-        let original: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let original: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let newer: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         // Install original route.
         table.add_route(0x4444, original);
@@ -2835,8 +2363,8 @@ mod tests {
                 // same destination 500 times. The dashmap entry
                 // API guarantees atomic compare-and-swap per
                 // iteration.
-                let next_hop: SocketAddr =
-                    format!("127.0.0.1:{}", 10_000 + metric).parse().unwrap();
+                let next_hop: PeerAddr =
+                    PeerAddr::Udp(format!("127.0.0.1:{}", 10_000 + metric).parse().unwrap());
                 for _ in 0..500 {
                     table.add_route_with_metric(dest, next_hop, metric);
                 }
@@ -2860,7 +2388,7 @@ mod tests {
         let winner = table.lookup(dest).expect("dest must resolve");
         assert_eq!(
             winner,
-            "127.0.0.1:10001".parse::<SocketAddr>().unwrap(),
+            PeerAddr::Udp("127.0.0.1:10001".parse::<SocketAddr>().unwrap()),
             "lookup should return the next_hop paired with the winning metric",
         );
     }
@@ -2879,7 +2407,7 @@ mod tests {
 
         let table = Arc::new(RoutingTable::new(0x1111));
         let dest = 0x2222u64;
-        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let direct: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         table.add_route(dest, direct);
         assert_eq!(table.lookup(dest), Some(direct));
         let start = Arc::new(Barrier::new(9));
@@ -2890,8 +2418,8 @@ mod tests {
             let start = start.clone();
             handles.push(thread::spawn(move || {
                 start.wait();
-                let indirect: SocketAddr =
-                    format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap();
+                let indirect: PeerAddr =
+                    PeerAddr::Udp(format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap());
                 for _ in 0..500 {
                     table.add_route_with_metric(dest, indirect, metric);
                 }

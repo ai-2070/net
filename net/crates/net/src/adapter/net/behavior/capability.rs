@@ -651,6 +651,36 @@ pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
 /// budgets.
 pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
 
+/// Reserved tag advertising that this node **reassembles leaf
+/// fragment groups** on its stream receive path, so a sender may
+/// split one stream event across several packets toward it
+/// (`S5_R5_BRIEF.md` §4).
+///
+/// A plain legacy tag, like [`RELAY_CAPABLE_TAG`], set via
+/// [`CapabilitySet::with_fragment_reassembly`]. Versioned in the
+/// `net.<subsystem>.<feature>@<n>` shape the transport-negotiation
+/// tags use, because it negotiates a wire behaviour rather than
+/// labelling a role.
+///
+/// **What it is not.** It confers no authority and obligates
+/// nothing: a receiver already reassembles whether or not it says
+/// so, and the tag exists for the SENDER's benefit. Without it a
+/// sender refuses an over-cap event typed
+/// (`StreamError::EventTooLarge` at
+/// [`MAX_EVENT_SIZE`](net_wire::protocol::MAX_EVENT_SIZE)), because
+/// fragmenting toward a peer that does not reassemble hands its
+/// application N partial events as if each were a message — a
+/// silent corruption where the refusal is discoverable.
+///
+/// **The tag only reaches a peer once this node actually broadcasts
+/// a capability announcement** — same caveat as
+/// `ACK_RANGES_CAPABILITY_TAG`: a node that never calls
+/// `MeshNode::announce_capabilities` (and is not on the
+/// `MeshNode::start` reannounce loop) does not advertise it, and its
+/// peers keep refusing over-cap events toward it. That is the safe
+/// direction to fail in.
+pub const FRAGMENT_REASSEMBLY_TAG: &str = "net.stream.fragment_reassembly@1";
+
 /// Resolved scope of a capability announcement, derived from the
 /// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
 /// Pure derivation — never stored, recomputed on each query via
@@ -1202,6 +1232,18 @@ impl CapabilitySet {
     /// legacy tag; idempotent.
     pub fn with_relay_capable(self) -> Self {
         self.add_tag(RELAY_CAPABLE_TAG)
+    }
+
+    /// Advertise that this node reassembles leaf fragment groups on
+    /// its stream receive path, so peers may fragment an over-cap
+    /// stream event toward it instead of refusing it.
+    ///
+    /// Emits [`FRAGMENT_REASSEMBLY_TAG`]; idempotent. Only claim it
+    /// if the receive path really does reassemble — the native side
+    /// adds it automatically when built with the `webrtc` feature,
+    /// because that is exactly when its RTC ingress reassembles.
+    pub fn with_fragment_reassembly(self) -> Self {
+        self.add_tag(FRAGMENT_REASSEMBLY_TAG)
     }
 
     /// Add a typed `BlobCapability` projection. Emits the matching
@@ -2391,6 +2433,75 @@ pub struct CapabilityAnnouncement {
     /// upgraded (plan §Migration step 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_cert: Option<super::org::OrgMembershipCert>,
+    /// The announcer's **Noise static public key** (X25519), so a
+    /// peer can build a session with it without an out-of-band
+    /// pubkey handoff (plan §5 Layer 1).
+    ///
+    /// This is the field that makes first contact possible for a
+    /// browser: `connect()` demands the peer's Noise key today, and
+    /// a browser has nowhere to get one. Carried here it is
+    /// authenticated by the announcer's Ed25519 signature and bound
+    /// to its `node_id` / `entity_id` by the existing verifier — it
+    /// is key *discovery*, not key *agreement*, and nothing about
+    /// the handshake changes.
+    ///
+    /// **Emission is off unless `MeshNodeConfig::rtc` is set**
+    /// (Stage 4a): a native node without RTC emits a byte-identical
+    /// announcement to the pre-Stage-4 one.
+    ///
+    /// **Wire compat.** Same treatment as [`Self::reflex_addr`]:
+    /// `None` serializes to nothing, so the signed byte form is
+    /// unchanged for every node that does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_pubkey: Option<[u8; 32]>,
+    /// An anchor's bootstrap URL — where a browser POSTs its first
+    /// SDP offer (plan §5 Layer 0). Set iff
+    /// `RtcConfig::serve_bootstrap`.
+    ///
+    /// Stage 4a carries the field; the listener that answers it is
+    /// Stage 4b. Advertising a URL nobody serves is why emission is
+    /// tied to `serve_bootstrap` rather than to `rtc.is_some()`.
+    ///
+    /// Wire compat: as [`Self::noise_pubkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_bootstrap: Option<String>,
+    /// The announcer's public RTC socket (UDP), for ICE and STUN
+    /// (plan §5, §6). Set iff `RtcConfig::public_addr` is set —
+    /// a node that has not been told its public address does not
+    /// guess one. Browsers omit it: a leaf has no server-reflexive
+    /// socket to advertise.
+    ///
+    /// Wire compat: as [`Self::noise_pubkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_addr: Option<std::net::SocketAddr>,
+    /// The announcer's **separately announced STUN endpoint**
+    /// (`host:port`, UDP) — a *distinct* externally reachable
+    /// socket from [`Self::rtc_addr`], published for the
+    /// `iceServers` of connections that may pair with this
+    /// anchor (Stage 6, Kyra's option 1).
+    ///
+    /// Why a second endpoint at all: libwebrtc will not gather
+    /// server-reflexive candidates from a STUN server that is
+    /// also the ICE peer of the same `RTCPeerConnection`, so
+    /// converting `rtc_addr` into a STUN URL for that anchor's
+    /// own connection cannot work. `rtc_addr` keeps its roles
+    /// unchanged — ICE endpoint, and the target of the
+    /// throwaway diagnostic `UdpBlocked` probe; this field is
+    /// what a leaf puts in `iceServers`.
+    ///
+    /// A `host:port` string rather than a `SocketAddr` because
+    /// an anchor may legitimately announce a DNS name for the
+    /// STUN endpoint it serves; the leaf turns it into
+    /// `stun:<value>`.
+    ///
+    /// **Emission is off unless configured** (`RtcConfig`'s STUN
+    /// endpoint): a node that does not serve a second STUN
+    /// socket announces nothing here, and never an adjacent-port
+    /// guess derived from `rtc_addr`.
+    ///
+    /// Wire compat: as [`Self::noise_pubkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_stun_addr: Option<String>,
 }
 
 /// Cap on any single allow-list axis on a
@@ -2424,7 +2535,7 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
         // emulating `signature = None` and `hop_count = 0`). The
         // count is a hint; the JSON serializer ignores it and the
         // others tolerate over-counting plus `skip_field`.
-        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 12)?;
+        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 16)?;
         state.serialize_field("node_id", &a.node_id)?;
         state.serialize_field("entity_id", &a.entity_id)?;
         state.serialize_field("version", &a.version)?;
@@ -2459,6 +2570,37 @@ impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
             state.serialize_field("owner_cert", &a.owner_cert)?;
         } else {
             state.skip_field("owner_cert")?;
+        }
+        // Stage 4a's three fields, in declaration order after
+        // `owner_cert`. Each enters the signed transcript, so
+        // tampering with one invalidates the signature; each is
+        // omitted when `None`, so a node that emits none of them
+        // produces the pre-Stage-4 signed bytes exactly.
+        if a.noise_pubkey.is_some() {
+            state.serialize_field("noise_pubkey", &a.noise_pubkey)?;
+        } else {
+            state.skip_field("noise_pubkey")?;
+        }
+        if a.rtc_bootstrap.is_some() {
+            state.serialize_field("rtc_bootstrap", &a.rtc_bootstrap)?;
+        } else {
+            state.skip_field("rtc_bootstrap")?;
+        }
+        if a.rtc_addr.is_some() {
+            state.serialize_field("rtc_addr", &a.rtc_addr)?;
+        } else {
+            state.skip_field("rtc_addr")?;
+        }
+        // Stage 6's separately announced STUN endpoint, in
+        // declaration order immediately after `rtc_addr`. Same
+        // discipline: inside the signed transcript, so a relay
+        // cannot substitute the STUN endpoint a leaf will gather
+        // against; omitted when `None`, so a node that does not
+        // serve one produces the pre-Stage-6 signed bytes exactly.
+        if a.rtc_stun_addr.is_some() {
+            state.serialize_field("rtc_stun_addr", &a.rtc_stun_addr)?;
+        } else {
+            state.skip_field("rtc_stun_addr")?;
         }
         state.end()
     }
@@ -2556,6 +2698,10 @@ impl CapabilityAnnouncement {
             signature: None,
             hop_count: 0,
             reflex_addr: None,
+            noise_pubkey: None,
+            rtc_bootstrap: None,
+            rtc_addr: None,
+            rtc_stun_addr: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -2588,6 +2734,42 @@ impl CapabilityAnnouncement {
     /// invalidates verification.
     pub fn with_reflex_addr(mut self, reflex: Option<std::net::SocketAddr>) -> Self {
         self.reflex_addr = reflex;
+        self
+    }
+
+    /// Attach the announcer's Noise static public key (§5 Layer 1).
+    ///
+    /// Included in the signed envelope: set it before
+    /// [`Self::sign`]. The mesh sets it only when
+    /// `MeshNodeConfig::rtc` is configured.
+    pub fn with_noise_pubkey(mut self, key: Option<[u8; 32]>) -> Self {
+        self.noise_pubkey = key;
+        self
+    }
+
+    /// Attach the anchor's bootstrap URL (§5 Layer 0). Set by the
+    /// mesh only when `RtcConfig::serve_bootstrap` is on.
+    pub fn with_rtc_bootstrap(mut self, url: Option<String>) -> Self {
+        self.rtc_bootstrap = url;
+        self
+    }
+
+    /// Attach the announcer's public RTC socket (§5, §6). Set by the
+    /// mesh only when `RtcConfig::public_addr` is configured.
+    pub fn with_rtc_addr(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+        self.rtc_addr = addr;
+        self
+    }
+
+    /// Attach the announcer's separately announced STUN endpoint
+    /// (Stage 6). Set by the mesh only when a STUN endpoint is
+    /// configured — never derived from [`Self::rtc_addr`], which
+    /// cannot serve the ICE peer's own connection.
+    ///
+    /// Included in the signed envelope: set it before
+    /// [`Self::sign`].
+    pub fn with_rtc_stun_addr(mut self, addr: Option<String>) -> Self {
+        self.rtc_stun_addr = addr;
         self
     }
 
@@ -3742,6 +3924,164 @@ mod tests {
             s
         );
     }
+    /// Stage 4a + Stage 6: each announced RTC field is **in the
+    /// signed transcript**. Tampering with one after signing must
+    /// invalidate the signature — otherwise a relay could swap the
+    /// Noise key a peer will handshake against, which is the whole
+    /// security of §5 Layer 1, or swap the STUN endpoint a leaf
+    /// will gather its candidates against, which is the whole
+    /// point of announcing one (Stage 6).
+    #[test]
+    fn tampering_with_any_announced_rtc_field_invalidates_the_signature() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut signed = CapabilityAnnouncement::new(
+            0x4A4A,
+            keypair.entity_id().clone(),
+            1,
+            sample_capability_set(),
+        )
+        .with_noise_pubkey(Some([0x11; 32]))
+        .with_rtc_bootstrap(Some("https://anchor.example/rtc".to_string()))
+        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")))
+        .with_rtc_stun_addr(Some("198.51.100.7:3478".to_string()));
+        signed.sign(&keypair);
+        signed.verify().expect("the freshly signed form verifies");
+
+        let mut swapped_key = signed.clone();
+        swapped_key.noise_pubkey = Some([0x22; 32]);
+        assert!(
+            swapped_key.verify().is_err(),
+            "swapping the announced Noise key must break the signature"
+        );
+
+        let mut swapped_url = signed.clone();
+        swapped_url.rtc_bootstrap = Some("https://attacker.example/rtc".to_string());
+        assert!(
+            swapped_url.verify().is_err(),
+            "swapping the bootstrap URL must break the signature"
+        );
+
+        let mut swapped_addr = signed.clone();
+        swapped_addr.rtc_addr = Some("203.0.113.9:4433".parse().expect("addr"));
+        assert!(
+            swapped_addr.verify().is_err(),
+            "swapping the advertised RTC socket must break the signature"
+        );
+
+        // Stage 6: the announced STUN endpoint. A relay that could
+        // substitute this would choose where every leaf pairing
+        // with this anchor gathers from.
+        let mut swapped_stun = signed.clone();
+        swapped_stun.rtc_stun_addr = Some("203.0.113.9:3478".to_string());
+        assert!(
+            swapped_stun.verify().is_err(),
+            "swapping the announced STUN endpoint must break the signature"
+        );
+
+        let mut dropped_stun = signed.clone();
+        dropped_stun.rtc_stun_addr = None;
+        assert!(
+            dropped_stun.verify().is_err(),
+            "dropping the announced STUN endpoint must break the signature — \
+             a stripped field would silently return a leaf to host-only gathering"
+        );
+
+        // Removing a field is tampering too.
+        let mut dropped = signed.clone();
+        dropped.noise_pubkey = None;
+        assert!(
+            dropped.verify().is_err(),
+            "dropping a signed field must break the signature"
+        );
+    }
+
+    /// …and with every optional RTC field absent the signed bytes
+    /// are **exactly** the pre-Stage-4 ones: a node that does not
+    /// configure RTC is wire-invisible to this change, which is
+    /// what lets the fields land before the fleet is upgraded.
+    /// Stage 6's `rtc_stun_addr` joins that set — an anchor that
+    /// serves no second STUN socket announces nothing new.
+    ///
+    /// The byte-for-byte comparison against the pinned pre-Stage-4
+    /// fixture lives in `tests/cross_lang_wire.rs`; this pins the
+    /// key set, which is what a reordering or a stray emission
+    /// would break first.
+    #[test]
+    fn all_optional_rtc_fields_absent_keeps_the_pre_stage4_signed_bytes() {
+        let ann = CapabilityAnnouncement::new(
+            0xA1B2_C3D4_E5F6_0708,
+            super::super::super::identity::EntityId::from_bytes([0x11; 32]),
+            7,
+            CapabilitySet::new(),
+        )
+        .with_ttl(300);
+        let payload = String::from_utf8(ann.signed_payload()).expect("JSON");
+        // Key ORDER, read off the emitted document rather than a
+        // parsed map: `serde_json::Value` sorts its keys, which
+        // would hide exactly the reordering this pins.
+        let order: Vec<usize> = [
+            "\"node_id\"",
+            "\"entity_id\"",
+            "\"version\"",
+            "\"timestamp_ns\"",
+            "\"ttl_secs\"",
+            "\"capabilities\"",
+        ]
+        .iter()
+        .map(|k| payload.find(k).unwrap_or_else(|| panic!("missing key {k}")))
+        .collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            order, sorted,
+            "the pre-Stage-4 keys must appear in declaration order: {payload}"
+        );
+        // …and no optional RTC key is emitted at all: a stray
+        // emission is the other half of "wire-invisible", and the
+        // order check above cannot see it.
+        for key in [
+            "\"noise_pubkey\"",
+            "\"rtc_bootstrap\"",
+            "\"rtc_addr\"",
+            "\"rtc_stun_addr\"",
+        ] {
+            assert!(
+                !payload.contains(key),
+                "an unconfigured node must emit no {key}: {payload}"
+            );
+        }
+    }
+
+    /// The canonical signer and the derived `Serialize` must agree
+    /// **with the new fields populated** — the failure mode the
+    /// `SignedPayloadCanonical` doc warns about is a field added to
+    /// the struct and forgotten here, which makes every signature
+    /// verify locally and fail everywhere else. Stage 6's
+    /// `rtc_stun_addr` is populated here for exactly that reason.
+    #[test]
+    fn the_canonical_signer_matches_the_derived_form_with_rtc_fields_set() {
+        let ann = CapabilityAnnouncement::new(
+            9,
+            super::super::super::identity::EntityId::from_bytes([0x5A; 32]),
+            3,
+            sample_capability_set(),
+        )
+        .with_noise_pubkey(Some([0x77; 32]))
+        .with_rtc_bootstrap(Some("https://anchor.example/rtc".to_string()))
+        .with_rtc_addr(Some("198.51.100.7:4433".parse().expect("addr")))
+        .with_rtc_stun_addr(Some("198.51.100.7:3478".to_string()));
+
+        let mut cloned = ann.clone();
+        cloned.signature = None;
+        cloned.hop_count = 0;
+        assert_eq!(
+            ann.signed_payload(),
+            serde_json::to_vec(&cloned).expect("derived form serializes"),
+            "canonical signer drifted from the derived impl"
+        );
+    }
+
     /// Round-trip an announcement with each allow-list populated
     /// — the decoder must reconstruct the exact field values.
     #[test]

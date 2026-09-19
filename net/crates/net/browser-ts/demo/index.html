@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Net — fleet demo</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; background: #0b1020; color: #e8eefc; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+      #stage { display: block; width: 100vw; height: 100vh; }
+      #hud { position: fixed; top: 12px; left: 12px; padding: 10px 14px; border-radius: 10px; background: #0f172ecc; backdrop-filter: blur(6px); max-width: 44ch; }
+      #hud h1 { margin: 0 0 6px; font-size: 14px; letter-spacing: 0.04em; text-transform: uppercase; color: #9fc5ff; }
+      #hud p { margin: 4px 0; }
+      #status { font-variant-numeric: tabular-nums; }
+      kbd { padding: 1px 5px; border: 1px solid #2c3a5c; border-bottom-width: 2px; border-radius: 4px; background: #16203a; }
+    </style>
+    <!-- Both dependencies are local: the built package from `dist/`
+         and Three.js from this directory's own `node_modules`. No CDN,
+         so the demo runs offline — and Three.js stays out of the
+         published package's dependency set. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./node_modules/three/build/three.module.js",
+          "three/": "./node_modules/three/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <div id="hud">
+      <h1>Net fleet</h1>
+      <p id="status">loading…</p>
+      <p><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> steer · <kbd>space</kbd> fire</p>
+      <p>Steering is a coalesced <em>input</em>; firing is a correlated <em>action</em> the host may refuse.</p>
+    </div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{NetAdapterConfig, StaticKeypair};
+use net::adapter::net::{NetAdapterConfig, PeerAddr, StaticKeypair};
 use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 use tokio::net::UdpSocket;
@@ -849,7 +849,7 @@ async fn test_router_forwarding_through_middle_node() {
         .expect("router B failed to bind");
 
     // B has a route to C
-    router_b.add_route(node_c, addr_c);
+    router_b.add_route(node_c, PeerAddr::Udp(addr_c));
 
     // Start B's send loop
     let send_handle = router_b.start();
@@ -869,11 +869,13 @@ async fn test_router_forwarding_through_middle_node() {
         .expect("recv failed");
 
     let data = Bytes::copy_from_slice(&recv_buf[..n]);
-    let action = router_b.route_packet(data, from).expect("route failed");
+    let action = router_b
+        .route_packet(data, PeerAddr::Udp(from))
+        .expect("route failed");
 
     match action {
         RouteAction::Forwarded(dest) => {
-            assert_eq!(dest, addr_c, "should forward to C's address");
+            assert_eq!(dest, PeerAddr::Udp(addr_c), "should forward to C's address");
         }
         RouteAction::Local(_) => panic!("should not be local delivery"),
     }
@@ -923,7 +925,9 @@ async fn test_router_local_delivery() {
         .expect("recv failed");
 
     let data = Bytes::copy_from_slice(&recv_buf[..n]);
-    let action = router_b.route_packet(data, from).expect("route failed");
+    let action = router_b
+        .route_packet(data, PeerAddr::Udp(from))
+        .expect("route failed");
 
     match action {
         RouteAction::Local(local_data) => {
@@ -956,13 +960,13 @@ async fn test_router_ttl_expiry() {
     let router_b = NetRouter::new(RouterConfig::new(node_b, addr_b))
         .await
         .expect("router B failed to bind");
-    router_b.add_route(node_c, addr_c);
+    router_b.add_route(node_c, PeerAddr::Udp(addr_c));
 
     // TTL=0: already expired, B should drop immediately
     let packet = build_routed_packet(node_c, node_a as u32, 0, b"should expire");
 
     // Simulate B receiving this packet
-    let result = router_b.route_packet(packet, "127.0.0.1:0".parse().unwrap());
+    let result = router_b.route_packet(packet, PeerAddr::Udp("127.0.0.1:0".parse().unwrap()));
 
     assert!(
         matches!(result, Err(RouterError::TtlExpired)),
@@ -999,7 +1003,7 @@ async fn test_router_hop_count_incremented() {
     let router_b = NetRouter::new(RouterConfig::new(node_b, addr_b))
         .await
         .expect("router B failed to bind");
-    router_b.add_route(node_c, addr_c);
+    router_b.add_route(node_c, PeerAddr::Udp(addr_c));
 
     // Start router to process the forwarded packet through the scheduler
     let send_handle = router_b.start();
@@ -1009,7 +1013,7 @@ async fn test_router_hop_count_incremented() {
 
     // Route it through B
     let action = router_b
-        .route_packet(packet, "127.0.0.1:0".parse().unwrap())
+        .route_packet(packet, PeerAddr::Udp("127.0.0.1:0".parse().unwrap()))
         .unwrap();
     assert!(matches!(action, RouteAction::Forwarded(_)));
 
@@ -1052,7 +1056,7 @@ async fn test_router_no_route() {
 
     // No route to 0x9999
     let packet = build_routed_packet(unknown_dest, 0x1111, 4, b"no route");
-    let result = router_b.route_packet(packet, "127.0.0.1:0".parse().unwrap());
+    let result = router_b.route_packet(packet, PeerAddr::Udp("127.0.0.1:0".parse().unwrap()));
 
     assert!(
         matches!(result, Err(RouterError::NoRoute)),
@@ -1372,7 +1376,7 @@ async fn test_router_end_to_end_forwarding() {
     let router_b = NetRouter::new(RouterConfig::new(node_b, addr_b))
         .await
         .expect("router B bind failed");
-    router_b.add_route(node_c, addr_c);
+    router_b.add_route(node_c, PeerAddr::Udp(addr_c));
     let send_handle = router_b.start();
 
     // C listens
@@ -1396,7 +1400,7 @@ async fn test_router_end_to_end_forwarding() {
                 .expect("B recv failed");
 
         let data = Bytes::copy_from_slice(&recv_buf[..n]);
-        let _ = router_b.route_packet(data, from);
+        let _ = router_b.route_packet(data, PeerAddr::Udp(from));
     }
 
     // Give the send loop time to flush
@@ -1452,7 +1456,7 @@ async fn test_router_multi_hop_two_routers() {
     let router_b = NetRouter::new(RouterConfig::new(node_b, addr_b))
         .await
         .expect("router B bind failed");
-    router_b.add_route(node_c, addr_c);
+    router_b.add_route(node_c, PeerAddr::Udp(addr_c));
     let send_b = router_b.start();
 
     // C is the destination (local delivery)
@@ -1473,7 +1477,9 @@ async fn test_router_multi_hop_two_routers() {
         .expect("B recv failed");
 
     let data = Bytes::copy_from_slice(&buf[..n]);
-    let action = router_b.route_packet(data, from).expect("B route failed");
+    let action = router_b
+        .route_packet(data, PeerAddr::Udp(from))
+        .expect("B route failed");
     assert!(matches!(action, RouteAction::Forwarded(_)));
 
     // Give B's send loop time to transmit
@@ -1486,7 +1492,9 @@ async fn test_router_multi_hop_two_routers() {
         .expect("C recv failed");
 
     let data = Bytes::copy_from_slice(&buf[..n]);
-    let action = router_c.route_packet(data, from).expect("C route failed");
+    let action = router_c
+        .route_packet(data, PeerAddr::Udp(from))
+        .expect("C route failed");
 
     match action {
         RouteAction::Local(payload) => {
@@ -1797,9 +1805,9 @@ async fn test_failure_detector_lifecycle() {
     let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
     // All three heartbeat — all healthy
-    detector.heartbeat(node_a, addr);
-    detector.heartbeat(node_b, addr);
-    detector.heartbeat(node_c, addr);
+    detector.heartbeat(node_a, PeerAddr::Udp(addr));
+    detector.heartbeat(node_b, PeerAddr::Udp(addr));
+    detector.heartbeat(node_c, PeerAddr::Udp(addr));
 
     assert_eq!(detector.status(node_a), NodeStatus::Healthy);
     assert_eq!(detector.status(node_b), NodeStatus::Healthy);
@@ -1809,8 +1817,8 @@ async fn test_failure_detector_lifecycle() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // A and C heartbeat, B does not
-    detector.heartbeat(node_a, addr);
-    detector.heartbeat(node_c, addr);
+    detector.heartbeat(node_a, PeerAddr::Udp(addr));
+    detector.heartbeat(node_c, PeerAddr::Udp(addr));
 
     // Check — B should be suspected or failed
     let newly_failed = detector.check_all();
@@ -1823,8 +1831,8 @@ async fn test_failure_detector_lifecycle() {
 
     // Wait longer and check again — B should be fully failed
     tokio::time::sleep(Duration::from_millis(300)).await;
-    detector.heartbeat(node_a, addr);
-    detector.heartbeat(node_c, addr);
+    detector.heartbeat(node_a, PeerAddr::Udp(addr));
+    detector.heartbeat(node_c, PeerAddr::Udp(addr));
     let _ = detector.check_all();
 
     assert_eq!(
@@ -1838,7 +1846,7 @@ async fn test_failure_detector_lifecycle() {
     );
 
     // B recovers — sends heartbeat
-    detector.heartbeat(node_b, addr);
+    detector.heartbeat(node_b, PeerAddr::Udp(addr));
     assert_eq!(
         detector.status(node_b),
         NodeStatus::Healthy,
@@ -2187,9 +2195,9 @@ async fn test_mesh_node_relay_through_middle() {
     r2.expect("B connect C failed");
 
     // Set up routing: A's route to C goes through B
-    node_a.router().add_route(nid_c, addr_b);
+    node_a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
     // B's route to C is direct
-    node_b.router().add_route(nid_c, addr_c);
+    node_b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     // Start all nodes
     node_a.start();
@@ -2283,8 +2291,8 @@ async fn test_mesh_relay_preserves_payload_integrity() {
     r1.unwrap();
     r2.unwrap();
 
-    a.router().add_route(nid_c, addr_b);
-    b.router().add_route(nid_c, addr_c);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
+    b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
     a.start();
     b.start();
     c.start();
@@ -2358,7 +2366,7 @@ async fn test_mesh_relay_tamper_detected() {
     a.router()
         .routing_table()
         .remove_destination_all_candidates(nid_c);
-    a.router().add_route(nid_c, addr_b);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
     a.start();
     c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2514,8 +2522,8 @@ async fn test_mesh_node_reroute_on_failure() {
     r2.unwrap();
 
     // Route to C goes through B initially
-    a.router().add_route(nid_c, addr_b);
-    b.router().add_route(nid_c, addr_c);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
+    b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     a.start();
     b.start();
@@ -2540,7 +2548,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     // Phase 3: A reroutes — update routing table to send directly to C
     a.router().remove_route(nid_c);
-    a.router().add_route(nid_c, addr_c);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     // A sends again — should reach C directly now
     let batch2 = make_batch(0, 5, "after_reroute");
@@ -2620,8 +2628,8 @@ async fn test_mesh_node_reroute_no_data_loss() {
     r1.unwrap();
     r2.unwrap();
 
-    a.router().add_route(nid_c, addr_b);
-    b.router().add_route(nid_c, addr_c);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
+    b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
     a.start();
     b.start();
     c.start();
@@ -2635,7 +2643,7 @@ async fn test_mesh_node_reroute_no_data_loss() {
     // Kill B, reroute direct
     b.shutdown().await.unwrap();
     a.router().remove_route(nid_c);
-    a.router().add_route(nid_c, addr_c);
+    a.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     // Send 10 more events directly
     let batch2 = make_batch(0, 10, "phase2_direct");
@@ -3371,8 +3379,8 @@ async fn test_mesh_node_auto_reroute() {
     // An ordinary candidate for C via B, beside the authenticated
     // direct candidate the A↔C handshake installed. B's death must
     // remove exactly the via-B one.
-    node_a.router().add_route(nid_c, addr_b);
-    node_b.router().add_route(nid_c, addr_c);
+    node_a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
+    node_b.router().add_route(nid_c, PeerAddr::Udp(addr_c));
 
     node_a.start();
     node_b.start();
@@ -3411,7 +3419,7 @@ async fn test_mesh_node_auto_reroute() {
     // …and did NOT leave the dead hop effective.
     assert_ne!(
         node_a.router().routing_table().lookup(nid_c),
-        Some(addr_b),
+        Some(PeerAddr::Udp(addr_b)),
         "the via-B candidate must be gone after B's failure"
     );
 
@@ -3502,7 +3510,7 @@ async fn test_mesh_node_auto_reroute_recovery() {
         .router()
         .routing_table()
         .remove_destination_all_candidates(nid_c);
-    node_a.router().add_route(nid_c, addr_b);
+    node_a.router().add_route(nid_c, PeerAddr::Udp(addr_b));
 
     node_a.start();
     node_b.start();
@@ -3523,7 +3531,7 @@ async fn test_mesh_node_auto_reroute_recovery() {
     );
     assert_ne!(
         node_a.router().routing_table().lookup(nid_c),
-        Some(addr_b),
+        Some(PeerAddr::Udp(addr_b)),
         "the via-B candidate must be gone while B is partitioned away \
          (C may be re-learned DIRECT from its own pingwaves; never via B)"
     );
@@ -3542,7 +3550,7 @@ async fn test_mesh_node_auto_reroute_recovery() {
     // must be B's current address).
     assert_eq!(
         node_a.router().routing_table().lookup(nid_b),
-        Some(addr_b),
+        Some(PeerAddr::Udp(addr_b)),
         "the recovered peer's own route must be back"
     );
 
@@ -3552,7 +3560,7 @@ async fn test_mesh_node_auto_reroute_recovery() {
     // which no longer exists.
     assert_ne!(
         node_a.router().routing_table().lookup(nid_c),
-        Some(addr_b),
+        Some(PeerAddr::Udp(addr_b)),
         "recovery must not resurrect the downstream via-B candidate; \
          that route returns only when discovery re-advertises it"
     );
@@ -3698,7 +3706,7 @@ async fn test_mesh_handshake_via_relay() {
     // Route for forwarded data: on B, A→C already exists from b.connect(C).
     // On A, connect_via already inserted a route for C via B.
     // On B, add a route for A→B so data C→A gets forwarded correctly.
-    b.router().add_route(nid_a, addr_a);
+    b.router().add_route(nid_a, PeerAddr::Udp(addr_a));
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -3792,7 +3800,7 @@ async fn test_mesh_handshake_relay_bidirectional() {
     // b.connect/add_route). On C, the responder side added a route for A
     // via B's addr during the handshake. On A, connect_via added the route
     // for C via B. All four directions are covered.
-    b.router().add_route(nid_a, addr_a);
+    b.router().add_route(nid_a, PeerAddr::Udp(addr_a));
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -4001,7 +4009,8 @@ async fn test_stream_open_close_idempotency() {
     );
 
     // Close + re-open creates fresh state.
-    a.close_stream(nid_b, 77);
+    a.close_stream_handle(&second)
+        .expect("handle-addressed close");
     assert!(a.stream_stats(nid_b, 77).is_none());
     let third = a.open_stream(nid_b, 77, StreamConfig::new()).unwrap();
     a.send_on_stream(&third, &[Bytes::from_static(b"{}")])
@@ -4068,7 +4077,8 @@ async fn test_regression_send_on_stream_rejects_closed_stream() {
 
     // Close the stream. The `stream` handle is now stale — the
     // session no longer tracks stream_id 123.
-    a.close_stream(nid_b, 123);
+    a.close_stream_handle(&stream)
+        .expect("handle-addressed close");
     assert!(a.stream_stats(nid_b, 123).is_none());
 
     // Send on the stale handle. Must return NotConnected — NOT
@@ -4111,6 +4121,158 @@ async fn test_regression_send_on_stream_rejects_closed_stream() {
     a.send_on_stream(&fresh, &[Bytes::from_static(b"{}")])
         .await
         .expect("fresh handle after reopen must work");
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// An event larger than one Net packet is refused TYPED at the
+/// sender, and NOTHING of the call reaches the wire.
+///
+/// Pre-fix, `send_on_stream` handed an over-`MAX_PAYLOAD_SIZE` batch
+/// straight to the packet builder: the batching loop splits a batch
+/// across packets but cannot split one event, so the builder stamped
+/// a `payload_len` no receiver accepts (every receive path reads into
+/// a `MAX_PACKET_SIZE` buffer and `NetHeader::validate` refuses an
+/// over-cap length). The call returned **`Ok`** and the bytes were
+/// delivered nowhere — silent loss on a reliable path, discoverable
+/// only by losing data, because the limit is not in any signature.
+///
+/// Three properties, all of which the pre-fix path failed:
+///
+/// 1. exactly at [`MAX_EVENT_SIZE`] the send still works and the
+///    receiver sees it — the refusal is at the real boundary, not one
+///    conservative byte inside it;
+/// 2. one byte over, and at 32 KiB, the sender returns
+///    `StreamError::EventTooLarge` **naming the limit**, the stream's
+///    `tx_seq` does not move (no sequence consumed, no packet built)
+///    and the receiver's `rx_seq` does not move either;
+/// 3. a batch whose FIRST event fits and whose second does not is
+///    refused WHOLE — the fitting prefix must not reach the wire, or
+///    the caller would have a partial delivery reported as an error.
+#[tokio::test]
+async fn test_regression_send_on_stream_refuses_oversize_event_rather_than_dropping_it() {
+    use net::adapter::net::{Reliability, StreamConfig, StreamError, MAX_EVENT_SIZE};
+
+    const SID: u64 = 4242;
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+    };
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = Arc::new(MeshNode::new(id_b, mk(addr_b)).await.unwrap());
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    let stream = a
+        .open_stream(
+            nid_b,
+            SID,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+
+    // (1) Two sends that fit, the second EXACTLY at the limit. Two,
+    // so the receiver's `rx_seq` reaches 1 — a highest-seq-observed
+    // counter cannot distinguish "one packet at seq 0" from "no
+    // packet at all", and this witness needs that distinction.
+    a.send_on_stream(&stream, &[Bytes::from_static(b"priming")])
+        .await
+        .expect("a small send must work");
+    let at_limit = Bytes::from(vec![0xA5u8; MAX_EVENT_SIZE]);
+    a.send_on_stream(&stream, std::slice::from_ref(&at_limit))
+        .await
+        .expect("an event of exactly MAX_EVENT_SIZE must still be accepted");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && !b.stream_stats(nid_a, SID).is_some_and(|s| s.rx_seq == 1)
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        b.stream_stats(nid_a, SID).is_some_and(|s| s.rx_seq == 1),
+        "the receiver must observe both fitting packets; stats {:?}",
+        b.stream_stats(nid_a, SID)
+    );
+    let tx_before = a.stream_stats(nid_b, SID).expect("sender stats").tx_seq;
+    assert_eq!(tx_before, 2, "two packets consumed two sequences");
+
+    // (2) One byte over the limit, and the 32 KiB the browser matrix
+    // measured. Both refused, typed, with the limit in the error.
+    for size in [MAX_EVENT_SIZE + 1, 32 * 1024] {
+        let over = Bytes::from(vec![0x5Au8; size]);
+        let refused = a.send_on_stream(&stream, std::slice::from_ref(&over)).await;
+        match refused {
+            Err(StreamError::EventTooLarge { size: got, limit }) => {
+                assert_eq!(got, size, "the error must name the offending size");
+                assert_eq!(
+                    limit, MAX_EVENT_SIZE,
+                    "the error must name the limit a caller cannot otherwise discover"
+                );
+                let shown = StreamError::EventTooLarge { size: got, limit }.to_string();
+                assert!(
+                    shown.contains(&limit.to_string()),
+                    "the Display form must carry the limit; got {shown:?}"
+                );
+            }
+            other => panic!(
+                "a {size}-byte event must be refused typed, never answered with Ok \
+                 and delivered nowhere; got {other:?}"
+            ),
+        }
+        assert_eq!(
+            a.stream_stats(nid_b, SID).expect("sender stats").tx_seq,
+            tx_before,
+            "a refused send must consume no sequence — nothing was built or sent"
+        );
+    }
+
+    // (3) Whole-or-nothing: the fitting first event of a mixed batch
+    // must not reach the wire either.
+    let mixed = [
+        Bytes::from_static(b"this one fits"),
+        Bytes::from(vec![0x33u8; MAX_EVENT_SIZE + 1]),
+    ];
+    assert!(
+        matches!(
+            a.send_on_stream(&stream, &mixed).await,
+            Err(StreamError::EventTooLarge { .. })
+        ),
+        "a batch containing an oversize event is refused whole"
+    );
+    assert_eq!(
+        a.stream_stats(nid_b, SID).expect("sender stats").tx_seq,
+        tx_before,
+        "the fitting prefix of a refused batch must NOT be on the wire"
+    );
+
+    // Nothing arrived from any of the refused calls: settle first, so
+    // a packet that was going to be delivered would have been.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        b.stream_stats(nid_a, SID).expect("receiver stats").rx_seq,
+        1,
+        "the receiver must have seen nothing beyond the two fitting packets"
+    );
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -4198,7 +4360,7 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
     let lookup = a.router().routing_table().lookup(nid_d);
     assert_eq!(
         lookup,
-        Some(addr_b),
+        Some(PeerAddr::Udp(addr_b)),
         "A should have learned D via B from pingwave propagation; got {:?}",
         lookup
     );
@@ -4207,7 +4369,11 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
     // metric 1 (direct); the pingwave-carried route to B arriving via
     // B itself would have metric 2 and must NOT win.
     let b_lookup = a.router().routing_table().lookup(nid_b);
-    assert_eq!(b_lookup, Some(addr_b), "direct B route preserved");
+    assert_eq!(
+        b_lookup,
+        Some(PeerAddr::Udp(addr_b)),
+        "direct B route preserved"
+    );
     let _ = nid_a;
     let _ = nid_c;
 
@@ -4504,8 +4670,8 @@ async fn test_regression_handshake_relay_multi_hop_via_routing_table() {
     //
     // msg1 path A→B→C→D:  B needs route D via C (C has D direct).
     // msg2 path D→C→B→A:  C needs route A via B (B has A direct).
-    b.router().add_route(nid_d, addr_c);
-    c.router().add_route(nid_a, addr_b);
+    b.router().add_route(nid_d, PeerAddr::Udp(addr_c));
+    c.router().add_route(nid_a, PeerAddr::Udp(addr_b));
 
     a.start();
     b.start();
@@ -5029,6 +5195,8 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
             Err(StreamError::Backpressure) => backpressure += 1,
             Err(StreamError::Transport(_)) => transport += 1,
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+            Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
+            Err(e) => panic!("concurrent send_on_stream failed unexpectedly: {e}"),
         }
     }
     // At least one caller must have hit the cap. We don't assert an
@@ -5203,6 +5371,8 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
                  credit exhaustion should always present as Backpressure"
             ),
             Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+            Err(StreamError::SessionSuperseded) => panic!("unexpected SessionSuperseded"),
+            Err(e) => panic!("serial send_on_stream failed unexpectedly: {e}"),
         }
     }
 

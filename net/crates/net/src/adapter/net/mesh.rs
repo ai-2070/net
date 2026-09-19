@@ -29,9 +29,8 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwapOption;
 use std::sync::Arc;
@@ -114,6 +113,17 @@ const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 /// loss — the last packets dropped, with no later arrival to trigger a
 /// receiver NACK.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
+
+/// How long [`MeshNode::shutdown`] waits for one background task,
+/// first for it to finish and then again for a cancellation to land.
+///
+/// Two seconds because the drain is sequential and a node can hold
+/// several tasks: long enough that an ordinary busy task is joined
+/// rather than aborted, short enough that a wedged one cannot turn
+/// shutdown into a hang. It matches the RTC driver's own
+/// `TASK_JOIN_TIMEOUT`, which bounds the same obligation one layer
+/// down.
+const SHUTDOWN_TASK_JOIN: Duration = Duration::from_secs(2);
 
 /// Max fixed-size control events packed into one batched control
 /// packet, per message type (STREAM_ACK_BATCHING B-2/B-3):
@@ -286,8 +296,41 @@ async fn await_credit_or_stall(
 #[derive(Clone)]
 struct PendingStreamGrant {
     session: Arc<NetSession>,
-    peer_addr: SocketAddr,
+    peer_addr: PeerAddr,
     total_consumed: u64,
+}
+
+/// What the receive path must do with one arrival, decided by
+/// [`MeshNode::account_inbound_stream_packet`] once the stream's
+/// receive state has recorded it.
+///
+/// The credit and acknowledgement half of that call is unconditional
+/// — every outcome below still leaves the sender owed whatever grant
+/// or repeated ack it earned. This is only about the *bytes*: whether
+/// they are the consumer's now, later, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDisposition {
+    /// Dispatch it now. Either the stream is not ordered, or this
+    /// arrival advanced the contiguous frontier. Carries the
+    /// lifetime that accepted it, because a deliverable frame still
+    /// joins the hold when the stream is already holding a run.
+    Deliver(StreamLifetime),
+    /// A reliable stream's future sequence: the receiver holds it
+    /// until the sequences before it are delivered
+    /// ([`net_wire::session::StreamState::hold_out_of_order`]).
+    ///
+    /// **NR4:** the `StreamLifetime` is the exact
+    /// `(session_id, epoch)` of the state that accepted the
+    /// sequence. Acceptance releases that state's map guard and the
+    /// hold re-acquires it by id, so without carrying the lifetime a
+    /// close/reopen in between put this frame into a replacement's
+    /// reorder buffer.
+    Hold(StreamLifetime),
+    /// Not the consumer's: a duplicate, a sequence past the
+    /// acceptance horizon, a provisional sender's refused stream
+    /// allocation, or an out-of-order frame there was no room to
+    /// hold in order.
+    Drop,
 }
 
 /// Group drained pending grants by session (STREAM_ACK_BATCHING B-1).
@@ -301,9 +344,8 @@ struct PendingStreamGrant {
 #[allow(clippy::type_complexity)]
 fn group_grants_by_session(
     drained: HashMap<(u64, u64), PendingStreamGrant>,
-) -> HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> {
-    let mut by_session: HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> =
-        HashMap::new();
+) -> HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> {
+    let mut by_session: HashMap<u64, (Arc<NetSession>, PeerAddr, Vec<(u64, u64)>)> = HashMap::new();
     for ((session_id, stream_id), grant) in drained {
         let PendingStreamGrant {
             session,
@@ -317,6 +359,165 @@ fn group_grants_by_session(
             .push((stream_id, total_consumed));
     }
     by_session
+}
+
+/// Carry every abandoned RTC fragment group into its stream's
+/// terminal disposition (**NR2**).
+///
+/// **An acknowledged group is owned.** The RTC ingress records a
+/// fragment's sequence and returns its credit *before* reassembly
+/// sees the piece — it has to, or the sender's window never opens —
+/// and that acknowledgement retires the sender's only copy. When a
+/// bound then ends the group (deadline, capacity refusal,
+/// contradiction, session end) there is nothing left to rebuild from
+/// and no wire gap left to NACK, because the sequences were
+/// consumed. Counting the loss and returning is the silence P1
+/// named: the peer goes on waiting for a reply to a request this
+/// node threw away.
+///
+/// So the loss becomes an event on the conversation that suffered
+/// it, in the RECEIVE direction only:
+///
+/// * the stream's local receive lifetime ends
+///   ([`NetSession::reset_rx_stream`]) — the cursor and reliability
+///   ranges go, so the peer's restarted sequences are admitted
+///   rather than dropped below a stale frontier;
+/// * the stream's remaining groups are fenced
+///   ([`super::rtc::RtcReassembly::retire_stream`]), so a delayed
+///   old tail cannot complete a pre-reset group against the
+///   lifetime that follows.
+///
+/// **R4-6: and NOTHING is sent to the peer.** This used to add
+/// [`NetSession::note_receive_terminal`], which the retransmit tick
+/// drains as a `StreamReset` — the frame that announces a **send**
+/// half giving up after its retransmits are exhausted. Both
+/// receiving implementations read it that way and answer it by
+/// clearing their OWN receive state (`mesh.rs`'s `StreamReset` arm;
+/// `leaf/src/node.rs`'s `Decoded::StreamReset`). So a native node
+/// that lost a B→A group reset B's healthy A→B receive progress: a
+/// failure in one direction ended the other one, and the half that
+/// actually failed — B's send half — was told nothing it could act
+/// on. Reusing one frame type is not directional coherence, and
+/// there is no frame that says "my receive half ended, your send
+/// half should fail": inventing one is a wire-format change, and
+/// sending the wrong one is worse than sending none. The leaf's
+/// receive-abandonment policy already rules exactly this way —
+/// `StreamFailure::ReassemblyAbandoned` sends no RESET, "a
+/// `StreamReset` announces a *send* half giving up… the peer's own
+/// send half is unaffected" — so the two engines now agree. B
+/// discovers its own loss where it owns it: its unacknowledged
+/// descriptors exhaust their retries (H-3) and it gives up typed.
+///
+/// **R4-6: a fire-and-forget group is a permitted loss**, not a
+/// terminal, which is the leaf's ruled policy too (R3-4). Its
+/// sequences were never retransmittable, so no acknowledgement took
+/// anything away and an incomplete group is precisely the outcome
+/// its mode allows. Ending the receive half over it made one
+/// expected fragment loss fatal to every later message on that id.
+/// It is counted where it is reaped and the stream carries on.
+///
+/// A record whose session is gone is skipped: its whole receive
+/// lifetime was retired with the session and there is no live stream
+/// left to end — the same rule the leaf's `dispose_abandoned_groups`
+/// applies to a scope it can no longer resolve.
+#[cfg(feature = "webrtc")]
+fn dispose_abandoned_rtc_groups(
+    reassembly: &super::rtc::RtcReassembly,
+    peers: &DashMap<u64, PeerInfo>,
+) {
+    let terminals = reassembly.take_terminals();
+    if terminals.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    for group in terminals {
+        if !group.provenance.reliable {
+            tracing::debug!(
+                session_id = group.session_id,
+                stream_id = format!("{:#x}", group.provenance.stream_id),
+                held = group.held,
+                reason = group.reason.as_str(),
+                "rtc: fire-and-forget reassembly loss is a permitted loss; \
+                 the stream carries on"
+            );
+            continue;
+        }
+        // One owner or none: a session id is process-unique.
+        let owner = peers
+            .iter()
+            .find(|e| e.value().session.session_id() == group.session_id)
+            .map(|e| e.value().session.clone());
+        let Some(session) = owner else {
+            continue;
+        };
+        let stream_id = group.provenance.stream_id;
+        // **R4-7: the disposition is owed to the receive lifetime
+        // that lost the bytes, not to whatever holds its id now.** A
+        // stream id is reused — close + reopen replaces the state
+        // with a fresh epoch — so a predecessor's terminal used to
+        // reset the SUCCESSOR's cursor and retire the successor's
+        // younger group. The predecessor's lifetime is already over
+        // and was settled when it ended; there is nothing left to
+        // end, exactly as for a record whose session is gone.
+        let live_epoch = session.try_stream(stream_id).map(|s| s.epoch());
+        if live_epoch != Some(group.epoch) {
+            tracing::debug!(
+                session_id = group.session_id,
+                stream_id = format!("{stream_id:#x}"),
+                group_epoch = group.epoch,
+                ?live_epoch,
+                "rtc: reassembly loss belonged to a receive lifetime that is \
+                 already over; the current lifetime on that id is not touched"
+            );
+            continue;
+        }
+        session.reset_rx_stream(stream_id);
+        reassembly.retire_stream(group.session_id, stream_id, group.epoch, now);
+        tracing::warn!(
+            session_id = group.session_id,
+            stream_id = format!("{stream_id:#x}"),
+            first_sequence = group.first_sequence,
+            last_sequence = group.last_sequence,
+            held = group.held,
+            reason = group.reason.as_str(),
+            "rtc: reassembly loss ended THIS node's receive half of the \
+             stream; the peer's send half is untouched and no StreamReset \
+             is sent, so the reverse direction keeps its progress"
+        );
+    }
+}
+
+/// End one session's receive lifetime for reassembly purposes
+/// (**NR3**).
+///
+/// Three acts, always together. The reassembly marker is a *bounded*
+/// fence — it expires with `GROUP_TTL` and gives way under
+/// `MAX_RETIRED_SESSIONS` churn — so it cannot be the whole
+/// retirement authority for work that was captured before it ran.
+/// `NetSession::retire_receive_lifetime` is: the dispatch path holds
+/// that exact `Arc` alongside the frame, the flag is one-way, and it
+/// expires with nothing. `MeshNode::process_local_packet` refuses a
+/// frame whose incarnation is retired, which is what bounds
+/// capture-to-dispatch rather than hoping the marker outlives it.
+///
+/// The retirement flag is NOT `active`, and the two calls below are
+/// not redundant. `active` is advisory local liveness with many
+/// writers (tests and the SDK mark sessions inactive that are still
+/// legitimate, still-sending selections); retirement is this
+/// incarnation being over. They were the same flag for one round,
+/// and the ingress guard keyed on `active` silently refused the
+/// inbound half of a live conversation whose session had merely been
+/// marked inactive locally. A retired session is also no longer live
+/// here, so this path still sets both — but only this one is the
+/// ingress predicate.
+#[cfg(feature = "webrtc")]
+fn retire_session_receive_lifetime(
+    reassembly: &super::rtc::RtcReassembly,
+    session: &Arc<NetSession>,
+) {
+    session.retire_receive_lifetime();
+    session.deactivate();
+    reassembly.retire_session(session.session_id(), std::time::Instant::now());
 }
 
 /// Capability gate for `StreamAckRanges` emission (STREAM_ACK_BATCHING
@@ -346,6 +547,51 @@ fn peer_supports_ack_ranges(
         .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
     cache.insert(node_id, (supports, Instant::now()));
     supports
+}
+
+/// Capability gate for outbound stream fragmentation
+/// (`S5_R5_BRIEF.md` §4): may this node split one over-cap stream
+/// event into a fragment group for `node_id` at `addr`?
+///
+/// **Two factors, and neither is redundant.**
+///
+/// * The peer must advertise
+///   [`FRAGMENT_REASSEMBLY_TAG`](super::behavior::capability::FRAGMENT_REASSEMBLY_TAG).
+///   A peer that does not reassemble would be handed N partial
+///   events as if each were a message, which is why the refusal at
+///   [`protocol::MAX_EVENT_SIZE`] stays exactly where it was for it.
+/// * The resolved address must be RTC. The native receive arm —
+///   `MeshNode::reassemble_rtc_fragments` — is confined to
+///   `PeerAddr::Rtc` sources on purpose (widening it would put a map
+///   lookup on the datagram hot path for a case that cannot occur
+///   there), so the tag alone is not enough: the same peer reached
+///   over UDP does **not** reassemble, whatever it advertises. The
+///   sender owns that distinction because the sender is the one
+///   choosing the transport.
+///
+/// No cache, unlike [`peer_supports_ack_ranges`]: that gate is asked
+/// at up to 1 kHz per session by the grant drainer, this one at most
+/// once per over-cap event — a send that is already about to put at
+/// least 8 KiB on the wire. One fold read there is free, and it
+/// removes a cache-invalidation surface rather than adding one.
+fn peer_reassembles_fragments(
+    capability_fold: &super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+    node_id: u64,
+    addr: &PeerAddr,
+) -> bool {
+    #[cfg(feature = "webrtc")]
+    let over_rtc = matches!(addr, PeerAddr::Rtc(_));
+    #[cfg(not(feature = "webrtc"))]
+    let over_rtc = {
+        let _ = addr;
+        false
+    };
+    if !over_rtc {
+        return false;
+    }
+    super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
+        .iter()
+        .any(|t| t == super::behavior::capability::FRAGMENT_REASSEMBLY_TAG)
 }
 
 /// Drop `ack_ranges_peer_cache` entries not refreshed within
@@ -494,10 +740,10 @@ fn pack_control_events(events: &[Bytes]) -> Vec<std::ops::Range<usize>> {
 /// per-stream `note_grant_sent` accounting keyed on the covered ids.
 #[allow(clippy::too_many_arguments)]
 async fn emit_control_chunks(
-    socket: &NetSocket,
+    sink: &PeerSink,
     builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
     session: &NetSession,
-    addr: SocketAddr,
+    addr: PeerAddr,
     events: &[Bytes],
     subprotocol_id: u16,
     packets_ctr: &AtomicU64,
@@ -513,7 +759,7 @@ async fn emit_control_chunks(
             PacketFlags::NONE,
             subprotocol_id,
         );
-        if socket.send_to(&packet, addr).await.is_ok() {
+        if sink.send(&packet, addr).await.is_ok() {
             ControlPlaneStats::record_packet(packets_ctr, events_ctr, chunk.len());
         }
     }
@@ -528,10 +774,95 @@ fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
         .saturating_add(PACKET_WIRE_OVERHEAD)
         .min(u32::MAX as usize) as u32
 }
+
+/// Allocate the TX sequence for one outbound subprotocol frame, and
+/// debit its wire bytes from the same stream's send ledger **exactly
+/// when the receiver will charge them** (N1).
+///
+/// The send-side mirror of the receive-side decision, and it has to
+/// stay a mirror: the receiver charges a frame's wire bytes when the
+/// subprotocol is accounted ([`MeshNode::accounts_inbound_subprotocol`]),
+/// the stream is not `CONTROL_STREAM_ID`, and the subprotocol is not
+/// the credit loop itself ([`MeshNode::charges_inbound_bytes`]).
+/// Every native producer of such a frame routes its sequence through
+/// here so the two halves of the ledger move together.
+///
+/// Why the leaf's producers did not need this: `leaf::session`
+/// acquires byte credit for every non-stream-control subprotocol it
+/// sends. The native side allocated a sequence and nothing else, so a
+/// control frame riding an application stream's id shifted the
+/// receiver's cumulative-consumed total ahead of the sender's
+/// `tx_bytes_sent` watermark, and the next authoritative grant
+/// refunded window for application bytes still in flight.
+///
+/// Handshake frames are excluded on the receive side by
+/// `flags.is_handshake()`; no producer here builds one.
+///
+/// Returns the debit BOUND TO THE SEND, not a bare sequence. The
+/// charge happens here and the transport decision happens later and
+/// elsewhere — awaited, spawned, or queued behind an ordered
+/// consumer — so the producer must say which outcome it got:
+/// [`ControlDebitGuard::commit`] once the transport accepted the
+/// packet, and otherwise nothing at all, because dropping the guard
+/// uncommitted is what gives the bytes back and reclaims the
+/// sequence. A refused enqueue, a failed or deadline-exceeded send, an
+/// evicted queue entry and a producer cancelled before admission are
+/// all the same case: bytes recorded as sent that the receiver can
+/// never report consumed, which on a stream shared with application
+/// traffic close the application window for good.
+///
+/// Accepted-then-lost is NOT that case and is never refunded — see
+/// [`ControlDebitGuard`].
+fn outbound_subprotocol_tx_seq(
+    session: &Arc<NetSession>,
+    stream_id: u64,
+    subprotocol_id: u16,
+    events: &[Bytes],
+) -> ControlDebitGuard {
+    let charged = stream_id != CONTROL_STREAM_ID
+        && MeshNode::accounts_inbound_subprotocol(subprotocol_id)
+        && MeshNode::charges_inbound_bytes(subprotocol_id);
+    let wire_bytes = if charged {
+        wire_bytes_for_payload(EventFrame::calculate_size(events))
+    } else {
+        0
+    };
+    session.next_tx_seq_charged(stream_id, wire_bytes)
+}
+
+/// Snapshot one live [`StreamState`] as a [`StreamStats`].
+///
+/// THE place a new counter is surfaced. `StreamStats` is
+/// `#[non_exhaustive]` and this crate is downstream of
+/// `net-mesh-wire`, so it cannot be built with a struct expression at
+/// all — functional-update syntax (`..StreamStats::empty()`) is a
+/// struct expression too and is refused identically. Field assignment
+/// off [`StreamStats::empty`] is the supported construction, and
+/// doing it once here is what keeps the next counter from being a
+/// per-call-site edit.
+fn stream_stats_of(state: &StreamState) -> StreamStats {
+    let mut stats = StreamStats::empty();
+    stats.tx_seq = state.current_tx_seq();
+    stats.rx_seq = state.current_rx_seq();
+    stats.inbound_pending = state.inbound_len() as u64;
+    stats.last_activity_ns = state.last_activity_ns();
+    stats.active = state.is_active();
+    stats.backpressure_events = state.backpressure_events();
+    stats.tx_credit_remaining = state.tx_credit_remaining();
+    stats.tx_window = state.tx_window();
+    stats.credit_grants_received = state.credit_grants_received();
+    stats.credit_grants_sent = state.credit_grants_sent();
+    stats.tx_bytes_sent = state.tx_bytes_sent();
+    stats.max_consumed_seen = state.max_consumed_seen();
+    stats
+}
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
-use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
+use super::session::{
+    ControlDebitGuard, NetSession, StreamCloseOutcome, StreamDrainState, StreamLifetime,
+    StreamState, TxAdmit, TxSendAdmit, CONTROL_STREAM_ID,
+};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
     route_hop::AuthenticatedNextHop, DropReason, ProtectedRelayStats, SubnetAuthError,
@@ -546,7 +877,10 @@ use super::subprotocol::stream_window::{
     SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
-use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
+use super::transport::{
+    bound_datagram_send, NetSocket, PacketReceiver, ParsedPacket, PeerAddr, PeerSink,
+    SocketBufferConfig,
+};
 use super::Visibility;
 use tokio::sync::oneshot;
 
@@ -677,7 +1011,7 @@ impl DirectHandshakeInbox {
 
 /// Direct-handshake initiators indexed by the peer address whose
 /// datagrams they are waiting for.
-type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
+type DirectHandshakeRegistry = DashMap<PeerAddr, Arc<DirectHandshakeInbox>>;
 
 /// Hand a handshake payload read off the shared socket to the direct
 /// initiator waiting on `source`, if there is one. Returns whether the
@@ -690,7 +1024,7 @@ type DirectHandshakeRegistry = DashMap<SocketAddr, Arc<DirectHandshakeInbox>>;
 /// every retransmit of it too.
 fn forward_to_direct_initiator(
     registry: &DirectHandshakeRegistry,
-    source: SocketAddr,
+    source: PeerAddr,
     payload: Bytes,
 ) -> bool {
     let Some(entry) = registry.get(&source) else {
@@ -736,6 +1070,311 @@ const FOLD_GENERATION_GC_MAX_AGE: Duration = Duration::from_secs(3600);
 /// For nodes where we only have the derived u64 node_id, we zero-pad
 /// it to 32 bytes. This preserves uniqueness for topology tracking
 /// without requiring the full public key exchange.
+/// The bounded RTC input the driver feeds and the receive loop owns.
+#[cfg(feature = "webrtc")]
+type RtcIngressInput = tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>;
+
+/// The bounded `0x0D02` input the dispatch arm feeds and the
+/// signalling engine owns.
+#[cfg(feature = "webrtc")]
+type RtcSignalInput = tokio::sync::mpsc::Receiver<(u64, super::rtc::RtcSignalMsg)>;
+
+/// Test-only record of admitted signalling frames.
+#[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+type RtcSignalTap = Arc<parking_lot::Mutex<Vec<(u64, super::rtc::RtcSignalMsg)>>>;
+
+/// Is this RTC datagram something `dispatch_packet` can act on?
+///
+/// The RTC path must admit **exactly** the outer formats the shared
+/// dispatcher accepts, no more and no less. R4-B: the first version
+/// admitted only a routing envelope or a validating `NetHeader`, so a
+/// full native RTC peer could not carry an authenticated route-hop
+/// (its own `ROUTE_HOP_MAGIC` discriminator) and could not carry a
+/// headerless pingwave — both were rejected before dispatch and
+/// charged to `validate_rejected`, which made valid native traffic
+/// look malformed.
+///
+/// Each admitted format keeps its own downstream check: this gate
+/// decides *shape*, never authority. `relay_protected_hop`
+/// authenticates the hop, the pingwave path still requires a
+/// registered direct source, and the routed and direct paths still
+/// decrypt under a session.
+///
+/// S0c found the failure mode the gate exists for — an oversize frame
+/// dropped with no counter anywhere, so a peer talking to a dead
+/// channel looked exactly like a quiet one. Rejections are counted
+/// (`RtcStats::validate_rejected`) and the channel stays up.
+#[cfg(feature = "webrtc")]
+fn rtc_ingress_is_well_formed(data: &Bytes) -> bool {
+    let first2 = if data.len() >= 2 {
+        u16::from_le_bytes([data[0], data[1]])
+    } else {
+        return false;
+    };
+
+    // 1. Pre-session keep-alive (14 bytes, its own magic). Reachable
+    //    over RTC only in a punch-adjacent flow, but the dispatcher
+    //    accepts it, so the gate does too rather than silently
+    //    diverging from it.
+    if data.len() == super::traversal::rendezvous::KEEPALIVE_LEN
+        && super::traversal::rendezvous::decode_keepalive(data).is_some()
+    {
+        return true;
+    }
+
+    // 2. Authenticated route-hop envelope (SUBNET_AUTH_PLAN D6).
+    //    `relay_protected_hop` verifies the hop tag; admitting the
+    //    shape is not admitting the hop.
+    if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
+        return true;
+    }
+
+    // 3. Legacy routing envelope, with room for the inner header.
+    if first2 == super::route::ROUTING_MAGIC
+        && data.len() >= super::route::ROUTING_HEADER_SIZE + super::protocol::HEADER_SIZE
+    {
+        return true;
+    }
+
+    // 4. Headerless pingwave: fixed size, and explicitly NOT Net
+    //    magic — the dispatcher's own discriminator, reproduced.
+    if data.len() == EnhancedPingwave::SIZE && first2 != MAGIC {
+        return true;
+    }
+
+    // 5. Direct Net packet: header parses AND validates. This is the
+    //    only arm that inspects the declared payload length, which is
+    //    what makes an oversize declaration a *validation* rejection
+    //    rather than a magic rejection.
+    super::protocol::NetHeader::from_bytes(data).is_some_and(|h| h.validate())
+}
+
+/// Every sidecar a peer-eviction has to unwind, in one place, so the
+/// RTC close path runs the *same* transaction the failure sweep runs
+/// rather than a second, thinner one (R3-E).
+#[cfg(feature = "webrtc")]
+#[derive(Clone)]
+struct PeerEvictionCtx {
+    session_routing: Arc<NodeSessionRouting>,
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
+    session_id_to_node: Arc<DashMap<u64, u64>>,
+    ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
+    /// The admission projection the §12 gates read (R3). Ordinary
+    /// eviction never cleared it, so a normally closed provisional
+    /// endpoint stayed in the projection for ever (Kyra:
+    /// `KYRA_CLOSE peer_gone=true provisional_projection=1`).
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// Leaf-fragment reassembly, so a session that ends releases the
+    /// partial groups it opened (N3). The map is mesh-owned and
+    /// outlives every session in it, so nothing but this — and the
+    /// group TTL, which only runs when traffic arrives — ever frees
+    /// a closed peer's held bytes.
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
+    peer_transitions: PeerTransitions,
+}
+
+#[cfg(feature = "webrtc")]
+impl PeerEvictionCtx {
+    /// Remove the peer whose **exact session id** is `session_id`,
+    /// as one serialized transition (R-B).
+    ///
+    /// The installer's own post-publish liveness re-read uses this
+    /// to take back an entry it published onto an endpoint that
+    /// closed underneath it. Idempotent with
+    /// [`Self::evict_endpoint`]: whichever runs first removes the
+    /// entry and the other finds nothing, and neither can touch a
+    /// successor, because both match on identity rather than on the
+    /// node id alone.
+    #[cfg_attr(
+        not(all(feature = "webrtc", any(test, feature = "fixtures"))),
+        allow(dead_code)
+    )]
+    fn evict_session_at(&self, node_id: u64, session_id: u64, endpoint: PeerAddr) -> bool {
+        // **R3-B: one conditional transition.** The precheck used
+        // to run under `peers.get`, release the guard, and then
+        // remove with a session-id-only predicate — so a promotion
+        // (or a replacement on the same session id) landing in that
+        // window was still evicted, and every side effect ran. The
+        // three facts are now the removal predicate itself, decided
+        // under the write guard that performs the removal, and
+        // every side effect below is conditional on it.
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    let removed = peers.remove_if(&node_id, |_, info| {
+                        info.session.session_id() == session_id
+                            && info.addr() == endpoint
+                            && info.admission.is_provisional()
+                    });
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&endpoint);
+                    // N3: the session is gone, so the partial
+                    // fragment groups it opened are released and
+                    // the session is fenced against the packets
+                    // already past their session lookup. NR3: and
+                    // the session handle's own receive lifetime is
+                    // retired, so a frame captured under it is
+                    // refused at dispatch however long it was held.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
+                    true
+                });
+                (evicted, evicted)
+            },
+        )
+    }
+
+    fn evict_session(&self, node_id: u64, session_id: u64) -> bool {
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    let removed = peers
+                        .remove_if(&node_id, |_, info| info.session.session_id() == session_id);
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    // R3: same projection cleanup on the
+                    // exact-session path.
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&old_info.addr());
+                    // N3 + NR3, on the exact-session path.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
+                    true
+                });
+                (evicted, evicted)
+            },
+        )
+    }
+
+    /// Remove the peer installed on `addr`, if any, as ONE serialized
+    /// peer transition — exactly like the failure sweep's eviction,
+    /// including the exact-endpoint guard that keeps a close from
+    /// evicting a successor installed in the meantime.
+    ///
+    /// Returns the node id it evicted.
+    fn evict_endpoint(&self, addr: PeerAddr) -> Option<u64> {
+        let node_id = *self.addr_to_node.get(&addr)?.value();
+        let peers = &self.peers;
+        let addr_to_node = &self.addr_to_node;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let ack_ranges_peer_cache = &self.ack_ranges_peer_cache;
+        let evicted = commit_peer_transition(
+            &self.session_routing,
+            &self.routing_registry,
+            peers,
+            &self.peer_entity_ids,
+            || {
+                let evicted = self.peer_transitions.with(node_id, || {
+                    // Exact endpoint, not just the node id: if the
+                    // peer has already been re-installed on some other
+                    // endpoint, this close is about a session that is
+                    // already gone.
+                    let removed = peers.remove_if(&node_id, |_, info| info.addr() == addr);
+                    let Some((_, old_info)) = &removed else {
+                        return false;
+                    };
+                    let old_session_id = old_info.session.session_id();
+                    if let Some(old_owned) = old_info.owned_addr() {
+                        addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                    }
+                    peer_addrs.remove_if(&node_id, |_, a| *a == old_info.addr());
+                    session_id_to_node.remove_if(&old_session_id, |_, n| *n == node_id);
+                    ack_ranges_peer_cache.remove(&node_id);
+                    // R3: the admission projection is part of the
+                    // peer's state, so ordinary eviction clears it.
+                    #[cfg(feature = "webrtc")]
+                    self.provisional_endpoints.remove(&addr);
+                    // N3 + NR3, on the ordinary close path.
+                    retire_session_receive_lifetime(&self.rtc_reassembly, &old_info.session);
+                    true
+                });
+                (evicted, evicted)
+            },
+        );
+        evicted.then_some(node_id)
+    }
+}
+
+/// RAII reclamation for a handshake-inbox registration (R3-E, H3).
+///
+/// Both halves need it. The responder's `accept_rtc` had it; the
+/// **initiator** relied on an explicit `deregister_direct_initiator`
+/// after the await, which a cancelled future never reaches — so a
+/// dropped `connect`/`connect_rtc` left its inbox installed, keyed
+/// by an endpoint (including an RTC generation) that no later
+/// lifetime can displace.
+///
+/// Removal is identity-conditional: a later attempt that displaced
+/// us owns the slot now, and must not be taken down with us.
+struct DirectInboxGuard<'a> {
+    registry: &'a DashMap<PeerAddr, Arc<DirectHandshakeInbox>>,
+    addr: PeerAddr,
+    inbox: Arc<DirectHandshakeInbox>,
+}
+
+impl Drop for DirectInboxGuard<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .remove_if(&self.addr, |_, cur| Arc::ptr_eq(cur, &self.inbox));
+        self.inbox.close();
+    }
+}
+
+/// Capability tag: this node can take a WebRTC DataChannel
+/// (plan §11). Read by the traversal classifier — an RTC-capable
+/// pair negotiates with ICE and never spends punch budget.
+#[cfg(feature = "webrtc")]
+pub const RTC_TRANSPORT_TAG: &str = "transport:rtc";
+
+/// Capability tag: this node serves the bootstrap endpoint named by
+/// its `rtc_bootstrap` announcement field (plan §11).
+#[cfg(feature = "webrtc")]
+pub const RTC_ANCHOR_TAG: &str = "rtc-anchor";
+
+/// Capability tag a browser leaf sets (Stage 5). Stage 4 only reads
+/// it: a `leaf`-tagged peer is never a forwarding next hop and is
+/// never re-flooded to.
+#[cfg(feature = "webrtc")]
+pub const RTC_LEAF_TAG: &str = "leaf";
+
 fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[0..8].copy_from_slice(&node_id.to_le_bytes());
@@ -759,7 +1398,7 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// Used by test harnesses to simulate network partitions. When a peer's
 /// address is in this set, both inbound and outbound packets are dropped
 /// as if the network link is severed.
-pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
+pub type PartitionFilter = Arc<dashmap::DashSet<PeerAddr>>;
 
 /// Waiter map for incoming `PunchIntroduce` messages keyed by the
 /// counterpart endpoint's `node_id`. Value is `(generation,
@@ -1106,7 +1745,7 @@ struct PeerRegistrationGuard {
     /// drop the `session_id_to_node` reverse-index entry alongside
     /// the other peer-keyed maps (PERF_AUDIT §2.4).
     registered_session_id: u64,
-    registered_next_hop: SocketAddr,
+    registered_next_hop: PeerAddr,
     /// The route transition token the registration's own install
     /// produced. The rollback removes that exact candidate rather than
     /// whatever currently sits at `(peer_node_id, registered_next_hop)`
@@ -1114,7 +1753,7 @@ struct PeerRegistrationGuard {
     /// identical pair.
     registered_route_token: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     session_id_to_node: Arc<DashMap<u64, u64>>,
     router: Arc<NetRouter>,
     /// The control-path transition handle, so the rollback is one
@@ -1379,6 +2018,7 @@ impl RetainedChain {
 /// dispatcher)` (OA2-E0.1 — the id enables conditional teardown).
 /// Shared by `DispatchCtx` (read on the hot path) and `MeshNode`
 /// (registration).
+#[cfg(feature = "cortex")]
 type RpcInboundDispatcherMap = DashMap<
     u16,
     Vec<(
@@ -1422,11 +2062,11 @@ pub(crate) enum ScopedIngestDisposition {
 struct DispatchCtx {
     local_node_id: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
     /// Node-id → addr map shared with the reroute policy. Must be kept in
     /// sync with `peers` on every registration so the reroute policy can
     /// resolve failed peers.
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// Control-path peer-transition handle, so dispatch-side peer
     /// registration and its rollback serialize against every other
     /// publisher (see [`PeerTransitions::with`]).
@@ -1434,6 +2074,25 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// `0x0D02` intake: the budget and the engine's input. Both
+    /// `None` on a node without RTC configured, which is what makes
+    /// the dispatch arm inert there.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_budget: Option<Arc<parking_lot::Mutex<super::rtc::SignalBudget>>>,
+    #[cfg(feature = "webrtc")]
+    rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
+    #[cfg(feature = "webrtc")]
+    rtc_stats: Option<Arc<super::rtc::RtcStats>>,
+    #[cfg(feature = "webrtc")]
+    forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
+    #[cfg(feature = "webrtc")]
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    #[cfg(feature = "webrtc")]
+    rtc_driver: Option<super::rtc::RtcDriverHandle>,
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_signal_tap: Option<RtcSignalTap>,
     /// Per-channel-hash dispatch hook for nRPC. See the matching
     /// field on `MeshNode`. Gated on `cortex` because the nRPC
     /// dispatcher type lives there and the `--features net`-only
@@ -1450,6 +2109,7 @@ struct DispatchCtx {
     // OA2-E0.1: entries carry a monotonic registration id — a stale
     // `ServeHandle` teardown removes ONLY its own id, so it cannot
     // evict a newer registration for the same canonical channel.
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
@@ -1569,8 +2229,12 @@ struct DispatchCtx {
     static_keypair: StaticKeypair,
     /// PSK shared across the mesh.
     psk: [u8; 32],
-    /// Socket for sending outbound subprotocol responses.
-    socket: Arc<NetSocket>,
+    /// Submission surface for this dispatch context's sends. The one
+    /// socket-level (non-peer-endpoint) send left on this path — the
+    /// punch train to a server-reflexive tuple — reaches the UDP socket
+    /// through [`PeerSink::udp_socket`], so no second `Arc<NetSocket>`
+    /// rides here to go unread when `nat-traversal` is off.
+    sink: PeerSink,
     /// Proximity graph for topology awareness.
     proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
@@ -1655,7 +2319,10 @@ struct DispatchCtx {
     /// the sensing audience gate keys on OWNER ROOT rather than grant
     /// scope — so without this a same-root peer holding no grant could
     /// confirm a grant-private service exists by probing for it.
-    #[cfg(feature = "redex")]
+    // `LocalServiceRegistry` itself is `cortex`-gated, so this field must
+    // be too: `cortex` implies `redex`, but not the reverse, and a
+    // `--features redex` build got the field without the type.
+    #[cfg(feature = "cortex")]
     rpc_local_services: Arc<LocalServiceRegistry>,
     /// SI-3: the origin-emission scheduler slot. See the matching
     /// field on `MeshNode`; the dispatch arm feeds it when a
@@ -1804,7 +2471,7 @@ struct DispatchCtx {
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
-            SocketAddr,
+            PeerAddr,
             (
                 u64,
                 tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
@@ -1982,6 +2649,29 @@ impl DispatchCtx {
     fn sensing_fence_seam_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
         None
     }
+
+    /// Does `capability_id` name a service this node serves under a private
+    /// visibility?
+    ///
+    /// Mirrors `MeshNode::capability_is_locally_private`. The registry it
+    /// consults is the nRPC one, so without `cortex` this node serves no
+    /// services at all and the answer is `false` by construction — the
+    /// sensing plane (`redex`) still needs to ask.
+    #[cfg(feature = "redex")]
+    fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
+        #[cfg(feature = "cortex")]
+        {
+            capability_id
+                .as_str()
+                .strip_prefix("nrpc:")
+                .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            let _ = capability_id;
+            false
+        }
+    }
 }
 
 /// Capacity of the per-worker protected-forwarding buffer.
@@ -2093,6 +2783,15 @@ pub struct MeshNodeConfig {
     /// exists so that measurement can A/B the two paths on the real mesh loop.
     #[cfg(feature = "batched-ingress")]
     pub batched_ingress: bool,
+    /// WebRTC DataChannel transport (Stage 3, `webrtc` feature).
+    ///
+    /// `None` — the default — means no RTC socket, no driver and no
+    /// behaviour change whatsoever: compiling the feature is not
+    /// enabling it. `Some(..)` binds a **second** UDP socket (§6: a
+    /// dedicated socket, never a demux of the Net socket) and spawns
+    /// the one task that owns every `str0m::Rtc`.
+    #[cfg(feature = "webrtc")]
+    pub rtc: Option<super::rtc::RtcConfig>,
     /// Handshake timeout per attempt
     pub handshake_timeout: Duration,
     /// Handshake retries
@@ -2594,6 +3293,8 @@ impl MeshNodeConfig {
             default_reliable: false,
             #[cfg(feature = "batched-ingress")]
             batched_ingress: false,
+            #[cfg(feature = "webrtc")]
+            rtc: None,
             handshake_timeout: Duration::from_secs(5),
             handshake_retries: 3,
             socket_buffers: SocketBufferConfig::for_testing(),
@@ -3067,7 +3768,7 @@ enum PeerTransport {
     /// Direct handshake. The peer answered at `owned_addr` itself, so
     /// the address is simultaneously where we send and what the peer
     /// owns — this is an authenticated adjacency.
-    Direct { owned_addr: SocketAddr },
+    Direct { owned: PeerAddr },
     /// Routed handshake. `relay_addr` is where datagrams go; the
     /// session authenticates the far endpoint, NOT the relay carrying
     /// it. `adjacent_relay_identity` names the relay when a direct
@@ -3075,7 +3776,7 @@ enum PeerTransport {
     /// and is `None` when nothing is known to own it — an unknown
     /// owner is never inferred to be the endpoint.
     Routed {
-        relay_addr: SocketAddr,
+        relay: PeerAddr,
         adjacent_relay_identity: Option<u64>,
     },
 }
@@ -3084,10 +3785,10 @@ impl PeerTransport {
     /// Where datagrams for this peer are sent. Always defined — every
     /// installed session has a wire destination.
     #[inline]
-    fn send_addr(&self) -> SocketAddr {
+    fn send_addr(&self) -> PeerAddr {
         match self {
-            Self::Direct { owned_addr } => *owned_addr,
-            Self::Routed { relay_addr, .. } => *relay_addr,
+            Self::Direct { owned } => *owned,
+            Self::Routed { relay, .. } => *relay,
         }
     }
 
@@ -3095,9 +3796,9 @@ impl PeerTransport {
     /// belongs to a relay. This is the only form that may be published
     /// into `addr_to_node` or used to decide adjacency.
     #[inline]
-    fn owned_addr(&self) -> Option<SocketAddr> {
+    fn owned_addr(&self) -> Option<PeerAddr> {
         match self {
-            Self::Direct { owned_addr } => Some(*owned_addr),
+            Self::Direct { owned } => Some(*owned),
             Self::Routed { .. } => None,
         }
     }
@@ -3138,19 +3839,29 @@ struct PeerInfo {
     /// gate only fires on the responder side) or from a test path
     /// without a real handshake.
     last_initiator_ephemeral: Option<[u8; 32]>,
+    /// §12 admission state — **what this session may exercise**,
+    /// kept beside `transport`, which answers where it goes.
+    ///
+    /// `Admitted` for every native session and for RTC sessions on
+    /// a node that serves no bootstrap: the gate exists for
+    /// browser-facing anchors and must be invisible everywhere
+    /// else. Only a session installed on a `PeerAddr::Rtc` endpoint
+    /// by a `serve_bootstrap` anchor starts `Provisional`.
+    #[cfg(feature = "webrtc")]
+    admission: super::rtc::PeerAdmission,
 }
 
 impl PeerInfo {
     /// Where datagrams for this peer are sent.
     #[inline]
-    fn addr(&self) -> SocketAddr {
+    fn addr(&self) -> PeerAddr {
         self.transport.send_addr()
     }
 
     /// The address this peer owns as its own direct attachment, or
     /// `None` for a peer reached through a relay.
     #[inline]
-    fn owned_addr(&self) -> Option<SocketAddr> {
+    fn owned_addr(&self) -> Option<PeerAddr> {
         self.transport.owned_addr()
     }
 
@@ -3278,8 +3989,6 @@ pub(super) struct RpcRoute {
 /// TTL, token sweep 30 s), so it never masks a legitimate
 /// fine-grained config — those values are already well above 1 s.
 /// Parse an inbound migration payload just far enough to decide
-/// whether it's a migration-initiating message that needs a
-/// `ComputeNotSupported` response. Returns the encoded reply for
 /// `TakeSnapshot` / `SnapshotReady`; `None` for decode failures or
 /// mid-migration message types (which arrive only inside an
 /// already-live migration and so can't reach a node with no
@@ -3383,13 +4092,13 @@ async fn await_punch_observer_outcome(
     obs_rx: tokio::sync::oneshot::Receiver<super::traversal::rendezvous::Keepalive>,
     deadline: Duration,
     punch_observers: &DashMap<
-        SocketAddr,
+        PeerAddr,
         (
             u64,
             tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
         ),
     >,
-    peer_reflex: SocketAddr,
+    peer_reflex: PeerAddr,
 ) -> bool {
     match tokio::time::timeout(deadline, obs_rx).await {
         // Observer fired with a sender-validated keep-alive.
@@ -4792,7 +5501,7 @@ fn spawn_event_pingwave(
     gate: &Arc<parking_lot::Mutex<EventPingwaveGate>>,
     min_gap: Duration,
     proximity_graph: &Arc<ProximityGraph>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     partition_filter: &PartitionFilter,
     resend: bool,
@@ -4831,7 +5540,7 @@ fn spawn_event_pingwave(
             tokio::spawn(flood_event_pingwave_rounds(
                 rounds,
                 proximity_graph.clone(),
-                socket.clone(),
+                sink.clone(),
                 peers.clone(),
                 partition_filter.clone(),
             ));
@@ -4843,7 +5552,7 @@ fn spawn_event_pingwave(
             // bookkeeping has long settled.
             let gate = gate.clone();
             let proximity_graph = proximity_graph.clone();
-            let socket = socket.clone();
+            let sink = sink.clone();
             let peers = peers.clone();
             let filter = partition_filter.clone();
             tokio::spawn(async move {
@@ -4853,7 +5562,7 @@ fn spawn_event_pingwave(
                     g.deferred_scheduled = false;
                     g.last_emit = Some(std::time::Instant::now());
                 }
-                flood_event_pingwave_rounds(1, proximity_graph, socket, peers, filter).await;
+                flood_event_pingwave_rounds(1, proximity_graph, sink, peers, filter).await;
             });
         }
     }
@@ -4873,7 +5582,7 @@ fn spawn_event_pingwave(
 async fn flood_event_pingwave_rounds(
     rounds: u8,
     proximity_graph: Arc<ProximityGraph>,
-    socket: Arc<NetSocket>,
+    sink: PeerSink,
     peers: Arc<DashMap<u64, PeerInfo>>,
     filter: PartitionFilter,
 ) {
@@ -4886,7 +5595,7 @@ async fn flood_event_pingwave_rounds(
             .to_bytes();
         // Snapshot before awaiting — same shard-guard discipline as
         // the heartbeat loop's send pass.
-        let targets: Vec<SocketAddr> = peers
+        let targets: Vec<PeerAddr> = peers
             .iter()
             .filter_map(|e| {
                 let addr = e.value().addr();
@@ -4900,7 +5609,7 @@ async fn flood_event_pingwave_rounds(
         for addr in targets {
             // Raw UDP, unencrypted — same as the heartbeat tick's
             // pingwave emission; topology is public.
-            let _ = socket.send_to(&pw_bytes, addr).await;
+            let _ = sink.send(&pw_bytes, addr).await;
         }
     }
 }
@@ -5089,7 +5798,7 @@ fn route_withdraw_damp_admit(
 async fn run_route_withdrawal_flood(
     seq_counter: Arc<AtomicU64>,
     damper: Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
-    socket: Arc<NetSocket>,
+    sink: PeerSink,
     peers: Arc<DashMap<u64, PeerInfo>>,
     partition_filter: PartitionFilter,
     dest: u64,
@@ -5109,7 +5818,7 @@ async fn run_route_withdrawal_flood(
     // Snapshot targets (Arc clones only) — cheap even at high peer
     // counts. The withdrawal's own `seq` is authored once here so
     // every peer sees the same value (per-dest ordering gate input).
-    let mut targets: Vec<(SocketAddr, Arc<NetSession>)> = Vec::new();
+    let mut targets: Vec<(PeerAddr, Arc<NetSession>)> = Vec::new();
     for entry in peers.iter() {
         let peer_id = *entry.key();
         if peer_id == dest || Some(peer_id) == exclude {
@@ -5132,18 +5841,21 @@ async fn run_route_withdrawal_flood(
     let stream_id = SUBPROTOCOL_ROUTE_WITHDRAW as u64;
     let events = [Bytes::copy_from_slice(&payload)];
     for (addr, session) in targets {
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let debit =
+            outbound_subprotocol_tx_seq(&session, stream_id, SUBPROTOCOL_ROUTE_WITHDRAW, &events);
         let packet = {
             let mut builder = session.thread_local_pool().get();
             builder.build_subprotocol(
                 stream_id,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 SUBPROTOCOL_ROUTE_WITHDRAW,
             )
         };
-        let _ = socket.send_to(&packet, addr).await;
+        if sink.send(&packet, addr).await.is_ok() {
+            debit.commit();
+        }
     }
 }
 
@@ -5154,7 +5866,7 @@ async fn run_route_withdrawal_flood(
 fn spawn_route_withdrawal_flood(
     seq_counter: &Arc<AtomicU64>,
     damper: &Arc<DashMap<(u64, Option<u64>), std::time::Instant>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
     partition_filter: &PartitionFilter,
     dest: u64,
@@ -5163,7 +5875,7 @@ fn spawn_route_withdrawal_flood(
     tokio::spawn(run_route_withdrawal_flood(
         seq_counter.clone(),
         damper.clone(),
-        socket.clone(),
+        sink.clone(),
         peers.clone(),
         partition_filter.clone(),
         dest,
@@ -5324,9 +6036,9 @@ fn expire_and_publish_consumer_cells(
 #[cfg(feature = "redex")]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_sensing_leader_deliveries(
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -5362,7 +6074,7 @@ fn dispatch_sensing_leader_deliveries(
                 };
                 if let Ok(bytes) = sensing::encode_attestation(&wire) {
                     spawn_sensing_frame_send(
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -5847,7 +6559,7 @@ fn sensing_scheduler_view(
 /// already handled by identity).
 fn sensing_live_direct_session(
     peers: &DashMap<u64, PeerInfo>,
-    addr_to_node: &DashMap<SocketAddr, u64>,
+    addr_to_node: &DashMap<PeerAddr, u64>,
     failure_detector: Option<&FailureDetector>,
     node: u64,
 ) -> bool {
@@ -5862,10 +6574,10 @@ fn sensing_live_direct_session(
 /// the node itself; LIVE iff the detector — where the caller has
 /// one — does not hold it Failed or Suspected.
 fn sensing_addr_is_live_direct(
-    addr_to_node: &DashMap<SocketAddr, u64>,
+    addr_to_node: &DashMap<PeerAddr, u64>,
     failure_detector: Option<&FailureDetector>,
     node: u64,
-    addr: SocketAddr,
+    addr: PeerAddr,
 ) -> bool {
     if addr_to_node.get(&addr).map(|e| *e.value()) != Some(node) {
         return false;
@@ -5952,9 +6664,9 @@ fn apply_sensing_removal_action(
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     emitter_stamp: Option<u64>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -5975,7 +6687,7 @@ fn apply_sensing_removal_action(
                 };
                 if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                     spawn_sensing_frame_send(
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -6008,9 +6720,9 @@ fn remove_sensing_downstream(
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -6030,7 +6742,7 @@ fn remove_sensing_downstream(
             observations,
             emitter,
             emitter_stamp,
-            socket,
+            sink,
             peers,
             addr_to_node,
             router,
@@ -6057,9 +6769,9 @@ fn remove_sensing_leader_consumer(
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &ObservationMutex,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -6095,7 +6807,7 @@ fn remove_sensing_leader_consumer(
                         observations,
                         emitter,
                         emitter_stamp,
-                        socket,
+                        sink,
                         peers,
                         addr_to_node,
                         router,
@@ -6355,7 +7067,7 @@ fn sensing_fold_gate_reclaim(
 #[allow(clippy::too_many_arguments)]
 fn build_sensing_frame_datagram(
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -6363,7 +7075,7 @@ fn build_sensing_frame_datagram(
     stream_id: u64,
     subprotocol: u16,
     payload: Vec<u8>,
-) -> Option<(Bytes, SocketAddr)> {
+) -> Option<(Bytes, PeerAddr, ControlDebitGuard)> {
     let next_addr = peers
         .get(&target)
         .map(|p| p.value().addr())
@@ -6394,12 +7106,24 @@ fn build_sensing_frame_datagram(
     // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
     // carries the §4.4 continuity-bearing flag (see
     // `sensing::SENSING_PROVISIONAL_STREAM`).
-    let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+    // The debit rides OUT with the datagram. This function only
+    // builds; the transport decision belongs to whoever performs the
+    // `send_to` (a spawned task on the legacy lane, the ordered
+    // consumer on the organization lane, and the queue itself when it
+    // evicts or refuses), so that owner is the one who can say
+    // whether the bytes were admitted.
+    let debit = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol, &events);
     let packet = {
         let mut builder = session.thread_local_pool().get();
-        builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
+        builder.build_subprotocol(
+            stream_id,
+            debit.seq(),
+            &events,
+            PacketFlags::NONE,
+            subprotocol,
+        )
     };
-    Some((packet, addr))
+    Some((packet, addr, debit))
 }
 
 /// ORDERED ORGANIZATION EGRESS.
@@ -6525,7 +7249,19 @@ struct PendingDatagram {
     #[cfg(any(test, feature = "fixtures"))]
     seq: u64,
     packet: Bytes,
-    addr: SocketAddr,
+    addr: PeerAddr,
+    /// The pre-send control debit these bytes were charged against,
+    /// scoped to this datagram's lifetime in the queue.
+    ///
+    /// Every way a queued datagram can end without reaching the
+    /// socket — refused by a closed queue, evicted by the bound,
+    /// released by teardown, or failed/deadline-exceeded at the send
+    /// — drops this guard and gives the bytes back. Only the
+    /// consumer's accepted send commits it. That is why the guard
+    /// travels WITH the datagram instead of being committed by
+    /// whoever built it: the builder does not know which of those
+    /// happened.
+    debit: ControlDebitGuard,
 }
 
 /// Shared, monotonic counters for [`OrderedSensingEgress`].
@@ -6612,6 +7348,30 @@ pub type SensingDarkDropObserver = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 /// node without reaching into dispatch.
 #[cfg(any(test, feature = "fixtures"))]
 type SensingDarkDropSlot = Arc<parking_lot::Mutex<Option<SensingDarkDropObserver>>>;
+
+/// Observer of the unary nRPC serve bridge's HAND-OFF to the fold:
+/// `(service, from_node, frame)` for one inbound REQUEST frame, fired
+/// synchronously in the bridge's own task immediately before
+/// `RpcServerFold::apply_inbound` sees it.
+///
+/// This is the boundary Net's ordering contract is stated at, and the
+/// only place it is observable. Per-stream DELIVERY order survives to
+/// here — one reliable stream releases in sequence order and one
+/// bridge task drains the receiver — whereas handler ENTRY order does
+/// not and deliberately does not: the fold spawns one task per call so
+/// a slow or parked handler cannot hold its source's successors
+/// (`server_fold_runs_one_sources_handlers_concurrently`,
+/// `a_long_first_poll_does_not_delay_its_sources_successors`). A
+/// witness that wants to measure the ordering Net promises has to
+/// measure it here; measuring it at a handler measures the scheduler.
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub type RpcDispatchObserver = Arc<dyn Fn(&str, u64, &[u8]) + Send + Sync>;
+
+/// The shared slot, so a witness can install the observation on a
+/// running node without reaching into the bridge.
+#[cfg(any(test, feature = "fixtures"))]
+type RpcDispatchSlot = Arc<parking_lot::Mutex<Option<RpcDispatchObserver>>>;
 
 /// Instrumented-only override of the egress' per-datagram send policy.
 ///
@@ -6745,7 +7505,7 @@ pub struct OrgEgressState {
 impl OrderedSensingEgress {
     /// Create the bounded queue and spawn its single consumer.
     fn spawn(
-        socket: Arc<NetSocket>,
+        sink: PeerSink,
         #[cfg(any(test, feature = "fixtures"))] observer: OrgEgressObserverSlot,
         #[cfg(any(test, feature = "fixtures"))] policy: OrgEgressSendPolicySlot,
         #[cfg(any(test, feature = "fixtures"))] lifecycle: OrgEgressLifecycleSeamSlot,
@@ -6759,7 +7519,7 @@ impl OrderedSensingEgress {
         let wake = Arc::new(tokio::sync::Notify::new());
         let counters = Arc::new(OrgEgressCounters::default());
         let consumer = tokio::spawn(Self::consume(
-            socket,
+            sink,
             queue.clone(),
             wake.clone(),
             counters.clone(),
@@ -6829,7 +7589,7 @@ impl OrderedSensingEgress {
     /// always `pending + in_flight`, and an abort mid-send leaves the mark set
     /// for teardown to retire rather than losing the datagram silently.
     async fn consume(
-        socket: Arc<NetSocket>,
+        sink: PeerSink,
         queue: Arc<parking_lot::Mutex<EgressQueue>>,
         wake: Arc<tokio::sync::Notify>,
         counters: Arc<OrgEgressCounters>,
@@ -6869,17 +7629,13 @@ impl OrderedSensingEgress {
                         // must retire it.
                         bound_datagram_send(std::future::pending(), next.addr, deadline).await
                     } else {
-                        bound_datagram_send(
-                            socket.send_to(&next.packet, next.addr),
-                            next.addr,
-                            deadline,
-                        )
-                        .await
+                        bound_datagram_send(sink.send(&next.packet, next.addr), next.addr, deadline)
+                            .await
                     }
                 };
                 #[cfg(not(any(test, feature = "fixtures")))]
                 let outcome = bound_datagram_send(
-                    socket.send_to(&next.packet, next.addr),
+                    sink.send(&next.packet, next.addr),
                     next.addr,
                     DATAGRAM_SEND_DEADLINE,
                 )
@@ -6891,9 +7647,19 @@ impl OrderedSensingEgress {
                 queue.lock().in_flight = false;
                 match outcome {
                     Ok(()) => {
+                        // Accepted by the transport. Commit BEFORE any
+                        // await: an abort can only land at an await
+                        // point, so the commit cannot be skipped after
+                        // the socket took the datagram, and these bytes
+                        // are never refunded.
+                        next.debit.commit();
                         counters.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(err) => {
+                        // Not sent: the guard drops with `next` and the
+                        // bytes go back. A datagram the socket did not
+                        // take never entered the receiver's accounting,
+                        // so it can never be reported consumed.
                         counters.send_failed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             addr = %next.addr,
@@ -6926,7 +7692,13 @@ impl OrderedSensingEgress {
     /// datagram rather than stalling the caller. A closed queue refuses; the
     /// closure test and the push happen under one lock acquisition, so an
     /// accepted datagram is always one a live consumer will still observe.
-    fn enqueue(&self, packet: Bytes, addr: SocketAddr) -> bool {
+    ///
+    /// Takes the datagram's control debit and does not commit it: a refusal
+    /// keeps `debit` in this frame and an eviction hands the casualty's guard
+    /// back out, so both refund. Both drops happen with the queue lock already
+    /// RELEASED — the refund touches the session's stream map, and this lock is
+    /// held for a single push/pop with no other lock under it.
+    fn enqueue(&self, packet: Bytes, addr: PeerAddr, debit: ControlDebitGuard) -> bool {
         #[cfg(any(test, feature = "fixtures"))]
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         /// What one enqueue attempt resolved to under the queue lock.
@@ -6938,11 +7710,15 @@ impl OrderedSensingEgress {
             /// Pushed within the bound.
             Queued,
         }
+        // Outlives the lock guard below, so the evicted datagram's debit is
+        // refunded after the queue lock is dropped rather than under it.
+        let evicted: Option<PendingDatagram>;
         let accepted = {
             let mut queue = self.queue.lock();
             #[cfg(any(test, feature = "fixtures"))]
             self.fire_lifecycle(OrgEgressLifecyclePoint::EnqueueUnderQueueLock);
             if queue.closed {
+                evicted = None;
                 Accepted::Refused
             } else {
                 queue.pending.push_back(PendingDatagram {
@@ -6950,15 +7726,18 @@ impl OrderedSensingEgress {
                     seq,
                     packet,
                     addr,
+                    debit,
                 });
                 if queue.pending.len() > MAX_PENDING_ORG_EGRESS {
-                    queue.pending.pop_front();
+                    evicted = queue.pending.pop_front();
                     Accepted::Evicted
                 } else {
+                    evicted = None;
                     Accepted::Queued
                 }
             }
         };
+        drop(evicted);
         match accepted {
             Accepted::Refused => {
                 self.counters.refused_closed.fetch_add(1, Ordering::Relaxed);
@@ -7012,15 +7791,21 @@ impl OrderedSensingEgress {
     /// the teardown log already claimed had been dropped.
     ///
     /// Forced-drop work is counted as `dropped_forced`, NEVER as `sent` and
-    /// never as `send_failed`: no send was attempted for it.
+    /// never as `send_failed`: no send was attempted for it — so each released
+    /// datagram's control debit is refunded when its guard drops, which
+    /// happens after the queue lock is released.
     fn retire_outstanding(&self) -> u64 {
+        // Taken, not cleared: the released datagrams' debits refund on drop,
+        // and that drop must not run under the queue lock.
+        let released;
         let forced = {
             let mut queue = self.queue.lock();
             let forced = queue.outstanding();
-            queue.pending.clear();
+            released = std::mem::take(&mut queue.pending);
             queue.in_flight = false;
             forced
         };
+        drop(released);
         if forced > 0 {
             self.counters
                 .dropped_forced
@@ -7862,9 +8647,9 @@ pub(crate) enum SensingRefreshOutcome {
 /// bytes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_sensing_frame_send(
-    socket: &Arc<NetSocket>,
+    sink: &PeerSink,
     peers: &Arc<DashMap<u64, PeerInfo>>,
-    addr_to_node: &Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: &Arc<DashMap<PeerAddr, u64>>,
     router: &Arc<NetRouter>,
     partition_filter: &PartitionFilter,
     local_node_id: u64,
@@ -7873,7 +8658,7 @@ fn spawn_sensing_frame_send(
     subprotocol: u16,
     payload: Vec<u8>,
 ) {
-    let Some((packet, addr)) = build_sensing_frame_datagram(
+    let Some((packet, addr, debit)) = build_sensing_frame_datagram(
         peers,
         addr_to_node,
         router,
@@ -7886,9 +8671,11 @@ fn spawn_sensing_frame_send(
     ) else {
         return;
     };
-    let socket = socket.clone();
+    let sink = sink.clone();
     tokio::spawn(async move {
-        let _ = socket.send_to(&packet, addr).await;
+        if sink.send(&packet, addr).await.is_ok() {
+            debit.commit();
+        }
     });
 }
 
@@ -9324,8 +10111,93 @@ struct ScopedSourceSnapshot {
 /// shard — and the announcement path funnels through the same map, so a
 /// forwarding task that pends there can stop an exported FFI entry point from
 /// ever reaching its own send.
+/// What an installer believes about the peer's current incarnation
+/// (H2).
+///
+/// The shared installer used to take `Option<u64>`, where `None`
+/// meant *replace whatever is there*. The RTC caller passed the
+/// `None` it got from "no incumbent" snapshot and described it as a
+/// compare-and-swap; it was not one. Making the three cases
+/// distinct types means a caller cannot spell "I expect nothing" and
+/// get "I accept anything".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorSession {
+    /// Replace whatever is installed, if anything.
+    Any,
+    /// Replace only this exact incarnation.
+    Exactly(u64),
+    /// Install only if there is still **no** peer.
+    ///
+    /// Only the RTC install path (fixtures/test) takes this
+    /// expectation today; a default build has no constructor for
+    /// it, and the arm still has to exist so the installer's match
+    /// is total.
+    #[cfg_attr(
+        not(all(feature = "webrtc", any(test, feature = "fixtures"))),
+        allow(dead_code)
+    )]
+    Absent,
+}
+
+impl PriorSession {
+    /// The ordinary callers' `Option<u64>` contract, unchanged.
+    #[inline]
+    fn from_option(expected: Option<u64>) -> Self {
+        match expected {
+            Some(sid) => Self::Exactly(sid),
+            None => Self::Any,
+        }
+    }
+}
+
+/// The RTC install path's commit fence (H2): an intent on the exact
+/// `(slot, generation)` plus whether the incumbent must still be
+/// quiescent when the install lands.
+#[cfg(feature = "webrtc")]
+struct RtcInstallFence {
+    intent: super::rtc::RtcInstallIntent,
+    require_quiescent: bool,
+}
+
+/// Which side of an RTC handshake is asking for the install, because
+/// a busy incumbent does not mean the same thing on both.
+///
+/// The quiescence gate exists to stop an upgrade throwing away
+/// in-flight state — but only one party can have that state, and
+/// which party it is depends on who initiated.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpgradeRole {
+    /// **We** are replacing our own session. The in-flight state is
+    /// ours, and the deferral is this node declining to throw it
+    /// away — `attempt_direct_upgrade`'s C3 decision.
+    Initiator,
+    /// The **remote** completed a Noise handshake on a new endpoint
+    /// under its own identity.
+    Responder,
+}
+
+/// What the snapshot decided: the incarnation to compare-and-swap
+/// against, and whether the commit must re-apply the quiescence
+/// check.
+#[cfg(feature = "webrtc")]
+struct UpgradePlan {
+    prior: PriorSession,
+    require_quiescent: bool,
+}
+
+/// The ingress admission verdict (R1). `Denied` covers every
+/// state that is not a live, admitted session on the endpoint the
+/// frame actually arrived on.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressAdmission {
+    Permitted,
+    Denied,
+}
+
 struct PeerRecipient {
-    addr: SocketAddr,
+    addr: PeerAddr,
     session: Arc<NetSession>,
 }
 
@@ -9351,31 +10223,6 @@ fn snapshot_peers(peers: &DashMap<u64, PeerInfo>, exclude: Option<u64>) -> Vec<P
         .collect()
 }
 
-/// Bound one ALREADY-ISSUED datagram send future by `deadline`.
-///
-/// The single place the datagram-send bound is expressed. Taking the future
-/// rather than the socket is what lets both the caller-facing
-/// [`send_datagram`] seam and the ordered organization egress share the exact
-/// same retirement policy — and lets an instrumented witness substitute a send
-/// that never resolves without duplicating the deadline wrapper it is meant to
-/// exercise.
-async fn bound_datagram_send<F>(
-    send: F,
-    addr: SocketAddr,
-    deadline: Duration,
-) -> Result<(), AdapterError>
-where
-    F: Future<Output = std::io::Result<usize>>,
-{
-    match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
-        Err(_) => Err(AdapterError::Connection(format!(
-            "send to {addr} exceeded the {deadline:?} datagram deadline"
-        ))),
-    }
-}
-
 /// Send ONE datagram under [`DATAGRAM_SEND_DEADLINE`].
 ///
 /// Every send on a caller-facing path goes through here, so the bound is a
@@ -9385,12 +10232,9 @@ where
 /// `DashMap` shard guard held across an await wedges that shard for as long as
 /// the send pends — blocking peer replacement, eviction, and every other
 /// reader of the same shard. Clone what you need and release the guard first.
-async fn send_datagram(
-    socket: &NetSocket,
-    packet: &[u8],
-    addr: SocketAddr,
-) -> Result<(), AdapterError> {
-    bound_datagram_send(socket.send_to(packet, addr), addr, DATAGRAM_SEND_DEADLINE).await
+async fn send_datagram(sink: &PeerSink, packet: &[u8], addr: PeerAddr) -> Result<(), AdapterError> {
+    sink.send_bounded(packet, addr, DATAGRAM_SEND_DEADLINE)
+        .await
 }
 
 /// Publish an authority change and advance the routing epoch as ONE ordered unit
@@ -10585,6 +11429,134 @@ pub struct MeshNode {
     config: MeshNodeConfig,
     /// Shared UDP socket
     socket: Arc<NetSocket>,
+    /// The one outbound submission surface (S0d §3.1). Wraps `socket`;
+    /// every peer-addressed send goes through it, receive-side and
+    /// socket-level uses keep `socket`.
+    sink: PeerSink,
+    /// The RTC driver handle, when `MeshNodeConfig::rtc` is set.
+    #[cfg(feature = "webrtc")]
+    rtc_driver: Option<super::rtc::RtcDriverHandle>,
+    /// The bounded RTC ingress input, parked here until
+    /// `spawn_receive_loop` takes it (it can only have one consumer,
+    /// and `dispatch_packet` is the single owner).
+    #[cfg(feature = "webrtc")]
+    rtc_ingress: Arc<parking_lot::Mutex<Option<RtcIngressInput>>>,
+    /// Per-sender `0x0D02` dialog and frame budget. A synchronous
+    /// lock taken and released inside the dispatch arm — never held
+    /// across an await.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_budget: Arc<parking_lot::Mutex<super::rtc::SignalBudget>>,
+    /// Endpoints whose sessions are provisional, mirrored from
+    /// `PeerInfo::admission` for the forwarding sites that never
+    /// touch the peer map (F3 router drain, F6 traversal, F7 proxy).
+    #[cfg(feature = "webrtc")]
+    provisional_endpoints: super::rtc::ProvisionalEndpoints,
+    /// §12 step 4: the session incarnation an in-flight enrollment
+    /// call was decoded against, keyed by `(node_id, call_id)`.
+    /// Promotion consumes it and re-verifies the binding — a
+    /// delayed completion whose session was replaced promotes
+    /// nothing.
+    #[cfg(feature = "webrtc")]
+    /// Enrollment reservations keyed by `(node_id, session_id,
+    /// call_id)` (R2).
+    ///
+    /// It was keyed by node id alone, so a second REQUEST
+    /// overwrote the first's reservation and the first call's
+    /// success then consumed — and promoted — the *replacement*
+    /// session (Kyra: `old_success_promoted_replacement=true`).
+    /// A completion now consumes only its own call's reservation.
+    pending_promotions: Arc<DashMap<(u64, u64, u64), PeerAddr>>,
+    /// Dialogs this node is driving (plan §9 steps 3–6).
+    #[cfg(feature = "webrtc")]
+    rtc_dialogs: super::rtc::SharedDialogs,
+    /// Open HTTP-originated attempts per claimed peer (R2).
+    ///
+    /// An HTTP attempt's signalling budget is charged to a
+    /// per-attempt identity the caller could not choose, so the
+    /// budget no longer answers "how many attempts does this peer
+    /// have open". This does, without taking the dialog table's
+    /// async lock from a synchronous accessor.
+    #[cfg(feature = "webrtc")]
+    /// The accepted bootstrap attempts, `(claimed node, dialog)` ->
+    /// the accounting identity its ingress is charged to (R1/R2).
+    ///
+    /// This is the attempt's OWNER record, not a counter. The
+    /// previous `node -> count` side map drifted from the real
+    /// dialog table (it was incremented after the completion spawn
+    /// and decremented on exactly one teardown), and because the
+    /// terminal paths release `(claimed node, dialog)` while the
+    /// ingress is charged to a random key, an owner close left the
+    /// random reservation live. Every terminal path now resolves the
+    /// key from here and releases the reservation that was actually
+    /// taken.
+    rtc_attempt_keys: Arc<DashMap<(u64, u64), u64>>,
+    /// H3 witness seam: hold the RTC close-notification consumer, so
+    /// the bounded channel can actually fill.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_close_consumer_paused: Arc<AtomicBool>,
+    /// R-B witness seam: a synchronous callback run **between**
+    /// the commit-time liveness check and the `peers` insert, so a
+    /// witness can land a close in exactly that window. Synchronous
+    /// by construction — nothing may await inside the transition.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    #[allow(clippy::type_complexity)]
+    rtc_pre_insert_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// H2 witness seam: park an RTC install between the completed
+    /// Noise exchange and the commit.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_install_pause: Arc<super::rtc::RtcInstallPause>,
+    /// S6-06 witness seam: park a dialog completion between "the
+    /// channel opened" and "claim the attempt", so a witness can
+    /// land a competing terminal owner in exactly that window.
+    ///
+    /// A second instance of the install pause rather than a shared
+    /// one: the two windows are different, and a witness that armed
+    /// one and parked at the other would be describing the wrong
+    /// race.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_claim_pause: Arc<super::rtc::RtcInstallPause>,
+    /// §10 part 2: packets this node forwarded per `(src, dst)`
+    /// pair, **excluding signalling**. A globally flat forward
+    /// counter is not the direct-path witness — signalling,
+    /// announcements and unrelated pairs legitimately keep
+    /// flowing — so the witness needs this one, keyed by pair and
+    /// blind to `0x0D02`, which it can separate because
+    /// `subprotocol_id` is cleartext AAD-authenticated header.
+    #[cfg(feature = "webrtc")]
+    forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
+    /// Leaf-fragment reassembly for the RTC ingress (Stage 5 R4).
+    ///
+    /// A browser leaf fragments anything over one packet and stamps
+    /// `frag_flags`; until this existed nothing in the core read
+    /// that field, so a fragmented publish reached a subscriber as
+    /// partial events and a fragmented enrollment request never
+    /// decoded. Keyed by wire session id and bounded per session by
+    /// the same byte budget that bounds provisional receive state.
+    #[cfg(feature = "webrtc")]
+    rtc_reassembly: Arc<super::rtc::RtcReassembly>,
+    /// Test-only record of every frame that passed the budget, so a
+    /// witness can assert what was *admitted* rather than inferring
+    /// it from an installed session.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_signal_tap: RtcSignalTap,
+    /// Inbound signalling frames, handed from the dispatch arm to
+    /// the signalling engine. Bounded: a full input drops and
+    /// counts, exactly like the RTC ingress input, because the
+    /// dispatch loop must never block on a peer's signalling.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
+    /// The receiving half, parked until the engine takes it.
+    #[cfg(feature = "webrtc")]
+    rtc_signal_rx: Arc<parking_lot::Mutex<Option<RtcSignalInput>>>,
+    /// R3-E: channel-close notifications from the driver, consumed by
+    /// the task `start()` spawns. Taken once, like `rtc_ingress`.
+    #[cfg(feature = "webrtc")]
+    rtc_closed: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<super::rtc::RtcPeerId>>>>,
+    /// RTC counters. Present whenever the feature is compiled, so a
+    /// node without `rtc` configured still reads zeros rather than
+    /// making every caller handle an `Option`.
+    #[cfg(feature = "webrtc")]
+    rtc_stats: Arc<super::rtc::RtcStats>,
     /// Per-peer sessions keyed by node_id. Keying by node_id (rather than
     /// SocketAddr) is required for relayed sessions: if A connects to C via
     /// relay B, both peers share B's wire address, so a SocketAddr-keyed map
@@ -10593,7 +11565,7 @@ pub struct MeshNode {
     /// Reverse lookup for dispatch: incoming source address → node_id. Only
     /// populated for directly-connected peers; relayed peers are resolved by
     /// session_id during dispatch.
-    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
+    addr_to_node: Arc<DashMap<PeerAddr, u64>>,
     /// Router for forwarding decisions
     router: Arc<NetRouter>,
     /// Failure detector
@@ -10617,6 +11589,7 @@ pub struct MeshNode {
     // typical sizing there is exactly one entry per bucket.
     // OA2-E0.1: entries carry a monotonic registration id (see the
     // `DispatchCtx` field for the teardown rationale).
+    #[cfg(feature = "cortex")]
     rpc_inbound_dispatchers: Arc<RpcInboundDispatcherMap>,
     /// OA2-E0.1: monotonic source of registration ids for
     /// [`Self::register_rpc_inbound`]. Bumped once per successful
@@ -11010,6 +11983,12 @@ pub struct MeshNode {
     /// install it on a running node.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_dark_drop_observer: SensingDarkDropSlot,
+    /// Fixtures-only observation of the unary nRPC serve bridge's
+    /// hand-off to the fold, in hand-off order. Held on the node
+    /// rather than on the handle so a witness may install it before
+    /// or after `serve_rpc`.
+    #[cfg(any(test, feature = "fixtures"))]
+    rpc_dispatch_observer: RpcDispatchSlot,
     /// Fixtures-only observer of the PRODUCTION organization send boundary.
     /// Shared with the consumer at spawn, so a witness may install it before or
     /// after the lazily created egress exists.
@@ -11325,7 +12304,7 @@ pub struct MeshNode {
     /// Automatic reroute policy
     reroute_policy: Arc<ReroutePolicy>,
     /// Node ID → SocketAddr map (shared with reroute policy)
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// Partition filter for simulating network splits
     partition_filter: PartitionFilter,
     /// Per-channel subscriber roster (daemon-layer fan-out).
@@ -11413,7 +12392,7 @@ pub struct MeshNode {
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
         DashMap<
-            SocketAddr,
+            PeerAddr,
             (
                 u64,
                 oneshot::Sender<super::traversal::rendezvous::Keepalive>,
@@ -11514,6 +12493,18 @@ pub struct MeshNode {
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Monotonic allocator for the `fragment_id` this node stamps on
+    /// the groups its stream sender emits (`S5_R5_BRIEF.md` §4).
+    ///
+    /// A group id only has to be unique among the groups one session
+    /// holds open at once, and a receiver bounds that at
+    /// `MAX_GROUPS_PER_SESSION`; one mesh-wide counter is therefore
+    /// strictly finer-grained than per-session ids would be, without
+    /// a per-session map to retire. Wraps past `u16::MAX` and never
+    /// yields 0 — the same discipline as the leaf's
+    /// `next_fragment_id`, so a group id is never the "unfragmented"
+    /// default an unstamped header carries.
+    fragment_id_counter: AtomicU32,
     /// Per PERF_AUDIT §4.1: generation-keyed snapshot of synthesized
     /// `Arc<CapabilitySet>` per node, shared with `DispatchCtx` so
     /// the per-packet greedy admission path (and other hot callers)
@@ -12211,6 +13202,54 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("bind failed: {}", e)))?;
         let socket = Arc::new(socket);
+        let sink = PeerSink::new(socket.clone());
+
+        // RTC: a dedicated socket and one driver task, only when the
+        // operator asked for it. `rtc: None` (the default) leaves
+        // every line below untouched — compiling the feature is not
+        // enabling it.
+        #[cfg(feature = "webrtc")]
+        let rtc_stats = Arc::new(super::rtc::RtcStats::default());
+        #[cfg(feature = "webrtc")]
+        let (rtc_driver, rtc_ingress, sink) = match config.rtc.clone() {
+            None => (None, None, sink),
+            Some(rtc_config) => {
+                let (ingress_tx, ingress_rx) =
+                    tokio::sync::mpsc::channel(rtc_config.ingress_queue_packets);
+                // R3-E: channel-close notifications. Small and
+                // bounded — one entry per closed channel, and
+                // `max_peers` bounds how many can be in flight.
+                let (closed_tx, closed_rx) =
+                    tokio::sync::mpsc::channel(rtc_config.max_peers.max(1));
+                let handle = super::rtc::RtcDriver::spawn(
+                    rtc_config,
+                    config.bind_addr,
+                    Arc::clone(&rtc_stats),
+                    ingress_tx,
+                    closed_tx,
+                )
+                .await
+                .map_err(|e| AdapterError::Connection(format!("rtc bind failed: {e}")))?;
+                let sink = sink.with_rtc(Arc::clone(handle.transport()));
+                (Some(handle), Some((ingress_rx, closed_rx)), sink)
+            }
+        };
+        #[cfg(feature = "webrtc")]
+        let (rtc_ingress, rtc_closed) = match rtc_ingress {
+            Some((ingress, closed)) => (Some(ingress), Some(closed)),
+            None => (None, None),
+        };
+        // The signalling intake exists only when RTC does: with no
+        // driver there is nothing an `Offer` could be acted on with,
+        // and the dispatch arm stays inert.
+        #[cfg(feature = "webrtc")]
+        let (rtc_signal_tx, rtc_signal_rx) = match rtc_driver.as_ref() {
+            Some(_) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
 
         let router_config = RouterConfig {
             local_id: node_id,
@@ -12228,6 +13267,27 @@ impl MeshNode {
 
         let router = Arc::new(router);
 
+        // R1: the scheduler drain needs the SAME admission side the
+        // sink got. Without this handoff a `scheduled` stream's
+        // packets are dequeued and dropped on the floor: the drain's
+        // RTC arm finds an empty option and returns, so the packet is
+        // neither admitted nor counted. `PeerSink` alone is not the
+        // handoff — the router has its own path to the wire.
+        #[cfg(feature = "webrtc")]
+        if let Some(handle) = rtc_driver.as_ref() {
+            router.set_rtc_transport(Arc::clone(handle.transport()));
+        }
+        // §12 F3: the router's view of which adjacent sessions are
+        // provisional. Installed unconditionally under the feature
+        // — an empty set is the correct answer for a node with no
+        // browser-facing sessions, and a missing projection would
+        // be indistinguishable from "nobody is provisional".
+        #[cfg(feature = "webrtc")]
+        let provisional_endpoints: super::rtc::ProvisionalEndpoints =
+            Arc::new(dashmap::DashSet::new());
+        #[cfg(feature = "webrtc")]
+        router.set_provisional_endpoints(Arc::clone(&provisional_endpoints));
+
         // Configure route staleness. Routes learned from pingwaves age
         // out if a fresh pingwave hasn't refreshed them in this window;
         // direct routes are refreshed by the heartbeat loop, so they
@@ -12236,7 +13296,7 @@ impl MeshNode {
             .routing_table()
             .set_max_route_age(config.session_timeout.saturating_mul(3));
 
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
 
         // Hoist `peers` and `addr_to_node` out of the struct literal so
         // the failure-detector `on_failure` callback below can evict
@@ -12248,7 +13308,7 @@ impl MeshNode {
         // and silently drop packets via UDP until an application-layer
         // timeout fired.
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let addr_to_node: Arc<DashMap<SocketAddr, u64>> = Arc::new(DashMap::new());
+        let addr_to_node: Arc<DashMap<PeerAddr, u64>> = Arc::new(DashMap::new());
 
         // Create proximity graph for topology awareness.
         //
@@ -12441,7 +13501,7 @@ impl MeshNode {
         let event_pingwave_min_gap = config.event_pingwave_min_gap;
         let event_pingwave_gate_recovery = event_pingwave_gate.clone();
         let proximity_graph_recovery = proximity_graph.clone();
-        let socket_recovery = socket.clone();
+        let sink_recovery = sink.clone();
         let peers_recovery = peers.clone();
         let partition_filter_recovery = partition_filter.clone();
         // RT-5: route-withdrawal state + the clones the `on_failure`
@@ -12452,7 +13512,7 @@ impl MeshNode {
         let enable_route_withdraw = config.enable_route_withdraw;
         let route_withdraw_seq_failure = route_withdraw_seq.clone();
         let route_withdraw_damper_failure = route_withdraw_damper.clone();
-        let socket_failure = socket.clone();
+        let sink_failure = sink.clone();
         let peers_failure = peers.clone();
         let partition_filter_failure = partition_filter.clone();
         let proximity_graph_failure = proximity_graph.clone();
@@ -12706,7 +13766,7 @@ impl MeshNode {
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &sensing_addr_to_node_failure,
                     &sensing_router_failure,
@@ -12722,7 +13782,7 @@ impl MeshNode {
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &sensing_addr_to_node_failure,
                     &sensing_router_failure,
@@ -12848,7 +13908,7 @@ impl MeshNode {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,
                     &route_withdraw_damper_failure,
-                    &socket_failure,
+                    &sink_failure,
                     &peers_failure,
                     &partition_filter_failure,
                     node_id,
@@ -12885,7 +13945,7 @@ impl MeshNode {
                 &event_pingwave_gate_recovery,
                 event_pingwave_min_gap,
                 &proximity_graph_recovery,
-                &socket_recovery,
+                &sink_recovery,
                 &peers_recovery,
                 &partition_filter_recovery,
                 // Recovery: no session-open race, so no second round.
@@ -12966,6 +14026,43 @@ impl MeshNode {
             node_id,
             config,
             socket,
+            sink,
+            #[cfg(feature = "webrtc")]
+            rtc_driver,
+            #[cfg(feature = "webrtc")]
+            rtc_ingress: Arc::new(parking_lot::Mutex::new(rtc_ingress)),
+            #[cfg(feature = "webrtc")]
+            rtc_closed: Arc::new(parking_lot::Mutex::new(rtc_closed)),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_budget: Arc::new(parking_lot::Mutex::new(super::rtc::SignalBudget::new())),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints,
+            #[cfg(feature = "webrtc")]
+            pending_promotions: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
+            #[cfg(feature = "webrtc")]
+            rtc_attempt_keys: Arc::new(DashMap::new()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_pre_insert_hook: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_claim_pause: Arc::new(super::rtc::RtcInstallPause::default()),
+            #[cfg(feature = "webrtc")]
+            forwarded_app_packets: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            rtc_reassembly: Arc::new(super::rtc::RtcReassembly::new()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_signal_tap: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_tx,
+            #[cfg(feature = "webrtc")]
+            rtc_signal_rx: Arc::new(parking_lot::Mutex::new(rtc_signal_rx)),
+            #[cfg(feature = "webrtc")]
+            rtc_stats,
             peers,
             addr_to_node,
             router,
@@ -13063,6 +14160,8 @@ impl MeshNode {
             }),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_dark_drop_observer: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(any(test, feature = "fixtures"))]
+            rpc_dispatch_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
@@ -13234,6 +14333,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            fragment_id_counter: AtomicU32::new(1),
             #[cfg(feature = "dataforts")]
             capability_set_cache,
             reservation_fold,
@@ -13466,12 +14566,32 @@ impl MeshNode {
         )
     }
 
+    /// The endpoint a peer is reached at, whatever its transport.
+    ///
+    /// [`Self::peer_addr`] answers the narrower operator-facing
+    /// question ("what UDP tuple?") and returns `None` for a
+    /// DataChannel peer, which is correct — there is no tuple. This
+    /// is the transport-agnostic view.
+    pub fn peer_endpoint(&self, node_id: u64) -> Option<PeerAddr> {
+        self.peers.get(&node_id).map(|e| e.value().addr())
+    }
+
+    /// Is this peer an authenticated adjacency (direct), rather than
+    /// a session that terminates through a relay?
+    pub fn peer_is_direct(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|e| e.value().transport.is_direct())
+    }
+
     /// The peer's socket address, if we have an active session
     /// with them. Used by the migration subprotocol to route
     /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
     /// the source node by its `node_id`.
     pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
-        self.peers.get(&node_id).map(|e| e.value().addr())
+        self.peers
+            .get(&node_id)
+            .and_then(|e| e.value().addr().udp())
     }
 
     // ── SI-2a: capability-sensing interest plane ──────────────────
@@ -13608,7 +14728,7 @@ impl MeshNode {
             }
         }
         let egress = Arc::new(OrderedSensingEgress::spawn(
-            self.socket.clone(),
+            self.sink.clone(),
             #[cfg(any(test, feature = "fixtures"))]
             self.org_egress_send_observer.clone(),
             #[cfg(any(test, feature = "fixtures"))]
@@ -13742,6 +14862,27 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn set_sensing_dark_drop_observer_for_test(&self, observer: SensingDarkDropObserver) {
         *self.sensing_dark_drop_observer.lock() = Some(observer);
+    }
+
+    /// Observe what the unary nRPC serve bridge hands to the fold, in
+    /// HAND-OFF order.
+    ///
+    /// The observation is the ordering contract's own boundary: one
+    /// reliable stream releases in sequence order and one bridge task
+    /// drains the inbound receiver, so the sequence seen here is the
+    /// order that stream delivered. It is NOT handler entry order —
+    /// the fold spawns one task per call on purpose, so handler bodies
+    /// start concurrently and their order belongs to the scheduler.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_rpc_dispatch_observer_for_test(&self, observer: RpcDispatchObserver) {
+        *self.rpc_dispatch_observer.lock() = Some(observer);
+    }
+
+    /// The installed hand-off observation, if any.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn rpc_dispatch_observer(&self) -> Option<RpcDispatchObserver> {
+        self.rpc_dispatch_observer.lock().clone()
     }
 
     /// Install the release pre-apply seam. It fires after a release's authority
@@ -14296,7 +15437,7 @@ impl MeshNode {
                             );
                             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                                 spawn_sensing_frame_send(
-                                    &self.socket,
+                                    &self.sink,
                                     &self.peers,
                                     &self.addr_to_node,
                                     &self.router,
@@ -14406,7 +15547,7 @@ impl MeshNode {
             // order — and handed to the single ordered consumer, which performs
             // the `send_to` sequentially. That is what makes the transition order
             // visible to the peer rather than merely visible to the scheduler.
-            if let Some((packet, addr)) = build_sensing_frame_datagram(
+            if let Some((packet, addr, debit)) = build_sensing_frame_datagram(
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -14417,7 +15558,7 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.enqueue_org_datagram(packet, addr);
+                self.enqueue_org_datagram(packet, addr, debit);
             }
         }
     }
@@ -14433,7 +15574,7 @@ impl MeshNode {
             target: Some(key.provider),
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-            if let Some((packet, addr)) = build_sensing_frame_datagram(
+            if let Some((packet, addr, debit)) = build_sensing_frame_datagram(
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -14444,7 +15585,7 @@ impl MeshNode {
                 sensing::SUBPROTOCOL_SENSING_INTEREST,
                 bytes,
             ) {
-                self.enqueue_org_datagram(packet, addr);
+                self.enqueue_org_datagram(packet, addr, debit);
             }
         }
     }
@@ -14456,10 +15597,15 @@ impl MeshNode {
     /// nothing left to order — and a refused enqueue means the queue closed;
     /// both are counted rather than silently swallowed, and neither is a
     /// delivery claim.
-    fn enqueue_org_datagram(&self, packet: Bytes, addr: SocketAddr) {
+    ///
+    /// Neither is an admission either, which is why the datagram's control
+    /// debit comes in with it: a terminal lifecycle drops the guard here, a
+    /// refusal drops it inside `enqueue`, and an accepted datagram carries it
+    /// to the consumer that learns whether the socket took it.
+    fn enqueue_org_datagram(&self, packet: Bytes, addr: PeerAddr, debit: ControlDebitGuard) {
         match self.org_egress() {
             Some(egress) => {
-                if !egress.enqueue(packet, addr) {
+                if !egress.enqueue(packet, addr, debit) {
                     tracing::debug!(
                         addr = %addr,
                         "ordered organization egress closed; the transition's frame is \
@@ -16756,7 +17902,7 @@ impl MeshNode {
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
             spawn_sensing_frame_send(
-                &self.socket,
+                &self.sink,
                 &self.peers,
                 &self.addr_to_node,
                 &self.router,
@@ -16880,7 +18026,7 @@ impl MeshNode {
             );
             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                 spawn_sensing_frame_send(
-                    &self.socket,
+                    &self.sink,
                     &self.peers,
                     &self.addr_to_node,
                     &self.router,
@@ -18135,10 +19281,20 @@ impl MeshNode {
     /// else is public by construction and answers `false` without a map probe.
     #[cfg(feature = "redex")]
     fn capability_is_locally_private(&self, capability_id: &sensing::CapabilityId) -> bool {
-        capability_id
-            .as_str()
-            .strip_prefix("nrpc:")
-            .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        // The registry is the nRPC one; without `cortex` this node serves no
+        // services, so nothing is privately served.
+        #[cfg(feature = "cortex")]
+        {
+            capability_id
+                .as_str()
+                .strip_prefix("nrpc:")
+                .is_some_and(|svc| self.rpc_local_services.is_private(svc))
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            let _ = capability_id;
+            false
+        }
     }
 
     /// Test-only helper — TOFU-pin `entity_id` for `node_id` exactly
@@ -18185,6 +19341,45 @@ impl MeshNode {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
+    }
+
+    /// The RTC leaf-fragment reassembler.
+    ///
+    /// A witness for N3 has to assert what a session actually
+    /// **holds**, before and after that session is retired, rather
+    /// than infer retirement from the absence of a peer entry.
+    #[doc(hidden)]
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_reassembly(&self) -> &Arc<super::rtc::RtcReassembly> {
+        &self.rtc_reassembly
+    }
+
+    /// Put one already-built packet on the wire to `node_id`.
+    ///
+    /// The fragment witness needs to send a packet whose
+    /// `frag_flags`, `fragment_id` and `fragment_offset` it chose —
+    /// exactly what a browser leaf emits and what no native send
+    /// path produces, because only the leaf fragments. Everything
+    /// below this is production: the peer's real session sealed the
+    /// packet, and the real transport carries it to the real
+    /// ingress.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn send_built_packet_for_test(
+        &self,
+        node_id: u64,
+        packet: &[u8],
+    ) -> Result<(), AdapterError> {
+        let addr = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().addr())
+            .ok_or_else(|| AdapterError::Connection(format!("unknown peer {node_id:#x}")))?;
+        self.sink
+            .send(packet, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("raw send: {e}")))
     }
 
     /// Seal ONE route-hop envelope on the edge to `node_id`.
@@ -18249,6 +19444,8 @@ impl MeshNode {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
+        // Operator-typed seam; the peer table keys on the endpoint.
+        let addr = PeerAddr::Udp(addr);
         // The consistent move is a peer-state transition and goes
         // through the same handle as every other publisher, so a
         // fixture build cannot interleave it with a real install.
@@ -18276,7 +19473,7 @@ impl MeshNode {
             {
                 return false;
             }
-            peer.transport = PeerTransport::Direct { owned_addr: addr };
+            peer.transport = PeerTransport::Direct { owned: addr };
             drop(peer);
             self.peer_addrs.insert(node_id, addr);
             // Learned multi-hop routes riding through this peer follow
@@ -21930,17 +23127,17 @@ impl MeshNode {
 
     /// Block packets from/to a peer address (simulates network partition).
     pub fn block_peer(&self, addr: SocketAddr) {
-        self.partition_filter.insert(addr);
+        self.partition_filter.insert(PeerAddr::Udp(addr));
     }
 
     /// Unblock a peer address (simulates partition healing).
     pub fn unblock_peer(&self, addr: &SocketAddr) {
-        self.partition_filter.remove(addr);
+        self.partition_filter.remove(&PeerAddr::Udp(*addr));
     }
 
     /// Check if a peer is blocked.
     pub fn is_blocked(&self, addr: &SocketAddr) -> bool {
-        self.partition_filter.contains(addr)
+        self.partition_filter.contains(&PeerAddr::Udp(*addr))
     }
 
     /// Get the proximity graph.
@@ -21997,13 +23194,14 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
         let keys = self
-            .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+            .handshake_initiator(PeerAddr::Udp(peer_addr), peer_pubkey, peer_node_id)
             .await?;
 
         // Shared peer install (NetSession + router + peers +
         // peer_addrs + addr_to_node). DIRECT: the peer answered at
         // `peer_addr` itself, so the address is its own and the
         // session is an authenticated adjacency.
+        let peer_addr = PeerAddr::Udp(peer_addr);
         self.install_direct(peer_node_id, peer_addr, keys, None);
 
         // Direct-handshake-only post-install wiring. Routed
@@ -22036,8 +23234,461 @@ impl MeshNode {
         // flood speed, not on the next heartbeat tick. Session open
         // races the peer's post-handshake bookkeeping, so resend.
         self.emit_event_pingwave(true);
-
         Ok(peer_node_id)
+    }
+
+    /// Establish a Net session over an already-open DataChannel,
+    /// as the Noise **initiator** (Stage 3; production since R4, where
+    /// the dialog completion owner calls it in the offerer's role).
+    /// Deliberately not a new handshake path: it is
+    /// [`Self::connect`]'s body with a `PeerAddr::Rtc` endpoint. The
+    /// post-`start()` initiator already registers an inbox in
+    /// `pending_direct_initiators` and waits for the dispatcher to
+    /// forward msg2, which is transport-agnostic — the only thing
+    /// that changes is which sink half carries msg1.
+    #[cfg(feature = "webrtc")]
+    pub async fn connect_rtc(
+        &self,
+        peer: super::rtc::RtcPeerId,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let peer_addr = PeerAddr::Rtc(peer);
+        // R3-E: the quiescence gate, before anything is spent. The
+        // ordinary direct-path upgrade defers while the incumbent is
+        // busy (`attempt_direct_upgrade`'s C3 gate); a fixture that
+        // skipped it could replace a session with open streams or
+        // unacked data and lose that state.
+        let plan = self.rtc_upgrade_precheck(peer_node_id, peer, UpgradeRole::Initiator)?;
+        let prior = plan.prior;
+        // H2: the intent is taken **before** the handshake wait, on
+        // the exact `(slot, generation)`, under the transport's own
+        // slot lock. A check taken after the wait answers a question
+        // about a handle that may already have been closed and had
+        // its notification consumed; the claim taken here is what
+        // the commit re-validates.
+        let fence = self.rtc_install_fence(peer, plan.require_quiescent)?;
+        let keys = self
+            .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+            .await?;
+        // H2: a pausable completed exchange — the witnesses need the
+        // gap between "Noise finished" and "install commits" to be an
+        // observable point rather than a timing accident.
+        self.rtc_install_pause_point().await;
+        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
+        if !outcome.owned {
+            return Err(AdapterError::Connection(
+                "rtc install lost the compare-and-swap: a newer incarnation won".into(),
+            ));
+        }
+        // R-B: the entry is published now; re-read liveness and take
+        // it back if the endpoint closed while it was being
+        // published.
+        self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
+
+        let peer_graph_id = node_id_to_graph_id(peer_node_id);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
+        self.proximity_graph.on_pingwave(pw, peer_addr);
+        let installed_session_id = self
+            .peers
+            .get(&peer_node_id)
+            .map(|p| p.value().session.session_id())
+            .unwrap_or(0);
+        self.failure_detector.heartbeat_for_incarnation(
+            peer_node_id,
+            peer_addr,
+            installed_session_id,
+        );
+        self.push_local_announcement(peer_node_id).await;
+        self.emit_event_pingwave(true);
+        Ok(peer_node_id)
+    }
+
+    /// The responder half of [`Self::connect_rtc`].
+    ///
+    /// `accept()` cannot serve here: it reads the Net socket directly,
+    /// pre-`start()`, and a DataChannel has no socket to read. Instead
+    /// this registers an inbox under the RTC endpoint — the same
+    /// registry the dispatcher already forwards handshake payloads to
+    /// — so msg1 arrives through the one dispatch owner, and msg2
+    /// leaves through the same `PeerSink` every other send uses. The
+    /// crypto is `NoiseHandshake` unchanged.
+    #[cfg(feature = "webrtc")]
+    pub async fn accept_rtc(
+        &self,
+        peer: super::rtc::RtcPeerId,
+        peer_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let peer_addr = PeerAddr::Rtc(peer);
+        // R3-E, responder half. The role is load-bearing: a busy
+        // incumbent on a DIFFERENT RTC endpoint is a channel the
+        // remote itself superseded, and only the remote could lose
+        // state by it — see `rtc_upgrade_precheck`.
+        let plan = self.rtc_upgrade_precheck(peer_node_id, peer, UpgradeRole::Responder)?;
+        let prior = plan.prior;
+        // H2, responder half: same intent, taken before the wait.
+        let fence = self.rtc_install_fence(peer, plan.require_quiescent)?;
+        let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
+        let mut handshake = NoiseHandshake::responder_with_prologue(
+            &self.config.psk,
+            &self.static_keypair,
+            &prologue,
+        )
+        .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {e}")))?;
+
+        let inbox = Arc::new(DirectHandshakeInbox::new());
+        if let Some(displaced) = self
+            .pending_direct_initiators
+            .insert(peer_addr, inbox.clone())
+        {
+            displaced.close();
+        }
+        // R3-E: reclaim the registration even if this future is
+        // *cancelled*. The explicit `deregister` below only runs when
+        // the future completes; a dropped `accept_rtc` used to leave
+        // its inbox installed until the next displacement.
+        let registration = DirectInboxGuard {
+            registry: &self.pending_direct_initiators,
+            addr: peer_addr,
+            inbox: Arc::clone(&inbox),
+        };
+
+        let outcome = tokio::time::timeout(self.config.handshake_timeout, async {
+            loop {
+                let Some(payload) = inbox.next().await else {
+                    return Err(AdapterError::Connection(
+                        "rtc handshake registration displaced".into(),
+                    ));
+                };
+                // A payload that does not advance the state is
+                // discarded, never fatal — same rule as the initiator
+                // side, and for the same reason: one malformed frame
+                // must not end the attempt.
+                if handshake.read_message(&payload).is_ok() {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
+        drop(registration);
+        match outcome {
+            Ok(inner) => inner?,
+            Err(_) => return Err(AdapterError::Connection("rtc handshake timeout".into())),
+        }
+
+        let msg2 = handshake
+            .write_message(&[])
+            .map_err(|e| AdapterError::Connection(format!("write_message failed: {e}")))?;
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let packet = builder.build_handshake(&msg2);
+        self.sink
+            .send(&packet, peer_addr)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("send failed: {e}")))?;
+
+        let keys = handshake
+            .into_session_keys()
+            .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {e}")))?;
+        // H2, responder half: the same pause seam; the fence was
+        // taken before the wait, and the commit re-validates it.
+        self.rtc_install_pause_point().await;
+        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
+        if !outcome.owned {
+            return Err(AdapterError::Connection(
+                "rtc install lost the compare-and-swap: a newer incarnation won".into(),
+            ));
+        }
+        // R-B, responder half: same post-publish re-read.
+        self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
+        Ok(peer_node_id)
+    }
+
+    /// The eviction context the close notifier and the installer's
+    /// own post-publish re-read share (R-B).
+    #[cfg(feature = "webrtc")]
+    fn peer_eviction_ctx(&self) -> PeerEvictionCtx {
+        PeerEvictionCtx {
+            session_routing: Arc::clone(&self.session_routing),
+            routing_registry: Arc::clone(&self.routing_registry),
+            peers: Arc::clone(&self.peers),
+            peer_entity_ids: Arc::clone(&self.peer_entity_ids),
+            addr_to_node: Arc::clone(&self.addr_to_node),
+            peer_addrs: Arc::clone(&self.peer_addrs),
+            session_id_to_node: Arc::clone(&self.session_id_to_node),
+            ack_ranges_peer_cache: Arc::clone(&self.ack_ranges_peer_cache),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints: Arc::clone(&self.provisional_endpoints),
+            rtc_reassembly: Arc::clone(&self.rtc_reassembly),
+            peer_transitions: self.peer_transitions.clone(),
+        }
+    }
+
+    /// The **post-publish** liveness re-read (R-B).
+    ///
+    /// The commit-time check inside `install_peer_locked` runs
+    /// before the `peers` entry exists; a close landing between it
+    /// and the insert is consumed by the notifier with nothing to
+    /// evict, and the dead endpoint stays published. `close_peer`
+    /// sets `closed` under the queue lock **before** its
+    /// notification is sent, so re-reading liveness *after* the
+    /// entry is published closes the window in both directions:
+    /// either this read sees the close and takes the entry back by
+    /// its exact session id, or the close happened after the
+    /// publish and its notification finds the entry.
+    ///
+    /// `Err` means nothing of ours is installed: the caller must
+    /// report a lost install. The eviction is keyed by the session id
+    /// **this** install published, never by whatever `peers` holds at
+    /// the moment of the re-read — a competitor that superseded the
+    /// entry in that instant keeps its session.
+    #[cfg(feature = "webrtc")]
+    fn confirm_rtc_install_or_evict(
+        &self,
+        peer_node_id: u64,
+        installed_session_id: Option<u64>,
+        fence: &RtcInstallFence,
+    ) -> Result<(), AdapterError> {
+        if fence.intent.still_live() {
+            return Ok(());
+        }
+        if let Some(session_id) = installed_session_id {
+            self.peer_eviction_ctx()
+                .evict_session(peer_node_id, session_id);
+        }
+        Err(AdapterError::Connection(
+            "rtc endpoint closed before the session could be installed".into(),
+        ))
+    }
+
+    /// The incumbent snapshot + quiescence gate every RTC install
+    /// goes through (R3-E), and how the commit must re-check it.
+    ///
+    /// `PriorSession::Exactly(sid)` is the incarnation the install
+    /// must compare-and-swap against; `Absent` means there is no
+    /// incumbent. A *busy* incumbent — open streams or unacked data —
+    /// is normally refused rather than replaced, because replacing it
+    /// drops that state.
+    ///
+    /// **One case is not that.** When the RESPONDER finds the
+    /// incumbent on a DIFFERENT RTC endpoint, the peer that just
+    /// completed a handshake has superseded its own channel: it is
+    /// the only party whose state could be lost, and it has already
+    /// abandoned it. Deferring there preserves nothing and locks the
+    /// identity out for good, because the streams that make the
+    /// session busy can only be closed by the peer that is gone — a
+    /// browser that got a typed failure and reconnected was refused
+    /// with `the incumbent session is busy` against six subscription
+    /// and reply channels left by its previous tab, on an endpoint
+    /// the anchor still believed was open. So that one case
+    /// displaces, and says so.
+    ///
+    /// Every other shape is unchanged: the initiator still defers
+    /// (its own state, its own call), and a responder facing a
+    /// ROUTED incumbent still defers — that session is live, the new
+    /// RTC endpoint is an optimisation, and the routed path keeps
+    /// working meanwhile.
+    #[cfg(feature = "webrtc")]
+    fn rtc_upgrade_precheck(
+        &self,
+        peer_node_id: u64,
+        peer: super::rtc::RtcPeerId,
+        role: UpgradeRole,
+    ) -> Result<UpgradePlan, AdapterError> {
+        let Some(entry) = self.peers.get(&peer_node_id) else {
+            // H2: "nothing is installed" is an expectation the commit
+            // must re-check, not permission to overwrite whatever
+            // arrives in the meantime.
+            return Ok(UpgradePlan {
+                prior: PriorSession::Absent,
+                require_quiescent: true,
+            });
+        };
+        let info = entry.value();
+        let busy = Self::session_is_busy(info);
+        let sid = info.session.session_id();
+        // Named in the refusal, because "busy" on its own sends the
+        // reader nowhere: which streams, and whether the incumbent's
+        // endpoint is even still there.
+        let streams: Vec<u64> = info.session.stream_ids().to_vec();
+        let unacked = info.session.has_unacked();
+        drop(entry);
+        if !busy {
+            return Ok(UpgradePlan {
+                prior: PriorSession::Exactly(sid),
+                require_quiescent: true,
+            });
+        }
+        let endpoint = self.peer_endpoint(peer_node_id);
+        let superseded_by_its_owner = role == UpgradeRole::Responder
+            && matches!(endpoint, Some(PeerAddr::Rtc(id)) if id != peer);
+        if superseded_by_its_owner {
+            let endpoint_open = match endpoint {
+                Some(PeerAddr::Rtc(id)) => self
+                    .rtc_driver
+                    .as_ref()
+                    .is_some_and(|d| d.transport().is_open(id)),
+                _ => false,
+            };
+            tracing::debug!(
+                peer = format!("{peer_node_id:#x}"),
+                ?endpoint,
+                endpoint_open,
+                ?streams,
+                unacked,
+                "the peer superseded its own RTC channel; displacing the busy \
+                 incumbent rather than locking the identity out"
+            );
+            // The commit must NOT re-apply the quiescence check for
+            // this install, or it would refuse at the seam what the
+            // snapshot just allowed. Everything else the fence does
+            // — the exact `(slot, generation)` claim and the
+            // compare-and-swap against `sid` — still holds.
+            return Ok(UpgradePlan {
+                prior: PriorSession::Exactly(sid),
+                require_quiescent: false,
+            });
+        }
+        Err(AdapterError::Connection(format!(
+            "rtc upgrade deferred: the incumbent session is busy \
+             (role={role:?} endpoint={endpoint:?} streams={streams:?} unacked={unacked})"
+        )))
+    }
+
+    /// Is this peer's session carrying application state an upgrade
+    /// would lose?
+    ///
+    /// The signalling stream itself is NOT application state.
+    /// `0x0D02` rides the very session the upgrade is about, so
+    /// counting it as "busy" would make a session that is
+    /// negotiating its own replacement permanently ineligible for
+    /// it. Everything else — application streams, unacked reliable
+    /// data — still defers, which is the C3 decision
+    /// `attempt_direct_upgrade` makes.
+    #[cfg(feature = "webrtc")]
+    fn session_is_busy(info: &PeerInfo) -> bool {
+        let signalling_stream = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
+        info.session
+            .stream_ids()
+            .iter()
+            .any(|id| *id != signalling_stream)
+            || info.session.has_unacked()
+    }
+
+    /// Take the install fence for this endpoint (R3-E, H2).
+    ///
+    /// Refuses immediately on a handle the driver no longer holds,
+    /// and carries the claim the commit re-validates under the
+    /// transport's slot lock.
+    ///
+    /// `require_quiescent` comes from the SNAPSHOT
+    /// ([`Self::rtc_upgrade_precheck`]) rather than being hard-coded
+    /// true: the commit re-checks what the snapshot decided, and an
+    /// install the snapshot allowed against a busy incumbent the
+    /// remote itself superseded must not be refused at the seam for
+    /// the reason the snapshot already weighed.
+    #[cfg(feature = "webrtc")]
+    fn rtc_install_fence(
+        &self,
+        peer: super::rtc::RtcPeerId,
+        require_quiescent: bool,
+    ) -> Result<RtcInstallFence, AdapterError> {
+        let intent = self
+            .rtc_driver
+            .as_ref()
+            .and_then(|d| d.transport().begin_install(peer))
+            .ok_or_else(|| {
+                AdapterError::Connection(
+                    "rtc endpoint closed before the session could be installed".into(),
+                )
+            })?;
+        Ok(RtcInstallFence {
+            intent,
+            require_quiescent,
+        })
+    }
+
+    /// Test hook: park an RTC install between "Noise completed" and
+    /// "commit" (H2). Unarmed in production — one relaxed load, and
+    /// nothing at all in a build without fixtures.
+    #[cfg(feature = "webrtc")]
+    async fn rtc_install_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.rtc_install_pause.wait_if_armed().await;
+    }
+
+    /// Test hook: park a dialog completion between "the channel
+    /// opened" and "claim the attempt" (S6-06). Unarmed in
+    /// production — one relaxed load, and nothing at all in a build
+    /// without fixtures.
+    #[cfg(feature = "webrtc")]
+    async fn rtc_claim_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.rtc_claim_pause.wait_if_armed().await;
+    }
+
+    /// The dialog-claim pause the S6-06 contention witnesses drive.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_dialog_claim_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_claim_pause
+    }
+
+    /// Hold (or release) the RTC close-notification consumer, so a
+    /// witness can fill the bounded channel (H3).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn set_rtc_close_consumer_paused(&self, paused: bool) {
+        self.rtc_close_consumer_paused
+            .store(paused, Ordering::Release);
+    }
+
+    /// How many handshake inboxes are registered (H3 witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn pending_handshake_registrations(&self) -> usize {
+        self.pending_direct_initiators.len()
+    }
+
+    /// Is a handshake inbox registered for this endpoint?
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn has_handshake_registration(&self, addr: PeerAddr) -> bool {
+        self.pending_direct_initiators.contains_key(&addr)
+    }
+
+    /// Install a callback fired between the commit-time liveness
+    /// check and the `peers` insert (R-B witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn set_rtc_pre_insert_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.rtc_pre_insert_hook.lock() = hook;
+    }
+
+    /// The install pause the H2 witnesses drive.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_install_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_install_pause
+    }
+
+    /// Install a DIRECT session with an RTC **install fence** (H2).
+    ///
+    /// Everything the fence carries is re-evaluated inside the
+    /// installer's entry lock: the endpoint's liveness on the exact
+    /// `(slot, generation)`, the caller's expectation about the
+    /// incumbent, and — for an upgrade — the incumbent's
+    /// quiescence. A precheck that answered before the Noise wait
+    /// answers a question about the past.
+    #[cfg(feature = "webrtc")]
+    fn install_direct_fenced(
+        &self,
+        peer_node_id: u64,
+        owned_addr: PeerAddr,
+        keys: SessionKeys,
+        expectation: PriorSession,
+        fence: &RtcInstallFence,
+    ) -> PeerTransitionOutcome {
+        self.install_peer_transition_inner(
+            peer_node_id,
+            PeerTransport::Direct { owned: owned_addr },
+            keys,
+            expectation,
+            Some(fence),
+        )
     }
 
     /// Install a DIRECT session: the peer answered at `owned_addr`
@@ -22052,15 +23703,15 @@ impl MeshNode {
     fn install_direct(
         &self,
         peer_node_id: u64,
-        owned_addr: SocketAddr,
+        owned_addr: PeerAddr,
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
         self.install_peer_transition(
             peer_node_id,
-            PeerTransport::Direct { owned_addr },
+            PeerTransport::Direct { owned: owned_addr },
             keys,
-            expected_prior_session_id,
+            PriorSession::from_option(expected_prior_session_id),
         )
     }
 
@@ -22070,7 +23721,7 @@ impl MeshNode {
     fn install_routed(
         &self,
         peer_node_id: u64,
-        relay_addr: SocketAddr,
+        relay_addr: PeerAddr,
         keys: SessionKeys,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
@@ -22088,11 +23739,11 @@ impl MeshNode {
         self.install_peer_transition(
             peer_node_id,
             PeerTransport::Routed {
-                relay_addr,
+                relay: relay_addr,
                 adjacent_relay_identity,
             },
             keys,
-            expected_prior_session_id,
+            PriorSession::from_option(expected_prior_session_id),
         )
     }
 
@@ -22115,7 +23766,25 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
-        expected_prior_session_id: Option<u64>,
+        expectation: PriorSession,
+    ) -> PeerTransitionOutcome {
+        self.install_peer_transition_inner(
+            peer_node_id,
+            transport,
+            keys,
+            expectation,
+            #[cfg(feature = "webrtc")]
+            None,
+        )
+    }
+
+    fn install_peer_transition_inner(
+        &self,
+        peer_node_id: u64,
+        transport: PeerTransport,
+        keys: SessionKeys,
+        expectation: PriorSession,
+        #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
         // OLB-2B.3c step 2, HOLD-2 item 1: the peer swap and the republication
         // it causes are ONE serialized transition. The session publication gate
@@ -22126,7 +23795,14 @@ impl MeshNode {
         // nothing.
         self.commit_peer_transition(|| {
             let outcome = self.peer_transitions.with(peer_node_id, || {
-                self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+                self.install_peer_locked(
+                    peer_node_id,
+                    transport,
+                    keys,
+                    expectation,
+                    #[cfg(feature = "webrtc")]
+                    fence,
+                )
             });
             let published = outcome.owned;
             (outcome, published)
@@ -22134,14 +23810,59 @@ impl MeshNode {
     }
 
     /// The install body, running under this peer's transition guard.
+    /// §12 step 1: which admission state a freshly installed
+    /// session starts in.
+    ///
+    /// The condition is deliberately narrow. `serve_bootstrap` is
+    /// what makes a node browser-facing; an RTC session between two
+    /// native nodes that serve no bootstrap is an ordinary session
+    /// and gating it would change Stage 3's behaviour for no
+    /// security gain.
+    #[cfg(feature = "webrtc")]
+    fn initial_admission(&self, peer_addr: PeerAddr) -> super::rtc::PeerAdmission {
+        let browser_facing = self
+            .config
+            .rtc
+            .as_ref()
+            .is_some_and(|rtc| rtc.serve_bootstrap);
+        if browser_facing && matches!(peer_addr, PeerAddr::Rtc(_)) {
+            let admission = super::rtc::PeerAdmission::provisional(std::time::Instant::now());
+            self.provisional_endpoints.insert(peer_addr);
+            admission
+        } else {
+            super::rtc::PeerAdmission::default()
+        }
+    }
+
     fn install_peer_locked(
         &self,
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
-        expected_prior_session_id: Option<u64>,
+        expectation: PriorSession,
+        #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
         use dashmap::mapref::entry::Entry;
+
+        // H2: the endpoint's liveness, re-read under the transport's
+        // own slot lock at the moment of commit. The intent was taken
+        // before the handshake's last wait; a close that landed since
+        // is observed here instead of publishing a dead peer that
+        // nothing will ever evict (its close notification was
+        // consumed while no reverse index existed).
+        #[cfg(feature = "webrtc")]
+        if fence.is_some_and(|f| !f.intent.still_live()) {
+            return PeerTransitionOutcome::lost();
+        }
+        // R-B seam: the window between that check and the insert
+        // below is the one Kyra's schedule (1) lives in.
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        if fence.is_some() {
+            let hook = self.rtc_pre_insert_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
 
         let peer_addr = transport.send_addr();
         let remote_static_pub = keys.remote_static_pub;
@@ -22163,6 +23884,14 @@ impl MeshNode {
             // Initiator-side: replay-guard is a responder-side
             // concern, leave empty.
             last_initiator_ephemeral: None,
+            // §12 step 1: a session on an RTC endpoint, installed by
+            // a node that serves bootstrap, is **provisional**.
+            // Everything else — every UDP session, and every RTC
+            // session on a node that serves no bootstrap — is
+            // admitted, which is what keeps native ↔ native and the
+            // Stage 3 harness byte-for-byte unchanged.
+            #[cfg(feature = "webrtc")]
+            admission: self.initial_admission(peer_addr),
         };
 
         // CAS + insert atomically under the entry's shard write lock.
@@ -22171,15 +23900,38 @@ impl MeshNode {
         // session untouched.
         let displaced: Option<PeerInfo> = match self.peers.entry(peer_node_id) {
             Entry::Occupied(mut occ) => {
-                if let Some(expected) = expected_prior_session_id {
-                    if occ.get().session.session_id() != expected {
-                        return PeerTransitionOutcome::lost();
+                match expectation {
+                    // H2: `Absent` is a real expectation, not the
+                    // absence of one. The RTC caller that snapshotted
+                    // "no incumbent" used to pass `None`, which this
+                    // helper reads as *unconditional replacement* — so
+                    // a session installed while Noise was in flight was
+                    // overwritten by the older attempt.
+                    PriorSession::Absent => return PeerTransitionOutcome::lost(),
+                    PriorSession::Exactly(expected) => {
+                        if occ.get().session.session_id() != expected {
+                            return PeerTransitionOutcome::lost();
+                        }
+                        // H2: quiescence is a commit-time property.
+                        // The incumbent was quiet when the caller
+                        // sampled it; a stream opened during the
+                        // handshake does not change its session id, so
+                        // the id CAS alone happily replaced a session
+                        // that had become busy — losing exactly the
+                        // in-flight state the gate exists to protect.
+                        #[cfg(feature = "webrtc")]
+                        if fence.is_some_and(|f| f.require_quiescent)
+                            && Self::session_is_busy(occ.get())
+                        {
+                            return PeerTransitionOutcome::lost();
+                        }
                     }
+                    PriorSession::Any => {}
                 }
                 Some(occ.insert(new_entry))
             }
             Entry::Vacant(vac) => {
-                if expected_prior_session_id.is_some() {
+                if matches!(expectation, PriorSession::Exactly(_)) {
                     // CAS expected a prior session, but it's gone (torn
                     // down). Abort rather than resurrect a session the
                     // upgrade didn't intend to create.
@@ -22208,6 +23960,21 @@ impl MeshNode {
         if let Some(old) = &displaced {
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // X10: a REPLACEMENT is a lifetime end like any other,
+            // so the displaced session's partial fragment groups go
+            // with it. A late endpoint-close notification is not a
+            // fallback: the reverse mapping this block is about to
+            // remove is exactly what `evict_endpoint` requires to
+            // find the peer, so nothing else ever retires this
+            // session — its held bytes would sit in the mesh-owned
+            // reassembly map until some unrelated fragment happened
+            // to arrive and age them out, which on a quiet mesh is
+            // never. NR3: and the displaced session is DEACTIVATED,
+            // which normal replacement never did — so a frame already
+            // captured under it is refused at dispatch rather than
+            // relying on a fence that expires in two seconds.
+            #[cfg(feature = "webrtc")]
+            retire_session_receive_lifetime(&self.rtc_reassembly, &old.session);
             // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
             // displaced session's OWNED address when it differs from
             // the new one (a relay→direct swap leaves the old address
@@ -22237,7 +24004,7 @@ impl MeshNode {
         // endpoint's end-to-end session while aiming the envelope at
         // the relay, which cannot authenticate it.
         let route_token = match transport {
-            PeerTransport::Direct { owned_addr } => {
+            PeerTransport::Direct { owned: owned_addr } => {
                 // A direct handshake IS an authenticated adjacency:
                 // destination and next hop are the same session peer,
                 // so the route carries `next_hop_id` by construction.
@@ -22264,7 +24031,9 @@ impl MeshNode {
                 self.addr_to_node.insert(owned_addr, peer_node_id);
                 token
             }
-            PeerTransport::Routed { relay_addr, .. } => {
+            PeerTransport::Routed {
+                relay: relay_addr, ..
+            } => {
                 // A routed end-to-end session is NOT an authenticated
                 // adjacent route-hop session: the recorded address is
                 // the immediate relay's, and the session authenticates
@@ -22398,7 +24167,7 @@ impl MeshNode {
         // `accept_in_flight` (so `start()` refuses) for that whole
         // time. See `try_handshake_responder`'s doc for why that is
         // the right trade and what to tune.
-        let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
+        let (keys, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
 
         // The responder side of a handshake is the SAME lifecycle
         // operation as the initiator side, so it runs through the same
@@ -22417,17 +24186,22 @@ impl MeshNode {
         // `install_direct` holds a `parking_lot` guard, whose non-`Send`
         // type keeps the compiler enforcing that no part of the
         // transition can straddle the `.await`s below.
+        // `accept` reports the UDP tuple to its caller; the peer table
+        // keys on the endpoint.
+        let peer_addr = peer_endpoint
+            .udp()
+            .ok_or_else(|| AdapterError::Connection("accept: peer is not a UDP endpoint".into()))?;
         let session_id = self
-            .install_direct(peer_node_id, peer_addr, keys, None)
+            .install_direct(peer_node_id, peer_endpoint, keys, None)
             .session_id
             .unwrap_or_default();
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
-        self.proximity_graph.on_pingwave(pw, peer_addr);
+        self.proximity_graph.on_pingwave(pw, peer_endpoint);
 
         self.failure_detector
-            .heartbeat_for_incarnation(peer_node_id, peer_addr, session_id);
+            .heartbeat_for_incarnation(peer_node_id, peer_endpoint, session_id);
 
         // See the matching comment in `connect`.
         self.push_local_announcement(peer_node_id).await;
@@ -22537,6 +24311,19 @@ impl MeshNode {
         }
 
         let recv_handle = self.spawn_receive_loop();
+        // R3-E: the driver's close notifications drive the ordinary
+        // peer-removal transaction. Spawned here, next to the receive
+        // loop, because it is the same lifecycle: it exits with the
+        // node.
+        #[cfg(feature = "webrtc")]
+        self.spawn_rtc_close_notifier();
+        // §12 step 5: expiry, budget breach and `max_provisional`
+        // all end the same way — close and reclaim — so one sweep
+        // owns all three.
+        #[cfg(feature = "webrtc")]
+        self.spawn_provisional_reclaim_loop();
+        #[cfg(feature = "webrtc")]
+        self.spawn_rtc_signal_engine();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
         let retransmit_handle = self.spawn_retransmit_loop();
@@ -23845,7 +25632,7 @@ impl MeshNode {
         let sensing_leader = self.sensing_leader.clone();
         let identity = self.identity.clone();
         let capability_version = self.capability_version.clone();
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let peers = self.peers.clone();
         let addr_to_node = self.addr_to_node.clone();
         let router = self.router.clone();
@@ -24079,7 +25866,7 @@ impl MeshNode {
                                 }
                             };
                             dispatch_sensing_leader_deliveries(
-                                &socket,
+                                &sink,
                                 &peers,
                                 &addr_to_node,
                                 &router,
@@ -24103,7 +25890,7 @@ impl MeshNode {
                     };
                     for node in peer_downstreams {
                         spawn_sensing_frame_send(
-                            &socket,
+                            &sink,
                             &peers,
                             &addr_to_node,
                             &router,
@@ -24195,6 +25982,28 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_budget: self
+                .rtc_driver
+                .as_ref()
+                .map(|_| Arc::clone(&self.rtc_signal_budget)),
+            #[cfg(feature = "webrtc")]
+            rtc_signal_tx: self.rtc_signal_tx.clone(),
+            #[cfg(feature = "webrtc")]
+            rtc_stats: self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
+            #[cfg(feature = "webrtc")]
+            forwarded_app_packets: Arc::clone(&self.forwarded_app_packets),
+            #[cfg(feature = "webrtc")]
+            rtc_reassembly: Arc::clone(&self.rtc_reassembly),
+            #[cfg(feature = "webrtc")]
+            provisional_endpoints: Arc::clone(&self.provisional_endpoints),
+            #[cfg(feature = "webrtc")]
+            rtc_driver: self.rtc_driver.clone(),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_signal_tap: self
+                .rtc_driver
+                .as_ref()
+                .map(|_| Arc::clone(&self.rtc_signal_tap)),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: self.rpc_inbound_dispatchers.clone(),
             num_shards: self.config.num_shards,
@@ -24221,7 +26030,7 @@ impl MeshNode {
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
             psk: self.config.psk,
-            socket: self.socket.clone(),
+            sink: self.sink.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
             enable_route_withdraw: self.config.enable_route_withdraw,
@@ -24247,7 +26056,7 @@ impl MeshNode {
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
                 self.identity.entity_id(),
             ),
-            #[cfg(feature = "redex")]
+            #[cfg(feature = "cortex")]
             rpc_local_services: self.rpc_local_services.clone(),
             sensing_emitter: self.sensing_emitter.clone(),
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
@@ -24323,6 +26132,1115 @@ impl MeshNode {
         }
     }
 
+    /// Drain inbound `0x0D02` frames and drive them against the
+    /// driver (plan §9 steps 3–6).
+    ///
+    /// One task, so the dialog table has one mutator; the dispatch
+    /// arm only hands frames over. Every effect that leaves this
+    /// node — the answer, the rejection — goes back over the same
+    /// session the frame arrived on, which is the routed path an
+    /// anchor is forwarding blind.
+    #[cfg(feature = "webrtc")]
+    fn spawn_rtc_signal_engine(&self) {
+        let Some(mut rx) = self.rtc_signal_rx.lock().take() else {
+            return;
+        };
+        let Some(driver) = self.rtc_driver.clone() else {
+            return;
+        };
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        let dialogs = Arc::clone(&self.rtc_dialogs);
+        let rtc_budget = Arc::clone(&self.rtc_signal_budget);
+        let rtc_attempts = Arc::clone(&self.rtc_attempt_keys);
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+                // Deadlines are checked on every turn, including the
+                // idle ones — an attempt that never gets another
+                // frame is exactly the case `ice_deadline` exists
+                // for.
+                {
+                    let mut table = dialogs.lock().await;
+                    let expired =
+                        super::rtc::expire_dialogs(&driver, &mut table, Instant::now()).await;
+                    // **R5: expiry releases the budget.** The
+                    // returned ids used to be discarded, so an
+                    // expired dialog kept its `SignalBudget` slot
+                    // for ever and the peer's fifth offer was
+                    // refused although four had ended.
+                    if !expired.is_empty() {
+                        let mut guard = rtc_budget.lock();
+                        for (node, dialog) in &expired {
+                            guard.end_dialog(*node, *dialog);
+                            // …and the reservation a bootstrap
+                            // attempt actually took, which is keyed
+                            // by its accounting identity rather than
+                            // by the claim (R2). Expiry is a
+                            // terminal path like any other: the
+                            // owner record goes with the row.
+                            if let Some((_, key)) = rtc_attempts.remove(&(*node, *dialog)) {
+                                if key != *node {
+                                    guard.end_dialog(key, *dialog);
+                                }
+                            }
+                        }
+                    }
+                }
+                let (from_node, msg) = match next {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
+                let dialog_of_frame = msg.dialog();
+                let outcome = {
+                    let mut table = dialogs.lock().await;
+                    super::rtc::handle_signal(&driver, &mut table, from_node, msg, ice_deadline)
+                        .await
+                };
+                let Some(node) = weak.upgrade() else { break };
+                match outcome {
+                    super::rtc::SignalOutcome::Answer { dialog, sdp, peer } => {
+                        let _ = node
+                            .send_rtc_signal(
+                                from_node,
+                                &super::rtc::RtcSignalMsg::Answer { dialog, sdp },
+                            )
+                            .await;
+                        // R4/R4-A: the answerer owns this dialog's
+                        // completion. The owner is spawned FIRST —
+                        // before the candidate that can make the
+                        // channel open — so its `accept_rtc` inbox
+                        // is registered before the first msg1 can
+                        // arrive. Spawning after the trickle left a
+                        // window where the initiator's msg1 reached
+                        // a node with no inbox and was lost.
+                        node.spawn_dialog_completion(from_node, dialog, peer, false);
+                        node.trickle_local_candidate(from_node, dialog).await;
+                    }
+                    super::rtc::SignalOutcome::AnswerApplied { dialog, peer } => {
+                        // R4: the offerer's half. ICE is running;
+                        // the completion owner takes it from the
+                        // channel-open event onward.
+                        node.trickle_local_candidate(from_node, dialog).await;
+                        node.spawn_dialog_completion(from_node, dialog, peer, true);
+                    }
+                    super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                        let _ = node
+                            .send_rtc_signal(
+                                from_node,
+                                &super::rtc::RtcSignalMsg::Reject { dialog, reason },
+                            )
+                            .await;
+                        // R5: our own Reject is a terminal path
+                        // too — a failed allocation used to keep
+                        // the slot it never got to use.
+                        node.release_signal_budget(from_node, dialog);
+                    }
+                    super::rtc::SignalOutcome::Ended(_) => {
+                        // R5: the peer's Reject ended the dialog;
+                        // `admit` already released its slot, and
+                        // this keeps our own outbound bookkeeping
+                        // in step for a dialog *we* offered.
+                        node.release_signal_budget(from_node, dialog_of_frame);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
+    }
+
+    /// Open a direct path to `peer_node_id` over the session that
+    /// already exists (plan §9 step 3): send an `Offer` on
+    /// `0x0D02` and let the engine carry the rest.
+    ///
+    /// Returns the dialog id. Retry policy is the caller's and must
+    /// never be per packet (§9 step 6).
+    #[cfg(feature = "webrtc")]
+    pub async fn offer_direct_path(&self, peer_node_id: u64) -> Result<u64, AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        // A dialog id only has to be unique between these two
+        // endpoints; the session already authenticates who is
+        // talking. A counter plus the clock is sufficient and needs
+        // no RNG dependency on this path.
+        let dialog = self
+            .capability_version
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ super::current_timestamp();
+        let offer = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::start_dialog(driver, &mut table, peer_node_id, dialog, ice_deadline)
+                .await
+                .map_err(AdapterError::Connection)?
+        };
+        // R5: the inbound budget learns about our outbound dialog
+        // here, so the peer's `Reject` for it correlates.
+        self.register_outbound_dialog(peer_node_id, dialog);
+        self.send_rtc_signal(peer_node_id, &offer).await?;
+        // R4: trickle our own host candidate immediately. On a
+        // native pair both sides know their bind address, so the
+        // pair does not have to wait for a gathering round trip
+        // (S0b measured trickle at 6.6x the floor). The reflex /
+        // relay candidates a NAT'd browser needs are 4b's.
+        self.trickle_local_candidate(peer_node_id, dialog).await;
+        Ok(dialog)
+    }
+
+    // === Stage 4b: the bootstrap listener's hooks ================
+    //
+    // These are NEW functions, added for the HTTPS listener; no
+    // Stage 3 seam and no 4a admission code is modified by them.
+    // They exist because an HTTP-originated offer has no session to
+    // arrive on, so the listener cannot reach the `0x0D02` engine
+    // the way a routed peer does — but everything downstream of the
+    // decision (the dialog table, `handle_signal`, the completion
+    // owner, the fenced install, §12 admission) is the same code.
+
+    /// Accept a **browser's** offer, arriving over HTTPS rather than
+    /// over `0x0D02`, and return the answer SDP (Stage 4b).
+    ///
+    /// `claimed_node_id` is exactly that — a claim. It is not
+    /// trusted: it goes into the Noise **prologue**
+    /// (`accept_rtc` → `handshake_prologue`), so a browser that
+    /// claims a node id it cannot handshake as fails the handshake,
+    /// and the session it does get is Provisional until enrollment
+    /// promotes it (§12). The listener validates the credential
+    /// before calling this; this function's job is the dialog.
+    ///
+    /// The path below is the engine's own Offer arm minus the two
+    /// mesh-shaped effects a browser cannot receive: the answer
+    /// goes back in the HTTP response instead of a `0x0D02` frame,
+    /// and the candidate rides the trickle socket
+    /// ([`Self::bootstrap_host_candidate`]) instead of
+    /// `send_rtc_signal`. The completion owner, and therefore the
+    /// install, is the identical production task.
+    #[cfg(feature = "webrtc")]
+    pub async fn accept_bootstrap_offer(
+        self: &Arc<Self>,
+        claimed_node_id: u64,
+        dialog: u64,
+        sdp: String,
+    ) -> Result<String, AdapterError> {
+        // The unkeyed form charges the claim, which is what a test
+        // measuring "the browser's own budget" wants. Production
+        // callers use the keyed form below and pass an identity the
+        // caller could not choose (R2).
+        self.accept_bootstrap_offer_keyed(claimed_node_id, claimed_node_id, dialog, sdp)
+            .await
+    }
+
+    /// [`Self::accept_bootstrap_offer`] with the signalling budget
+    /// charged to `budget_key` instead of the claimed node id (R2).
+    ///
+    /// `claimed_node_id` still names the dialog (the table is keyed
+    /// by it, and the Noise prologue binds it), but it is a claim:
+    /// charging it let any credential holder spend another peer's
+    /// dialog and frame allowance. `budget_key` is the listener's
+    /// per-attempt random identity.
+    #[cfg(feature = "webrtc")]
+    pub async fn accept_bootstrap_offer_keyed(
+        self: &Arc<Self>,
+        budget_key: u64,
+        claimed_node_id: u64,
+        dialog: u64,
+        sdp: String,
+    ) -> Result<String, AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        // The same size bound and the same per-sender budget an
+        // over-the-mesh frame spends — one function, two callers
+        // (R2) — charged to `budget_key`.
+        self.admit_signal_frame(
+            budget_key,
+            &super::rtc::RtcSignalMsg::Offer {
+                dialog,
+                sdp: sdp.clone(),
+            },
+        )?;
+        let outcome = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::handle_signal(
+                driver,
+                &mut table,
+                claimed_node_id,
+                super::rtc::RtcSignalMsg::Offer { dialog, sdp },
+                ice_deadline,
+            )
+            .await
+        };
+        match outcome {
+            super::rtc::SignalOutcome::Answer {
+                dialog, sdp, peer, ..
+            } => {
+                // Spawned BEFORE the answer leaves, for the reason
+                // R4-A gives on the mesh path: the responder's
+                // `accept_rtc` inbox must exist before the browser's
+                // first Noise msg1 can arrive.
+                self.spawn_dialog_completion(claimed_node_id, dialog, peer, false);
+                // The attempt's accounting owner, so every terminal
+                // path releases the reservation this ingress took
+                // rather than one keyed by the caller's claim (R2).
+                self.rtc_attempt_keys
+                    .insert((claimed_node_id, dialog), budget_key);
+                Ok(sdp)
+            }
+            super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                self.rtc_attempt_keys.remove(&(claimed_node_id, dialog));
+                self.release_signal_budget(budget_key, dialog);
+                Err(AdapterError::Connection(format!(
+                    "the offer was refused: {reason:?}"
+                )))
+            }
+            other => Err(AdapterError::Connection(format!(
+                "unexpected outcome for a bootstrap offer: {other:?}"
+            ))),
+        }
+    }
+
+    /// Apply a browser's trickled ICE candidate to its dialog
+    /// (Stage 4b). Same engine path as an inbound `0x0D02`
+    /// `Candidate`; a candidate for a dialog this node does not hold
+    /// is refused rather than ignored, so the trickle socket can
+    /// close with a typed code.
+    /// **The shared ingress check (R2).** Size bound, then the
+    /// per-sender `SignalBudget`, with the same counters the native
+    /// `0x0D02` path increments.
+    ///
+    /// Stage 4b's HTTP/WebSocket ingress constructed frames directly
+    /// and reached the engine without either: the review pushed a
+    /// 16 KiB `mid` and 65 candidates in one window through it. This
+    /// is the one function both paths call.
+    #[cfg(feature = "webrtc")]
+    pub fn admit_signal_frame(
+        &self,
+        budget_key: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<(), AdapterError> {
+        let stats = self.rtc_stats_opt().cloned();
+        if let Err(e) = msg.validate_size() {
+            if let Some(stats) = stats.as_ref() {
+                stats.note_signal_malformed();
+            }
+            return Err(AdapterError::Connection(format!(
+                "signalling frame over the size bound: {e}"
+            )));
+        }
+        if let Some(stats) = stats.as_ref() {
+            stats.note_signal_delivered();
+        }
+        let admitted = {
+            let mut guard = self.rtc_signal_budget.lock();
+            guard.admit(budget_key, msg, std::time::Instant::now())
+        };
+        match admitted {
+            super::rtc::SignalAdmit::Refused(super::rtc::RtcSignalError::UnknownDialog) => {
+                if let Some(stats) = stats.as_ref() {
+                    stats.note_signal_unknown_dialog();
+                }
+                Err(AdapterError::Connection(
+                    "signalling frame for an unknown dialog".into(),
+                ))
+            }
+            super::rtc::SignalAdmit::Refused(e) => {
+                if let Some(stats) = stats.as_ref() {
+                    stats.note_signal_over_budget();
+                }
+                Err(AdapterError::Connection(format!(
+                    "signalling frame over budget: {e}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Self::apply_bootstrap_candidate`] with the budget charged to
+    /// `budget_key` rather than the claimed node id (R2).
+    ///
+    /// **A candidate that arrives after the channel opened is LATE,
+    /// not unknown.** The completion owner takes the dialog out of
+    /// the expiry table the moment the DataChannel opens (R4-A), and
+    /// a browser goes on trickling for as long as it is still
+    /// gathering — so the engine has no row to apply the candidate
+    /// to, through no fault of the caller's. Reporting that as a
+    /// refusal made the listener close the browser's trickle socket
+    /// with a typed `4404` in the middle of the Noise handshake,
+    /// which the leaf reads as the attempt failing:
+    /// `browser_enrollment_survives_replacement` and
+    /// `mitm_anchor_fails_the_handshake_and_installs_nothing` both
+    /// died on `timeout: noise msg2` behind
+    /// `closed code=4404 reason=… signalling frame for an unknown
+    /// dialog`. So: while the attempt is still LIVE, a candidate the
+    /// engine cannot place is accepted and dropped. Once the attempt
+    /// is gone the refusal stands, which is what lets the socket
+    /// close with a reason instead of hanging.
+    #[cfg(feature = "webrtc")]
+    pub async fn apply_bootstrap_candidate_checked(
+        &self,
+        budget_key: u64,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        self.admit_signal_frame(
+            budget_key,
+            &super::rtc::RtcSignalMsg::Candidate {
+                dialog,
+                candidate: candidate.clone(),
+                mid: mid.clone(),
+            },
+        )?;
+        match self
+            .dispatch_bootstrap_candidate(claimed_node_id, dialog, candidate.clone(), mid)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.bootstrap_attempt_is_live(claimed_node_id, dialog, budget_key) {
+                    // This arm knows two things: the engine did not
+                    // apply the candidate, and the attempt is still
+                    // live. It does NOT know the channel is open —
+                    // `dispatch_bootstrap_candidate` returns `Err` for
+                    // every non-`CandidateApplied` outcome, an
+                    // unparseable mDNS `.local` address among them.
+                    // The old wording asserted openness and cost a
+                    // debugging cycle chasing a contradiction that did
+                    // not exist; the candidate and the reason are what
+                    // a reader needs.
+                    tracing::debug!(
+                        peer = format!("{claimed_node_id:#x}"),
+                        dialog,
+                        candidate = %candidate,
+                        reason = %e,
+                        "bootstrap candidate not applied while the attempt is live; dropped"
+                    );
+                    return Ok(());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply a browser's trickled ICE candidate, charging the
+    /// claimed node id's own budget. Production callers use
+    /// [`Self::apply_bootstrap_candidate_checked`] with an identity
+    /// the caller could not choose.
+    #[cfg(feature = "webrtc")]
+    pub async fn apply_bootstrap_candidate(
+        &self,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        self.apply_bootstrap_candidate_checked(
+            claimed_node_id,
+            claimed_node_id,
+            dialog,
+            candidate,
+            mid,
+        )
+        .await
+    }
+
+    /// The engine half, after the bounds have been applied.
+    #[cfg(feature = "webrtc")]
+    async fn dispatch_bootstrap_candidate(
+        &self,
+        claimed_node_id: u64,
+        dialog: u64,
+        candidate: String,
+        mid: String,
+    ) -> Result<(), AdapterError> {
+        let driver = self
+            .rtc_driver
+            .as_ref()
+            .ok_or_else(|| AdapterError::Connection("rtc is not configured".into()))?;
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        let outcome = {
+            let mut table = self.rtc_dialogs.lock().await;
+            super::rtc::handle_signal(
+                driver,
+                &mut table,
+                claimed_node_id,
+                super::rtc::RtcSignalMsg::Candidate {
+                    dialog,
+                    candidate,
+                    mid,
+                },
+                ice_deadline,
+            )
+            .await
+        };
+        match outcome {
+            super::rtc::SignalOutcome::CandidateApplied => Ok(()),
+            _ => Err(AdapterError::Connection(
+                "no such dialog on this anchor".into(),
+            )),
+        }
+    }
+
+    /// This anchor's host candidate in SDP form, for the trickle
+    /// socket to send (Stage 4b). The same string
+    /// `trickle_local_candidate` puts on a `0x0D02` frame — the
+    /// public address when the operator configured one, since a
+    /// browser outside the NAT cannot use the bound address.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_host_candidate(&self) -> Option<String> {
+        let driver = self.rtc_driver.as_ref()?;
+        let addr = self
+            .config
+            .rtc
+            .as_ref()
+            .and_then(|rtc| rtc.public_addr)
+            .unwrap_or_else(|| driver.local_addr());
+        str0m::Candidate::host(addr, "udp")
+            .ok()
+            .map(|c| c.to_sdp_string())
+    }
+
+    /// End a bootstrap dialog the browser abandoned (Stage 4b): the
+    /// trickle socket closing before the channel opens is the
+    /// browser going away, and the attempt should not sit until its
+    /// deadline holding a budget slot.
+    #[cfg(feature = "webrtc")]
+    pub async fn end_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) {
+        let entry = {
+            let mut table = self.rtc_dialogs.lock().await;
+            table.remove(claimed_node_id, dialog)
+        };
+        // **The `remove` returning `Some` is what makes this
+        // terminal exactly once** (plan §10's partition): a dialog
+        // whose channel already opened left the table in
+        // `spawn_dialog_completion` step 2, so a late close here
+        // finds nothing and the completion owner's own outcome —
+        // `ice_direct` or `ice_failed` — stands unduplicated. When
+        // the entry IS still here the browser went away before the
+        // channel opened, which is `ice_failed` and not
+        // `ice_relayed`: the attempt did not run out of time, it
+        // lost its peer.
+        if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
+            driver.stats().note_ice_failed();
+            let _ = driver.close(entry.peer).await;
+        }
+        self.release_signal_budget(claimed_node_id, dialog);
+    }
+
+    /// The §12 global provisional bound this anchor was configured
+    /// with, so the listener can refuse an offer it knows the
+    /// admission layer would immediately shed (Stage 4b).
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_max_provisional(&self) -> usize {
+        self.config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.max_provisional)
+            .unwrap_or(0)
+    }
+
+    /// The candidate pair this node's ICE stack is transmitting to
+    /// for `node_id`, as `(local, remote, learned)` (Stage 4b R8).
+    ///
+    /// `learned` is `"signalled"` when the remote address arrived as
+    /// a candidate over signalling and `"peer-reflexive"` when it was
+    /// learned from the peer's own inbound binding request — which is
+    /// what distinguishes "we are talking to the address the anchor
+    /// ANNOUNCED" from "we discovered an address that happens to
+    /// match". `None` unless the peer sits on a DataChannel and
+    /// something has been sent.
+    #[cfg(feature = "webrtc")]
+    pub async fn rtc_selected_pair(
+        &self,
+        node_id: u64,
+    ) -> Option<(SocketAddr, SocketAddr, &'static str)> {
+        let driver = self.rtc_driver.as_ref()?;
+        match self.peer_endpoint(node_id)? {
+            PeerAddr::Rtc(id) => driver.selected_pair(id).await,
+            _ => None,
+        }
+    }
+
+    /// The address this anchor publishes as `rtc_addr` (Stage 4b:
+    /// `GET /rtc/anchor` reports it so a browser can aim its ICE at
+    /// the same socket the announcement names).
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_addr(&self) -> Option<SocketAddr> {
+        self.config.rtc.as_ref().and_then(|rtc| rtc.public_addr)
+    }
+
+    /// The **separately announced STUN endpoint**, when configured.
+    ///
+    /// Distinct from [`Self::rtc_public_addr`] on purpose, and this is
+    /// the whole point of Stage 6 §6.12.1: libwebrtc's
+    /// `UDPPort::OnReadPacket` consumes any datagram whose source is a
+    /// configured STUN server BEFORE `GetConnection`, in both
+    /// directions — so a leaf handed `stun:<anchor rtc_addr>` can
+    /// never form a candidate pair with that anchor. A second socket,
+    /// announced separately, is what lets a leaf's default
+    /// `iceServers` be useful instead of fatal.
+    ///
+    /// **Resolved, and bound before it is resolved.** The second
+    /// socket's actual bound address when the operator set no
+    /// override, so a `:0` bind announces a real endpoint — and
+    /// `None` whenever no second socket exists, *whatever*
+    /// `stun_public_addr` says. The override means "announce this
+    /// instead of what the socket bound", so with no socket there
+    /// is nothing to announce instead of: returning it anyway put
+    /// an endpoint this anchor never served into a signed
+    /// announcement, and a browser aiming `iceServers` at a dead
+    /// port has no symptom but a slow ICE failure. The
+    /// configuration is refused at startup by
+    /// `RtcConfig::validate`; this is the same rule at the emission
+    /// point, so no path reaches the announcement past it.
+    ///
+    /// The same reason the bootstrap URL falls back to the driver's
+    /// `local_addr` below: an announcement names what exists, and
+    /// never an adjacent-port guess.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_public_stun_addr(&self) -> Option<SocketAddr> {
+        let rtc = self.config.rtc.as_ref()?;
+        let bound = self.rtc_driver.as_ref().and_then(|d| d.stun_local_addr());
+        rtc.advertised_stun_addr(bound)
+    }
+
+    /// `rtc_stats()` without requiring a driver to exist.
+    #[cfg(feature = "webrtc")]
+    fn rtc_stats_opt(&self) -> Option<&Arc<super::rtc::RtcStats>> {
+        self.rtc_driver.as_ref().map(|d| d.stats())
+    }
+
+    /// This node's ICE attempt ledger (plan §10's field telemetry),
+    /// or `None` when this node has no RTC driver — no driver is no
+    /// ledger, which is not the same as a ledger reading zero.
+    ///
+    /// Powers `DeckClient::ice_stats`, Deck's ICE column and
+    /// `net-mesh anchor stats`. This node's OWN attempts: an attempt
+    /// ledger is not announced and cannot be read across the mesh.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_ice_stats(&self) -> Option<super::rtc::IceStats> {
+        self.rtc_stats_opt().map(|s| s.ice_snapshot())
+    }
+
+    /// Release one dialog's `SignalBudget` slot (R5).
+    ///
+    /// Every terminal path calls this: expiry, our own `Reject`,
+    /// the peer's `Reject`, and the completion owner's success or
+    /// failure. A reservation that is never released is a peer that
+    /// silently loses its dialog allowance.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn release_signal_budget(&self, peer_node_id: u64, dialog: u64) {
+        // **The reservation that was actually taken** (R2). A
+        // bootstrap attempt's ingress is charged to a random key the
+        // caller could not choose, while the dialog itself is named
+        // by the claimed node id — so releasing only the claim left
+        // the random reservation admitting frames after the owner's
+        // socket had closed. The owner record says which key, and it
+        // is consumed here: this is the one place every terminal
+        // path (owner close, expiry, our Reject, the peer's Reject,
+        // completion success and failure) already goes through.
+        let owned = self.rtc_attempt_keys.remove(&(peer_node_id, dialog));
+        let mut guard = self.rtc_signal_budget.lock();
+        guard.end_dialog(peer_node_id, dialog);
+        if let Some((_, key)) = owned {
+            if key != peer_node_id {
+                guard.end_dialog(key, dialog);
+            }
+        }
+    }
+
+    /// The accounting identity recorded for an accepted attempt
+    /// (R2 witnesses): what its ingress is charged to, and what its
+    /// terminal path must release.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn bootstrap_attempt_key(&self, claimed_node_id: u64, dialog: u64) -> Option<u64> {
+        self.rtc_attempt_keys
+            .get(&(claimed_node_id, dialog))
+            .map(|e| *e.value())
+    }
+
+    /// Is this exactly the accepted, still-live bootstrap attempt
+    /// (R1)?
+    ///
+    /// The listener's token map proves token ownership; it does not
+    /// prove the CORE attempt is still there. An attempt that
+    /// expired, was rejected or completed has had its row released
+    /// here, and a token for it must stop authorizing a socket.
+    #[cfg(feature = "webrtc")]
+    pub fn bootstrap_attempt_is_live(&self, claimed_node_id: u64, dialog: u64, key: u64) -> bool {
+        self.rtc_attempt_keys
+            .get(&(claimed_node_id, dialog))
+            .is_some_and(|e| *e.value() == key)
+    }
+
+    /// Does this anchor still hold `dialog` in the **expiry table**?
+    ///
+    /// The witness barrier for "the completion owner has passed its
+    /// channel-open step": the owner's first act after the channel
+    /// opens is to take the row out of this table so expiry cannot
+    /// close an endpoint the install is about to own (R4-A). It is a
+    /// different question from [`Self::bootstrap_attempt_is_live`],
+    /// and the difference is precisely what the two got merged into.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn holds_bootstrap_dialog(&self, claimed_node_id: u64, dialog: u64) -> bool {
+        self.rtc_dialogs
+            .lock()
+            .await
+            .peer_for(claimed_node_id, dialog)
+            .is_some()
+    }
+
+    /// Make a dialog **we** offered known to the inbound budget
+    /// (R5), so an immediate `Reject` for it correlates instead of
+    /// being refused as unknown — which kept the offer alive until
+    /// its timeout.
+    #[cfg(feature = "webrtc")]
+    fn register_outbound_dialog(&self, peer_node_id: u64, dialog: u64) {
+        self.rtc_signal_budget
+            .lock()
+            .note_outbound_dialog(peer_node_id, dialog);
+    }
+
+    /// How many dialogs this peer holds against the inbound budget
+    /// (R5 witnesses).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn open_signal_dialogs(&self, peer_node_id: u64) -> usize {
+        // The peer's own budget reservations, plus its LIVE accepted
+        // bootstrap attempts (R2). Not a maximum of two views: a
+        // bootstrap attempt's ingress is charged to a random key, so
+        // it is absent from the peer's budget count, and the owner
+        // records are the real rows — an attempt is here exactly
+        // while its reservation exists, because both are consumed by
+        // `release_signal_budget`. The previous `max(...)` of a
+        // drifting counter reported an open attempt after the core
+        // row was gone, and zero while a reservation was still live.
+        let budgeted = self.rtc_signal_budget.lock().open_dialogs(peer_node_id);
+        let attempts = self
+            .rtc_attempt_keys
+            .iter()
+            .filter(|e| e.key().0 == peer_node_id)
+            .count();
+        budgeted + attempts
+    }
+
+    /// Send this node's host candidate for `dialog` (R4).
+    ///
+    /// **The announced address, when there is one (Stage 4b R8).**
+    /// This used to send `driver.local_addr()` unconditionally — the
+    /// address the RTC socket is BOUND to. Behind a NAT that is a
+    /// private address no peer outside can use, so the session
+    /// formed anyway but formed **peer-reflexively**: the client
+    /// discovered the mapped address from this node's own inbound
+    /// check, and the candidate this node signalled contributed
+    /// nothing. Measured in `natsim`'s `rtc_anchor_direct`, where
+    /// the client's selected pair read `learned=peer-reflexive` at
+    /// the very address the announcement named. `rtc_addr`,
+    /// `bootstrap_host_candidate` and this frame now all name the
+    /// same socket.
+    #[cfg(feature = "webrtc")]
+    async fn trickle_local_candidate(&self, peer_node_id: u64, dialog: u64) {
+        let Some(driver) = self.rtc_driver.as_ref() else {
+            return;
+        };
+        let addr = self
+            .config
+            .rtc
+            .as_ref()
+            .and_then(|rtc| rtc.public_addr)
+            .unwrap_or_else(|| driver.local_addr());
+        let Ok(candidate) = str0m::Candidate::host(addr, "udp") else {
+            return;
+        };
+        let _ = self
+            .send_rtc_signal(
+                peer_node_id,
+                &super::rtc::RtcSignalMsg::Candidate {
+                    dialog,
+                    candidate: candidate.to_sdp_string(),
+                    mid: "0".to_string(),
+                },
+            )
+            .await;
+    }
+
+    /// **The production completion owner for one dialog (R4).**
+    ///
+    /// This is the piece that was missing: the engine processed
+    /// Offer/Answer/Candidate and expired attempts, but nothing
+    /// carried the dialog's DataChannel-open event through Noise
+    /// and the fenced install — `connect_rtc`/`accept_rtc` were
+    /// reachable only from fixtures, and the flagship test waited
+    /// for the attempt to expire and then built a *different*
+    /// connection with `connect_rtc_loopback`.
+    ///
+    /// Bounded by the dialog's own `ice_deadline`: if the channel
+    /// never opens, the task ends and `expire_dialogs` reclaims the
+    /// attempt exactly as before — the routed session is untouched.
+    /// On success the attempt is retired so the expiry sweep cannot
+    /// close the endpoint the install now owns.
+    #[cfg(feature = "webrtc")]
+    fn spawn_dialog_completion(
+        self: &Arc<Self>,
+        peer_node_id: u64,
+        dialog: u64,
+        peer: super::rtc::RtcPeerId,
+        offerer: bool,
+    ) {
+        let Some(driver) = self.rtc_driver.clone() else {
+            return;
+        };
+        let ice_deadline = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.ice_deadline)
+            .unwrap_or_else(|| Duration::from_secs(10));
+        // **R4-A: a weak node reference.** A strong `Arc` held
+        // across these waits stops `MeshNode::drop` — the path that
+        // sets `shutdown` — from ever running for a node dropped
+        // without an explicit `shutdown()`.
+        let weak = self.self_weak.get().cloned();
+        let dialogs = Arc::clone(&self.rtc_dialogs);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        // **One absolute deadline per attempt** (R4-A): the channel
+        // wait, Noise and the install share it, so the table can no
+        // longer expire an attempt that is already installing.
+        let deadline = tokio::time::Instant::now() + ice_deadline;
+        let handle = tokio::spawn(async move {
+            // 1. The dialog's own DataChannel-open event, under the
+            //    attempt's own deadline, and cancellable by
+            //    shutdown.
+            let opened = tokio::select! {
+                r = tokio::time::timeout_at(deadline, driver.await_open(peer)) => {
+                    matches!(r, Ok(Ok(())))
+                }
+                _ = shutdown_notify.notified() => false,
+            };
+            if !opened || shutdown.load(Ordering::Acquire) {
+                // Never opened, or we are going away: leave the
+                // attempt to the expiry sweep, which is what keeps
+                // the routed session.
+                return;
+            }
+            let Some(node) = weak.as_ref().and_then(|w| w.upgrade()) else {
+                return;
+            };
+            // The witness seam for the contention below: armed, a
+            // test lands a competing terminal owner in exactly this
+            // window. Unarmed — every production path — one relaxed
+            // load.
+            node.rtc_claim_pause_point().await;
+            // 2. **Claim the attempt, exactly, before anything
+            //    commits** (R4-A, S6-06). Taking the dialog out of
+            //    the expiry table is what stops expiry closing a
+            //    just-installed direct endpoint after the routed
+            //    incumbent has been displaced — the table used to
+            //    stay expirable across the install and the
+            //    post-install announcement await.
+            //
+            //    The `remove` RESULT is the claim, and it is
+            //    load-bearing. Every terminal owner — the expiry
+            //    sweep, our Reject, the peer's Reject, the
+            //    bootstrap dialog's abandonment — takes the same
+            //    row and charges one terminal term. Discarding the
+            //    result meant a completion whose channel opened
+            //    just as another owner removed the row went on to
+            //    install and charge a SECOND term for one attempt,
+            //    so `direct + relayed + failed` could exceed
+            //    `attempted`. A row that is gone, or that now
+            //    belongs to a successor endpoint, is not this
+            //    attempt's to install under and not its to charge:
+            //    the other owner's outcome stands, alone.
+            //
+            //    Only the table. The attempt's RESERVATION — and
+            //    with it the row that authorizes the attempt's own
+            //    bootstrap socket — is NOT released here: an
+            //    attempt whose channel has just opened is still in
+            //    flight, and "the accounting slot may be given
+            //    back" is a different fact from "this attempt is
+            //    over". Releasing at channel-open merged them, and
+            //    the browser paid for it: the anchor's host
+            //    candidate rides the offer body, so on a fast path
+            //    ICE completes before the trickle socket's own
+            //    TCP+TLS handshake lands, the R1 layer found no
+            //    live attempt and answered 404 — which a page can
+            //    only read as a bare `1006`. The attempt is retired
+            //    below, when it is genuinely terminal.
+            let claimed = {
+                let mut table = dialogs.lock().await;
+                table.remove(peer_node_id, dialog)
+            };
+            match claimed {
+                Some(entry) if entry.peer == peer => {}
+                other => {
+                    // Lost the claim. `other` is `None` (another
+                    // terminal owner took the row) or a successor's
+                    // endpoint under the same dialog id — and a
+                    // successor's row must go back, because it is
+                    // still live and its own owner will claim it.
+                    if let Some(entry) = other {
+                        let mut table = dialogs.lock().await;
+                        table.insert(peer_node_id, dialog, entry);
+                    }
+                    tracing::debug!(
+                        peer = format!("{peer_node_id:#x}"),
+                        "rtc upgrade: the attempt was already terminal elsewhere; \
+                         not installing and not charging a second terminal term"
+                    );
+                    // This endpoint is ours and nothing will use it.
+                    let _ = driver.close(peer).await;
+                    return;
+                }
+            }
+            // 3. Noise over it, in this dialog's role. The offerer
+            //    initiates, so both sides do not send msg1.
+            let peer_pubkey = node
+                .peer_announced_noise_pubkey(peer_node_id)
+                .or_else(|| node.peer_static_x25519(peer_node_id));
+            let install = async {
+                if offerer {
+                    match peer_pubkey {
+                        Some(key) => node.connect_rtc(peer, &key, peer_node_id).await.map(|_| ()),
+                        None => Err(AdapterError::Connection(
+                            "rtc upgrade: no announced Noise key for the peer".into(),
+                        )),
+                    }
+                } else {
+                    node.accept_rtc(peer, peer_node_id).await.map(|_| ())
+                }
+            };
+            let installed = tokio::select! {
+                r = tokio::time::timeout_at(deadline, install) => match r {
+                    Ok(inner) => inner,
+                    Err(_) => Err(AdapterError::Connection(
+                        "rtc upgrade: the attempt's deadline passed during Noise".into(),
+                    )),
+                },
+                _ = shutdown_notify.notified() => Err(AdapterError::Connection(
+                    "rtc upgrade: node shutting down".into(),
+                )),
+            };
+            // 4. **Now the attempt is terminal**, whichever way it
+            //    went: a completed install means the session, not
+            //    the attempt, owns this peer from here on, and a
+            //    failed one means the attempt cannot succeed. Both
+            //    stop the token authorizing and both give the
+            //    accounting slot back — the single release every
+            //    other terminal path (expiry, our Reject, the
+            //    peer's Reject, the owner's close) already uses.
+            node.release_signal_budget(peer_node_id, dialog);
+            match installed {
+                Ok(()) => {
+                    driver.stats().note_ice_direct();
+                }
+                Err(e) => {
+                    // The attempt is terminal and it did not
+                    // install. `ice_failed`, never `ice_relayed`:
+                    // its DataChannel OPENED (step 1 above), so ICE
+                    // connected — what failed was Noise, the key
+                    // lookup, the install, or the deadline landing
+                    // inside them. Counting this as relayed would
+                    // report "ICE could not connect" about an
+                    // attempt where it demonstrably did. The dialog
+                    // left the expiry table at step 2, so the
+                    // expiry sweep cannot count this attempt again.
+                    driver.stats().note_ice_failed();
+                    tracing::debug!(
+                        error = %e,
+                        peer = format!("{peer_node_id:#x}"),
+                        "rtc upgrade did not install; the routed session stands"
+                    );
+                    let _ = driver.close(peer).await;
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
+    }
+
+    /// Sweep provisional sessions: reclaim the expired and, when
+    /// the anchor is over `max_provisional`, the oldest (§12 step
+    /// 5). One second is well inside the 30 s provisional TTL and
+    /// cheap — the sweep touches only peers whose admission is
+    /// provisional.
+    #[cfg(feature = "webrtc")]
+    fn spawn_provisional_reclaim_loop(&self) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            // A node that was never started has no weak self;
+            // its provisional sessions are reclaimed on close and
+            // on shutdown, and the Stage 3 harness never creates
+            // any (it serves no bootstrap).
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let handle = tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = shutdown_notify.notified() => break,
+                }
+                let Some(node) = weak.upgrade() else { break };
+                let reclaimed = node.reclaim_provisional_sessions();
+                if reclaimed > 0 {
+                    tracing::debug!(reclaimed, "§12: reclaimed provisional sessions");
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
+    }
+
+    /// Consume the RTC driver's channel-close notifications and run
+    /// the peer-removal transaction for each (R3-E).
+    ///
+    /// Before this, a reaped DataChannel left the peer entry, its
+    /// address indexes and its routes installed until an unrelated
+    /// failure detector happened to notice — so "the channel closed"
+    /// and "the peer is gone" were different events an unbounded
+    /// distance apart.
+    #[cfg(feature = "webrtc")]
+    fn spawn_rtc_close_notifier(&self) {
+        let Some(mut closed) = self.rtc_closed.lock().take() else {
+            return;
+        };
+        let ctx = self.peer_eviction_ctx();
+        let registrations = Arc::clone(&self.pending_direct_initiators);
+        let transport = self.rtc_driver.as_ref().map(|d| Arc::clone(d.transport()));
+        // R2: the notifier retires the evicted peer's enrollment
+        // reservations, which needs the node itself.
+        let mesh_for_eviction = Arc::clone(&self.self_weak);
+        #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+        let paused = Arc::clone(&self.rtc_close_consumer_paused);
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            // One implementation of the removal transaction, shared
+            // by the steady-state loop and the shutdown drain below.
+            let on_close = |id: super::rtc::RtcPeerId| {
+                // H3: a closed or recycled endpoint also drops any
+                // handshake inbox registered under it. Nothing else
+                // visits this registry for RTC, and a recycled slot
+                // comes back at a new generation — a different key —
+                // so a registration left here was permanent.
+                if let Some((_, inbox)) = registrations.remove(&PeerAddr::Rtc(id)) {
+                    inbox.close();
+                }
+                match ctx.evict_endpoint(PeerAddr::Rtc(id)) {
+                    Some(node_id) => {
+                        // R2: the peer is gone, so every
+                        // reservation it held is retired — a late
+                        // completion for one of them promotes
+                        // nothing and is counted.
+                        //
+                        // Defence in depth, honestly scoped: the
+                        // key already carries the session id, so a
+                        // late completion for a dead incarnation
+                        // fails `promote_admission` anyway and
+                        // removing this arm alone leaves the
+                        // witnesses green (§12: R2b). It exists so
+                        // the retirement is *counted* rather than
+                        // inferred, and so reservations do not
+                        // accumulate per dead peer.
+                        if let Some(mesh) = mesh_for_eviction.get().and_then(|w| w.upgrade()) {
+                            mesh.retire_enrollment_reservations(node_id);
+                        }
+                        tracing::debug!(
+                            node_id = format!("{node_id:#x}"),
+                            "rtc channel closed; peer evicted"
+                        );
+                    }
+                    // R-B: nothing installed on that endpoint *yet*,
+                    // but an installer holds an intent on it — its
+                    // publish may land after this. Re-arm the close
+                    // so the next driver turn offers it again; the
+                    // intent is released when the install finishes
+                    // either way, so this cannot spin.
+                    //
+                    // This is the second delivery, not the primary
+                    // one: the installer's own post-publish re-read
+                    // (`confirm_rtc_install_or_evict`) already
+                    // covers the window, and removing this arm
+                    // leaves the R-B witnesses green (recorded in
+                    // S3_REPORT §12.2 as R-B2). It exists so
+                    // `install_intents` is read rather than
+                    // decorative, and so a future caller that
+                    // publishes without the re-read is still
+                    // reconciled.
+                    None => {
+                        if let Some(transport) = transport.as_ref() {
+                            if transport.install_in_flight(id) {
+                                transport.mark_pending_eviction(id);
+                            }
+                        }
+                    }
+                }
+            };
+            while !shutdown.load(Ordering::Acquire) {
+                // A bounded wait, not a bare `recv().await`: this
+                // handle is joined by `shutdown`, and a task parked
+                // forever on an empty channel would make that join
+                // the deadlock instead of the teardown.
+                // H3 witness seam: a held consumer is how the
+                // bounded channel is made to overflow on purpose.
+                #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+                if paused.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let next = tokio::time::timeout(Duration::from_millis(100), closed.recv()).await;
+                let id = match next {
+                    Ok(Some(id)) => id,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
+                on_close(id);
+            }
+            // **NR3.** The driver's teardown announces every
+            // remaining channel close, and `MeshNode::shutdown`
+            // joins the driver BEFORE it joins this task precisely
+            // so those announcements exist by now. Exiting on the
+            // shutdown flag alone dropped them: the peer entries,
+            // address indexes and enrollment reservations of every
+            // channel open at teardown were left installed on a node
+            // that had stopped. Bounded — `try_recv` drains what is
+            // queued and never waits.
+            while let Ok(id) = closed.try_recv() {
+                on_close(id);
+            }
+        });
+        self.tasks.lock().push(handle);
+    }
+
     /// Spawn the main receive loop.
     ///
     /// This is the heart of the mesh node. Every packet from every peer
@@ -24341,6 +27259,14 @@ impl MeshNode {
         let batched_ingress = self.config.batched_ingress;
 
         let ctx = self.dispatch_ctx();
+        // The RTC input, when this node is configured for it. A second
+        // input, not a replacement: a node can carry UDP and RTC peers
+        // at once, and `dispatch_packet` stays the single owner of
+        // both (§2, §3.4).
+        #[cfg(feature = "webrtc")]
+        let rtc_ingress = self.rtc_ingress.lock().take();
+        #[cfg(feature = "webrtc")]
+        let rtc_stats = self.rtc_stats.clone();
 
         // Local receiver abstraction so the select! loop body below is
         // written once across the per-packet path and the Linux batched-
@@ -24350,14 +27276,40 @@ impl MeshNode {
             Single(PacketReceiver),
             #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
             Batched(super::transport::BatchedPacketReceiver),
+            /// Bounded RTC input, fed by the driver (§3.4). Bounded
+            /// because a full input must drop and count rather than
+            /// block: blocking here stalls every peer's
+            /// `poll_output`, not just the noisy one's.
+            #[cfg(feature = "webrtc")]
+            Rtc(tokio::sync::mpsc::Receiver<(Bytes, super::rtc::RtcPeerId)>),
         }
         impl IngressReceiver {
+            /// One packet, in arrival order, with the endpoint it came
+            /// from. The UDP arms convert the socket tuple here — the
+            /// receive loop is the boundary — and the RTC arm carries
+            /// the driver's handle, which is already an endpoint.
             #[inline]
-            async fn recv(&mut self) -> std::io::Result<(Bytes, SocketAddr)> {
+            async fn recv(&mut self) -> std::io::Result<(Bytes, PeerAddr)> {
                 match self {
-                    IngressReceiver::Single(r) => r.recv().await,
+                    IngressReceiver::Single(r) => {
+                        r.recv().await.map(|(b, a)| (b, PeerAddr::Udp(a)))
+                    }
                     #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
-                    IngressReceiver::Batched(r) => r.recv().await,
+                    IngressReceiver::Batched(r) => {
+                        r.recv().await.map(|(b, a)| (b, PeerAddr::Udp(a)))
+                    }
+                    // The driver's sender being dropped is the ONLY
+                    // fatal ingress condition for RTC (§3.4): a
+                    // `ConnectionReset` on the RTC *socket* never
+                    // reaches here, the driver swallows and counts it.
+                    #[cfg(feature = "webrtc")]
+                    IngressReceiver::Rtc(r) => match r.recv().await {
+                        Some((data, id)) => Ok((data, PeerAddr::Rtc(id))),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "rtc driver stopped",
+                        )),
+                    },
                 }
             }
 
@@ -24374,6 +27326,8 @@ impl MeshNode {
                     IngressReceiver::Single(_) => false,
                     #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                     IngressReceiver::Batched(_) => true,
+                    #[cfg(feature = "webrtc")]
+                    IngressReceiver::Rtc(_) => true,
                 }
             }
         }
@@ -24405,12 +27359,78 @@ impl MeshNode {
             // recv thread died); for the per-packet path it's transient. Decide
             // once by receiver variant rather than re-checking the flag.
             let reset_is_fatal = receiver.reset_is_fatal();
+            #[cfg(feature = "webrtc")]
+            let mut rtc_receiver = rtc_ingress.map(IngressReceiver::Rtc);
 
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
+                    // Fair interleave (§3.4): per-source ordering is
+                    // preserved *within* each input, never across
+                    // them — and no packet stream can split across
+                    // both, because a session belongs to exactly one
+                    // endpoint at a time.
+                    result = async {
+                        #[cfg(feature = "webrtc")]
+                        {
+                            match rtc_receiver.as_mut() {
+                                Some(r) => r.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }
+                        #[cfg(not(feature = "webrtc"))]
+                        {
+                            // No RTC input compiled in: this arm never
+                            // completes, so the select! is exactly the
+                            // pre-Stage-3 one.
+                            std::future::pending::<std::io::Result<(Bytes, PeerAddr)>>().await
+                        }
+                    } => {
+                        match result {
+                            Ok((data, source)) => {
+                                #[cfg(feature = "webrtc")]
+                                if !rtc_ingress_is_well_formed(&data) {
+                                    // S0c's silent 8 KiB black hole:
+                                    // an oversize or malformed frame
+                                    // used to vanish with the channel
+                                    // looking healthy. Count it, and
+                                    // keep the channel.
+                                    rtc_stats.note_validate_rejected();
+                                    continue;
+                                }
+                                // §12 / S0e §2 whole-session bounds:
+                                // charge this frame to the sender's
+                                // provisional budget BEFORE it can
+                                // reach any handler. A breach is not
+                                // a clamp — §12 step 5 says close and
+                                // reclaim — so the session ends here
+                                // and the frame is never dispatched.
+                                #[cfg(feature = "webrtc")]
+                                if Self::charge_provisional_ingress(&source, &data, &ctx)
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                                Self::dispatch_packet(data, source, &ctx);
+                            }
+                            Err(e) => {
+                                // The driver's sender was dropped: the
+                                // driver is gone, so this input is
+                                // permanently dead (§3.4).
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "rtc ingress closed");
+                                }
+                                #[cfg(feature = "webrtc")]
+                                {
+                                    rtc_receiver = None;
+                                }
+                            }
+                        }
+                    }
                     result = receiver.recv() => {
                         match result {
                             Ok((data, source)) => {
+                                // The UDP receive loop is a boundary: the
+                                // socket's tuple becomes the peer endpoint here.
                                 Self::dispatch_packet(data, source, &ctx);
                             }
                             // Batched receiver: a ConnectionReset means its recv
@@ -24449,7 +27469,7 @@ impl MeshNode {
     /// - Handshake packets are ignored (handled during connect/accept)
     /// - Heartbeat packets update the failure detector
     /// - Data packets are decrypted if local, forwarded if not
-    fn dispatch_packet(data: Bytes, source: SocketAddr, ctx: &DispatchCtx) {
+    fn dispatch_packet(data: Bytes, source: PeerAddr, ctx: &DispatchCtx) {
         // Partition filter: silently drop packets from blocked peers
         if ctx.partition_filter.contains(&source) {
             return;
@@ -24539,6 +27559,14 @@ impl MeshNode {
         // authenticate pingwaves against a spoofing attacker; that is a
         // separate protocol concern.
         if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
+            // §12 F4, inbound half: a pingwave FROM a provisional
+            // peer is dropped and counted. It is a topology beacon —
+            // acting on one installs routes and graph edges for a
+            // peer that has not enrolled (S0e §3 row 11).
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_forward(&source, ctx) {
+                return;
+            }
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
                 let origin_nid = graph_id_to_node_id(&pw.origin_id);
 
@@ -24649,7 +27677,7 @@ impl MeshNode {
                     // Borrowed, not cloned: the re-broadcast below runs
                     // inline rather than in a spawned task, so nothing
                     // needs to outlive this scope.
-                    let socket = &ctx.socket;
+                    let sink = &ctx.sink;
                     let peers = &ctx.peers;
                     let filter = &ctx.partition_filter;
                     let router = &ctx.router;
@@ -24691,12 +27719,34 @@ impl MeshNode {
                         if filter.contains(&addr) {
                             continue;
                         }
+                        // §12 F4, outbound half: an anchor does not
+                        // pingwave a provisional peer either. The
+                        // rule is symmetric because the beacon is.
+                        // §7/§11: a `leaf`-tagged peer is never a
+                        // forwarding next hop and is never
+                        // re-flooded to — a browser has no routing
+                        // table and nothing downstream of it.
+                        #[cfg(feature = "webrtc")]
+                        if ctx
+                            .addr_to_node
+                            .get(&addr)
+                            .is_some_and(|n| Self::peer_is_leaf(*n.value(), ctx))
+                        {
+                            continue;
+                        }
+                        #[cfg(feature = "webrtc")]
+                        if Self::is_provisional(&addr, ctx) {
+                            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                                stats.note_admission_refused_forward();
+                            }
+                            continue;
+                        }
                         // A full egress socket means that peer is
                         // already behind; a pingwave is a periodic
                         // liveness beacon, so the next one carries the
                         // same information. Dropping one is strictly
                         // better than queuing it.
-                        let _ = socket.try_send_to(&fwd_bytes, addr);
+                        let _ = sink.try_send(&fwd_bytes, addr);
                     }
                 }
                 return;
@@ -24731,7 +27781,7 @@ impl MeshNode {
         // whether this node is even a gateway — is decided inside
         // `relay_protected_hop`, which authenticates before it acts.
         if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
-            Self::relay_protected_hop(&data, ctx);
+            Self::relay_protected_hop(&data, source, ctx);
             return;
         }
         if !is_routed && !is_direct {
@@ -24804,6 +27854,46 @@ impl MeshNode {
                         session.touch();
                     }
                 } else {
+                    // §12 F1: the `dest_id == local_node_id` test is
+                    // ABOVE this arm, so the enrollment envelope is
+                    // already delivered. What remains is transit for
+                    // somebody else, and a provisional adjacent
+                    // session may not ask for it — no exceptions in
+                    // v1. Checked here, before TTL, before the route
+                    // lookup, before anything is sent.
+                    #[cfg(feature = "webrtc")]
+                    if !Self::admission_allows(&source, ctx, |stats| {
+                        // F1's own counter: "refused to relay this
+                        // envelope onward" is a different fact from
+                        // "refused to re-flood a pingwave", and the
+                        // §12 witness has to be able to tell them
+                        // apart.
+                        stats.note_admission_refused_transit();
+                        stats.note_admission_refused_forward();
+                    }) {
+                        return;
+                    }
+                    // §10 part 2: count this forward for the pair,
+                    // unless it is signalling. Reading
+                    // `subprotocol_id` off the inner header is
+                    // exactly the anchor-side classification §10
+                    // sanctions — the field is cleartext and
+                    // AAD-authenticated, and the SDP it carries
+                    // stays unread.
+                    #[cfg(feature = "webrtc")]
+                    {
+                        let inner_sub = data
+                            .get(ROUTING_HEADER_SIZE..ROUTING_HEADER_SIZE + protocol::HEADER_SIZE)
+                            .and_then(protocol::NetHeader::from_bytes)
+                            .map(|h| h.subprotocol_id);
+                        if inner_sub != Some(super::rtc::SUBPROTOCOL_RTC_SIGNAL) {
+                            *ctx.forwarded_app_packets
+                                .entry((routing_header.src_id, routing_header.dest_id))
+                                .or_insert(0) += 1;
+                        } else if let Some(stats) = ctx.rtc_stats.as_ref() {
+                            stats.note_signal_forwarded();
+                        }
+                    }
                     // Not for us — forward without decrypting (header-only
                     // routing). We send via the main socket so the
                     // receiving node sees `source` = our bound addr,
@@ -24879,7 +27969,7 @@ impl MeshNode {
                     // wrong response at the moment this node should be
                     // dropping. Verbatim `send_to` semantics are not
                     // lost — UDP was always allowed to drop this.
-                    if let Err(e) = ctx.socket.try_send_to(&forwarded, next_hop) {
+                    if let Err(e) = ctx.sink.try_send(&forwarded, next_hop) {
                         tracing::debug!(
                             dest = format!("{:#x}", routing_header.dest_id),
                             reason = %e,
@@ -24988,8 +28078,18 @@ impl MeshNode {
     ///    hop-local attachments;
     /// 6. only then decrement the outer TTL and re-tag for the next
     ///    hop. The inner packet is copied through byte for byte.
-    fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
+    fn relay_protected_hop(data: &[u8], source: PeerAddr, ctx: &DispatchCtx) {
         use super::subnet::route_hop;
+
+        // §12 F2: hop authentication proves the *envelope*; it says
+        // nothing about whether the adjacent session may ask this
+        // anchor to carry it onward.
+        #[cfg(feature = "webrtc")]
+        if !Self::admission_gate_forward(&source, ctx) {
+            return;
+        }
+        #[cfg(not(feature = "webrtc"))]
+        let _ = source;
 
         // Measured-section marker for the production allocation witness
         // (`tests/subnet_relay_alloc_e2e.rs`). RAII, so it covers every
@@ -25185,7 +28285,7 @@ impl MeshNode {
             // that queue grow without limit. If queuing is ever wanted
             // here it has to be an explicitly bounded worker-owned ring,
             // not one spawned task per datagram.
-            if let Err(e) = ctx.socket.try_send_to(&buf[..n], egress_addr) {
+            if let Err(e) = ctx.sink.try_send(&buf[..n], egress_addr) {
                 tracing::debug!(
                     egress = format!("{egress_node:#x}"),
                     reason = %e,
@@ -25218,7 +28318,7 @@ impl MeshNode {
     fn handle_routed_handshake(
         parsed: &ParsedPacket,
         routing_header: &RoutingHeader,
-        source: SocketAddr,
+        source: PeerAddr,
         ctx: &DispatchCtx,
     ) {
         // Routing id of the remote party: what we see in the routing
@@ -25408,6 +28508,17 @@ impl MeshNode {
         // serialized under the session publication gate, taken FIRST — so no
         // projection build can be sitting between its revalidation and its
         // store while this registration lands.
+        // **R1-A: compute the derived admission BEFORE taking the
+        // `peers` entry.** `derived_admission` re-enters
+        // `peers.get` through `ingress_admission`, and both arms of
+        // the constructor below run while holding a `peers.entry`
+        // write guard — a same-node routed re-handshake over its
+        // own indexed RTC endpoint reacquires its own DashMap shard
+        // and deadlocks. The decision is about the *upstream*
+        // endpoint and does not depend on this entry, so it is
+        // taken here, once.
+        #[cfg(feature = "webrtc")]
+        let inherited_admission = Self::derived_admission(source, ctx);
         let Some((registered_session_id, registered_route_token)) = commit_peer_transition(
             &ctx.session_routing,
             &ctx.routing_registry,
@@ -25458,11 +28569,26 @@ impl MeshNode {
                                     // the existing session — evict its reverse-
                                     // index entry, otherwise every accepted
                                     // rotation leaks one stale entry forever.
-                                    let displaced_session_id = occ.get().session.session_id();
+                                    let displaced = occ.get().session.clone();
+                                    let displaced_session_id = displaced.session_id();
                                     ctx.session_id_to_node
                                         .remove_if(&displaced_session_id, |_, n| {
                                             *n == peer_node_id
                                         });
+                                    // X10: the displaced session's
+                                    // lifetime ends here too, so its
+                                    // partial fragment groups are
+                                    // retired and the session fenced.
+                                    // Nothing else will: the rotation
+                                    // leaves no close notification and
+                                    // no endpoint removal behind it.
+                                    // NR3: its receive lifetime is
+                                    // retired with it.
+                                    #[cfg(feature = "webrtc")]
+                                    retire_session_receive_lifetime(
+                                        &ctx.rtc_reassembly,
+                                        &displaced,
+                                    );
                                     let session = Arc::new(NetSession::new(
                                         keys,
                                         source,
@@ -25480,7 +28606,7 @@ impl MeshNode {
                                         // assert an adjacency the handshake
                                         // never established.
                                         transport: PeerTransport::Routed {
-                                            relay_addr: source,
+                                            relay: source,
                                             adjacent_relay_identity: ctx
                                                 .addr_to_node
                                                 .get(&source)
@@ -25490,6 +28616,16 @@ impl MeshNode {
                                         session,
                                         remote_static_pub,
                                         last_initiator_ephemeral: Some(initiator_ephemeral),
+                                        // R1: derive, never default.
+                                        // A routed Noise handshake
+                                        // relayed *through* a
+                                        // provisional RTC endpoint
+                                        // used to install an
+                                        // ADMITTED logical peer,
+                                        // which then satisfied the
+                                        // node-keyed unary gate.
+                                        #[cfg(feature = "webrtc")]
+                                        admission: inherited_admission,
                                     });
                                     Some(session_id)
                                 }
@@ -25506,7 +28642,7 @@ impl MeshNode {
                             vac.insert(PeerInfo {
                                 node_id: peer_node_id,
                                 transport: PeerTransport::Routed {
-                                    relay_addr: source,
+                                    relay: source,
                                     adjacent_relay_identity: ctx
                                         .addr_to_node
                                         .get(&source)
@@ -25516,6 +28652,10 @@ impl MeshNode {
                                 session,
                                 remote_static_pub,
                                 last_initiator_ephemeral: Some(initiator_ephemeral),
+                                // R1: derive, never default (see
+                                // the rotation arm above).
+                                #[cfg(feature = "webrtc")]
+                                admission: inherited_admission,
                             });
                             Some(session_id)
                         }
@@ -25539,7 +28679,36 @@ impl MeshNode {
                     // actually carried the handshake, the route stays
                     // address-only and protected forwarding fails closed on
                     // it.
-                    let route_token = ctx.router.add_route(peer_node_id, source);
+                    // §12 gate 2: install the session, withhold the
+                    // route. A provisional adjacent session must not
+                    // make this anchor a routing participant on its
+                    // behalf — S0e names this exact site as where
+                    // "a provisional peer must not become a normal
+                    // discovery/routing participant" lands.
+                    #[cfg(feature = "webrtc")]
+                    let gate_open = Self::admission_gate_route_install(&source, ctx);
+                    #[cfg(not(feature = "webrtc"))]
+                    let gate_open = true;
+                    // A withheld route still yields a token: the
+                    // rollback machinery is keyed on it, and "no
+                    // route was installed" must not read as "no
+                    // registration happened".
+                    // A withheld route still needs a transition
+                    // token: the rollback machinery is keyed on one,
+                    // and "no route installed" must not read as "no
+                    // registration happened". Re-reading the current
+                    // token without mutating is exactly that.
+                    let route_token = if gate_open {
+                        ctx.router.add_route(peer_node_id, source)
+                    } else {
+                        // No route was installed, so the rollback
+                        // has nothing to remove: token 0 never
+                        // matches a live entry, and
+                        // `remove_ordinary_route_if_token_is`
+                        // declines rather than evicting somebody
+                        // else's route.
+                        0
+                    };
                     ctx.session_id_to_node
                         .insert(registered_session_id, peer_node_id);
                     // Fresh session incarnation (Vacant or accepted
@@ -25587,7 +28756,7 @@ impl MeshNode {
         // skip the rollback if the runtime was shutting down or
         // the task was cancelled before the send completed,
         // leaving the peer/session/route in an unsendable state.
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let payload = routed.freeze();
         let guard = PeerRegistrationGuard {
             peer_node_id,
@@ -25607,7 +28776,7 @@ impl MeshNode {
             peer_entity_ids: ctx.peer_entity_ids.clone(),
         };
         tokio::spawn(async move {
-            match socket.send_to(&payload, next_hop).await {
+            match sink.send(&payload, next_hop).await {
                 Ok(_) => {
                     // `commit` disarms the guard and drops it, so the
                     // rollback is skipped, the registrations stay in
@@ -25652,9 +28821,9 @@ impl MeshNode {
     #[inline]
     fn resolve_grant_peer(
         peers: &DashMap<u64, PeerInfo>,
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         session: &NetSession,
-    ) -> Option<(SocketAddr, Arc<NetSession>)> {
+    ) -> Option<(PeerAddr, Arc<NetSession>)> {
         session
             .cached_node_id()
             .and_then(|nid| {
@@ -25697,14 +28866,60 @@ impl MeshNode {
             })
     }
 
+    /// Decrypt one packet addressed to this node, dispatch it, and
+    /// then release whatever its stream was holding behind it.
+    ///
+    /// The release loop is what makes a reliable stream's delivery
+    /// FIFO: an out-of-order arrival is recorded, acknowledged and
+    /// parked by the accounting step, and the arrival that fills the
+    /// gap in front of it lets every parked successor through, in
+    /// sequence order, before this call returns. Held frames are
+    /// already decrypted and already accounted, so they re-enter at
+    /// [`Self::dispatch_local_packet`] rather than here — paying AEAD
+    /// twice is impossible anyway, since the replay window admits a
+    /// counter exactly once.
+    ///
+    /// **NR3: capture-to-dispatch is bounded here.** The receive
+    /// loop clones the resolved session `Arc` and releases the peer
+    /// lookup before this call, and nothing bounds how long a worker
+    /// can be descheduled in between — so a frame can arrive at
+    /// dispatch after its session has been closed, replaced, swept or
+    /// shut down. Reassembly's retirement marker could not be the
+    /// answer: it expires with `GROUP_TTL` and is evicted under
+    /// churn, and a frame that outlives it recreated state under the
+    /// retired session id. The session handle CAN be: it is the very
+    /// object this frame was admitted against,
+    /// `NetSession::retire_receive_lifetime` is one-way and expires
+    /// with nothing, and every retirement path performs it.
+    ///
+    /// The predicate is RETIREMENT, never `is_active`. Those are two
+    /// different questions and asking the wrong one here is a
+    /// regression that has already happened once: `active` is
+    /// advisory local state with many writers — replacement,
+    /// shutdown, tests, and an SDK marking a session it no longer
+    /// treats as live — and a locally deactivated session is still a
+    /// legitimate peer that is still sending and still owed its
+    /// replies. Refusing its frames here silently blackholed the
+    /// inbound half of a live conversation. A frame whose
+    /// INCARNATION is retired is refused before it is decrypted,
+    /// dispatched or reassembled; a frame from a merely inactive
+    /// session is processed normally.
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
         session: &NetSession,
         ctx: &DispatchCtx,
     ) {
-        let inbound = &ctx.inbound;
-        let num_shards = ctx.num_shards;
+        if session.is_receive_lifetime_retired() {
+            tracing::debug!(
+                session_id = session.session_id(),
+                from_node = format!("{from_node:#x}"),
+                stream_id = format!("{:#x}", parsed.header.stream_id),
+                "dispatch: frame captured under a retired session incarnation \
+                 refused"
+            );
+            return;
+        }
         // Validate payload length
         if !parsed.header.flags.is_handshake()
             && !parsed.header.flags.is_heartbeat()
@@ -25743,8 +28958,97 @@ impl MeshNode {
             Err(_) => return,
         };
 
+        let stream_id = parsed.header.stream_id;
+        Self::dispatch_local_packet(parsed, decrypted, from_node, session, ctx, false);
+        while let Some(held) = session.take_in_order_frame(stream_id) {
+            Self::dispatch_local_packet(held.parsed, held.decrypted, from_node, session, ctx, true);
+        }
+    }
+
+    /// Dispatch one decrypted packet: stream accounting, then the
+    /// subprotocol chain, then the event plane.
+    ///
+    /// `released` marks a frame coming back out of its stream's
+    /// in-order hold. Such a frame was accounted when it arrived —
+    /// its sequence is recorded, its bytes are charged and its ack is
+    /// on the way — so re-running the accounting would offer the
+    /// sequence a second time and be told, correctly, that it is a
+    /// duplicate.
+    fn dispatch_local_packet(
+        parsed: ParsedPacket,
+        decrypted: Bytes,
+        from_node: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+        released: bool,
+    ) {
+        let inbound = &ctx.inbound;
+        let num_shards = ctx.num_shards;
+
+        // **One stream, one sequence space.** A peer allocates every
+        // sequence on a stream from that stream's single counter,
+        // whatever subprotocol the frame carries: a browser leaf's
+        // channel `Subscribe` rides the channel's own publish stream
+        // id (`leaf::node::subscribe`), reliably, and an nRPC REQUEST
+        // on the same channel takes the next sequence after it.
+        //
+        // Every control-subprotocol arm below returns before the
+        // event-plane accounting at the foot of this function, so
+        // pre-fix such a frame was never recorded and never
+        // acknowledged. Its sender saw no ack, retransmitted to
+        // exhaustion and RESET the stream — on a leaf that killed the
+        // very stream the anchor publishes its RPC replies on — and
+        // the unrecorded sequence left a permanent hole below
+        // `next_expected`, so no later event on that stream could
+        // advance the cumulative ack either.
+        //
+        // `CONTROL_STREAM_ID` is excluded: those frames carry the
+        // session's own control-sequence counter
+        // (`NetSession::next_control_tx_seq`), not a stream's, and no
+        // sender tracks them for retransmit.
+        if !released
+            && Self::accounts_inbound_subprotocol(parsed.header.subprotocol_id)
+            && parsed.header.stream_id != CONTROL_STREAM_ID
+            && !parsed.header.flags.is_handshake()
+        {
+            match Self::account_inbound_stream_packet(
+                &parsed,
+                (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64,
+                Self::charges_inbound_bytes(parsed.header.subprotocol_id),
+                session,
+                ctx,
+            ) {
+                // Deliverable, but ordering is ordering: if the
+                // stream is already holding frames, this one joins
+                // them so the drain releases the whole run in
+                // sequence order. Frames held BELOW this sequence —
+                // what a conceded boundary gap leaves behind —
+                // would otherwise be delivered after it.
+                InboundDisposition::Deliver(lifetime)
+                    if session.holds_in_order(parsed.header.stream_id) =>
+                {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
+                    return;
+                }
+                InboundDisposition::Deliver(_) => {}
+                InboundDisposition::Drop => return,
+                InboundDisposition::Hold(lifetime) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
+                    return;
+                }
+            }
+        }
+
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
+            // **R1-A: migration is a local effect too.** The
+            // dispatch invoked the application's migration handler
+            // before any admission decision, so an unenrolled peer
+            // could drive it.
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {
@@ -25851,25 +29155,28 @@ impl MeshNode {
                                     if ctx.partition_filter.contains(&dest_addr) {
                                         continue;
                                     }
-                                    let socket = ctx.socket.clone();
+                                    let sink = ctx.sink.clone();
                                     let payload = Bytes::from(msg.payload);
                                     tokio::spawn(async move {
                                         let pool = dest_sess.thread_local_pool();
                                         let mut builder = pool.get();
-                                        let seq = {
-                                            let stream = dest_sess
-                                                .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                            stream.next_tx_seq()
-                                        };
                                         let events = vec![payload];
+                                        let debit = outbound_subprotocol_tx_seq(
+                                            &dest_sess,
+                                            SUBPROTOCOL_MIGRATION as u64,
+                                            SUBPROTOCOL_MIGRATION,
+                                            &events,
+                                        );
                                         let packet = builder.build_subprotocol(
                                             SUBPROTOCOL_MIGRATION as u64,
-                                            seq,
+                                            debit.seq(),
                                             &events,
                                             PacketFlags::NONE,
                                             SUBPROTOCOL_MIGRATION,
                                         );
-                                        let _ = socket.send_to(&packet, dest_addr).await;
+                                        if sink.send(&packet, dest_addr).await.is_ok() {
+                                            debit.commit();
+                                        }
                                     });
                                 }
                             }
@@ -25903,24 +29210,27 @@ impl MeshNode {
                         .map(|e| (e.value().addr(), e.value().session.clone()));
                     if let Some((dest_addr, dest_sess)) = dest_session {
                         if !ctx.partition_filter.contains(&dest_addr) {
-                            let socket = ctx.socket.clone();
+                            let sink = ctx.sink.clone();
                             tokio::spawn(async move {
                                 let pool = dest_sess.thread_local_pool();
                                 let mut builder = pool.get();
-                                let seq = {
-                                    let stream = dest_sess
-                                        .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                    stream.next_tx_seq()
-                                };
                                 let events = vec![reply];
+                                let debit = outbound_subprotocol_tx_seq(
+                                    &dest_sess,
+                                    SUBPROTOCOL_MIGRATION as u64,
+                                    SUBPROTOCOL_MIGRATION,
+                                    &events,
+                                );
                                 let packet = builder.build_subprotocol(
                                     SUBPROTOCOL_MIGRATION as u64,
-                                    seq,
+                                    debit.seq(),
                                     &events,
                                     PacketFlags::NONE,
                                     SUBPROTOCOL_MIGRATION,
                                 );
-                                let _ = socket.send_to(&packet, dest_addr).await;
+                                if sink.send(&packet, dest_addr).await.is_ok() {
+                                    debit.commit();
+                                }
                             });
                         }
                     }
@@ -26024,17 +29334,27 @@ impl MeshNode {
                     // allocation + full-packet memcpy per
                     // retransmit. Loss-path only, but the burst
                     // fires exactly when the link is stressed.
+                    // A rebuild is a second build, and the fragment
+                    // stamp is one-shot: restamp it from the
+                    // descriptor or the recovered piece arrives with
+                    // `frag_flags == 0` and is delivered as a whole
+                    // event — a partial payload handed to the peer's
+                    // application, which is precisely the failure
+                    // reassembly exists to prevent.
+                    if let Some(f) = d.fragment {
+                        builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                    }
                     let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                     packets.push(p);
                 }
             }
             if !packets.is_empty() {
-                let socket = ctx.socket.clone();
+                let sink = ctx.sink.clone();
                 let dest = parsed.source;
                 let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        if socket.send_to(&p, dest).await.is_ok() {
+                        if sink.send(&p, dest).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -26078,7 +29398,12 @@ impl MeshNode {
         // Stream reset (STREAM_RETRANSMIT H-3): the sender gave up
         // retransmitting this stream. Fail any pending blob-transfer read
         // on it now (distinct error) instead of waiting for the caller's
-        // timeout, and drop the local receive-stream state.
+        // timeout, and drop the local receive-stream state — ONLY the
+        // receive state. A stream id is one bidirectional conversation,
+        // so the pre-fix `close_stream` let a peer's reset destroy what
+        // WE send on that id: `tx_seq` restarted at 0 mid-conversation
+        // and the grant quarantine then dropped the peer's acks for it.
+        // See `NetSession::reset_rx_stream`.
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_RESET {
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
@@ -26091,7 +29416,32 @@ impl MeshNode {
                         engine.on_reset(reset.stream_id);
                     }
                 }
-                session.close_stream(reset.stream_id);
+                // **R4-7:** the epoch of the lifetime the reset
+                // ends, read BEFORE it is reset, so the groups
+                // released are that lifetime's and not a
+                // predecessor's leftovers on the same id.
+                #[cfg(feature = "webrtc")]
+                let reset_epoch = session.try_stream(reset.stream_id).map(|s| s.epoch());
+                session.reset_rx_stream(reset.stream_id);
+                // **NR6:** the reset ends that stream's RECEIVE
+                // lifetime, so its partial fragment groups end with
+                // it. Leave them and a delayed old tail completes a
+                // pre-reset group afterwards, and a payload from
+                // before the reset is dispatched against the fresh
+                // cursor — behind the reset the consumer has already
+                // been given. Session retirement does not cover this:
+                // the session is still live. Mirrors the leaf's
+                // `Reassembler::retire_stream`, including reporting
+                // nothing: the reset IS the terminal disposition.
+                #[cfg(feature = "webrtc")]
+                if let Some(epoch) = reset_epoch {
+                    ctx.rtc_reassembly.retire_stream(
+                        session.session_id(),
+                        reset.stream_id,
+                        epoch,
+                        std::time::Instant::now(),
+                    );
+                }
             }
             return;
         }
@@ -26114,6 +29464,31 @@ impl MeshNode {
             // session_id — no need to re-scan `peers` here.
             for payload in events {
                 Self::handle_membership_message(&payload, from_node, ctx);
+            }
+            return;
+        }
+
+        // RTC signalling (`0x0D02`, plan §5 Layer 3). Session
+        // authenticated: the frame arrived inside this peer's
+        // session, so origin and target are the endpoints and there
+        // is nothing on the wire to spoof. Decoded under a size
+        // bound, budgeted per sender, then handed to the engine
+        // over a bounded channel — the dispatch loop never blocks
+        // on signalling and never awaits here.
+        #[cfg(feature = "webrtc")]
+        if parsed.header.subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
+            // **R1: signalling is a local effect too.** A valid
+            // Offer from a provisional peer reached the engine and
+            // allocated an ICE agent (Kyra: `KYRA_SIGNAL
+            // ice_allocations=1`). Signalling is what an *admitted*
+            // peer uses to upgrade; an unenrolled one has no
+            // business allocating an agent.
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                Self::handle_rtc_signal(&payload, from_node, ctx);
             }
             return;
         }
@@ -26524,26 +29899,33 @@ impl MeshNode {
                         if ctx.partition_filter.contains(&dest_addr) {
                             continue;
                         }
-                        let response = reflex::encode_response(dest_addr);
-                        let socket = ctx.socket.clone();
+                        // Reflex publication is a UDP-tuple boundary (the
+                        // wire field is a `SocketAddr`).
+                        let Some(observed) = dest_addr.udp() else {
+                            continue;
+                        };
+                        let response = reflex::encode_response(observed);
+                        let sink = ctx.sink.clone();
                         tokio::spawn(async move {
                             let pool = dest_sess.thread_local_pool();
                             let mut builder = pool.get();
-                            let seq = {
-                                let stream = dest_sess.get_or_create_stream(
-                                    super::traversal::SUBPROTOCOL_REFLEX as u64,
-                                );
-                                stream.next_tx_seq()
-                            };
                             let events = vec![response];
+                            let debit = outbound_subprotocol_tx_seq(
+                                &dest_sess,
+                                super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                super::traversal::SUBPROTOCOL_REFLEX,
+                                &events,
+                            );
                             let packet = builder.build_subprotocol(
                                 super::traversal::SUBPROTOCOL_REFLEX as u64,
-                                seq,
+                                debit.seq(),
                                 &events,
                                 PacketFlags::NONE,
                                 super::traversal::SUBPROTOCOL_REFLEX,
                             );
-                            let _ = socket.send_to(&packet, dest_addr).await;
+                            if sink.send(&packet, dest_addr).await.is_ok() {
+                                debit.commit();
+                            }
                         });
                     }
                     reflex::ReflexMsg::Response(observed) => {
@@ -26720,7 +30102,12 @@ impl MeshNode {
                             // bytes — `from_peer` still points at the
                             // original sender, which is what the
                             // recipient correlates on.
-                            Self::forward_punch_ack(ack, ctx);
+                            Self::forward_punch_ack(
+                                ack,
+                                #[cfg(feature = "webrtc")]
+                                from_node,
+                                ctx,
+                            );
                         }
                     }
                     rendezvous::RendezvousMsg::PunchReject(rej) => {
@@ -26801,6 +30188,37 @@ impl MeshNode {
         // symmetric — the sender debits the same quantity via
         // `wire_bytes_for_payload` on admission.
         let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
+
+        // Credit-window bookkeeping, the ack this receiver owes the
+        // sender, and the FIFO decision — see
+        // `account_inbound_stream_packet`. This is the event plane's
+        // turn: every other subprotocol was accounted at the top of
+        // this function ("one stream, one sequence space"), and an
+        // unrecognised subprotocol id returned above, so the guard
+        // keeps a packet from being charged twice.
+        //
+        // It runs BEFORE the frame is parsed into events because an
+        // out-of-order arrival is parked whole — the bytes, and the
+        // header they were parsed with — and released once the
+        // sequences in front of it have been delivered.
+        if !released && parsed.header.subprotocol_id == 0 {
+            match Self::account_inbound_stream_packet(&parsed, payload_bytes, true, session, ctx) {
+                // Same ordering rule as the control-plane site above.
+                InboundDisposition::Deliver(lifetime)
+                    if session.holds_in_order(parsed.header.stream_id) =>
+                {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
+                    return;
+                }
+                InboundDisposition::Deliver(_) => {}
+                InboundDisposition::Drop => return,
+                InboundDisposition::Hold(lifetime) => {
+                    Self::hold_inbound_in_order(parsed, decrypted, session, lifetime);
+                    return;
+                }
+            }
+        }
+
         let events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
@@ -26846,71 +30264,22 @@ impl MeshNode {
                 }
             }
         }
-
-        // Credit-window bookkeeping: charge only *accepted* inbound
-        // bytes against the stream's RxCreditState. `on_receive`
-        // returns `false` for duplicates (already-acked sequences)
-        // and for sequences past the Reliable receive window —
-        // crediting those would refund send credit for
-        // retransmissions / replays, letting a chatty peer inflate
-        // `tx_credit_remaining` past what it actually pushed through
-        // the protocol. Accounting runs at receive time (not drain
-        // time); this closes the v1 gap where a single serial sender
-        // ran `Transport(io::Error)` into a full kernel buffer. A
-        // separately slow daemon is still backstopped by the
-        // existing shard-queue-depth limits.
-        let grant_bytes = {
-            // Create the receive-side stream reliable when the packet is
-            // RELIABLE-flagged, so it tracks SACK and can NACK lost
-            // sequences. The sender's reliability is a property of the
-            // traffic (the flag), not the receiver's default_reliable.
-            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
-            let stream = session
-                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
-            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
-            if accepted {
-                stream.update_rx_seq(parsed.header.sequence);
-                stream.on_bytes_consumed(payload_bytes)
-            } else {
-                None
-            }
+        // **Leaf fragments become one event here (Stage 5 R4).**
+        //
+        // A browser leaf cannot exceed `MAX_PAYLOAD_SIZE` in one
+        // packet, so anything larger arrives as a `frag_flags`
+        // group. Nothing in the core read that field before, which
+        // is why an over-cap leaf publish reached a native
+        // subscriber as partial events and a fragmented enrollment
+        // request declared a body longer than it carried and timed
+        // out. This runs AFTER credit accounting on purpose: every
+        // piece crossed the wire and its window must be returned
+        // even when the group is still incomplete.
+        #[cfg(feature = "webrtc")]
+        let events = match Self::reassemble_rtc_fragments(&parsed, session, events, ctx) {
+            Some(events) => events,
+            None => return,
         };
-
-        if let Some(total_consumed) = grant_bytes {
-            // Resolve the sending peer.
-            //
-            // PERF_AUDIT §2.8 — see `Self::resolve_grant_peer`:
-            // tier-1 cached-node-id load (session-id cross-checked),
-            // `addr_to_node` second tier, O(peers) scan last resort,
-            // and the fallback publishes the cache so subsequent
-            // packets take tier 1.
-            let peer = Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session);
-            if let Some((peer_addr, peer_session)) = peer {
-                if !ctx.partition_filter.contains(&peer_addr) {
-                    // Enqueue for the per-mesh drainer
-                    // (`spawn_stream_grant_drainer_loop`). Same-key
-                    // overwrites — the latest `total_consumed` wins
-                    // because grants are authoritative. Single
-                    // `Notify::notify_one` after the insert wakes
-                    // the drainer if it's currently sleeping;
-                    // sticky-permit semantics make a wake during an
-                    // in-flight drain safe (drainer will see the
-                    // new entry on its next cycle).
-                    {
-                        let mut guard = ctx.pending_stream_grants.lock();
-                        guard.insert(
-                            (peer_session.session_id(), stream_id),
-                            PendingStreamGrant {
-                                session: peer_session,
-                                peer_addr,
-                                total_consumed,
-                            },
-                        );
-                    }
-                    ctx.pending_stream_grants_notify.notify_one();
-                }
-            }
-        }
 
         // nRPC dispatch hook: if a dispatcher is registered for the
         // inbound packet's `channel_hash`, route every event from
@@ -27059,6 +30428,10 @@ impl MeshNode {
                             continue;
                         }
                         disp(crate::adapter::net::cortex::RpcInboundEvent {
+                            // R2: the incarnation that carried this
+                            // request, not whatever is installed
+                            // when the bridge drains it.
+                            session_id: session.session_id(),
                             channel_hash: canonical,
                             origin_hash,
                             from_node,
@@ -27083,6 +30456,7 @@ impl MeshNode {
                                 (matching.next(), matching.next())
                             {
                                 disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    session_id: session.session_id(),
                                     channel_hash: *canonical,
                                     origin_hash,
                                     from_node,
@@ -27094,6 +30468,7 @@ impl MeshNode {
                             // the legacy fan-out to every candidate.
                             for (canonical, disp) in &pairs {
                                 disp(crate::adapter::net::cortex::RpcInboundEvent {
+                                    session_id: session.session_id(),
                                     channel_hash: *canonical,
                                     origin_hash,
                                     from_node,
@@ -27191,15 +30566,39 @@ impl MeshNode {
             None
         };
 
-        // Delivery-order contract (H-8): events are pushed in ARRIVAL
-        // order, each tagged with the packet's `seq`. The reliability
-        // layer guarantees gap-free eventual delivery (retransmit), but
-        // NOT ordering at this point — an out-of-order arrival or a
-        // retransmit lands here in the order it hit the wire. Consumers
-        // needing strict order reassemble by `StoredEvent::seq` (see the
-        // blob-transfer engine's reorder buffer); ones that frame their
-        // own ordering (nRPC keys on EventMeta/call_id) or tolerate
-        // reordering ignore it.
+        // Delivery-order contract: events are pushed in DELIVERY
+        // order, each tagged with the packet's `seq`.
+        //
+        // On a RELIABLE stream that is sequence order — the receive
+        // path holds an out-of-order arrival and releases it once the
+        // sequences in front of it have been delivered, so a wire
+        // reorder or a late retransmit is invisible here (see
+        // `account_inbound_stream_packet` and
+        // `StreamState::hold_out_of_order`). Ordering used to be the
+        // consumer's problem, which meant every consumer that did not
+        // implement a reorder buffer — an nRPC service handler, for
+        // one — observed the wire's order on a stream whose contract
+        // says it will not.
+        //
+        // On a fire-and-forget stream it is still arrival order,
+        // which is that mode's whole point: nothing is held, nothing
+        // is recovered, and a gap is reported rather than waited for.
+        //
+        // **R1: the application queue is a local effect.** Gate 5
+        // sat on the unary RPC bridge only, so an ordinary event
+        // from a provisional peer was pushed straight into the
+        // anchor's application queue (Kyra: `KYRA_APP
+        // delivered=true still_provisional=true`). This is the
+        // non-RPC arm — a frame with a registered nRPC dispatcher
+        // has already been handed to the bridge above, where the
+        // decision is made on the DECODED service name, because
+        // `net.mesh.enroll` is exactly the one call a provisional
+        // peer is allowed to make.
+        #[cfg(feature = "webrtc")]
+        if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+            return;
+        }
+
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -27217,6 +30616,357 @@ impl MeshNode {
             let _ = write!(event_id, "{}:{}", seq, i);
             queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
         }
+    }
+
+    /// Record one inbound packet against **its stream's** receive
+    /// state, enqueue the `StreamWindow` its sender is owed, and say
+    /// what the dispatch path must do with the bytes.
+    ///
+    /// [`InboundDisposition::Drop`] covers a provisional sender's
+    /// refused stream allocation (R3), a duplicate, and a sequence
+    /// there is no room to hold in order;
+    /// [`InboundDisposition::Hold`] is a reliable stream's
+    /// out-of-order arrival, which the caller parks on the stream and
+    /// the dispatch loop releases once the gap in front of it is
+    /// filled. Only [`InboundDisposition::Deliver`] may be dispatched
+    /// by the caller.
+    ///
+    /// Two properties this centralises, both of which a stream's
+    /// *sender* depends on to make progress:
+    ///
+    /// - **Credit.** Only *accepted* bytes are charged, and only when
+    ///   `charge_bytes` says the sender debited them. `on_receive`
+    ///   returns `false` for duplicates and for sequences past the
+    ///   reliable receive window; crediting those would refund send
+    ///   credit for retransmissions, letting a chatty peer inflate
+    ///   `tx_credit_remaining` past what it pushed through the
+    ///   protocol. Accounting runs at receive time (not drain time):
+    ///   the credit window protects the kernel buffer, and the
+    ///   application-side backstop is the shard queue depth.
+    /// - **The ack.** The same `StreamWindow` carries `ack_seq`, the
+    ///   cumulative acknowledgement the sender's retransmit window
+    ///   prunes against. A *duplicate* therefore still enqueues a
+    ///   grant: a retransmit is the peer saying it never heard the
+    ///   ack for what it already delivered, so what is owed is the
+    ///   ack, repeated. Staying silent would leave the sender to
+    ///   exhaust its retries and reset a stream that arrived intact.
+    ///   No bytes are consumed on that path, so the credit half is
+    ///   unchanged.
+    ///
+    /// `charge_bytes == false` is the third case, and it is the
+    /// sequence/byte split made explicit: a frame whose sender does
+    /// not debit its bytes must not be charged here either. Sequence
+    /// ownership and byte ownership are different invariants, and
+    /// charging one without the other moves the receiver's
+    /// cumulative-consumed total ahead of the sender's watermark —
+    /// whereupon the next grant refunds credit for bytes a *different*
+    /// producer on that stream still has in flight. See
+    /// [`Self::charges_inbound_bytes`].
+    fn account_inbound_stream_packet(
+        parsed: &ParsedPacket,
+        payload_bytes: u64,
+        charge_bytes: bool,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) -> InboundDisposition {
+        let stream_id = parsed.header.stream_id;
+        let seq = parsed.header.sequence;
+        // **NR4.** The lifetime that ACCEPTS the sequence, captured
+        // while its map guard is still held and carried out of this
+        // call, so the hold can prove it is inserting into the same
+        // state rather than into whatever answers to this id by the
+        // time it looks.
+        let mut lifetime = StreamLifetime {
+            session_id: session.session_id(),
+            epoch: 0,
+        };
+        // Assigned as soon as the accepting state is in hand, below:
+        // there is no meaningful disposition before its epoch is
+        // known, and the one early return above it returns `Drop`
+        // outright rather than reading this.
+        let mut disposition;
+        let total_consumed = {
+            // Make the receive-side stream reliable when the packet is
+            // RELIABLE-flagged, so it tracks SACK and can NACK lost
+            // sequences. The sender's reliability is a property of the
+            // traffic (the flag), not the receiver's default_reliable,
+            // and not of whichever mode happened to open the id first
+            // — see `StreamState::ensure_reliable`.
+            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            // And WHERE it became reliable is the sender's to state,
+            // not this receiver's to infer: a packet carrying
+            // `MODE_BOUNDARY` declares its own sequence to be the
+            // first reliable one on the stream, so everything below
+            // is a fire-and-forget prefix nothing can rebuild.
+            // Promoting on the flag alone leaves the conservative
+            // assumed boundary in place, which names the sender's
+            // last fire-and-forget sequence whenever THAT was the
+            // one lost — and then every reliable arrival is held
+            // behind a hole no retransmit can fill, until the
+            // sender's retries exhaust and it fails a stream that
+            // lost nothing reliable.
+            let stated_boundary = parsed
+                .header
+                .flags
+                .is_mode_boundary()
+                .then_some(parsed.header.sequence);
+            // R3: a provisional sender's stream allocation is
+            // reserved BEFORE it happens — the two-stream and
+            // 64 KiB rules were declared constants that nothing
+            // checked, so arbitrary receive streams could be
+            // created pre-enrollment.
+            #[cfg(feature = "webrtc")]
+            if !Self::charge_provisional_stream(
+                &parsed.source,
+                stream_id,
+                payload_bytes,
+                session,
+                ctx,
+            ) {
+                return InboundDisposition::Drop;
+            }
+            let stream = session.get_or_create_stream_for_packet(
+                stream_id,
+                ctx.default_reliable || reliable_pkt,
+                stated_boundary,
+            );
+            // **FIFO within a reliable stream.** Room to hold an
+            // out-of-order arrival is reserved BEFORE the sequence is
+            // offered to the reliability mode, because acceptance
+            // records it as received and SACKs it — after which the
+            // sender drops its descriptor and this side holds the
+            // only copy. No room therefore means "not accepted": the
+            // sequence stays the sender's to send again.
+            //
+            // The exemption is **feedback**, not "control": the four
+            // stream-control messages are the credit and reliability
+            // loop itself (`Self::charges_inbound_bytes` names
+            // exactly that set and says why), and holding one behind
+            // a gap would deadlock the stream it exists to unblock.
+            // They still consume a sequence, so they are still
+            // recorded and acknowledged — only never parked. Same
+            // exemption, same reason, as the leaf's receive half.
+            lifetime.epoch = stream.epoch();
+            disposition = InboundDisposition::Deliver(lifetime);
+            let ordered =
+                stream.reliable_mode() && Self::charges_inbound_bytes(parsed.header.subprotocol_id);
+            let frontier = ordered.then(|| stream.with_reliability(|r| r.rx_ack_seq()));
+            let accepted = if frontier.is_some_and(|next_expected| {
+                seq > next_expected && !stream.has_reorder_room(payload_bytes as usize)
+            }) {
+                disposition = InboundDisposition::Drop;
+                false
+            } else {
+                stream.with_reliability(|r| r.on_receive(seq))
+            };
+            if accepted {
+                stream.update_rx_seq(seq);
+                // Ordered and still above the contiguous frontier:
+                // recorded and acknowledged, but not the consumer's
+                // until what precedes it has been delivered.
+                if ordered && seq >= stream.with_reliability(|r| r.rx_ack_seq()) {
+                    disposition = InboundDisposition::Hold(lifetime);
+                }
+            } else {
+                disposition = InboundDisposition::Drop;
+            }
+            if accepted && charge_bytes {
+                stream.on_bytes_consumed(payload_bytes)
+            } else if stream.rx_credit().window_bytes() != 0 && (accepted || stream.reliable_mode())
+            {
+                // Nothing was consumed against the window, but the
+                // ack is still owed: either the sequence was refused
+                // on a reliable stream (a retransmit whose ack the
+                // peer never heard), or the frame is the credit loop
+                // itself and rides outside the window it refills.
+                Some(stream.rx_credit().consumed())
+            } else {
+                None
+            }
+        };
+
+        let Some(total_consumed) = total_consumed else {
+            return disposition;
+        };
+        // Resolve the sending peer.
+        //
+        // PERF_AUDIT §2.8 — see `Self::resolve_grant_peer`:
+        // tier-1 cached-node-id load (session-id cross-checked),
+        // `addr_to_node` second tier, O(peers) scan last resort,
+        // and the fallback publishes the cache so subsequent
+        // packets take tier 1.
+        let Some((peer_addr, peer_session)) =
+            Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session)
+        else {
+            return disposition;
+        };
+        if ctx.partition_filter.contains(&peer_addr) {
+            return disposition;
+        }
+        // Enqueue for the per-mesh drainer
+        // (`spawn_stream_grant_drainer_loop`). Same-key
+        // overwrites — the latest `total_consumed` wins
+        // because grants are authoritative. Single
+        // `Notify::notify_one` after the insert wakes
+        // the drainer if it's currently sleeping;
+        // sticky-permit semantics make a wake during an
+        // in-flight drain safe (drainer will see the
+        // new entry on its next cycle).
+        {
+            let mut guard = ctx.pending_stream_grants.lock();
+            guard.insert(
+                (peer_session.session_id(), stream_id),
+                PendingStreamGrant {
+                    session: peer_session,
+                    peer_addr,
+                    total_consumed,
+                },
+            );
+        }
+        ctx.pending_stream_grants_notify.notify_one();
+        disposition
+    }
+
+    /// Park one accounted-but-out-of-order arrival on its stream so
+    /// the sequences in front of it are delivered first.
+    ///
+    /// The room was reserved before the sequence was accepted, so
+    /// there is nothing to refuse on capacity grounds. What CAN
+    /// refuse it is identity: `lifetime` is the exact
+    /// `(session_id, epoch)` of the state that accepted this
+    /// sequence, and a stream that vanished OR WAS REPLACED between
+    /// acceptance and insertion is not that state (NR4). The old
+    /// comment was half right — a vanished stream's consumer is
+    /// gone, so dropping is correct — but a REPLACED stream has a
+    /// live consumer that never accepted this sequence and never
+    /// reserved its bytes, and handing it the predecessor's frame is
+    /// a cross-lifetime delivery, not a drop.
+    fn hold_inbound_in_order(
+        parsed: ParsedPacket,
+        decrypted: Bytes,
+        session: &NetSession,
+        lifetime: StreamLifetime,
+    ) {
+        let stream_id = parsed.header.stream_id;
+        let seq = parsed.header.sequence;
+        if !session.hold_in_order_frame(
+            stream_id,
+            seq,
+            lifetime,
+            net_wire::session::HeldFrame { parsed, decrypted },
+        ) {
+            tracing::debug!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                epoch = lifetime.epoch,
+                "in-order hold not taken: the accepting stream lifetime is gone"
+            );
+        }
+    }
+
+    /// Does this node DISPATCH `subprotocol_id`, and therefore owe
+    /// its sender receive-side accounting?
+    ///
+    /// R3 hoisted the accounting above the dispatch chain because a
+    /// stream is one sequence space whatever subprotocol its frames
+    /// carry. Hoisting it above the chain must not hoist it above
+    /// the DECISION: an unknown subprotocol is dropped and counted,
+    /// and a dropped frame must leave no receive-side stream behind
+    /// — `unknown_subprotocol_is_dropped_not_surfaced_as_events`
+    /// pins exactly that, and the first cut of the hoist broke it.
+    ///
+    /// The list is the dispatch chain below, in wire order. A new
+    /// dispatched subprotocol belongs here in the same commit that
+    /// adds its arm; one that is absent is treated as unknown, which
+    /// is the safe direction (its sender retransmits and gives up,
+    /// loudly) rather than the unsafe one (state allocated for
+    /// frames nobody handles).
+    fn accounts_inbound_subprotocol(subprotocol_id: u16) -> bool {
+        const ACCOUNTED: &[u16] = &[
+            SUBPROTOCOL_MIGRATION,
+            super::state::causal::SUBPROTOCOL_CAUSAL,
+            super::state::causal::SUBPROTOCOL_SNAPSHOT,
+            super::subprotocol::SUBPROTOCOL_NEGOTIATION,
+            super::continuity::SUBPROTOCOL_CONTINUITY,
+            super::continuity::SUBPROTOCOL_FORK_ANNOUNCE,
+            super::continuity::SUBPROTOCOL_CONTINUITY_PROOF,
+            super::contested::SUBPROTOCOL_PARTITION,
+            super::contested::SUBPROTOCOL_RECONCILE,
+            super::compute::replica_group::SUBPROTOCOL_REPLICA_GROUP,
+            net_wire::channel::membership::SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_WINDOW,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_NACK,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_RESET,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_ACK,
+            super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN,
+            super::behavior::broadcast::SUBPROTOCOL_ROUTE_WITHDRAW,
+            super::behavior::broadcast::SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+        ];
+        ACCOUNTED.contains(&subprotocol_id)
+            || Self::accounts_inbound_subprotocol_gated(subprotocol_id)
+    }
+
+    /// The feature-gated half of [`Self::accounts_inbound_subprotocol`].
+    fn accounts_inbound_subprotocol_gated(subprotocol_id: u16) -> bool {
+        // Each of these modules exists only under its own feature,
+        // so naming them in the unconditional table above made the
+        // narrow configurations fail to compile (`E0433` on
+        // `traversal` in a `--no-default-features --features net`
+        // build). A `cfg`-gated arm per feature is the form that
+        // survives the narrow-config matrix.
+        #[cfg(feature = "nat-traversal")]
+        if subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX
+            || subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS
+        {
+            return true;
+        }
+        #[cfg(feature = "webrtc")]
+        if subprotocol_id == super::rtc::SUBPROTOCOL_RTC_SIGNAL {
+            return true;
+        }
+        #[cfg(feature = "redex")]
+        if subprotocol_id == super::redex::SUBPROTOCOL_REDEX {
+            return true;
+        }
+        #[cfg(feature = "meshdb")]
+        if subprotocol_id == super::behavior::meshdb::SUBPROTOCOL_MESHDB {
+            return true;
+        }
+        #[cfg(feature = "cortex")]
+        if subprotocol_id == super::behavior::fold::SUBPROTOCOL_FOLD {
+            return true;
+        }
+        #[cfg(feature = "dataforts")]
+        if subprotocol_id == super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER {
+            return true;
+        }
+        let _ = subprotocol_id;
+        false
+    }
+
+    /// Does a frame carrying `subprotocol_id` have its **bytes**
+    /// charged to the receiving stream's credit ledger?
+    ///
+    /// Narrower than [`Self::accounts_inbound_subprotocol`], which
+    /// answers the *sequence* question. Every accounted subprotocol
+    /// consumes a sequence on the stream it rides and is owed an ack;
+    /// the four stream-control subprotocols are the credit loop
+    /// itself, and a grant/ack/nack/reset that had to buy window from
+    /// the very window it exists to refill would deadlock the stream.
+    /// The leaf's sender excludes exactly this set from its debit
+    /// (`leaf::session::is_stream_control`), and native's grants ride
+    /// `CONTROL_STREAM_ID`, which is excluded on both sides anyway —
+    /// so this predicate is what keeps a leaf's on-stream feedback
+    /// frames from being charged against a ledger their sender never
+    /// debited.
+    fn charges_inbound_bytes(subprotocol_id: u16) -> bool {
+        !matches!(
+            subprotocol_id,
+            net_wire::stream_window::SUBPROTOCOL_STREAM_WINDOW
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_NACK
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_RESET
+                | net_wire::stream_window::SUBPROTOCOL_STREAM_ACK
+        )
     }
 
     /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
@@ -27246,7 +30996,7 @@ impl MeshNode {
     /// overwrite delivers the freshest `total_consumed` the drainer
     /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let partition_filter = self.partition_filter.clone();
         let pending = self.pending_stream_grants.clone();
         let notify = self.pending_stream_grants_notify.clone();
@@ -27331,7 +31081,7 @@ impl MeshNode {
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_WINDOW,
                         );
-                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                        if let Err(e) = sink.send(&packet, peer_addr).await {
                             tracing::debug!(error = %e, "StreamWindow grant send failed");
                             continue;
                         }
@@ -27355,7 +31105,7 @@ impl MeshNode {
                         );
                     }
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         peer_addr,
@@ -27366,7 +31116,7 @@ impl MeshNode {
                     )
                     .await;
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         peer_addr,
@@ -27390,7 +31140,7 @@ impl MeshNode {
     /// past `max_retries` are dropped from the window by `get_timed_out`.
     fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
         let peers = self.peers.clone();
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let control_stats = self.control_stats.clone();
@@ -27416,7 +31166,7 @@ impl MeshNode {
                 // below (that could deadlock against a concurrent peer
                 // insert/remove on the same shard).
                 let mut work: Vec<(
-                    SocketAddr,
+                    PeerAddr,
                     Arc<NetSession>,
                     Vec<Arc<super::RetransmitDescriptor>>,
                 )> = Vec::new();
@@ -27430,8 +31180,14 @@ impl MeshNode {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
                     for d in due {
+                        // Same one-shot restamp as the NACK path:
+                        // a rebuilt piece without its fragment
+                        // header is a partial payload at the peer.
+                        if let Some(f) = d.fragment {
+                            builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                        }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        if socket.send_to(&packet, addr).await.is_ok() {
+                        if sink.send(&packet, addr).await.is_ok() {
                             control_stats
                                 .retransmit_packets_sent
                                 .fetch_add(1, Ordering::Relaxed);
@@ -27442,9 +31198,23 @@ impl MeshNode {
                 // H-3: any stream whose reliable layer gave up
                 // retransmitting → tell the peer to fail its pending read
                 // now (a `StreamReset`) instead of stalling to a timeout.
-                let mut resets: Vec<(SocketAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                //
+                // NR2/NR4: and any stream whose RECEIVE half ended
+                // locally, for the same reason from the other
+                // direction. A reassembly group that acknowledged
+                // bytes it can never deliver, or a cap sweep that
+                // evicted arrivals only this receiver still held, both
+                // leave the SENDER waiting on data it has already
+                // discarded its copy of. One egress, one frame type:
+                // the peer's read fails fast either way.
+                let mut resets: Vec<(PeerAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
                 for peer in peers.iter() {
-                    let failed = peer.value().session.take_failed_stream_ids();
+                    let mut failed = peer.value().session.take_failed_stream_ids();
+                    for stream_id in peer.value().session.take_receive_terminals() {
+                        if !failed.contains(&stream_id) {
+                            failed.push(stream_id);
+                        }
+                    }
                     if !failed.is_empty() {
                         resets.push((peer.value().addr(), peer.value().session.clone(), failed));
                     }
@@ -27462,7 +31232,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27490,7 +31260,7 @@ impl MeshNode {
                 // NACKs are harmless (`on_nack` resends are bounded by
                 // `max_retries` and deduped by the receiver).
                 struct TickGaps {
-                    addr: SocketAddr,
+                    addr: PeerAddr,
                     session: Arc<NetSession>,
                     reports: Vec<super::session::GapReport>,
                 }
@@ -27541,7 +31311,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27568,7 +31338,7 @@ impl MeshNode {
                         })
                         .collect();
                     emit_control_chunks(
-                        &socket,
+                        &sink,
                         &mut builder,
                         &session,
                         addr,
@@ -27585,7 +31355,7 @@ impl MeshNode {
 
     /// Spawn heartbeat sender for all peers.
     fn spawn_heartbeat_loop(&self) -> JoinHandle<()> {
-        let socket = self.socket.clone();
+        let sink = self.sink.clone();
         let peers = self.peers.clone();
         let addr_to_node = self.addr_to_node.clone();
         let peer_addrs = self.peer_addrs.clone();
@@ -27593,6 +31363,11 @@ impl MeshNode {
         let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
         let subnet_challenges_evict = self.subnet_challenges.clone();
         let subnet_contexts_evict = self.subnet_contexts.clone();
+        // X10: the failure sweep ends a session's lifetime, so it
+        // retires that session's reassembly state exactly like the
+        // ordinary close path does.
+        #[cfg(feature = "webrtc")]
+        let rtc_reassembly_evict = Arc::clone(&self.rtc_reassembly);
         let identity_challenges_evict = self.identity_challenges.clone();
         let peer_identity_sessions_evict = self.peer_identity_sessions.clone();
         // Eviction is a peer-state transition like any other and runs
@@ -27687,22 +31462,51 @@ impl MeshNode {
                         // counter=0 across heartbeats so the replay
                         // window would reject every heartbeat after
                         // the first.
-                        let snapshot: Vec<(SocketAddr, Arc<NetSession>)> = peers
+                        // §12 / S0e §3 rows 10–11: heartbeat is
+                        // permitted maintenance for a provisional
+                        // session; the pingwave two lines below is
+                        // not. The split is per statement, not per
+                        // loop — which is exactly how they are
+                        // emitted, and why a coarser check would
+                        // have taken the heartbeat with it.
+                        #[cfg(feature = "webrtc")]
+                        let snapshot: Vec<(PeerAddr, Arc<NetSession>, bool)> = peers
                             .iter()
                             .filter_map(|entry| {
                                 let peer_addr = entry.value().addr();
                                 if partition_filter.contains(&peer_addr) {
                                     None
                                 } else {
-                                    Some((peer_addr, entry.value().session.clone()))
+                                    Some((
+                                        peer_addr,
+                                        entry.value().session.clone(),
+                                        entry.value().admission.is_provisional(),
+                                    ))
                                 }
                             })
                             .collect();
-                        for (peer_addr, session) in snapshot {
+                        #[cfg(not(feature = "webrtc"))]
+                        let snapshot: Vec<(PeerAddr, Arc<NetSession>, bool)> = peers
+                            .iter()
+                            .filter_map(|entry| {
+                                let peer_addr = entry.value().addr();
+                                if partition_filter.contains(&peer_addr) {
+                                    None
+                                } else {
+                                    Some((peer_addr, entry.value().session.clone(), false))
+                                }
+                            })
+                            .collect();
+                        for (peer_addr, session, provisional) in snapshot {
                             let packet = session.build_heartbeat();
-                            let _ = socket.send_to(&packet, peer_addr).await;
+                            let _ = sink.send(&packet, peer_addr).await;
+                            if provisional {
+                                // No pingwave to an unenrolled peer:
+                                // a topology beacon is participation.
+                                continue;
+                            }
                             // Pingwave (raw UDP — not encrypted, topology is public)
-                            let _ = socket.send_to(&pw_bytes, peer_addr).await;
+                            let _ = sink.send(&pw_bytes, peer_addr).await;
                         }
 
                         // Drop routes whose `updated_at` is past the age
@@ -27756,7 +31560,7 @@ impl MeshNode {
                                 };
                                 if !deliveries.is_empty() {
                                     dispatch_sensing_leader_deliveries(
-                                        &socket,
+                                        &sink,
                                         &peers,
                                         &addr_to_node,
                                         &router,
@@ -27836,7 +31640,7 @@ impl MeshNode {
                                     };
                                     if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                                         spawn_sensing_frame_send(
-                                            &socket,
+                                            &sink,
                                             &peers,
                                             &addr_to_node,
                                             &router,
@@ -28117,7 +31921,7 @@ impl MeshNode {
                                     }
                                 };
                                 dispatch_sensing_leader_deliveries(
-                                    &socket,
+                                    &sink,
                                     &peers,
                                     &addr_to_node,
                                     &router,
@@ -28142,7 +31946,7 @@ impl MeshNode {
                                     sensing::SENSING_PROVISIONAL_STREAM
                                 };
                                 spawn_sensing_frame_send(
-                                    &socket,
+                                    &sink,
                                     &peers,
                                     &addr_to_node,
                                     &router,
@@ -28218,6 +32022,23 @@ impl MeshNode {
                                 max_streams,
                                 "idle_timeout",
                             );
+                        }
+
+                        // **NR2: the reassembly deadline is a
+                        // deadline.** Expiry used to run only from
+                        // `accept`, i.e. only when some later
+                        // fragment happened to arrive — so a quiet
+                        // live session held an incomplete group's
+                        // acknowledged bytes indefinitely, and the
+                        // stream that lost them was never told. This
+                        // tick is the deadline's owner: it reaps on
+                        // the clock and then carries whatever it
+                        // reaped into the losing stream's terminal,
+                        // exactly as the ingress does.
+                        #[cfg(feature = "webrtc")]
+                        {
+                            rtc_reassembly_evict.expire(std::time::Instant::now());
+                            dispose_abandoned_rtc_groups(&rtc_reassembly_evict, &peers);
                         }
 
                         // Dead-peer eviction: walk peers in Failed
@@ -28324,6 +32145,23 @@ impl MeshNode {
                                 // security boundary.
                                 subnet_challenges_evict.forget_peer(node_id);
                                 subnet_contexts_evict.forget_peer(node_id);
+                                // X10: the session is gone, so its
+                                // partial fragment groups are
+                                // released and it is fenced against
+                                // the packets already past their
+                                // session lookup — the same
+                                // transaction the ordinary close
+                                // runs. Without this, a peer the
+                                // failure detector gave up on left
+                                // its acknowledged partial bytes
+                                // pinned in the mesh-owned map.
+                                // NR3: its receive lifetime is
+                                // retired with it.
+                                #[cfg(feature = "webrtc")]
+                                retire_session_receive_lifetime(
+                                    &rtc_reassembly_evict,
+                                    &old_info.session,
+                                );
                                 // Identity readiness, same lockstep.
                                 // A reconnect under this node_id must
                                 // re-authenticate its entity rather
@@ -28381,7 +32219,7 @@ impl MeshNode {
     /// may be reachable through it. A caller that holds a node id must
     /// use the node-keyed form and never launder the id through an
     /// address to get back a (possibly different) id.
-    fn node_owning_addr(&self, peer_addr: SocketAddr) -> Result<u64, AdapterError> {
+    fn node_owning_addr(&self, peer_addr: PeerAddr) -> Result<u64, AdapterError> {
         self.addr_to_node
             .get(&peer_addr)
             .map(|e| *e.value())
@@ -28400,7 +32238,7 @@ impl MeshNode {
         peer_addr: SocketAddr,
         batch: &Batch,
     ) -> Result<(), AdapterError> {
-        self.send_to_peer_node(self.node_owning_addr(peer_addr)?, batch)
+        self.send_to_peer_node(self.node_owning_addr(PeerAddr::Udp(peer_addr))?, batch)
             .await
     }
 
@@ -28455,7 +32293,7 @@ impl MeshNode {
                     PacketFlags::NONE
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                send_datagram(&self.socket, &packet, peer_addr).await?;
+                send_datagram(&self.sink, &packet, peer_addr).await?;
 
                 current_batch.clear();
                 current_size = 0;
@@ -28476,7 +32314,7 @@ impl MeshNode {
                 PacketFlags::NONE
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            send_datagram(&self.socket, &packet, peer_addr).await?;
+            send_datagram(&self.sink, &packet, peer_addr).await?;
         }
 
         // builder is dropped here — auto-released back to the pool
@@ -28549,8 +32387,8 @@ impl MeshNode {
                 routed.extend_from_slice(&routing_bytes);
                 routed.extend_from_slice(&net_packet);
 
-                self.socket
-                    .send_to(&routed, next_hop)
+                self.sink
+                    .send(&routed, next_hop)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
@@ -28577,8 +32415,8 @@ impl MeshNode {
             routed.extend_from_slice(&routing_bytes);
             routed.extend_from_slice(&net_packet);
 
-            self.socket
-                .send_to(&routed, next_hop)
+            self.sink
+                .send(&routed, next_hop)
                 .await
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
         }
@@ -28918,7 +32756,7 @@ impl MeshNode {
             &self.event_pingwave_gate,
             self.config.event_pingwave_min_gap,
             &self.proximity_graph,
-            &self.socket,
+            &self.sink,
             &self.peers,
             &self.partition_filter,
             resend,
@@ -30005,6 +33843,15 @@ impl MeshNode {
     /// latch is for.
     #[cfg(feature = "cortex")]
     pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
+        // S0e §3 row 13, enforced at the claim so no caller can
+        // reach around it: this announce bypasses the rate limit,
+        // and a provisional peer must never hold a mesh-wide flood
+        // trigger. Its Subscribe refusal is a policy answer, not a
+        // stale-announcement problem.
+        #[cfg(feature = "webrtc")]
+        if self.peer_is_provisional(target) {
+            return false;
+        }
         if self.rpc_corrective_announced.contains(&target) {
             return false;
         }
@@ -30265,6 +34112,35 @@ impl MeshNode {
                 return;
             }
         };
+
+        // §12 gate 3: subscription mutation. A provisional session
+        // may subscribe to exactly its own enrollment reply
+        // channel, bare — a wildcard, a token, a queue group or
+        // anyone else's channel is refused, not ignored.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            let action = match &msg {
+                MembershipMsg::Subscribe {
+                    channel,
+                    token,
+                    queue_group,
+                    ..
+                } => super::rtc::BootstrapAction::Subscribe {
+                    channel: channel.as_str(),
+                    has_token: token.is_some(),
+                    has_queue_group: queue_group.is_some(),
+                },
+                MembershipMsg::Unsubscribe { channel, .. } => {
+                    super::rtc::BootstrapAction::Unsubscribe {
+                        channel: channel.as_str(),
+                    }
+                }
+                _ => super::rtc::BootstrapAction::Other,
+            };
+            if !Self::admission_gate_subscribe(&endpoint, ctx, &action, from_node) {
+                return;
+            }
+        }
 
         match msg {
             MembershipMsg::Subscribe {
@@ -30688,7 +34564,7 @@ impl MeshNode {
             return;
         }
         let dest_sess = peer_entry.value().session.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let bytes = Bytes::from(encode_identity_proof(msg));
         drop(peer_entry);
 
@@ -30708,7 +34584,7 @@ impl MeshNode {
                 PacketFlags::NONE,
                 SUBPROTOCOL_IDENTITY_PROOF,
             );
-            let _ = socket.send_to(&packet, dest_addr).await;
+            let _ = sink.send(&packet, dest_addr).await;
         });
     }
 
@@ -30819,11 +34695,11 @@ impl MeshNode {
     /// any hop whose address equals the withdrawing sender's, which
     /// would re-install exactly the route we just dropped.
     fn promotable_direct_hop(
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         failure_detector: &FailureDetector,
         hop: u64,
-        addr: SocketAddr,
-        via_addr: SocketAddr,
+        addr: PeerAddr,
+        via_addr: PeerAddr,
     ) -> bool {
         if addr == via_addr {
             return false;
@@ -30846,12 +34722,12 @@ impl MeshNode {
     fn try_promote_graph_alternate(
         proximity_graph: &ProximityGraph,
         router: &NetRouter,
-        peer_addrs: &DashMap<u64, SocketAddr>,
-        addr_to_node: &DashMap<SocketAddr, u64>,
+        peer_addrs: &DashMap<u64, PeerAddr>,
+        addr_to_node: &DashMap<PeerAddr, u64>,
         failure_detector: &FailureDetector,
         dest: u64,
         from_node: u64,
-        via_addr: SocketAddr,
+        via_addr: PeerAddr,
     ) -> bool {
         // Exclude the withdrawing peer as a first hop: the UNRESTRICTED
         // shortest path to `dest` may still start with `from_node` (it
@@ -31120,7 +34996,7 @@ impl MeshNode {
         let failure_detector = ctx.failure_detector.clone();
         let route_withdraw_seq = ctx.route_withdraw_seq.clone();
         let route_withdraw_damper = ctx.route_withdraw_damper.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let peers = ctx.peers.clone();
         let partition_filter = ctx.partition_filter.clone();
         tokio::spawn(async move {
@@ -31145,7 +35021,7 @@ impl MeshNode {
                 run_route_withdrawal_flood(
                     route_withdraw_seq,
                     route_withdraw_damper,
-                    socket,
+                    sink,
                     peers,
                     partition_filter,
                     dest,
@@ -31381,11 +35257,7 @@ impl MeshNode {
                         ctx.sensing_local_entity_root,
                         &ctx.sensing_local_root,
                         capability_id,
-                        |cap| {
-                            cap.as_str()
-                                .strip_prefix("nrpc:")
-                                .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
-                        },
+                        |cap| ctx.capability_is_locally_private(cap),
                     );
                     let mut slot = ctx.sensing_leader.lock();
                     let Some(leader) = slot.as_mut() else {
@@ -31450,7 +35322,7 @@ impl MeshNode {
                     // provider-free path).
                     if !registration.warm_starts.is_empty() {
                         dispatch_sensing_leader_deliveries(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -31597,7 +35469,7 @@ impl MeshNode {
                         {
                             if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                                 spawn_sensing_frame_send(
-                                    &ctx.socket,
+                                    &ctx.sink,
                                     &ctx.peers,
                                     &ctx.addr_to_node,
                                     &ctx.router,
@@ -32138,7 +36010,7 @@ impl MeshNode {
                 if let Some(cached) = cached {
                     if let Ok(bytes) = sensing::encode_attestation(&cached) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -32182,7 +36054,7 @@ impl MeshNode {
                 {
                     if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -32765,7 +36637,7 @@ impl MeshNode {
                 // Forward the origin's SIGNED bytes verbatim —
                 // relays never author attestations (§4.2).
                 spawn_sensing_frame_send(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -33035,7 +36907,7 @@ impl MeshNode {
                     }
                 };
                 dispatch_sensing_leader_deliveries(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -33065,7 +36937,7 @@ impl MeshNode {
         }
         for node in forwards {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -33098,7 +36970,7 @@ impl MeshNode {
         };
         for node in peers {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -33213,11 +37085,7 @@ impl MeshNode {
             ctx.sensing_local_entity_root,
             &ctx.sensing_local_root,
             capability_id,
-            |cap| {
-                cap.as_str()
-                    .strip_prefix("nrpc:")
-                    .is_some_and(|svc| ctx.rpc_local_services.is_private(svc))
-            },
+            |cap| ctx.capability_is_locally_private(cap),
         );
         let reconciliation = {
             let mut slot = ctx.sensing_leader.lock();
@@ -33241,7 +37109,7 @@ impl MeshNode {
                     &ctx.sensing_observations,
                     &ctx.sensing_emitter,
                     emitter_stamp,
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -33294,7 +37162,7 @@ impl MeshNode {
                 {
                     if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                         spawn_sensing_frame_send(
-                            &ctx.socket,
+                            &ctx.sink,
                             &ctx.peers,
                             &ctx.addr_to_node,
                             &ctx.router,
@@ -33354,7 +37222,7 @@ impl MeshNode {
             // The origin's EXACT signed bytes — the leader never
             // authors refusals for a foreign origin (§4.2).
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -33412,7 +37280,7 @@ impl MeshNode {
         if let Some(upstream) = sensing::plan_provider_continuation(&continuation, |_org| None) {
             if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                 spawn_sensing_frame_send(
-                    &ctx.socket,
+                    &ctx.sink,
                     &ctx.peers,
                     &ctx.addr_to_node,
                     &ctx.router,
@@ -33440,7 +37308,7 @@ impl MeshNode {
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
             spawn_sensing_frame_send(
-                &ctx.socket,
+                &ctx.sink,
                 &ctx.peers,
                 &ctx.addr_to_node,
                 &ctx.router,
@@ -33768,7 +37636,1433 @@ impl MeshNode {
         }
     }
 
+    /// Send one `RtcSignalMsg` to `peer_node_id` over its existing
+    /// session (plan §5 Layer 3).
+    ///
+    /// The session may be routed — that is the point: signalling is
+    /// how a pair that has no direct path arranges one, and every
+    /// anchor between them forwards the packet without a key for
+    /// its contents.
+    #[cfg(feature = "webrtc")]
+    pub async fn send_rtc_signal(
+        &self,
+        peer_node_id: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<(), AdapterError> {
+        let encoded = msg
+            .to_bytes()
+            .map_err(|e| AdapterError::Connection(format!("rtc signal encode failed: {e}")))?;
+        // Route-aware by necessity: signalling exists precisely for
+        // a pair with NO direct path, so the common case is a
+        // routed session and the frame has to ride a routing
+        // envelope. `send_subprotocol_to_node` sends the bare Net
+        // packet to the peer's send address — for a routed peer
+        // that is the anchor, which holds no session for it and
+        // would drop it.
+        let (dest_addr, session, is_direct) = self
+            .peers
+            .get(&peer_node_id)
+            .map(|e| {
+                (
+                    e.value().addr(),
+                    e.value().session.clone(),
+                    e.value().is_direct(),
+                )
+            })
+            .ok_or_else(|| {
+                AdapterError::Connection(format!("no session for node {peer_node_id:#x}"))
+            })?;
+        if is_direct {
+            return self
+                .send_subprotocol_to_node(
+                    peer_node_id,
+                    super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+                    &encoded,
+                )
+                .await;
+        }
+
+        let stream_id = super::rtc::SUBPROTOCOL_RTC_SIGNAL as u64;
+        let events = [Bytes::from(encoded)];
+        let debit = outbound_subprotocol_tx_seq(
+            &session,
+            stream_id,
+            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+            &events,
+        );
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let packet = builder.build_subprotocol(
+            stream_id,
+            debit.seq(),
+            &events,
+            PacketFlags::NONE,
+            super::rtc::SUBPROTOCOL_RTC_SIGNAL,
+        );
+        let routing_header = RoutingHeader::new(peer_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + packet.len());
+        routed.extend_from_slice(&routing_header.to_bytes());
+        routed.extend_from_slice(&packet);
+        let next_hop = self
+            .router
+            .routing_table()
+            .lookup(peer_node_id)
+            .unwrap_or(dest_addr);
+        self.sink
+            .send(&routed, next_hop)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("rtc signal send failed: {e}")))?;
+        debit.commit();
+        Ok(())
+    }
+
+    /// Attach the Stage 4a RTC fields to an announcement being
+    /// built, each under its own condition (plan §5, §11).
+    ///
+    /// `noise_pubkey` rides on `rtc.is_some()` — it is what lets a
+    /// peer build a session with us without an out-of-band key
+    /// handoff, and a node with no RTC has no use advertising it
+    /// yet. `rtc_bootstrap` needs `serve_bootstrap`, because
+    /// advertising a URL nobody serves is worse than advertising
+    /// nothing. `rtc_addr` needs `public_addr`: a node that has not
+    /// been told its public address does not guess one.
+    #[cfg(feature = "webrtc")]
+    fn with_rtc_announcement_fields(&self, ann: CapabilityAnnouncement) -> CapabilityAnnouncement {
+        let Some(rtc) = self.config.rtc.as_ref() else {
+            return ann;
+        };
+        let bootstrap = if rtc.serve_bootstrap {
+            // **Stage 4b: the configured listener URL is the real
+            // one.** 4a could only synthesise `https://<rtc addr>/rtc`
+            // from the ICE socket — an address no browser can present
+            // to a certificate — and that placeholder was a carried
+            // gap. It remains only as the fallback for an operator
+            // who turned the flag on without naming a URL.
+            rtc.bootstrap_url
+                .clone()
+                .or_else(|| rtc.public_addr.map(|addr| format!("https://{addr}/rtc")))
+                .or_else(|| {
+                    self.rtc_driver
+                        .as_ref()
+                        .map(|d| format!("https://{}/rtc", d.local_addr()))
+                })
+        } else {
+            None
+        };
+        ann.with_noise_pubkey(Some(*self.public_key()))
+            .with_rtc_bootstrap(bootstrap)
+            .with_rtc_addr(rtc.public_addr)
+            // `Option<String>`, not a `SocketAddr`: an anchor may
+            // announce a name. `None` when nothing is configured, so
+            // the signed transcript of an anchor that does not serve
+            // a second STUN socket is byte-identical to today's.
+            .with_rtc_stun_addr(self.rtc_public_stun_addr().map(|a| a.to_string()))
+    }
+
+    /// §10 part 2: how many **application-data** packets this node
+    /// has forwarded from `src` to `dst`. Signalling is excluded by
+    /// construction.
+    #[cfg(feature = "webrtc")]
+    pub fn forwarded_app_packets(&self, src_id: u32, dest_id: u64) -> u64 {
+        self.forwarded_app_packets
+            .get(&(src_id, dest_id))
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
+    /// Test-only: send a routed envelope addressed to
+    /// `dest_node_id` **over this peer's own session**, the way a
+    /// browser would.
+    ///
+    /// The §12 witness needs this because `connect_via` takes a
+    /// `SocketAddr` relay and therefore always leaves over UDP; a
+    /// browser has no UDP path and asks its anchor for transit on
+    /// the DataChannel. Without it the F1 gate could only ever be
+    /// witnessed on a path a browser does not have.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn send_transit_probe_for_test(
+        &self,
+        via_node_id: u64,
+        dest_node_id: u64,
+    ) -> Result<(), AdapterError> {
+        let (addr, session) = self
+            .peers
+            .get(&via_node_id)
+            .map(|e| (e.value().addr(), e.value().session.clone()))
+            .ok_or_else(|| AdapterError::Connection("no session with the anchor".into()))?;
+        let stream_id = 0x0F00u64;
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let inner = builder.build(
+            stream_id,
+            seq,
+            &[Bytes::from_static(b"transit")],
+            PacketFlags::NONE,
+        );
+        let routing = RoutingHeader::new(dest_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&routing.to_bytes());
+        routed.extend_from_slice(&inner);
+        self.sink
+            .send(&routed, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
+    }
+
+    /// Test-only view of the corrective-announce claim, so the
+    /// §12 witness can assert the guard rather than the flood.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn claim_corrective_announce_for_test(&self, target: u64) -> bool {
+        self.claim_corrective_announce(target)
+    }
+
+    /// Is this peer's session provisional? Public so the enrollment
+    /// and reply-subscription paths can ask without reaching into
+    /// `PeerInfo`.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_is_provisional(&self, node_id: u64) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|e| e.value().admission.is_provisional())
+    }
+
+    /// §12 step 4: promote **the exact live session incarnation**.
+    ///
+    /// `expected_session_id` is captured when the enrollment REQUEST
+    /// is decoded, and `expected_endpoint` is the RTC handle it
+    /// arrived on. If either has moved by the time the handler
+    /// succeeds — the peer re-handshaked, the channel closed and
+    /// reopened, another incarnation took the `node_id` — this
+    /// promotes **nothing** and the current session stays
+    /// provisional. Promoting "whichever session currently occupies
+    /// that NodeId" is precisely what §12 forbids.
+    ///
+    /// Returns whether a promotion happened.
+    #[cfg(feature = "webrtc")]
+    pub fn promote_admission(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+    ) -> bool {
+        let Some(mut entry) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        let info = entry.value_mut();
+        if info.session.session_id() != expected_session_id || info.addr() != expected_endpoint {
+            return false;
+        }
+        if !info.admission.is_provisional() {
+            return false;
+        }
+        info.admission = super::rtc::PeerAdmission::Admitted {
+            promoted_at: std::time::Instant::now(),
+            session_id: expected_session_id,
+        };
+        drop(entry);
+        self.provisional_endpoints.remove(&expected_endpoint);
+        if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+            stats.note_admission_promoted();
+        }
+        true
+    }
+
+    /// Charge one enrollment REQUEST frame and reserve its
+    /// in-flight slot against the sender's provisional budget (R3).
+    ///
+    /// `false` refuses the frame **before** dispatch, counted. Only
+    /// the enrollment service is charged: everything else a
+    /// provisional peer might send was already refused above.
+    #[cfg(all(feature = "webrtc", feature = "cortex"))]
+    fn charge_enrollment_request(&self, node_id: u64, service: &str) -> bool {
+        if service != super::rtc::ENROLL_SERVICE {
+            return true;
+        }
+        let refused = {
+            let Some(mut entry) = self.peers.get_mut(&node_id) else {
+                return false;
+            };
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return true;
+            };
+            budget
+                .charge_enroll_request()
+                .and_then(|()| budget.reserve_enrollment())
+                .is_err()
+        };
+        if refused {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Release the in-flight enrollment reservation on a terminal
+    /// outcome (R3): success, rejection, or a retired call.
+    #[cfg(feature = "webrtc")]
+    fn release_enrollment_slot_of(&self, node_id: u64, session_id: u64) {
+        if let Some(mut entry) = self.peers.get_mut(&node_id) {
+            // R3-A: only the incarnation that holds the reservation
+            // gets its slot back. An obsolete completion must never
+            // release a successor's budget.
+            if entry.value().session.session_id() != session_id {
+                return;
+            }
+            if let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            {
+                budget.release_enrollment();
+            }
+        }
+    }
+
+    /// Run the reclaim decision for one selected incarnation
+    /// (R3 witness seam). `true` when this call owned the removal.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn close_provisional_session_for_test(
+        &self,
+        node_id: u64,
+        endpoint: PeerAddr,
+        session_id: u64,
+    ) -> bool {
+        self.close_provisional_session(node_id, endpoint, session_id)
+    }
+
+    /// Is there a reservation for this **exact** key (Kyra's
+    /// seam)? The witnesses need to see the key, not infer it from
+    /// a promotion that may have consumed someone else's.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn kyra_has_enrollment_reservation(&self, node: u64, session: u64, call: u64) -> bool {
+        self.pending_promotions.contains_key(&(node, session, call))
+    }
+
+    /// Arm an enrollment reservation exactly as the gate does
+    /// (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn arm_enrollment_reservation_for_test(
+        &self,
+        node_id: u64,
+        session_id: u64,
+        endpoint: PeerAddr,
+        call_id: u64,
+    ) {
+        self.pending_promotions
+            .insert((node_id, session_id, call_id), endpoint);
+    }
+
+    /// Replace this peer's provisional session with a fresh
+    /// incarnation on the same endpoint, returning the new session
+    /// id (R2 witness seam: the reconnection Kyra's probe performs
+    /// over the wire, without the reconnect).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn replace_provisional_for_test(&self, node_id: u64, endpoint: PeerAddr) -> u64 {
+        let Some(mut entry) = self.peers.get_mut(&node_id) else {
+            return 0;
+        };
+        let keys = super::crypto::SessionKeys {
+            tx_key: [0x11u8; 32],
+            rx_key: [0x22u8; 32],
+            session_id: super::current_timestamp_micros() | 1,
+            remote_static_pub: [0u8; 32],
+            route_hop_tx_key: [0u8; 32],
+            route_hop_rx_key: [0u8; 32],
+        };
+        let session = Arc::new(NetSession::new(
+            keys,
+            endpoint,
+            self.config.packet_pool_size,
+            self.config.default_reliable,
+        ));
+        let session_id = session.session_id();
+        entry.value_mut().session = session;
+        self.retire_enrollment_reservations(node_id);
+        session_id
+    }
+
+    /// Drive the response half by call id (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn promote_on_enrollment_response_for_test(&self, node_id: u64, call_id: u64) -> bool {
+        let origin = self
+            .provisional_reply_origin(node_id)
+            .unwrap_or_else(|| self.bind_origin_for_test(node_id));
+        let session = self.peer_session_id(node_id).unwrap_or(0);
+        self.promote_on_enrollment_response(
+            node_id,
+            &super::rtc::enroll_reply_channel(origin),
+            call_id,
+            session,
+        )
+    }
+
+    /// Drive the rejection half by call id (R2 witness seam).
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn note_enrollment_rejected_for_test(&self, node_id: u64, call_id: u64) {
+        let origin = self
+            .provisional_reply_origin(node_id)
+            .unwrap_or_else(|| self.bind_origin_for_test(node_id));
+        let session = self.peer_session_id(node_id).unwrap_or(0);
+        self.note_enrollment_rejected(
+            node_id,
+            &super::rtc::enroll_reply_channel(origin),
+            call_id,
+            session,
+        );
+    }
+
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    fn bind_origin_for_test(&self, node_id: u64) -> u64 {
+        let origin = 0x4B59_5241_0000_0001u64;
+        Self::bind_provisional_origin_locked(node_id, origin, &self.peers);
+        origin
+    }
+
+    /// The dispatch byte an nRPC frame carries (R3-A).
+    #[cfg(feature = "webrtc")]
+    fn rpc_dispatch_of(frame: &Bytes) -> Option<u8> {
+        use super::cortex::{EventMeta, EVENT_META_SIZE};
+        if frame.len() < EVENT_META_SIZE {
+            return None;
+        }
+        EventMeta::from_bytes(&frame[..EVENT_META_SIZE]).map(|meta| meta.dispatch)
+    }
+
+    /// The `call_id` an nRPC frame carries, read from its
+    /// `EventMeta` prefix (R2).
+    #[cfg(feature = "webrtc")]
+    fn rpc_call_id_of(frame: &Bytes) -> u64 {
+        use super::cortex::{EventMeta, EVENT_META_SIZE};
+        if frame.len() < EVENT_META_SIZE {
+            return 0;
+        }
+        // The request's `call_id` rides in `seq_or_ts` (see
+        // `EventMeta::new` at the client's publish site).
+        EventMeta::from_bytes(&frame[..EVENT_META_SIZE]).map_or(0, |meta| meta.seq_or_ts)
+    }
+
+    /// Consume the reservation for **this** `(node, call)` — and
+    /// only it (R2). `None` when the call holds none.
+    #[cfg(feature = "webrtc")]
+    /// Consume the reservation for **this exact** `(node, session,
+    /// call)` — never a scan (R2-A).
+    ///
+    /// It used to find by node + call, scanning across session ids:
+    /// call ids are sender-controlled, so a peer that reconnected
+    /// and reused a call id had its *successor's* reservation
+    /// consumed — and promoted — by the old call's completion.
+    #[cfg(feature = "webrtc")]
+    fn take_enrollment_reservation(
+        &self,
+        node_id: u64,
+        call_id: u64,
+        session_id: u64,
+    ) -> Option<(u64, PeerAddr)> {
+        let (_, endpoint) = self
+            .pending_promotions
+            .remove(&(node_id, session_id, call_id))?;
+        Some((session_id, endpoint))
+    }
+
+    /// Retire every reservation this node holds (R2): the peer was
+    /// evicted or replaced, so a late success or rejection for it
+    /// must be a counted no-op rather than a promotion.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn retire_enrollment_reservations(&self, node_id: u64) {
+        let keys: Vec<(u64, u64, u64)> = self
+            .pending_promotions
+            .iter()
+            .map(|e| *e.key())
+            .filter(|(node, _, _)| *node == node_id)
+            .collect();
+        for key in keys {
+            if self.pending_promotions.remove(&key).is_some() {
+                if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                    stats.note_admission_reservation_retired();
+                }
+            }
+        }
+    }
+
+    /// §12 step 4, the response half: an enrollment call that
+    /// produced a response promotes the incarnation captured at its
+    /// own REQUEST decode — and only that one (R2).
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn promote_on_enrollment_response(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+        receiving_session_id: u64,
+    ) -> bool {
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return false;
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return false;
+        }
+        // R3-A: the in-flight slot is released **only** for the
+        // call that owned it, and only when its own reservation is
+        // consumed here. Releasing before proving ownership handed
+        // a successor's budget to an obsolete completion.
+        let Some((session_id, endpoint)) =
+            self.take_enrollment_reservation(node_id, call_id, receiving_session_id)
+        else {
+            // Not this call's reservation to spend. A completion
+            // whose own reservation was retired (eviction,
+            // replacement, timeout) promotes nothing.
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_promotion_orphaned();
+            }
+            return false;
+        };
+        self.release_enrollment_slot_of(node_id, session_id);
+        self.promote_admission(node_id, session_id, endpoint)
+    }
+
+    /// **R6-B: which node actually holds the reservation for this
+    /// `(session, call)`?**
+    ///
+    /// Session ids are assigned by this node and never appear on
+    /// the wire as a claim, so `(session, call)` names one
+    /// incarnation unforgeably. Resolving the promotion target this
+    /// way — rather than from a claimed origin — is what stops a
+    /// provisional peer that binds a *victim's* origin from being
+    /// promoted by the victim's own enrollment response, which the
+    /// `bound_origin` scan below would have allowed (it takes the
+    /// first match, and an unauthenticated peer may claim any
+    /// origin).
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn enrollment_reservation_owner(
+        &self,
+        session_id: u64,
+        call_id: u64,
+    ) -> Option<u64> {
+        self.pending_promotions.iter().find_map(|e| {
+            let (node, session, call) = *e.key();
+            (session == session_id && call == call_id).then_some(node)
+        })
+    }
+
+    /// The provisional peer bound to this enrollment reply
+    /// channel's origin, if any.
+    ///
+    /// A browser's enrollment REQUEST is its first message: the
+    /// anchor has pinned no identity for it and its origin is in no
+    /// reverse index, so neither of the response path's ordinary
+    /// resolutions finds it. The session's own bound origin does.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn provisional_node_for_reply_channel(&self, reply_channel: &str) -> Option<u64> {
+        let origin = super::rtc::PeerAdmission::origin_from_enroll_reply_channel(reply_channel)?;
+        self.peers
+            .iter()
+            .find_map(|e| (e.value().admission.bound_origin() == Some(origin)).then(|| *e.key()))
+    }
+
+    /// Which origin may name this peer's enrollment reply channel?
+    ///
+    /// A pinned identity wins — that is an announcement this node
+    /// verified. A provisional peer has none by construction (gate
+    /// 4 refuses to ingest one), so it falls back to the origin the
+    /// session bound on first use. A session that has claimed
+    /// nothing yet answers `None`, and promotes nothing.
+    #[cfg(feature = "webrtc")]
+    fn provisional_reply_origin(&self, node_id: u64) -> Option<u64> {
+        if let Some(entity) = self.peer_entity_id(node_id) {
+            return Some(entity.origin_hash());
+        }
+        self.peers
+            .get(&node_id)
+            .and_then(|e| e.value().admission.bound_origin())
+    }
+
+    /// R3-A: retire the owned call on a terminal outcome this
+    /// anchor cannot read as an admission or a rejection — a
+    /// handler error, a panic, a malformed body.
+    ///
+    /// Promotes nothing and counts nothing as a rejection; it
+    /// releases exactly the reservation and in-flight slot the call
+    /// held, so the peer's remaining allowance is usable.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn retire_enrollment_call(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+        receiving_session_id: u64,
+    ) {
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return;
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return;
+        }
+        if self
+            .take_enrollment_reservation(node_id, call_id, receiving_session_id)
+            .is_some()
+        {
+            self.release_enrollment_slot_of(node_id, receiving_session_id);
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_reservation_retired();
+            }
+        }
+    }
+
+    /// §12 step 4, the refusal half: an enrollment that was
+    /// **rejected** consumes its pending promotion and promotes
+    /// nothing. The session stays provisional and expires on its
+    /// own clock; the refusal is counted so it is visible as a
+    /// refusal rather than as an absence.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn note_enrollment_rejected(
+        &self,
+        node_id: u64,
+        reply_channel: &str,
+        call_id: u64,
+        receiving_session_id: u64,
+    ) {
+        let Some(origin) = self.provisional_reply_origin(node_id) else {
+            return;
+        };
+        if reply_channel != super::rtc::enroll_reply_channel(origin) {
+            return;
+        }
+        if self
+            .take_enrollment_reservation(node_id, call_id, receiving_session_id)
+            .is_some()
+        {
+            self.release_enrollment_slot_of(node_id, receiving_session_id);
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_rejected_outcome();
+            }
+        }
+    }
+
+    /// How many provisional sessions this node currently holds.
+    #[cfg(feature = "webrtc")]
+    pub fn provisional_count(&self) -> usize {
+        self.provisional_endpoints.len()
+    }
+
+    /// §12 step 5: close and reclaim provisional sessions that have
+    /// expired, breached a bound, or exceeded `max_provisional`.
+    ///
+    /// Called on the heartbeat tick. The oldest are reclaimed first
+    /// when the global cap is over, because a browser that has sat
+    /// unenrolled for 29 s is a worse bet than one that arrived a
+    /// moment ago.
+    #[cfg(feature = "webrtc")]
+    pub fn reclaim_provisional_sessions(&self) -> usize {
+        let max = self
+            .config
+            .rtc
+            .as_ref()
+            .map(|rtc| rtc.max_provisional)
+            .unwrap_or(usize::MAX);
+        let now = std::time::Instant::now();
+        // R3: the snapshot carries the **session id** as well, so
+        // the removal names the exact incarnation it selected. The
+        // predicate used to be "is provisional", which let a sweep
+        // remove a *replacement* it never looked at, and close the
+        // endpoint of a session that had since been promoted.
+        let mut candidates: Vec<(u64, PeerAddr, u64, std::time::Instant)> = Vec::new();
+        let mut expired: Vec<(u64, PeerAddr, u64)> = Vec::new();
+        for entry in self.peers.iter() {
+            let info = entry.value();
+            if let super::rtc::PeerAdmission::Provisional { since, .. } = info.admission {
+                let session_id = info.session.session_id();
+                if info.admission.is_expired(now) {
+                    expired.push((info.node_id, info.addr(), session_id));
+                } else {
+                    candidates.push((info.node_id, info.addr(), session_id, since));
+                }
+            }
+        }
+        // Oldest first, so the cap sheds the least promising.
+        candidates.sort_by_key(|(_, _, _, since)| *since);
+        let over = candidates.len().saturating_sub(max);
+        let mut doomed = expired;
+        doomed.extend(
+            candidates
+                .into_iter()
+                .take(over)
+                .map(|(n, a, s, _)| (n, a, s)),
+        );
+
+        let mut count = 0usize;
+        for (node_id, endpoint, session_id) in doomed {
+            if self.close_provisional_session(node_id, endpoint, session_id) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Close one provisional session and reclaim its state.
+    #[cfg(feature = "webrtc")]
+    fn close_provisional_session(&self, node_id: u64, endpoint: PeerAddr, session_id: u64) -> bool {
+        // R3: route the removal through the exact-incarnation
+        // transition, and take side effects ONLY if it owned the
+        // removal. The old path removed by "still provisional" and
+        // closed the endpoint regardless — so a replacement could
+        // be removed, and a session promoted between selection and
+        // removal could still have its channel closed.
+        let owned = self
+            .peer_eviction_ctx()
+            .evict_session_at(node_id, session_id, endpoint);
+        if !owned {
+            return false;
+        }
+        self.retire_enrollment_reservations(node_id);
+        if let (Some(driver), PeerAddr::Rtc(id)) = (self.rtc_driver.as_ref(), endpoint) {
+            driver.stats().note_admission_reclaimed();
+            let driver = driver.clone();
+            tokio::spawn(async move {
+                let _ = driver.close(id).await;
+            });
+        }
+        true
+    }
+
+    /// §12 gate 5 for the nRPC carrier: may this caller's session
+    /// have this service invoked on its behalf?
+    ///
+    /// Admitted and native sessions pass unconditionally. A
+    /// provisional session passes only the bounded enrollment call
+    /// — the same service, addressed to this node, with its own
+    /// reply channel — and every refusal is counted.
+    #[cfg(all(feature = "webrtc", feature = "cortex"))]
+    pub(crate) fn rtc_admission_allows_rpc(
+        &self,
+        inbound: &super::cortex::RpcInboundEvent,
+        service: &str,
+    ) -> bool {
+        let Some(entry) = self.peers.get(&inbound.from_node) else {
+            return true;
+        };
+        if !entry.value().admission.is_provisional() {
+            return true;
+        }
+        let endpoint = entry.value().addr();
+        drop(entry);
+        // Same one-session-one-identity binding the subscribe gate
+        // applies: the REQUEST's claimed origin must be the origin
+        // this session already claimed, if any.
+        if !Self::bind_provisional_origin_locked(
+            inbound.from_node,
+            inbound.origin_hash,
+            &self.peers,
+        ) {
+            if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
+        let reply_channel = super::rtc::enroll_reply_channel(inbound.origin_hash);
+        let action = super::rtc::BootstrapAction::NrpcRequest {
+            service,
+            target_node: self.node_id,
+            reply_channel: &reply_channel,
+            body_len: inbound.payload.len(),
+        };
+        let allowed = Self::admission_gate_deliver(
+            endpoint,
+            self.rtc_driver.as_ref().map(|d| Arc::clone(d.stats())),
+            self.node_id,
+            &action,
+            inbound.origin_hash,
+        );
+        // R3-A: classify the frame **before** any accounting. A
+        // CANCEL is the caller retiring its own call, not another
+        // REQUEST: charging it spent one of the four and refused
+        // it, so a cancelling caller lost its allowance and its
+        // in-flight slot stayed held.
+        if Self::rpc_dispatch_of(&inbound.payload) == Some(super::cortex::DISPATCH_RPC_CANCEL) {
+            let call_id = Self::rpc_call_id_of(&inbound.payload);
+            let origin = self.provisional_reply_origin(inbound.from_node);
+            if let Some(origin) = origin {
+                self.retire_enrollment_call(
+                    inbound.from_node,
+                    &super::rtc::enroll_reply_channel(origin),
+                    call_id,
+                    inbound.session_id,
+                );
+            }
+            return allowed;
+        }
+        // R3: charge the REQUEST and reserve the in-flight call
+        // BEFORE the frame is dispatched. The declared bounds
+        // (initial + 3 retries, one call in flight) existed only as
+        // constants — five sequential REQUESTs each reached the
+        // handler (Kyra: `KYRA_ENROLL executions=5`).
+        let allowed = allowed && self.charge_enrollment_request(inbound.from_node, service);
+        if allowed {
+            // §12 step 4 + R2: bind the reservation to the exact
+            // call AND the incarnation that carried it. The
+            // response path may consume only its own key, and
+            // `promote_admission` re-verifies the session — so
+            // neither a replaced session nor another call's
+            // completion can promote anything.
+            let call_id = Self::rpc_call_id_of(&inbound.payload);
+            self.pending_promotions
+                .insert((inbound.from_node, inbound.session_id, call_id), endpoint);
+        }
+        if !allowed {
+            tracing::debug!(
+                service = service,
+                from_node = format!("{:#x}", inbound.from_node),
+                "§12: refusing an nRPC service to a provisional session"
+            );
+        }
+        allowed
+    }
+
+    /// Test-only: every signalling frame this node admitted, in
+    /// arrival order, drained.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn drain_rtc_signals_for_test(&self) -> Vec<(u64, super::rtc::RtcSignalMsg)> {
+        std::mem::take(&mut *self.rtc_signal_tap.lock())
+    }
+
+    /// **Gate 1 of 5 (§12): forwarding.** May this anchor forward
+    /// on behalf of the *adjacent* session `source`?
+    ///
+    /// Called at F1–F7 (S0e §4). At F1 it sits **below** the
+    /// `dest_id == local_node_id` test, so the enrollment envelope —
+    /// which `connect_via` addresses to the anchor itself — is
+    /// delivered locally rather than refused. That ordering is the
+    /// whole of S0e's named attack: `relay_addr` and `dest_node_id`
+    /// are independent parameters, and nothing but this check stops
+    /// a provisional peer putting a third party in the envelope.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_forward(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_forward())
+    }
+
+    /// **Gate 2 of 5 (§12): route installation.** A provisional peer
+    /// gets a session, not discovery participation — the routed
+    /// handshake installs the peer and withholds the route.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_route_install(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_route())
+    }
+
+    /// **Gate 3 of 5 (§12): subscription mutation.**
+    ///
+    /// A provisional peer may subscribe to exactly one channel: its
+    /// own enrollment reply channel, bare. Everything else — a
+    /// wildcard, a token, a queue group, someone else's channel — is
+    /// refused, not ignored.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_subscribe(
+        source: &PeerAddr,
+        ctx: &DispatchCtx,
+        action: &super::rtc::BootstrapAction<'_>,
+        caller_origin_node: u64,
+    ) -> bool {
+        if !Self::is_provisional(source, ctx) {
+            return true;
+        }
+        // A provisional peer has no pinned identity, so the origin
+        // that names its reply channel IS its claim. Bind it to the
+        // session on first use and require every later claim to
+        // match, so a peer cannot subscribe as one origin and
+        // enroll as another.
+        let claimed = match action {
+            super::rtc::BootstrapAction::Subscribe { channel, .. }
+            | super::rtc::BootstrapAction::Unsubscribe { channel } => {
+                super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel)
+            }
+            _ => None,
+        };
+        let allowed = match claimed {
+            Some(origin) if Self::bind_provisional_origin(caller_origin_node, origin, ctx) => {
+                super::rtc::allow_provisional_action(action, ctx.local_node_id, origin).is_ok()
+            }
+            // No enrollment-shaped channel, or a second, different
+            // origin claim on the same session: run the allow-list
+            // against an origin this channel cannot match, so the
+            // answer is a refusal with a counter rather than a drop.
+            _ => false,
+        };
+        if !allowed {
+            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                stats.note_admission_refused_subscribe();
+            }
+        }
+        allowed
+    }
+
+    /// [`Self::bind_provisional_origin`] against a peer map held
+    /// directly rather than through a [`DispatchCtx`].
+    #[cfg(feature = "webrtc")]
+    fn bind_provisional_origin_locked(
+        node_id: u64,
+        origin: u64,
+        peers: &DashMap<u64, PeerInfo>,
+    ) -> bool {
+        match peers.get_mut(&node_id) {
+            Some(mut entry) => entry.value_mut().admission.bind_origin(origin),
+            None => false,
+        }
+    }
+
+    /// Bind `origin` to `node_id`'s provisional session, or
+    /// re-check an existing binding. `false` means the session
+    /// already claimed a different origin.
+    #[cfg(feature = "webrtc")]
+    fn bind_provisional_origin(node_id: u64, origin: u64, ctx: &DispatchCtx) -> bool {
+        match ctx.peers.get_mut(&node_id) {
+            Some(mut entry) => entry.value_mut().admission.bind_origin(origin),
+            None => false,
+        }
+    }
+
+    /// The admission a session installed *through* `source`
+    /// inherits (R1).
+    ///
+    /// A peer reached over a relay is no more authorized than the
+    /// relay that carried its handshake: if the immediate upstream
+    /// endpoint is an unenrolled RTC session, the logical peer it
+    /// introduces starts provisional too. A native/UDP upstream is
+    /// unchanged.
+    #[cfg(feature = "webrtc")]
+    fn derived_admission(source: PeerAddr, ctx: &DispatchCtx) -> super::rtc::PeerAdmission {
+        if matches!(source, PeerAddr::Rtc(_))
+            && matches!(
+                Self::ingress_admission(&source, ctx),
+                IngressAdmission::Denied
+            )
+        {
+            super::rtc::PeerAdmission::provisional(std::time::Instant::now())
+        } else {
+            super::rtc::PeerAdmission::default()
+        }
+    }
+
+    /// Reassemble a leaf fragment group at the RTC ingress (R4).
+    ///
+    /// `Some(events)` is what the rest of the dispatch path should
+    /// treat as this packet's events: the packet's own events when
+    /// it is not a fragment, or the single reassembled payload when
+    /// this piece completed its group. `None` means the piece was
+    /// buffered, refused or contradicted its group — nothing is
+    /// delivered, and nothing partial ever reaches a handler.
+    ///
+    /// Confined to RTC sources. A UDP peer is a native node that
+    /// never sets `frag_flags`, and widening this to every ingress
+    /// would put a map lookup on the datagram hot path for a case
+    /// that cannot occur there.
+    #[cfg(feature = "webrtc")]
+    fn reassemble_rtc_fragments(
+        parsed: &ParsedPacket,
+        session: &NetSession,
+        events: Vec<Bytes>,
+        ctx: &DispatchCtx,
+    ) -> Option<Vec<Bytes>> {
+        use net_wire::protocol::FRAG_FRAGMENTED;
+
+        if parsed.header.frag_flags & FRAG_FRAGMENTED == 0
+            || !matches!(parsed.source, PeerAddr::Rtc(_))
+        {
+            return Some(events);
+        }
+        // A fragment carries exactly one event: the leaf splits a
+        // payload, it does not batch several into a piece. Anything
+        // else is a claim this ingress will not reconstruct.
+        let [piece] = events.as_slice() else {
+            tracing::debug!(
+                session_id = session.session_id(),
+                events = events.len(),
+                "rtc: fragmented packet carrying more than one event dropped"
+            );
+            return None;
+        };
+        // NR3, first half of the capture-to-dispatch bound. The
+        // top-of-dispatch check refuses a frame whose incarnation is
+        // retired; this is the same question — retirement, NOT the
+        // advisory `is_active` flag, see `process_local_packet` —
+        // asked again here, close to the admission, so an already
+        // retired lifetime costs nothing further.
+        //
+        // **R4-8: it is not the authority.** The authority is read
+        // INSIDE the reassembler's session guard, at the insertion
+        // itself (`accept_under_lifetime` below), because the
+        // interval this check misses is precisely the one between it
+        // and the write.
+        if session.is_receive_lifetime_retired() {
+            tracing::debug!(
+                session_id = session.session_id(),
+                fragment_id = parsed.header.fragment_id,
+                "rtc: leaf fragment refused, its session incarnation is retired"
+            );
+            return None;
+        }
+        // The NR3 seam: a captured-and-checked-but-not-yet-admitted
+        // frame, held on purpose so a retirement can land while it
+        // waits — AFTER the check above, which is the interval the
+        // R4-8 schedule needs and the one a seam placed before it
+        // could not reach. Fixtures/test builds only, `None` by
+        // default, and it runs with no lock held.
+        #[cfg(any(test, feature = "fixtures"))]
+        ctx.rtc_reassembly.run_dispatch_pause();
+        // **R4-7:** the piece is keyed by the receive lifetime the
+        // ingress RESOLVED it onto, not by its stream id alone. The
+        // state exists by now — this runs after the sequence was
+        // recorded and the credit returned — so a missing one means
+        // the stream was closed under us and epoch 0 is a lifetime no
+        // `StreamState` ever has, which keeps the group's owner
+        // unambiguous either way.
+        let epoch = session
+            .try_stream(parsed.header.stream_id)
+            .map_or(0, |s| s.epoch());
+        let outcome = ctx.rtc_reassembly.accept_under_lifetime(
+            super::rtc::FragmentPiece::from_header(
+                session.session_id(),
+                epoch,
+                &parsed.header,
+                piece.clone(),
+            ),
+            std::time::Instant::now(),
+            &|| session.is_receive_lifetime_retired(),
+        );
+        // **NR2: the production drain.** Whatever that call destroyed
+        // — this piece's own refused group, a deadline this piece's
+        // arrival applied to some other group, a contradiction — is
+        // acknowledged data, and it becomes a terminal on the stream
+        // that lost it HERE, at the conversation boundary, rather
+        // than a diagnostic record nobody reads.
+        dispose_abandoned_rtc_groups(&ctx.rtc_reassembly, &ctx.peers);
+        match outcome {
+            // X11: the group's identity was bound by its FIRST piece
+            // and every later piece had to match it, so the context
+            // this dispatch continues with — stream, origin, channel,
+            // subprotocol, reliability — is provably the group's own
+            // rather than whichever piece happened to finish it.
+            Ok(Some(assembled)) => {
+                debug_assert_eq!(
+                    assembled.provenance,
+                    super::rtc::FragmentProvenance::from_header(&parsed.header),
+                    "a completing piece that disagreed with its group must have \
+                     been refused as inconsistent"
+                );
+                Some(vec![assembled.payload])
+            }
+            // Not a fragment after all — the flag check above means
+            // this cannot happen, but the codec, not this caller,
+            // owns that decision.
+            Ok(None) => Some(events),
+            Err(super::rtc::FragmentOutcome::Buffered) => None,
+            // X11/P1: a refusal is no longer silence. Every group
+            // this reassembler destroys is reported against the
+            // stream that owned it — by the reassembler, on every
+            // path including the quiet-mesh close — and a piece whose
+            // group is gone is refused as `Abandoned` rather than
+            // opening a headless successor that can never complete.
+            Err(outcome) => {
+                tracing::debug!(
+                    session_id = session.session_id(),
+                    fragment_id = parsed.header.fragment_id,
+                    stream_id = parsed.header.stream_id,
+                    ?outcome,
+                    "rtc: leaf fragment refused"
+                );
+                None
+            }
+        }
+    }
+
+    /// Reserve a provisional sender's stream allocation (R3).
+    ///
+    /// `false` refuses the frame before any receive state is
+    /// created. Admitted and native senders are one map read.
+    #[cfg(feature = "webrtc")]
+    fn charge_provisional_stream(
+        source: &PeerAddr,
+        stream_id: u64,
+        bytes: u64,
+        session: &NetSession,
+        ctx: &DispatchCtx,
+    ) -> bool {
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            return true;
+        };
+        let new_stream = !session.stream_ids().contains(&stream_id);
+        let refused = {
+            let Some(mut entry) = ctx.peers.get_mut(&node_id) else {
+                return true;
+            };
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return true;
+            };
+            budget.charge_stream(new_stream, bytes).is_err()
+        };
+        if refused {
+            if let Some(stats) = ctx.rtc_stats.as_ref() {
+                stats.note_admission_refused_deliver();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// The origin a **provisional** peer may name in its enrollment
+    /// reply channel (R6).
+    ///
+    /// `None` for every other case, so this widens nothing: not
+    /// another channel, not an admitted peer's subscription, and not
+    /// an origin the session has not bound.
+    #[cfg(feature = "webrtc")]
+    fn bootstrap_reply_origin(
+        channel: &ChannelName,
+        from_node: u64,
+        ctx: &DispatchCtx,
+    ) -> Option<u64> {
+        let claimed =
+            super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel.as_str())?;
+        let entry = ctx.peers.get(&from_node)?;
+        let admission = entry.value().admission;
+        if !admission.is_provisional() {
+            return None;
+        }
+        (admission.bound_origin() == Some(claimed)).then_some(claimed)
+    }
+
+    /// **Gate 5 of 5 (§12), by authenticated source (R1).**
+    ///
+    /// The local-effect decision every ingress path consults before
+    /// its effect: application enqueue, signalling, ICE allocation
+    /// and the streaming serve bridges. The node-id-keyed wrapper
+    /// on the unary bridge remains for callers that only hold a
+    /// node id.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_deliver_source(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_deliver())
+    }
+
+    /// **Gate 4 of 5 (§12): announcement ingest.** A provisional
+    /// peer's announcement is neither ingested nor flooded — that
+    /// would be route installation for an unadmitted peer (S0e §3
+    /// row 12).
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_announce(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        Self::admission_allows(source, ctx, |stats| stats.note_admission_refused_announce())
+    }
+
+    /// **Gate 5 of 5 (§12): application delivery.**
+    ///
+    /// The one gate that cannot be a header test: the enrollment
+    /// REQUEST's service name lives *inside* the nRPC envelope, so
+    /// the caller decodes under strict bounds and hands the decoded
+    /// facts here (§12 step 3, S0e §6).
+    ///
+    /// Takes the resolved session rather than a `DispatchCtx`,
+    /// because its caller is the nRPC bridge, which holds a
+    /// `MeshNode` and no dispatch context.
+    /// [`Self::admission_gate_deliver`] for a caller that has
+    /// already resolved the session (the nRPC bridge holds no
+    /// `DispatchCtx`). Same decision, same counter, one
+    /// implementation of the allow-list.
+    #[cfg(feature = "webrtc")]
+    fn admission_gate_deliver(
+        endpoint: PeerAddr,
+        stats: Option<Arc<super::rtc::RtcStats>>,
+        local_node_id: u64,
+        action: &super::rtc::BootstrapAction<'_>,
+        caller_origin: u64,
+    ) -> bool {
+        let allowed =
+            super::rtc::allow_provisional_action(action, local_node_id, caller_origin).is_ok();
+        if !allowed {
+            if let Some(stats) = stats {
+                stats.note_admission_refused_deliver();
+            }
+        }
+        let _ = endpoint;
+        allowed
+    }
+
+    /// Charge one inbound RTC frame to a provisional sender's
+    /// whole-session budget (S0e §2: ≤ 256 frames, ≤ 256 KiB).
+    ///
+    /// `Err` means the session breached a bound and has been closed
+    /// and reclaimed (§12 step 5) — the caller must not dispatch
+    /// the frame. Admitted and native senders are never charged,
+    /// so this is one `DashMap` read on their path.
+    #[cfg(feature = "webrtc")]
+    fn charge_provisional_ingress(
+        source: &PeerAddr,
+        data: &Bytes,
+        ctx: &DispatchCtx,
+    ) -> Result<(), super::rtc::AdmissionRefusal> {
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            return Ok(());
+        };
+        let (breached, charged_session) = {
+            let Some(mut entry) = ctx.peers.get_mut(&node_id) else {
+                return Ok(());
+            };
+            // R3-B: remember WHICH incarnation was charged, so the
+            // reclamation below can only remove that one.
+            let charged_session = entry.value().session.session_id();
+            let super::rtc::PeerAdmission::Provisional { budget, .. } =
+                &mut entry.value_mut().admission
+            else {
+                return Ok(());
+            };
+            (
+                budget.charge_frame(data.len() as u64).is_err(),
+                charged_session,
+            )
+        };
+        if !breached {
+            return Ok(());
+        }
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            stats.note_admission_refused_deliver();
+        }
+        // Close and reclaim on the spot: a session that has spent
+        // its whole-session budget has nothing further it is
+        // allowed to do, and leaving it open would make the bound
+        // advisory.
+        Self::reclaim_breached_provisional(node_id, *source, charged_session, ctx);
+        Err(super::rtc::AdmissionRefusal::BudgetExhausted)
+    }
+
+    /// Close and reclaim a provisional session that breached a
+    /// whole-session bound, from the dispatch path (which holds a
+    /// `DispatchCtx`, not a `MeshNode`).
+    #[cfg(feature = "webrtc")]
+    fn reclaim_breached_provisional(
+        node_id: u64,
+        endpoint: PeerAddr,
+        session_id: u64,
+        ctx: &DispatchCtx,
+    ) {
+        // **R3-B: the breach path uses the same conditional
+        // transition as the sweep**, carrying the session that was
+        // actually charged. It used to remove by "is provisional"
+        // alone and take its side effects unconditionally — so a
+        // breach charged against one incarnation could close a
+        // successor's channel.
+        let removed = ctx.peers.remove_if(&node_id, |_, info| {
+            info.session.session_id() == session_id
+                && info.addr() == endpoint
+                && info.admission.is_provisional()
+        });
+        let Some((_, breached)) = removed else {
+            return;
+        };
+        ctx.peer_addrs.remove_if(&node_id, |_, a| *a == endpoint);
+        ctx.addr_to_node.remove_if(&endpoint, |_, n| *n == node_id);
+        ctx.provisional_endpoints.remove(&endpoint);
+        // N3: the breach path ends the session too, so its partial
+        // fragment groups go with it. NR3: its receive lifetime is
+        // retired with it.
+        retire_session_receive_lifetime(&ctx.rtc_reassembly, &breached.session);
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            stats.note_admission_reclaimed();
+        }
+        if let (Some(driver), PeerAddr::Rtc(id)) = (ctx.rtc_driver.as_ref(), endpoint) {
+            let driver = driver.clone();
+            tokio::spawn(async move {
+                let _ = driver.close(id).await;
+            });
+        }
+    }
+
+    /// Does this peer announce itself as a `leaf` (§7, §11)?
+    /// Stage 4 only reads the tag; Stage 5 emits it. A leaf is
+    /// never a forwarding next hop and is never re-flooded to —
+    /// it has no routing table and nothing downstream of it.
+    #[cfg(feature = "webrtc")]
+    fn peer_is_leaf(node_id: u64, ctx: &DispatchCtx) -> bool {
+        ctx.capability_fold.with_state(|state| {
+            let Some(keys) = state.by_node.get(&node_id) else {
+                return false;
+            };
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .any(|entry| entry.payload.tags.iter().any(|t| t == RTC_LEAF_TAG))
+        })
+    }
+
+    /// The endpoint a node id's session sits on, for the gates that
+    /// are handed a node id rather than an address.
+    #[cfg(feature = "webrtc")]
+    fn endpoint_of(node_id: u64, ctx: &DispatchCtx) -> Option<PeerAddr> {
+        ctx.peers.get(&node_id).map(|e| e.value().addr())
+    }
+
+    /// The **one** ingress admission decision (R1).
+    ///
+    /// Fail-closed for RTC: an endpoint with no installed
+    /// `PeerInfo`, a peer whose installed endpoint is a *different*
+    /// incarnation, or a session marked provisional is `Denied`.
+    /// The previous `is_provisional` read answered `false` — "not
+    /// provisional", taken as permission — for exactly the states
+    /// that carry the least authority: a DataChannel that is open
+    /// but has not completed Noise, and frames still queued behind
+    /// a peer that has already been removed.
+    ///
+    /// Legacy UDP is untouched: a UDP source is `Permitted` here
+    /// and continues to be judged by its own authorization, which
+    /// is what "browser admission does not apply to native peers"
+    /// means.
+    #[cfg(feature = "webrtc")]
+    fn ingress_admission(source: &PeerAddr, ctx: &DispatchCtx) -> IngressAdmission {
+        let PeerAddr::Rtc(_) = source else {
+            return IngressAdmission::Permitted;
+        };
+        let Some(node_id) = ctx.addr_to_node.get(source).map(|e| *e.value()) else {
+            // Unknown RTC endpoint: pre-Noise, or post-removal.
+            // Neither may borrow an admitted peer's permissions.
+            return IngressAdmission::Denied;
+        };
+        let Some(entry) = ctx.peers.get(&node_id) else {
+            return IngressAdmission::Denied;
+        };
+        let info = entry.value();
+        if info.addr() != *source {
+            // The mapping points at a node whose live session sits
+            // on a different endpoint: this frame belongs to a
+            // retired incarnation.
+            return IngressAdmission::Denied;
+        }
+        if info.admission.is_provisional() {
+            return IngressAdmission::Denied;
+        }
+        IngressAdmission::Permitted
+    }
+
+    /// Is the session on `source` provisional **or unknown**? Kept
+    /// as the name the gates read, now answering the fail-closed
+    /// question.
+    #[cfg(feature = "webrtc")]
+    fn is_provisional(source: &PeerAddr, ctx: &DispatchCtx) -> bool {
+        matches!(
+            Self::ingress_admission(source, ctx),
+            IngressAdmission::Denied
+        )
+    }
+
+    /// Shared body of the three yes/no gates: provisional ⇒ refuse
+    /// and count, with the counter the caller names.
+    #[cfg(feature = "webrtc")]
+    fn admission_allows(
+        source: &PeerAddr,
+        ctx: &DispatchCtx,
+        count: impl FnOnce(&super::rtc::RtcStats),
+    ) -> bool {
+        if !Self::is_provisional(source, ctx) {
+            return true;
+        }
+        if let Some(stats) = ctx.rtc_stats.as_ref() {
+            count(stats);
+        }
+        false
+    }
+
+    /// One inbound `0x0D02` frame (plan §5 Layer 3).
+    ///
+    /// Four decisions, in this order and none of them skippable:
+    /// decode under [`super::rtc::MAX_SDP_BYTES`]; charge the
+    /// sender's budget; refuse — **counted** — if it is over; hand
+    /// the frame to the engine without awaiting. A malformed or
+    /// over-budget frame is never silently dropped, because silence
+    /// here looks exactly like a peer that never signalled.
+    #[cfg(feature = "webrtc")]
+    fn handle_rtc_signal(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let (Some(budget), Some(stats)) = (&ctx.rtc_signal_budget, &ctx.rtc_stats) else {
+            // No RTC on this node: nothing to act on, and nothing
+            // to count it against either.
+            return;
+        };
+        let msg = match super::rtc::RtcSignalMsg::from_bytes(payload) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal refused");
+                // A frame that did not decode is not a budget
+                // refusal: the sender may be within every bound and
+                // still have sent something this build cannot read
+                // (an unknown variant, or an SDP over
+                // `MAX_SDP_BYTES`). One counter for three causes made
+                // a witness unable to say which fired.
+                stats.note_signal_malformed();
+                return;
+            }
+        };
+        // R5-A: **receipt** is counted here, before the dialog
+        // decision. The frame decoded inside this peer's session and
+        // reached this handler; whether it names a live attempt is
+        // the next question, and the two facts have separate
+        // counters. (Previously a refusal was indistinguishable
+        // from a frame that never arrived.)
+        stats.note_signal_delivered();
+        let admitted = {
+            // Synchronous, and released before anything else — the
+            // dispatch path holds no guard across an await.
+            let mut guard = budget.lock();
+            guard.admit(from_node, &msg, std::time::Instant::now())
+        };
+        match admitted {
+            super::rtc::SignalAdmit::Refused(super::rtc::RtcSignalError::UnknownDialog) => {
+                // R5-A: an Answer/Candidate/Reject for an id nobody
+                // offered — or one already rejected, expired or
+                // completed. It reserves nothing and allocates
+                // nothing, and it is counted as what it is.
+                tracing::debug!(
+                    from = format!("{from_node:#x}"),
+                    dialog = msg.dialog(),
+                    "rtc signal for an unknown dialog refused"
+                );
+                stats.note_signal_unknown_dialog();
+                return;
+            }
+            super::rtc::SignalAdmit::Refused(e) => {
+                tracing::debug!(error = %e, from = format!("{from_node:#x}"), "rtc signal over budget");
+                stats.note_signal_over_budget();
+                return;
+            }
+            _ => {}
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(tap) = ctx.rtc_signal_tap.as_ref() {
+            tap.lock().push((from_node, msg.clone()));
+        }
+        let Some(tx) = ctx.rtc_signal_tx.as_ref() else {
+            return;
+        };
+        if tx.try_send((from_node, msg)).is_err() {
+            // The engine is gone or saturated. Counted, like every
+            // other bounded input in this transport — but as OUR
+            // failure to keep up, not as the sender exceeding a
+            // budget it was in fact inside.
+            stats.note_signal_engine_full();
+        }
+    }
+
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        // §12 gate 4: a provisional peer's announcement is neither
+        // ingested nor flooded. Ingesting it would install routes
+        // and publish discovery state for a peer that has not
+        // enrolled — S0e §3 row 12.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_announce(&endpoint, ctx) {
+                return;
+            }
+        }
         let Some(mut ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
@@ -34208,8 +39502,17 @@ impl MeshNode {
     /// and a relay generally has no route to the provider anyway. The frame bytes
     /// ship verbatim — a relay never opens, stores, or re-signs them.
     fn forward_scoped_announcement(frame: Vec<u8>, from_node: u64, ctx: &DispatchCtx) {
+        // §12 F5, scoped half. Same rule; `0x0C04` itself is out of
+        // v1 browser scope, but the forwarding gate is not selective
+        // about which announcement kind it refuses to carry.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         let peers = ctx.peers.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
 
         tokio::spawn(async move {
@@ -34224,19 +39527,23 @@ impl MeshNode {
                 let stream_id = SUBPROTOCOL_SCOPED_CAPABILITY_ANN as u64;
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session.get_or_create_stream(stream_id);
-                    stream.next_tx_seq()
-                };
                 let events = vec![Bytes::copy_from_slice(&frame)];
+                let debit = outbound_subprotocol_tx_seq(
+                    session,
+                    stream_id,
+                    SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     stream_id,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&socket, &packet, peer.addr).await;
+                if send_datagram(&sink, &packet, peer.addr).await.is_ok() {
+                    debit.commit();
+                }
                 drop(builder);
                 session.touch();
             }
@@ -34249,8 +39556,17 @@ impl MeshNode {
         sender_node_id: u64,
         ctx: &DispatchCtx,
     ) {
+        // §12 F5: do not flood on behalf of a provisional sender.
+        // Gate 4 already refuses to ingest it; this refuses to be
+        // its megaphone.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         let peers = ctx.peers.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let partition_filter = ctx.partition_filter.clone();
         let router = ctx.router.clone();
 
@@ -34278,19 +39594,23 @@ impl MeshNode {
                 let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session.get_or_create_stream(stream_id);
-                    stream.next_tx_seq()
-                };
                 let events = vec![Bytes::copy_from_slice(&payload)];
+                let debit = outbound_subprotocol_tx_seq(
+                    session,
+                    stream_id,
+                    SUBPROTOCOL_CAPABILITY_ANN,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     stream_id,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = send_datagram(&socket, &packet, peer.addr).await;
+                if send_datagram(&sink, &packet, peer.addr).await.is_ok() {
+                    debit.commit();
+                }
                 drop(builder);
                 session.touch();
             }
@@ -34326,6 +39646,15 @@ impl MeshNode {
         req: super::traversal::rendezvous::PunchRequest,
         ctx: &DispatchCtx,
     ) {
+        // §12 F6: introducing two peers is forwarding on behalf of
+        // the requester. A provisional session does not get to ask
+        // this anchor to introduce it to anybody.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
         use super::traversal::rendezvous::{
             PunchIntroduce, PunchReject, RejectReason, RendezvousMsg,
         };
@@ -34360,7 +39689,7 @@ impl MeshNode {
         let reject_punch_id = req.punch_id;
         let send_reject = |reason: RejectReason| {
             let session = a_session.clone();
-            let socket = ctx.socket.clone();
+            let sink = ctx.sink.clone();
             let body = RendezvousMsg::PunchReject(PunchReject {
                 target: reject_target,
                 punch_id: reject_punch_id,
@@ -34370,20 +39699,23 @@ impl MeshNode {
             tokio::spawn(async move {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
-                let seq = {
-                    let stream = session
-                        .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                    stream.next_tx_seq()
-                };
                 let events = vec![body];
+                let debit = outbound_subprotocol_tx_seq(
+                    &session,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                    super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                    &events,
+                );
                 let packet = builder.build_subprotocol(
                     super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                    seq,
+                    debit.seq(),
                     &events,
                     PacketFlags::NONE,
                     super::traversal::SUBPROTOCOL_RENDEZVOUS,
                 );
-                let _ = socket.send_to(&packet, a_addr).await;
+                if sink.send(&packet, a_addr).await.is_ok() {
+                    debit.commit();
+                }
             });
         };
 
@@ -34444,7 +39776,7 @@ impl MeshNode {
         // against the relay IP and drop a legitimate request — but
         // that only costs the optimization (A falls back to the
         // relay), never correctness.
-        if req.self_reflex.ip() != a_addr.ip() {
+        if Some(req.self_reflex.ip()) != a_addr.udp().map(|a| a.ip()) {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 claimed = %req.self_reflex,
@@ -34533,48 +39865,57 @@ impl MeshNode {
             "rendezvous: mediating punch, introducing both ends"
         );
 
-        let socket_a = ctx.socket.clone();
-        let socket_b = ctx.socket.clone();
+        let sink_a = ctx.sink.clone();
+        let sink_b = ctx.sink.clone();
         tokio::spawn(async move {
             let pool = a_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream =
-                    a_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![intro_to_a];
+            let debit = outbound_subprotocol_tx_seq(
+                &a_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
             // A discarded send error here used to be indistinguishable
-            // from a delivered introduce.
-            if let Err(e) = socket_a.send_to(&packet, a_addr).await {
-                tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
+            // from a delivered introduce — and an introduce that never
+            // reached the transport must not keep its bytes charged.
+            match sink_a.send(&packet, a_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
+                }
             }
         });
         tokio::spawn(async move {
             let pool = b_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream =
-                    b_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![intro_to_b];
+            let debit = outbound_subprotocol_tx_seq(
+                &b_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = socket_b.send_to(&packet, b_addr).await {
-                tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
+            match sink_b.send(&packet, b_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
+                }
             }
         });
     }
@@ -34727,7 +40068,10 @@ impl MeshNode {
         if ctx.partition_filter.contains(&coord_addr) {
             return;
         }
-        if ctx.partition_filter.contains(&intro.peer_reflex) {
+        if ctx
+            .partition_filter
+            .contains(&PeerAddr::Udp(intro.peer_reflex))
+        {
             return;
         }
 
@@ -34740,7 +40084,7 @@ impl MeshNode {
         // oneshot.
         let (obs_tx, obs_rx) = oneshot::channel();
         ctx.punch_observers
-            .insert(intro.peer_reflex, (intro.peer, obs_tx));
+            .insert(PeerAddr::Udp(intro.peer_reflex), (intro.peer, obs_tx));
 
         // What this node is now waiting for. Paired with the
         // observer-miss log in the receive loop, this pins down the
@@ -34773,8 +40117,10 @@ impl MeshNode {
         let local_node_id = ctx.local_node_id;
         let peer_reflex = intro.peer_reflex;
         let peer = intro.peer;
-        let socket_send = ctx.socket.clone();
-        let socket_ack = ctx.socket.clone();
+        // Traversal stays on the raw socket (Stage 1 decision 1): the
+        // destination is a reflexive tuple, not a peer endpoint.
+        let socket_send = ctx.sink.udp_socket().clone();
+        let sink_ack = ctx.sink.clone();
         let deadline = ctx.traversal_config.punch_deadline;
         let punch_observers = ctx.punch_observers.clone();
 
@@ -34862,7 +40208,13 @@ impl MeshNode {
             // keep-alive reached us. A wrong-sender packet is dropped
             // upstream *without* consuming the observer, so it can't
             // burn the attempt — a later valid keep-alive still fires.
-            if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
+            if !await_punch_observer_outcome(
+                obs_rx,
+                deadline,
+                &punch_observers,
+                PeerAddr::Udp(peer_reflex),
+            )
+            .await
             {
                 tracing::debug!(
                     counterpart = format!("{:#x}", peer),
@@ -34888,21 +40240,25 @@ impl MeshNode {
             .encode();
             let pool = coord_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream = coord_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![ack_body];
+            let debit = outbound_subprotocol_tx_seq(
+                &coord_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            if let Err(e) = socket_ack.send_to(&packet, coord_addr).await {
-                tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
+            match sink_ack.send(&packet, coord_addr).await {
+                Ok(_) => debit.commit(),
+                Err(e) => {
+                    tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
+                }
             }
         });
     }
@@ -34915,8 +40271,34 @@ impl MeshNode {
     /// the original sender so the recipient can correlate
     /// against its `pending_punch_acks` map.
     #[cfg(feature = "nat-traversal")]
-    fn forward_punch_ack(ack: super::traversal::rendezvous::PunchAck, ctx: &DispatchCtx) {
+    fn forward_punch_ack(
+        ack: super::traversal::rendezvous::PunchAck,
+        #[cfg(feature = "webrtc")] from_node: u64,
+        ctx: &DispatchCtx,
+    ) {
         use super::traversal::rendezvous::RendezvousMsg;
+
+        // **§12 F6, by the authenticated requester (R1).** This arm
+        // used to gate `ack.to_peer` — the *recipient* — so an
+        // admitted destination satisfied the gate on behalf of a
+        // provisional sender, and the relay emitted third-party
+        // traffic for an unenrolled peer. `handle_punch_request`
+        // always checked `from_node`; the two arms are now
+        // equivalent.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
+        // The destination's own admission still applies: an
+        // unenrolled peer is not a relay *target* either.
+        #[cfg(feature = "webrtc")]
+        if let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) {
+            if !Self::admission_gate_forward(&endpoint, ctx) {
+                return;
+            }
+        }
 
         let Some((dest_addr, dest_session)) = ctx
             .peers
@@ -34934,24 +40316,27 @@ impl MeshNode {
         }
 
         let body = RendezvousMsg::PunchAck(ack).encode();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         tokio::spawn(async move {
             let pool = dest_session.thread_local_pool();
             let mut builder = pool.get();
-            let seq = {
-                let stream = dest_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
             let events = vec![body];
+            let debit = outbound_subprotocol_tx_seq(
+                &dest_session,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = socket.send_to(&packet, dest_addr).await;
+            if sink.send(&packet, dest_addr).await.is_ok() {
+                debit.commit();
+            }
         });
     }
 
@@ -35127,10 +40512,30 @@ impl MeshNode {
         // retries on it, so first-call and post-reconnect races
         // self-heal rather than failing permanently.
         if let Some(binding) = cfg.subscriber_origin_binding {
+            #[cfg(feature = "webrtc")]
+            let bootstrap_origin = Self::bootstrap_reply_origin(channel, from_node, ctx);
+            #[cfg(not(feature = "webrtc"))]
+            let bootstrap_origin: Option<u64> = None;
             let pinned_origin = ctx
                 .peer_entity_ids
                 .get(&from_node)
-                .map(|e| e.value().origin_hash());
+                .map(|e| e.value().origin_hash())
+                // **R6, the bootstrap exception — and nothing wider.**
+                // A genuinely new provisional peer has no pinned
+                // entity by construction: gate 4 refuses to ingest
+                // its announcement, so the origin binding rejected
+                // the ONE subscription §12 permits and the real SDK
+                // enrollment could never receive its reply.
+                //
+                // The substitute is the origin the session itself
+                // bound on first use, and it is accepted only when
+                // ALL of these hold: the session is provisional, the
+                // channel is exactly that origin's enrollment reply
+                // channel, and the origin is the one this session
+                // already claimed (one session, one identity). Every
+                // other origin-bound channel still requires a pinned
+                // identity.
+                .or(bootstrap_origin);
             if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
@@ -35733,7 +41138,7 @@ impl MeshNode {
             return;
         }
         let dest_sess = peer_entry.value().session.clone();
-        let socket = ctx.socket.clone();
+        let sink = ctx.sink.clone();
         let ack = MembershipMsg::Ack {
             nonce,
             accepted,
@@ -35746,19 +41151,26 @@ impl MeshNode {
             let pool = dest_sess.thread_local_pool();
             let mut builder = pool.get();
             let stream_id = SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
-            let seq = {
-                let stream = dest_sess.get_or_create_stream(stream_id);
-                stream.next_tx_seq()
-            };
             let events = vec![bytes];
+            let debit = outbound_subprotocol_tx_seq(
+                &dest_sess,
+                stream_id,
+                SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+                &events,
+            );
             let packet = builder.build_subprotocol(
                 stream_id,
-                seq,
+                debit.seq(),
                 &events,
                 PacketFlags::NONE,
                 SUBPROTOCOL_CHANNEL_MEMBERSHIP,
             );
-            let _ = socket.send_to(&packet, dest_addr).await;
+            // A discarded send error is still a send that did not
+            // happen: commit only on acceptance, and let the drop
+            // give the ack's bytes back otherwise.
+            if sink.send(&packet, dest_addr).await.is_ok() {
+                debit.commit();
+            }
         });
     }
 
@@ -36341,6 +41753,17 @@ impl MeshNode {
                     stream_id
                 )));
             }
+            // `try_acquire_tx_credit_guard` carries no handle and so
+            // no incarnation to mismatch: the publish path resolved
+            // this `session` itself moments ago. Unreachable, and
+            // reported as the closed stream it effectively is rather
+            // than silently treated as success.
+            TxAdmit::SessionSuperseded => {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                    "publish: stream {:#x} belongs to a superseded session",
+                    stream_id
+                )));
+            }
         };
 
         let pool = session.thread_local_pool();
@@ -36401,7 +41824,7 @@ impl MeshNode {
             .lookup(peer_node_id)
             .unwrap_or(dest_addr);
 
-        if let Err(e) = self.socket.send_to(&packet, next_hop).await {
+        if let Err(e) = self.sink.send(&packet, next_hop).await {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish send failed: {}",
                 e
@@ -36460,7 +41883,13 @@ impl MeshNode {
         let bytes = ann
             .encode()
             .map_err(|e| AdapterError::Connection(format!("fold: encode failed: {e}")))?;
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr()).collect();
+        // `send_subprotocol` is the operator-facing seam and keeps its
+        // `SocketAddr`; resolve each endpoint's tuple at this boundary.
+        let peer_addrs: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter_map(|e| e.value().addr().udp())
+            .collect();
         // Share the encoded bytes by reference; each send
         // borrows the same slice. send_subprotocol clones into
         // its own internal allocation, so concurrent sends don't
@@ -36651,8 +42080,12 @@ impl MeshNode {
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
-        self.send_subprotocol_to_node(self.node_owning_addr(peer_addr)?, subprotocol_id, payload)
-            .await
+        self.send_subprotocol_to_node(
+            self.node_owning_addr(PeerAddr::Udp(peer_addr))?,
+            subprotocol_id,
+            payload,
+        )
+        .await
     }
 
     /// Send a raw subprotocol message to a peer by NODE ID.
@@ -36709,16 +42142,34 @@ impl MeshNode {
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
 
-        let seq = {
-            let stream = session.get_or_create_stream(stream_id);
-            stream.next_tx_seq()
-        };
-
         let events = vec![Bytes::copy_from_slice(payload)];
-        let packet =
-            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
+        // N1: the receiver charges this frame's wire bytes to the
+        // stream's credit ledger when it accounts the subprotocol, so
+        // this producer debits them. Pre-fix a control frame sharing
+        // an application stream's id moved the receiver's cumulative
+        // total without moving the sender's watermark, and the next
+        // grant refunded window for application bytes the receiver
+        // had never seen.
+        //
+        // The debit is scoped to THIS send. `send_datagram` below is
+        // bounded transport admission: it refuses, it can exceed its
+        // deadline, and this whole future can be cancelled while
+        // suspended on it. Every one of those leaves the packet
+        // un-admitted, and the `?` / the cancellation drops `debit`,
+        // which returns the bytes and reclaims the sequence. Only an
+        // accepted datagram reaches `commit`.
+        let debit = outbound_subprotocol_tx_seq(&session, stream_id, subprotocol_id, &events);
 
-        send_datagram(&self.socket, &packet, peer_addr).await?;
+        let packet = builder.build_subprotocol(
+            stream_id,
+            debit.seq(),
+            &events,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
+
+        send_datagram(&self.sink, &packet, peer_addr).await?;
+        debit.commit();
 
         drop(builder);
         session.touch();
@@ -37211,6 +42662,43 @@ impl MeshNode {
                 caps
             };
 
+            // Stage 5 ruling 4: advertise that this node's stream
+            // receive path reassembles leaf fragment groups, so a
+            // peer may send an over-cap stream event to us instead
+            // of refusing it typed.
+            //
+            // NOT config-gated, and that is deliberate: the RTC
+            // ingress reassembles unconditionally (there is no knob
+            // that turns `reassemble_rtc_fragments` off), so a flag
+            // here would let an operator withdraw a claim that is
+            // still true and cost peers a capability this node does
+            // in fact have. The `webrtc` cfg IS the condition —
+            // without it there is no RTC ingress and nothing
+            // reassembles.
+            #[cfg(feature = "webrtc")]
+            let caps =
+                caps.add_tag(super::behavior::capability::FRAGMENT_REASSEMBLY_TAG.to_string());
+
+            // Stage 4a §11 tags. `transport:rtc` is how a peer
+            // learns it can take a DataChannel with us — the
+            // classifier reads it and returns `PairAction::Ice`
+            // instead of planning a punch. `rtc-anchor` says this
+            // node serves the bootstrap endpoint its
+            // `rtc_bootstrap` field names. `leaf` is Stage 5's to
+            // emit; Stage 4 only reads it.
+            #[cfg(feature = "webrtc")]
+            let caps = match self.config.rtc.as_ref() {
+                Some(rtc) => {
+                    let caps = caps.add_tag(RTC_TRANSPORT_TAG.to_string());
+                    if rtc.serve_bootstrap {
+                        caps.add_tag(RTC_ANCHOR_TAG.to_string())
+                    } else {
+                        caps
+                    }
+                }
+                None => caps,
+            };
+
             let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Piggyback the current NAT classification as a `nat:*`
@@ -37294,6 +42782,15 @@ impl MeshNode {
             {
                 broadcast_ann = broadcast_ann.with_reflex_addr(reflex_snapshot);
             }
+            // Stage 4a §5 Layer 1: the RTC discovery fields, each
+            // emitted only when the operator configured the thing it
+            // describes. A node without `rtc` sets none of them and
+            // its announcement is byte-identical to the pre-Stage-4
+            // one, signature included.
+            #[cfg(feature = "webrtc")]
+            {
+                broadcast_ann = self.with_rtc_announcement_fields(broadcast_ann);
+            }
             if sign {
                 broadcast_ann.sign(&self.identity);
             }
@@ -37327,6 +42824,10 @@ impl MeshNode {
                     #[cfg(feature = "nat-traversal")]
                     {
                         a = a.with_reflex_addr(reflex_snapshot);
+                    }
+                    #[cfg(feature = "webrtc")]
+                    {
+                        a = self.with_rtc_announcement_fields(a);
                     }
                     if sign {
                         a.sign(&self.identity);
@@ -37568,7 +43069,7 @@ impl MeshNode {
             .peers
             .get(&node_id)
             .map(|p| p.value().addr())
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+            .unwrap_or_else(|| PeerAddr::Udp(SocketAddr::from(([0, 0, 0, 0], 0))));
         if let Err(e) = self
             .send_subprotocol_to_node(node_id, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
             .await
@@ -38426,18 +43927,24 @@ impl MeshNode {
         })?);
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
         let events = [bytes];
+        let debit = outbound_subprotocol_tx_seq(
+            &session,
+            stream_id,
+            super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
+            &events,
+        );
         let packet = builder.build_subprotocol(
             stream_id,
-            seq,
+            debit.seq(),
             &events,
             PacketFlags::RELIABLE,
             super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
         );
-        self.socket.send_to(&packet, dest_addr).await.map_err(|e| {
+        self.sink.send(&packet, dest_addr).await.map_err(|e| {
             super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
         })?;
+        debit.commit();
         Ok(())
     }
 }
@@ -38751,6 +44258,156 @@ impl MeshNode {
         super::behavior::fold::reflex_addr_for(&self.capability_fold, peer_node_id)
     }
 
+    /// The RTC counters (Stage 3). Zeroed and inert on a node
+    /// without `MeshNodeConfig::rtc`.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_stats(&self) -> &Arc<super::rtc::RtcStats> {
+        &self.rtc_stats
+    }
+
+    /// The RTC driver handle, when this node has one.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_driver(&self) -> Option<&super::rtc::RtcDriverHandle> {
+        self.rtc_driver.as_ref()
+    }
+
+    /// Does this peer **own** a DataChannel attachment to us?
+    ///
+    /// Target-owned direct attachment, never a routed session's
+    /// relay endpoint (H4). `PeerInfo::addr()` is where datagrams
+    /// *go*, which for a routed peer is the relay: in
+    /// X —UDP— R —RTC— Y, Y's routed session to X has an RTC next
+    /// hop, and reading the send endpoint classified **X** as
+    /// `Ice` — marking X's native upgrade done although ICE had only
+    /// negotiated Y↔R. Only `Direct { owned: PeerAddr::Rtc(_) }` is
+    /// evidence about the target itself.
+    #[cfg(feature = "webrtc")]
+    fn peer_owns_rtc_attachment(&self, peer_node_id: u64) -> bool {
+        self.peers
+            .get(&peer_node_id)
+            .is_some_and(|p| matches!(p.value().transport.owned_addr(), Some(PeerAddr::Rtc(_))))
+    }
+
+    /// Does this peer's most recent announcement carry
+    /// `transport:rtc` (plan §11)?
+    #[cfg(feature = "webrtc")]
+    fn peer_announces_rtc(&self, peer_node_id: u64) -> bool {
+        self.capability_fold.with_state(|state| {
+            let Some(keys) = state.by_node.get(&peer_node_id) else {
+                return false;
+            };
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .any(|entry| {
+                    entry
+                        .payload
+                        .tags
+                        .iter()
+                        .any(|tag| tag == RTC_TRANSPORT_TAG)
+                })
+        })
+    }
+
+    /// The peer's announced Noise static key, if it published one
+    /// (plan §5 Layer 1) — the key `connect_via` needs and a
+    /// browser has no out-of-band way to obtain.
+    #[cfg(feature = "webrtc")]
+    pub fn peer_announced_noise_pubkey(&self, peer_node_id: u64) -> Option<[u8; 32]> {
+        self.capability_fold.with_state(|state| {
+            let keys = state.by_node.get(&peer_node_id)?;
+            keys.iter()
+                .filter_map(|key| state.entries.get(key))
+                .find_map(|entry| entry.payload.noise_pubkey)
+        })
+    }
+
+    /// Every peer this node has heard advertise the RTC anchor role,
+    /// with the two addresses that make the role usable (Stage 4b:
+    /// `net-mesh anchor ls` and Deck's ANCHORS column).
+    ///
+    /// Read from **signature-verified** announcements, the same
+    /// fold `peer_announced_noise_pubkey` reads: an anchor row is a
+    /// claim its own entity signed, not something a peer asserted
+    /// about a third party. Sorted by node id so two calls agree.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_anchors(&self) -> Vec<super::behavior::deck::RtcAnchorRow> {
+        use super::behavior::deck::RtcAnchorRow;
+        let mut rows: Vec<RtcAnchorRow> = self.capability_fold.with_state(|state| {
+            let mut rows = Vec::new();
+            for (node_id, keys) in state.by_node.iter() {
+                let mut row: Option<RtcAnchorRow> = None;
+                for entry in keys.iter().filter_map(|key| state.entries.get(key)) {
+                    let is_anchor = entry.payload.tags.iter().any(|tag| tag == RTC_ANCHOR_TAG);
+                    if !is_anchor {
+                        continue;
+                    }
+                    let candidate = RtcAnchorRow {
+                        node_id: *node_id,
+                        rtc_addr: entry.payload.rtc_addr,
+                        rtc_bootstrap: entry.payload.rtc_bootstrap.clone(),
+                        rtc_stun_addr: entry.payload.rtc_stun_addr.clone(),
+                        noise_pubkey: entry.payload.noise_pubkey,
+                    };
+                    // Several announcements from one node: prefer the
+                    // one that actually carries a bootstrap URL, since
+                    // that is the row an operator is looking for.
+                    row = match row {
+                        Some(existing) if existing.rtc_bootstrap.is_some() => Some(existing),
+                        _ => Some(candidate),
+                    };
+                }
+                rows.extend(row);
+            }
+            rows
+        });
+        rows.sort_by_key(|row| row.node_id);
+        rows
+    }
+
+    /// The pair action for this peer, ICE short-circuit included.
+    ///
+    /// `nat-traversal`-gated like its three callers (`connect_direct`,
+    /// `connect_direct_auto`, `attempt_direct_upgrade`): the classifier
+    /// lives under `super::traversal`, which does not exist without the
+    /// feature — a member built with `webrtc` off and `nat-traversal`
+    /// off (the meshdb/meshos/deck FFI crates) otherwise fails to
+    /// compile the core.
+    #[cfg(feature = "nat-traversal")]
+    fn pair_action_for(&self, peer_node_id: u64) -> super::traversal::classify::PairAction {
+        // Stage 4a: an *announced* `transport:rtc` counts too, not
+        // only an already-installed RTC endpoint. That is the whole
+        // point of §5 Layer 1 — the pair learns it can use ICE from
+        // discovery, before either side has a DataChannel, which is
+        // exactly when the decision matters.
+        //
+        // H4: it is a property of **this pair**, so both ends must
+        // carry it. Our own driver alone is not evidence about the
+        // target, and neither is a relay we happen to reach over
+        // RTC — only the target's own direct attachment or its
+        // announced `transport:rtc` tag.
+        #[cfg(feature = "webrtc")]
+        let rtc_side = self.config.rtc.is_some()
+            && (self.peer_owns_rtc_attachment(peer_node_id)
+                || self.peer_announces_rtc(peer_node_id));
+        #[cfg(not(feature = "webrtc"))]
+        let rtc_side = false;
+        super::traversal::classify::pair_action_with_transport(
+            self.nat_class(),
+            self.peer_nat_class(peer_node_id),
+            rtc_side,
+        )
+    }
+
+    /// The pair action this node would take for `peer_node_id`
+    /// (H4 witness).
+    #[cfg(all(feature = "nat-traversal", any(test, feature = "fixtures")))]
+    pub fn pair_action_for_test(
+        &self,
+        peer_node_id: u64,
+    ) -> super::traversal::classify::PairAction {
+        self.pair_action_for(peer_node_id)
+    }
+
     /// Read a peer's most recently advertised NAT classification
     /// from the capability index. Parses the `nat:*` tag on the
     /// peer's announcement. Returns `NatClass::Unknown` when the
@@ -38816,7 +44473,7 @@ impl MeshNode {
     /// [`Self::upgrade_is_loop_candidate`], so the three can't drift
     /// apart on the default or the ownership rule.
     #[cfg(feature = "nat-traversal")]
-    fn is_relayed_peer(&self, peer_id: u64, addr: &SocketAddr) -> bool {
+    fn is_relayed_peer(&self, peer_id: u64, addr: &PeerAddr) -> bool {
         self.addr_to_node
             .get(addr)
             .map(|owner| *owner != peer_id)
@@ -38943,14 +44600,21 @@ impl MeshNode {
         peer_node_id: u64,
         peer_pubkey: &[u8; 32],
     ) -> Result<u64, super::traversal::TraversalError> {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
         use super::traversal::TraversalError;
 
-        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_node_id));
+        let action = self.pair_action_for(peer_node_id);
         match action {
             // Direct pairs ignore the coordinator entirely; pass a
             // sentinel `0` — the Direct arm never reads it.
             PairAction::Direct => self.connect_direct(peer_node_id, peer_pubkey, 0).await,
+            // ICE owns connectivity for a DataChannel peer: there is
+            // no UDP tuple to punch toward, and a coordinator cannot
+            // help. Refuse rather than burn a rendezvous budget on a
+            // punch that is meaningless by construction.
+            PairAction::Ice => Err(TraversalError::Transport(
+                "peer is reached over a DataChannel; ICE owns connectivity, no punch".into(),
+            )),
             PairAction::SinglePunch | PairAction::SkipPunch => {
                 match self.select_punch_coordinator(peer_node_id) {
                     Some(coord) => self.connect_direct(peer_node_id, peer_pubkey, coord).await,
@@ -39022,7 +44686,7 @@ impl MeshNode {
         peer_pubkey: &[u8; 32],
         coordinator: u64,
     ) -> Result<u64, super::traversal::TraversalError> {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
         use super::traversal::TraversalError;
 
         // NOTE: `peer_reflex` and `coordinator` are deliberately
@@ -39037,17 +44701,17 @@ impl MeshNode {
         // Both lookups now happen lazily inside the arms that
         // actually consume them.
 
-        let local_class = self.nat_class();
-        let remote_class = self.peer_nat_class(peer_node_id);
-        let action = pair_action(local_class, remote_class);
+        let action = self.pair_action_for(peer_node_id);
 
         // Resolve `coordinator` into a wire address. Only call
         // from the SkipPunch / SinglePunch arms — `Direct`
         // routes via the routing table (below).
         let coordinator_addr = || {
+            // The coordinator is dialled through `connect_via`, the
+            // operator-facing seam, so resolve its UDP tuple here.
             self.peer_addrs
                 .get(&coordinator)
-                .map(|e| *e.value())
+                .and_then(|e| e.value().udp())
                 .ok_or(TraversalError::PeerNotReachable)
         };
 
@@ -39061,7 +44725,7 @@ impl MeshNode {
         // Unconditionally short-circuiting on any existing session
         // would leave callers stuck on the relay forever,
         // defeating the optimization.
-        let session_matches = |want_addr: std::net::SocketAddr| {
+        let session_matches = |want_addr: PeerAddr| {
             self.peers
                 .get(&peer_node_id)
                 .map(|e| e.value().addr() == want_addr)
@@ -39075,7 +44739,7 @@ impl MeshNode {
         // loop pending_handshakes path via `connect_via`, which
         // avoids recv-loop contention on a post-`start()` node.
         let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
-            let id = if session_matches(target_addr) {
+            let id = if session_matches(PeerAddr::Udp(target_addr)) {
                 peer_node_id
             } else {
                 self.connect_via(target_addr, peer_pubkey, peer_node_id)
@@ -39115,9 +44779,10 @@ impl MeshNode {
                     .peers
                     .get(&peer_node_id)
                     .and_then(|p| p.value().owned_addr())
-                    == Some(target_addr);
+                    == Some(PeerAddr::Udp(target_addr));
                 if owns_target {
-                    self.addr_to_node.insert(target_addr, peer_node_id);
+                    self.addr_to_node
+                        .insert(PeerAddr::Udp(target_addr), peer_node_id);
                 }
             });
             Ok::<u64, TraversalError>(id)
@@ -39135,7 +44800,7 @@ impl MeshNode {
         // runs unless we can confirm the existing session is
         // already the one this call was asked to resolve.
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
-            if session_matches(coord_addr) {
+            if session_matches(PeerAddr::Udp(coord_addr)) {
                 return Ok(peer_node_id);
             }
             self.connect_via(coord_addr, peer_pubkey, peer_node_id)
@@ -39144,6 +44809,11 @@ impl MeshNode {
         };
 
         match action {
+            // No punch, no coordinator: the peer is on a DataChannel
+            // and ICE already did the connectivity work.
+            PairAction::Ice => Err(TraversalError::Transport(
+                "peer is reached over a DataChannel; ICE owns connectivity, no punch".into(),
+            )),
             PairAction::Direct => {
                 // `Direct` pairs (Open/Open, Open/Cone,
                 // Open/Unknown, Unknown/Unknown, etc.) don't
@@ -39863,9 +45533,14 @@ impl MeshNode {
             ))
         })?;
         let reliable = config.reliability.is_reliable();
-        // Capture the freshly-allocated (or existing, on idempotent
-        // re-open) epoch so the returned `Stream` handle can later
-        // reject stale sends after a close+reopen.
+        // The handle's two-part identity (R12): the incarnation this
+        // stream belongs to, and the freshly-allocated (or existing,
+        // on idempotent re-open) epoch within it. The epoch alone
+        // rejects a stale handle after a close+reopen on this session;
+        // the session id is what rejects a handle whose session has
+        // been displaced entirely — the epoch counter restarts at 1
+        // per session, so the two collide on the first stream.
+        let session_id = peer.session.session_id();
         let epoch = peer.session.open_stream_full(
             stream_id,
             reliable,
@@ -39892,34 +45567,170 @@ impl MeshNode {
                 "cap_exceeded",
             );
         }
-        Ok(Stream {
+        Ok(Stream::new(
             peer_node_id,
+            session_id,
             stream_id,
             epoch,
             config,
-        })
+        ))
     }
 
-    /// Close a stream: drop its `StreamState` from the session, ending
-    /// delivery of any buffered inbound events for the stream and
-    /// dropping outbound packets that haven't hit the wire yet.
-    /// Idempotent. `CloseBehavior::DrainThenClose` is honored only to
+    /// Close the stream this handle owns: drop its `StreamState` from
+    /// the session, ending delivery of any buffered inbound events for
+    /// the stream and dropping outbound packets that haven't hit the
+    /// wire yet. `CloseBehavior::DrainThenClose` is honored only to
     /// the extent the router's scheduler has already flushed; there is
     /// no wire "drain-then-close" signal in v1.
-    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
-        if let Some(peer) = self.peers.get(&peer_node_id) {
-            peer.session.close_stream(stream_id);
+    ///
+    /// Idempotent for the lifetime the handle names: closing a stream
+    /// that is already gone is `Ok(())`.
+    ///
+    /// **Lifetime-fenced, and the comparison is atomic with the
+    /// removal.** Refuses with [`StreamError::SessionSuperseded`] when
+    /// the peer's current session is not the one the handle was opened
+    /// against, and with [`StreamError::NotConnected`] when a
+    /// close+reopen on that same session has replaced the stream
+    /// lifetime (R12, N2). Both checks and the removal happen inside
+    /// [`NetSession::close_stream_for_lifetime`], under one write
+    /// guard: checking through a released read guard and then removing
+    /// unconditionally let a concurrent same-id reopen land in the gap
+    /// and be torn down by the stale handle.
+    ///
+    /// Callers holding no handle — a peer-driven reset, a receive-side
+    /// teardown, the id-addressed language bindings — use
+    /// [`Self::close_stream`], which is explicit about addressing
+    /// whatever is open under that id.
+    ///
+    /// **R4-7: the closed lifetime's partial fragment groups are
+    /// retired with it.** A reopen allocates a fresh epoch under the
+    /// same id, so a group left behind by the predecessor was — to
+    /// every later lookup keyed by id alone — a group of the current
+    /// stream: its expiry reset the successor's cursor and retired
+    /// the successor's younger group. The groups end where the
+    /// lifetime does, and the fence they leave is that epoch's, so a
+    /// delayed old tail cannot open a headless successor either.
+    pub fn close_stream_handle(&self, stream: &Stream) -> Result<(), StreamError> {
+        let Some(peer) = self.peers.get(&stream.peer_node_id()) else {
+            // No session at all: the lifetime this handle named is
+            // definitively over, and there is nothing to tear down.
+            return Ok(());
+        };
+        let outcome = peer.session.close_stream_for_lifetime(
+            stream.stream_id(),
+            stream.session_id(),
+            stream.epoch(),
+        );
+        #[cfg(feature = "webrtc")]
+        if matches!(outcome, StreamCloseOutcome::Closed) {
+            self.rtc_reassembly.retire_stream(
+                stream.session_id(),
+                stream.stream_id(),
+                stream.epoch(),
+                std::time::Instant::now(),
+            );
+        }
+        match outcome {
+            // Absent is the idempotent case: this lifetime is over and
+            // nothing was removed, so a stream opened under that id
+            // after the guard was taken is left alone.
+            StreamCloseOutcome::Closed | StreamCloseOutcome::Absent => Ok(()),
+            StreamCloseOutcome::LifetimeMismatch => Err(StreamError::NotConnected),
+            StreamCloseOutcome::SessionSuperseded => Err(StreamError::SessionSuperseded),
         }
     }
 
-    /// Close a reliable stream **gracefully** (H-7, `DrainThenClose`):
-    /// wait until the reliability layer has no unacked packets — i.e. the
-    /// receiver has acked everything (with H-9 ack-pruning, `pending`
-    /// empties as grants arrive) — or `timeout` elapses, then close. Use
-    /// after the last bytes of a reliable send so retransmit can still
-    /// fill gaps before teardown; closing eagerly (`close_stream`) drops
-    /// the retransmit window and can strand a lost tail packet on a lossy
-    /// link. A fire-and-forget stream (nothing tracked) drains instantly.
+    /// Close whatever stream is open under `(peer_node_id, stream_id)`.
+    ///
+    /// Idempotent. `CloseBehavior::DrainThenClose` is honored only to
+    /// the extent the router's scheduler has already flushed; there is
+    /// no wire "drain-then-close" signal in v1.
+    ///
+    /// **Unfenced by contract** — it addresses an id, not a lifetime,
+    /// which is exactly what a peer-driven `StreamReset`, a
+    /// receive-side transfer teardown and the id-addressed language
+    /// bindings need. A caller that holds a [`Stream`] handle must use
+    /// [`Self::close_stream_handle`] instead: closing by id with a
+    /// displaced session's coordinates tears down whichever lifetime
+    /// is current, including a **successor** session's stream of the
+    /// same id.
+    ///
+    /// **R4-7:** whatever lifetime it closes takes its partial
+    /// fragment groups with it, for the reason spelled out on
+    /// [`Self::close_stream_handle`].
+    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+        if let Some(peer) = self.peers.get(&peer_node_id) {
+            #[cfg(feature = "webrtc")]
+            let closing = peer.session.try_stream(stream_id).map(|s| s.epoch());
+            peer.session.close_stream(stream_id);
+            #[cfg(feature = "webrtc")]
+            if let Some(epoch) = closing {
+                self.rtc_reassembly.retire_stream(
+                    peer.session.session_id(),
+                    stream_id,
+                    epoch,
+                    std::time::Instant::now(),
+                );
+            }
+        }
+    }
+
+    /// Close the stream this handle owns **gracefully** (H-7,
+    /// `DrainThenClose`): wait until the reliability layer has no
+    /// unacked packets — i.e. the receiver has acked everything (with
+    /// H-9 ack-pruning, `pending` empties as grants arrive) — or
+    /// `timeout` elapses, then close. Use after the last bytes of a
+    /// reliable send so retransmit can still fill gaps before
+    /// teardown; closing eagerly
+    /// ([`Self::close_stream_handle`]) drops the retransmit window
+    /// and can strand a lost tail packet on a lossy link. A
+    /// fire-and-forget stream (nothing tracked) drains instantly.
+    ///
+    /// Fenced exactly like [`Self::close_stream_handle`], and the
+    /// drain loop refuses **immediately** rather than waiting out the
+    /// timeout when the lifetime it named is gone: waiting on a
+    /// successor's unacked data is waiting on somebody else's stream.
+    /// The probe releases its guard before each sleep — nothing is
+    /// held across the wait.
+    pub async fn close_stream_graceful_handle(
+        &self,
+        stream: &Stream,
+        timeout: Duration,
+    ) -> Result<(), StreamError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match self.peers.get(&stream.peer_node_id()) {
+                Some(p) => match p.session.drain_state_for_lifetime(
+                    stream.stream_id(),
+                    stream.session_id(),
+                    stream.epoch(),
+                ) {
+                    StreamDrainState::SessionSuperseded => {
+                        return Err(StreamError::SessionSuperseded)
+                    }
+                    StreamDrainState::LifetimeMismatch => return Err(StreamError::NotConnected),
+                    StreamDrainState::Pending => false,
+                    // Absent → nothing left to drain.
+                    StreamDrainState::Drained | StreamDrainState::Absent => true,
+                },
+                None => true, // peer gone → nothing to drain
+            };
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.close_stream_handle(stream)
+    }
+
+    /// Close whatever reliable stream is open under `(peer_node_id,
+    /// stream_id)` **gracefully** — drain unacked packets, then close.
+    ///
+    /// **Unfenced by contract**, the graceful counterpart of
+    /// [`Self::close_stream`]: the drain waits on whichever lifetime
+    /// holds that id, and the close removes whichever lifetime holds
+    /// it when the wait ends. A caller holding a [`Stream`] handle
+    /// wants [`Self::close_stream_graceful_handle`].
     pub async fn close_stream_graceful(
         &self,
         peer_node_id: u64,
@@ -39954,21 +45765,123 @@ impl MeshNode {
     /// and preserves pre-backpressure behavior. `Transport` is returned
     /// for underlying socket send failures.
     ///
-    /// Returns `NotConnected` when the stream was never opened or has
-    /// been closed since (`close_stream`, idle eviction, cap-exceeded
-    /// LRU). A previously-closed `Stream` handle is inert by design —
-    /// reusing it does NOT silently re-create the stream with default
-    /// config; the caller must explicitly re-open.
+    /// Returns `NotConnected` when the stream was never opened on this
+    /// session or has been closed since (`close_stream`, idle eviction,
+    /// cap-exceeded LRU). A previously-closed `Stream` handle is inert
+    /// by design — reusing it does NOT silently re-create the stream
+    /// with default config; the caller must explicitly re-open.
+    ///
+    /// Returns [`StreamError::SessionSuperseded`] when the peer's
+    /// session is no longer the incarnation the handle was opened
+    /// against (R12) — the handle is inert for good, and the stream id
+    /// it names may be live on the successor with a different config.
+    ///
+    /// Returns [`StreamError::EventTooLarge`] when a single event in
+    /// `events` is one this stream cannot carry to *this* peer.
+    /// Nothing is enqueued and no packet of the call reaches the
+    /// wire, and the `limit` it names is the bound that applied:
+    ///
+    /// * [`protocol::MAX_EVENT_SIZE`] (8 104) for a peer that does
+    ///   not reassemble fragments — which is every UDP peer and
+    ///   every RTC peer that has not advertised
+    ///   [`FRAGMENT_REASSEMBLY_TAG`](super::behavior::capability::FRAGMENT_REASSEMBLY_TAG).
+    ///   Unchanged, including for a peer that is not connected at
+    ///   all: the gate below cannot resolve, so the refusal is the
+    ///   same one this path has always returned.
+    /// * [`protocol::MAX_FRAGMENTED_EVENT_SIZE`] (64 832) for a peer
+    ///   that does — the fragmentation ceiling, refused before the
+    ///   FIRST piece exists rather than after some of the group is
+    ///   already on the wire.
+    ///
+    /// **Why the refusal survives at all** (Stage 5 ruling 4
+    /// qualified it; it did not delete it). The batching loop below
+    /// splits a batch across packets; splitting one EVENT is
+    /// fragmentation, and fragmenting toward a peer with no
+    /// reassembly arm hands its application N partial events as if
+    /// each were a message. That reasoning is intact — it is now the
+    /// justification for the gate instead of for a blanket refusal.
+    /// Pre-repair this path built an over-cap packet anyway, whose
+    /// `payload_len` no receiver accepts — every native receive path
+    /// reads into a `MAX_PACKET_SIZE` buffer and
+    /// `NetHeader::validate` refuses an over-cap length — so the
+    /// call returned `Ok` and the bytes were never delivered
+    /// anywhere. A refusal that names the limit is discoverable;
+    /// `Ok` plus silence is not.
+    ///
+    /// **The group's sequences are contiguous, across concurrent
+    /// calls too (R5-N1).** A fragment group's pieces take
+    /// consecutive sequences in offset order, because that is the
+    /// rule both receivers hold a group to (`rtc/fragment.rs`, NR6).
+    /// Two concurrent `send_on_stream` calls on one stream still
+    /// interleave their EVENTS — this function guarantees ordering
+    /// *within* a call and never across calls — but they can no
+    /// longer interleave a group's PIECES: the whole range is
+    /// reserved by one admission before the first piece commits
+    /// (`flush_stream_fragment_group`). The previous text here
+    /// called the receiver's typed refusal of the straddled group
+    /// "the same scope of guarantee batching already had"; it was
+    /// not. Interleaving whole events loses nothing, while a
+    /// straddled group destroys a logical event and can terminal the
+    /// shared reliable stream, so this is ownership rather than a
+    /// documented hazard.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
         events: &[Bytes],
     ) -> Result<(), StreamError> {
+        // Checked over the WHOLE slice up front — the batching loop
+        // flushes as it goes, so validating inline would put the
+        // events before the offending one on the wire and then
+        // report a failure, which is exactly the partial delivery
+        // the typed refusal exists to prevent.
+        let fragmenting = match events.iter().find(|e| e.len() > protocol::MAX_EVENT_SIZE) {
+            None => false,
+            Some(oversize) => {
+                // The gate needs the RESOLVED address, so it reads
+                // the peer map — but it touches no send state and
+                // clones no session, so an unresolvable peer simply
+                // cannot reassemble and gets the refusal this path
+                // has always returned.
+                let node_id = stream.peer_node_id();
+                let reassembles = self.peers.get(&node_id).is_some_and(|peer| {
+                    peer_reassembles_fragments(&self.capability_fold, node_id, &peer.addr())
+                });
+                if !reassembles {
+                    return Err(StreamError::EventTooLarge {
+                        size: oversize.len(),
+                        limit: protocol::MAX_EVENT_SIZE,
+                    });
+                }
+                // The ceiling, refused at the first piece: there is
+                // no first piece yet, so nothing partial can exist.
+                if let Some(over_ceiling) = events
+                    .iter()
+                    .find(|e| e.len() > protocol::MAX_FRAGMENTED_EVENT_SIZE)
+                {
+                    return Err(StreamError::EventTooLarge {
+                        size: over_ceiling.len(),
+                        limit: protocol::MAX_FRAGMENTED_EVENT_SIZE,
+                    });
+                }
+                true
+            }
+        };
+
         let peer = self
             .peers
-            .get(&stream.peer_node_id)
+            .get(&stream.peer_node_id())
             .ok_or(StreamError::NotConnected)?;
         let peer_addr = peer.addr();
+        // R12: the incarnation check and the `Arc` clone happen under
+        // the same `peers` lookup. Everything after this point — the
+        // epoch check, the credit admission, every flush — runs
+        // against *this* session object, so a displacement racing the
+        // send either loses to this read (and the send completes on a
+        // session that was current when it was admitted) or wins it
+        // (and the handle is refused here).
+        if peer.session.session_id() != stream.session_id() {
+            return Err(StreamError::SessionSuperseded);
+        }
         let session = peer.session.clone();
         drop(peer);
 
@@ -39976,13 +45889,59 @@ impl MeshNode {
             return Ok(()); // matches send_to_peer's silent drop
         }
 
-        let stream_id = stream.stream_id;
-        let reliable = stream.config.reliability.is_reliable();
+        let stream_id = stream.stream_id();
+        // **R4-1: the promoted stream INHERITS.** Reliability is
+        // configured per handle, and two handles can be open on one
+        // stream id — so a still-fire-and-forget handle used to keep
+        // emitting `PacketFlags::NONE` above the stream's reliable
+        // boundary and registering no retransmit descriptor. The
+        // receiver of that shared sequence space has one mode per
+        // stream: it promotes at the boundary and then holds every
+        // sequence above it as a reliable obligation, so a
+        // fire-and-forget gap above the boundary is either NACKed
+        // forever or (before its fallback was made conservative)
+        // acknowledged unreceived.
+        //
+        // The leaf's producer already rules this way
+        // (`LeafSession::build_packets`): once a stream is promoted,
+        // a fire-and-forget handle's flag is a REQUEST and the
+        // stream's mode is the contract. Inheriting cannot break a
+        // caller — reliable is strictly stronger than
+        // fire-and-forget, so one that asked for "may be lost" and
+        // got "will not be lost" received everything it asked for —
+        // and it costs exactly what makes the receiver's obligation
+        // answerable: a descriptor and a stamp.
+        let reliable = stream.config().reliability.is_reliable()
+            || session
+                .try_stream(stream_id)
+                .is_some_and(|s| s.tx_promoted());
         // Opt-in: bulk-transfer streams route their originating sends
         // through the FairScheduler (T-0.5) instead of straight to the
         // socket, so they participate in per-stream weighted fairness.
         // Default streams keep the direct path (zero blast radius).
-        let scheduled = stream.config.scheduled;
+        let scheduled = stream.config().scheduled;
+
+        // **R5-N2: the packets this call will emit**, by the same
+        // rule the flush loop below applies to the same slice — the
+        // loop counts what it actually emits and the debug assertion
+        // at the end pins the two together.
+        //
+        // Byte credit is not descriptor admission. `can_send()`
+        // below is the congestion gate and it is checked ONCE for
+        // the call, while each packet then took byte admission only;
+        // past the descriptor window `ReliableStream::on_send`
+        // evicts the OLDEST unacknowledged descriptor, so a lost
+        // head became unrebuildable while its send returned `Ok`. A
+        // newly allowed multi-piece event made that reachable
+        // without caller batching or concurrency at all: 31 pending
+        // single-packet sends plus a two-piece event needs 33 slots
+        // of 32. So the whole call is admitted against the
+        // descriptor window before any piece of it commits, exactly
+        // as the leaf admits a whole message
+        // (`LeafSession::build_packets`' `retransmit_headroom`
+        // reservation), or it is refused typed with nothing on the
+        // wire.
+        let packets = Self::stream_call_packets(events, fragmenting);
 
         // Refuse to send on a stream that isn't currently open, OR
         // whose live state has a different epoch than the handle. The
@@ -39994,7 +45953,7 @@ impl MeshNode {
         // stats, wrong tx_window accounting.
         match session.try_stream(stream_id) {
             None => return Err(StreamError::NotConnected),
-            Some(state) if state.epoch() != stream.epoch => {
+            Some(state) if state.epoch() != stream.epoch() => {
                 return Err(StreamError::NotConnected);
             }
             // Congestion gate (H-6): if in-flight is already at the
@@ -40004,6 +45963,28 @@ impl MeshNode {
             // hit this (cwnd grows past the in-flight count), so normal
             // and low-volume (nRPC) traffic is unaffected.
             Some(state) if reliable && !state.with_reliability(|r| r.can_send()) => {
+                return Err(StreamError::Backpressure);
+            }
+            // R5-N2: and the descriptor window, for every packet
+            // this call will emit. Retryable for the same reason the
+            // congestion gate is — an acknowledgement frees a slot —
+            // and refused before the first commit, so
+            // `send_with_retry` may safely replay the whole slice.
+            Some(state)
+                if reliable
+                    && state
+                        .with_reliability(|r| r.retransmit_headroom())
+                        .is_some_and(|headroom| headroom < packets) =>
+            {
+                tracing::debug!(
+                    stream_id = format!("{stream_id:#x}"),
+                    packets,
+                    headroom = state
+                        .with_reliability(|r| r.retransmit_headroom())
+                        .unwrap_or(0),
+                    "stream send refused: the reliable descriptor window \
+                     cannot own every packet of this call"
+                );
                 return Err(StreamError::Backpressure);
             }
             Some(_) => {}
@@ -40042,8 +46023,51 @@ impl MeshNode {
         // that meets backpressure retries *internally* with backoff until
         // it clears, so the batch is sent exactly once, in order.
         let mut committed_any = false;
+        // R5-N2: what the loop actually emits, against what the
+        // admission above reserved. The two rules are the same rule
+        // written twice, and this is what keeps them that way.
+        let mut emitted = 0usize;
 
         for event in events {
+            // An over-cap event is its own message and its own
+            // group: it never shares a packet with a neighbour, so
+            // whatever is pending flushes first and ordering within
+            // the call is preserved.
+            if fragmenting && event.len() > protocol::MAX_EVENT_SIZE {
+                if !current_batch.is_empty() {
+                    self.flush_stream_batch(
+                        &session,
+                        &mut builder,
+                        stream,
+                        stream_id,
+                        peer_addr,
+                        scheduled,
+                        flags,
+                        &current_batch,
+                        current_size,
+                        None,
+                        &mut committed_any,
+                    )
+                    .await?;
+                    emitted += 1;
+                    current_batch.clear();
+                    current_size = 0;
+                }
+                self.flush_stream_fragment_group(
+                    &session,
+                    &mut builder,
+                    stream,
+                    stream_id,
+                    peer_addr,
+                    scheduled,
+                    flags,
+                    event,
+                    &mut committed_any,
+                )
+                .await?;
+                emitted += event.len().div_ceil(protocol::MAX_EVENT_SIZE);
+                continue;
+            }
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
                 self.flush_stream_batch(
@@ -40056,9 +46080,11 @@ impl MeshNode {
                     flags,
                     &current_batch,
                     current_size,
+                    None,
                     &mut committed_any,
                 )
                 .await?;
+                emitted += 1;
                 current_batch.clear();
                 current_size = 0;
             }
@@ -40077,14 +46103,58 @@ impl MeshNode {
                 flags,
                 &current_batch,
                 current_size,
+                None,
                 &mut committed_any,
             )
             .await?;
+            emitted += 1;
         }
+        debug_assert_eq!(
+            emitted, packets,
+            "R5-N2: the descriptor admission reserved {packets} packets for \
+             this call and the flush loop emitted {emitted}; the two rules \
+             have drifted"
+        );
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// How many packets one [`Self::send_on_stream`] call will emit
+    /// for `events` (**R5-N2**).
+    ///
+    /// The batching rule of the flush loop, as arithmetic: an event
+    /// past the single-packet cap is its own group of
+    /// `ceil(len / MAX_EVENT_SIZE)` pieces and flushes whatever was
+    /// pending first, and everything else accumulates until the next
+    /// event would overflow `MAX_PAYLOAD_SIZE`. It exists so the
+    /// descriptor window can be asked to own the WHOLE call before
+    /// any piece of it commits; the loop counts what it emits and
+    /// debug-asserts the two agree.
+    fn stream_call_packets(events: &[Bytes], fragmenting: bool) -> usize {
+        let mut packets = 0usize;
+        let mut pending = 0usize;
+        for event in events {
+            if fragmenting && event.len() > protocol::MAX_EVENT_SIZE {
+                if pending > 0 {
+                    packets += 1;
+                    pending = 0;
+                }
+                packets += event.len().div_ceil(protocol::MAX_EVENT_SIZE);
+                continue;
+            }
+            let frame_size = EventFrame::LEN_SIZE + event.len();
+            if pending + frame_size > protocol::MAX_PAYLOAD_SIZE && pending > 0 {
+                packets += 1;
+                pending = 0;
+            }
+            pending += frame_size;
+        }
+        if pending > 0 {
+            packets += 1;
+        }
+        packets
     }
 
     /// Flush one built batch of a [`Self::send_on_stream`] call: acquire
@@ -40123,11 +46193,18 @@ impl MeshNode {
         builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
         stream: &Stream,
         stream_id: u64,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         scheduled: bool,
         flags: PacketFlags,
         batch: &[Bytes],
         batch_size: usize,
+        // `fragment` is the stamp this packet carries when it is one
+        // piece of a group: stamped one-shot on the build below and
+        // kept on the retransmit descriptor so a rebuild restamps
+        // it. A rebuilt piece with `frag_flags == 0` would reach the
+        // peer as a whole event and be handed to its application as
+        // a partial payload.
+        fragment: Option<net_wire::reliability::FragmentStamp>,
         committed_any: &mut bool,
     ) -> Result<(), StreamError> {
         // Charge the **wire size** (Net header + AEAD tag + payload)
@@ -40143,28 +46220,72 @@ impl MeshNode {
         // sender forever (#4 follow-up). Only consulted on the committed
         // path; pre-commit backpressure still returns immediately.
         let stall_deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        // R4-1: a boundary claimed on an attempt whose packet was
+        // then rolled back is still this send's to state — the claim
+        // is one-shot, so a retry that does not restamp it would
+        // leave the receiver with no statement at all.
+        let mut claimed_boundary: Option<u64> = None;
         loop {
-            // `TxAdmit::Acquired` returns credit + sequence under the
-            // same DashMap lookup — a close+reopen race can't slip a
-            // stale sequence from the old lifetime onto the new state.
-            let (guard, seq) =
-                match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
-                {
-                    TxAdmit::Acquired { guard, seq } => (guard, seq),
-                    TxAdmit::WindowFull => {
-                        if *committed_any {
-                            // Already committed earlier packets this call —
-                            // a return would trigger a whole-slice replay.
-                            // Wait for a receiver grant to free credit, but
-                            // give up (terminal error, no replay) once the
-                            // stall budget is exhausted.
-                            await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
-                            continue;
-                        }
-                        return Err(StreamError::Backpressure);
+            // One lookup for the credit, the sequence and the
+            // reliable-mode boundary claim — a close+reopen race
+            // can't slip a stale sequence from the old lifetime onto
+            // the new state, and the claim cannot name a HIGHER
+            // sequence than a concurrent first reliable send's (R4-1:
+            // the boundary must be the lowest reliable sequence, or
+            // the receiver concedes a reliable one below it). The
+            // session id is passed too so the admission itself
+            // refuses a predecessor's lifetime rather than relying on
+            // the caller having resolved the right session (R12).
+            let (guard, seq, boundary) = match session.try_admit_stream_send(
+                stream_id,
+                stream.session_id(),
+                stream.epoch(),
+                needed,
+                1,
+                flags.contains(PacketFlags::RELIABLE),
+            ) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                TxSendAdmit::WindowFull => {
+                    if *committed_any {
+                        // Already committed earlier packets this call —
+                        // a return would trigger a whole-slice replay.
+                        // Wait for a receiver grant to free credit, but
+                        // give up (terminal error, no replay) once the
+                        // stall budget is exhausted.
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
                     }
-                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-                };
+                    return Err(StreamError::Backpressure);
+                }
+                TxSendAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                TxSendAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+            };
+            if boundary.is_some() {
+                claimed_boundary = boundary;
+            }
+            // **R4-1: the boundary is STATED, not inferred.** This
+            // packet's sequence is the first reliable one on the
+            // stream, and saying so is what lets the receiver concede
+            // the fire-and-forget sequences below it without
+            // acknowledging anything it never got — and what stops it
+            // conceding a reliable one. The flag rides the retransmit
+            // descriptor too, so a lost boundary packet re-announces
+            // itself on rebuild. Exactly the leaf's rule
+            // (`LeafSession::build_packets`).
+            let flags = if claimed_boundary == Some(seq) {
+                flags.with(PacketFlags::MODE_BOUNDARY)
+            } else {
+                flags
+            };
+            // The stamp is one-shot: `build` consumes it, so it is
+            // set inside the retry loop and re-set on every attempt.
+            if let Some(f) = fragment {
+                builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+            }
             let packet = builder.build(stream_id, seq, batch, flags);
             match self
                 .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
@@ -40172,7 +46293,15 @@ impl MeshNode {
             {
                 Ok(()) => {
                     guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
-                    Self::register_retransmit(session, stream_id, stream.epoch, seq, batch, flags);
+                    Self::register_retransmit(
+                        session,
+                        stream_id,
+                        stream.epoch(),
+                        seq,
+                        batch,
+                        flags,
+                        fragment,
+                    );
                     *committed_any = true;
                     return Ok(());
                 }
@@ -40184,7 +46313,7 @@ impl MeshNode {
                     // prefix is already committed) or surface backpressure
                     // for a safe whole-slice replay.
                     drop(guard);
-                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch(), seq);
                     if *committed_any {
                         await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
                         continue;
@@ -40196,7 +46325,7 @@ impl MeshNode {
                     // credit. Roll back the seq too — the packet never
                     // reached the wire, so the sequence is unused.
                     drop(guard);
-                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch(), seq);
                     return Err(e);
                 }
             }
@@ -40228,6 +46357,7 @@ impl MeshNode {
         seq: u64,
         events: &[Bytes],
         flags: PacketFlags,
+        fragment: Option<net_wire::reliability::FragmentStamp>,
     ) {
         if !flags.contains(PacketFlags::RELIABLE) {
             return;
@@ -40237,10 +46367,240 @@ impl MeshNode {
             stream_id,
             events: events.to_vec(),
             flags,
+            fragment,
         });
         if let Some(state) = session.try_stream(stream_id) {
             if state.epoch() == epoch {
                 state.with_reliability(|r| r.on_send(descriptor));
+            }
+        }
+    }
+
+    /// Emit one over-cap stream event as a fragment group
+    /// (`S5_R5_BRIEF.md` §4). **The new seam this round adds.**
+    ///
+    /// It is a new function rather than a call into
+    /// `rtc/fragment.rs` because that module is the RECEIVER: it
+    /// owns group provenance, the abandonment ledger, the session
+    /// byte budget and the TTL, and has no notion of credit,
+    /// sequences, backpressure or a socket. The two halves share
+    /// what must not drift — the flag bits, the per-piece cap and
+    /// the ceiling, all from `net_wire::protocol` — and nothing
+    /// else. Writing this as a second reassembler would have been
+    /// the defect the brief forbids; writing it as a sender is the
+    /// missing half.
+    ///
+    /// The emission is the leaf's, piece for piece
+    /// (`leaf/src/frame.rs::split_payload` +
+    /// `leaf/src/session.rs::build_packets`): cut at
+    /// [`protocol::MAX_EVENT_SIZE`], `FRAG_FRAGMENTED` on every
+    /// piece and `FRAG_LAST` on the last, one `fragment_id` for the
+    /// group, and consecutive sequences allocated in offset order —
+    /// which is the sequence-ownership rule the receiver holds a
+    /// group to (round 4's mode boundary: the head's sequence is the
+    /// group's, the tail's are consumed by reassembly).
+    ///
+    /// **R5-N1: the whole group's sequences are reserved before its
+    /// first piece commits.** Each piece used to take its own
+    /// sequence through a separately awaited
+    /// [`Self::flush_stream_batch`], which yields on byte credit and
+    /// on delivery pressure — so a small concurrent send on the same
+    /// stream could take the sequence between two pieces, and BOTH
+    /// sends succeeded. Both receivers require a group's piece
+    /// sequences to be contiguous in offset order (`rtc/fragment.rs`
+    /// refuses exactly that shape, and retransmission preserves it),
+    /// so the interleave destroyed a logical event and could terminal
+    /// the shared reliable stream. Interleaving whole EVENTS is
+    /// compatible with the batching contract; interleaving a group's
+    /// pieces is not, and the sequence space is the thing that has to
+    /// say so. `NetSession::try_admit_stream_send` reserves the
+    /// range, the group's byte credit and the boundary claim under
+    /// ONE lookup; nothing is held across the awaits below.
+    ///
+    /// A fire-and-forget group is lossy by construction: its pieces
+    /// register no descriptor, so a lost piece leaves the group
+    /// incomplete, the receiver reaps it on its TTL, and the stream
+    /// survives (`dispose_abandoned_rtc_groups`' reliable guard,
+    /// R3-4/R4-6).
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_stream_fragment_group(
+        &self,
+        session: &Arc<NetSession>,
+        builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
+        stream: &Stream,
+        stream_id: u64,
+        peer_addr: PeerAddr,
+        scheduled: bool,
+        flags: PacketFlags,
+        event: &Bytes,
+        committed_any: &mut bool,
+    ) -> Result<(), StreamError> {
+        use net_wire::protocol::{FRAG_FRAGMENTED, FRAG_LAST};
+
+        debug_assert!(
+            event.len() > protocol::MAX_EVENT_SIZE
+                && event.len() <= protocol::MAX_FRAGMENTED_EVENT_SIZE,
+            "send_on_stream decided the size disposition before any piece \
+             existed; reaching here outside the fragmentable band means that \
+             decision was bypassed"
+        );
+        let fragment_id = self.next_fragment_id();
+        let pieces = event.len().div_ceil(protocol::MAX_EVENT_SIZE);
+        // The group's wire bytes, charged once: the same per-packet
+        // overhead each piece would have been charged separately.
+        let mut group_bytes = 0u32;
+        let mut offset = 0usize;
+        while offset < event.len() {
+            let end = (offset + protocol::MAX_EVENT_SIZE).min(event.len());
+            group_bytes = group_bytes.saturating_add(wire_bytes_for_payload(
+                EventFrame::LEN_SIZE + (end - offset),
+            ));
+            offset = end;
+        }
+
+        let mut delay = Duration::from_millis(5);
+        let cap = Duration::from_millis(200);
+        let stall_deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        let (guard, first_seq, boundary) = loop {
+            match session.try_admit_stream_send(
+                stream_id,
+                stream.session_id(),
+                stream.epoch(),
+                group_bytes,
+                pieces as u32,
+                flags.contains(PacketFlags::RELIABLE),
+            ) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => break (guard, first_seq, boundary),
+                TxSendAdmit::WindowFull => {
+                    // Before the first commit of the CALL this is a
+                    // safe whole-slice replay; after it, waiting is
+                    // the only option that does not duplicate the
+                    // committed prefix. Either way no piece of this
+                    // group exists yet, so the group is whole in
+                    // both outcomes (#19).
+                    if *committed_any {
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
+                    }
+                    return Err(StreamError::Backpressure);
+                }
+                TxSendAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                TxSendAdmit::SessionSuperseded => return Err(StreamError::SessionSuperseded),
+            }
+        };
+
+        let mut offset = 0usize;
+        let mut sent = 0usize;
+        let mut delivered_bytes = 0u32;
+        while offset < event.len() {
+            let end = (offset + protocol::MAX_EVENT_SIZE).min(event.len());
+            let last = end == event.len();
+            let piece = event.slice(offset..end);
+            let seq = first_seq + sent as u64;
+            let piece_flags = if boundary == Some(seq) {
+                flags.with(PacketFlags::MODE_BOUNDARY)
+            } else {
+                flags
+            };
+            let stamp = net_wire::reliability::FragmentStamp {
+                fragment_id,
+                // The ceiling and `MAX_FRAGMENTS_PER_GROUP` are
+                // asserted at compile time to keep every start
+                // offset inside the header's u16, and the band
+                // assertion above keeps this event inside them.
+                fragment_offset: offset as u16,
+                frag_flags: FRAG_FRAGMENTED | if last { FRAG_LAST } else { 0 },
+            };
+            let batch = std::slice::from_ref(&piece);
+            let piece_bytes = wire_bytes_for_payload(EventFrame::LEN_SIZE + piece.len());
+            loop {
+                // The stamp is one-shot: `build` consumes it, so it
+                // is set on every attempt.
+                builder.set_fragment(stamp.fragment_id, stamp.fragment_offset, stamp.frag_flags);
+                let packet = builder.build(stream_id, seq, batch, piece_flags);
+                match self
+                    .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                    .await
+                {
+                    Ok(()) => {
+                        Self::register_retransmit(
+                            session,
+                            stream_id,
+                            stream.epoch(),
+                            seq,
+                            batch,
+                            piece_flags,
+                            Some(stamp),
+                        );
+                        *committed_any = true;
+                        delivered_bytes = delivered_bytes.saturating_add(piece_bytes);
+                        break;
+                    }
+                    // The group's sequence range is already reserved,
+                    // so this piece cannot be retried under a fresh
+                    // sequence without leaving a hole the receiver
+                    // would hold the group's successor behind. The
+                    // packet is not on the wire, so retrying the SAME
+                    // sequence is exactly right — and bounded by the
+                    // same stall budget every committed flush uses.
+                    Err(StreamError::Backpressure) => {
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        // The group is broken: the delivered prefix
+                        // is on the wire and owns its bytes, the rest
+                        // never existed. Commit what was delivered,
+                        // refund the tail, and reclaim the unused
+                        // sequences from the TOP so the receiver is
+                        // left no hole it would NACK forever (the
+                        // reclaim is a CAS per sequence, so a
+                        // concurrent send that raced ahead simply
+                        // leaves them consumed, exactly as one
+                        // rolled-back packet always could).
+                        let unused = group_bytes.saturating_sub(delivered_bytes);
+                        guard.commit();
+                        if unused > 0 {
+                            if let Some(state) = session.try_stream(stream_id) {
+                                if state.epoch() == stream.epoch() {
+                                    state.refund_tx_credit(unused);
+                                }
+                            }
+                        }
+                        for back in (sent..pieces).rev() {
+                            session.try_rollback_tx_seq(
+                                stream_id,
+                                stream.epoch(),
+                                first_seq + back as u64,
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            sent += 1;
+            offset = end;
+        }
+        guard.commit();
+        Ok(())
+    }
+
+    /// The next `fragment_id` this node's sender stamps.
+    ///
+    /// Never 0, because 0 is what an unstamped header carries and a
+    /// group must not share an id with "no group". Wraps at
+    /// `u16::MAX` back to 1 — the same discipline as the leaf's
+    /// `next_fragment_id`.
+    fn next_fragment_id(&self) -> u16 {
+        loop {
+            let raw = self.fragment_id_counter.fetch_add(1, Ordering::Relaxed);
+            let id = (raw % (u16::MAX as u32 + 1)) as u16;
+            if id != 0 {
+                return id;
             }
         }
     }
@@ -40259,7 +46619,7 @@ impl MeshNode {
         &self,
         scheduled: bool,
         packet: &[u8],
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         stream_id: u64,
     ) -> Result<(), StreamError> {
         if scheduled {
@@ -40278,12 +46638,34 @@ impl MeshNode {
                 Err(StreamError::Backpressure)
             }
         } else {
-            self.socket
-                .send_to(packet, peer_addr)
+            self.sink
+                .send(packet, peer_addr)
                 .await
                 .map(|_| ())
-                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))
+                .map_err(|e| Self::stream_send_error(peer_addr, e))
         }
+    }
+
+    /// Classify a sink error for the unscheduled stream arm.
+    ///
+    /// **UDP is unchanged, byte for byte** (Stage 1 exit criterion):
+    /// every UDP failure — including a `WouldBlock` out of
+    /// `try_send_to` — stays `StreamError::Transport`, because on UDP
+    /// that is a socket fault the caller cannot wait out.
+    ///
+    /// RTC is different in kind, not in degree: its `WouldBlock` is
+    /// the admission gate refusing a *healthy* DataChannel whose
+    /// reserved queue is momentarily full. That is pressure, and
+    /// `send_with_retry` is built to ride pressure — returning
+    /// `Transport` made a congested channel look like a broken one
+    /// and killed the send outright (R2).
+    fn stream_send_error(peer_addr: PeerAddr, e: std::io::Error) -> StreamError {
+        #[cfg(feature = "webrtc")]
+        if matches!(peer_addr, PeerAddr::Rtc(_)) && e.kind() == std::io::ErrorKind::WouldBlock {
+            return StreamError::Backpressure;
+        }
+        let _ = peer_addr;
+        StreamError::Transport(format!("send failed: {}", e))
     }
 
     /// Send `events` on `stream`, retrying on `Backpressure` with
@@ -40338,18 +46720,7 @@ impl MeshNode {
     pub fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<StreamStats> {
         let peer = self.peers.get(&peer_node_id)?;
         let state = peer.session.get_stream(stream_id)?;
-        Some(StreamStats {
-            tx_seq: state.current_tx_seq(),
-            rx_seq: state.current_rx_seq(),
-            inbound_pending: state.inbound_len() as u64,
-            last_activity_ns: state.last_activity_ns(),
-            active: state.is_active(),
-            backpressure_events: state.backpressure_events(),
-            tx_credit_remaining: state.tx_credit_remaining(),
-            tx_window: state.tx_window(),
-            credit_grants_received: state.credit_grants_received(),
-            credit_grants_sent: state.credit_grants_sent(),
-        })
+        Some(stream_stats_of(&state))
     }
 
     /// Snapshot of per-stream stats for every stream in the session to
@@ -40366,21 +46737,7 @@ impl MeshNode {
             .into_iter()
             .filter_map(|sid| {
                 let state = session.get_stream(sid)?;
-                Some((
-                    sid,
-                    StreamStats {
-                        tx_seq: state.current_tx_seq(),
-                        rx_seq: state.current_rx_seq(),
-                        inbound_pending: state.inbound_len() as u64,
-                        last_activity_ns: state.last_activity_ns(),
-                        active: state.is_active(),
-                        backpressure_events: state.backpressure_events(),
-                        tx_credit_remaining: state.tx_credit_remaining(),
-                        tx_window: state.tx_window(),
-                        credit_grants_received: state.credit_grants_received(),
-                        credit_grants_sent: state.credit_grants_sent(),
-                    },
-                ))
+                Some((sid, stream_stats_of(&state)))
             })
             .collect()
     }
@@ -40408,7 +46765,7 @@ impl MeshNode {
     /// router + peers + addr_to_node).
     async fn try_connect_via_once(
         &self,
-        relay_addr: SocketAddr,
+        relay_addr: PeerAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
@@ -40458,7 +46815,7 @@ impl MeshNode {
         let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
         routed.extend_from_slice(&routing.to_bytes());
         routed.extend_from_slice(&inner);
-        if let Err(e) = self.socket.send_to(&routed, relay_addr).await {
+        if let Err(e) = self.sink.send(&routed, relay_addr).await {
             self.pending_handshakes.remove(&pending_key);
             return Err(AdapterError::Connection(format!("send failed: {}", e)));
         }
@@ -40525,7 +46882,7 @@ impl MeshNode {
         let keys = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(relay_addr, dest_pubkey, dest_node_id)
+                .try_connect_via_once(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(keys) => break keys,
@@ -40547,7 +46904,7 @@ impl MeshNode {
         // intentionally skip the post-install pingwave /
         // failure_detector / announcement push — see `connect`'s wiring
         // for the direct-handshake-only bookkeeping.
-        self.install_routed(dest_node_id, relay_addr, keys, None);
+        self.install_routed(dest_node_id, PeerAddr::Udp(relay_addr), keys, None);
 
         Ok(dest_node_id)
     }
@@ -40581,7 +46938,7 @@ impl MeshNode {
         let keys = loop {
             attempt += 1;
             match self
-                .try_connect_via_once(target_addr, dest_pubkey, dest_node_id)
+                .try_connect_via_once(PeerAddr::Udp(target_addr), dest_pubkey, dest_node_id)
                 .await
             {
                 Ok(keys) => break keys,
@@ -40594,9 +46951,9 @@ impl MeshNode {
         };
         let expected = Some(expected_prior_session_id);
         let outcome = if direct {
-            self.install_direct(dest_node_id, target_addr, keys, expected)
+            self.install_direct(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
         } else {
-            self.install_routed(dest_node_id, target_addr, keys, expected)
+            self.install_routed(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
         };
         Ok(outcome.owned)
     }
@@ -40764,7 +47121,7 @@ impl MeshNode {
     /// reconnects starts from a clean slate.
     #[cfg(feature = "nat-traversal")]
     async fn attempt_direct_upgrade(&self, peer_id: u64) {
-        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::classify::PairAction;
 
         // Re-evaluate a not-yet-upgradable `SinglePunch` pair after
         // this long, so a NAT reclassification that makes it `Direct`
@@ -40805,7 +47162,7 @@ impl MeshNode {
             return;
         }
 
-        let action = pair_action(self.nat_class(), self.peer_nat_class(peer_id));
+        let action = self.pair_action_for(peer_id);
         let target_addr = match action {
             PairAction::Direct => match self.peer_reflex_addr(peer_id) {
                 Some(addr) => addr,
@@ -40830,6 +47187,42 @@ impl MeshNode {
             // ticking at 1 s, well inside that window. Marking `done`
             // here pinned such a peer to the relay for the life of its
             // peer entry, on a classification that was about to change.
+            // An RTC peer is already on its best path: ICE negotiated
+            // it. The direct-upgrade scan has nothing to upgrade to,
+            // so it is done with this peer rather than deferred —
+            // re-checking would re-derive the same answer forever.
+            PairAction::Ice => {
+                // **R4:** an `Ice` pair is not *already* upgraded —
+                // it is the pair whose upgrade is an RTC dialog.
+                // Marking the scan done here pinned such a peer to
+                // the relay for the life of its peer entry, with
+                // nothing ever scheduling the attempt. Offer the
+                // direct path, and defer on the existing retry
+                // ladder so a failed or expired attempt is
+                // revisited rather than abandoned.
+                #[cfg(feature = "webrtc")]
+                if !self.peer_is_direct(peer_id) {
+                    if let Some(node) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                        tokio::spawn(async move {
+                            if let Err(e) = node.offer_direct_path(peer_id).await {
+                                tracing::debug!(
+                                    error = %e,
+                                    peer = format!("{peer_id:#x}"),
+                                    "rtc upgrade: offer not sent"
+                                );
+                            }
+                        });
+                    }
+                }
+                self.upgrade_record_defer(
+                    peer_id,
+                    upgrade_jitter(
+                        upgrade_jitter_seed(self.node_id, peer_id, 0),
+                        SKIPPUNCH_RECHECK,
+                    ),
+                );
+                return;
+            }
             PairAction::SkipPunch => {
                 self.upgrade_record_defer(
                     peer_id,
@@ -40860,7 +47253,7 @@ impl MeshNode {
         };
 
         // Guard against "upgrading" to the very path we're already on.
-        if target_addr == relay_addr {
+        if PeerAddr::Udp(target_addr) == relay_addr {
             self.upgrade_record_done(peer_id);
             return;
         }
@@ -40917,7 +47310,7 @@ impl MeshNode {
     /// peer straight from the `peers` iterator entry instead of doing a
     /// redundant `peers.get` shard-lookup on the map it is iterating.
     #[cfg(feature = "nat-traversal")]
-    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: SocketAddr) -> bool {
+    fn upgrade_is_loop_candidate_at(&self, peer_id: u64, addr: PeerAddr) -> bool {
         // C1: only the lower-node-id end initiates.
         if self.node_id >= peer_id {
             return false;
@@ -41093,6 +47486,12 @@ impl MeshNode {
                     dest_node_id
                 ))
             })?;
+        let first_hop = first_hop.udp().ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "connect_routed: no route to peer {:#x}",
+                dest_node_id
+            ))
+        })?;
         self.connect_via(first_hop, dest_pubkey, dest_node_id).await
     }
 
@@ -41126,7 +47525,7 @@ impl MeshNode {
     /// on path.
     async fn handshake_initiator(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
@@ -41177,7 +47576,7 @@ impl MeshNode {
     /// and are reused across attempts — see its doc for why.
     async fn try_handshake_initiator(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: PeerAddr,
         packet: &Bytes,
         handshake: &mut NoiseHandshake,
     ) -> Result<(), AdapterError> {
@@ -41213,8 +47612,18 @@ impl MeshNode {
                 displaced.close();
             }
 
-            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
-                self.deregister_direct_initiator(peer_addr, &inbox);
+            // H3: reclaim on **cancel**, not only on completion.
+            // Dropping this future while parked on `inbox.next()`
+            // skipped the explicit deregistration below, and nothing
+            // else visits this registry — a recycled RTC generation
+            // is a different key, so the stale entry was permanent.
+            let registration = DirectInboxGuard {
+                registry: &self.pending_direct_initiators,
+                addr: peer_addr,
+                inbox: Arc::clone(&inbox),
+            };
+
+            if let Err(e) = self.sink.send(packet, peer_addr).await {
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
@@ -41245,7 +47654,7 @@ impl MeshNode {
             })
             .await;
 
-            self.deregister_direct_initiator(peer_addr, &inbox);
+            drop(registration);
             match outcome {
                 Ok(inner) => inner,
                 // The responder never replied, or its reply arrived
@@ -41268,9 +47677,15 @@ impl MeshNode {
                 displaced.close();
             }
 
+            // H3: same RAII reclamation on the pre-`start()` branch.
+            let registration = DirectInboxGuard {
+                registry: &self.pending_direct_initiators,
+                addr: peer_addr,
+                inbox: Arc::clone(&inbox),
+            };
+
             let socket_arc = self.socket.socket_arc();
-            if let Err(e) = self.socket.send_to(packet, peer_addr).await {
-                self.deregister_direct_initiator(peer_addr, &inbox);
+            if let Err(e) = self.sink.send(packet, peer_addr).await {
                 return Err(AdapterError::Connection(format!("send failed: {}", e)));
             }
 
@@ -41294,6 +47709,9 @@ impl MeshNode {
                             let (n, source) = read.map_err(|e| {
                                 AdapterError::Connection(format!("recv failed: {}", e))
                             })?;
+                            // Receive boundary: the socket tuple becomes
+                            // the peer endpoint here.
+                            let source = PeerAddr::Udp(source);
                             let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
                             let Some(p) = ParsedPacket::parse(data, source) else {
@@ -41342,26 +47760,12 @@ impl MeshNode {
             })
             .await;
 
-            self.deregister_direct_initiator(peer_addr, &inbox);
+            drop(registration);
             match outcome {
                 Ok(inner) => inner,
                 Err(_) => Err(AdapterError::Connection("handshake timeout".into())),
             }
         }
-    }
-
-    /// Remove OUR direct-handshake registration, and only ours.
-    ///
-    /// A later `connect()` to the same address replaces the entry —
-    /// last writer wins — so an unconditional `remove` here would take
-    /// that live registration down with us and strand it.
-    fn deregister_direct_initiator(
-        &self,
-        peer_addr: SocketAddr,
-        inbox: &Arc<DirectHandshakeInbox>,
-    ) {
-        self.pending_direct_initiators
-            .remove_if(&peer_addr, |_, registered| Arc::ptr_eq(registered, inbox));
     }
 
     /// Handshake datagrams one source may buy Noise work with per
@@ -41379,7 +47783,7 @@ impl MeshNode {
     async fn handshake_responder(
         &self,
         peer_node_id: u64,
-    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
         // Rejection state for the WHOLE accept, not for one attempt.
         // The case that matters is a genuine key mismatch whose `msg1`
         // lands during an early attempt: the initiator's budget is not
@@ -41389,7 +47793,7 @@ impl MeshNode {
         // nothing at all on the wire — reports a bare
         // `handshake timeout` for what is really a misconfiguration.
         let mut last_decrypt_reject: Option<String> = None;
-        let mut last_paced_source: Option<SocketAddr> = None;
+        let mut last_paced_source: Option<PeerAddr> = None;
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -41492,8 +47896,8 @@ impl MeshNode {
         &self,
         peer_node_id: u64,
         last_decrypt_reject: &mut Option<String>,
-        last_paced_source: &mut Option<SocketAddr>,
-    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+        last_paced_source: &mut Option<PeerAddr>,
+    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
@@ -41545,6 +47949,9 @@ impl MeshNode {
                     .await
                     .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
+                // Receive boundary: the socket tuple becomes the peer
+                // endpoint here.
+                let source = PeerAddr::Udp(source);
                 let data = Bytes::copy_from_slice(&recv_buf[..n]);
 
                 let Some(p) = ParsedPacket::parse(data, source) else {
@@ -41638,8 +48045,8 @@ impl MeshNode {
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg2);
 
-        self.socket
-            .send_to(&packet, source)
+        self.sink
+            .send(&packet, source)
             .await
             .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
@@ -41682,10 +48089,13 @@ impl MeshNode {
     ) -> Result<std::net::SocketAddr, super::traversal::TraversalError> {
         use super::traversal::{reflex, TraversalError};
 
+        // Traversal edge: `send_subprotocol` is the operator-facing
+        // seam and keeps its `SocketAddr`, so resolve the endpoint's
+        // UDP tuple here.
         let peer_addr = self
             .peer_addrs
             .get(&peer_node_id)
-            .map(|e| *e.value())
+            .and_then(|e| e.value().udp())
             .ok_or(TraversalError::PeerNotReachable)?;
 
         // Install the pending-oneshot BEFORE sending so an
@@ -42005,10 +48415,11 @@ impl MeshNode {
         use super::traversal::rendezvous::{PunchRequest, RendezvousMsg};
         use super::traversal::TraversalError;
 
+        // Same boundary as the reflex probe above.
         let relay_addr = self
             .peer_addrs
             .get(&relay)
-            .map(|e| *e.value())
+            .and_then(|e| e.value().udp())
             .ok_or(TraversalError::PeerNotReachable)?;
 
         // Install the waiter BEFORE sending. An improbably fast
@@ -42395,7 +48806,7 @@ impl Adapter for MeshNode {
             .peers
             .iter()
             .next()
-            .map(|e| e.value().addr())
+            .and_then(|e| e.value().addr().udp())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
         self.send_to_peer(peer_addr, &batch).await
@@ -42433,16 +48844,95 @@ impl Adapter for MeshNode {
             egress.close_and_join().await;
         }
 
-        // Deactivate all sessions
+        // Retire every session's receive lifetime, and mark it not
+        // live. NR3: the retirement is also what refuses every frame
+        // still in flight past its session lookup — a frame captured
+        // under a retired incarnation is not dispatched
+        // (`process_local_packet`), so no late arrival can rebuild
+        // receive state on a node that is going away. The `active`
+        // flag is not that predicate: see
+        // `retire_session_receive_lifetime` for why the two are
+        // separate.
         for entry in self.peers.iter() {
+            entry.value().session.retire_receive_lifetime();
             entry.value().session.deactivate();
+        }
+
+        // R3-B: the RTC driver is this node's task and its socket is
+        // this node's socket, so this call owns ending both. Signalled
+        // AND joined: without the join, "shut down" would only mean
+        // "asked to stop", and a successor trying to rebind an
+        // explicit RTC port would lose a race it cannot see.
+        //
+        // **NR3: joined BEFORE the general task drain, not after.**
+        // `SessionTable::drop` announces every remaining channel
+        // close as it tears down, and the consumer of those
+        // announcements is one of the tasks below. Draining the tasks
+        // first stopped that consumer before the announcements
+        // existed, so the driver's final closes went into a channel
+        // nobody would ever read. In this order the notifier is still
+        // alive when they are queued, and its shutdown path drains
+        // what is already queued before it exits.
+        #[cfg(feature = "webrtc")]
+        if let Some(driver) = self.rtc_driver.as_ref() {
+            driver.shutdown_and_join().await;
         }
 
         // Wait for background tasks. Taken under the synchronous lock in its own
         // scope so the guard is released before the first await.
+        //
+        // BOUNDED, and the bound is the point. This drain used to be
+        // a bare `handle.await` per task with no abort and no
+        // deadline, so one task that never yields — wedged in a
+        // synchronous block, or simply starved on a loaded machine —
+        // hung `shutdown()` forever, and a caller could not tell that
+        // from a slow drain. The cancellation is cooperative, so the
+        // abort is a request rather than a guarantee: that is exactly
+        // why the wait AFTER it is bounded too, instead of trading an
+        // unbounded join for an unbounded await on the same handle.
+        //
+        // Escalation is loud. A task still running here is not a
+        // tidy-up detail — it holds whatever it was holding while the
+        // node it belongs to is being torn down — so it is named at
+        // `warn`, not swallowed.
         let tasks = { std::mem::take(&mut *self.tasks.lock()) };
-        for handle in tasks {
-            let _ = handle.await;
+        for mut handle in tasks {
+            if tokio::time::timeout(SHUTDOWN_TASK_JOIN, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                if tokio::time::timeout(SHUTDOWN_TASK_JOIN, &mut handle)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        node = format!("{:#x}", self.node_id()),
+                        "shutdown: a background task did not exit and could not be \
+                         cancelled; it is wedged in a non-cancellable section and \
+                         shutdown is proceeding without it"
+                    );
+                }
+            }
+        }
+
+        // **NR3: shutdown owns the mesh's reassembly.** The map
+        // outlives every session in it, so a retained shut-down node
+        // kept every partial group it had buffered — and the close
+        // notifications that would have retired them are exactly the
+        // ones whose consumer this call has just joined. Retiring
+        // here does not depend on any notification arriving: it runs
+        // last, after every producer of new groups is gone.
+        #[cfg(feature = "webrtc")]
+        {
+            let released = self.rtc_reassembly.retire_all(std::time::Instant::now());
+            if released > 0 {
+                tracing::info!(
+                    released,
+                    "shutdown: released partial leaf-fragment groups the mesh \
+                     was holding"
+                );
+            }
         }
 
         Ok(())
@@ -42518,6 +49008,15 @@ impl Drop for MeshNode {
         // schedule and abort it, best-effort, exactly like the egress below.
         self.close_sensing_refresh_detached();
 
+        // R3-B, the destructor's half: a `Drop` cannot await, so it
+        // signals and aborts rather than joining. Dropping the handle
+        // alone left the driver detached — still bound to its socket,
+        // still answering STUN if configured.
+        #[cfg(feature = "webrtc")]
+        if let Some(driver) = self.rtc_driver.as_ref() {
+            driver.shutdown_detached();
+        }
+
         // Same best-effort treatment for the ordered organization egress: a
         // destructor cannot await, and silently dropping the handle would merely
         // DETACH the consumer, leaving it sending over a node that is gone. It
@@ -42569,8 +49068,8 @@ mod punch_observer_tests {
         }
     }
 
-    fn sample_peer() -> SocketAddr {
-        "198.51.100.5:9001".parse().unwrap()
+    fn sample_peer() -> PeerAddr {
+        PeerAddr::Udp("198.51.100.5:9001".parse().unwrap())
     }
 
     /// Expected counterpart node id stored alongside each observer.
@@ -42585,7 +49084,7 @@ mod punch_observer_tests {
     /// oneshot, so the helper doesn't need to remove anything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fires_true_when_keepalive_arrives() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
         observers.insert(peer, (EXPECTED_PEER, tx));
@@ -42605,7 +49104,7 @@ mod punch_observer_tests {
     /// keep-alive doesn't find it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_evicts_own_stale_entry() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
         observers.insert(peer, (EXPECTED_PEER, tx));
@@ -42627,7 +49126,7 @@ mod punch_observer_tests {
     /// in the map.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sender_dropped_leaves_replacement_observer_intact() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // Install observer A.
@@ -42658,7 +49157,7 @@ mod punch_observer_tests {
     /// `remove` on every cleanup path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_then_sender_drop_does_not_double_evict() {
-        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
+        let observers: DashMap<PeerAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // First task: install A, let it time out, evict.
@@ -43292,8 +49791,8 @@ mod sensing_live_direct_session_tests {
         // reverse mapping for that address names X, not P. The old
         // `peers.contains_key(P)` predicate read this as a live
         // direct session and skipped disruption.
-        let relay_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        let relay_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
+        let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(relay_addr, 0xE0); // the RELAY's id
         assert!(
             !sensing_addr_is_live_direct(&addr_to_node, None, 0xF0, relay_addr),
@@ -43303,13 +49802,13 @@ mod sensing_live_direct_session_tests {
 
     #[test]
     fn direct_session_reverse_maps_to_the_node_itself() {
-        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-        let addr_to_node: DashMap<SocketAddr, u64> = DashMap::new();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9002".parse().unwrap());
+        let addr_to_node: DashMap<PeerAddr, u64> = DashMap::new();
         addr_to_node.insert(addr, 0xD1);
         assert!(sensing_addr_is_live_direct(&addr_to_node, None, 0xD1, addr));
         // And an address nobody reverse-maps is not direct either
         // (a torn/mid-eviction entry stays conservative).
-        let stale: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let stale: PeerAddr = PeerAddr::Udp("127.0.0.1:9003".parse().unwrap());
         assert!(!sensing_addr_is_live_direct(
             &addr_to_node,
             None,
@@ -43414,6 +49913,10 @@ mod fold_publisher_helpers_tests {
                 region: Some("us-east".into()),
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
@@ -43627,13 +50130,13 @@ mod fold_publisher_helpers_tests {
         );
         assert_eq!(node.subscriber_chains.len(), 2);
 
-        node.failure_detector.heartbeat(dead, addr);
-        node.failure_detector.heartbeat(live, addr);
+        node.failure_detector.heartbeat(dead, PeerAddr::Udp(addr));
+        node.failure_detector.heartbeat(live, PeerAddr::Udp(addr));
 
         // Age `dead`'s heartbeat well past `miss_threshold × timeout`,
         // then refresh `live` so only `dead` trips.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        node.failure_detector.heartbeat(live, addr);
+        node.failure_detector.heartbeat(live, PeerAddr::Udp(addr));
 
         let failed = node.failure_detector.check_all();
         assert!(failed.contains(&dead), "dead peer must be detected failed");
@@ -43792,11 +50295,10 @@ mod route_withdrawal_promotion_tests {
     //! reinstall exactly the route the withdrawal just dropped.
     use super::*;
     use crate::adapter::net::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
-    use std::net::SocketAddr;
     use std::time::Duration;
 
-    fn addr(port: u16) -> SocketAddr {
-        format!("127.0.0.1:{port}").parse().unwrap()
+    fn addr(port: u16) -> PeerAddr {
+        PeerAddr::Udp(format!("127.0.0.1:{port}").parse().unwrap())
     }
 
     /// A detector whose nodes go Failed after a hair of real time so
@@ -43958,11 +50460,16 @@ mod heartbeat_aead_tests {
     #[test]
     fn aead_authenticated_heartbeat_passes_verification_and_touches_session() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
 
-        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap())
+        let parsed = ParsedPacket::parse(bytes, PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()))
             .expect("legitimate heartbeat must parse");
         assert!(parsed.header.flags.is_heartbeat());
 
@@ -43984,7 +50491,12 @@ mod heartbeat_aead_tests {
     #[test]
     fn unauthenticated_heartbeat_fails_verification_and_does_not_touch() {
         let (_init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
 
         // Attacker forges a heartbeat header with the right
         // session_id but garbage 16-byte tail. Pre-fix this passed
@@ -43997,8 +50509,11 @@ mod heartbeat_aead_tests {
         header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
         forged.extend_from_slice(&header_bytes);
         forged.extend_from_slice(&[0xAAu8; 16]); // garbage tag
-        let parsed = ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
-            .expect("forged heartbeat must still parse — verification is downstream");
+        let parsed = ParsedPacket::parse(
+            forged.freeze(),
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+        )
+        .expect("forged heartbeat must still parse — verification is downstream");
         assert!(parsed.header.flags.is_heartbeat());
 
         let last_before = resp_session.last_activity_ns();
@@ -44028,10 +50543,10 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_rolls_back_on_drop_when_not_completed() {
         let peer_id = 0xDEAD_BEEFu64;
-        let next_hop: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let next_hop: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -44056,12 +50571,12 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: next_hop,
-                },
+                transport: PeerTransport::Direct { owned: next_hop },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -44127,10 +50642,10 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
         let peer_id = 0xCAFE_F00Du64;
-        let next_hop: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        let next_hop: PeerAddr = PeerAddr::Udp("10.0.0.2:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -44149,12 +50664,12 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: next_hop,
-                },
+                transport: PeerTransport::Direct { owned: next_hop },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, next_hop);
@@ -44257,11 +50772,11 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn peer_registration_guard_preserves_concurrent_overwrite() {
         let peer_id = 0xFACE_F00Du64;
-        let stale: SocketAddr = "10.0.0.3:9000".parse().unwrap();
-        let fresh: SocketAddr = "10.0.0.4:9000".parse().unwrap();
+        let stale: PeerAddr = PeerAddr::Udp("10.0.0.3:9000".parse().unwrap());
+        let fresh: PeerAddr = PeerAddr::Udp("10.0.0.4:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -44287,10 +50802,12 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct { owned_addr: fresh },
+                transport: PeerTransport::Direct { owned: fresh },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, fresh);
@@ -44346,10 +50863,10 @@ mod heartbeat_aead_tests {
     async fn a_stale_rollback_sharing_one_relay_address_leaves_the_replacement_whole() {
         let peer_id = 0x5EED_5EEDu64;
         // ONE address for both registrations: the shared relay.
-        let relay: SocketAddr = "10.0.0.9:9000".parse().unwrap();
+        let relay: PeerAddr = PeerAddr::Udp("10.0.0.9:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
                 0xCAFE_BABE,
@@ -44377,12 +50894,14 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay_addr: relay,
+                    relay,
                     adjacent_relay_identity: None,
                 },
                 session: fresh_session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, relay);
@@ -44451,10 +50970,10 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn an_owned_rollback_declines_a_route_another_writer_replaced() {
         let peer_id = 0x7A11_7A11u64;
-        let relay: SocketAddr = "10.0.0.11:9000".parse().unwrap();
+        let relay: PeerAddr = PeerAddr::Udp("10.0.0.11:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
-        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
         let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
         let router = Arc::new(
             NetRouter::new(crate::adapter::net::router::RouterConfig::new(
@@ -44473,12 +50992,14 @@ mod heartbeat_aead_tests {
             PeerInfo {
                 node_id: peer_id,
                 transport: PeerTransport::Routed {
-                    relay_addr: relay,
+                    relay,
                     adjacent_relay_identity: None,
                 },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         peer_addrs.insert(peer_id, relay);
@@ -44543,7 +51064,7 @@ mod heartbeat_aead_tests {
     #[tokio::test]
     async fn routed_dispatch_lookup_filters_session_id_mismatch() {
         let peer_id = 0xBEEF_CAFEu64;
-        let peer_addr: SocketAddr = "10.1.1.1:9000".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:9000".parse().unwrap());
 
         let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
         let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
@@ -44555,12 +51076,12 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                transport: PeerTransport::Direct {
-                    owned_addr: peer_addr,
-                },
+                transport: PeerTransport::Direct { owned: peer_addr },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         session_id_to_node.insert(live_session_id, peer_id);
@@ -44619,7 +51140,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xFEED_F00Du64;
-        let peer_addr: SocketAddr = "10.2.2.2:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.2.2.2:9100".parse().unwrap());
 
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
@@ -44671,7 +51192,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xAB_CD_EF_01u64;
-        let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
+        let relay_addr: PeerAddr = PeerAddr::Udp("10.9.9.9:9100".parse().unwrap());
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
         node.install_routed(peer_id, relay_addr, relay_keys, None);
@@ -44685,7 +51206,7 @@ mod heartbeat_aead_tests {
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
-        let punched_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let punched_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:7000".parse().unwrap());
         let (punch_keys, _) = make_session_keys();
         let installed = node
             .install_direct(peer_id, punched_addr, punch_keys, Some(relay_session_id))
@@ -44720,7 +51241,7 @@ mod heartbeat_aead_tests {
         let peer_id = 0x11_22_33_44u64;
         // Direct install so addr_to_node[old_addr] = peer_id (a
         // stale mapping the swap should clean up).
-        let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let old_addr: PeerAddr = PeerAddr::Udp("10.5.5.5:9100".parse().unwrap());
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
         node.install_direct(peer_id, old_addr, first_keys, None);
@@ -44730,7 +51251,7 @@ mod heartbeat_aead_tests {
             "precondition: old addr maps to the peer",
         );
 
-        let new_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
+        let new_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:7000".parse().unwrap());
         let (punch_keys, _) = make_session_keys();
         let punch_session_id = punch_keys.session_id;
         let installed = node
@@ -44776,8 +51297,8 @@ mod heartbeat_aead_tests {
         );
 
         let peer_id = 0xBA55_0001u64;
-        let addr_b: SocketAddr = "10.4.4.4:9100".parse().unwrap();
-        let addr_c: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+        let addr_b: PeerAddr = PeerAddr::Udp("10.4.4.4:9100".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("10.5.5.5:9100".parse().unwrap());
 
         for round in 0..64 {
             let (keys_b, _) = make_session_keys();
@@ -44859,7 +51380,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let dest_id = 0x0DE5_7000u64;
-        let relay_addr: SocketAddr = "10.8.8.8:9100".parse().unwrap();
+        let relay_addr: PeerAddr = PeerAddr::Udp("10.8.8.8:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_routed(dest_id, relay_addr, keys, None);
 
@@ -44877,7 +51398,7 @@ mod heartbeat_aead_tests {
 
         // The inverse of the inverse: a DIRECT install still binds.
         let direct_id = 0x0D12_EC70u64;
-        let direct_addr: SocketAddr = "10.8.8.9:9100".parse().unwrap();
+        let direct_addr: PeerAddr = PeerAddr::Udp("10.8.8.9:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_direct(direct_id, direct_addr, keys, None);
         assert_eq!(
@@ -44900,8 +51421,9 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x5EA1_0001u64;
-        let home: SocketAddr = "10.6.6.6:9100".parse().unwrap();
-        let moved: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let home: PeerAddr = PeerAddr::Udp("10.6.6.6:9100".parse().unwrap());
+        let moved_tuple: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, home, keys, None);
 
@@ -44931,12 +51453,12 @@ mod heartbeat_aead_tests {
         node.router
             .routing_table()
             .remove_destination_all_candidates(peer_id);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("absent route");
 
         // Legacy (identity-less) direct route.
         node.router.add_route(peer_id, home);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("legacy route");
         assert_eq!(
             node.router.routing_table().lookup(peer_id),
@@ -44952,7 +51474,7 @@ mod heartbeat_aead_tests {
         node.router
             .routing_table()
             .add_authenticated_route(peer_id, home, OTHER);
-        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert!(!node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_untouched("conflicting identity");
         assert_eq!(
             node.router.routing_table().lookup_authenticated(peer_id),
@@ -44974,8 +51496,9 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x5EA1_0002u64;
-        let home: SocketAddr = "10.6.6.7:9100".parse().unwrap();
-        let moved: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let home: PeerAddr = PeerAddr::Udp("10.6.6.7:9100".parse().unwrap());
+        let moved_tuple: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, home, keys, None);
 
@@ -44984,7 +51507,7 @@ mod heartbeat_aead_tests {
         const OTHER: u64 = 0x07_15u64;
         node.addr_to_node.insert(home, OTHER);
 
-        assert!(node.set_peer_addr_for_test(peer_id, moved));
+        assert!(node.set_peer_addr_for_test(peer_id, moved_tuple));
         assert_eq!(
             node.addr_to_node.get(&home).map(|e| *e),
             Some(OTHER),
@@ -45010,7 +51533,7 @@ mod heartbeat_aead_tests {
     #[test]
     fn a_bad_tag_does_not_burn_the_replay_sequence() {
         let (init_keys, resp_keys) = make_session_keys();
-        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let sender = NetSession::new(init_keys, addr, 4, false);
         let receiver = NetSession::new(resp_keys, addr, 4, false);
 
@@ -45047,7 +51570,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0x2E01_0001u64;
-        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.3.3.3:9100".parse().unwrap());
         let header = crate::adapter::net::route::RoutingHeader::new(peer_id, 0x51C, 4);
 
         // First incarnation: the peer's sending side is the far half of
@@ -45084,7 +51607,7 @@ mod heartbeat_aead_tests {
     /// the edge.
     #[test]
     fn a_new_session_incarnation_starts_a_fresh_replay_window() {
-        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:5001".parse().unwrap());
         let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
 
         let (init_keys, resp_keys) = make_session_keys();
@@ -45126,7 +51649,7 @@ mod heartbeat_aead_tests {
             .expect("MeshNode::new");
 
         let peer_id = 0xCAFE_D00Du64;
-        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let peer_addr: PeerAddr = PeerAddr::Udp("10.3.3.3:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
         node.install_direct(peer_id, peer_addr, keys, None);
         let session = node
@@ -45194,11 +51717,16 @@ mod heartbeat_aead_tests {
         let (init_keys, resp_keys) = make_session_keys();
         let init_session = NetSession::new(
             init_keys.clone(),
-            "127.0.0.1:5001".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()),
             4,
             false,
         );
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
 
         // Mirror the production sender — go through
         // `Session::build_heartbeat`, not a fresh
@@ -45206,9 +51734,9 @@ mod heartbeat_aead_tests {
         let h1_bytes = init_session.build_heartbeat();
         let h2_bytes = init_session.build_heartbeat();
 
-        let p1 = ParsedPacket::parse(h1_bytes, "127.0.0.1:5001".parse().unwrap())
+        let p1 = ParsedPacket::parse(h1_bytes, PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()))
             .expect("first heartbeat must parse");
-        let p2 = ParsedPacket::parse(h2_bytes, "127.0.0.1:5001".parse().unwrap())
+        let p2 = ParsedPacket::parse(h2_bytes, PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()))
             .expect("second heartbeat must parse");
 
         assert!(
@@ -45229,10 +51757,16 @@ mod heartbeat_aead_tests {
     #[test]
     fn replay_of_authenticated_heartbeat_fails_verification_on_second_try() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let resp_session = NetSession::new(
+            resp_keys,
+            PeerAddr::Udp("127.0.0.1:5000".parse().unwrap()),
+            4,
+            false,
+        );
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
-        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();
+        let parsed =
+            ParsedPacket::parse(bytes, PeerAddr::Udp("127.0.0.1:5000".parse().unwrap())).unwrap();
 
         assert!(resp_session.verify_and_touch_heartbeat(&parsed));
         // Replay: counter is now committed, so the second attempt
@@ -45268,7 +51802,7 @@ mod heartbeat_aead_tests {
         let (init_keys, _resp_keys) = make_session_keys();
         let init_session = NetSession::new(
             init_keys.clone(),
-            "127.0.0.1:5001".parse().unwrap(),
+            PeerAddr::Udp("127.0.0.1:5001".parse().unwrap()),
             4,
             false,
         );
@@ -45378,17 +51912,19 @@ mod heartbeat_aead_tests {
     /// reply.
     #[test]
     fn routed_rotation_outcome_drops_replay_for_matching_static_and_ephemeral() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let static_a = [0xAAu8; 32];
         let ephemeral_a = [0xCCu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_a),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
             routed_rotation_outcome(&info, &static_a, &ephemeral_a, Duration::from_secs(30)),
@@ -45404,7 +51940,7 @@ mod heartbeat_aead_tests {
     /// `connect_direct` retarget path. AcceptRotation now.
     #[test]
     fn routed_rotation_outcome_accepts_reinit_with_fresh_ephemeral() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let static_a = [0xAAu8; 32];
@@ -45412,10 +51948,12 @@ mod heartbeat_aead_tests {
         let ephemeral_new = [0xDDu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_old),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         assert_eq!(
             routed_rotation_outcome(&info, &static_a, &ephemeral_new, Duration::from_secs(30)),
@@ -45433,15 +51971,17 @@ mod heartbeat_aead_tests {
     /// verification on every legitimate packet to the affected peer.
     #[test]
     fn routed_rotation_outcome_refuses_rotation_while_session_is_fresh() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         let new_static = [0xBBu8; 32];
         let new_ephemeral = [0xDDu8; 32];
@@ -45459,15 +51999,17 @@ mod heartbeat_aead_tests {
     /// could never reconnect).
     #[test]
     fn routed_rotation_outcome_accepts_rotation_after_session_timeout() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Wait past a 1 ms session_timeout. `current_timestamp()`
         // uses wall-clock `SystemTime::now()` so a real sleep
@@ -45487,7 +52029,7 @@ mod heartbeat_aead_tests {
     /// so an in-flight transfer isn't dropped by the swap.
     #[test]
     fn routed_rotation_outcome_defers_while_session_busy() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         // Open an application stream → the session is now "busy".
@@ -45496,10 +52038,12 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Same static, fresh ephemeral, live (30 s timeout) + busy.
         assert_eq!(
@@ -45514,7 +52058,7 @@ mod heartbeat_aead_tests {
     /// rebind — is never blocked by stale "busy" state.
     #[test]
     fn routed_rotation_outcome_accepts_busy_session_past_timeout() {
-        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("10.0.0.1:9000".parse().unwrap());
         let (init_keys, _) = make_session_keys();
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         session.get_or_create_stream(1);
@@ -45522,10 +52066,12 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            transport: PeerTransport::Direct { owned_addr: addr },
+            transport: PeerTransport::Direct { owned: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
+            #[cfg(feature = "webrtc")]
+            admission: crate::adapter::net::rtc::PeerAdmission::default(),
         };
         // Let the session go idle past a 1 ms timeout — not live.
         std::thread::sleep(Duration::from_millis(5));
@@ -45695,7 +52241,7 @@ mod heartbeat_aead_tests {
         let body = &src[start..scan_end];
 
         assert!(
-            body.contains("self.addr_to_node.insert(target_addr, peer_node_id)"),
+            body.contains(".insert(PeerAddr::Udp(target_addr), peer_node_id)"),
             "regression: connect_on_direct_path must refresh addr_to_node \
              on success — pre-fix the dispatch fast path missed on the \
              upgraded session's reflex addr and fell back to a linear \
@@ -46836,13 +53382,18 @@ mod stream_ack_batching_tests {
 
     fn session_at(addr: &str) -> Arc<NetSession> {
         let (_init, resp) = make_session_keys();
-        Arc::new(NetSession::new(resp, addr.parse().unwrap(), 4, false))
+        Arc::new(NetSession::new(
+            resp,
+            PeerAddr::Udp(addr.parse().unwrap()),
+            4,
+            false,
+        ))
     }
 
     fn pending(session: &Arc<NetSession>, addr: &str, consumed: u64) -> PendingStreamGrant {
         PendingStreamGrant {
             session: session.clone(),
-            peer_addr: addr.parse().unwrap(),
+            peer_addr: PeerAddr::Udp(addr.parse().unwrap()),
             total_consumed: consumed,
         }
     }
@@ -46906,7 +53457,7 @@ mod stream_ack_batching_tests {
         let grouped = group_grants_by_session(drained);
         assert_eq!(grouped.len(), 1, "one session ⇒ one batch");
         let (_, peer_addr, grants) = &grouped[&s.session_id()];
-        assert_eq!(*peer_addr, addr.parse().unwrap());
+        assert_eq!(*peer_addr, PeerAddr::Udp(addr.parse().unwrap()));
         let mut seen: Vec<(u64, u64)> = grants.clone();
         seen.sort_unstable();
         assert_eq!(
@@ -46926,7 +53477,7 @@ mod stream_ack_batching_tests {
         let addr = "127.0.0.1:7005";
         let s = session_at(addr);
         let sid = 42u64;
-        s.get_or_create_stream_for_packet(sid, true);
+        s.get_or_create_stream_for_packet(sid, true, None);
 
         let grants = vec![(sid, 1000u64)];
         let (entries, _nacks, _acks) = build_session_control_events(&s, &grants, false);
@@ -46956,11 +53507,11 @@ mod stream_ack_batching_tests {
         let s = session_at(addr);
         // Stream 1: clean in-order receive. Stream 2: gapped (0
         // received, 5 out of order → head gap at 1).
-        s.get_or_create_stream_for_packet(1, true)
+        s.get_or_create_stream_for_packet(1, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
             });
-        s.get_or_create_stream_for_packet(2, true)
+        s.get_or_create_stream_for_packet(2, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
                 assert!(r.on_receive(5));
@@ -47099,7 +53650,7 @@ mod stream_ack_batching_tests {
         // A gapped receive stream: 0 received, 5 out of order ⇒ head gap
         // at 1 (so there IS a NACK and there WOULD be SACK ranges).
         session
-            .get_or_create_stream_for_packet(3, true)
+            .get_or_create_stream_for_packet(3, true, None)
             .with_reliability(|r| {
                 assert!(r.on_receive(0));
                 assert!(r.on_receive(5));
@@ -47128,8 +53679,14 @@ mod stream_ack_batching_tests {
         drained.insert((s2.session_id(), 1u64), pending(&s2, a2, 22));
         let grouped = group_grants_by_session(drained);
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[&s1.session_id()].1, a1.parse().unwrap());
-        assert_eq!(grouped[&s2.session_id()].1, a2.parse().unwrap());
+        assert_eq!(
+            grouped[&s1.session_id()].1,
+            PeerAddr::Udp(a1.parse().unwrap())
+        );
+        assert_eq!(
+            grouped[&s2.session_id()].1,
+            PeerAddr::Udp(a2.parse().unwrap())
+        );
     }
 
     /// Decrypt-side pin for `chunk` → `build_subprotocol` framing:
@@ -51022,6 +57579,43 @@ mod sensing_authority_witness_tests {
 
     // ---- BOUNDED ORDERED EGRESS -------------------------------------------
 
+    /// A control debit for one test datagram on the ordered egress.
+    ///
+    /// The datagram the egress tests enqueue was never built by
+    /// `build_sensing_frame_datagram`, so it has no debit of its own; these
+    /// tests are about ORDER and teardown, not about credit. Charging zero
+    /// bytes against a standalone session gives the guard a real ledger to
+    /// commit or refund against while moving no counter any of them assert
+    /// on. The refund witness below charges real bytes instead.
+    fn egress_test_debit() -> ControlDebitGuard {
+        egress_debit_on(&egress_debit_session(), 0)
+    }
+
+    /// A standalone session whose stream ledger a test debit can be charged
+    /// against. Not installed on any node: the guard holds the `Arc`, so the
+    /// ledger outlives the datagram it belongs to.
+    fn egress_debit_session() -> Arc<NetSession> {
+        Arc::new(NetSession::new(
+            super::super::crypto::SessionKeys {
+                tx_key: [0x31u8; 32],
+                rx_key: [0x32u8; 32],
+                session_id: 0x5555_5555,
+                remote_static_pub: [0u8; 32],
+                route_hop_tx_key: [0u8; 32],
+                route_hop_rx_key: [0u8; 32],
+            },
+            PeerAddr::Udp("127.0.0.1:9".parse().expect("addr")),
+            2,
+            false,
+        ))
+    }
+
+    /// Charge `wire_bytes` on the sensing interest stream, exactly as
+    /// `build_sensing_frame_datagram` does.
+    fn egress_debit_on(session: &Arc<NetSession>, wire_bytes: u32) -> ControlDebitGuard {
+        session.next_tx_seq_charged(sensing::SUBPROTOCOL_SENSING_INTEREST as u64, wire_bytes)
+    }
+
     /// One unwritable socket cannot wedge the ordered egress forever: the
     /// stuck send is RETIRED at the deadline, is NOT counted as sent, and the
     /// next queued datagram advances.
@@ -51047,10 +57641,10 @@ mod sensing_authority_witness_tests {
         let egress = node
             .org_egress()
             .expect("a fresh node's egress is creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
-        assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr));
-        assert!(egress.enqueue(Bytes::from_static(b"next"), addr));
+        assert!(egress.enqueue(Bytes::from_static(b"stuck"), addr, egress_test_debit()));
+        assert!(egress.enqueue(Bytes::from_static(b"next"), addr, egress_test_debit()));
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -51129,7 +57723,7 @@ mod sensing_authority_witness_tests {
     async fn an_enqueue_after_close_is_refused_and_strands_no_queue() {
         let node = sensing_org_node("egress-close-race").await;
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
         // Close and JOIN, so the consumer has provably observed closed+empty
         // and exited before the racing enqueue is attempted.
@@ -51140,12 +57734,117 @@ mod sensing_authority_witness_tests {
         );
 
         assert!(
-            !egress.enqueue(Bytes::from_static(b"late"), addr),
+            !egress.enqueue(Bytes::from_static(b"late"), addr, egress_test_debit()),
             "a closed queue accepted a datagram no consumer will ever observe"
         );
         let state = node.org_egress_state_for_test();
         assert_eq!(state.depth, 0, "a stranded nonzero queue with no consumer");
         assert_eq!(state.refused_closed, 1, "and the refusal must be counted");
+    }
+
+    /// X8: a control datagram the transport NEVER ADMITTED must not keep its
+    /// pre-send debit — and one the transport accepted must keep it.
+    ///
+    /// The charge happens before asynchronous admission, so the producer's
+    /// watermark moves for bytes the receiver may never be given the chance
+    /// to report consumed. On a stream shared with application traffic those
+    /// bytes close the application window permanently: the receiver cannot
+    /// refund what it never saw. Both halves are asserted here, because the
+    /// refund is only safe if it stops at admission — a datagram the socket
+    /// took may still arrive and be charged, and refunding it would credit
+    /// the sender for the same bytes twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_never_admitted_control_debit_is_refunded_and_an_accepted_one_is_not() {
+        let node = sensing_org_node("egress-debit-refund").await;
+        let egress = node.org_egress().expect("creatable");
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        let stream_id = sensing::SUBPROTOCOL_SENSING_INTEREST as u64;
+        let session = egress_debit_session();
+
+        // ── never admitted: the queue is closed, so the enqueue is refused
+        let refused = egress_debit_on(&session, 400);
+        let (charged_sent, charged_remaining, charged_seq) = {
+            let s = session.get_stream(stream_id).expect("charged stream");
+            (
+                s.tx_bytes_sent(),
+                s.tx_credit_remaining(),
+                s.current_tx_seq(),
+            )
+        };
+        assert_eq!(
+            charged_sent, 400,
+            "precondition: the debit moved the watermark"
+        );
+        assert_eq!(
+            charged_seq, 1,
+            "precondition: the debit consumed one sequence"
+        );
+        let window = session
+            .get_stream(stream_id)
+            .expect("charged stream")
+            .tx_window();
+        assert_eq!(
+            charged_remaining,
+            window - 400,
+            "precondition: the debit closed 400 bytes of window"
+        );
+
+        egress.close_and_join().await;
+        assert!(
+            !egress.enqueue(Bytes::from_static(b"refused"), addr, refused),
+            "precondition: a closed queue refuses"
+        );
+        {
+            let s = session.get_stream(stream_id).expect("stream");
+            assert_eq!(
+                s.tx_bytes_sent(),
+                0,
+                "the watermark must exclude bytes no transport ever took"
+            );
+            assert_eq!(
+                s.tx_credit_remaining(),
+                window,
+                "and the window they closed must reopen"
+            );
+            assert_eq!(
+                s.current_tx_seq(),
+                0,
+                "a refused datagram must leave no sequence gap behind"
+            );
+        }
+
+        // ── admitted: a fresh node whose consumer really performs the send
+        let sender = sensing_org_node("egress-debit-commit").await;
+        let live = sender.org_egress().expect("creatable");
+        let accepted = egress_debit_on(&session, 400);
+        assert!(
+            live.enqueue(Bytes::from_static(b"accepted"), addr, accepted),
+            "precondition: a live queue accepts"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = sender.org_egress_state_for_test();
+            if state.sent >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the consumer never sent the accepted datagram: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s = session.get_stream(stream_id).expect("stream");
+        assert_eq!(
+            s.tx_bytes_sent(),
+            400,
+            "bytes the socket accepted are the receiver's to report consumed, \
+             never the sender's to refund"
+        );
+        assert_eq!(
+            s.tx_credit_remaining(),
+            window - 400,
+            "and the window they closed stays closed until the receiver grants it"
+        );
     }
 
     // ---- TEARDOWN OWNERSHIP AND GRACE EXPIRY ------------------------------
@@ -51181,9 +57880,9 @@ mod sensing_authority_witness_tests {
         }));
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
         for _ in 0..3 {
-            assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+            assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
         }
         // The FIRST datagram is provably in flight — not merely queued — so the
         // in-flight half of the accounting is genuinely exercised.
@@ -51240,7 +57939,7 @@ mod sensing_authority_witness_tests {
             "no egress may be created after settlement"
         );
         assert!(
-            !egress.enqueue(Bytes::from_static(b"late"), addr),
+            !egress.enqueue(Bytes::from_static(b"late"), addr, egress_test_debit()),
             "no datagram may be accepted after settlement"
         );
         node.clear_org_egress_lifecycle_seam_for_test();
@@ -51293,8 +57992,8 @@ mod sensing_authority_witness_tests {
         }
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         // FIRST attempt: parks holding teardown ownership.
         let (first_done_tx, first_done_rx) = mpsc::sync_channel::<OrgEgressState>(1);
@@ -51398,8 +58097,8 @@ mod sensing_authority_witness_tests {
             stall: Arc::new(|_| true),
         });
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         // CANCELLED WHILE DRAINING: well inside the grace window, so the
         // attempt was demonstrably still awaiting the drain timeout.
@@ -51480,8 +58179,8 @@ mod sensing_authority_witness_tests {
         });
 
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr));
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        assert!(egress.enqueue(Bytes::from_static(b"stalled"), addr, egress_test_debit()));
 
         let attempt = {
             let egress = Arc::clone(&egress);
@@ -51660,7 +58359,7 @@ mod sensing_authority_witness_tests {
 
         let node = sensing_org_node("egress-enqueue-close-race").await;
         let egress = node.org_egress().expect("creatable");
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
 
         let (parked_tx, parked_rx) = mpsc::sync_channel::<()>(1);
         let (unpark_tx, unpark_rx) = mpsc::sync_channel::<()>(1);
@@ -51682,7 +58381,9 @@ mod sensing_authority_witness_tests {
 
         let enqueuing = {
             let egress = Arc::clone(&egress);
-            tokio::task::spawn_blocking(move || egress.enqueue(Bytes::from_static(b"racer"), addr))
+            tokio::task::spawn_blocking(move || {
+                egress.enqueue(Bytes::from_static(b"racer"), addr, egress_test_debit())
+            })
         };
         parked_rx
             .recv_timeout(Duration::from_secs(5))
@@ -53536,7 +60237,7 @@ mod protected_forward_allocation_pins {
              not spawn a send task per datagram",
         );
         assert!(
-            body.contains(&format!("try_send_to{}", "(")),
+            body.contains(&format!("try_send{}", "(")),
             "the relay egress must be the non-blocking send",
         );
     }
@@ -53568,7 +60269,8 @@ mod protected_forward_allocation_pins {
              legacy relay and pingwave re-broadcast both act on unauthenticated \
              ingress, so a spawn-per-packet turns downstream congestion into \
              unbounded heap and scheduler pressure driven by a source that never \
-             authenticated. Use socket.try_send_to and drop when it is not ready.",
+             authenticated. Use the sink's non-blocking try_send and drop when \
+             it is not ready.",
         );
         assert!(
             !body.contains(&awaited_send),
@@ -53576,7 +60278,7 @@ mod protected_forward_allocation_pins {
              it carries a send deadline, which is a bounded wait, not a drop",
         );
         assert!(
-            body.contains(&format!("try_send_to{}", "(")),
+            body.contains(&format!("try_send{}", "(")),
             "the forwarding egress must be the non-blocking send",
         );
     }
@@ -53784,6 +60486,225 @@ mod exported_discovery_pin_coherence_tests {
     }
 }
 
+/// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
+/// the session's retransmit bookkeeping cannot disagree.
+///
+/// Stage 2 briefly made the handle's fields public, which let an
+/// application write `handle.config.reliability = Reliable` on a
+/// stream the session had opened as fire-and-forget. `send_on_stream`
+/// takes the wire flags from the handle and every retransmit entry
+/// from the live `StreamState`, so the packet went out with
+/// `RELIABLE` set and nothing retained to resend it.
+///
+/// The write is a compile error again (the `compile_fail` doctests on
+/// `Stream`). This is the runtime half: over a real two-node
+/// connect/accept pair, with no `start()` — no ACK workers, no
+/// heartbeat, nothing that could retire an entry behind the
+/// assertions — a fire-and-forget send retains nothing and a reliable
+/// send retains exactly its own descriptor, flags included.
+#[cfg(test)]
+mod stream_handle_contract_tests {
+    use super::super::protocol::{NackPayload, NetHeader};
+    use super::super::stream::Reliability;
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    async fn node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let cfg = MeshNodeConfig::new(addr, [0x5Au8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Real handshake, deliberately WITHOUT `start()`: no receive
+    /// loop on either side, so the responder's socket still holds
+    /// every datagram the initiator sends and this test can read it
+    /// off the wire itself.
+    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>, u64, u64) {
+        let a = node().await;
+        let b = node().await;
+        let (a_id, b_id) = (a.node_id(), b.node_id());
+        let b_pub = *b.public_key();
+        let b_addr = b.local_addr();
+        let b_clone = b.clone();
+        let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+        a.connect(b_addr, &b_pub, b_id)
+            .await
+            .expect("connect must establish a session");
+        accept.await.expect("accept task").expect("accept");
+        (a, b, a_id, b_id)
+    }
+
+    /// What the sender retained for `stream_id`, as
+    /// `(reliability mode name, has_pending)`.
+    fn retransmit_state(node: &MeshNode, peer: u64, stream_id: u64) -> (&'static str, bool) {
+        let peer_entry = node.peers.get(&peer).expect("peer session");
+        let state = peer_entry
+            .session
+            .try_stream(stream_id)
+            .expect("stream state");
+        state.with_reliability(|r| (r.name(), r.has_pending()))
+    }
+
+    /// The header of the next datagram `receiver` gets on
+    /// `want_stream`, decrypted with the session's rx cipher.
+    ///
+    /// Reading the header alone would accept any bytes that happen to
+    /// parse; decrypting proves the datagram is this session's real
+    /// packet. Datagrams for other streams are skipped so a stray
+    /// control frame cannot be mistaken for the one under test.
+    async fn recv_stream_packet(
+        receiver: &MeshNode,
+        sender_id: u64,
+        want_stream: u64,
+    ) -> (NetHeader, Vec<u8>) {
+        let socket = receiver.socket.socket_arc();
+        let session = {
+            let peer = receiver
+                .peers
+                .get(&sender_id)
+                .expect("receiver must hold the sender's session");
+            peer.session.clone()
+        };
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (n, from) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf))
+                .await
+                .expect("a datagram for the target stream must arrive within 5s")
+                .expect("recv_from");
+
+            let data = Bytes::copy_from_slice(&buf[..n]);
+            let Some(parsed) = ParsedPacket::parse(data, PeerAddr::Udp(from)) else {
+                continue;
+            };
+            if parsed.header.stream_id != want_stream {
+                continue;
+            }
+            assert!(
+                parsed.is_valid_length(),
+                "the datagram under test must be a well-formed Net packet"
+            );
+
+            let aad = parsed.header.aad();
+            let counter = u64::from_le_bytes(
+                parsed.header.nonce[4..12]
+                    .try_into()
+                    .expect("nonce counter"),
+            );
+            let plaintext = session
+                .rx_cipher()
+                .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
+                .expect("the packet must decrypt under this session's rx key");
+            return (parsed.header, plaintext.to_vec());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fire_and_forget_stream_sends_unreliable_and_retains_nothing() {
+        let (a, b, a_id, b_id) = connected_pair().await;
+        const STREAM: u64 = 0xF00D;
+
+        let handle = a
+            .open_stream(b_id, STREAM, StreamConfig::new())
+            .expect("open_stream");
+        assert!(
+            !handle.config().reliability.is_reliable(),
+            "precondition: the default config is fire-and-forget"
+        );
+
+        a.send_on_stream(&handle, &[Bytes::from_static(b"faf")])
+            .await
+            .expect("send_on_stream");
+
+        // The wire bit, read off the datagram B actually received.
+        let (header, payload) = recv_stream_packet(&b, a_id, STREAM).await;
+        assert_eq!(header.stream_id, STREAM);
+        assert!(
+            !header.flags.is_reliable(),
+            "regression: a fire-and-forget stream must not set RELIABLE on the wire"
+        );
+        assert!(
+            payload.windows(3).any(|w| w == b"faf"),
+            "the observed packet must be the one this test sent"
+        );
+
+        // …and the bookkeeping the flags have to agree with.
+        let (mode, pending) = retransmit_state(&a, b_id, STREAM);
+        assert_eq!(mode, "fire-and-forget");
+        assert!(
+            !pending,
+            "a fire-and-forget stream must retain no retransmit entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reliable_stream_sends_reliable_and_retains_its_descriptor() {
+        let (a, b, a_id, b_id) = connected_pair().await;
+        const STREAM: u64 = 0xBEEF;
+
+        let mut config = StreamConfig::new();
+        config.reliability = Reliability::Reliable;
+        let handle = a.open_stream(b_id, STREAM, config).expect("open_stream");
+        assert!(handle.config().reliability.is_reliable());
+
+        a.send_on_stream(&handle, &[Bytes::from_static(b"rel")])
+            .await
+            .expect("send_on_stream");
+
+        // The wire bit. This is the assertion Kyra's production
+        // inverse breaks: building the packet with `PacketFlags::NONE`
+        // while still registering the retransmit leaves every
+        // sender-side assertion true and the packet unreliable.
+        let (header, payload) = recv_stream_packet(&b, a_id, STREAM).await;
+        assert_eq!(header.stream_id, STREAM);
+        assert!(
+            header.flags.is_reliable(),
+            "regression: a reliable stream's packet must carry RELIABLE on the wire"
+        );
+        assert!(
+            payload.windows(3).any(|w| w == b"rel"),
+            "the observed packet must be the one this test sent"
+        );
+
+        let (mode, pending) = retransmit_state(&a, b_id, STREAM);
+        assert_eq!(mode, "reliable");
+        assert!(pending, "a reliable send must retain its retransmit entry");
+
+        // Exactly one entry, and it is THIS packet's. A NACK naming
+        // the sequence the wire carried must produce that descriptor
+        // and nothing else. (`missing_bitmap: 0` is not an empty
+        // request — `next_expected` itself is the missing sequence.)
+        let peer_entry = a.peers.get(&b_id).expect("peer session");
+        let state = peer_entry.session.try_stream(STREAM).expect("stream state");
+        let resent = state.with_reliability(|r| {
+            r.on_nack(&NackPayload {
+                next_expected: header.sequence,
+                missing_bitmap: 0,
+            })
+        });
+        assert_eq!(
+            resent.len(),
+            1,
+            "a NACK for the sequence on the wire must name exactly one retained packet"
+        );
+        assert_eq!(resent[0].stream_id, STREAM);
+        assert_eq!(
+            resent[0].seq, header.sequence,
+            "the retained descriptor must be the packet that went out, not some other seq"
+        );
+        assert!(
+            resent[0].flags.contains(PacketFlags::RELIABLE),
+            "the retained descriptor must carry the flags the packet was built with"
+        );
+    }
+}
+
 /// Identity readiness for token admission — the prerequisite is an
 /// authenticated `node_id → EntityId` binding on the LIVE session, not
 /// a capability announcement and not the credential's own subject
@@ -53814,7 +60735,7 @@ mod identity_readiness_tests {
                 route_hop_tx_key: [0x44u8; 32],
                 route_hop_rx_key: [0x55u8; 32],
             },
-            addr,
+            PeerAddr::Udp(addr),
             4,
             false,
         ))
@@ -53829,10 +60750,14 @@ mod identity_readiness_tests {
             peer,
             PeerInfo {
                 node_id: peer,
-                transport: PeerTransport::Direct { owned_addr: addr },
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
                 session: session(session_id),
                 remote_static_pub: [0x33u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
     }
@@ -54221,7 +61146,9 @@ mod lifecycle_regression_tests {
             peer,
             PeerInfo {
                 node_id: peer,
-                transport: PeerTransport::Direct { owned_addr: addr },
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
                 session: Arc::new(NetSession::new(
                     crate::adapter::net::crypto::SessionKeys {
                         tx_key: [0x11u8; 32],
@@ -54231,12 +61158,14 @@ mod lifecycle_regression_tests {
                         route_hop_tx_key: [0x44u8; 32],
                         route_hop_rx_key: [0x55u8; 32],
                     },
-                    addr,
+                    PeerAddr::Udp(addr),
                     4,
                     false,
                 )),
                 remote_static_pub: [0x33u8; 32],
                 last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
             },
         );
         // `Box::pin`, not `tokio::pin!`: the latter shadows the future

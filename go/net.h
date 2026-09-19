@@ -61,6 +61,26 @@ typedef enum {
     NET_ERR_MESH_TRANSPORT = -114,
     NET_ERR_CHANNEL = -115,
     NET_ERR_CHANNEL_AUTH = -116,
+    /* Stream handle names a session incarnation the peer no longer has.
+     * Distinct from NET_ERR_MESH_NOT_CONNECTED: the peer is connected and
+     * the stream id may be open on its successor session, which the handle
+     * does not own. Re-open; retrying the handle cannot succeed. */
+    NET_ERR_MESH_SESSION_SUPERSEDED = -117,
+    /* One payload in the batch is larger than what this stream can
+     * carry to this peer. Nothing was sent. Not a transport fault and
+     * not retryable: no receive path accepts an over-cap packet, so
+     * the payload must be split by the caller.
+     *
+     * The refused event's length and the limit that applied come back
+     * in the send call's `out_size` / `out_limit`, which are written
+     * only for this code. Do not reconstruct them: the limit is
+     * per-peer (`net_mesh_max_event_size()` for a peer that does not
+     * reassemble fragments, the eight-packet fragmentation ceiling for
+     * one that does), and the refused element of a batch is not
+     * necessarily its first one above `net_mesh_max_event_size()`. No
+     * send function returns a detail string — earlier revisions of
+     * this comment promised one that never existed. */
+    NET_ERR_MESH_EVENT_TOO_LARGE = -118,
     /* Identity + permission-token surface (compiled when the Rust
      * cdylib has the `net` feature on). Codes below -119 — one per
      * `TokenError` kind so Go callers can `errors.Is` without
@@ -395,9 +415,14 @@ void     net_mesh_stream_free(net_mesh_stream_t* handle);
  * under a new configuration — without it the original "first open
  * wins" config stays in force for the life of the node.
  *
- * Returns 0 on success or a negative NET_ERR_* code. Null your handle
+ * Returns 0 on success or a negative NET_ERR_* code. The handle is
+ * freed either way, including on a refusal. Null your handle
  * afterwards; calling it or net_mesh_stream_free twice on the same
- * pointer is undefined. */
+ * pointer is undefined.
+ *
+ * Returns NET_ERR_MESH_SESSION_SUPERSEDED when the peer's session was
+ * replaced since the handle was opened: the stream id may be live on
+ * the successor session and closing it is not this handle's to do. */
 int      net_mesh_close_stream(net_mesh_stream_t* handle);
 
 /* Send a batch of payloads on an open stream.
@@ -409,24 +434,67 @@ int      net_mesh_close_stream(net_mesh_stream_t* handle);
  *
  * Returns `NET_ERR_MESH_BACKPRESSURE` when the window is full,
  * `NET_ERR_MESH_NOT_CONNECTED` when the peer is gone,
+ * `NET_ERR_MESH_SESSION_SUPERSEDED` when the peer's session was
+ * replaced since this handle was opened,
+ * `NET_ERR_MESH_EVENT_TOO_LARGE` when one payload exceeds what this
+ * stream can carry to this peer (nothing is sent), and
  * `NET_ERR_MESH_TRANSPORT` for other I/O errors.
+ *
+ * `out_size` and `out_limit` report the refused event's length and
+ * the limit that applied to it. They are written IF AND ONLY IF the
+ * return value is `NET_ERR_MESH_EVENT_TOO_LARGE`; on every other
+ * outcome, success included, they are untouched, so check the code
+ * before reading them. Either may be NULL for "do not report that
+ * half".
+ *
+ * Neither number is derivable by the caller, which is why they are
+ * here. The limit is per-peer: `net_mesh_max_event_size()` for a
+ * peer that does not reassemble fragments, and the eight-packet
+ * fragmentation ceiling for one that does. The size is whichever
+ * element the send path refused, which in a batch is not
+ * necessarily the first one above `net_mesh_max_event_size()`.
  */
 int      net_mesh_send(net_mesh_stream_t* stream,
                        const uint8_t* const* payloads,
                        const size_t* lens,
                        size_t count,
-                       net_meshnode_t* node_handle);
+                       net_meshnode_t* node_handle,
+                       size_t* out_size,
+                       size_t* out_limit);
 int      net_mesh_send_with_retry(net_mesh_stream_t* stream,
                                   const uint8_t* const* payloads,
                                   const size_t* lens,
                                   size_t count,
                                   uint32_t max_retries,
-                                  net_meshnode_t* node_handle);
+                                  net_meshnode_t* node_handle,
+                                  size_t* out_size,
+                                  size_t* out_limit);
 int      net_mesh_send_blocking(net_mesh_stream_t* stream,
                                 const uint8_t* const* payloads,
                                 const size_t* lens,
                                 size_t count,
-                                net_meshnode_t* node_handle);
+                                net_meshnode_t* node_handle,
+                                size_t* out_size,
+                                size_t* out_limit);
+
+/* The largest single event ONE PACKET can carry, in bytes:
+ * MAX_PAYLOAD_SIZE minus the event frame's 4-byte length prefix.
+ *
+ * This is the bound a peer that does not reassemble fragments is
+ * held to — every UDP peer, and every RTC peer that has not
+ * advertised fragment reassembly — so it is the limit most
+ * NET_ERR_MESH_EVENT_TOO_LARGE refusals name. It is not every
+ * refusal's limit: a peer that does reassemble is held to the
+ * eight-packet fragmentation ceiling instead. Read the limit that
+ * actually applied from the send call's `out_limit`; this accessor
+ * is for sizing a payload BEFORE sending, when there is no refusal
+ * to read.
+ *
+ * Query it once — it cannot change for the life of the loaded
+ * library, needs no node or stream, and never returns 0. It admits
+ * nothing: the refusal remains inside the send path.
+ */
+size_t   net_mesh_max_event_size(void);
 
 /* Stream stats — JSON shape mirrors `StreamStats`. Writes `null` to
  * *out_json when the stream isn't open. */

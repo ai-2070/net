@@ -1574,6 +1574,7 @@ mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use crate::adapter::net::identity::EntityId;
+    use crate::adapter::net::PeerAddr;
     use std::sync::Arc;
 
     /// Build an `Arc<Fold<CapabilityFold>>` populated with the
@@ -2067,7 +2068,6 @@ mod tests {
         use crate::adapter::net::behavior::proximity::{
             EnhancedPingwave, ProximityConfig, ProximityGraph,
         };
-        use std::net::SocketAddr;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         fn now_us() -> u64 {
@@ -2084,7 +2084,7 @@ mod tests {
 
         let my = nid(0xFF);
         let graph = ProximityGraph::new(my, ProximityConfig::default());
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let now = now_us();
 
         let mut pw_a = EnhancedPingwave::new(nid(1), 1, 3);

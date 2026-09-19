@@ -1,0 +1,173 @@
+[package]
+name = "net-mesh-leaf"
+version = "0.36.0"
+edition = "2021"
+description = "Net mesh leaf profile: the browser-side node over net-mesh-wire — sessions, streams, dispatcher, channels, nRPC client, and the control-plane boundary. wasm32 first."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+keywords = ["networking", "mesh", "webrtc", "wasm", "browser"]
+categories = ["network-programming", "wasm"]
+
+# **Not a member of the `net-mesh` workspace.** The leaf pulls
+# `wasm-bindgen`, `web-sys` and `js-sys`; a native `cargo build
+# --workspace` must not resolve or compile any of them. The crate is
+# built for `wasm32-unknown-unknown` by its own CI job, exactly as
+# `tests/rtc_browser/leaf` is. `tests/dependency_boundary.rs` asserts
+# the separation from the other side.
+[workspace]
+
+[lib]
+# Mirrors `net-mesh-wire` / `net_wire`: published under the `net-mesh`
+# prefix, imported as `net_leaf`.
+name = "net_leaf"
+path = "src/lib.rs"
+# `cdylib` for the wasm-bindgen bundle, `rlib` so the wasm test runner
+# and other Rust consumers can link it.
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+# Production items must be documented. Integration-test crates are
+# not a documentation surface, and one of them — `tests/kyra_review.rs`
+# — is a reviewer's file landed VERBATIM, so a crate-level doc
+# comment cannot be added to it without editing her probe file.
+missing_docs = "warn"
+
+[features]
+default = []
+# The in-memory, genuinely anchorless `ControlPlane` used by the wasm
+# test runner (Stage 5 slice 6). Test-only: it is not compiled into a
+# shipped bundle, so a mock cannot become a production code path by
+# accident.
+mock-control-plane = []
+# The `cross_lang_wire` golden vectors as constants inside the
+# package. Tests only: the wasm test target replays them INSIDE wasm
+# (a Stage 5 exit criterion), and `include_str!` across a package
+# boundary breaks an unpacked `cargo package` tarball. A shipped
+# bundle must not carry test data, so this is off by default.
+test-vectors = []
+
+[dependencies]
+# THE production wire layer. `webrtc` gives `PeerAddr::Rtc` — a
+# browser has no socket address, so keying a session on an invented
+# UDP tuple would be a lie the session table then rests on. The
+# feature adds the variant and nothing else (no str0m).
+net-mesh-wire = { path = "../wire", features = ["webrtc"] }
+bytes = "1"
+# Pinned to the installed `wasm-bindgen-cli`; a mismatch is a hard
+# error at bindgen time, so the version is exact here and in CI.
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+tracing = "0.1"
+# Identity generation in the browser. 0.3 needs its own browser
+# opt-in, as S0a recorded for 0.2 and 0.4.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# The leaf's own identity: Ed25519 for the announcement signature and
+# the `0x0D02` envelope, X25519 for the Noise static half. Same
+# majors the core resolves, so a credential minted by a native node
+# verifies here byte for byte.
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
+# `EntityId::origin_hash` / `node_id` are keyed BLAKE2s-MAC over the
+# public key. Same derivation as the core's, or this leaf's packets
+# would carry an origin hash no native node could map back.
+blake2 = "0.11"
+# The nRPC call table's per-call completion. Not `tokio`: the leaf is
+# single-threaded and has no runtime — `oneshot` is a plain future.
+futures-channel = "0.3"
+# The announcement is UTF-8 JSON on the wire. `preserve_order` is
+# load-bearing, not a preference: signature verification rebuilds the
+# signed transcript from the parsed document, so the object's field
+# order MUST survive the parse or every inbound announcement fails to
+# verify. No `serde` derive — this crate writes its JSON by hand
+# through `Value`, which is one less dependency in the bundle.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Credential decoding (`net-bootstrap:` + URL-safe unpadded base64)
+# and the base64 the event JSON carries byte payloads in.
+base64 = "0.22"
+# Overwrite the identity scalars when the at-rest value drops
+# (`identity::IdentitySecrets`). A volatile write plus a compiler
+# fence, which is the part a plain assignment cannot promise; the
+# crate is `forbid(unsafe_code)`, so it cannot do this itself.
+# Already in the graph through both dalek crates — this makes the
+# direct use explicit rather than borrowing a transitive dependency.
+zeroize = "1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "RtcPeerConnection",
+  "RtcConfiguration",
+  "RtcIceServer",
+  "RtcDataChannel",
+  "RtcDataChannelInit",
+  "RtcDataChannelType",
+  "RtcDataChannelState",
+  "RtcSessionDescriptionInit",
+  "RtcSdpType",
+  "RtcIceCandidate",
+  "RtcIceCandidateInit",
+  "RtcPeerConnectionIceEvent",
+  "RtcIceConnectionState",
+  "RtcPeerConnectionState",
+  "MessageEvent",
+  "Event",
+  "Window",
+  "Performance",
+  "console",
+  # Layer 0: the bootstrap listener is HTTPS + a WebSocket.
+  "Request",
+  "RequestInit",
+  "Response",
+  "Headers",
+  "WebSocket",
+  "BinaryType",
+  "CloseEvent",
+  # §8 identity at rest: IndexedDB holding a ciphertext plus the
+  # non-extractable AES-GCM `CryptoKey` that unwraps it, and the
+  # generation counter leader election fences on.
+  "IdbFactory",
+  "IdbDatabase",
+  "IdbObjectStore",
+  "IdbObjectStoreParameters",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbRequest",
+  "IdbOpenDbRequest",
+  "IdbVersionChangeEvent",
+  "DomException",
+  "Crypto",
+  "SubtleCrypto",
+  "CryptoKey",
+  "AesGcmParams",
+  "AesKeyGenParams",
+  # §8 leader election: the cross-tab carrier for the follower proxy.
+  # `Navigator` is here for `navigator.locks`, which web-sys only
+  # exposes behind `--cfg=web_sys_unstable_apis` — see
+  # `leader::web_lock` for why the Web Locks call goes through
+  # `js_sys::Reflect` instead of demanding a crate-wide RUSTFLAGS.
+  "BroadcastChannel",
+  "Navigator",
+  # §9 browser ↔ browser: the answerer does not create the
+  # DataChannel, it receives the offerer's through `ondatachannel`.
+  "RtcDataChannelEvent",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+# The crate's own tests always want the vectors; a consumer's build
+# does not. `net-mesh-wire/test-vectors` brings the shared AEAD
+# vector, which the wasm test replays on the RustCrypto backend.
+net-mesh-leaf = { path = ".", features = ["test-vectors"] }
+net-mesh-wire = { path = "../wire", features = ["webrtc", "test-vectors"] }
+# The wasm test builds a responder half to handshake against, which
+# needs an X25519 keypair the Noise resolver agrees with.
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
+
+[profile.release]
+# The size profile S0a measured against; the exit criterion is
+# gzipped wasm <= 1.5 MB.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

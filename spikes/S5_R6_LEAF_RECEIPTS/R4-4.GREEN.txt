@@ -1,0 +1,13 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.34s
+     Running tests\kyra_round4_parent.rs (target\debug\deps\kyra_round4_parent-7043c05559cc9856.exe)
+
+running 2 tests
+test kyra_rpc_carrier_cannot_silently_shadow_admitted_stream ... ok
+test kyra_unowned_carrier_application_control ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.04s
+
+EXIT=0

@@ -1,0 +1,65 @@
+### P1 (b) RAW INVERSE — the reassembly deadline stops being evaluated before the arrival's admission/acknowledgement decision
+### repaired snapshot: spikes/s5r3_inverse/repaired/node.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+--- spikes/s5r3_inverse/repaired/node.rs	2026-09-15 14:09:21.132231200 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-15 14:09:27.158428500 +0200
+@@ -1233,7 +1233,6 @@
+         // latched in `recv_failed` before the acknowledgement
+         // decision is taken, so a tail can never be acknowledged
+         // into a group that no longer has its head.
+-        self.sweep_reassemblies(now);
+         let self_node = self.identity.node_id();
+         let Some(inner) = dispatch::unwrap_routing(bytes, self_node, &self.counters) else {
+             return;
+EXIT=1
+
+## mutated run
+$ cd net/crates/net/leaf && cargo test --lib -- a_late_tail reaped_at_the_ttl
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.08s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 2 tests
+test node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival ... FAILED
+test node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging ... ok
+
+failures:
+
+---- node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival stdout ----
+
+thread 'node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival' (52764) panicked at src\node.rs:3272:9:
+the tail's sequence must stay outstanding: acknowledging it here retires the sender's last copy of a message that can never arrive
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 170 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run
+$ cd net/crates/net/leaf && cargo test --lib -- a_late_tail reaped_at_the_ttl
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.63s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 2 tests
+test node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging ... ok
+test node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 170 filtered out; finished in 0.02s
+
+EXIT=0

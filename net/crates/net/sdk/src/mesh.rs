@@ -121,6 +121,12 @@ pub struct MeshBuilder {
     subnet_attachment: Option<crate::subnet::TopologySubnetId>,
     subnet_control_channel: Option<net::adapter::net::ChannelName>,
     subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
+    /// RTC transport for this node (R6): a browser-facing anchor
+    /// has to be constructible from the SDK, or the SDK's own
+    /// enrollment service cannot be exercised on the surface the
+    /// core's §12 admission actually gates.
+    #[cfg(feature = "webrtc")]
+    rtc: Option<net::adapter::net::rtc::RtcConfig>,
     enable_sensing: bool,
     sensing_incarnation: Option<net::adapter::net::behavior::sensing::Incarnation>,
     #[cfg(feature = "nat-traversal")]
@@ -150,6 +156,8 @@ impl MeshBuilder {
             subnet_attachment: None,
             subnet_control_channel: None,
             subnet_exports: Vec::new(),
+            #[cfg(feature = "webrtc")]
+            rtc: None,
             enable_sensing: false,
             sensing_incarnation: None,
             #[cfg(feature = "nat-traversal")]
@@ -172,6 +180,15 @@ impl MeshBuilder {
     /// also bound to this mesh; tokens installed via
     /// [`Identity::install_token`](crate::identity::Identity::install_token)
     /// become available to the channel auth path at subscribe time.
+    /// Serve RTC on this node (R6). `serve_bootstrap` in the
+    /// config is what makes it a browser-facing anchor, whose RTC
+    /// sessions install provisional under §12.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc(mut self, config: net::adapter::net::rtc::RtcConfig) -> Self {
+        self.rtc = Some(config);
+        self
+    }
+
     pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
         self.identity = Some(identity);
         self
@@ -398,6 +415,11 @@ impl MeshBuilder {
         // facade refuses to bind credentials to a generated fallback, and a
         // binding holding only `Arc<MeshNode>` cannot otherwise tell.
         config.configured_identity = sdk_identity.is_some();
+        // R6: the RTC transport, if the caller asked for one.
+        #[cfg(feature = "webrtc")]
+        {
+            config.rtc = self.rtc;
+        }
         if let Some(id) = self.subnet {
             config = config.with_subnet(id);
         }
@@ -632,7 +654,7 @@ impl Mesh {
     /// combination as its sole consumer (`mesh_rpc` /
     /// `mesh_rpc_resilience`) so feature combinations that
     /// exclude either don't trip dead-code lints.
-    pub(crate) fn node(&self) -> &Arc<MeshNode> {
+    pub fn node(&self) -> &Arc<MeshNode> {
         &self.node
     }
 
@@ -1023,7 +1045,11 @@ impl Mesh {
         let addr: SocketAddr = next_hop_addr
             .parse()
             .map_err(|e| SdkError::Config(format!("invalid address: {}", e)))?;
-        self.node.router().add_route(dest_node_id, addr);
+        // The SDK takes an operator-typed address; the routing plane
+        // keys on the endpoint.
+        self.node
+            .router()
+            .add_route(dest_node_id, net::adapter::net::PeerAddr::Udp(addr));
         Ok(())
     }
 
@@ -1080,7 +1106,30 @@ impl Mesh {
             .map_err(SdkError::from)
     }
 
-    /// Close a stream: drop its `StreamState` and free the window. Idempotent.
+    /// Close the stream this handle owns: drop its `StreamState` and
+    /// free the window. Idempotent for the lifetime the handle names.
+    ///
+    /// Lifetime-fenced. Returns [`SdkError::SessionSuperseded`] when
+    /// the peer's session has been replaced since the handle was
+    /// opened — the handle is inert, and the stream id it names may be
+    /// live on the successor session, which is not this handle's to
+    /// tear down. Returns [`SdkError::NotConnected`] when the stream
+    /// was closed and reopened on that same session: a different
+    /// lifetime holds the id.
+    pub fn close_stream_handle(&self, stream: &Stream) -> Result<()> {
+        self.node
+            .close_stream_handle(stream)
+            .map_err(SdkError::from)
+    }
+
+    /// Close whatever stream is open under `(peer_node_id, stream_id)`:
+    /// drop its `StreamState` and free the window. Idempotent.
+    ///
+    /// **Unfenced by contract** — it addresses an id, not a lifetime.
+    /// Prefer [`Self::close_stream_handle`] whenever a handle is in
+    /// hand; closing by id with a displaced session's coordinates
+    /// tears down whichever lifetime is current, including a
+    /// successor session's stream of the same id.
     pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
         self.node.close_stream(peer_node_id, stream_id);
     }
@@ -1090,7 +1139,12 @@ impl Mesh {
     /// Returns [`SdkError::Backpressure`] when the stream's per-stream
     /// in-flight window is full (no events were sent — the caller
     /// decides whether to drop, retry, or buffer). [`SdkError::NotConnected`]
-    /// when the peer session is gone. All other failures surface as
+    /// when the peer session is gone. [`SdkError::EventTooLarge`] — with
+    /// the limit in it — when one event is bigger than a single Net
+    /// packet can carry: nothing is sent, and no receiver in the mesh
+    /// would have accepted it. Compare against
+    /// [`MAX_EVENT_SIZE`](net::adapter::net::MAX_EVENT_SIZE) to split
+    /// before sending. All other failures surface as
     /// [`SdkError::Adapter`].
     pub async fn send_on_stream(&self, stream: &Stream, events: &[Bytes]) -> Result<()> {
         self.node

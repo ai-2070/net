@@ -1,0 +1,13 @@
+# Build artifacts of the two nested crates and the harness's scratch
+# directory. CI builds these; the repo never carries them.
+leaf/target/
+leaf/dist/
+# `wasm-bindgen --out-dir` for the page; the runner regenerates it on
+# every run, and CI builds it from source.
+page/dist/
+runner/target/
+work/
+logs/
+# The Playwright driver's single dependency, installed on first use.
+driver/node_modules/
+driver/package-lock.json

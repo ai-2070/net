@@ -1,0 +1,35 @@
+=== identity ===
+3fdacc684c3f8260e1ab1b4d8e6c0211b755f235861d64f32db17bffe3edfac0  src/adapter/net/mesh.rs
+eb2acfb4120f64d7df3a873af689cf7e56fd00e527ff630408eaec472e4f2102  src/adapter/net/rtc/fragment.rs
+83ccaa627210a4cf3fcfb3938f4bec6ed69519fd41636d9aaef142daa65d103d  src/adapter/net/rtc/driver.rs
+b9ed9596ebd493e8017ff923c89cd491731bee2e09c435c684df2a061a50de24  tests/rtc_repairs.rs
+0
+=== full rtc_repairs ===
+test one_datagram_lost_below_sctp_is_recovered_only_where_net_covers_it ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.76s
+
+=== other rtc binaries ===
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.68s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.53s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.77s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.21s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.00s
+=== workspace check ===
+
+warning: `net-node` (lib test) generated 18 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 03s
+=== clippy ===
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+    Checking net-mesh-wire v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\wire)
+    Checking net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.98s

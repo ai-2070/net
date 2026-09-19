@@ -1,0 +1,20 @@
+[package]
+name = "s0b-native"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Throwaway S0b spike: native RTC anchor — one driver thread owning the RTC UDP socket and every str0m Rtc, plus a text signalling/static server. Not production code."
+
+# Standalone: NOT a member of net/crates/net.
+[workspace]
+
+[dependencies]
+# The S0a wire crate, by path. Used on the native side for the Noise
+# responder, NetSession and PacketBuilder.
+s0a-wire = { path = "../../s0a-wire" }
+
+# The pinned configuration from the plan's §Dependencies. Defaults
+# (aws-lc-rs + examples) are deliberately NOT used.
+str0m = { version = "0.23.1", default-features = false, features = ["rust-crypto"] }
+bytes = "1.12.1"
+parking_lot = "0.12.5"

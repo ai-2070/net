@@ -6,8 +6,18 @@
 
 mod config;
 mod guard;
-pub mod membership;
-mod name;
+// `membership` (the 0x0A00 codec) and `name` (validation + the
+// canonical/wire hashes) moved to `net-mesh-wire` in Stage 5 — plan
+// §7 assigns the wire-level subprotocol codecs to that crate, and the
+// browser leaf's dispatcher is the second consumer S0a said would
+// drive the move. Re-exported under their previous paths, so no
+// `use …::channel::membership::…` site changed.
+// `membership` stays a public module path (it was `pub mod
+// membership`); `name` stays private (it was `mod name`), with only
+// its `pub use`d items surfacing — so the export surface is
+// unchanged in both directions.
+pub use net_wire::channel::membership;
+use net_wire::channel::name;
 mod publisher;
 mod roster;
 

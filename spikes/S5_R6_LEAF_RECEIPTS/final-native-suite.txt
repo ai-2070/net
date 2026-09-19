@@ -1,0 +1,409 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.75s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-43e6005ce57c2f08.exe)
+
+running 227 tests
+test bootstrap::tests::only_both_observations_together_classify_udp_as_blocked ... ok
+test bootstrap::tests::equivalent_ipv6_spellings_of_the_peers_endpoint_are_one_endpoint ... ok
+test bootstrap::tests::a_stun_entry_naming_this_connections_peer_is_refused_with_both_endpoints_named ... ok
+test bootstrap::tests::a_credential_decodes_to_the_pinned_key_the_psk_and_the_url ... ok
+test bootstrap::tests::an_expired_psk_is_refused_at_validation_not_at_parse ... ok
+test bootstrap::tests::a_separate_endpoint_a_relay_or_an_unknown_peer_is_not_a_conflict ... ok
+test bootstrap::tests::anchor_info_parses_both_node_id_spellings ... ok
+test announce::tests::two_announcements_sharing_a_routing_id_resolve_to_neither ... ok
+test bootstrap::tests::an_anchor_serving_a_different_key_is_refused_before_any_handshake ... ok
+test bootstrap::tests::an_offer_response_parses_its_three_load_bearing_fields ... ok
+test announce::tests::a_routing_id_resolves_to_the_announced_node_and_expires_with_it ... ok
+test bootstrap::tests::the_default_ice_server_is_the_announced_stun_endpoint_or_nothing ... ok
+test channel::tests::an_invalid_channel_name_is_refused_at_construction ... ok
+test announce::tests::the_transcript_removes_only_the_two_unsigned_fields ... ok
+test channel::tests::a_subscribe_payload_round_trips_through_the_production_codec ... ok
+test bootstrap::tests::a_malformed_or_foreign_credential_is_refused ... ok
+test channel::tests::the_publish_stream_id_is_the_bit_48_packing_of_the_canonical_hash ... ok
+test announce::tests::an_unsigned_announcement_is_refused ... ok
+test channel::tests::the_nrpc_channel_names_are_the_deterministic_ones ... ok
+test clock::tests::a_deadline_is_not_expired_before_its_instant_and_is_after ... ok
+test control_plane::tests::the_payload_cannot_run_into_the_next_field ... ok
+test clock::tests::the_wall_clock_returns_a_real_epoch_reading ... ok
+test clock::tests::a_zero_deadline_is_expired_immediately ... ok
+test counters::tests::an_inapplicable_field_says_why_instead_of_reporting_zero ... ok
+test control_plane::tests::the_signed_body_distinguishes_every_field ... ok
+test counters::tests::every_reason_has_its_own_slot ... ok
+test counters::tests::every_native_rtc_stats_field_is_emitted_or_declared_inapplicable ... ok
+test counters::tests::reason_names_are_unique ... ok
+test counters::tests::the_json_snapshot_carries_every_reason_as_a_string ... ok
+test dispatch::tests::a_direct_packet_passes_the_routing_discriminator_untouched ... ok
+test dispatch::tests::a_payload_that_does_not_decode_is_dropped_and_counted_separately ... ok
+test dispatch::tests::a_routing_envelope_for_another_node_is_dropped_and_counted ... ok
+test dispatch::tests::a_routing_envelope_for_this_leaf_is_unwrapped ... ok
+test dispatch::tests::a_truncated_envelope_is_dropped_as_unparsable ... ok
+test counters::tests::the_rtc_reading_reports_both_halves_as_decimal_strings ... ok
+test dispatch::tests::an_expired_envelope_is_dropped_under_its_own_reason ... ok
+test dispatch::tests::an_unknown_subprotocol_is_dropped_and_counted ... ok
+test dispatch::tests::announcements_and_fold_frames_reach_the_node_unverified ... ok
+test dispatch::tests::every_listed_subprotocol_maps_to_its_arm_and_nothing_else_does ... ok
+test dispatch::tests::the_control_arms_decode_what_the_production_encoders_produce ... ok
+test enroll::tests::a_malformed_invite_is_refused_rather_than_guessed ... ok
+test enroll::tests::a_malformed_outcome_is_refused ... ok
+test enroll::tests::a_rejection_names_its_code_and_is_never_retried ... ok
+test enroll::tests::an_admitted_outcome_yields_the_chain ... ok
+test enroll::tests::an_expired_invite_is_refused_at_validation_not_at_parse ... ok
+test enroll::tests::an_invite_decodes_to_the_root_the_nonce_and_the_deadline ... ok
+test enroll::tests::every_reject_code_has_a_name ... ok
+test dispatch::tests::the_signal_arm_decodes_a_real_envelope ... ok
+test error::tests::the_ice_timeout_message_refuses_the_stronger_claim ... ok
+test error::tests::udp_blocked_requires_both_observations ... ok
+test establish::tests::the_transcript_is_domain_separated_and_fixed_layout ... ok
+test frame::tests::a_contradictory_fragment_drops_the_whole_group ... ok
+test frame::tests::a_contradicted_sequenced_group_names_the_stream_it_owned ... ok
+test frame::tests::a_fragment_conflicting_with_a_held_piece_is_refused ... ok
+test frame::tests::a_group_cannot_change_its_mode ... ok
+test frame::tests::a_group_cannot_change_its_plane ... ok
+test frame::tests::a_group_cannot_change_its_stream_origin_or_channel ... ok
+test frame::tests::a_group_cannot_claim_a_sequence_none_of_its_pieces_arrived_on ... ok
+test frame::tests::a_new_group_reusing_a_completed_fragment_id_still_opens ... ok
+test establish::tests::an_initiator_proof_is_not_a_responder_proof ... ok
+test frame::tests::a_reaped_control_group_strands_no_stream ... ok
+test frame::tests::a_reaped_sequenced_group_names_the_stream_it_owned ... ok
+test establish::tests::the_frame_is_fixed_width_and_versioned ... ok
+test frame::tests::a_rebuilt_head_of_a_delivered_group_reports_no_abandonment ... ok
+test frame::tests::a_tail_arriving_past_the_ttl_cannot_complete_a_reaped_group ... ok
+test establish::tests::a_proof_signed_for_someone_elses_id_is_refused ... ok
+test frame::tests::an_exact_duplicate_fragment_is_a_counted_no_op ... ok
+test frame::tests::an_unfragmented_packet_passes_straight_through ... ok
+test frame::tests::expiry_frees_slots_and_counts_what_it_dropped ... ok
+test frame::tests::retiring_one_stream_takes_only_its_own_groups ... ok
+test frame::tests::the_completed_group_memory_expires_with_the_deadline ... ok
+test frame::tests::split_then_reassemble_is_the_identity_even_out_of_order ... ok
+test frame::tests::the_reassembler_refuses_past_its_bound_and_counts_the_refusals ... ok
+test frame::tests::the_fragmentation_boundary_is_max_payload_minus_the_length_prefix ... ok
+test identity::tests::a_debug_print_of_the_at_rest_secrets_carries_neither_scalar ... ok
+test identity::tests::a_stored_blob_is_refused_four_distinguishable_ways ... ok
+test identity::tests::a_debug_print_never_contains_the_secret_scalar ... ok
+test identity::tests::hex_round_trips_and_the_entity_id_is_sixty_four_characters ... ok
+test identity::tests::node_id_and_origin_hash_are_the_meshs_keyed_blake2s_derivations ... ok
+test frame::tests::a_payload_above_the_ceiling_is_refused_not_truncated ... ok
+test leader::tests::a_forgotten_request_is_answered_rather_than_left_pending ... ok
+test leader::tests::a_leader_local_request_is_answered_without_broadcasting ... ok
+test leader::tests::a_request_with_no_leader_is_refused_immediately ... ok
+test leader::tests::a_leader_change_fails_the_old_generations_calls_typed_and_retries_nothing ... ok
+test identity::tests::custodial_injection_is_deterministic_in_the_half_that_names_the_node ... ok
+test identity::tests::the_noise_static_public_half_is_the_x25519_derivation ... ok
+test identity::tests::the_at_rest_blob_round_trips_and_names_the_scalars_it_carries ... ok
+test enroll::tests::an_over_cap_request_is_refused_before_admission_can_swallow_it ... ok
+test leader::tests::a_resumed_leaders_messages_are_fenced_and_change_nothing ... ok
+test leader::tests::a_stood_down_leader_refuses_instead_of_serving ... ok
+test leader::tests::a_request_from_another_generation_is_refused_and_never_performed ... ok
+test leader::tests::an_announced_leader_loss_fails_the_pending_work_it_names ... ok
+test leader::tests::a_followers_request_reaches_the_node_and_its_answer_comes_back ... ok
+test leader::tests::an_unknown_protocol_version_is_refused ... ok
+test leader::tests::attach_is_served_without_a_generation_and_answered_with_leadership ... ok
+test identity::tests::the_fingerprint_is_a_stable_domain_separated_name ... ok
+test announce::tests::a_zero_ttl_announcement_is_expired_from_the_instant_it_was_stamped ... ok
+test leader::tests::every_u64_crosses_the_channel_as_a_decimal_string ... ok
+test leader::tests::restoration_is_the_union_of_every_followers_declaration ... ok
+test announce::tests::query_json_carries_node_ids_as_strings ... ok
+test leader::tests::the_gate_refuses_every_generation_below_the_highest_it_has_seen ... ok
+test announce::tests::a_leaf_announcement_verifies_and_carries_the_two_role_tags ... ok
+test mock_control_plane::tests::a_member_cannot_send_an_envelope_claiming_another_sender ... ok
+test leader::tests::the_scope_names_the_identity_on_the_origin ... ok
+test announce::tests::the_authority_lookup_expires_exactly_ttl_nanoseconds_after_the_stamp ... ok
+test leader::tests::every_body_shape_round_trips ... ok
+test leader::tests::udp_blocked_without_both_observations_arrives_as_an_ice_timeout ... ok
+test mock_control_plane::tests::a_net_packet_cannot_be_published_as_an_announcement ... ok
+test leader::tests::every_typed_failure_survives_the_channel_unchanged ... ok
+test mock_control_plane::tests::a_net_packet_is_refused_and_poisons_the_ledger ... ok
+test mock_control_plane::tests::an_envelope_reaches_only_its_addressee ... ok
+test leader::tests::the_leader_stamps_its_generation_on_every_message_it_sends ... ok
+test mock_control_plane::tests::an_offer_is_refused_because_no_carrier_could_authenticate_it ... ok
+test mock_control_plane::tests::an_unadmitted_addressee_is_refused ... ok
+test mock_control_plane::tests::the_ledger_records_each_leg_with_its_direction_and_length ... ok
+test announce::tests::a_forwarded_announcement_still_verifies ... ok
+test establish::tests::a_signed_proof_verifies_for_the_establishment_it_names ... ok
+test establish::tests::a_proof_does_not_verify_for_a_different_handshake ... ok
+test mock_control_plane::tests::a_late_joiner_discovers_by_query_what_it_never_received ... ok
+test enroll::tests::the_join_request_self_signature_verifies_against_a_reconstructed_challenge ... ok
+test announce::tests::the_store_is_newest_wins_per_node_and_query_matches_on_tags ... ok
+test identity::tests::a_signature_verifies_and_a_tampered_message_does_not ... ok
+test node::tests::a_packet_from_a_peer_with_no_session_is_dropped ... ok
+test node::tests::a_fragment_group_cannot_change_its_mode_between_pieces ... ok
+test node::tests::a_relayed_packet_from_an_undiscovered_source_is_refused ... ok
+test node::tests::a_deadline_sweep_times_out_the_call_and_emits_a_cancel ... ok
+test node::tests::a_fragment_group_cannot_be_completed_under_another_plane ... ok
+test node::tests::a_consistent_group_arriving_out_of_order_still_assembles ... ok
+test announce::tests::tampering_with_any_signed_field_fails_verification ... ok
+test node::tests::a_call_round_trips_and_resolves_the_callers_future ... ok
+test node::tests::a_publish_rides_the_derived_stream_and_carries_the_payload_verbatim ... ok
+test node::tests::a_rejected_enrollment_is_typed_and_does_not_promote ... ok
+test node::tests::a_boundary_on_a_fragment_head_concedes_the_lost_prefix_before_the_group_completes ... ok
+test node::tests::a_call_cannot_take_a_carrier_an_application_stream_already_owns ... ok
+test node::tests::a_late_tail_is_not_acknowledged_into_a_group_reaped_on_its_own_arrival ... ok
+test node::tests::a_channel_message_that_begins_with_a_reply_dispatch_byte_is_still_delivered ... ok
+test node::tests::a_reset_retires_the_streams_partial_groups_and_leaves_the_send_half ... ok
+test node::tests::a_fire_and_forget_send_after_promotion_is_held_and_recovered_in_order ... ok
+test node::tests::a_routed_envelope_for_someone_else_is_dropped_with_a_counter ... ok
+test node::tests::a_subscribe_goes_out_under_the_membership_subprotocol ... ok
+test node::tests::a_relayed_handshake_installs_a_session_on_both_sides_from_discovery_alone ... ok
+test node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence ... ok
+test node::tests::a_lost_reliable_packet_is_nacked_retransmitted_and_delivered_in_order ... ok
+test node::tests::an_expired_invite_is_refused_before_a_packet_is_built ... ok
+test node::tests::a_stream_record_carries_its_session_incarnation ... ok
+test node::tests::an_acknowledged_group_reaped_at_the_ttl_ends_its_stream_and_stops_acknowledging ... ok
+test node::tests::the_event_json_keeps_every_u64_as_a_decimal_string ... ok
+test node::tests::an_application_stream_payload_is_never_decoded_as_an_nrpc_reply ... ok
+test retry::tests::a_later_network_change_gets_its_own_re_attempt ... ok
+test node::tests::a_reply_that_matches_no_call_is_surfaced_as_well_as_counted ... ok
+test node::tests::a_reliable_send_recovers_on_an_id_that_first_carried_fire_and_forget ... ok
+test retry::tests::a_peer_with_a_live_direct_session_is_not_re_attempted ... ok
+test retry::tests::a_trigger_after_the_session_is_back_starts_nothing ... ok
+test retry::tests::an_armed_trigger_for_a_pair_this_leaf_answered_starts_nothing ... ok
+test retry::tests::an_unarmed_ice_failure_is_dropped_and_arming_replays_nothing ... ok
+test retry::tests::both_triggers_for_one_network_change_start_one_re_attempt ... ok
+test retry::tests::completed_counts_as_recovery ... ok
+test retry::tests::forgetting_a_pair_drops_its_ownership_and_its_episode ... ok
+test retry::tests::one_online_event_re_attempts_each_interrupted_peer_once ... ok
+test retry::tests::the_episode_and_its_re_attempt_share_one_absolute_deadline ... ok
+test retry::tests::role_reversal_moves_repair_ownership_and_leaves_one_owner ... ok
+test retry::tests::the_ice_watch_fires_on_the_transition_and_not_on_the_state ... ok
+test rpc::tests::a_dropped_caller_does_not_break_delivery_accounting ... ok
+test rpc::tests::a_late_reply_to_a_finished_call_is_dropped_and_counted ... ok
+test rpc::tests::a_lost_session_fails_only_its_own_calls_and_never_retries ... ok
+test rpc::tests::a_reply_is_refused_unless_peer_incarnation_route_and_carrier_all_match ... ok
+test rpc::tests::a_server_deadline_frame_is_a_timeout_not_a_refusal ... ok
+test rpc::tests::a_non_ok_status_becomes_a_typed_refusal_carrying_the_diagnostic ... ok
+test rpc::tests::a_successful_reply_reaches_the_caller_and_frees_the_slot ... ok
+test rpc::tests::cancelling_a_call_returns_its_peer_and_frees_the_slot ... ok
+test rpc::tests::failing_one_incarnation_leaves_the_successors_calls_alone ... ok
+test rpc::tests::leader_loss_fails_everything_with_the_generation_that_owned_it ... ok
+test rpc::tests::seeded_call_ids_do_not_restart_at_zero ... ok
+test rpc::tests::the_local_deadline_produces_a_timeout_and_names_the_call ... ok
+test rpc_wire::tests::a_deadline_exceeded_frame_needs_no_payload ... ok
+test rpc_wire::tests::a_nonzero_pad_is_ignored_on_read ... ok
+test rpc::tests::the_table_is_bounded_and_refuses_rather_than_growing ... ok
+test rpc_wire::tests::a_refusal_status_survives_the_round_trip_with_its_diagnostic ... ok
+test rpc_wire::tests::a_request_frame_has_the_meta_route_payload_layout ... ok
+test rpc_wire::tests::a_request_or_cancel_dispatch_is_not_a_client_frame ... ok
+test rpc_wire::tests::a_response_frame_round_trips_through_the_client_decoder ... ok
+test rpc_wire::tests::a_truncated_response_is_an_error_not_a_partial_decode ... ok
+test rpc_wire::tests::every_status_round_trips_and_reserved_values_decode_as_application ... ok
+test rpc_wire::tests::an_over_cap_field_is_refused_rather_than_truncated ... ok
+test rpc_wire::tests::the_event_meta_layout_is_the_pinned_twenty_four_bytes ... ok
+test node::tests::an_unknown_subprotocol_from_a_live_session_is_dropped_and_surfaced ... ok
+test node::tests::a_signal_envelope_needs_a_verified_announcement_and_is_admitted_once ... ok
+test node::tests::an_over_cap_payload_survives_fragmentation_and_reassembly ... ok
+test node::tests::losing_the_session_fails_an_in_flight_call_typed ... ok
+test node::tests::enrollment_emits_the_subscribe_then_the_request_and_promotes_on_admission ... ok
+test signal::tests::a_malformed_envelope_is_refused_rather_than_guessed ... ok
+test node::tests::a_signed_offer_rides_the_relayed_session_and_the_receiver_verifies_it ... ok
+test node::tests::a_tiny_reliable_burst_is_refused_at_the_descriptor_bound_with_every_packet_still_owned ... ok
+test signal::tests::an_envelope_for_another_node_is_refused ... ok
+test signal::tests::the_seen_set_admits_once_and_prunes_by_the_window ... ok
+test node::tests::query_answers_only_from_verified_announcements ... ok
+test stream::tests::a_late_arrival_after_a_fire_and_forget_skip_is_dropped_as_a_duplicate ... ok
+test node::tests::stream_overrides_arrive_on_the_packet_header_not_just_on_the_handle ... ok
+test signal::tests::a_signature_from_another_entity_does_not_verify ... ok
+test stream::tests::a_reliable_stream_delivers_in_sequence_order_whatever_the_arrival_order ... ok
+test stream::tests::a_reliable_stream_fails_typed_at_the_buffer_bound_rather_than_losing_its_head_gap ... ok
+test stream::tests::a_reliable_stream_holds_a_gap_rather_than_delivering_past_it ... ok
+test stream::tests::a_retransmitted_duplicate_is_delivered_once ... ok
+test stream::tests::fire_and_forget_skips_a_gap_and_counts_every_lost_sequence ... ok
+test stream::tests::leaf_stream_ids_cannot_alias_the_publish_or_subprotocol_spaces ... ok
+test stream::tests::reliability_parses_both_spellings_and_rejects_anything_else ... ok
+test node::tests::an_expired_announcement_is_not_discoverable_and_not_a_signal_authority ... ok
+test node::tests::the_handshake_emits_a_connected_event_carrying_the_published_rtc_addr ... ok
+test signal::tests::an_envelope_round_trips_through_the_wire_form_and_verifies ... ok
+test signal::tests::the_window_is_enforced_at_both_ends ... ok
+test node::tests::an_unreplenished_window_refuses_the_send_synchronously ... ok
+test session::tests::a_built_packet_opens_on_the_peer_side ... ok
+test node::tests::application_data_rides_the_relayed_session_and_stops_when_the_pair_goes_direct ... ok
+test node::tests::an_unreaped_group_completes_and_ends_no_stream ... ok
+test session::tests::an_over_cap_payload_becomes_a_fragment_group_on_contiguous_sequences ... ok
+test session::tests::fragment_ids_never_repeat_zero ... ok
+test session::tests::the_initiator_handshake_installs_a_session_both_halves_agree_on ... ok
+test node::tests::the_leafs_announcement_is_versioned_and_role_tagged ... ok
+test session::tests::a_full_stamp_table_refuses_a_new_stream_rather_than_evicting_an_owned_one ... ok
+test node::tests::sustained_traffic_past_the_send_window_is_replenished_by_receiver_grants ... ok
+test node::tests::the_reply_channel_is_subscribed_once_per_service_and_again_after_a_reconnect ... ok
+test session::tests::the_session_table_replaces_rather_than_joins ... ok
+test signal::tests::a_carrier_cannot_alter_any_signed_field ... ok
+test node::tests::a_fragment_refused_for_capacity_is_recovered_by_the_ordinary_retransmit ... ok
+test node::tests::stream_records_name_the_peer_whose_session_delivered_them ... ok
+test node::tests::an_exhausted_channel_refuses_publish_while_another_channel_still_sends ... ok
+test node::tests::an_exhausted_stream_returns_its_stamps_so_a_fresh_id_is_admitted ... ok
+
+test result: ok. 227 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.37s
+
+     Running tests\control_plane_boundary.rs (target\debug\deps\control_plane_boundary-e2fdd31e609611f3.exe)
+
+running 8 tests
+test a_control_plane_needs_no_anchor_to_exist ... ok
+test no_net_packet_type_is_nameable_in_the_trait ... ok
+test no_anchor_type_is_nameable_in_the_trait ... ok
+test the_anchorless_mock_holds_no_keys ... ok
+test the_anchor_implementations_public_surface_leaks_nothing ... ok
+test the_trait_module_imports_nothing_from_the_anchor_or_the_wire ... ok
+test no_control_plane_implementation_touches_the_data_path ... ok
+test the_bindgen_surface_does_no_transport_of_its_own ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\dependency_boundary.rs (target\debug\deps\dependency_boundary-ebd6b4892d43e686.exe)
+
+running 5 tests
+test the_leaf_is_its_own_workspace ... ok
+test the_leaf_depends_on_the_wire_crate_and_nothing_native ... ok
+test the_mesh_workspace_does_not_include_the_leaf ... ok
+test web_sys_is_confined_to_the_transport_and_the_bindgen_surface ... ok
+test nothing_reads_the_clock_outside_the_seam ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\establishment_identity.rs (target\debug\deps\establishment_identity-187115b0e0ef0e52.exe)
+
+running 11 tests
+test the_periodic_sweep_retires_an_abandoned_attempt ... ok
+test a_wrong_domain_psk_is_still_refused_before_any_admission ... ok
+test closing_the_peer_revokes_an_unproven_establishment ... ok
+test retiring_the_attempt_revokes_an_unproven_establishment ... ok
+test application_bytes_on_an_unproven_establishment_are_never_delivered ... ok
+test a_proof_arriving_after_the_attempt_expired_installs_nothing ... ok
+test an_impostor_with_the_domain_psk_is_refused_the_identity_it_claims ... ok
+test the_honest_initiator_is_installed_after_its_establishment_proof ... ok
+test a_superseded_attempt_loses_its_right_to_install ... ok
+test the_direct_path_demands_the_same_proof_as_the_routed_one ... ok
+test a_proof_from_another_establishment_cannot_promote_this_one ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests\fixture_parity.rs (target\debug\deps\fixture_parity-8b6a0ff41ee79905.exe)
+
+running 4 tests
+test the_leaf_nrpc_encoder_reproduces_the_pinned_frame ... ok
+test every_package_vector_mirrors_its_repository_original ... ok
+test the_leaf_enrollment_encoder_reproduces_the_pinned_objects ... ok
+test the_leaf_announcement_encoder_reproduces_the_pinned_bytes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\kyra_followup.rs (target\debug\deps\kyra_followup-3f1cf47d0ce0944a.exe)
+
+running 10 tests
+test kyra_fragment_group_cannot_change_stream_or_provenance ... ok
+test kyra_lossfree_fragment_delivery_control ... ok
+test kyra_correct_inner_route_does_not_authorize_wrong_outer_channel ... ok
+test kyra_subscribe_then_publish_consumes_one_sequence_space ... ok
+test kyra_reliable_reorder_overflow_delivers_all_or_fails_typed ... ok
+test kyra_other_channel_membership_control ... ok
+test kyra_fresh_handle_after_replacement_control ... ok
+test kyra_old_leaf_stream_handle_is_refused_after_replacement ... ok
+test kyra_retransmitted_fragment_does_not_destroy_acknowledged_partial ... ok
+test kyra_unexpired_signal_replay_stays_refused_under_capacity_pressure ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests\kyra_review.rs (target\debug\deps\kyra_review-8ab23a8e81c7bfb3.exe)
+
+running 15 tests
+test kyra_incomplete_fragment_coverage_is_rejected ... ok
+test kyra_expired_announcement_is_not_discovery_or_signal_authority ... ok
+test kyra_reliable_packet_build_retains_retransmit_owner ... ok
+test kyra_other_entity_cannot_replace_victim_and_authorize_signal ... ok
+test kyra_two_distinct_ice_candidates_in_one_dialog_survive_dedup ... ok
+test kyra_correct_peer_and_route_reply_control ... ok
+test kyra_reliable_fragmented_payload_is_delivered ... ok
+test kyra_channel_publication_is_not_misclassified_as_stream ... ok
+test kyra_small_reliable_control ... ok
+test kyra_reordered_stream_events_keep_their_own_sequences ... ok
+test kyra_same_peer_wrong_reply_route_cannot_complete_call ... ok
+test kyra_fire_and_forget_fragment_control ... ok
+test kyra_reply_from_another_session_cannot_complete_call ... ok
+test kyra_session_replacement_resets_receive_sequence ... ok
+test kyra_session_replacement_fails_old_pending_call ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests\kyra_round2_review.rs (target\debug\deps\kyra_round2_review-3496558c44e80802.exe)
+
+running 5 tests
+test kyra_control_debit_below_window_control ... ok
+test kyra_control_overdraft_grant_does_not_refund_withheld_application ... ok
+test kyra_expired_acknowledged_partial_delivers_or_fails_typed ... ok
+test kyra_same_session_close_reopen_preserves_receive_progress ... ok
+test kyra_unexpired_partial_delivery_control ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\kyra_round3_review.rs (target\debug\deps\kyra_round3_review-e95cbef72b766d1c.exe)
+
+running 12 tests
+test kyra_large_cumulative_grant_retires_all_control_debt ... ok
+test kyra_promotion_wire_ack_does_not_claim_missing_sequence ... ok
+test kyra_implicit_epoch_debit_cannot_rewind_successor ... ok
+test kyra_explicit_epoch_debit_replacement_control ... ok
+test kyra_promotion_lost_reliable_boundary_delivers_or_fails ... ok
+test kyra_promotion_delayed_packet_still_delivers_control ... ok
+test kyra_reliable_fragment_head_promotes_consumer_before_faf_tail_traffic ... ok
+test kyra_promotion_past_lost_faf_boundary_settles_consumer ... ok
+test kyra_deadline_shaped_application_bytes_other_route_control ... ok
+test kyra_deadline_shaped_application_bytes_matching_route_are_data ... ok
+test kyra_promotion_lossfree_control ... ok
+test kyra_faf_fragment_loss_does_not_kill_following_faf_messages ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\kyra_round4_parent.rs (target\debug\deps\kyra_round4_parent-7043c05559cc9856.exe)
+
+running 10 tests
+test kyra_native_flags_cannot_false_ack_lost_reliable_head ... ok
+test kyra_reset_replaces_receive_boundary_not_send_half ... ok
+test kyra_unowned_carrier_application_control ... ok
+test kyra_rpc_carrier_cannot_silently_shadow_admitted_stream ... ok
+test kyra_partial_faf_expiry_after_promotion_reordered ... ok
+test kyra_partial_faf_expiry_after_promotion_ordered ... ok
+test kyra_real_faf_loss_before_promotion_reordered ... ok
+test kyra_completed_fragment_no_duplicate_control ... ok
+test kyra_real_faf_loss_before_promotion_ordered ... ok
+test kyra_completed_fragment_duplicate_does_not_terminal ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests\ts_abi_fixture.rs (target\debug\deps\ts_abi_fixture-88c2415411c139c7.exe)
+
+running 1 test
+test the_typescript_fixture_is_exactly_what_the_leaf_emits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\wasm_anchorless.rs (target\debug\deps\wasm_anchorless-d73a467d4592f5c7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\wasm_leader.rs (target\debug\deps\wasm_leader-4742c57e9a166ccd.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\wasm_leaf.rs (target\debug\deps\wasm_leaf-c80e19eca94a4899.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\wasm_rtc_conservation.rs (target\debug\deps\wasm_rtc_conservation-9eb0571b8b44a9e0.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests net_leaf
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT=0

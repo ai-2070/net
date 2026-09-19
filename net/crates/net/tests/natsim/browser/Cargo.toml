@@ -1,0 +1,41 @@
+[package]
+name = "natsim-browser-matrix"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stage 6 deterministic NAT conformance: two headless browsers behind simulated NATs plus one anchor, driven inside Linux network namespaces."
+
+# Its own workspace root, for the same reason the Stage 4b harness has
+# one: this is a harness binary under `net/crates/net/tests/`, and
+# `net/crates/net/Cargo.toml` is not ours to edit.
+[workspace]
+
+[[bin]]
+name = "natsim-browser-matrix"
+path = "src/main.rs"
+
+[dependencies]
+# The anchor: a real `MeshNode` with the RTC socket and the STUN
+# responder the browsers gather against.
+net-mesh = { path = "../../..", features = ["webrtc"] }
+# The production bootstrap listener and the browser credential — the
+# rows go through the same front door a deployment does.
+net-mesh-sdk = { path = "../../../sdk", features = ["rtc-bootstrap"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The local CA + leaf, with an IP SAN: the browsers reach the listener
+# at `https://10.99.0.10:8443`, not at a hostname.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
+# `base64(SHA-256(SubjectPublicKeyInfo))` for Chromium's one-key SPKI
+# pin, computed here rather than shelled out.
+sha2 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+# The anchor's enrollment RPC provider. `connect()` enrols, and an
+# anchor that serves nothing leaves that call unanswered.
+async-trait = "0.1"
+bytes = "1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }

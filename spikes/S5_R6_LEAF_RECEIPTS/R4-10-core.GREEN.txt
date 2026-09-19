@@ -1,0 +1,13 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.55s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-43e6005ce57c2f08.exe)
+
+running 2 tests
+test node::tests::a_stream_record_carries_its_session_incarnation ... ok
+test node::tests::stream_records_name_the_peer_whose_session_delivered_them ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 225 filtered out; finished in 0.08s
+
+EXIT=0

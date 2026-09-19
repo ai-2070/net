@@ -1,0 +1,52 @@
+=== R4-1 — inverse receipt ===
+--- repaired identity
+3fdacc684c3f8260e1ab1b4d8e6c0211b755f235861d64f32db17bffe3edfac0 *src/adapter/net/mesh.rs
+eb2acfb4120f64d7df3a873af689cf7e56fd00e527ff630408eaec472e4f2102 *src/adapter/net/rtc/fragment.rs
+--- applied repair diff (this item's hunks are named in inverse.py)
+apply R4-1 ok
+--- INVERSE APPLIED; command:
+$ CARGO_INCREMENTAL=0 cargo test --test rtc_repairs --features "net webrtc fixtures" mixed_producer
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 03s
+     Running tests\rtc_repairs.rs (target\debug\deps\rtc_repairs-ab2ae437d8444f07.exe)
+
+running 1 test
+test a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits ... FAILED
+
+failures:
+
+---- a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits stdout ----
+
+thread 'a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits' (98940) panicked at tests\rtc_repairs.rs:5908:5:
+assertion `left == right` failed: **R4-1**: every payload of the shared sequence space arrives, IN SEQUENCE ORDER. The lost reliable head is recovered rather than conceded, and the old fire-and-forget handle's payload is held in order behind it — which it can only be if that send inherited the stream's reliable mode and its descriptor
+  left: [[82, 52, 49, 0, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225], [82, 52, 49, 2, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225], [82, 52, 49, 1, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225]]
+ right: [[82, 52, 49, 0, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225], [82, 52, 49, 1, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225], [82, 52, 49, 2, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225], [82, 52, 49, 3, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225, 225]]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 55 filtered out; finished in 30.31s
+
+error: test failed, to rerun pass `--test rtc_repairs`
+EXIT=101
+restore R4-1 ok
+--- RESTORED identity (must equal the repaired identity above)
+3fdacc684c3f8260e1ab1b4d8e6c0211b755f235861d64f32db17bffe3edfac0 *src/adapter/net/mesh.rs
+eb2acfb4120f64d7df3a873af689cf7e56fd00e527ff630408eaec472e4f2102 *src/adapter/net/rtc/fragment.rs
+--- GREEN rerun, same command:
+warning: Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 02s
+     Running tests\rtc_repairs.rs (target\debug\deps\rtc_repairs-ab2ae437d8444f07.exe)
+
+running 1 test
+test a_native_mixed_producer_states_its_boundary_and_the_old_handle_inherits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.32s
+
+EXIT=0

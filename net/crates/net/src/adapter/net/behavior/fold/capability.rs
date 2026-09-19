@@ -105,6 +105,38 @@ pub struct CapabilityMembership {
     /// (one publisher tends to publish the same reflex across
     /// every class it joins).
     pub reflex_addr: Option<std::net::SocketAddr>,
+    /// Publisher's announced Noise static public key (plan §5
+    /// Layer 1, Stage 4a). Projected exactly like `reflex_addr`:
+    /// the publisher emits it only when it has RTC configured, and
+    /// receivers read it to build a session without an
+    /// out-of-band key handoff. `None` for every publisher that
+    /// does not announce one, which is every pre-Stage-4 node.
+    /// **Not serialized.** The fold envelope is a non-self-describing
+    /// binary encoding, so an omitted-when-`None` field is a decode
+    /// error on the far side rather than a default — and this
+    /// projection does not need to travel: every node ingests the
+    /// announcement itself and fills this locally.
+    #[serde(skip)]
+    pub noise_pubkey: Option<[u8; 32]>,
+    /// Publisher's announced bootstrap listener URL
+    /// (`rtc_bootstrap`, plan §11; Stage 4b). Projected exactly like
+    /// `noise_pubkey`, and `#[serde(skip)]` for the same reason:
+    /// every node ingests the announcement itself, so this
+    /// projection never travels in the fold envelope.
+    #[serde(skip)]
+    pub rtc_bootstrap: Option<String>,
+    /// Publisher's announced public RTC/STUN socket (`rtc_addr`,
+    /// plan §11; Stage 4b). Same projection rules as
+    /// `rtc_bootstrap`.
+    #[serde(skip)]
+    pub rtc_addr: Option<std::net::SocketAddr>,
+    /// Publisher's announced STUN endpoint (`rtc_stun_addr`,
+    /// Stage 6) — the endpoint a leaf's `iceServers` points at,
+    /// deliberately distinct from `rtc_addr`, which cannot serve
+    /// STUN for a connection it is itself the ICE peer of. Same
+    /// projection rules as `rtc_bootstrap`.
+    #[serde(skip)]
+    pub rtc_stun_addr: Option<String>,
     /// v0.4 capability-auth allow-list — peer `node_id`s
     /// authorized to invoke any of this publisher's `tags`. Empty
     /// = unrestricted (permissive default). Union semantics with
@@ -1038,6 +1070,10 @@ mod tests {
                 region: region.map(String::from),
                 price_quote: None,
                 reflex_addr,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),
@@ -1251,6 +1287,10 @@ mod tests {
             region: Some("us-east".into()),
             price_quote: None,
             reflex_addr: None,
+            noise_pubkey: None,
+            rtc_bootstrap: None,
+            rtc_addr: None,
+            rtc_stun_addr: None,
             allowed_nodes: Vec::new(),
             allowed_subnets: Vec::new(),
             allowed_groups: Vec::new(),
@@ -1340,6 +1380,10 @@ mod tests {
                     region: Some("us-east".into()),
                     price_quote: None,
                     reflex_addr: None,
+                    noise_pubkey: None,
+                    rtc_bootstrap: None,
+                    rtc_addr: None,
+                    rtc_stun_addr: None,
                     allowed_nodes: Vec::new(),
                     allowed_subnets: Vec::new(),
                     allowed_groups: Vec::new(),
@@ -2012,6 +2056,10 @@ mod tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: Vec::new(),
                 allowed_subnets: Vec::new(),
                 allowed_groups: Vec::new(),

@@ -1,0 +1,119 @@
+### P2 RAW INVERSE — close_stream deletes the receive cursor again instead of retaining it for the stream's lifetime in the session
+### repaired snapshot: spikes/s5r3_inverse/repaired/node.rs
+
+## bounded source diff
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+--- spikes/s5r3_inverse/repaired/node.rs	2026-09-15 14:09:21.132231200 +0200
++++ net/crates/net/leaf/src/node.rs	2026-09-15 14:09:57.828038300 +0200
+@@ -917,8 +917,8 @@
+     /// stream state.
+     pub fn close_stream(&mut self, handle: StreamHandle) -> Result<()> {
+         self.check_handle(handle)?;
+-        self.rx_closed
+-            .insert((handle.incarnation, handle.stream_id));
++        self.rx_streams
++            .remove(&(handle.incarnation, handle.stream_id));
+         self.stream_kinds.remove(&(handle.peer, handle.stream_id));
+         Ok(())
+     }
+EXIT=1
+
+## mutated run 1
+$ cd net/crates/net/leaf && cargo test --lib -- a_closed_stream_delivers_nothing
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.99s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 1 test
+test node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence ... FAILED
+
+failures:
+
+---- node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence stdout ----
+
+thread 'node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence' (112680) panicked at src\node.rs:3348:9:
+assertion `left == right` failed: and the record it did not get is counted, not silent
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101
+
+## mutated run 2
+$ cd net/crates/net/leaf && cargo test --test kyra_round2_review
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running tests\kyra_round2_review.rs (target\debug\deps\kyra_round2_review-7f3a156a0a521db2.exe)
+
+running 5 tests
+test kyra_control_debit_below_window_control ... ok
+test kyra_control_overdraft_grant_does_not_refund_withheld_application ... ok
+test kyra_unexpired_partial_delivery_control ... ok
+test kyra_expired_acknowledged_partial_delivers_or_fails_typed ... ok
+test kyra_same_session_close_reopen_preserves_receive_progress ... FAILED
+
+failures:
+
+---- kyra_same_session_close_reopen_preserves_receive_progress stdout ----
+
+thread 'kyra_same_session_close_reopen_preserves_receive_progress' (98536) panicked at tests\kyra_round2_review.rs:77:5:
+successful close/reopen stranded the peer's next sequence; events=[]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kyra_same_session_close_reopen_preserves_receive_progress
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--test kyra_round2_review`
+EXIT=101
+
+## restoration
+$ diff -u spikes/s5r3_inverse/repaired/node.rs net/crates/net/leaf/src/node.rs
+EXIT=0 (0 = byte-identical to the repaired snapshot)
+
+## restored run 1
+$ cd net/crates/net/leaf && cargo test --lib -- a_closed_stream_delivers_nothing
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.87s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-07dd5be407959f6e.exe)
+
+running 1 test
+test node::tests::a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.02s
+
+EXIT=0
+
+## restored run 2
+$ cd net/crates/net/leaf && cargo test --test kyra_round2_review
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.55s
+     Running tests\kyra_round2_review.rs (target\debug\deps\kyra_round2_review-7f3a156a0a521db2.exe)
+
+running 5 tests
+test kyra_control_debit_below_window_control ... ok
+test kyra_control_overdraft_grant_does_not_refund_withheld_application ... ok
+test kyra_expired_acknowledged_partial_delivers_or_fails_typed ... ok
+test kyra_same_session_close_reopen_preserves_receive_progress ... ok
+test kyra_unexpired_partial_delivery_control ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+EXIT=0

@@ -1,0 +1,26 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-wire v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\wire)
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.48s
+     Running unittests src\lib.rs (target\debug\deps\net_leaf-43e6005ce57c2f08.exe)
+
+running 1 test
+test node::tests::a_call_cannot_take_a_carrier_an_application_stream_already_owns ... FAILED
+
+failures:
+
+---- node::tests::a_call_cannot_take_a_carrier_an_application_stream_already_owns stdout ----
+
+thread 'node::tests::a_call_cannot_take_a_carrier_an_application_stream_already_owns' (118972) panicked at src\node.rs:5701:14:
+the call must be refused, not silently shadow the admitted owner: Receiver { complete: false }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    node::tests::a_call_cannot_take_a_carrier_an_application_stream_already_owns
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 226 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101

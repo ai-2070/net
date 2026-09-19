@@ -812,9 +812,44 @@ async fn run_issue_delegated(
             format_subnet_rights(issuer_grant.maximum_rights),
         )));
     }
+    // NESTED IN THE ISSUER'S WINDOW BY CONSTRUCTION, not by luck of
+    // the clock.
+    //
+    // Both the issuer grant and this leaf default their window from
+    // their OWN `unix_now()`, in two separate command invocations. A
+    // second boundary between them made the leaf's `not_after`
+    // exactly one second later than its issuer's, and the verifier
+    // refuses that with `IssuerAttenuationBroadened` — a delegation
+    // may not outlive the grant that empowered it. The chain was
+    // then unusable, having been issued successfully: the CLI
+    // reported code 0 and produced a credential no verifier accepts.
+    //
+    // Clamping is the right fix rather than widening the verifier's
+    // tolerance, because the nesting rule is correct; what was wrong
+    // was issuing outside it. An EXPLICIT `--not-before` is still
+    // honoured as given and validated below, so an operator who asks
+    // for a window outside the issuer's is told, not silently moved.
+    let explicit_not_before = args.not_before.is_some();
     let not_before = args
         .not_before
-        .unwrap_or_else(|| unix_now().saturating_sub(NOT_BEFORE_HEADROOM_SECS));
+        .unwrap_or_else(|| unix_now().saturating_sub(NOT_BEFORE_HEADROOM_SECS))
+        .max(issuer_grant.not_before);
+    let ttl_secs = if explicit_not_before {
+        args.ttl_secs
+    } else {
+        // Never past the issuer's expiry, and never negative: a
+        // grant with no remaining life is a refusal, not a
+        // zero-length credential.
+        let room = issuer_grant.not_after.saturating_sub(not_before);
+        if room == 0 {
+            return Err(invalid_args(format!(
+                "the issuer grant expires at {} and is not able to empower a leaf from {} \
+                 (subnet:issuer_attenuation_broadened)",
+                issuer_grant.not_after, not_before,
+            )));
+        }
+        args.ttl_secs.min(room)
+    };
 
     let leaf = SubnetGrant::try_issue(
         &issuer_kp,
@@ -825,7 +860,7 @@ async fn run_issue_delegated(
         rights,
         args.generation,
         not_before,
-        args.ttl_secs,
+        ttl_secs,
     )
     .map_err(|e| invalid_args(format!("issue-delegated: subnet:{e}")))?;
     let authority_hex = hex::encode(issuer_grant.authority.as_bytes());
@@ -853,7 +888,10 @@ async fn run_issue_delegated(
         topology_epoch,
         generation: args.generation,
         not_before,
-        not_after: not_before.saturating_add(args.ttl_secs),
+        // The window the credential ACTUALLY carries: `ttl_secs` is
+        // the clamped value, so a summary can never advertise a
+        // lifetime the artifact does not have.
+        not_after: not_before.saturating_add(ttl_secs),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &summary)
         .map_err(|e| generic(format!("write summary: {e}")))?;

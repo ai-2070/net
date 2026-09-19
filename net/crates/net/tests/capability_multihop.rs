@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -218,7 +218,7 @@ async fn route_install_from_multihop_receipt() {
     let route = c.router().routing_table().lookup(a.node_id());
     assert_eq!(
         route,
-        Some(b.local_addr()),
+        Some(PeerAddr::Udp(b.local_addr())),
         "C's routing table didn't install the multi-hop route to A via B"
     );
 }

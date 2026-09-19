@@ -1,10 +1,13 @@
 name: Release Rust crates
 
-# Publishes `net-mesh`, `net-mesh-sdk-macros`, `net-mesh-sdk`, and
-# `net-mesh-mcp` to crates.io.
+# Publishes `net-mesh-wire`, `net-mesh`, `net-mesh-sdk-macros`,
+# `net-mesh-sdk`, and `net-mesh-mcp` to crates.io.
 #
 # Tag schema: `crates-v<semver>`. The crates publish in dependency
-# order — `net-mesh` and `net-mesh-sdk-macros` first (independent),
+# order — `net-mesh-wire` FIRST (the tokio-free wire layer; `net-mesh`
+# depends on it by version + path since Stage 2, so a `net-mesh`
+# publish cannot resolve until the index has it), then `net-mesh` and
+# `net-mesh-sdk-macros` (independent of each other),
 # then `net-mesh-sdk` once the index has caught up, then
 # `net-mesh-mcp` (the MCP bridge adapter, which depends on the SDK)
 # after a further index wait. `net-cli` depends on `net-mesh-mcp` by
@@ -28,7 +31,7 @@ env:
 
 jobs:
   publish:
-    name: Publish net-mesh + net-mesh-sdk-macros + net-mesh-sdk + net-mesh-mcp
+    name: Publish net-mesh-wire + net-mesh + net-mesh-sdk-macros + net-mesh-sdk + net-mesh-mcp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -46,6 +49,26 @@ jobs:
             ~/.cargo/git/db/
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+
+      # `net-mesh-wire` publishes BEFORE the root crate: `net-mesh`
+      # depends on it by `version = "0.36.0", path = "wire"`, and
+      # cargo resolves the version half against crates.io at publish
+      # time. It has no workspace dependencies of its own, so it can
+      # be dry-run and published independently.
+      - name: cargo publish --dry-run (net-mesh-wire)
+        working-directory: net/crates/net/wire
+        run: cargo publish --dry-run
+
+      - name: Publish net-mesh-wire
+        working-directory: net/crates/net/wire
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      # Same sparse-index lag as below: `net-mesh`'s publish resolves
+      # `net-mesh-wire` against the registry, not the path.
+      - name: Wait for crates.io index (net-mesh-wire)
+        run: sleep 30
 
       # Dry-run the root crate first so a packaging failure
       # (missing license file, path-only deps, oversized package,

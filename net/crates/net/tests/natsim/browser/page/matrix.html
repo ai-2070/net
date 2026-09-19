@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>natsim — NAT conformance matrix</title>
+  </head>
+  <body>
+    <!-- Served from `http://localhost:<port>` INSIDE the browser's own
+         network namespace, by a page-server child of the runner.
+
+         `http://localhost` is a secure context, which is what
+         `RTCPeerConnection`, `crypto.subtle` and wasm need — and it is
+         the only mechanism that works on both engines without a flag.
+         The alternatives were measured and rejected: serving the page
+         from the anchor's namespace over plain HTTP is not a secure
+         context, and Chromium's
+         `--unsafely-treat-insecure-origin-as-secure` has no Firefox
+         counterpart, so the control row could not have run. The
+         anchor's own endpoints stay on the real HTTPS listener, which
+         is the production shape anyway: page on one origin, anchor on
+         another. -->
+    <pre id="log"></pre>
+    <!-- ICE OBSERVATION.
+
+         A classic script, inline, BEFORE the module: it has to wrap
+         `RTCPeerConnection` before anything can capture the original,
+         and the leaf's wasm glue calls the global by name.
+
+         This is the engine's own account of the row, and it is the one
+         witness the harness was missing. `connectPeer` reports a typed
+         disposition and the anchor reports counters, but both are
+         statements ABOUT ICE: when a row died with `ICE did not connect
+         inside the deadline` while the anchor logged that the same
+         dialog's channel was already open, nothing in the evidence
+         could say which of the two was describing reality. The
+         candidates actually gathered (is there a `srflx`? — that IS the
+         gateway's mapping), the candidates actually received, the STUN
+         errors the engine raised, and `getStats`' candidate pairs with
+         their request/response counts settle it without asking either
+         party to interpret itself. -->
+    <script>
+      (() => {
+        const Native = window.RTCPeerConnection;
+        const events = [];
+        const pcs = [];
+        const seen = new WeakMap();
+        const t0 = performance.now();
+        const note = (s) => {
+          events.push(`${Math.round(performance.now() - t0)}ms ${s}`);
+          if (events.length > 400) events.shift();
+        };
+        if (!Native) {
+          window.__natsimIce = {
+            note,
+            report: async () => ({ unavailable: 'this engine has no RTCPeerConnection' }),
+          };
+          return;
+        }
+
+        const describe = (c) => {
+          if (!c || !c.candidate) return 'end-of-candidates';
+          return `${c.type || '?'}/${c.protocol || '?'} ${c.address || '?'}:${
+            c.port === undefined || c.port === null ? '?' : c.port
+          } [${c.candidate}]`;
+        };
+
+        const watchChannel = (i, state, ch, origin) => {
+          const tag = `${origin}:${ch.label}`;
+          const record = () => {
+            const v = `${tag}=${ch.readyState}`;
+            const k = state.channels.findIndex((x) => x.startsWith(`${tag}=`));
+            if (k >= 0) state.channels[k] = v;
+            else state.channels.push(v);
+          };
+          record();
+          for (const ev of ['open', 'closing', 'close', 'error']) {
+            ch.addEventListener(ev, () => {
+              note(`pc${i} channel ${tag} ${ev} readyState=${ch.readyState}`);
+              record();
+            });
+          }
+        };
+
+        const side = (s) =>
+          s ? `${s.candidateType}/${s.protocol} ${s.address}:${s.port}` : '(unknown)';
+
+        // Sampled WHILE THE CONNECTION IS ALIVE, not at report time.
+        // The leaf closes the RTCPeerConnection the moment `connect`
+        // gives up, and `getStats` on a closed connection returns
+        // nothing — so the first instrumented run reported
+        // `pairs: []` on exactly the rows whose candidate pairs were
+        // the question. The last live sample is kept instead, with
+        // the instant it was taken.
+        const summarizePairs = (stats) => {
+          const by = new Map();
+          let selected = null;
+          stats.forEach((s) => {
+            by.set(s.id, s);
+            if (s.type === 'transport' && s.selectedCandidatePairId) {
+              selected = s.selectedCandidatePairId;
+            }
+          });
+          const pairs = [];
+          stats.forEach((s) => {
+            if (s.type !== 'candidate-pair') return;
+            pairs.push(
+              `${s.state}${s.id === selected || s.selected ? ' SELECTED' : ''}` +
+                ` nominated=${!!s.nominated} sent=${s.requestsSent || 0}` +
+                ` gotResponse=${s.responsesReceived || 0} recvd=${s.requestsReceived || 0}` +
+                ` answered=${s.responsesSent || 0}` +
+                ` bytes=${s.bytesSent || 0}/${s.bytesReceived || 0} ` +
+                `${side(by.get(s.localCandidateId))} -> ${side(by.get(s.remoteCandidateId))}`,
+            );
+          });
+          return pairs;
+        };
+
+        // EVERY candidate the engine holds, not only the ones that
+        // reached a pair. libwebrtc credits a response to the pair
+        // whose LOCAL candidate the request left from, so a check sent
+        // from a host candidate whose response carries the SRFLX
+        // mapped address is only credited if the srflx->remote pair
+        // exists — and that pair exists only if the engine actually
+        // holds the remote candidate. `pairs` cannot answer "does it
+        // hold the anchor's candidate at all"; this can.
+        const summarizeCandidates = (stats) => {
+          const out = [];
+          stats.forEach((s) => {
+            if (s.type !== 'local-candidate' && s.type !== 'remote-candidate') return;
+            out.push(
+              `${s.type} ${s.candidateType || '?'}/${s.protocol || '?'} ` +
+                `${s.address || s.ip || '<none>'}:${s.port} prio=${s.priority || 0}` +
+                `${s.relatedAddress ? ` raddr=${s.relatedAddress}:${s.relatedPort}` : ''}`,
+            );
+          });
+          return out;
+        };
+
+        const sample = async (pc, state) => {
+          try {
+            const stats = await pc.getStats();
+            const pairs = summarizePairs(stats);
+            const cands = summarizeCandidates(stats);
+            if (cands.length) state.lastCandidates = cands;
+            if (pairs.length) {
+              state.lastPairs = pairs;
+              state.lastPairsAtMs = Math.round(performance.now() - t0);
+            }
+            const local = pc.localDescription;
+            const remote = pc.remoteDescription;
+            if (local && local.sdp) state.localSdp = local.sdp;
+            if (remote && remote.sdp) state.remoteSdp = remote.sdp;
+          } catch (e) {
+            // A closed connection. The last live sample stands.
+          }
+        };
+
+        class Observed extends Native {
+          constructor(config) {
+            super(config);
+            const state = {
+              index: pcs.length,
+              local: [],
+              remote: [],
+              candidateErrors: [],
+              channels: [],
+              remoteSdpCandidates: 0,
+            };
+            seen.set(this, state);
+            pcs.push({ pc: this, state });
+            const i = state.index;
+            note(`pc${i} new iceServers=${JSON.stringify((config && config.iceServers) || [])}`);
+            const timer = setInterval(() => {
+              if (this.connectionState === 'closed' || this.signalingState === 'closed') {
+                clearInterval(timer);
+                return;
+              }
+              void sample(this, state);
+            }, 250);
+            this.addEventListener('icecandidate', (e) => {
+              const d = describe(e.candidate);
+              state.local.push(d);
+              note(`pc${i} gathered ${d}`);
+            });
+            this.addEventListener('icecandidateerror', (e) => {
+              const d = `code=${e.errorCode} ${e.errorText || ''} url=${e.url || ''} from=${
+                e.address || '?'
+              }:${e.port === undefined ? '?' : e.port}`;
+              state.candidateErrors.push(d);
+              note(`pc${i} candidate-error ${d}`);
+            });
+            for (const ev of [
+              'icegatheringstatechange',
+              'iceconnectionstatechange',
+              'connectionstatechange',
+              'signalingstatechange',
+            ]) {
+              this.addEventListener(ev, () => {
+                note(
+                  `pc${i} ${ev} gathering=${this.iceGatheringState} ice=${this.iceConnectionState}` +
+                    ` conn=${this.connectionState} signaling=${this.signalingState}`,
+                );
+              });
+            }
+            this.addEventListener('datachannel', (e) => watchChannel(i, state, e.channel, 'remote'));
+          }
+
+          createDataChannel(...args) {
+            const ch = super.createDataChannel(...args);
+            const state = seen.get(this);
+            if (state) watchChannel(state.index, state, ch, 'local');
+            return ch;
+          }
+
+          addIceCandidate(...args) {
+            const state = seen.get(this);
+            const d = describe(args[0]);
+            note(`pc${state ? state.index : '?'} applying-remote ${d}`);
+            // The OUTCOME, not the attempt. This recorded `applied-remote`
+            // and pushed to `state.remote` before awaiting anything, so a
+            // rejected candidate read exactly like an accepted one — the
+            // same swallowed-error shape the leaf's peer leg had, one
+            // layer up and in the bootstrap path, where it mattered.
+            return super.addIceCandidate(...args).then(
+              (v) => {
+                if (state) state.remote.push(d);
+                note(`pc${state ? state.index : '?'} applied-remote ${d}`);
+                return v;
+              },
+              (e) => {
+                const text = (e && e.message) || String(e);
+                if (state) state.candidateErrors.push(`${d}: ${text}`);
+                note(`pc${state ? state.index : '?'} REFUSED-remote ${d}: ${text}`);
+                throw e;
+              },
+            );
+          }
+
+          setRemoteDescription(...args) {
+            const state = seen.get(this);
+            const sdp = (args[0] && args[0].sdp) || '';
+            const n = (sdp.match(/^a=candidate:/gm) || []).length;
+            if (state) state.remoteSdpCandidates += n;
+            note(
+              `pc${state ? state.index : '?'} setRemoteDescription type=${
+                (args[0] && args[0].type) || '?'
+              } candidates-in-sdp=${n}`,
+            );
+            return super.setRemoteDescription(...args);
+          }
+        }
+        window.RTCPeerConnection = Observed;
+
+        window.__natsimIce = {
+          note,
+          report: async () => {
+            const out = { peerConnections: [], events: events.slice(-200) };
+            for (const { pc, state } of pcs) {
+              // A last-gasp live sample: if the connection is still
+              // up, this is the freshest truth; if it is closed, the
+              // interval sampler's last one stands.
+              await sample(pc, state);
+              const entry = {
+                index: state.index,
+                ice: pc.iceConnectionState,
+                conn: pc.connectionState,
+                gathering: pc.iceGatheringState,
+                signaling: pc.signalingState,
+                gatheredLocal: state.local,
+                appliedRemote: state.remote,
+                remoteSdpCandidates: state.remoteSdpCandidates,
+                candidateErrors: state.candidateErrors,
+                channels: state.channels,
+                // `sent` with `gotResponse=0` is the anchor not
+                // answering this side's checks; `recvd=0` is the
+                // anchor never sending any.
+                pairs: state.lastPairs || [],
+                pairsAtMs: state.lastPairsAtMs === undefined ? null : state.lastPairsAtMs,
+                candidates: state.lastCandidates || [],
+              };
+              // Only the bootstrap connection's SDP: it is the pair
+              // that fails, and two more copies would bury it.
+              if (state.index === 0) {
+                entry.offerSdp = state.localSdp || '';
+                entry.answerSdp = state.remoteSdp || '';
+              }
+              out.peerConnections.push(entry);
+            }
+            return out;
+          },
+        };
+      })();
+    </script>
+    <script type="module" src="/matrix.js"></script>
+  </body>
+</html>

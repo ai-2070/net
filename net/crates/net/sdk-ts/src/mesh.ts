@@ -187,6 +187,24 @@ export class NotConnectedError extends Error {
 }
 
 /**
+ * Thrown when the stream handle's session has been replaced by a
+ * successor incarnation of the same peer (S5-R12). Distinct from
+ * {@link NotConnectedError}: the peer is connected and the stream id
+ * may even be open — on a different session, with its own credit,
+ * sequence space and reliability config.
+ *
+ * Never retryable with the same handle. Re-open the stream against
+ * the current session.
+ */
+export class SessionSupersededError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? "stream's session has been replaced by a successor");
+    this.name = 'SessionSupersededError';
+    Object.setPrototypeOf(this, SessionSupersededError.prototype);
+  }
+}
+
+/**
  * Translate a napi-thrown error into one of the typed stream error
  * classes if it matches the stable prefix contract from the binding.
  * Anything else is passed through unchanged.
@@ -201,6 +219,9 @@ function toStreamError(e: unknown): never {
   }
   if (msg.startsWith('stream not connected')) {
     throw new NotConnectedError(msg);
+  }
+  if (msg.startsWith('stream session superseded')) {
+    throw new SessionSupersededError(msg);
   }
   throw e;
 }

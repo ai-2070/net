@@ -180,7 +180,8 @@ fn the_bridge_is_declared_once_and_is_absent_from_mesh() {
         1,
         "the bridge module must be declared exactly once"
     );
-    let block = attribute_block(&module, declaration).expect("attribute block above the module");
+    let block = attribute_block(&module, declaration)
+        .unwrap_or_else(|| panic!("no attribute block above `{declaration}`"));
     assert!(
         block.contains(FIXTURES_CFG),
         "the module declaration must carry {FIXTURES_CFG}. Block:\n{block}"
@@ -260,13 +261,14 @@ fn the_fixtures_off_probe_covers_every_bridge_declaration() {
         "the probe may forward the core fixtures gate ONLY through its own \
          optional feature, never through its dependency's default set"
     );
-    let dependency_block = probe_manifest
-        .split("[dependencies.net]")
-        .nth(1)
-        .expect("the probe must depend on the core crate")
-        .split("\n[")
-        .next()
-        .expect("dependency block");
+    let (_, after_header) = probe_manifest
+        .split_once("[dependencies.net]")
+        .unwrap_or_else(|| panic!("the probe must depend on the core crate"));
+    // The dependency block runs to the next TOML table header, or to EOF when
+    // it is the manifest's last table.
+    let dependency_block = after_header
+        .split_once("\n[")
+        .map_or(after_header, |(block, _)| block);
     assert!(
         !dependency_block.contains("fixtures"),
         "the probe's core dependency must NOT enable `fixtures`; the negative leg \

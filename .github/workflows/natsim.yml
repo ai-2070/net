@@ -3,9 +3,15 @@
 #
 # Provisions network namespaces with genuine nftables masquerade
 # (cone = plain, symmetric = fully-random) and runs the punch /
-# fallback / upgrade scenario matrix across them — the only place
-# the feature is exercised against actual NAT behavior rather than
-# loopback. See net/crates/net/tests/natsim/README.md.
+# fallback / upgrade / RTC scenario matrix across them — the only
+# place the feature is exercised against actual NAT behavior rather
+# than loopback. See net/crates/net/tests/natsim/README.md.
+#
+# `webrtc` is in the feature set because `rtc_anchor_direct` needs a
+# helper with a real RTC socket; every other scenario is unaffected
+# by it (a node with `rtc: None` announces nothing RTC-shaped and
+# takes no RTC path), and the scenario refuses to provision anything
+# when the helper lacks the feature.
 #
 # Runs on traversal-touching PRs, nightly, and on demand.
 name: natsim
@@ -28,7 +34,15 @@ jobs:
   natsim:
     name: netns NAT scenario matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    env:
+      # The browser drivers run as ROOT inside the namespaces (netns and
+      # nft need root), so Playwright would otherwise look under root's
+      # HOME and find nothing the build user installed.
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    # Cold wasm + npm + runner builds are ~10 min, and the two relayed
+    # rows each wait out a real 60 s ICE deadline — that wait IS the
+    # measurement, not slack.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -46,13 +60,150 @@ jobs:
           # `conntrack` is for the post-scenario NAT snapshot: it renders
           # the mappings far more readably than /proc/net/nf_conntrack,
           # which run_scenario.sh falls back to if it is missing.
-          sudo apt-get install -y -q nftables iproute2 conntrack
+          # `libnss3-tools` provides certutil, which seeds the run's CA
+          # into the Firefox control row's profile NSS database. The
+          # driver REFUSES the run if it cannot seed it, so without this
+          # the control row fails loudly rather than running untrusted.
+          sudo apt-get install -y -q nftables iproute2 conntrack libnss3-tools tcpdump xvfb
+
+      # A display for the HEADED Chromium rows. The Chromium NAT rows
+      # fail inside the engine — every anchor-side boundary passes and
+      # the response arrives in the browser's own namespace — and
+      # headless Chromium's network service never logged the `p2p/base`
+      # discard reason. Headed runs the full renderer path and makes
+      # `chrome://webrtc-internals` readable. Firefox rows stay
+      # headless and are unaffected.
+      - name: Start Xvfb
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          # Assert it, rather than exporting a DISPLAY that points at
+          # nothing: the driver falls back to headless when DISPLAY is
+          # unset, so a silently dead Xvfb would quietly undo this
+          # whole step.
+          test -e /tmp/.X11-unix/X99 || { echo "::error::Xvfb :99 never came up"; cat /tmp/xvfb.log; exit 1; }
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      # FIRST, deliberately: this is the drift guard. It parses
+      # `run_scenario.sh`'s own `browser_*` case arms and fails if they
+      # disagree with the Rust row table, so a row that would provision
+      # one topology and assert another dies here in seconds instead of
+      # twenty minutes into the matrix. No root, no netns.
+      - name: Matrix table + counter arithmetic (no root, no netns)
+        working-directory: net/crates/net
+        run: |
+          set -o pipefail
+          cargo test --test natsim_browser --features net,nat-traversal,webrtc \
+            -- --nocapture 2>&1 | tee /tmp/natsim_rows.log
+          ROWS_WITNESSES="
+          the_matrix_is_the_six_derived_rows
+          the_control_row_is_row_one_on_the_other_engine
+          run_scenario_matrix_matches_the_rust_table
+          the_two_good_shapes_pass
+          the_anchor_bootstrap_dialog_is_counted_in_every_expectation
+          an_all_zero_side_fails_rather_than_passing_vacuously
+          an_outcome_total_above_attempted_is_a_broken_partition
+          an_attempt_with_no_outcome_yet_fails_in_the_same_assertion
+          a_row_that_landed_the_other_way_fails_both_directions
+          a_retry_shows_as_a_third_attempt
+          a_missing_term_is_an_error_and_never_a_zero
+          counter_terms_survive_values_a_js_number_would_round
+          a_well_formed_direct_verdict_passes_its_row
+          a_relayed_verdict_is_typed_ice_timeout_at_the_page_surface
+          udp_blocked_is_refused_as_over_claiming_on_a_nat_row
+          the_offerer_and_the_answerer_must_agree
+          a_typed_failure_reaches_no_disposition
+          a_runner_error_fails_the_row_before_any_counter_is_read
+          an_errored_verdict_reports_the_runners_reason_not_a_parse_complaint
+          a_miswired_scenario_fails_even_with_perfect_counters
+          a_relayed_row_with_a_broken_anchor_dialog_fails
+          the_gateways_discriminate_direct_from_relayed
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "natsim matrix table" --mode fn \
+            --source tests/natsim_browser.rs $ROWS_WITNESSES
+          for w in $ROWS_WITNESSES; do
+            grep -q "^test $w \.\.\. ok$" /tmp/natsim_rows.log || {
+              echo "::error::the matrix-table witness $w did not run and pass"; exit 1; }
+          done
+          grep -q "^test result: ok. 41 passed" /tmp/natsim_rows.log || {
+            echo "::error::expected 41 matrix-table witnesses"; exit 1; }
+
+      # The repo root resolves `stable`; `net/crates/net/**` resolves the
+      # PINNED toolchain from `rust-toolchain.toml`, and they are separate
+      # installations with separate target sets. Installing from the root
+      # and then building in `leaf/` is `E0463: can't find crate for
+      # 'core'` — which is exactly how this job first went red. Install
+      # from each directory that runs a wasm build, and assert it there.
+      - name: Add wasm32 to every toolchain that builds for it
+        run: |
+          set -o pipefail
+          rustup target add --toolchain stable wasm32-unknown-unknown
+          for dir in net/crates/net net/crates/net/leaf; do
+            ( cd "$dir"
+              rustup target add wasm32-unknown-unknown
+              echo "== $dir: $(rustup show active-toolchain)"
+              rustup target list --installed | grep -qx wasm32-unknown-unknown || {
+                echo "::error::wasm32-unknown-unknown is missing for the toolchain $dir selects"
+                exit 1
+              } ) || exit 1
+          done
+
+      # Pinned, like ci.yml's browser-package job: wasm-bindgen's CLI and
+      # the crate must agree exactly or the bundle is unloadable.
+      - name: Install wasm-bindgen-cli 0.2.128
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Build the leaf bundle
+        working-directory: net/crates/net/leaf
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/release/net_leaf.wasm
+
+      # `npm install`, not `npm ci`: the repo does not track
+      # package-lock.json, so `npm ci` has nothing to install from.
+      - name: Build @net-mesh/browser
+        working-directory: net/crates/net/browser-ts
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build the natsim browser runner
+        run: cargo build --release --manifest-path net/crates/net/tests/natsim/browser/Cargo.toml
+
+      # The CLI version MUST equal the driver's `playwright-core`
+      # version. The driver depends on `playwright-core` only, which
+      # ships no CLI, so a bare `npx playwright install` silently
+      # fetches the LATEST `playwright` and downloads ITS browser
+      # builds: 1.63.0 installed chromium v1243 while
+      # `playwright-core@1.56.0` looks for v1194, and every browser row
+      # died with `Executable doesn't exist at
+      # …/chromium_headless_shell-1194`. Pin it, as ci.yml's browser
+      # jobs already do, and keep the two numbers equal.
+      - name: Install the browser driver + engines
+        working-directory: net/crates/net/tests/natsim/browser/driver
+        run: |
+          npm install --no-audit --no-fund
+          pinned=$(node -p "require('./package.json').dependencies['playwright-core']")
+          echo "driver pins playwright-core $pinned"
+          npx --yes "playwright@$pinned" install --with-deps chromium firefox
 
       - name: Build helper + test binaries
         working-directory: net/crates/net
         run: |
-          cargo build --example natsim_node --features net,nat-traversal
-          cargo test --test natsim --features net,nat-traversal --no-run
+          cargo build --example natsim_node --features net,nat-traversal,webrtc
+          cargo test --test natsim --features net,nat-traversal,webrtc --no-run
 
       # Serial on purpose: scenarios share namespace names and the
       # 10.99.0.0/24 range. Each test provisions + tears down its own
@@ -60,8 +211,137 @@ jobs:
       - name: Run scenario matrix
         working-directory: net/crates/net
         run: |
-          cargo test --test natsim --features net,nat-traversal \
-            -- --ignored --test-threads=1 --nocapture
+          set -o pipefail
+          BROWSER_ROW_WITNESSES="
+          natsim_browser_cone_cone_is_direct
+          natsim_browser_cone_portrestricted_is_direct
+          natsim_browser_portrestricted_portrestricted_is_direct
+          natsim_browser_cone_symmetric_is_direct
+          natsim_browser_portrestricted_symmetric_is_relayed
+          natsim_browser_symmetric_symmetric_is_relayed
+          natsim_browser_cone_cone_is_direct_on_firefox
+          natsim_browser_cone_cone_is_direct_without_media_permission
+          natsim_natted_anchor_publishes_both_mapped_endpoints
+          natsim_browser_symmetric_symmetric_is_relayed_without_media_permission
+          "
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label "NAT conformance rows" --mode fn \
+            --source tests/natsim.rs $BROWSER_ROW_WITNESSES
+          cargo test --test natsim --features net,nat-traversal,webrtc \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/natsim.log
+          ran=$(grep -c '^test .* \.\.\. ok$' /tmp/natsim.log || true)
+          echo "natsim scenarios: $ran"
+          # 6 pre-existing native scenarios + 7 browser rows, plus the
+          # two S6 acceptance rows: the permission-free Chromium leg
+          # (the granted camera/microphone was part of the measured
+          # environment, not of the product) and the NAT'd anchor that
+          # observes BOTH of its mapped endpoints answering.
+          if [ "${ran:-0}" -lt 16 ]; then
+            echo "::error::natsim ran ${ran:-0} scenarios, floor is 16 — \
+          lower the floor deliberately or restore the row"
+            exit 1
+          fi
+          # A NAT conformance matrix that quietly stops running behind
+          # NATs is worth nothing, so every row is pinned by name.
+          for w in $BROWSER_ROW_WITNESSES; do
+            grep -q "^test $w \.\.\. ok$" /tmp/natsim.log || {
+              echo "::error::the NAT conformance row $w did not run and pass"; exit 1; }
+          done
+
+      # The scenarios leave their state dirs under /tmp: every helper
+      # log, the browser runner's log, the conntrack snapshots and the
+      # verdicts. A red row whose evidence is only readable by adding a
+      # print and pushing again costs a full CI cycle per question —
+      # which this red has already cost twice.
+      #
+      # They are written by helpers running under `sudo`, so they are
+      # root-owned and `actions/upload-artifact` fails on them with
+      # `EACCES: permission denied, scandir`. Widen the read bits first;
+      # the upload step cannot do it itself.
+
+      # THE BISECT (S6_REPORT.md §6.12), and the reason it exists:
+      # Chromium works against this same anchor on loopback in the
+      # browser-matrix job and fails here, and only two things differ —
+      # the NAT and the network namespace. Chromium's receive path has
+      # no logging at all (`socket_client_impl`, `ipc_socket_factory`:
+      # no VLOGs), so no further instrumentation can answer it.
+      #
+      # `diag_wan_wan` puts both browsers directly in nsim_wan on the
+      # lab segment: no NAT, no gateway, a real non-loopback
+      # interface. Connects -> the NAT is implicated. Fails -> the
+      # namespace is. Either answer costs one step and needs no
+      # Chromium internals.
+      #
+      # Diagnostic, never a gate: `|| true`, and it is not a pinned
+      # row — the Rust table and this file's `browser_*` arms stay in
+      # lockstep, which is why the arm is named `diag_*`.
+      - name: Bisect - Chromium in a namespace with no NAT
+        if: ${{ failure() }}
+        run: |
+          set -uo pipefail
+          sudo env \
+            "PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-}" \
+            "DISPLAY=${DISPLAY:-}" \
+            "NATSIM_NODE_BIN=$PWD/net/crates/net/target/debug/examples/natsim_node" \
+            net/crates/net/tests/natsim/run_scenario.sh diag_wan_wan \
+            > /tmp/diag_wan_wan.log 2>&1 || true
+          echo "=== verdict"
+          grep -aE 'landed|errors|page_type|ICE did not connect' /tmp/diag_wan_wan.log | head -20 || true
+          echo "=== networks and ports as the engine saw them"
+          for log in /tmp/natsim.*/runner.log; do
+            [ -f "$log" ] || continue
+            grep -a 'PRECONDITION networks' "$log" | tail -2 || true
+          done
+          echo "=== the bisect's own log, tail. The first run printed an EMPTY"
+          echo "=== verdict and no ICE lines — it failed before the browsers"
+          echo "=== did anything, and its own output was never shown."
+          tail -n 80 /tmp/diag_wan_wan.log || true
+
+      # The engine's enumeration and ICE accounting, into the JOB log.
+      #
+      # It reaches `runner.log` inside a state dir, and one run
+      # uploaded NO artifact at all: the browser profile the driver now
+      # owns contains unix sockets, which `upload-artifact` refuses. So
+      # the one measurement a cycle existed for was unreadable for a
+      # reason that had nothing to do with it. Printed here as well,
+      # where nothing can swallow it.
+      #
+      # `grep -m`, NOT `grep | head`: this step runs under `bash -e`
+      # with `pipefail`, so `head` closing the pipe made `grep` die of
+      # SIGPIPE and took the STEP with it — run 35138824048 printed
+      # row one's lines, `grep: write error: Broken pipe`, and then
+      # `exit code 2`, with the other five rows' logs never opened.
+      # Two sessions read that partial output as if it were the whole
+      # matrix. `-m` is grep's own limit and closes no pipe.
+      - name: Chromium's ICE accounting
+        if: ${{ failure() }}
+        run: |
+          set -uo pipefail
+          found=0
+          for log in /tmp/natsim.*/runner.log; do
+            [ -f "$log" ] || continue
+            if grep -aq 'chromium-ice' "$log"; then
+              found=1
+              echo "=== $log"
+              grep -a -m 120 'chromium-ice' "$log"
+            fi
+          done
+          [ "$found" = 1 ] || echo "no [chromium-ice] lines in any runner.log"
+
+      - name: Make the scenario state dirs readable
+        if: ${{ failure() }}
+        run: sudo chmod -R a+rX /tmp/natsim.* 2>/dev/null || true
+
+      - name: Upload the scenario state dirs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: natsim-state
+          path: |
+            /tmp/natsim.*/**
+            /tmp/natsim.log
+            !/tmp/natsim.*/browser/profile-*/cdp-profile/**
+          if-no-files-found: warn
 
       - name: Teardown (paranoia)
         if: always()

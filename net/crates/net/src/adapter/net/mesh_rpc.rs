@@ -838,6 +838,10 @@ async fn emit_capability_denial(
     let _ = publish_response_to_caller(
         mesh,
         reply_origin,
+        call_id,
+        // A denial is emitted before any handler ran; it answers no
+        // reservation, so it carries no receiving incarnation.
+        0,
         Some(from_node),
         &reply_channel,
         reply_channel_hash,
@@ -915,6 +919,8 @@ fn emit_admission_denial(
         .try_send(RpcResponseJob {
             caller_origin: reply_origin,
             call_id,
+            // A denial answers no reservation.
+            session_id: 0,
             target_hint: Some(from_node),
             reply_channel,
             reply_channel_hash,
@@ -973,6 +979,7 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
     let mut buf = inbound.payload[..RPC_FRAME_BODY_OFFSET].to_vec();
     req.encode_into(&mut buf);
     Some(RpcInboundEvent {
+        session_id: inbound.session_id,
         channel_hash: inbound.channel_hash,
         origin_hash: inbound.origin_hash,
         from_node: inbound.from_node,
@@ -1406,6 +1413,10 @@ fn reject_relayed_flow_controlled_request(
 struct RpcResponseJob {
     caller_origin: u64,
     call_id: u64,
+    /// R2-A: the incarnation that received the request this
+    /// response answers. Enrollment promotion consumes the exact
+    /// `(node, session, call)` reservation or nothing.
+    session_id: u64,
     target_hint: Option<u64>,
     reply_channel: ChannelName,
     /// PERF_AUDIT §3.10 — cached
@@ -2720,6 +2731,8 @@ fn build_request_grant_emitter(
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller,
+                    call_id,
+                    0,
                     target_hint,
                     &reply_channel,
                     reply_channel_hash,
@@ -2891,6 +2904,68 @@ enum ResponseRouteFallback {
     DirectOnly,
 }
 
+/// Is this RPC RESPONSE frame carrying an **Admitted**
+/// `JoinOutcome`?
+///
+/// `Some(true)` admitted, `Some(false)` rejected, `None` when the
+/// frame is not a readable enrollment outcome — which promotes
+/// nothing, because an unreadable verdict is not an admission.
+///
+/// Reads the versioned wire form directly (`b"NMO1"` + tag) rather
+/// than depending on the SDK type: the core cannot link the SDK,
+/// and the encoding is a pinned, self-describing one.
+#[cfg(feature = "webrtc")]
+fn enrollment_outcome_is_admitted(frame: &Bytes) -> Option<bool> {
+    /// `OUTCOME_MAGIC` from `sdk/src/enrollment.rs`.
+    const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
+    if frame.len() < RPC_FRAME_BODY_OFFSET {
+        return None;
+    }
+    let payload = RpcResponsePayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
+    let body = payload.body.as_ref();
+    // **R6-A: parse structurally, exactly as `JoinOutcome::from_bytes`
+    // does — magic, tag, the tag's own fields, and NO trailing bytes.**
+    // A prefix test on `b"NMO1"` + one byte accepted a truncated
+    // Admitted (magic + tag with no chain), an Admitted whose
+    // length prefix overruns the body, and any payload that merely
+    // begins with those five bytes. Anything this parser cannot
+    // fully account for is not a readable verdict, and an
+    // unreadable verdict promotes nothing.
+    let mut rest = body.strip_prefix(&OUTCOME_MAGIC[..])?;
+    let (&tag, after_tag) = rest.split_first()?;
+    rest = after_tag;
+    let admitted = match tag {
+        // Admitted { chain: length-prefixed bytes }.
+        0 => {
+            rest = take_lp(rest)?;
+            true
+        }
+        // Rejected { code: u16 LE, message: length-prefixed UTF-8 }.
+        1 => {
+            if rest.len() < 2 {
+                return None;
+            }
+            rest = take_lp(&rest[2..])?;
+            false
+        }
+        // An unknown tag is a version this anchor does not
+        // understand. Refusing to promote is the safe reading.
+        _ => return None,
+    };
+    // Trailing bytes mean this is not the outcome it claims to be.
+    rest.is_empty().then_some(admitted)
+}
+
+/// Skip one `u32`-LE length-prefixed field, returning the remainder,
+/// or `None` when the prefix is truncated or overruns the buffer.
+/// Mirrors `Reader::take_lp` in `sdk/src/enrollment.rs`.
+#[cfg(feature = "webrtc")]
+fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
+    let (len, rest) = bytes.split_at_checked(4)?;
+    let len = u32::from_le_bytes(len.try_into().ok()?) as usize;
+    rest.get(len..)
+}
+
 // The reply-channel triple (`reply_channel`, `reply_channel_hash`,
 // `reply_stream_id`) is deliberately passed pre-split rather than bundled:
 // PERF_AUDIT §3.10 computes and caches the hash + stream_id per caller so
@@ -2902,6 +2977,15 @@ enum ResponseRouteFallback {
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
+    // R2: which call this response answers. Enrollment promotion
+    // may consume only this call's own reservation. Read on the
+    // `webrtc` path; the parameter stays so every caller keeps
+    // threading the fact rather than re-deriving it later.
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] call_id: u64,
+    // R2-A: the incarnation that received the request this response
+    // answers. Enrollment promotion consumes that exact
+    // `(node, session, call)` reservation or nothing.
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] receiving_session_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -2915,6 +2999,20 @@ async fn publish_response_to_caller(
     // the reply channel's canonical hash — once, centrally. The
     // caller's mesh ingress selects exactly this dispatcher.
     let payload = crate::adapter::net::cortex::insert_rpc_route(payload, reply_channel_hash);
+    // §12 step 4: an enrollment RESPONSE leaving this anchor
+    // promotes the session that asked for it — the exact
+    // incarnation captured when the REQUEST was decoded, re-checked
+    // inside `promote_admission`. Keyed on the reply channel, so no
+    // other service's response can promote anything.
+    //
+    // **Only an ADMITTED outcome promotes.** `JoinOutcome`'s wire
+    // form is self-describing — `b"NMO1"` then a tag byte, `0`
+    // Admitted, `1` Rejected (`sdk/src/enrollment.rs`) — so the
+    // anchor can read the verdict it is about to send without any
+    // SDK surface change. Promoting on *any* response was a
+    // security defect: a rejected enrollment (wrong nonce, expired
+    // invite) would have been admitted to the mesh by the very
+    // message that refused it.
     // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
     // AEAD-authenticated session peer): it must never resolve a
     // destination through the origin reverse-index, which could point at
@@ -2927,6 +3025,93 @@ async fn publish_response_to_caller(
             target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
         }
     };
+    // §12 step 4: an enrollment RESPONSE leaving this anchor
+    // promotes the session that asked for it — the exact
+    // incarnation captured when the REQUEST was decoded, re-checked
+    // inside `promote_admission`. Keyed on the reply channel, so no
+    // other service's response can promote anything.
+    //
+    // **Only an ADMITTED outcome promotes.** `JoinOutcome`'s wire
+    // form is self-describing — `b"NMO1"` then a tag byte, `0`
+    // Admitted, `1` Rejected (`sdk/src/enrollment.rs`) — so the
+    // anchor reads the verdict it is about to send without any SDK
+    // surface change. Promoting on *any* response was a security
+    // defect: a rejected enrollment (wrong nonce, expired invite)
+    // would have been admitted to the mesh by the very message that
+    // refused it.
+    //
+    // A browser's first call arrives before the anchor has pinned
+    // any identity for it, so `target_hint` can be `None` and the
+    // origin reverse-index empty; the provisional peer bound to
+    // this reply channel's origin is the third resolution. Breadth
+    // here is safe: `promote_admission` re-verifies the session id
+    // AND the endpoint captured at REQUEST decode.
+    // **R6-B: the reservation, not the claim, names the peer being
+    // promoted.** The resolutions below answer "where does this
+    // frame go" — a routing question, answered from a hint or from
+    // a claimed origin. Promotion is an authorization question, and
+    // must be answered by the call's own reservation: an
+    // unauthenticated provisional peer may bind any origin, and the
+    // `bound_origin` scan returns the first match, so a peer
+    // claiming a victim's origin could be promoted by the victim's
+    // enrollment response. The routing fallbacks remain, but only
+    // as a fallback for a call that holds no reservation (which
+    // then promotes nothing).
+    #[cfg(feature = "webrtc")]
+    if let Some(node_id) = mesh
+        .enrollment_reservation_owner(receiving_session_id, call_id)
+        .or(resolved)
+        .or_else(|| mesh.provisional_node_for_reply_channel(reply_channel.as_str()))
+    {
+        match enrollment_outcome_is_admitted(&payload) {
+            Some(true) => {
+                if mesh.promote_on_enrollment_response(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                ) {
+                    tracing::debug!(
+                        node_id = format!("{node_id:#x}"),
+                        "§12: enrollment admitted; session promoted"
+                    );
+                }
+            }
+            Some(false) => {
+                // A refusal leaves the session Provisional — it
+                // expires on its own 30 s clock — and is counted, so
+                // an operator sees refusals rather than inferring
+                // them from an absence of promotions.
+                mesh.note_enrollment_rejected(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                );
+                tracing::debug!(
+                    node_id = format!("{node_id:#x}"),
+                    "§12: enrollment rejected; session stays provisional"
+                );
+            }
+            // R3-A: **a terminal non-outcome is still terminal.**
+            // A handler error, a panic, an `UnknownVersion` or any
+            // body this anchor cannot read as an outcome used to
+            // leave the reservation and the in-flight slot in
+            // place, so the peer's next REQUEST was refused at the
+            // gate and never reached the handler. Promote nothing —
+            // an unreadable verdict is not an admission — but
+            // retire the call that produced it.
+            None => {
+                mesh.retire_enrollment_call(
+                    node_id,
+                    reply_channel.as_str(),
+                    call_id,
+                    receiving_session_id,
+                );
+            }
+        }
+    }
+
     // R2-6: attempt the direct send and branch on the ATOMIC typed
     // outcome, eliminating the `has_peer_session`-then-`publish` TOCTOU
     // that AV-5 used. `try_publish_to_peer` makes the session-existence
@@ -3487,71 +3672,74 @@ impl MeshNode {
         // `emit_for_bridge`, which existed for exactly this reason on the
         // capability-denial path.
         let resp_tx_for_denials = resp_tx.clone();
-        let emit: RpcResponseEmitter = Arc::new(move |from_node, caller_origin, call_id, resp| {
-            let target_hint = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
-            // Resolve the reply channel from cache (Arc bump on hit; one
-            // `format!` + `ChannelName::new` the first time we see a caller).
-            let cached = match reply_channel_cache.get(caller_origin) {
-                Some(c) => c,
-                None => {
-                    let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
-                    match ChannelName::new(&name) {
-                        Ok(channel_name) => {
-                            // Compute hash + stream_id ONCE per caller_origin
-                            // and stash them alongside the name.
-                            let channel_id = ChannelId::new(channel_name.clone());
-                            let triple = CachedReplyChannel {
-                                hash: channel_id.hash(),
-                                stream_id: MeshNode::publish_stream_id(&channel_id),
-                                name: channel_name,
-                            };
-                            reply_channel_cache.insert(caller_origin, triple.clone());
-                            triple
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, channel = %name,
+        let emit: RpcResponseEmitter =
+            Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
+                let target_hint =
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                // Resolve the reply channel from cache (Arc bump on hit; one
+                // `format!` + `ChannelName::new` the first time we see a caller).
+                let cached = match reply_channel_cache.get(caller_origin) {
+                    Some(c) => c,
+                    None => {
+                        let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
+                        match ChannelName::new(&name) {
+                            Ok(channel_name) => {
+                                // Compute hash + stream_id ONCE per caller_origin
+                                // and stash them alongside the name.
+                                let channel_id = ChannelId::new(channel_name.clone());
+                                let triple = CachedReplyChannel {
+                                    hash: channel_id.hash(),
+                                    stream_id: MeshNode::publish_stream_id(&channel_id),
+                                    name: channel_name,
+                                };
+                                reply_channel_cache.insert(caller_origin, triple.clone());
+                                triple
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, channel = %name,
                                 "rpc serve_rpc: invalid reply channel name");
-                            return;
+                                return;
+                            }
                         }
                     }
-                }
-            };
-            // Build the RESPONSE event envelope (24-byte meta + encoded
-            // payload) synchronously — pure CPU, no await — then hand it to
-            // the drainer.
-            let meta = EventMeta::new(
-                crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
-                0,
-                server_origin,
-                call_id,
-                0,
-            );
-            let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-            buf.extend_from_slice(&meta.to_bytes());
-            resp.encode_into(&mut buf);
-            if resp_tx
-                .try_send(RpcResponseJob {
-                    caller_origin,
+                };
+                // Build the RESPONSE event envelope (24-byte meta + encoded
+                // payload) synchronously — pure CPU, no await — then hand it to
+                // the drainer.
+                let meta = EventMeta::new(
+                    crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+                    0,
+                    server_origin,
                     call_id,
-                    target_hint,
-                    reply_channel: cached.name,
-                    reply_channel_hash: cached.hash,
-                    reply_stream_id: cached.stream_id,
-                    payload: Bytes::from(buf),
-                })
-                .is_err()
-            {
-                tracing::debug!(
-                    caller_origin = format!("{:#x}", caller_origin),
-                    call_id,
-                    "rpc serve_rpc: response drainer at capacity; dropping response"
+                    0,
                 );
-            }
-            // AV-4 item 4: a unary call emits exactly one, always-
-            // terminal RESPONSE — retire its cached response route now
-            // (target_hint for THIS response was already captured above).
-            origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
-        });
+                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+                buf.extend_from_slice(&meta.to_bytes());
+                resp.encode_into(&mut buf);
+                if resp_tx
+                    .try_send(RpcResponseJob {
+                        caller_origin,
+                        call_id,
+                        session_id,
+                        target_hint,
+                        reply_channel: cached.name,
+                        reply_channel_hash: cached.hash,
+                        reply_stream_id: cached.stream_id,
+                        payload: Bytes::from(buf),
+                    })
+                    .is_err()
+                {
+                    tracing::debug!(
+                        caller_origin = format!("{:#x}", caller_origin),
+                        call_id,
+                        "rpc serve_rpc: response drainer at capacity; dropping response"
+                    );
+                }
+                // AV-4 item 4: a unary call emits exactly one, always-
+                // terminal RESPONSE — retire its cached response route now
+                // (target_hint for THIS response was already captured above).
+                origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
+            });
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
         // so the bridge task can drive it (the trait takes
@@ -3710,6 +3898,19 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // §12 gate 5 — application delivery, and the one
+                // gate that cannot be a header test: the service
+                // name lives INSIDE the nRPC envelope, behind a
+                // channel-hash discriminator. The envelope has been
+                // decoded under the bounds the fold already
+                // enforces, so the decision is made on decoded
+                // facts, before the handler runs (§12 step 3, S0e
+                // §6). A provisional caller reaches exactly
+                // `net.mesh.enroll` on this node and nothing else.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 match reg_for_bridge.admission() {
                     OrgAdmission::PublicAuthenticated => {
                         // The ONE shared public callee preflight: captured-
@@ -3731,6 +3932,19 @@ impl MeshNode {
                                 // binds to the authenticated session peer.
                                 // `frame` is the preflight's stripped frame
                                 // (E1.6 / §8) — never the raw `inbound`.
+                                //
+                                // The hand-off itself is where Net's
+                                // ordering contract is observable: this
+                                // task drains one receiver and disposes of
+                                // each frame before the next, so the
+                                // sequence a witness sees here is the order
+                                // the stream delivered. Fired inline, so an
+                                // observation cannot reorder relative to
+                                // the dispatch it is observing.
+                                #[cfg(any(test, feature = "fixtures"))]
+                                if let Some(observe) = mesh_for_bridge.rpc_dispatch_observer() {
+                                    observe(&service_for_bridge, frame.from_node, &frame.payload);
+                                }
                                 if let Err(e) = fold.lock().apply_inbound(&frame) {
                                     tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                                 }
@@ -3790,6 +4004,8 @@ impl MeshNode {
                 if let Err(e) = publish_response_to_caller(
                     &response_drain_mesh,
                     job.caller_origin,
+                    job.call_id,
+                    job.session_id,
                     job.target_hint,
                     &job.reply_channel,
                     job.reply_channel_hash,
@@ -3941,6 +4157,8 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4002,6 +4220,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // The shared callee preflight (see the unary bridge).
                 match bridge_preflight(
                     &mesh_for_bridge,
@@ -4112,7 +4338,8 @@ impl MeshNode {
         let emit_resp_service = service_for_emit.clone();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         let emit_resp: RpcResponseEmitter =
-            Arc::new(move |from_node, caller_origin, call_id, resp| {
+            Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
+                let _ = session_id;
                 let mesh = Arc::clone(&emit_resp_mesh);
                 let service = emit_resp_service.clone();
                 let target_hint =
@@ -4149,6 +4376,8 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4217,6 +4446,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // NC1: the SAME shared callee preflight the unary /
                 // response-streaming bridges run — client-streaming
                 // used to skip may_execute entirely, leaving it
@@ -4508,6 +4745,8 @@ impl MeshNode {
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
+                        call_id,
+                        0,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
@@ -4566,6 +4805,14 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
+                // **R1 gate 5 on this shape too.** The RTC
+                // admission decision used to sit on the unary
+                // bridge alone, so a provisional caller could
+                // invoke a *registered* streaming provider.
+                #[cfg(feature = "webrtc")]
+                if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
+                    continue;
+                }
                 // NC1: the shared callee preflight — duplex used to skip
                 // may_execute entirely (transport-authenticated but not
                 // capability-authorized).
@@ -5305,6 +5552,97 @@ impl MeshNode {
         }
     }
 
+    /// Can this node address `service` on `target` at all? Keeps
+    /// the R1 witness from racing service discovery.
+    /// Can this node address `service` on `target` at all?
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn publish_rpc_request_unsubscribed_is_routable(
+        self: &Arc<Self>,
+        service: &str,
+        target_node_id: u64,
+    ) -> bool {
+        self.rpc_route_or_no_route(target_node_id, service).is_ok()
+    }
+
+    /// [`Self::publish_rpc_request_unsubscribed`] with a
+    /// **caller-selected `call_id`** (Kyra's seam).
+    ///
+    /// Call ids are sender-controlled on the wire, so a witness
+    /// must be able to choose one: reusing a call id across a
+    /// reconnection is exactly the R2-A schedule.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn kyra_publish_fixed_request(
+        self: &Arc<Self>,
+        call_id: u64,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+    ) -> Result<(), AdapterError> {
+        self.publish_rpc_request_with_call_id(target_node_id, service, body, Some(call_id))
+            .await
+    }
+
+    /// Publish an nRPC REQUEST **without** subscribing a reply
+    /// channel (R1 witness seam).
+    ///
+    /// This is the hostile sender Kyra describes: the ordinary
+    /// client sets up its reply subscription first, and for a
+    /// provisional peer that subscription is refused at gate 3 — so
+    /// the ordinary API can never show whether the *serve* bridges
+    /// gate anything. Publishing the request directly is what a
+    /// sender who does not care about the reply does, and handler
+    /// invocation is the effect the gate must prevent.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub async fn publish_rpc_request_unsubscribed(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+    ) -> Result<(), AdapterError> {
+        self.publish_rpc_request_with_call_id(target_node_id, service, body, None)
+            .await
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    async fn publish_rpc_request_with_call_id(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        body: Bytes,
+        call_id: Option<u64>,
+    ) -> Result<(), AdapterError> {
+        let route = self
+            .rpc_route_or_no_route(target_node_id, service)
+            .map_err(|e| AdapterError::Connection(format!("{e}")))?;
+        let req = RpcRequestPayload {
+            service: service.to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: Vec::new(),
+            body,
+        };
+        let meta = EventMeta::new(
+            DISPATCH_RPC_REQUEST,
+            0,
+            self.identity_origin_hash(),
+            call_id.unwrap_or_else(mint_random_call_id),
+            0,
+        );
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.encoded_len());
+        buf.extend_from_slice(&meta.to_bytes());
+        encode_rpc_route(&mut buf, route.request_channel_hash);
+        req.encode_into(&mut buf);
+        let payload = Bytes::from(buf);
+        self.publish_to_peer(
+            target_node_id,
+            route.request_channel_hash,
+            route.request_stream_id,
+            true,
+            std::slice::from_ref(&payload),
+        )
+        .await
+    }
+
     /// Issue an RPC call to `target_node_id` for `service`.
     ///
     /// Phase 1 — direct entity-to-entity addressing. The caller
@@ -5939,7 +6277,19 @@ impl MeshNode {
                     // corrective announce until an unrelated peer
                     // failure cleared the latch. Refund it: nothing was
                     // broadcast, so there is nothing to bound.
-                    if self.claim_corrective_announce(target_node_id) {
+                    // S0e §3 row 13 — the sharpest finding: this
+                    // corrective announce deliberately BYPASSES the
+                    // announce rate limit, so a peer that can make
+                    // us keep failing a Subscribe has a mesh-wide
+                    // flood trigger, one per refused attempt. A
+                    // provisional session's refusal is a POLICY
+                    // answer, not a stale-announcement problem, so
+                    // it earns no announce at all.
+                    #[cfg(feature = "webrtc")]
+                    let provisional_rejecter = self.peer_is_provisional(target_node_id);
+                    #[cfg(not(feature = "webrtc"))]
+                    let provisional_rejecter = false;
+                    if !provisional_rejecter && self.claim_corrective_announce(target_node_id) {
                         if let Err(e) = self.reannounce_for_authorization().await {
                             tracing::debug!(
                                 target = format!("{target_node_id:#x}"),
@@ -6717,10 +7067,16 @@ mod reply_subscribe_retry_tests {
              retrying anything else cannot change the answer"
         );
         assert!(
-            body.contains("if self.claim_corrective_announce(target_node_id) {"),
+            body.contains("self.claim_corrective_announce(target_node_id) {"),
             "regression: the corrective announce must stay behind the \
              once-per-target latch, or one persistently-denying target turns \
              every RPC into extra rate-limit-bypassing capability broadcasts"
+        );
+        assert!(
+            body.contains("provisional_rejecter"),
+            "S0e §3 row 13: a provisional rejecter must not reach the latch at \
+             all — its Subscribe refusal is a policy answer, and this announce \
+             bypasses the rate limit"
         );
     }
 }
@@ -7328,6 +7684,7 @@ mod roster_fallback_tests {
                      dispatch: u8,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: chan,
                 origin_hash: claimed_origin,
                 from_node,
@@ -7515,6 +7872,7 @@ mod roster_fallback_tests {
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: packet_origin,
                 from_node,
@@ -7711,6 +8069,7 @@ mod roster_fallback_tests {
                      call_id: u64,
                      window: Option<&[u8]>| {
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: packet_origin,
                 from_node,
@@ -7977,6 +8336,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -8107,6 +8467,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -8212,6 +8573,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: 0,
                 origin_hash: 0,
                 from_node: 1,
@@ -8306,6 +8668,7 @@ mod roster_fallback_tests {
         // `from_node == 0` is the loopback/local exemption, so the origin bind
         // and the capability gate both pass — this test is about the strip.
         let inbound = RpcInboundEvent {
+            session_id: 0,
             channel_hash: 0,
             origin_hash: 0,
             from_node: 0,
@@ -8347,6 +8710,7 @@ mod roster_fallback_tests {
         encode_rpc_route(&mut payload, 0);
         payload.extend_from_slice(&clean.encode());
         let inbound = RpcInboundEvent {
+            session_id: 0,
             channel_hash: 0,
             origin_hash: 0,
             from_node: 0,
@@ -8960,6 +9324,7 @@ mod roster_fallback_tests {
         encode_rpc_route(&mut frame, 0);
         frame.extend_from_slice(&payload.encode());
         let event = RpcInboundEvent {
+            session_id: 0,
             channel_hash,
             origin_hash: caller_origin,
             from_node: CALLER_NODE,
@@ -9101,6 +9466,7 @@ mod roster_fallback_tests {
         frame.extend_from_slice(&payload.encode());
         let frame = Bytes::from(frame);
         let event = |payload: Bytes| RpcInboundEvent {
+            session_id: 0,
             channel_hash,
             origin_hash: caller_origin,
             from_node: CALLER_NODE,
@@ -9273,6 +9639,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9397,6 +9764,7 @@ mod roster_fallback_tests {
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9523,6 +9891,7 @@ mod roster_fallback_tests {
         assert!(server.deliver_rpc_inbound_for_test(
             channel_hash,
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -9676,6 +10045,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10072,6 +10442,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10470,6 +10841,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut frame, 0);
             frame.extend_from_slice(&payload.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash: ch,
                 origin_hash: caller_origin,
                 from_node: CALLER_NODE,
@@ -10531,6 +10903,10 @@ mod roster_fallback_tests {
                 region: None,
                 price_quote: None,
                 reflex_addr: None,
+                noise_pubkey: None,
+                rtc_bootstrap: None,
+                rtc_addr: None,
+                rtc_stun_addr: None,
                 allowed_nodes: vec![0xDEAD],
                 allowed_subnets: vec![],
                 allowed_groups: vec![],
@@ -10731,6 +11107,7 @@ mod roster_fallback_tests {
             encode_rpc_route(&mut f, 0);
             f.extend_from_slice(&req.encode());
             RpcInboundEvent {
+                session_id: 0,
                 channel_hash,
                 origin_hash: frame_origin,
                 from_node: CALLER_NODE,
@@ -10843,6 +11220,8 @@ mod roster_fallback_tests {
         let direct = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x3,
+            /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -10859,6 +11238,8 @@ mod roster_fallback_tests {
         let roster = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x3,
+            /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(GONE_NODE),
             &reply,
             reply_hash,
@@ -10894,6 +11275,8 @@ mod roster_fallback_tests {
         let result = publish_response_to_caller(
             &server,
             /* caller_origin */ 0x1,
+            /* call_id */ 0,
+            /* receiving_session_id */ 0,
             Some(STALE_NODE),
             &reply,
             reply_hash,

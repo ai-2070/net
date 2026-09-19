@@ -12,6 +12,7 @@
 //! Those are measured in integration tests with timing assertions, not here.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use net::adapter::net::PeerAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ fn make_reroute_setup(num_peers: usize, routes_per_peer: usize) -> (Arc<RerouteP
     let mut peer_ids = Vec::with_capacity(num_peers);
     for i in 0..num_peers {
         let node_id = 0x2000 + i as u64;
-        let addr: SocketAddr = format!("127.0.0.1:{}", 3000 + i).parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp(format!("127.0.0.1:{}", 3000 + i).parse().unwrap());
         peers.insert(node_id, addr);
         peer_ids.push(node_id);
 
@@ -100,7 +101,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
         node_id[0..8].copy_from_slice(&i.to_le_bytes());
         let addr: SocketAddr = format!("127.0.0.1:{}", 4000 + i).parse().unwrap();
         let pw = EnhancedPingwave::new(node_id, i, 3).with_load(0, HealthStatus::Healthy);
-        graph.on_pingwave(pw, addr);
+        graph.on_pingwave(pw, PeerAddr::Udp(addr));
     }
 
     // Process a new pingwave.
@@ -121,7 +122,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
             node_id[0..8].copy_from_slice(&seq.to_le_bytes());
             let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
             let pw = EnhancedPingwave::new(node_id, seq, 3);
-            growth_graph.on_pingwave(pw, addr);
+            growth_graph.on_pingwave(pw, PeerAddr::Udp(addr));
         });
     });
 
@@ -135,7 +136,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
         let addr: SocketAddr = "127.0.0.1:5050".parse().unwrap();
         b.iter(|| {
             let pw = EnhancedPingwave::new(known_id, 50, 3);
-            graph.on_pingwave(pw, addr);
+            graph.on_pingwave(pw, PeerAddr::Udp(addr));
         });
     });
 
@@ -232,7 +233,7 @@ fn bench_routing_table(c: &mut Criterion) {
     // Populate
     for i in 0..1000u64 {
         let addr: SocketAddr = format!("127.0.0.1:{}", 5000 + (i % 100)).parse().unwrap();
-        rt.add_route(i + 0x10000, addr);
+        rt.add_route(i + 0x10000, PeerAddr::Udp(addr));
     }
 
     // Lookup hit
@@ -255,7 +256,7 @@ fn bench_routing_table(c: &mut Criterion) {
         let rt = RoutingTable::new(0x1111);
         for i in 0..count as u64 {
             let addr: SocketAddr = format!("127.0.0.1:{}", 6000 + (i % 50)).parse().unwrap();
-            rt.add_route(i + 0x20000, addr);
+            rt.add_route(i + 0x20000, PeerAddr::Udp(addr));
         }
         group.bench_with_input(BenchmarkId::new("all_routes", count), &count, |b, _| {
             b.iter(|| rt.all_routes());
@@ -265,7 +266,7 @@ fn bench_routing_table(c: &mut Criterion) {
     // add_route (atomic overwrite)
     group.bench_function("add_route", |b| {
         let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
-        b.iter(|| rt.add_route(0x10500, addr));
+        b.iter(|| rt.add_route(0x10500, PeerAddr::Udp(addr)));
     });
 
     group.finish();

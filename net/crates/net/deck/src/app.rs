@@ -35,6 +35,307 @@ pub struct LogsBackTarget {
     pub prior_paused: Option<Vec<net_sdk::deck::LogRecord>>,
 }
 
+/// The addresses that make an RTC anchor usable, as the NODES
+/// table shows them (Stage 4b; the STUN endpoint is Stage 6).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AnchorAddresses {
+    /// The announced public RTC socket — what a browser aims ICE
+    /// at, and the diagnostic probe's target.
+    pub rtc_addr: Option<String>,
+    /// The **separately announced STUN endpoint**
+    /// (`rtc_stun_addr`), when this anchor configured one. `None`
+    /// on every anchor that did not, which is why [`Self::cell`]
+    /// appends it only when it is there: an anchor without one has
+    /// to read exactly as it did before the field existed, and a
+    /// `—` next to a real RTC address would read as a broken
+    /// announcement rather than an unused option.
+    pub rtc_stun_addr: Option<String>,
+    /// The announced bootstrap listener URL.
+    pub rtc_bootstrap: Option<String>,
+}
+
+impl AnchorAddresses {
+    /// One cell's worth: the RTC socket if there is one, else the
+    /// bootstrap URL's host, else the bare anchor marker. An anchor
+    /// with neither address announced is still an anchor — and
+    /// showing it as one is how an operator notices it is
+    /// unreachable.
+    ///
+    /// An anchor that announced a separate STUN endpoint gets it
+    /// appended (`203.0.113.7:7101 stun 203.0.113.7:7102`); one
+    /// that did not renders exactly the string it rendered before
+    /// Stage 6.
+    pub fn cell(&self) -> String {
+        let base = if let Some(addr) = self.rtc_addr.as_deref() {
+            addr.to_string()
+        } else if let Some(url) = self.rtc_bootstrap.as_deref() {
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(url);
+            host.to_string()
+        } else {
+            "anchor (no address)".to_string()
+        };
+        // Two endpoints are two facts, and the second one is the
+        // one a browser gathers against — labelled, because an
+        // unlabelled second socket beside the first is unreadable.
+        match self.rtc_stun_addr.as_deref() {
+            Some(stun) => format!("{base} stun {stun}"),
+            None => base,
+        }
+    }
+}
+
+/// The ANCHOR column's data for one frame: either the anchors the
+/// Deck's node has ingested, or the statement that this build
+/// cannot read them at all.
+///
+/// Two states, because they are two different facts and one map
+/// cannot express both. A `webrtc` build that has heard no anchor
+/// announce itself holds an empty map, and the column renders `—`
+/// per row: there is no anchor here. A build without `webrtc` has
+/// no `rtc_addr` / `rtc_bootstrap` fields to read at all, so "no
+/// anchors" is a claim it is not entitled to make — it holds
+/// `None`, and the column says so instead of borrowing the `—`
+/// that means something else.
+#[derive(Clone, Debug)]
+pub struct AnchorRollup(
+    /// What `DeckClient::rtc_anchors` returned, keyed by node id —
+    /// or `None` on a build that cannot read it.
+    ///
+    /// Not an intra-doc link on purpose: that accessor is
+    /// `#[cfg(feature = "webrtc")]` on the core crate, so it does
+    /// not exist in the documentation configuration CI builds
+    /// (`cargo doc -p net-deck --no-deps`, default features) and a
+    /// link to it is a hard error there.
+    Option<std::collections::BTreeMap<u64, AnchorAddresses>>,
+);
+
+impl AnchorRollup {
+    /// The addresses `node_id` announced, if it announced the
+    /// anchor role at all.
+    pub fn get(&self, node_id: u64) -> Option<&AnchorAddresses> {
+        self.0.as_ref().and_then(|rows| rows.get(&node_id))
+    }
+
+    /// `true` when this build cannot read the anchor fields, so a
+    /// row's `—` must not be read as "not an anchor".
+    pub fn not_this_build(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The width, in characters, of the widest cell this rollup
+    /// will paint — what the ANCHOR column has to be able to hold.
+    ///
+    /// Zero for a build that cannot read the fields and for a mesh
+    /// with no anchors: both paint strings narrower than the
+    /// column's own floor, so the layout is the caller's constant
+    /// either way. Goes through [`AnchorAddresses::cell`] rather
+    /// than measuring the fields, so the width can never disagree
+    /// with the text.
+    pub fn widest_cell(&self) -> usize {
+        self.0
+            .as_ref()
+            .and_then(|rows| rows.values().map(|a| a.cell().chars().count()).max())
+            .unwrap_or(0)
+    }
+}
+
+/// Read the anchor rollup off the deck client.
+///
+/// **R6: the rows come from the mesh node the client is attached
+/// to.** `DeckClient::rtc_anchors` returns the mesh-less default
+/// when no `MeshNode` was wired in, which is why this used to be
+/// structurally empty; both Deck construction sites
+/// (`crate::runtime::spawn_with_psk` and `crate::demo::spawn`) now
+/// attach the live node they observe via `DeckClient::with_mesh`,
+/// so what lands here is what that node has ingested from signed
+/// announcements.
+fn collect_rtc_anchors(
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
+) -> AnchorRollup {
+    #[cfg(feature = "webrtc")]
+    let rows = Some(
+        deck.rtc_anchors()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.node_id,
+                    AnchorAddresses {
+                        rtc_addr: row.rtc_addr.map(|a| a.to_string()),
+                        rtc_stun_addr: row.rtc_stun_addr,
+                        rtc_bootstrap: row.rtc_bootstrap,
+                    },
+                )
+            })
+            .collect(),
+    );
+    // No `rtc_addr` / `rtc_bootstrap` in this build's announcement
+    // type; there is nothing to read and nothing to claim.
+    #[cfg(not(feature = "webrtc"))]
+    let rows = None;
+    AnchorRollup(rows)
+}
+
+/// One node's ICE attempt ledger, as the ICE column renders it —
+/// plan §10's `ice_direct / ice_attempted` field telemetry.
+///
+/// **The denominator is attempts, not sessions**, and the column
+/// prints it alongside the percentage for that reason.
+///
+/// A local value type, not the core's `IceStats`, for the same
+/// reason [`AnchorAddresses`] is not the core's `RtcAnchorRow`: the
+/// core type exists only in a `webrtc` build, and this column has to
+/// render — saying "not in this build" — in a Deck that has no RTC
+/// at all.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IceLedger {
+    /// **The denominator.** Direct-path attempts: one per signalling
+    /// dialog.
+    pub attempted: u64,
+    /// Attempts that ended with an installed direct RTC endpoint.
+    pub direct: u64,
+    /// Attempts that hit their deadline with ICE never connected —
+    /// the pair stayed on the anchor. Not a failure.
+    pub relayed: u64,
+    /// Attempts that ended for a reason other than their deadline.
+    pub failed: u64,
+}
+
+impl IceLedger {
+    /// Attempts counted in the denominator with no outcome yet.
+    /// Saturating: the counters are independent relaxed atomics, so
+    /// a read can straddle a terminating attempt.
+    pub fn pending(&self) -> u64 {
+        self.attempted
+            .saturating_sub(self.direct)
+            .saturating_sub(self.relayed)
+            .saturating_sub(self.failed)
+    }
+
+    /// `direct / attempted`, or `None` when nothing was attempted.
+    /// **`None` is not zero** — see [`IceRollup::cell`].
+    pub fn direct_ratio(&self) -> Option<f64> {
+        if self.attempted == 0 {
+            return None;
+        }
+        Some(self.direct as f64 / self.attempted as f64)
+    }
+}
+
+/// The ICE column's data for one frame: plan §10's
+/// `ice_direct / ice_attempted` field telemetry for **the Deck's own
+/// node**, or the statement that this build cannot read it.
+///
+/// Three states, because they are three different facts and a bare
+/// number can only express one:
+///
+/// * `None` — this build has no RTC at all, so "no attempts" is a
+///   claim it is not entitled to make. The column says so, rather
+///   than borrowing the `—` that means something else.
+/// * `Some(None)` — an RTC-capable build whose node has no RTC
+///   driver: there is no attempt ledger. Not the same as a ledger
+///   reading zero.
+/// * `Some(Some(ledger))` — the ledger. Whose ratio may still be
+///   absent, because zero attempts has no ratio and `0/0` is not
+///   `0 %`.
+///
+/// **It is this node's own ledger, not a per-peer fact.** An attempt
+/// ledger is not announced and cannot be read across the mesh, so
+/// the column populates the local row and shows `—` on every remote
+/// one. To ask whether a given pair is direct, ask the pair.
+#[derive(Clone, Debug)]
+pub struct IceRollup(
+    /// What `DeckClient::ice_stats` returned, or `None` on a build
+    /// that cannot read it.
+    ///
+    /// Not an intra-doc link on purpose, for the same reason
+    /// [`AnchorRollup`]'s field is not: that accessor is
+    /// `#[cfg(feature = "webrtc")]` on the core crate and does not
+    /// exist in the documentation configuration CI builds.
+    Option<Option<IceLedger>>,
+);
+
+impl IceRollup {
+    /// The ledger, when this build can read one and the node has
+    /// one.
+    pub fn ledger(&self) -> Option<&IceLedger> {
+        self.0.as_ref().and_then(|inner| inner.as_ref())
+    }
+
+    /// `true` when this build cannot read the ICE ledger at all, so
+    /// a row's `—` must not be read as "no attempts".
+    pub fn not_this_build(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The cell text for the local node's row.
+    ///
+    /// Every branch is a distinct statement, and none of them is a
+    /// number that could be misread:
+    ///
+    /// * `not in this build` — nothing to read.
+    /// * `no rtc driver` — this node keeps no attempt ledger.
+    /// * `no attempts` — the ledger exists and is empty. **Not
+    ///   `0 %`**: a node that has never attempted a direct path has
+    ///   no direct-path ratio, and `0 %` would report total failure
+    ///   where nothing has happened.
+    /// * `6/9 67%` — direct over ATTEMPTS, the denominator spelled
+    ///   out next to the percentage so the ratio cannot be read as
+    ///   a session success rate.
+    /// * a trailing `+1 pending` when attempts are still in flight,
+    ///   because that is exactly when the four outcomes do not yet
+    ///   sum to the denominator.
+    pub fn cell(&self) -> String {
+        let Some(inner) = self.0.as_ref() else {
+            return "not in this build".to_string();
+        };
+        let Some(stats) = inner.as_ref() else {
+            return "no rtc driver".to_string();
+        };
+        let Some(ratio) = stats.direct_ratio() else {
+            return "no attempts".to_string();
+        };
+        let pending = stats.pending();
+        let head = format!(
+            "{}/{} {}%",
+            stats.direct,
+            stats.attempted,
+            (ratio * 100.0).round() as u64
+        );
+        if pending == 0 {
+            head
+        } else {
+            format!("{head} +{pending} pending")
+        }
+    }
+}
+
+/// Read the ICE ledger off the deck client.
+///
+/// Same wiring as [`collect_rtc_anchors`]: `DeckClient::ice_stats`
+/// reads the `MeshNode` attached with `DeckClient::with_mesh`, and
+/// returns `None` when there is no node or no RTC driver behind it.
+fn collect_ice_stats(
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] deck: &Arc<DeckClient>,
+) -> IceRollup {
+    #[cfg(feature = "webrtc")]
+    let ledger = Some(deck.ice_stats().map(|s| IceLedger {
+        attempted: s.attempted,
+        direct: s.direct,
+        relayed: s.relayed,
+        failed: s.failed,
+    }));
+    // No RTC in this build: there is no attempt ledger to read and
+    // nothing to claim about one.
+    #[cfg(not(feature = "webrtc"))]
+    let ledger = None;
+    IceRollup(ledger)
+}
+
 /// Navigation half of [`LogsBackTarget`] — the three
 /// contexts `filter_logs_for_id` is reachable from.
 #[derive(Clone, Debug)]
@@ -200,6 +501,19 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
+    /// Stage 4b: the RTC anchors this node has ingested, keyed by
+    /// node id, refreshed with the snapshot. `rtc_addr` /
+    /// `rtc_bootstrap` do not ride `PeerSnapshot`, so the NODES
+    /// table reads them from here.
+    /// [`AnchorRollup::not_this_build`] on a build without `webrtc`,
+    /// which is also a build that cannot use them.
+    pub rtc_anchors: AnchorRollup,
+    /// Stage 6: this node's own ICE attempt ledger, refreshed with
+    /// the snapshot — plan §10's `ice_direct / ice_attempted` field
+    /// telemetry, which does not ride `PeerSnapshot` either and is
+    /// not a per-peer fact at all, so the NODES table's ICE column
+    /// paints it on the local row only.
+    pub ice: IceRollup,
     /// Memoized SUBNETS-tab derivation against the current
     /// snapshot. `subnet_rollups_with_local` and
     /// `aggregator_source_subnets` get called every frame on
@@ -611,6 +925,8 @@ impl App {
         this_node: net_sdk::meshos::NodeId,
     ) -> Self {
         let snapshot = Arc::new(deck.status());
+        let rtc_anchors = collect_rtc_anchors(&deck);
+        let ice = collect_ice_stats(&deck);
         let (toast_tx, toast_rx) = std::sync::mpsc::channel();
         let crate::streams::Tails {
             logs: logs_tail,
@@ -642,7 +958,9 @@ impl App {
             tick: 0,
             deck,
             snapshot,
+            rtc_anchors,
             subnet_view_cache: std::cell::RefCell::new(SubnetViewCache::default()),
+            ice,
             groups_cursor: DaemonCursor::default(),
             daemons_cursor: 0,
             netmap_cursor: 0,
@@ -709,6 +1027,8 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+        self.rtc_anchors = collect_rtc_anchors(&self.deck);
+        self.ice = collect_ice_stats(&self.deck);
         // Snapshot just swapped — every memoized derivation
         // against it is now stale.
         self.subnet_view_cache.borrow_mut().invalidate();
@@ -3297,7 +3617,15 @@ impl App {
                 peer: &local_peer,
                 local_maintenance: &self.snapshot.local_maintenance,
             };
-            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot, Some(local_row));
+            tabs::subnet_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                Some(local_row),
+                &self.rtc_anchors,
+                &self.ice,
+            );
             widgets::footer::render(
                 frame,
                 chunks[4],
@@ -3339,6 +3667,8 @@ impl App {
                     Some(&self.snapshot),
                     self.nodes_cursor,
                     Some(local_row),
+                    &self.rtc_anchors,
+                    &self.ice,
                 );
             }
             Tab::Daemons => {
@@ -3520,5 +3850,523 @@ impl App {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_cell_tests {
+    use super::{AnchorAddresses, AnchorRollup, IceRollup};
+
+    /// Draw the NODES tab into an offscreen terminal `width`
+    /// columns wide and return every symbol it painted. Row-major,
+    /// so a cell's text is contiguous in the result.
+    fn nodes_tab_text_at(width: u16, rollup: &AnchorRollup) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut snapshot = net_sdk::deck::MeshOsSnapshot::default();
+        snapshot
+            .peers
+            .insert(0xA11CE, net_sdk::deck::PeerSnapshot::default());
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("offscreen terminal");
+        terminal
+            .draw(|frame| {
+                crate::tabs::nodes::render(
+                    frame,
+                    frame.area(),
+                    Some(&snapshot),
+                    0,
+                    None,
+                    rollup,
+                    // No local row here, so the ICE column paints
+                    // nothing either way: this helper is about the
+                    // ANCHOR cell.
+                    &IceRollup(Some(None)),
+                );
+            })
+            .expect("draw NODES");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The same draw at 150 columns: wide enough that the ANCHOR
+    /// column gets real width after the ten fixed columns and
+    /// ICE's floor.
+    fn nodes_tab_text(rollup: &AnchorRollup) -> String {
+        nodes_tab_text_at(150, rollup)
+    }
+
+    /// **R6.** The NODES tab paints the rollup's addresses in the
+    /// ANCHOR column, and a build that cannot read the fields says
+    /// so instead of painting the `—` that means "not an anchor".
+    #[test]
+    fn the_anchor_column_paints_the_rollup_and_distinguishes_a_build_that_cannot_read_it() {
+        let ingested = AnchorRollup(Some(
+            [(
+                0xA11CE,
+                AnchorAddresses {
+                    rtc_addr: Some("203.0.113.7:7101".to_string()),
+                    rtc_stun_addr: None,
+                    rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        let painted = nodes_tab_text(&ingested);
+        assert!(
+            painted.contains("ANCHOR"),
+            "the column must be in the header: {painted}"
+        );
+        assert!(
+            painted.contains("203.0.113.7:7101"),
+            "the announced RTC socket must reach the operator's screen, not just the \
+             rollup: {painted}"
+        );
+
+        // Same peer, `webrtc` off: nothing was read, so the column
+        // must not imply the peer is not an anchor.
+        let painted = nodes_tab_text(&AnchorRollup(None));
+        assert!(
+            painted.contains("not in this build"),
+            "a build that cannot read the anchor fields must say so: {painted}"
+        );
+        assert!(
+            !painted.contains("203.0.113.7:7101"),
+            "…and must not invent addresses it never read: {painted}"
+        );
+    }
+
+    /// The ANCHOR cell prefers the address a browser aims ICE at,
+    /// falls back to the bootstrap host, and never renders an
+    /// announced anchor as if it were not one.
+    #[test]
+    fn the_anchor_cell_prefers_the_rtc_socket_then_the_bootstrap_host() {
+        let both = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+        };
+        assert_eq!(both.cell(), "203.0.113.7:7101");
+
+        let url_only = AnchorAddresses {
+            rtc_addr: None,
+            rtc_stun_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+        };
+        assert_eq!(url_only.cell(), "anchor.example.com");
+
+        // An anchor that announced neither is still an anchor —
+        // showing it as one is how an operator notices it is
+        // unreachable, and a blank cell would read as "not an
+        // anchor".
+        assert_eq!(AnchorAddresses::default().cell(), "anchor (no address)");
+    }
+
+    /// **Stage 6.** An anchor that announced a separate STUN
+    /// endpoint shows both; an anchor that announced none renders
+    /// the string it rendered before the field existed.
+    ///
+    /// The second half is the one that matters: the field is off
+    /// unless an operator configures it, so nearly every row in
+    /// the field is the `None` case, and any placeholder there
+    /// (`—`, `stun: -`, a trailing separator) would be a column
+    /// full of noise announcing an option nobody took.
+    ///
+    /// Inverse receipt: make [`AnchorAddresses::cell`] append
+    /// unconditionally — `format!("{base} stun {}", …unwrap_or("—"))`
+    /// — and the `no_stun` assertion fails with
+    /// `"203.0.113.7:7101 stun —"`; make it never append and the
+    /// `announced` assertion fails with the bare RTC address, the
+    /// endpoint a browser actually gathers against having silently
+    /// not reached the operator.
+    #[test]
+    fn the_anchor_cell_appends_an_announced_stun_endpoint_and_adds_nothing_without_one() {
+        let announced = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: Some("203.0.113.7:7102".to_string()),
+            rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+        };
+        assert_eq!(
+            announced.cell(),
+            "203.0.113.7:7101 stun 203.0.113.7:7102",
+            "both endpoints, labelled — the RTC socket a browser aims ICE at and the \
+             distinct endpoint it gathers against"
+        );
+
+        let no_stun = AnchorAddresses {
+            rtc_addr: Some("203.0.113.7:7101".to_string()),
+            rtc_stun_addr: None,
+            rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+        };
+        assert_eq!(
+            no_stun.cell(),
+            "203.0.113.7:7101",
+            "an anchor that configured no STUN endpoint renders exactly as it did \
+             before Stage 6 — no placeholder that reads like a value"
+        );
+        assert_eq!(
+            AnchorAddresses {
+                rtc_addr: None,
+                rtc_stun_addr: None,
+                rtc_bootstrap: Some("https://anchor.example.com/rtc".to_string()),
+            }
+            .cell(),
+            "anchor.example.com",
+            "…and the bootstrap-host fallback is untouched too"
+        );
+    }
+
+    /// **Stage 6, on the operator's actual screen.** Both endpoints
+    /// are painted in full, and a mesh with no announced STUN
+    /// endpoint paints the ANCHOR column exactly as it did before
+    /// Stage 6 — same width, same text.
+    ///
+    /// Two widths on purpose. The column was `Length(21)`, sized to
+    /// `rtc_addr` alone, and two endpoints need 38: at 180 columns
+    /// there is room to the right of ICE's floor and the cell must
+    /// be painted whole, because a clipped `203.0.113.7:71` reads
+    /// as a broken announcement rather than a narrowed one. At 150
+    /// — the width the pre-existing tests draw at — a row with no
+    /// STUN endpoint must be indistinguishable from the old one,
+    /// which is the case nearly every anchor in the field is in.
+    ///
+    /// Inverse receipt: pin the column back to
+    /// `Constraint::Length(21)` in `tabs::nodes` and the first half
+    /// fails — the painted buffer holds `203.0.113.7:7101 stun`
+    /// and no endpoint — while the no-STUN half still passes,
+    /// which is exactly why the width is derived from the widest
+    /// cell instead of a constant. Drop the `widest_cell` clamp's
+    /// `BASE` floor and the second half fails instead: a 16-char
+    /// cell would shrink the column below its header.
+    #[test]
+    fn the_anchor_column_paints_both_endpoints_in_full_and_is_unchanged_without_one() {
+        let rollup = |stun: Option<&str>| {
+            AnchorRollup(Some(
+                [(
+                    0xA11CE,
+                    AnchorAddresses {
+                        rtc_addr: Some("203.0.113.7:7101".to_string()),
+                        rtc_stun_addr: stun.map(str::to_string),
+                        rtc_bootstrap: Some("https://anchor.example.com".to_string()),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ))
+        };
+
+        let painted = nodes_tab_text_at(180, &rollup(Some("203.0.113.7:7102")));
+        assert!(
+            painted.contains("203.0.113.7:7101 stun 203.0.113.7:7102"),
+            "both endpoints must reach the screen whole — a clipped one is a wrong \
+             address, not a shorter one: {painted}"
+        );
+
+        // The case every anchor that has not opted in is in: at the
+        // width the pre-Stage-6 tests draw, the column is the same
+        // 21 characters holding the same text.
+        let painted_without = nodes_tab_text(&rollup(None));
+        assert!(
+            painted_without.contains("203.0.113.7:7101"),
+            "the RTC socket still paints: {painted_without}"
+        );
+        assert!(
+            !painted_without.contains("stun"),
+            "an anchor that announced no STUN endpoint must paint no trace of one: \
+             {painted_without}"
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 150, 8);
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&rollup(None), area),
+            21,
+            "no announced STUN endpoint anywhere in the mesh: the column keeps the \
+             exact width it had before Stage 6, so the whole table's layout is \
+             unchanged"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&AnchorRollup(None), area),
+            21,
+            "…and so does a build that cannot read the fields at all"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(
+                &rollup(Some("203.0.113.7:7102")),
+                ratatui::layout::Rect::new(0, 0, 180, 8)
+            ),
+            38,
+            "with an announced endpoint and room for it, the column is exactly as wide \
+             as the cell it has to hold"
+        );
+        assert_eq!(
+            crate::tabs::nodes::anchor_column_width(&rollup(Some("203.0.113.7:7102")), area),
+            22,
+            "and at a width that cannot fit both, ICE keeps its floor: the column takes \
+             the headroom there is rather than pushing another column's numbers off the \
+             screen"
+        );
+    }
+
+    /// **R6 wiring witness.** The rollup the ANCHOR column renders
+    /// carries a real anchor's announced addresses.
+    ///
+    /// Built the way production builds it:
+    /// `crate::runtime::spawn_with_psk` is the entire body of
+    /// `crate::runtime::spawn` (which differs only in minting the
+    /// PSK), so the `DeckClient` here is the one the binary hands
+    /// to `App::new`. A real anchor — RTC configured, public
+    /// `rtc_addr`, bootstrap URL — handshakes with that runtime's
+    /// own mesh node and announces itself; the assertion reads
+    /// back exactly what `App::refresh_snapshot` reads.
+    ///
+    /// Inverse: drop `.with_mesh(mesh.node_arc())` in
+    /// `crate::runtime::spawn_with_psk` and the rollup is
+    /// `Ingested({})` forever — the announcement still arrives,
+    /// the client just has no node to read it from. That was the
+    /// shipped state: a comment claiming a mesh the constructor
+    /// never attached.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_rollup_the_anchor_column_renders_carries_an_ingested_anchor() {
+        use net::adapter::net::rtc::RtcConfig;
+
+        // One trust domain for the deck's node and the anchor that
+        // peers with it; `spawn` mints a random one per process.
+        const PSK: [u8; 32] = [0x4Bu8; 32];
+        let public: std::net::SocketAddr = "203.0.113.7:7101".parse().expect("addr");
+
+        let harness = crate::runtime::spawn_with_psk(&PSK)
+            .await
+            .expect("the deck runtime");
+        let deck = harness.deck();
+
+        let anchor = net_sdk::MeshBuilder::new("127.0.0.1:0", &PSK)
+            .expect("anchor builder")
+            .rtc(RtcConfig {
+                public_addr: Some(public),
+                ..RtcConfig::new()
+                    .with_bind_addr("127.0.0.1:0".parse().expect("addr"))
+                    .with_bootstrap_url("https://anchor.example.com")
+            })
+            .build()
+            .await
+            .expect("the anchor node");
+        anchor.start();
+        // The deck's node is already dispatching (`spawn` starts
+        // it), so the anchor joins over the routed handshake — the
+        // same path any peer takes against a running node.
+        anchor
+            .connect_via(
+                &harness.mesh().local_addr().to_string(),
+                harness.mesh().public_key(),
+                harness.mesh().node_id(),
+            )
+            .await
+            .expect("the anchor must reach the deck's node");
+        let anchor_id = anchor.node_id();
+        // `start` only schedules the re-announce loop; the first
+        // announcement is this one.
+        anchor
+            .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
+            .await
+            .expect("announce");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let rollup = loop {
+            let rollup = super::collect_rtc_anchors(&deck);
+            if rollup.get(anchor_id).is_some() || tokio::time::Instant::now() >= deadline {
+                break rollup;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        assert!(
+            !rollup.not_this_build(),
+            "this build reads the anchor fields; the rollup must not claim otherwise"
+        );
+        // The map the ANCHOR column indexes, straight off the
+        // rollup the render path holds.
+        let rows = rollup.0.as_ref().expect("the ingested rows");
+        assert!(
+            !rows.is_empty(),
+            "the deck's node ingested an anchor announcement, so the column's rollup \
+             cannot be empty — an empty one means the client is reading a mesh it does \
+             not have"
+        );
+        let row = rows
+            .get(&anchor_id)
+            .unwrap_or_else(|| panic!("the anchor row (rollup has {:?})", rows.keys()));
+        assert_eq!(
+            row.rtc_addr.as_deref(),
+            Some("203.0.113.7:7101"),
+            "the ANCHOR cell renders the announced RTC socket; without it the column \
+             lists an anchor nobody can reach"
+        );
+        assert_eq!(
+            row.rtc_bootstrap.as_deref(),
+            Some("https://anchor.example.com"),
+            "…and the operator's configured bootstrap URL, not a synthesised one"
+        );
+        assert_eq!(
+            row.cell(),
+            "203.0.113.7:7101",
+            "the cell the operator actually sees"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ice_cell_tests {
+    use super::{IceLedger, IceRollup};
+
+    fn stats(attempted: u64, direct: u64, relayed: u64, failed: u64) -> IceLedger {
+        IceLedger {
+            attempted,
+            direct,
+            relayed,
+            failed,
+        }
+    }
+
+    /// Draw the NODES tab **with a local row** into an offscreen
+    /// terminal and return every symbol it painted. The local row is
+    /// the only one the ICE column populates: an attempt ledger is
+    /// this node's own.
+    fn nodes_tab_text(ice: &IceRollup) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut snapshot = net_sdk::deck::MeshOsSnapshot::default();
+        snapshot
+            .peers
+            .insert(0xA11CE, net_sdk::deck::PeerSnapshot::default());
+        let local_peer = net_sdk::deck::PeerSnapshot::default();
+        // Wide enough that the ICE column (the last, `Min(24)`) gets
+        // real width after the eleven fixed columns.
+        let mut terminal = Terminal::new(TestBackend::new(170, 8)).expect("offscreen terminal");
+        terminal
+            .draw(|frame| {
+                let local = crate::tabs::nodes::LocalNodeRow {
+                    id: 0x10CA1,
+                    peer: &local_peer,
+                    local_maintenance: &snapshot.local_maintenance,
+                };
+                crate::tabs::nodes::render(
+                    frame,
+                    frame.area(),
+                    Some(&snapshot),
+                    0,
+                    Some(local),
+                    &super::AnchorRollup(Some(Default::default())),
+                    ice,
+                );
+            })
+            .expect("draw NODES");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The column reaches the operator's screen carrying **its own
+    /// denominator**: `6/9`, not a bare `67%`.
+    ///
+    /// That is the whole point of the slice. A lone percentage is
+    /// the thing that gets read as "a third of our sessions are
+    /// broken" for a year; `6/9` on the screen says what was
+    /// counted.
+    #[test]
+    fn the_ice_column_paints_the_ratio_with_its_denominator_not_a_bare_percentage() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(9, 6, 2, 1)))));
+        assert!(
+            painted.contains("ICE"),
+            "the column must be in the header: {painted}"
+        );
+        assert!(
+            painted.contains("6/9 67%"),
+            "the cell must carry direct-over-ATTEMPTS and the percentage: {painted}"
+        );
+        assert_eq!(
+            painted.matches("6/9").count(),
+            1,
+            "and only on the local row — an attempt ledger is this node's own, so a \
+             remote row showing it would be a claim about a peer that nothing on \
+             this node can support: {painted}"
+        );
+    }
+
+    /// **The degenerate case is rendered as an absence.** A node that
+    /// has attempted nothing has no ratio; painting `0%` would report
+    /// total failure where nothing has happened.
+    #[test]
+    fn zero_attempts_is_painted_as_no_attempts_and_never_as_zero_percent() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(0, 0, 0, 0)))));
+        assert!(
+            painted.contains("no attempts"),
+            "an empty ledger says so: {painted}"
+        );
+        assert!(
+            !painted.contains("0%"),
+            "0/0 is not 0 per cent, and the column must not print one: {painted}"
+        );
+    }
+
+    /// An attempt in flight is shown, because that is exactly when
+    /// the outcome terms do not sum to the denominator.
+    #[test]
+    fn attempts_still_in_flight_are_named_in_the_cell() {
+        let painted = nodes_tab_text(&IceRollup(Some(Some(stats(4, 1, 0, 0)))));
+        assert!(
+            painted.contains("1/4 25% +3 pending"),
+            "the residual belongs next to the ratio: three attempts are counted in \
+             the denominator and in no outcome yet: {painted}"
+        );
+    }
+
+    /// Three absences, three different statements — the same
+    /// discipline the ANCHOR column keeps.
+    #[test]
+    fn the_three_absences_are_distinguished_rather_than_collapsed() {
+        assert_eq!(
+            IceRollup(None).cell(),
+            "not in this build",
+            "no RTC in the build: 'no attempts' is a claim it cannot make"
+        );
+        assert_eq!(
+            IceRollup(Some(None)).cell(),
+            "no rtc driver",
+            "no driver is no ledger — not a ledger reading zero"
+        );
+        assert_eq!(
+            IceRollup(Some(Some(stats(0, 0, 0, 0)))).cell(),
+            "no attempts",
+            "a ledger that exists and is empty"
+        );
+        let painted = nodes_tab_text(&IceRollup(None));
+        assert!(
+            painted.contains("not in this build"),
+            "and the screen says it too: {painted}"
+        );
+    }
+
+    /// The cell rounds the percentage but never rounds the
+    /// denominator away: `2/3` stays `2/3` at 67 %, so two surfaces
+    /// reporting "67%" can still be told apart by what they counted.
+    #[test]
+    fn the_percentage_is_rounded_but_the_counts_are_exact() {
+        assert_eq!(IceRollup(Some(Some(stats(3, 2, 1, 0)))).cell(), "2/3 67%");
+        assert_eq!(
+            IceRollup(Some(Some(stats(9, 6, 3, 0)))).cell(),
+            "6/9 67%",
+            "the same percentage, a different population — which is why the counts \
+             are on the screen"
+        );
     }
 }

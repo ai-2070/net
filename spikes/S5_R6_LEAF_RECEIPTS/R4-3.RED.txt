@@ -1,0 +1,46 @@
+warning: C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: `net-mesh` (manifest) generated 1 warning
+   Compiling net-mesh-leaf v0.36.0 (C:\Users\chief\orca\workspaces\net\webrtc-transport\net\crates\net\leaf)
+warning: unused variable: `sequenced`
+   --> src\frame.rs:622:13
+    |
+622 |         let sequenced = meta.is_some();
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sequenced`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `already_delivered` is never used
+   --> src\frame.rs:358:8
+    |
+355 | impl Completed {
+    | -------------- method in this implementation
+...
+358 |     fn already_delivered(&self, sequence: u64, sequenced: bool) -> bool {
+    |        ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `net-mesh-leaf` (lib) generated 2 warnings (run `cargo fix --lib -p net-mesh-leaf` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.45s
+     Running tests\kyra_round4_parent.rs (target\debug\deps\kyra_round4_parent-7043c05559cc9856.exe)
+
+running 2 tests
+test kyra_completed_fragment_no_duplicate_control ... ok
+test kyra_completed_fragment_duplicate_does_not_terminal ... FAILED
+
+failures:
+
+---- kyra_completed_fragment_duplicate_does_not_terminal stdout ----
+
+thread 'kyra_completed_fragment_duplicate_does_not_terminal' (119608) panicked at tests\kyra_round4_parent.rs:221:5:
+already-delivered group's duplicate must not kill stream: [StreamFailed { peer_node: 7141180291169902176, stream_id: 562949953421385, reason: ReassemblyAbandoned }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kyra_completed_fragment_duplicate_does_not_terminal
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `--test kyra_round4_parent`
+EXIT=101

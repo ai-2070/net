@@ -43,9 +43,19 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-# Passthrough for the FFI symbol `net_compute_test_inject_synthetic_peer`, which
-# `go/groups_testhelpers.go` references under the `test_helpers` build tag.
-test-helpers = ["net-compute-ffi/test-helpers"]
+# Everything the test suites of the C-ABI consumers need, and nothing a
+# shipped build carries.
+#
+# * `net-compute-ffi/test-helpers` — the FFI symbol
+#   `net_compute_test_inject_synthetic_peer`, which `go/groups_testhelpers.go`
+#   references under the `test_helpers` build tag.
+# * `net/fixtures` — the core crate's existing test/bench-only seam feature.
+#   It is what gates `net_mesh_test_send_refusal_attribution`, the seam the Go
+#   size/limit parity tests drive: the 64,832-byte fragmentation ceiling is
+#   only reachable when the resolved peer address is RTC, and this cdylib is
+#   built without `webrtc`, so no live send through it can produce that
+#   attribution to check against.
+test-helpers = ["net-compute-ffi/test-helpers", "net/fixtures"]
 
 [dependencies]
 # The core crate, and the union of every feature the sibling surfaces below ask

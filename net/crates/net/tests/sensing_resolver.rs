@@ -45,7 +45,9 @@ use net::adapter::net::behavior::sensing::{
     CapabilityInterestKey, DisclosureClass, InterestSpec, ProviderSelector, ResultMode,
     SensingInterestFrame, WorkLatencyEnvelope, SUBPROTOCOL_SENSING_INTEREST,
 };
-use net::adapter::net::{EntityId, EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{
+    EntityId, EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig,
+};
 use net::adapter::Adapter;
 
 const TTL: Duration = Duration::from_secs(30);
@@ -135,7 +137,7 @@ fn inject_declarer(
     ));
     r.test_pin_peer_entity(node_id, entity.clone());
     let dummy_next_hop: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    r.router().add_route(node_id, dummy_next_hop);
+    r.router().add_route(node_id, PeerAddr::Udp(dummy_next_hop));
     r.proximity_graph()
         .test_insert_edge(graph_id(r.node_id()), graph_id(node_id), edge_latency_us);
 }

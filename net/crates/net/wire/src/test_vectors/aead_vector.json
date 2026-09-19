@@ -1,0 +1,8 @@
+{
+  "description": "Cross-backend packet-AEAD golden vector (RFC 8439 ChaCha20-Poly1305, 12-byte nonce, 16-byte tag). The native build seals with ring::aead::LessSafeKey, the wasm32 build with the RustCrypto chacha20poly1305 crate; both must produce this exact ciphertext||tag for the same (key, nonce, aad, plaintext), or the AEAD seam has changed the wire format.",
+  "key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "nonce_hex": "0102030405060708090a0b0c",
+  "aad_hex": "2424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424",
+  "plaintext_utf8": "cross-backend ChaCha20-Poly1305 golden vector",
+  "ciphertext_and_tag_hex": "dd63fc843c6590f1c78e9c8111269498a411bd5efd5b30d74f6ef27257b3f81dfad4d7115a52c5ef439fc508952ff23b1f53881b4fe9fbdd1dd6021ce7"
+}

@@ -1,0 +1,29 @@
+[package]
+name = "rtc-browser-leaf"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stage 4b Chromium harness: the browser leaf. A wasm-bindgen wrapper around the PRODUCTION wire crate (net-mesh-wire), not a spike copy."
+
+# Its own workspace root: this crate lives inside `net/crates/net/tests/`
+# and must not be a member of the `net-mesh` workspace (it is a wasm32
+# cdylib built by the harness, never by `cargo build --workspace`).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# THE PRODUCTION WIRE LAYER. The S0b spike compiled the throwaway
+# `s0a-wire`; this compiles what the mesh actually ships, so the
+# browser half of every witness runs production code.
+net-mesh-wire = { path = "../../../wire" }
+# Pinned to the installed `wasm-bindgen-cli`; a mismatch is a hard
+# error at bindgen time.
+wasm-bindgen = "=0.2.128"
+bytes = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

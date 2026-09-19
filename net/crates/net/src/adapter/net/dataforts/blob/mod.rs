@@ -38,6 +38,13 @@ pub mod stripe_index;
 pub mod transfer;
 /// `blob.transfers` operator-introspection RPC (list / status / cancel)
 /// over a node's [`transfer::BlobTransferEngine`].
+///
+/// nRPC-gated: this is a service definition on top of
+/// `adapter::net::{cortex::rpc, mesh_rpc}`, and `dataforts` does not imply
+/// `cortex`. The transfer ENGINE above rides router streams and stays
+/// available in a `--features dataforts` build; only the RPC face of it
+/// needs the nRPC surface.
+#[cfg(feature = "cortex")]
 pub mod transfer_rpc;
 
 /// Format a 32-byte content hash as the lowercase 64-char hex
@@ -132,6 +139,7 @@ pub use transfer::{
     is_transfer_stream_id, next_transfer_stream_id, transfer_stream_id, TransferStatus,
     SUBPROTOCOL_BLOB_TRANSFER,
 };
+#[cfg(feature = "cortex")]
 pub use transfer_rpc::{
     BlobTransferClient, TransferAdminPolicy, TransferClientError, TransferRpcError,
     TransferRpcHandler, TransferRpcRequest, TransferRpcResponse, DEFAULT_TRANSFER_DEADLINE,

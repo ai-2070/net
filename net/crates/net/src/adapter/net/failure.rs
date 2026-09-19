@@ -6,10 +6,10 @@
 //! - `RecoveryManager` - Route recovery and failover
 //! - `CircuitBreaker` - Prevent cascading failures
 
+use super::transport::PeerAddr;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,7 +62,7 @@ struct NodeState {
     status: NodeStatus,
     /// Node address
     #[allow(dead_code)]
-    addr: SocketAddr,
+    addr: PeerAddr,
     /// Total heartbeats received
     total_heartbeats: u64,
     /// Time node was first seen
@@ -92,7 +92,7 @@ struct NodeState {
 }
 
 impl NodeState {
-    fn new(addr: SocketAddr, epoch: u64) -> Self {
+    fn new(addr: PeerAddr, epoch: u64) -> Self {
         let now = Instant::now();
         Self {
             last_heartbeat: now,
@@ -106,7 +106,7 @@ impl NodeState {
         }
     }
 
-    fn on_heartbeat(&mut self, addr: SocketAddr, epoch: u64) {
+    fn on_heartbeat(&mut self, addr: PeerAddr, epoch: u64) {
         self.last_heartbeat = Instant::now();
         self.missed_count = 0;
         self.status = NodeStatus::Healthy;
@@ -179,7 +179,7 @@ pub struct PeerFailureEvent {
     /// The node the verdict concerns.
     pub node_id: u64,
     /// Its address as the detector last observed it.
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     /// The incarnation (session id) the detector was tracking, or 0
     /// when the heartbeat source supplied none.
     pub epoch: u64,
@@ -313,7 +313,7 @@ impl FailureDetector {
     /// "should I notify?" flag inside the closure and fires the
     /// callback *after* the `and_modify` returns, releasing the
     /// shard lock.
-    pub fn heartbeat(&self, node_id: u64, addr: SocketAddr) {
+    pub fn heartbeat(&self, node_id: u64, addr: PeerAddr) {
         self.heartbeat_for_incarnation(node_id, addr, 0);
     }
 
@@ -323,7 +323,7 @@ impl FailureDetector {
     /// Recording it here is what lets a later failure verdict say
     /// which incarnation died, instead of leaving every consumer to
     /// guess from state that may already have moved on.
-    pub fn heartbeat_for_incarnation(&self, node_id: u64, addr: SocketAddr, epoch: u64) {
+    pub fn heartbeat_for_incarnation(&self, node_id: u64, addr: PeerAddr, epoch: u64) {
         let mut should_notify_recovery = false;
         let mut node_inserted = false;
         let mut recovered_epoch = epoch;
@@ -1120,7 +1120,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         assert_eq!(detector.status(0x1234), NodeStatus::Healthy);
@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     fn node_count_tracks_heartbeats_and_removal() {
         let detector = FailureDetector::new();
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         detector.heartbeat(1, addr);
         detector.heartbeat(2, addr);
@@ -1173,7 +1173,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         // Wait for timeout (~1.5× the timeout → 1 miss).
@@ -1202,7 +1202,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         std::thread::sleep(Duration::from_millis(15));
@@ -1231,7 +1231,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
         });
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(0x1234, addr);
 
         // Wait long enough that multiple timeouts have elapsed
@@ -1669,7 +1669,7 @@ mod tests {
             }),
         );
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         // Drive node into Failed state, then heartbeat to recover.
         detector_arc.heartbeat(0x4242, addr);
         std::thread::sleep(Duration::from_millis(25));
@@ -1799,7 +1799,7 @@ mod tests {
         // the internal `nodes` map directly (the same trick
         // existing tests use to stage failure-detector state
         // without sleeping out real timeouts).
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         detector.heartbeat(1, addr);
         detector.heartbeat(2, addr);
         detector.heartbeat(3, addr);

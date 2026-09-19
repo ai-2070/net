@@ -10,7 +10,8 @@ trivially arrives.
 ```
               nsim_wan  ("the internet", 10.99.0.0/24 on br0)
         .10 = R (relay/coordinator)    .11 = X (aux classify target)
-        .12 = B when it plays the public peer (relay_upgrade)
+        .12 = B when it plays the public peer (relay_upgrade,
+              rtc_anchor_direct — there it is the RTC client)
             |                       |
         nsim_gwa (.2)           nsim_gwb (.3)      ← NAT gateways
       static snat + input drop      masquerade
@@ -22,8 +23,21 @@ trivially arrives.
 - **cone** = static `snat to <public>:<port>` for the joiner's own port,
   plus an INPUT drop for unsolicited inbound on that port. That gives
   endpoint-independent mapping (one public port for all destinations)
-  with address-restricted filtering — the realistic punch-needing NAT.
+  with **port-restricted** filtering — the realistic punch-needing NAT.
   The classifier reads it as `Cone`.
+
+  > **This mode's filtering is port-restricted, and this document said
+  > "address-restricted" until Stage 6.** Both this bullet and
+  > `setup.sh`'s own comment made that claim; neither was true. The
+  > only way in is conntrack's FULL-TUPLE reply match, so a peer
+  > writing from any source port other than the one this side sent to
+  > is dropped — which is the definition of port-restricted. The
+  > mislabel mattered the moment a conformance matrix wanted a cone
+  > row AND a port-restricted row: spelled against this mode they
+  > would have been the same NAT class twice, proving one thing while
+  > claiming two. `cone-ar` below is the genuine
+  > address-restricted flavor. The rules of THIS mode are unchanged —
+  > every pre-existing scenario behaves exactly as before.
 
   > **`masquerade persistent` is not a cone NAT.** The earlier version of
   > this harness used it and claimed endpoint-independent mapping here.
@@ -46,6 +60,39 @@ trivially arrives.
 - **symmetric** = `masquerade fully-random`: fresh public port per
   connection tuple. The classifier reads it as `Symmetric` because R
   and X (two *distinct* public IPs) observe different mappings.
+- **cone-pr** / **cone-ar** = the same two filtering classes for a side
+  whose UDP source port cannot be known in advance, i.e. a **browser**.
+  No pinned port: plain `masquerade` (port-preserving, not
+  `fully-random`) keeps the mapping endpoint-independent, and the
+  `ct state new` input drop keeps a stranger's inbound from claiming
+  the tuple first. Exactly one host lives behind each gateway, so
+  nothing of its own can collide with its ephemeral port — a future
+  row with two nodes behind one gateway invalidates that and must pin
+  instead.
+  - **cone-pr** — port-restricted: conntrack's full-tuple reply match,
+    the same filtering class as `cone`.
+  - **cone-ar** — address-restricted: an nftables **dynamic set** of
+    every address this side has written UDP to (learned on the forward
+    hook from the joiner's own outbound) plus a prerouting DNAT that
+    admits inbound from any source PORT at such an address. Nothing is
+    reachable unsolicited — the mapping opens only after the local
+    outbound — so this is not the full-cone static DNAT the `cone`
+    bullet rejects.
+
+  The difference decides two matrix rows: `cone-ar × symmetric` solves
+  (the symmetric peer's check arrives from an unpredictable port, is
+  admitted, and ICE learns the pair peer-reflexively) while
+  `cone-pr × symmetric` cannot (same packet, full-tuple filter,
+  dropped — and the reverse check dies at the symmetric gateway).
+
+A cone gateway can also pin a **second** UDP port for the same
+joiner (`setup.sh --rtc-port-a <port>`), with the same `snat to
+<public>:<port>` + INPUT drop pair. That is what makes a NAT'd
+**RTC anchor** possible: its WebRTC socket is a separate socket from
+the mesh socket, so without the pin its public mapping is whatever
+`masquerade` happens to pick — unknowable in advance and therefore
+impossible to advertise. With the pin, `10.99.0.2:<port>` is a
+stable mapping the anchor can publish as `rtc_addr`.
 
 R and X are two IPs on the same bridge precisely so classification
 has two distinct destinations to compare — the cone/symmetric
@@ -57,8 +104,11 @@ distinction is real, not forced by a test hook.
 |---|---|
 | `setup.sh` / `teardown.sh` | provision / destroy the namespaces, veths, masquerade rules |
 | `run_scenario.sh <name>` | orchestrate one scenario: setup → launch helpers → collect verdict → teardown |
-| `../../examples/natsim_node.rs` | the helper node (roles: `keygen`, `public`, `joiner`) |
+| `../../examples/natsim_node.rs` | the helper node (roles: `keygen`, `capabilities`, `public`, `joiner`) |
 | `../natsim.rs` | `#[ignore]`d Rust tests wrapping the scripts; assert outcome + `traversal_stats` deltas |
+| `rows.rs` | the Stage 6 browser matrix as DATA: rows, dispositions, derivations, the counter checker, the verdict parser. Compiled by the row tests, the runner and `../natsim_browser.rs` — one table, three consumers |
+| `../natsim_browser.rs` | the matrix's platform-independent half: runs EVERYWHERE, cross-checks `rows.rs` against this script's `browser_*` case arms, and exercises the checker against every shape it must refuse |
+| `browser/` | the Stage 6 runner: anchor + bootstrap listener + page origin + both Playwright drivers, one binary, launched inside `nsim_wan` (`src/`), the page it serves (`page/`), and the per-namespace browser driver (`driver/`) |
 | `.github/workflows/natsim.yml` | CI job: traversal-touching PRs + nightly + manual |
 
 Helpers coordinate through a shared state directory (namespaces
@@ -76,21 +126,148 @@ public node), readiness markers, and the initiator's
 | `symmetric_symmetric_skip` | symmetric | symmetric | matrix skip: zero attempts, relay fallback |
 | `dropped_keepalives` | cone | cone (+ direct-UDP drop on both gateways) | attempt times out, falls back within deadline |
 | `relay_upgrade` | cone | — (B public) | relay-routed session migrates off the relay (`upgrades_succeeded ≥ 1`); the NAT'd joiner is forced to be the lower node id (C1 initiator) via `keygen` ordering |
+| `rtc_anchor_direct` | cone (+ RTC port 7101 pinned) | — (B public, the client) | the NAT'd **anchor** announces `rtc_addr = 10.99.0.2:7101` (its mapped address, not its `192.168.101.2:7101` bind), and the outside client's relay-signalled session ends up on a DataChannel (`transport: "rtc"`, `stats.rtc.ice_direct ≥ 1`). Needs a helper built with `webrtc`; the scenario refuses before provisioning if it isn't. Note B, not A, writes the verdict here — the client is the side that drives the upgrade |
+| `rtc_anchor_stun_endpoint` | cone (+ RTC port 7101 pinned, + STUN port 7103 pinned **and forwarded**) | — (B public, the client) | the same NAT'd anchor with **both** of its announced endpoints, each observed from outside the NAT: `rtc_addr = 10.99.0.2:7101` carries the DataChannel (signalled candidate, not peer-reflexive), and the separately announced `rtc_stun_addr = 10.99.0.2:7103` (Stage 6 §6.12.2) answers an unsolicited binding request whose XOR-MAPPED-ADDRESS is the client's own public tuple. The two ports are asserted distinct. Reachable by deliberately different means: the ICE port stays address-restricted, the STUN port is forwarded, because an announced STUN endpoint that drops a stranger's first request could never serve the peers it is announced to |
+
+### The Stage 6 browser NAT conformance matrix
+
+Six rows plus a control, from
+`BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md` Stage 6: **two headless
+browsers behind two simulated NATs, one anchor**, no mesh helper
+anywhere. The anchor, the HTTPS bootstrap listener, the page origin
+and both Playwright drivers are one binary,
+`tests/natsim/browser/` (`natsim-browser-matrix`), launched inside
+`nsim_wan`; it puts each browser and its whole control stack inside
+the NAT'd namespace with `ip netns exec`.
+
+| scenario | NAT A | NAT B | expectation |
+|---|---|---|---|
+| `browser_cone_cone` | cone-ar | cone-ar | **direct** |
+| `browser_cone_portrestricted` | cone-ar | cone-pr | **direct** |
+| `browser_portrestricted_portrestricted` | cone-pr | cone-pr | **direct** (simultaneous open) |
+| `browser_cone_symmetric` | cone-ar | symmetric | **direct** (peer-reflexive through the address-restricted filter) |
+| `browser_portrestricted_symmetric` | cone-pr | symmetric | **relayed**, typed `iceTimeout` |
+| `browser_symmetric_symmetric` | symmetric | symmetric | **relayed**, typed `iceTimeout` |
+| `browser_cone_cone_firefox` | cone-ar | cone-ar | **direct** — row 1 on Firefox, both sides, as a control. Permission-free by nature: Firefox has no media gate and Playwright cannot grant it camera/microphone |
+| `browser_cone_cone_nomedia` | cone-ar | cone-ar | **direct, with interface enumeration OFF** — row 1 on Chromium with **nothing granted**. One variable: the six rows grant the page's origin camera+microphone because Chromium withholds interface enumeration from WebRTC until a media permission exists (§6.12), and "the product calls no media API" is source evidence about the product rather than a measurement of the ungranted context. **Measured** (§11.8): both tabs log `permission status: denied` and allocate only wildcard ports, and the pair still solved `direct` and still delivered both nonces. What the denial cost on this row was the real host candidate (an mDNS `.local` name instead), the IPv6 leg, and candidate priority/cost — none of which decided it. That is a statement about this row and **not** a rule that srflx decides NAT success: replacing an enumeration oracle with an srflx oracle is the same mistake with a different noun. What stays decisive is authenticated delivery and the measured forwarding counters. The `real=0` counts are **recorded** into the verdict, not asserted: they are the explanation, not the criterion. Scoped to the tested Chromium build, policy and topology |
+| `browser_symmetric_symmetric_nomedia` | symmetric | symmetric | **relayed**, permission-free — the ROUTED half, which the direct row structurally cannot witness (on a direct row the anchor's per-pair counter is flat by assertion). Net's fallback is **not TURN**: it rides each leaf's authenticated anchor session, so "it falls back to the anchor" has to be measured. Requires all three of: (1) receiver-observed nonces in **both** directions, same instrument as the direct row; (2) increases in the **application-only** per-pair forwarding counters in both directions, as checked deltas; (3) an **accounted** routed disposition — the anchor must have forwarded at least as many application packets as the sender reports sending, per direction, because a timeout plus a counter increment is not a routed session. Beside those: both halves type it and must agree, `udpBlocked` refused, ledgers exact, and **no replied flow between the public addresses in either gateway's conntrack** — which is what lets it fail when the payloads arrived directly after all. One variable against `browser_symmetric_symmetric`: the grant |
+
+**A relayed row is a PASS.** The routed session through the anchor is
+the documented disposition (plan §6), and the row asserts it is
+*typed* as such at the page surface rather than reported as a broken
+direct attempt. **Three** rows are relayed, not one: `cone-pr × symmetric`
+cannot solve either (the derivation is in `rows.rs`), and
+`browser_symmetric_symmetric_nomedia` drives the routed path
+deliberately because a direct row cannot witness forwarding.
+
+The table, the expected disposition, the counter arithmetic and the
+derivations live in **`rows.rs`**, compiled by three consumers (the
+row tests, the runner, and `tests/natsim_browser.rs`) so there is one
+matrix and no drift. `tests/natsim_browser.rs` runs on **every**
+platform — it parses this script's own `browser_*` case arms and
+fails if they disagree with the Rust table, and it exercises the
+counter checker against every shape it must refuse.
+
+Each row asserts four independent witnesses:
+
+1. the typed `PeerConnectOutcome.type` on **both** halves of the
+   dialog (`connectPeer` on the offerer, `acceptPeer` on the
+   answerer), and that the two agree — one pair has one disposition;
+2. the §10 ICE ledgers on both leaves and on the anchor:
+   `direct + relayed + failed + udp_blocked == attempted`,
+   `pending == 0`, a **non-zero** denominator, and every term at its
+   exact expected value. An attempt is one signalling **dialog**, and
+   a leaf's dialog with its anchor is one — so every participant
+   expects `attempted == 2` (anchor bootstrap plus the peer dialog),
+   and a relayed row reads `direct == 1, relayed == 1` rather than
+   `direct == 0`. The anchor reads `attempted == 2, direct == 2` on
+   **every** row, which is what establishes that both anchors were
+   reachable — the scope the plan's "100 % of sessions established"
+   criterion is stated over;
+3. `<state>/nat_flow.json` — the two gateways' own conntrack tables.
+   Not "is there a flow to the peer": ICE sends checks on every row,
+   so the outbound entry always exists. What discriminates is whether
+   it was ever **replied** to. Each side also records the READER that
+   produced its numbers (`conntrack`, `procfs`, or `unreadable`), and
+   an unreadable side fails the row: a table nobody could read used
+   to yield `0/0`, which is exactly a relayed row's confirmation, so
+   measurement failure would have counted as observed absence;
+4. **application delivery, and the anchor's per-pair application
+   counter either side of it.** A nonce-correlated bidirectional
+   exchange on the public peer-addressed stream surface: the runner
+   mints both nonces, A must send its own and decode B's, B the
+   reverse, and `anchor.forwarded_app_packets` for the exact ordered
+   pair must be **flat both ways on a direct row** and **moving both
+   ways on a relayed one**. Neither of the first three witnesses
+   observes a payload — conntrack reply traffic can be ICE or Noise,
+   and a relayed *disposition* only says the routed session was kept
+   — so a direct row whose bytes the anchor carried passes all three
+   and fails only this one. Delivery and the counter disposition fail
+   independently.
+
+`udpBlocked` is refused as a disposition here, deliberately. It is
+`iceTimeout` narrowed by `UdpBlockedEvidence`, and on these rows UDP
+egress demonstrably works — every leaf's anchor dialog is a UDP
+DataChannel that landed direct. A row reporting it would be claiming a
+narrower cause than the evidence supports.
+
+What the rows still do **not** measure: the §10 three-part witness's
+*unrelated-pair* liveness leg, which needs a third context and lives
+in the browser matrix where all the tabs share one origin.
+
+Successful runs now leave an uploadable bundle at
+`<state>/artifacts/` — regular files only (verdict, runner and page
+logs, gateway snapshots, per-namespace pcaps), with its file count
+and total byte size printed. Uploading `<state>` wholesale would
+reproduce a previous cycle's empty artifact: it holds browser
+profiles, and `upload-artifact` refuses a tree containing unix
+sockets.
 
 Deferred (documented, not yet wired): the parent-decision-11 IPv6
 pair — dual-stack both-open → direct, and a NAT64/464XLAT topology
-(needs tayga/jool in the runner image). Add as scenarios 6–7 when a
+(needs tayga/jool in the runner image). Add as scenarios 7–8 when a
 consumer needs them; the harness shape (per-side gateway namespaces)
 already accommodates both.
+
+### What `rtc_anchor_direct` does and does not prove
+
+It proves two things. **The announcement**: `anchor_rtc_addr` in the
+verdict is read back from the anchor's own emitted
+`CapabilityAnnouncement`, so the assertion pins what went on the
+wire, not what the flag said. **The reachability**: a DataChannel
+installs across the real masquerade, so the client is reaching the
+anchor's RTC socket through the pinned mapping.
+
+It does **not** prove that the advertised candidate is the pair ICE
+selected. The anchor's own connectivity checks leave through the
+same mapping, so a client told nothing would discover
+`10.99.0.2:7101` as a peer-reflexive candidate anyway (measured on
+loopback: with a deliberately wrong `--rtc-public`, ICE still
+connects). Same address, different provenance — the announcement
+half is what pins the provenance.
 
 ## Running locally (Linux, root)
 
 ```bash
-cargo build --example natsim_node --features net,nat-traversal
-cargo test --test natsim --features net,nat-traversal -- --ignored --test-threads=1
+cargo build --example natsim_node --features net,nat-traversal,webrtc
+cargo test --test natsim --features net,nat-traversal,webrtc -- --ignored --test-threads=1
 # or a single scenario, directly:
 sudo tests/natsim/run_scenario.sh cone_cone_punch /tmp/natsim-state
+sudo tests/natsim/run_scenario.sh rtc_anchor_direct /tmp/natsim-rtc
+# the Stage 6 browser matrix (needs the runner, node, and Playwright
+# browsers; every row refuses BEFORE provisioning if a piece is
+# missing):
+cargo build --release --manifest-path tests/natsim/browser/Cargo.toml
+# `npm install`, not `npm ci`: the repo ignores package-lock.json, so
+# there is no committed lockfile (same as browser-ts and sdk-ts).
+(cd tests/natsim/browser/driver && npm install && npx playwright install --with-deps chromium firefox)
+sudo tests/natsim/run_scenario.sh browser_cone_symmetric /tmp/natsim-browser
 ```
+
+`webrtc` is only needed for `rtc_anchor_direct`; without it that
+scenario refuses (`natsim: ... needs a helper built with the webrtc
+feature`) before provisioning anything, and its wrapper test does
+not exist.
 
 `--test-threads=1` is mandatory: scenarios share namespace names and
 the `10.99.0.0/24` range. Everything the harness creates is
@@ -105,3 +282,12 @@ usual suspects, in order: the helper binary wasn't rebuilt after a
 mesh change; a classifier read `Unknown` because one public didn't
 come up (check `x.log`); conntrack surprises from a previous run
 (`teardown.sh`, then retry — namespace deletion drops all state).
+
+For `rtc_anchor_direct` specifically: the verdict's `stats.rtc`
+block says which half failed. `signal_delivered == 0` on the anchor
+means the `0x0D02` offer never arrived (a relay/routing problem, not
+an ICE one); `ice_attempted > 0` with `ice_relayed == ice_attempted`
+means ICE ran and never connected — check `nsim_gwa_nat.log` for
+whether the gateway really mapped the RTC socket to `sport=7101`,
+because an unpinned mapping is the one failure the anchor cannot
+detect itself.

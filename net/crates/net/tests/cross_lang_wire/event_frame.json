@@ -1,0 +1,8 @@
+{
+  "description": "EventFrame::write_events / read_events. Each event is a 4-byte little-endian length prefix followed by its bytes.",
+  "events_utf8": [
+    "{\"a\":1}",
+    "second"
+  ],
+  "hex": "070000007b2261223a317d060000007365636f6e64"
+}

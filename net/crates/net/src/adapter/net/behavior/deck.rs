@@ -350,6 +350,33 @@ pub struct SubnetRollup {
     pub is_local: bool,
 }
 
+/// One RTC anchor, as [`DeckClient::rtc_anchors`] reports it.
+///
+/// A row exists only for a peer whose own signed announcement
+/// carries the `rtc-anchor` tag; the two address fields are the ones
+/// that make the role usable, and either may be absent (an anchor
+/// that serves no bootstrap listener, or one whose operator has not
+/// told it its public address).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtcAnchorRow {
+    /// The anchor's node id.
+    pub node_id: u64,
+    /// Its public RTC socket (`rtc_addr`), when announced — what a
+    /// browser aims ICE at, and the diagnostic STUN probe's target.
+    pub rtc_addr: Option<std::net::SocketAddr>,
+    /// Its **separately announced STUN endpoint**
+    /// (`rtc_stun_addr`, Stage 6), when it configured one: a second
+    /// UDP endpoint, distinct from [`Self::rtc_addr`], that a
+    /// connection pairing with this anchor gathers against. `None`
+    /// on every anchor that has not opted in, which is why the
+    /// surfaces that render it omit it rather than showing a blank.
+    pub rtc_stun_addr: Option<String>,
+    /// Its bootstrap listener URL (`rtc_bootstrap`), when announced.
+    pub rtc_bootstrap: Option<String>,
+    /// Its Noise static public key, when announced (plan §5 Layer 1).
+    pub noise_pubkey: Option<[u8; 32]>,
+}
+
 /// One-shot snapshot returned by [`DeckClient::aggregator_snapshot`].
 /// Bundles every field a renderer needs in a single struct so
 /// callers don't pay for five per-field lock acquisitions per
@@ -768,6 +795,36 @@ impl DeckClient {
                 }
             })
             .collect()
+    }
+
+    /// Every RTC anchor this node has heard announce itself, sorted
+    /// by node id (Stage 4b). Empty when no `MeshNode` is wired in,
+    /// or when the build has no `webrtc` — an anchor row this build
+    /// cannot act on would be a listing with nothing behind it.
+    ///
+    /// Powers `net-mesh anchor ls` and Deck's ANCHORS view.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_anchors(&self) -> Vec<RtcAnchorRow> {
+        self.mesh
+            .as_ref()
+            .map(|m| m.rtc_anchors())
+            .unwrap_or_default()
+    }
+
+    /// This node's own ICE attempt ledger — plan §10's
+    /// `ice_direct / ice_attempted` field telemetry.
+    ///
+    /// `None` when no `MeshNode` is wired in or the node has no RTC
+    /// driver: there is then no attempt ledger at all, which is a
+    /// different statement from a ledger reading zero, and the
+    /// surfaces that render this keep them apart.
+    ///
+    /// **This node's own attempts**, never a peer's: an attempt
+    /// ledger is not announced and cannot be read across the mesh.
+    /// Powers Deck's ICE column and `net-mesh anchor stats`.
+    #[cfg(feature = "webrtc")]
+    pub fn ice_stats(&self) -> Option<crate::adapter::net::rtc::IceStats> {
+        self.mesh.as_ref().and_then(|m| m.rtc_ice_stats())
     }
 
     /// Aggregate gateway counters for `net gateway stats`.

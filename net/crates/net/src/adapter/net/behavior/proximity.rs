@@ -7,10 +7,10 @@
 //! - Integration with load balancer for locality-aware selection
 //! - Automatic capability index updates from pingwave data
 
+use super::super::transport::PeerAddr;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -275,7 +275,7 @@ pub struct ProximityNode {
     /// Node ID
     pub node_id: NodeId,
     /// Network address
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     /// Hop distance
     pub hops: u8,
     /// Estimated latency in microseconds
@@ -319,7 +319,7 @@ impl Clone for ProximityNode {
 
 impl ProximityNode {
     /// Create new proximity node from pingwave
-    pub fn from_pingwave(pw: &EnhancedPingwave, addr: SocketAddr) -> Self {
+    pub fn from_pingwave(pw: &EnhancedPingwave, addr: PeerAddr) -> Self {
         // `pw.hop_count + 1` would panic in debug at u8::MAX and
         // silently wrap to 0 in release. A buggy or malicious peer
         // can advertise `hop_count == 255`, after which:
@@ -347,7 +347,7 @@ impl ProximityNode {
     }
 
     /// Update from new pingwave
-    pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: SocketAddr) {
+    pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: PeerAddr) {
         // Same `+ 1` overflow concern as `from_pingwave`. Use
         // `saturating_add` here too. The "better path" comparison
         // also uses the saturated value so a 255-hop pingwave
@@ -650,7 +650,7 @@ impl ProximityGraph {
     pub fn on_pingwave(
         &self,
         pw: EnhancedPingwave,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> Option<EnhancedPingwave> {
         let from_node = pw.origin_id;
         self.on_pingwave_from(pw, from_node, from_addr)
@@ -675,7 +675,7 @@ impl ProximityGraph {
         &self,
         pw: EnhancedPingwave,
         from_node: NodeId,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> Option<EnhancedPingwave> {
         match self.admit_pingwave_from(pw, from_node, from_addr) {
             PingwaveAdmission::AcceptedAndForward(fwd) => Some(fwd),
@@ -727,7 +727,7 @@ impl ProximityGraph {
         &self,
         mut pw: EnhancedPingwave,
         from_node: NodeId,
-        from_addr: SocketAddr,
+        from_addr: PeerAddr,
     ) -> PingwaveAdmission {
         self.stats
             .pingwaves_received
@@ -1444,7 +1444,7 @@ mod tests {
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
 
         let pw = EnhancedPingwave::new(make_node_id(2), 1, 3);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Process pingwave
         let forwarded = graph.on_pingwave(pw, from);
@@ -1475,7 +1475,7 @@ mod tests {
     fn proximity_node_from_pingwave_saturates_at_max_hop_count() {
         let mut pw = EnhancedPingwave::new(make_node_id(2), 1, 3);
         pw.hop_count = u8::MAX;
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Pre-fix this would panic in debug builds and wrap to
         // 0 in release builds. Post-fix it saturates at 255.
@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn proximity_node_update_from_pingwave_saturates_at_max_hop_count() {
         let mut pw_initial = EnhancedPingwave::new(make_node_id(2), 1, 3);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let mut node = ProximityNode::from_pingwave(&pw_initial, from);
         let initial_hops = node.hops;
 
@@ -1523,7 +1523,7 @@ mod tests {
     fn update_from_pingwave_keeps_better_path_when_newer_seq_arrives_via_longer_route() {
         // Direct path: 1 hop after the +1 bump.
         let mut pw_direct = EnhancedPingwave::new(make_node_id(2), 5, 0);
-        let direct_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let direct_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let mut node = ProximityNode::from_pingwave(&pw_direct, direct_addr);
         let direct_hops = node.hops;
         let direct_last_seq = node.last_seq;
@@ -1531,7 +1531,7 @@ mod tests {
 
         // A later, higher-seq pingwave for the same node arrives via
         // a 7-hop indirect path from a different source address.
-        let indirect_addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let indirect_addr: PeerAddr = PeerAddr::Udp("10.0.0.5:9000".parse().unwrap());
         pw_direct.seq = 9;
         pw_direct.hop_count = 7;
         node.update_from_pingwave(&pw_direct, indirect_addr);
@@ -1562,7 +1562,7 @@ mod tests {
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
 
         // Add some nodes via pingwaves
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         let mut pw1 = EnhancedPingwave::new(make_node_id(2), 1, 3);
         pw1.primary_caps = PrimaryCapabilities {
@@ -1595,7 +1595,7 @@ mod tests {
         let my_id = make_node_id(1);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
 
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Add nodes
         graph.on_pingwave(EnhancedPingwave::new(make_node_id(2), 1, 3), from);
@@ -1609,7 +1609,7 @@ mod tests {
     #[test]
     fn test_routing_score() {
         let pw = EnhancedPingwave::new(make_node_id(1), 1, 3);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         let mut node = ProximityNode::from_pingwave(&pw, from);
         node.latency_us = 1000; // 1ms
@@ -1648,7 +1648,7 @@ mod tests {
             ..Default::default()
         };
         let graph = ProximityGraph::new(my_id, config);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let sender = make_node_id(2);
 
         // 500 distinct origins, each with a distinct seq — the attack
@@ -1720,7 +1720,7 @@ mod tests {
             ..Default::default()
         };
         let graph = ProximityGraph::new(my_id, config);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let sender = make_node_id(2);
         let known = make_node_id(42);
 
@@ -1779,7 +1779,7 @@ mod tests {
             ..Default::default()
         };
         let graph = ProximityGraph::new(my_id, config);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         let sender = make_node_id(2);
         let known = make_node_id(42);
 
@@ -1895,7 +1895,7 @@ mod tests {
         };
         let graph = ProximityGraph::new(my_id, config);
 
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         graph.on_pingwave(EnhancedPingwave::new(make_node_id(2), 1, 3), from);
 
         assert_eq!(graph.node_count(), 1);
@@ -1920,7 +1920,7 @@ mod tests {
             ..Default::default()
         };
         let graph = ProximityGraph::new(make_node_id(1), config);
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         for origin in 2u8..6 {
             graph.on_pingwave(EnhancedPingwave::new(make_node_id(origin), 1, 3), from);
@@ -1983,7 +1983,7 @@ mod tests {
         let my_id = make_node_id(1);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
 
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Add nodes with very high latency (edge case for routing_score)
         let pw = EnhancedPingwave::new(make_node_id(2), 1, 3).with_load(0, HealthStatus::Healthy);
@@ -2023,7 +2023,7 @@ mod tests {
         let z = make_node_id(2);
         let y = make_node_id(3);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Pingwave carries origin Y, arrived via Z (hop_count=1).
         let pw = EnhancedPingwave::new(y, 1, 3).with_load(0, HealthStatus::Healthy);
@@ -2045,7 +2045,7 @@ mod tests {
         let z = make_node_id(2); // forwarding direct peer
         let y = make_node_id(3); // origin
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9100".parse().unwrap());
 
         // Accept pingwave P (origin Y via Z). Byte-identical replay
         // means identical (origin, seq) — capture the exact bytes and
@@ -2090,8 +2090,8 @@ mod tests {
         let z = make_node_id(2);
         let y = make_node_id(3);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from_y: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let from_z: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let from_y: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
+        let from_z: PeerAddr = PeerAddr::Udp("127.0.0.1:9002".parse().unwrap());
 
         // Direct edge self→Y (pingwave straight from Y).
         graph.on_pingwave_from(EnhancedPingwave::new(y, 1, 3), y, from_y);
@@ -2171,7 +2171,7 @@ mod tests {
         let my_id = make_node_id(1);
         let y = make_node_id(3);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from_y: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let from_y: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
         graph.on_pingwave_from(EnhancedPingwave::new(y, 1, 3), y, from_y);
 
         assert_eq!(graph.path_to(&y), Some(vec![my_id, y]));
@@ -2189,7 +2189,7 @@ mod tests {
         let z = make_node_id(2);
         let y = make_node_id(3);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         let mut pw = EnhancedPingwave::new(y, 1, 3).with_load(0, HealthStatus::Healthy);
         pw.hop_count = 1;
@@ -2221,7 +2221,7 @@ mod tests {
         // rule is enforced in `mesh.rs` dispatch earlier.
         let my_id = make_node_id(1);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         let pw = EnhancedPingwave::new(my_id, 1, 3);
         let forwarded = graph.on_pingwave(pw, from);
@@ -2235,7 +2235,7 @@ mod tests {
         let z = make_node_id(2);
         let y = make_node_id(3);
         let graph = ProximityGraph::new(my_id, ProximityConfig::default());
-        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
 
         // Two pingwaves with known timestamps → two latency samples.
         let now = current_time_us();

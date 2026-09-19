@@ -9,8 +9,8 @@
 //! Linux box):
 //!
 //! ```text
-//! cargo build --example natsim_node --features net,nat-traversal
-//! cargo test --test natsim --features net,nat-traversal -- --ignored --test-threads=1
+//! cargo build --example natsim_node --features net,nat-traversal,webrtc
+//! cargo test --test natsim --features net,nat-traversal,webrtc -- --ignored --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` is required — scenarios share the namespace
@@ -211,9 +211,29 @@ fn scenario(name: &str) -> ScenarioRun {
     // SAME profile's binary as this test run instead of its
     // debug-path default.
     let bin = natsim_node_bin();
-    let out = Command::new("sudo")
-        .arg("env")
-        .arg(format!("NATSIM_NODE_BIN={}", bin.display()))
+    let mut cmd = Command::new("sudo");
+    cmd.arg("env")
+        .arg(format!("NATSIM_NODE_BIN={}", bin.display()));
+    // The browser rows need three more values on the far side of sudo,
+    // and all three are environment-only by design.
+    //
+    // `PLAYWRIGHT_BROWSERS_PATH` is the load-bearing one: the drivers
+    // run as ROOT inside the namespaces, so Playwright would look for
+    // browsers under root's `$HOME` and find the ones CI installed for
+    // the build user nowhere. Forwarded only when set, so a machine
+    // using the default location is unaffected.
+    //
+    // `DISPLAY` is what makes the Chromium rows HEADED: the driver
+    // launches headless when it is absent, so failing to forward it
+    // through sudo would silently undo the display CI starts — and a
+    // headless run is exactly what could not answer the question
+    // these rows are stuck on.
+    for key in ["PLAYWRIGHT_BROWSERS_PATH", "NATSIM_BROWSER_BIN", "DISPLAY"] {
+        if let Ok(value) = std::env::var(key) {
+            cmd.arg(format!("{key}={value}"));
+        }
+    }
+    let out = cmd
         .arg(script)
         .arg(name)
         .output()
@@ -246,6 +266,15 @@ fn scenario(name: &str) -> ScenarioRun {
 fn stat(v: &serde_json::Value, key: &str) -> u64 {
     v["stats"][key].as_u64().unwrap_or_else(|| {
         panic!("stats.{key} missing from outcome: {v:#}");
+    })
+}
+
+/// One RTC counter from the initiator's snapshot (`stats.rtc`,
+/// present only for a node that actually runs an RTC driver).
+#[cfg(feature = "webrtc")]
+fn rtc_stat(v: &serde_json::Value, key: &str) -> u64 {
+    v["stats"]["rtc"][key].as_u64().unwrap_or_else(|| {
+        panic!("stats.rtc.{key} missing from outcome: {v:#}");
     })
 }
 
@@ -344,6 +373,426 @@ fn natsim_relay_session_upgrades_to_direct() {
     );
 }
 
+/// Stage 4b's exit shape, against a real masquerade: an anchor
+/// behind a cone NAT publishes the **mapped** address of its RTC
+/// socket, and a native client outside the NAT ends up talking to it
+/// over a DataChannel (`PeerAddr::Rtc`) rather than over the relay
+/// the signalling rode.
+///
+/// Two facts, and it is worth being exact about which is which:
+///
+/// 1. **The announcement.** The anchor's RTC socket is bound to
+///    `192.168.101.2:7101`, which nothing outside the NAT can reach.
+///    `10.99.0.2:7101` is what `setup.sh --rtc-port-a` pins the
+///    gateway to map it to, and it is what the anchor must put on the
+///    wire. `anchor_rtc_addr` is read back from the anchor's own
+///    emitted `CapabilityAnnouncement`, not echoed from its flags.
+/// 2. **The reachability.** A DataChannel installs across the real
+///    masquerade, so the client genuinely reaches the anchor's RTC
+///    socket at the gateway's mapping — the only address its packets
+///    can be arriving on.
+///
+/// 3. **The use, with provenance** (R8). The client's ICE stack is
+///    transmitting to `10.99.0.2:7101`, and it learned that address
+///    as a **signalled** candidate — not peer-reflexively. This is
+///    what closes the gap the doc comment used to concede: the
+///    earlier verdict could not distinguish "we are talking to the
+///    address the anchor announced" from "we discovered an address
+///    that happens to equal it", because the anchor's own checks
+///    leave through the same mapping (measured: with a deliberately
+///    wrong `--rtc-public`, ICE still connects — and now it would
+///    connect `peer-reflexive`, which this assertion refuses).
+///
+/// A fourth fact is recorded but deliberately NOT asserted:
+/// `stun_probe_ok`, one unsolicited binding request from a fresh
+/// socket to the announced address. It is expected to be dropped
+/// here — `setup.sh` installs
+/// `iifname gw?-wan udp dport <rtc> ct state new drop` so the
+/// scenario models an address-restricted cone NAT rather than a
+/// full-cone one, and a restricted NAT is unreachable to a stranger
+/// until its own outbound opens the mapping. Asserting it would be
+/// asserting a different topology; the probe stays as evidence of
+/// which kind of NAT this is. The gateway's side of the story — that the pinned
+/// 1:1 SNAT really produced `sport=7101` — is captured in
+/// `nsim_gwa_nat.log`, which `ScenarioRun`'s `Drop` prints on any
+/// failure here.
+#[cfg(feature = "webrtc")]
+#[test]
+#[ignore = "requires root + Linux netns; run via the natsim CI job"]
+fn natsim_natted_anchor_publishes_a_reachable_rtc_addr() {
+    let v = scenario("rtc_anchor_direct");
+    assert_eq!(v["ok"], true, "the relayed session must resolve: {v:#}");
+    assert_eq!(v["started_on_relay"], true, "{v:#}");
+    assert_eq!(
+        v["anchor_rtc_addr"], "10.99.0.2:7101",
+        "the anchor must announce its MAPPED RTC socket, never the private \
+         address it is bound to: {v:#}",
+    );
+    assert_eq!(
+        v["transport"], "rtc",
+        "the client's session must end up on the DataChannel: {v:#}",
+    );
+    assert_eq!(v["direct"], true, "an RTC endpoint is a direct one: {v:#}");
+    assert!(
+        rtc_stat(&v, "ice_direct") >= 1,
+        "the attempt must be counted as an installed direct path: {v:#}",
+    );
+    // R8: the announced address is the one the client transmits to,
+    // and it got there from the announcement.
+    assert_eq!(
+        v["selected_remote"], "10.99.0.2:7101",
+        "the client's ICE stack must be transmitting to the ANNOUNCED address: {v:#}",
+    );
+    assert_eq!(
+        v["selected_learned"], "signalled",
+        "…and must have learned it from the announced candidate, not peer-reflexively — \
+         a peer-reflexive selection is the same address with none of the provenance: {v:#}",
+    );
+    assert_eq!(
+        v["stun_probe_target"], "10.99.0.2:7101",
+        "the evidence probe must have been aimed at the announced address: {v:#}",
+    );
+    // The routed leg is what carried the signalling; if the UDP punch
+    // had produced this session instead, the verdict would be a
+    // different mechanism wearing the same result.
+    assert_eq!(
+        stat(&v, "punches_succeeded"),
+        0,
+        "the direct path under test is the DataChannel, not a punch: {v:#}",
+    );
+}
+
+/// **Both of a NAT'd anchor's announced endpoints, observed from
+/// outside the NAT, each with its own reply** (Kyra's E1 item 2).
+///
+/// The row above proves ONE mapping. This one adds the endpoint Stage
+/// 6 §6.12.2 introduced — the anchor's separate STUN socket,
+/// announced as `rtc_stun_addr` — and it is the leg the browser
+/// matrix structurally cannot supply: that matrix's anchor sits on
+/// the simulated internet with no NAT in front of it, where two
+/// local sockets establish nothing about two externally reachable
+/// mappings.
+///
+/// Four facts, and they are different facts:
+///
+/// 1. **Two announced addresses, both mapped.** `rtc_addr` and
+///    `rtc_stun_addr` are read back out of the anchor's own emitted
+///    announcement, and both must be the gateway's public tuples
+///    rather than the private sockets they bind.
+/// 2. **Two DIFFERENT ports.** One endpoint on one port is one
+///    endpoint; the separation is the §6.12.2 requirement, and it is
+///    asserted rather than assumed from the flags.
+/// 3. **The STUN mapping answers a stranger.** One unsolicited
+///    binding request from a fresh socket to the ANNOUNCED address
+///    gets a well-formed success response, and its
+///    XOR-MAPPED-ADDRESS is this client's own public tuple as the
+///    anchor saw it. That reply is the part a local socket cannot
+///    fake: the request crossed the gateway, was served inside, and
+///    came back.
+/// 4. **The RTC mapping carries a session.** A DataChannel installs
+///    at the announced `rtc_addr`, learned as a signalled candidate
+///    rather than peer-reflexively — the same provenance assertion
+///    the row above makes, on the other endpoint.
+///
+/// The two endpoints are reachable by deliberately DIFFERENT means,
+/// and `setup.sh` is where that asymmetry lives: the ICE port stays
+/// address-restricted (unsolicited inbound dropped, reachable once
+/// the anchor's own outbound opens the mapping) while the STUN port
+/// is forwarded, because an announced STUN endpoint that drops a
+/// stranger's first request could never serve the peers it is
+/// announced to. `stun_probe_ok` against `rtc_addr` therefore stays
+/// recorded-not-asserted, exactly as it is above.
+#[cfg(feature = "webrtc")]
+#[test]
+#[ignore = "requires root + Linux netns; run via the natsim CI job"]
+fn natsim_natted_anchor_publishes_both_mapped_endpoints() {
+    let v = scenario("rtc_anchor_stun_endpoint");
+    assert_eq!(v["ok"], true, "the relayed session must resolve: {v:#}");
+    assert_eq!(
+        v["anchor_rtc_addr"], "10.99.0.2:7101",
+        "the anchor must announce its MAPPED RTC socket: {v:#}",
+    );
+    assert_eq!(
+        v["anchor_stun_addr"], "10.99.0.2:7103",
+        "…and its MAPPED second endpoint, the §6.12.2 STUN socket it binds at \
+         192.168.101.2:7103 — an announced address the anchor's own gateway never produces is \
+         the defect this asserts against: {v:#}",
+    );
+    assert_ne!(
+        v["anchor_rtc_addr"], v["anchor_stun_addr"],
+        "the two endpoints must be two endpoints: libwebrtc consumes datagrams that arrive on \
+         an ICE port from an address configured as a STUN server, so an anchor announcing one \
+         address for both roles can never form a candidate pair with Chromium: {v:#}",
+    );
+    // The second endpoint, observed from outside the NAT.
+    assert_eq!(
+        v["stun_endpoint_target"], v["anchor_stun_addr"],
+        "the probe must have been aimed at the ANNOUNCED address, not at a flag: {v:#}",
+    );
+    assert_eq!(
+        v["stun_endpoint_probe_ok"], true,
+        "an unsolicited binding request to the announced STUN endpoint must be ANSWERED — a \
+         forwarded mapping that drops a stranger's first request is not an endpoint anything \
+         could be announced to: {v:#}",
+    );
+    let mapped = v["stun_endpoint_mapped"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the STUN reply must carry an XOR-MAPPED-ADDRESS: {v:#}"));
+    assert!(
+        mapped.starts_with("10.99.0.12:"),
+        "the reply must report THIS client's public tuple as the anchor saw it (10.99.0.12:*), \
+         which is what makes it a statement about a mapping rather than about a local socket; \
+         got {mapped}: {v:#}",
+    );
+    // …and the reply must be that tuple EXACTLY, compared against the
+    // value the probing process read off its own socket rather than
+    // against this hardcoded prefix.
+    //
+    // The prefix alone pins WHICH address the probe used. It does not
+    // pin that the anchor echoed the source it actually saw, and the
+    // two are different claims: run 35185332604 returned a
+    // well-formed reply naming `10.99.0.1:60141` — a faithful mapping
+    // statement about the wrong socket, because the probe left
+    // `0.0.0.0` bound and the kernel chose `br0`'s primary address
+    // out of the four `setup.sh` installs. The client is un-NAT'd on
+    // this topology (`self_nat_class: Open`, no gateway between it
+    // and the wan bridge), so the mapping is the identity and exact
+    // equality is the available statement. Anything else — a rewrite
+    // in the path, a responder echoing a stale or constructed tuple —
+    // fails here instead of passing a prefix check.
+    let local = v["stun_endpoint_local"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the probe must report the tuple it bound: without it the reply can only be \
+             compared against a hardcoded address, which is what let a mapping for a \
+             different socket pass as this client's: {v:#}"
+        )
+    });
+    assert_eq!(
+        mapped, local,
+        "the anchor's XOR-MAPPED-ADDRESS must be the source tuple the probe actually sent \
+         from. This client is not behind a NAT here, so the mapping is the identity: a reply \
+         naming anything else is a statement about some other socket: {v:#}",
+    );
+    // The first endpoint, carrying a session — the same assertions
+    // the single-endpoint row makes, so this leg is a superset and
+    // not a substitute.
+    assert_eq!(v["transport"], "rtc", "{v:#}");
+    assert_eq!(v["direct"], true, "{v:#}");
+    assert!(rtc_stat(&v, "ice_direct") >= 1, "{v:#}");
+    assert_eq!(
+        v["selected_remote"], "10.99.0.2:7101",
+        "the client's ICE stack must be transmitting to the announced RTC address: {v:#}",
+    );
+    assert_eq!(
+        v["selected_learned"], "signalled",
+        "…learned from the announcement, not peer-reflexively: {v:#}",
+    );
+}
+
+// =========================================================================
+// Stage 6 — the browser NAT conformance matrix
+// (BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md Stage 6, §3, §9, §10)
+//
+// Two headless browsers behind two simulated NATs plus one anchor,
+// six rows over the cone / port-restricted / symmetric axis, and a
+// Firefox control. The table, the expected disposition per row, the
+// counter arithmetic and the derivation of all of it live in
+// `natsim/rows.rs` — ONE table, shared with the runner and with
+// `tests/natsim_browser.rs`, which cross-checks it against
+// `run_scenario.sh`'s own case arms on every platform.
+//
+// Each row asserts three independent witnesses:
+//
+//   1. the typed `PeerConnectOutcome.type` on BOTH halves of the
+//      dialog (`connectPeer` on the offerer, `acceptPeer` on the
+//      answerer) — and that they agree, because one pair has one
+//      disposition;
+//   2. the §10 ICE ledgers on both leaves and on the anchor, with the
+//      identity `direct + relayed + failed + udp_blocked ==
+//      attempted`, `pending == 0` and a non-zero denominator, every
+//      term at its exact expected value;
+//   3. the two gateways' own conntrack tables, which are nobody's
+//      report but the NAT's: a two-way UDP flow between the public
+//      addresses on a direct row, and none on a relayed row.
+// =========================================================================
+
+#[path = "natsim/rows.rs"]
+mod rows;
+
+/// Run one matrix row and assert everything it promises.
+///
+/// Every failure path panics with the whole verdict attached, and
+/// `ScenarioRun`'s `Drop` then dumps the runner log, both page
+/// consoles and both gateways' NAT snapshots — because the next
+/// occurrence has to be diagnosable from the CI log without a re-run,
+/// and a row that failed at the NAT level and a row that failed at
+/// the leaf level look identical in a bare assertion message.
+fn browser_row(row: &rows::Row) {
+    let run = scenario(row.scenario);
+    let verdict = rows::RowVerdict::from_json(&run.outcome)
+        .unwrap_or_else(|e| panic!("row {}: unreadable verdict: {e}\n{run:#}", row.scenario));
+    if let Err(e) = verdict.check(row) {
+        panic!("row {}: {e}\n{run:#}", row.scenario);
+    }
+
+    // The independent half. Read from the gateways, not from either
+    // endpoint: a leaf reporting `direct` and an anchor reporting a
+    // flat forwarding counter are both statements by a party to the
+    // session.
+    let path = run.state.join("nat_flow.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "row {}: no gateway flow witness at {}: {e}\n{run:#}",
+            row.scenario,
+            path.display()
+        )
+    });
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("row {}: nat_flow.json: {e}", row.scenario));
+    let flows = rows::NatFlows::from_json(&json)
+        .unwrap_or_else(|e| panic!("row {}: nat_flow.json: {e}\n{json:#}", row.scenario));
+    if let Err(e) = flows.check(row) {
+        panic!("row {}: {e}\n{run:#}", row.scenario);
+    }
+}
+
+/// Address-restricted cone on both sides: each gateway admits the
+/// peer's check once its own outbound has opened the mapping.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct() {
+    browser_row(&rows::ROWS[0]);
+}
+
+/// Address-restricted × port-restricted: both mappings are
+/// endpoint-independent, so each side's check lands on the exact
+/// tuple the other sent to.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_portrestricted_is_direct() {
+    browser_row(&rows::ROWS[1]);
+}
+
+/// Port-restricted on both sides — the simultaneous-open case. Each
+/// check matches the conntrack reply tuple the other side's own check
+/// created; nothing peer-reflexive is needed.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_portrestricted_portrestricted_is_direct() {
+    browser_row(&rows::ROWS[2]);
+}
+
+/// Address-restricted × symmetric: the row that justifies having both
+/// cone flavors. The symmetric side's check arrives from a port
+/// nobody could predict, the address-restricted filter admits it
+/// anyway, and ICE learns the pair peer-reflexively.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_symmetric_is_direct() {
+    browser_row(&rows::ROWS[3]);
+}
+
+/// Port-restricted × symmetric: **relayed, and that is the correct
+/// outcome.** The same check a `cone-ar` gateway admits is dropped by
+/// a full-tuple filter, and the reverse check dies at the symmetric
+/// gateway, so ICE cannot solve this pair at all. The routed session
+/// through the anchor is kept and typed `iceTimeout` — not
+/// `udpBlocked`, which this row refuses, because the leaf's own
+/// anchor dialog is a UDP DataChannel that landed direct.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_portrestricted_symmetric_is_relayed() {
+    browser_row(&rows::ROWS[4]);
+}
+
+/// Symmetric × symmetric: relayed, the plan's named fallback row.
+/// Neither side can predict the other's mapping.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_symmetric_symmetric_is_relayed() {
+    browser_row(&rows::ROWS[5]);
+}
+
+/// The control: row 1 again with Firefox on both sides, so a direct
+/// result is not a Chromium artifact. Same NAT pair, one variable.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct_on_firefox() {
+    browser_row(&rows::CONTROL);
+}
+
+/// The permission-free leg: **row 1 again with nothing granted, and
+/// it lands `direct`.**
+///
+/// The six Chromium rows grant the page's own origin camera and
+/// microphone before opening it, because Chromium withholds its
+/// interface enumeration from WebRTC until a media permission exists
+/// (S6_REPORT.md §6.12). That the product calls no media API is
+/// source evidence about the product and not a measurement of the
+/// ungranted browsing context: the granted rows cannot distinguish a
+/// product that needs no permission from one whose networking the
+/// grant happened to fix.
+///
+/// One variable against row 1 — the grant — behind the same two real
+/// NATs, because the enumeration this measures is what a
+/// non-loopback candidate needs. §11.8 measured the answer: both
+/// tabs log `permission status: denied` and allocate wildcard ports,
+/// and the pair still solves `direct` with flat anchor forwarding and
+/// a replied two-way flow in both gateways' conntrack. A wildcard
+/// port still binds `0.0.0.0` and still receives; what the denial
+/// cost on that row was the real host candidate, the IPv6 leg and
+/// candidate priority — none of which decided it. That is an
+/// observation about the row, not a rule that srflx decides NAT
+/// success; what stays decisive is authenticated delivery and the
+/// measured forwarding counters.
+///
+/// The verdict records what the DRIVERS reported granting, so a row
+/// that quietly acquired the permission fails here rather than
+/// passing under this name. The `real=0` enumeration counts are
+/// RECORDED into the verdict rather than asserted: they are the
+/// explanatory observation, the outcome under investigation is
+/// authenticated application delivery, and a row that refused on
+/// `real=0` would have thrown away the working measurement above.
+///
+/// Scoped to the tested Chromium build, policy and topology. It says
+/// the grant is not a prerequisite for a data-only Net application
+/// HERE; it does not say anything universal about Chromium, and it
+/// does not retire the fact that the grant was a material part of the
+/// environment the six matrix rows ran in.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_cone_cone_is_direct_without_media_permission() {
+    browser_row(&rows::NO_MEDIA);
+}
+
+/// The permission-free **routed** leg: `symmetric × symmetric` again
+/// with nothing granted.
+///
+/// The direct row above cannot answer this one. On a row that solves
+/// direct the anchor's per-pair application counter is flat *by
+/// design* — that flatness is the direct row's own assertion — so a
+/// direct row is precisely the shape that cannot witness forwarding.
+///
+/// And it is the half that most needs witnessing, because Net's
+/// routed path is **not TURN**: it rides each leaf's authenticated
+/// session with the anchor rather than a relay allocation, so
+/// "it falls back to the anchor" is a claim about leaf-to-anchor
+/// application delivery. If a denied enumeration broke the anchor
+/// hop, there would be no fallback to fall back to, and a row that
+/// asserted one without measuring it would assert nothing.
+///
+/// So: the pair ICE cannot solve, driven with the instrument the
+/// granted relayed rows already use — both nonces observed by the
+/// receiver that did not mint them, and the anchor's own per-pair
+/// application counter moving in BOTH directions across the
+/// exchange. One variable against `browser_symmetric_symmetric`: the
+/// grant.
+#[test]
+#[ignore = "requires root + Linux netns + two headless browsers; run via the natsim CI job"]
+fn natsim_browser_symmetric_symmetric_is_relayed_without_media_permission() {
+    browser_row(&rows::NO_MEDIA_RELAYED);
+}
+
 // =========================================================================
 // Configuration-validation guards (no root, no netns — run anywhere
 // the suite compiles). These pin the harness's fail-loudly behavior
@@ -387,6 +836,32 @@ fn setup_rejects_public_b_with_a_natted_b_side() {
     assert!(
         stderr.contains("--public-b requires --nat-b none"),
         "must name the conflict; got: {stderr}",
+    );
+}
+
+/// `--rtc-port-a` pins a 1:1 mapping the anchor then advertises.
+/// A symmetric NAT has no such mapping, so the combination must be
+/// refused rather than producing an anchor that advertises an
+/// address its own gateway never emits.
+#[test]
+fn setup_rejects_a_pinned_rtc_port_on_a_symmetric_side() {
+    let out = setup_sh(&["--nat-a", "symmetric", "--rtc-port-a", "7101"]);
+    assert_eq!(out.status.code(), Some(2), "conflicting config must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--rtc-port-a requires --nat-a cone"),
+        "must name the conflict; got: {stderr}",
+    );
+}
+
+#[test]
+fn setup_rejects_a_non_port_rtc_port() {
+    let out = setup_sh(&["--rtc-port-a", "not-a-port"]);
+    assert_eq!(out.status.code(), Some(2), "a bad port must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--rtc-port-a wants a UDP port"),
+        "must name the problem; got: {stderr}",
     );
 }
 

@@ -252,6 +252,102 @@ fn issue_delegated_chain_verifies_and_refuses_escapes() {
     assert!(!has_stage_temp(dir.path()));
 }
 
+/// A delegated leaf is issued INSIDE its issuer's window even when the
+/// requested TTL is longer than the issuer has left.
+///
+/// Found by CI, intermittently, at roughly one run in eight: the
+/// issuer grant and the leaf are two separate `net-mesh` invocations
+/// and each defaulted its window from its own `unix_now()`, so a
+/// second boundary between them left the leaf's `not_after` one
+/// second past its issuer's. `verify_credential_set` refuses that
+/// with `IssuerAttenuationBroadened` — a delegation may not outlive
+/// the grant that empowered it — and the CLI had already exited 0.
+/// An issuance that succeeds and produces a credential no verifier
+/// accepts is worse than a refusal.
+///
+/// This witness does not wait for a clock boundary. It pins the
+/// issuer's window with explicit flags and asks for a leaf TTL far
+/// longer than what remains, so the clamp is exercised on every run
+/// rather than on an unlucky one. Without the clamp the chain fails
+/// verification here deterministically.
+#[test]
+fn a_delegated_leaf_is_clamped_into_its_issuers_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_key = subnet_keygen(dir.path(), "root.toml");
+    let issuer_key = subnet_keygen(dir.path(), "issuer.toml");
+    let root = entity_of(&root_key);
+    let authority_hex = toml_field(&root_key, "entity_id_hex");
+    let issuer_hex = toml_field(&issuer_key, "entity_id_hex");
+
+    // The issuer's window is pinned: it starts an hour ago and has
+    // one hour left.
+    let issuer_not_before = unix_now().saturating_sub(3600);
+    let issuer_ttl = 7200u64;
+    let issuer_not_after = issuer_not_before + issuer_ttl;
+
+    let issuer_grant = dir.path().join("issuer.grant");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["subnet", "issue-issuer", "--root-key"])
+        .arg(&root_key)
+        .args(["--authority", &authority_hex])
+        .args(["--issuer", &issuer_hex])
+        .args(["--scope", "3", "--max-rights", "attach,export"])
+        .args(["--not-before", &issuer_not_before.to_string()])
+        .args(["--ttl-secs", &issuer_ttl.to_string()])
+        .args(["--out"])
+        .arg(&issuer_grant)
+        .assert()
+        .code(0);
+
+    // The leaf asks for seven days, which is far past what the issuer
+    // has left.
+    let delegated = dir.path().join("delegated.credential");
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["subnet", "issue-delegated", "--issuer-grant"])
+        .arg(&issuer_grant)
+        .args(["--issuer-key"])
+        .arg(&issuer_key)
+        .args(["--subject", SUBJECT_HEX])
+        .args(["--scope", "3.9", "--rights", "export"])
+        .args(["--ttl-secs", &(7 * 24 * 3600).to_string()])
+        .args(["--out"])
+        .arg(&delegated)
+        .assert()
+        .code(0);
+
+    let set = SubnetCredentialSet::from_bytes(&std::fs::read(&delegated).unwrap()).unwrap();
+    let SubnetCredentialSet::OneHop { ref leaf, .. } = set else {
+        panic!("issue-delegated must produce a one-hop set");
+    };
+    assert!(
+        leaf.not_after <= issuer_not_after,
+        "the leaf's window must nest inside its issuer's: leaf not_after {} against issuer {}",
+        leaf.not_after,
+        issuer_not_after
+    );
+
+    // And the chain the clamp produces is one a verifier accepts —
+    // the property the clamp exists for, not merely a smaller number.
+    let subject = EntityId::from_bytes(hex::decode(SUBJECT_HEX).unwrap().try_into().unwrap());
+    let config = SubnetAuthorityConfig {
+        authority: root.clone(),
+        roots: vec![root],
+        maximum_grant_lifetime_secs: 30 * 24 * 60 * 60,
+    };
+    verify_credential_set(
+        &set,
+        &subject,
+        &config,
+        0,
+        &SubnetFloorRegistry::new(),
+        unix_now(),
+        0,
+    )
+    .expect("a clamped delegated chain verifies against the root");
+}
+
 #[test]
 fn control_facts_frame_correctly_and_inspect_classifies_artifacts() {
     let dir = tempfile::tempdir().unwrap();

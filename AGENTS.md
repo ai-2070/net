@@ -30,6 +30,30 @@ go test ./...          # from go/ — cgo must actually be enabled (see Bindings
 npm run check          # from web/ — docs links + releases sync + types
 ```
 
+`TESTS.md` (repo root) is the guide to running tests without wasting time.
+The short version, because this is where an implementation loop leaks the
+most time:
+
+- **Inner loop is `cargo check --lib`** (seconds, no linking), not a test run.
+- **Then the narrowest selection that covers the change**: `cargo tf --test
+  <binary>` / `cargo tf -E 'binary(a) + binary(b)'`, or `cargo tfl <module>`
+  for in-source units. `tf` / `tfl` stop at the first failure and print only
+  failures; `t` / `tl` run and report everything, for the end of the change.
+- **Then one full family or the full unit suite, ONCE.** A warm full run is
+  about a minute; re-running it to confirm a pass you already have is the
+  most common way a loop doubles its own cost.
+- **Never paste a `--features` list out of `ci.yml` into a local run.** Cargo
+  fingerprints per feature set, so each new set is a full root-crate rebuild
+  — more expensive than running every test you own. The four aliases exist so
+  a session owns two fingerprints, both warm.
+- Pick WHAT to run by CI family (`integration-*` jobs group binaries by
+  surface). `codegraph affected` narrows only for leaf modules; for anything
+  central it answers "almost everything", which is true and useless.
+
+Measurements behind all of this (and behind the dev profile's
+`debug = "line-tables-only"`) are in
+`docs/internal/misc/PERF_AUDIT_2026_09_13_TEST_EXECUTION.md`.
+
 ### Pre-push checklist (Rust)
 
 `cargo check` plus a `--lib` clippy is **not** a green branch — several CI lints only fire on targets those commands never build (that exact gap has let three different CI failures through in a single day: a cfg'd test that never compiled, a lint that fires only on the lib-test target, and a rustdoc link error). Before calling a branch ready:

@@ -29,12 +29,14 @@ pub fn render(
     snapshot: Option<&MeshOsSnapshot>,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
+    anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     let has_peers = snapshot.map(|s| !s.peers.is_empty()).unwrap_or(false);
     let has_local = local.is_some();
     if has_peers || has_local {
         if let Some(s) = snapshot {
-            render_live_nodes_table(frame, area, s, cursor, local);
+            render_live_nodes_table(frame, area, s, cursor, local, anchors, ice);
         }
     } else {
         render_empty_nodes_table(frame, area);
@@ -63,6 +65,16 @@ pub(crate) fn render_nodes_view(
     cursor: usize,
     local_id: Option<u64>,
     local_maintenance_mirror: Option<net_sdk::deck::MaintenanceMirrorSnapshot>,
+    // Stage 4b: the announced `rtc_addr` / `rtc_bootstrap`, which
+    // do not ride `PeerSnapshot`. A row with no entry shows `—`
+    // (not an anchor); a build that cannot read the fields at all
+    // says so, because those are not the same statement.
+    anchors: &crate::app::AnchorRollup,
+    // Stage 6: plan §10's `ice_direct / ice_attempted` field
+    // telemetry. NOT a per-peer fact — an attempt ledger is this
+    // node's own and is not announced — so the column paints the
+    // local row and `—` everywhere else.
+    ice: &crate::app::IceRollup,
 ) {
     use net_sdk::deck::{MaintenanceMirrorSnapshot, PeerHealthSnapshot};
 
@@ -102,6 +114,8 @@ pub(crate) fn render_nodes_view(
         cell_dim("SAT"),
         cell_dim("DAEMONS"),
         cell_dim("MAINT"),
+        cell_dim("ANCHOR"),
+        cell_dim("ICE"),
     ])
     .height(1);
 
@@ -212,6 +226,8 @@ pub(crate) fn render_nodes_view(
             Cell::from(Span::styled(sat_text, sat_style)),
             Cell::from(Span::styled(format!("{daemon_count:>3}"), theme::text())),
             Cell::from(Span::styled(maint_text, maint_style)),
+            Cell::from(anchor_span(anchors, peer_id)),
+            Cell::from(ice_span(ice, is_local_row)),
         ]));
     }
 
@@ -228,6 +244,10 @@ pub(crate) fn render_nodes_view(
             Constraint::Length(5),  // SAT
             Constraint::Length(8),  // DAEMONS
             Constraint::Length(10), // MAINT
+            // ANCHOR (rtc_addr / bootstrap host, plus the
+            // separately announced STUN endpoint when there is one)
+            Constraint::Length(anchor_column_width(anchors, area)),
+            Constraint::Min(24), // ICE (direct/attempts + pending)
         ],
     )
     .header(header)
@@ -238,6 +258,85 @@ pub(crate) fn render_nodes_view(
         .filter(|s| start + *s < end);
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The ANCHOR cell for one node row. Three outcomes, because the
+/// column answers three different questions:
+///
+/// * this node announced the anchor role → its addresses, in the
+///   accent color an operator can act on;
+/// * it did not → `—`;
+/// * this build has no `rtc_addr` / `rtc_bootstrap` to read at
+///   all → say that, rather than borrow the `—` that means "not
+///   an anchor" and turn an unreadable column into a claim about
+///   the mesh.
+fn anchor_span(anchors: &crate::app::AnchorRollup, peer_id: u64) -> Span<'static> {
+    if anchors.not_this_build() {
+        return Span::styled("not in this build", theme::dim());
+    }
+    match anchors.get(peer_id) {
+        Some(addresses) => Span::styled(addresses.cell(), theme::cyan()),
+        None => Span::styled("—".to_string(), theme::chrome()),
+    }
+}
+
+/// The ANCHOR column's width for this frame.
+///
+/// 21 is the width the widest cell needed when `rtc_addr` was the
+/// only endpoint a row could carry, and it stays 21 whenever that
+/// is still true — a mesh where no anchor announced a separate
+/// STUN endpoint (every mesh, until an operator opts in) is laid
+/// out exactly as it was before Stage 6, to the character.
+///
+/// When an anchor does announce one, the column takes the width
+/// its widest cell needs instead of truncating it: a clipped
+/// `203.0.113.7:71` is not a narrower fact, it is a wrong one.
+/// Bounded so the ICE column keeps its `Min(24)` floor — growing
+/// one operator-facing column by squeezing another's numbers off
+/// the screen would be a worse trade than a truncated address.
+pub(crate) fn anchor_column_width(anchors: &crate::app::AnchorRollup, area: Rect) -> u16 {
+    /// What `rtc_addr`-or-bootstrap-host alone needed: the width
+    /// this column had before Stage 6, and its floor now.
+    const BASE: u16 = 21;
+    /// The ten fixed columns either side of ANCHOR.
+    const FIXED_ELSEWHERE: u16 = 2 + 22 + 11 + 7 + 5 + 5 + 5 + 5 + 8 + 10;
+    /// `column_spacing(2)` between the twelve columns.
+    const SPACING: u16 = 2 * 11;
+    /// ICE's own `Min`, which this column must not eat into.
+    const ICE_FLOOR: u16 = 24;
+    /// The surrounding block's left and right borders.
+    const BORDERS: u16 = 2;
+
+    let headroom = area
+        .width
+        .saturating_sub(BORDERS + FIXED_ELSEWHERE + SPACING + ICE_FLOOR);
+    let widest = u16::try_from(anchors.widest_cell()).unwrap_or(u16::MAX);
+    widest.clamp(BASE, headroom.max(BASE))
+}
+
+/// The ICE cell for one node row — plan §10's
+/// `ice_direct / ice_attempted` deployment metric.
+///
+/// **The denominator is ATTEMPTS, not sessions**, and the cell
+/// spells it out (`6/9 67%`, not a bare `67%`) for exactly that
+/// reason: an attempt is one signalling dialog, so a peer reached
+/// on a retry spends two of them, and the percentage is not a
+/// session success rate. A relayed session is not a failed one.
+///
+/// Only the local row carries a value. An attempt ledger is this
+/// node's own and is never announced, so a remote row gets `—`
+/// meaning "not this node's ledger" — the same glyph the ANCHOR
+/// column uses for its own "not this" fact, and for the same
+/// reason: a number there would be a claim about a peer that
+/// nothing on this node can support.
+fn ice_span(ice: &crate::app::IceRollup, is_local_row: bool) -> Span<'static> {
+    if !is_local_row {
+        return Span::styled("—".to_string(), theme::chrome());
+    }
+    if ice.not_this_build() || ice.ledger().is_none() {
+        return Span::styled(ice.cell(), theme::dim());
+    }
+    Span::styled(ice.cell(), theme::cyan())
 }
 
 /// Map the local node's `MaintenanceStateSnapshot` (state machine
@@ -293,6 +392,8 @@ fn render_live_nodes_table(
     snapshot: &MeshOsSnapshot,
     cursor: usize,
     local: Option<LocalNodeRow<'_>>,
+    anchors: &crate::app::AnchorRollup,
+    ice: &crate::app::IceRollup,
 ) {
     use net_sdk::deck::PeerHealthSnapshot;
 
@@ -337,6 +438,8 @@ fn render_live_nodes_table(
         cursor,
         local_id,
         local_maintenance_mirror,
+        anchors,
+        ice,
     );
 }
 

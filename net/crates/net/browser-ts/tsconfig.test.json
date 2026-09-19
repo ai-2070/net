@@ -1,0 +1,20 @@
+{
+  // The tests, type-checked.
+  //
+  // `tsconfig.json` includes only `src`, because `src` is what ships.
+  // The consequence went unnoticed for a stage: `FakeStream implements
+  // LeafWasmStream` was never actually checked, so the package's test
+  // doubles could claim to satisfy the wasm boundary while producing a
+  // shape Rust never emits — which is exactly what they did. Checking
+  // them is what makes `implements` mean something.
+  //
+  // `noEmit`, and no `rootDir`: nothing here belongs in `dist`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "rootDir": "."
+  },
+  "include": ["src", "test", "tests"],
+  "exclude": ["node_modules", "dist"]
+}

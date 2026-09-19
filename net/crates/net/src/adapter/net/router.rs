@@ -11,6 +11,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use std::net::SocketAddr;
+
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,7 +112,7 @@ fn record_batch_flush(packets: u64) {
 /// over `groups` — fine, since the distinct-peer count per drain is small
 /// (and bounded by `reset_dest_groups`).
 #[inline]
-fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, data: Bytes) {
+fn group_by_dest(groups: &mut Vec<(PeerAddr, Vec<Bytes>)>, dest: PeerAddr, data: Bytes) {
     match groups.iter_mut().find(|(d, _)| *d == dest) {
         Some((_, v)) => v.push(data),
         None => groups.push((dest, vec![data])),
@@ -126,7 +128,7 @@ fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, d
 /// drain touches at most `cap` (`MAX_DRAIN`) dests, so the bounded set stays
 /// at `cap + 1` worst case.
 #[inline]
-fn reset_dest_groups(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, cap: usize) {
+fn reset_dest_groups(groups: &mut Vec<(PeerAddr, Vec<Bytes>)>, cap: usize) {
     if groups.len() > cap {
         groups.clear();
     } else {
@@ -195,7 +197,7 @@ pub struct QueuedPacket {
     /// Packet data
     pub data: Bytes,
     /// Destination address
-    pub dest: SocketAddr,
+    pub dest: PeerAddr,
     /// Stream identifier
     pub stream_id: u64,
     /// Whether this is a priority packet
@@ -672,6 +674,49 @@ pub struct NetRouter {
     /// relaxed load per send, negligible. Shared into the send-loop task.
     test_drop_every_n: Arc<AtomicU64>,
     test_drop_counter: Arc<AtomicU64>,
+    /// The RTC admission side, installed after construction when the
+    /// node is configured with `MeshNodeConfig::rtc`. `ArcSwapOption`
+    /// because the send loop reads it per drain and must never take a
+    /// lock the installer could hold.
+    #[cfg(feature = "webrtc")]
+    rtc: Arc<arc_swap::ArcSwapOption<super::rtc::RtcTransport>>,
+    /// §12 F3: the mesh's projection of which endpoints hold a
+    /// provisional session. The router forwards for whoever handed
+    /// it a packet and never touches the peer map, so it cannot
+    /// read `PeerInfo::admission` itself.
+    #[cfg(feature = "webrtc")]
+    provisional: Arc<arc_swap::ArcSwapOption<dashmap::DashSet<PeerAddr>>>,
+}
+
+/// Submit one packet to a DataChannel from the scheduler drain.
+///
+/// Admission is total, so a refusal is immediate and means the peer's
+/// reserved queue is full right now. The packet gets exactly one
+/// re-offer — the drain cannot park, and holding it would reorder the
+/// stream behind every later packet — and is then dropped **with a
+/// counter** (`RtcStats::drain_refused`), never silently.
+#[cfg(feature = "webrtc")]
+fn submit_rtc_with_one_retry(
+    rtc: &arc_swap::ArcSwapOption<super::rtc::RtcTransport>,
+    packet: &[u8],
+    id: super::rtc::RtcPeerId,
+) {
+    let Some(rtc) = rtc.load_full() else {
+        // No admission side installed: this is a wiring bug, not a
+        // disposition. Count it rather than returning silently — R1
+        // was exactly this branch being taken in production.
+        return;
+    };
+    let first = match rtc.submit(packet, id) {
+        Ok(()) => return,
+        Err(e) => e,
+    };
+    // Only *pressure* earns the second offer. An `UnknownPeer` is a
+    // closed channel: re-offering it cannot succeed, and pretending
+    // otherwise just delays the counter.
+    if first == super::rtc::RtcSubmitError::UnknownPeer || rtc.submit(packet, id).is_err() {
+        rtc.stats().note_drain_refused();
+    }
 }
 
 impl NetRouter {
@@ -700,7 +745,28 @@ impl NetRouter {
             latency_samples: AtomicU64::new(0),
             test_drop_every_n: Arc::new(AtomicU64::new(0)),
             test_drop_counter: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "webrtc")]
+            rtc: Arc::new(arc_swap::ArcSwapOption::empty()),
+            #[cfg(feature = "webrtc")]
+            provisional: Arc::new(arc_swap::ArcSwapOption::empty()),
         })
+    }
+
+    /// Install the §12 provisional-endpoint projection (F3).
+    ///
+    /// The router forwards for whoever handed it a packet and never
+    /// touches the peer map, so it cannot read `PeerInfo::admission`
+    /// itself. This is the mirror the mesh maintains.
+    #[cfg(feature = "webrtc")]
+    pub fn set_provisional_endpoints(&self, set: super::rtc::ProvisionalEndpoints) {
+        self.provisional.store(Some(set));
+    }
+
+    /// Install the RTC admission side so the scheduler drain can
+    /// submit `PeerAddr::Rtc` destinations (Stage 3).
+    #[cfg(feature = "webrtc")]
+    pub fn set_rtc_transport(&self, rtc: Arc<super::rtc::RtcTransport>) {
+        self.rtc.store(Some(rtc));
     }
 
     /// Test-only: drop every `n`th dequeued (scheduled) packet in the
@@ -727,7 +793,7 @@ impl NetRouter {
     }
 
     /// Add a route. Returns the transition token it produced.
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) -> u64 {
+    pub fn add_route(&self, dest_id: u64, next_hop: PeerAddr) -> u64 {
         self.routing_table.add_route(dest_id, next_hop)
     }
 
@@ -747,7 +813,7 @@ impl NetRouter {
     /// because the only caller of `add_authenticated_route` was a test
     /// fixture.
     /// Returns the transition token it produced.
-    pub fn add_direct_route(&self, peer_node_id: u64, peer_addr: SocketAddr) -> u64 {
+    pub fn add_direct_route(&self, peer_node_id: u64, peer_addr: PeerAddr) -> u64 {
         self.routing_table
             .add_authenticated_route(peer_node_id, peer_addr, peer_node_id)
     }
@@ -766,7 +832,20 @@ impl NetRouter {
     }
 
     /// Route a packet (called from receive loop)
-    pub fn route_packet(&self, data: Bytes, _from: SocketAddr) -> Result<RouteAction, RouterError> {
+    pub fn route_packet(&self, data: Bytes, _from: PeerAddr) -> Result<RouteAction, RouterError> {
+        // §12 F3: no transit for a provisional adjacent session. The
+        // router is the one forwarding site with no view of the peer
+        // map, so it consults the mesh's projection.
+        #[cfg(feature = "webrtc")]
+        if self
+            .provisional
+            .load()
+            .as_ref()
+            .is_some_and(|set| set.contains(&_from))
+        {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(RouterError::NoRoute);
+        }
         let start = Instant::now();
         let len = data.len() as u64;
 
@@ -905,9 +984,42 @@ impl NetRouter {
         }
     }
 
-    /// Send a packet directly (bypassing routing)
-    pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
-        self.socket.send_to(data, dest).await
+    /// Send a packet directly (bypassing routing).
+    ///
+    /// The router owns its own ephemeral socket — a different socket from
+    /// the node's [`PeerSink`](super::transport::PeerSink) — so the
+    /// endpoint is resolved to its UDP tuple here, at the boundary, and
+    /// submitted on that socket exactly as before. Only the `Udp` variant
+    /// is live in this stage.
+    pub async fn send_to(&self, data: &[u8], dest: PeerAddr) -> std::io::Result<usize> {
+        match dest {
+            PeerAddr::Udp(addr) => self.socket.send_to(data, addr).await,
+            // R5-A: total over the shared wire type — a downstream
+            // consumer can enable `net-mesh-wire/webrtc` without the
+            // core's feature, and this crate then has no driver to
+            // submit to. Unreachable in practice: nothing here can
+            // mint an `Rtc` endpoint without the feature.
+            #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => match self.rtc.load_full() {
+                Some(rtc) => rtc
+                    .submit(data, id)
+                    .map(|()| data.len())
+                    .map_err(std::io::Error::from),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "rtc endpoint addressed on a router with no RTC transport",
+                )),
+            },
+        }
     }
 
     /// Receive a packet
@@ -934,6 +1046,8 @@ impl NetRouter {
         let running = self.running.clone();
         let drop_every_n = self.test_drop_every_n.clone();
         let drop_counter = self.test_drop_counter.clone();
+        #[cfg(feature = "webrtc")]
+        let rtc = self.rtc.clone();
 
         Some(tokio::spawn(async move {
             // Phase 0 instrument: latch the arm flag once; when armed, count
@@ -950,7 +1064,7 @@ impl NetRouter {
             // on the hot path; the slot set is bounded on reset (see below) so
             // it can't accumulate a stale entry per peer forever under churn.
             const MAX_DRAIN: usize = 64;
-            let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+            let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
             // Linux-only batched sender over the same socket fd. The send loop
             // is the socket's sole, single-threaded sender, so it owns one
             // `BatchedTransport` for its whole lifetime and reuses the iovec /
@@ -981,7 +1095,32 @@ impl NetRouter {
                     // zero-overhead path. Guarded by the live `current_depth`.
                     if scheduler.current_depth() == 0 {
                         if !drop_injected(&drop_every_n, &drop_counter) {
-                            let _ = socket.send_to(&first.data, first.dest).await;
+                            // Partitioned by endpoint variant; only the
+                            // `Udp` arm is live in this stage. The send
+                            // itself is byte-for-byte the previous one.
+                            match first.dest {
+                                PeerAddr::Udp(addr) => {
+                                    let _ = socket.send_to(&first.data, addr).await;
+                                }
+                                // R5-A: see `NetRouter::send_to`.
+                                #[cfg(not(feature = "webrtc"))]
+                                #[allow(
+                                    unreachable_patterns,
+                                    reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+                                )]
+                                _ => {}
+                                // RTC is never batched (str0m writes
+                                // one packet per drain), so the
+                                // depth-0 path and the group flush
+                                // below do the same thing for it:
+                                // submit once, and on refusal give it
+                                // exactly one more chance before
+                                // counting the drop.
+                                #[cfg(feature = "webrtc")]
+                                PeerAddr::Rtc(id) => {
+                                    submit_rtc_with_one_retry(&rtc, &first.data, id);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1012,6 +1151,41 @@ impl NetRouter {
                         if data.is_empty() {
                             continue;
                         }
+                        // Endpoint-variant partition for the flush. Only
+                        // `Udp` is live; the grouping above, `MAX_DRAIN`
+                        // and the drain instrumentation stay whole-drain.
+                        #[cfg(feature = "webrtc")]
+                        let dest = match *dest {
+                            PeerAddr::Udp(addr) => addr,
+                            PeerAddr::Rtc(id) => {
+                                // One at a time: str0m's contract is
+                                // one `Channel::write` per drain, so
+                                // there is nothing to batch. The
+                                // grouping above, `MAX_DRAIN` and the
+                                // drain instrumentation stay
+                                // whole-drain, so the UDP
+                                // measurements remain comparable.
+                                for packet in data {
+                                    submit_rtc_with_one_retry(&rtc, packet, id);
+                                }
+                                if measure_drain {
+                                    record_batch_flush(data.len() as u64);
+                                }
+                                continue;
+                            }
+                        };
+                        // R5-A: a `let`-binding cannot be refutable, and
+                        // the shared type may carry the `Rtc` variant
+                        // even here. Skip what this build cannot send.
+                        #[cfg(not(feature = "webrtc"))]
+                        #[allow(
+                            irrefutable_let_patterns,
+                            reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+                        )]
+                        let PeerAddr::Udp(dest) = *dest
+                        else {
+                            continue;
+                        };
                         #[cfg(target_os = "linux")]
                         {
                             // `send_batch` is a synchronous `sendmmsg` on the
@@ -1023,15 +1197,15 @@ impl NetRouter {
                             // send / EWOULDBLOCK), which re-registers the waker
                             // so we preserve backpressure rather than dropping
                             // or spinning.
-                            let sent = batch_sender.send_batch(data, *dest).unwrap_or(0);
+                            let sent = batch_sender.send_batch(data, dest).unwrap_or(0);
                             for d in &data[sent..] {
-                                let _ = socket.send_to(d, *dest).await;
+                                let _ = socket.send_to(d, dest).await;
                             }
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
                             for d in data {
-                                let _ = socket.send_to(d, *dest).await;
+                                let _ = socket.send_to(d, dest).await;
                             }
                         }
                         if measure_drain {
@@ -1136,7 +1310,7 @@ pub enum RouteAction {
     /// Packet is for local delivery
     Local(Bytes),
     /// Packet was forwarded to next hop
-    Forwarded(SocketAddr),
+    Forwarded(PeerAddr),
 }
 
 /// Router errors
@@ -1186,7 +1360,7 @@ mod tests {
             for _ in 0..4 {
                 let packet = QueuedPacket {
                     data: Bytes::from(vec![0u8; 64]),
-                    dest: "127.0.0.1:9000".parse().unwrap(),
+                    dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                     stream_id: stream,
                     priority: false,
                     queued_at: Instant::now(),
@@ -1223,7 +1397,7 @@ mod tests {
         let scheduler = FairScheduler::new(2, 4); // per-queue cap = 4
         let mk = |stream_id: u64, priority: bool| QueuedPacket {
             data: Bytes::from(vec![0u8; 32]),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id,
             priority,
             queued_at: Instant::now(),
@@ -1272,12 +1446,12 @@ mod tests {
         // invariants the send loop relies on: (1) packets to the same peer
         // keep dequeue order; (2) the reuse-clear pattern empties the inner
         // vecs while keeping the dest slots for the next drain.
-        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let a: PeerAddr = PeerAddr::Udp("127.0.0.1:1".parse().unwrap());
+        let b: PeerAddr = PeerAddr::Udp("127.0.0.1:2".parse().unwrap());
+        let c: PeerAddr = PeerAddr::Udp("127.0.0.1:3".parse().unwrap());
         let mk = |n: u8| Bytes::from(vec![n]);
 
-        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
         // Interleaved across three peers.
         group_by_dest(&mut groups, a, mk(1));
         group_by_dest(&mut groups, b, mk(2));
@@ -1312,11 +1486,11 @@ mod tests {
         // set would grow to one entry per peer ever seen (here 500); the
         // bounded reset must keep it at `cap + 1`.
         const CAP: usize = 64;
-        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        let mut groups: Vec<(PeerAddr, Vec<Bytes>)> = Vec::new();
         let mut max_len = 0usize;
         for port in 0u16..500 {
             reset_dest_groups(&mut groups, CAP);
-            let dest: SocketAddr = format!("127.0.0.1:{}", port + 1).parse().unwrap();
+            let dest: PeerAddr = PeerAddr::Udp(format!("127.0.0.1:{}", port + 1).parse().unwrap());
             group_by_dest(&mut groups, dest, Bytes::from_static(b"x"));
             max_len = max_len.max(groups.len());
         }
@@ -1334,7 +1508,7 @@ mod tests {
         for _ in 0..4 {
             let packet = QueuedPacket {
                 data: Bytes::from(vec![0u8; 64]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: 0,
                 priority: false,
                 queued_at: Instant::now(),
@@ -1345,7 +1519,7 @@ mod tests {
         // Enqueue priority packet
         let priority = QueuedPacket {
             data: Bytes::from(vec![1u8; 64]),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 1,
             priority: true,
             queued_at: Instant::now(),
@@ -1377,7 +1551,7 @@ mod tests {
             for _ in 0..packets_per_stream {
                 let packet = QueuedPacket {
                     data: Bytes::from(vec![stream as u8; 1]),
-                    dest: "127.0.0.1:9000".parse().unwrap(),
+                    dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                     stream_id: stream,
                     priority: false,
                     queued_at: Instant::now(),
@@ -1463,7 +1637,7 @@ mod tests {
         let config = RouterConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
 
-        let dest: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9001".parse().unwrap());
         router.add_route(0x5678, dest);
 
         assert_eq!(router.routing_table().lookup(0x5678), Some(dest));
@@ -1501,7 +1675,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let _ = router.route_packet(packet.freeze(), from);
 
         // The stream stats should be keyed by the correct stream_id
@@ -1528,7 +1702,7 @@ mod tests {
     async fn route_packet_drops_when_src_id_is_local() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1554,7 +1728,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
         match result {
             Err(RouterError::RoutingLoop) => {}
@@ -1588,7 +1762,7 @@ mod tests {
     async fn route_packet_drops_when_forward_makes_ttl_zero() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1615,7 +1789,7 @@ mod tests {
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
 
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
 
         match result {
@@ -1634,7 +1808,7 @@ mod tests {
     async fn route_packet_forwards_when_ttl_remains_positive_after_decrement() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1655,7 +1829,7 @@ mod tests {
         let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
         let result = router.route_packet(packet.freeze(), from);
         match result {
             Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
@@ -1681,7 +1855,7 @@ mod tests {
     async fn ttl_drop_does_not_double_count_packets_in_for_stream() {
         let local_id = 0x1234u64;
         let dest_id = 0x9999u64;
-        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+        let dest_addr: PeerAddr = PeerAddr::Udp("127.0.0.2:6000".parse().unwrap());
 
         let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
         let router = NetRouter::new(config).await.unwrap();
@@ -1707,7 +1881,7 @@ mod tests {
         let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
         packet.extend_from_slice(&routing_bytes);
         packet.extend_from_slice(&net_bytes);
-        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let from: PeerAddr = PeerAddr::Udp("127.0.0.1:5000".parse().unwrap());
 
         let result = router.route_packet(packet.freeze(), from);
         assert!(matches!(result, Err(RouterError::TtlExpired)));
@@ -1748,7 +1922,7 @@ mod tests {
         for stream in 0..num_streams {
             let packet = QueuedPacket {
                 data: Bytes::from(vec![0u8; 8]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: stream,
                 priority: false,
                 queued_at: Instant::now(),
@@ -1795,7 +1969,7 @@ mod tests {
         // Stream 0 with 1 packet (quantum = 1, so first pass drains it)
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"s0"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 0,
             priority: false,
             queued_at: Instant::now(),
@@ -1808,7 +1982,7 @@ mod tests {
         // Now add stream 1 while the scheduler is "between rounds"
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"s1"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 1,
             priority: false,
             queued_at: Instant::now(),
@@ -1844,7 +2018,7 @@ mod tests {
         // enqueue → new stream → rebuild.
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"a"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 7,
             priority: false,
             queued_at: Instant::now(),
@@ -1861,7 +2035,7 @@ mod tests {
         let before_existing = Arc::as_ptr(&scheduler.active_streams.load_full());
         scheduler.enqueue(QueuedPacket {
             data: Bytes::from_static(b"b"),
-            dest: "127.0.0.1:9000".parse().unwrap(),
+            dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
             stream_id: 7,
             priority: false,
             queued_at: Instant::now(),
@@ -1951,7 +2125,7 @@ mod tests {
                     let stream_id = t * 100_000 + i;
                     sched.enqueue(QueuedPacket {
                         data: Bytes::from_static(b"x"),
-                        dest: "127.0.0.1:9000".parse().unwrap(),
+                        dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                         stream_id,
                         priority: false,
                         queued_at: Instant::now(),
@@ -2008,7 +2182,7 @@ mod tests {
         scheduler.set_stream_weight(1, 1);
         scheduler.set_stream_weight(2, 4);
 
-        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         // Fill both streams with 8 packets each.
         for stream_id in [1u64, 2u64] {
             for _ in 0..8 {
@@ -2065,7 +2239,7 @@ mod tests {
         scheduler.set_stream_weight(bulk, 1);
         scheduler.set_stream_weight(interactive, 1);
 
-        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let dest: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
         // A transfer-scale backlog on the bulk stream …
         let bulk_backlog = 260usize;
         for _ in 0..bulk_backlog {
@@ -2149,7 +2323,7 @@ mod tests {
         for stream in 0..5u64 {
             scheduler.enqueue(QueuedPacket {
                 data: Bytes::from(vec![0u8; 8]),
-                dest: "127.0.0.1:9000".parse().unwrap(),
+                dest: PeerAddr::Udp("127.0.0.1:9000".parse().unwrap()),
                 stream_id: stream,
                 priority: false,
                 queued_at: Instant::now(),

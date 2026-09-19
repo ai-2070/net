@@ -48,6 +48,12 @@ pub use net::adapter::net::behavior::deck::{
     PeerCounts, SimulatedIceProposal, SnapshotStream, StatusSummary, StatusSummaryStream,
     SubnetRollup,
 };
+// Stage 6: the ICE attempt ledger behind `ice_direct / ice_attempted`.
+// Lives in the core's `rtc` module rather than beside `GatewayStats`
+// on purpose: `behavior::deck` needs `meshos`, and the ledger must be
+// readable in a `webrtc` build that has no cluster-behavior engine.
+#[cfg(feature = "webrtc")]
+pub use net::adapter::net::rtc::IceStats;
 // Pure ICE simulator — runs a `BlastRadius` against any
 // `MeshOsSnapshot` + `IceActionProposal` without touching the
 // runtime. Used by the deck binary to preview blast radius

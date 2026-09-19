@@ -1,0 +1,7 @@
+# `tsc` + esbuild output, and the leaf wasm the build copies in beside
+# it. CI builds these from source; the repo never carries them.
+dist/
+
+# The demo installs Three.js into its own tree; it is the demo's
+# dependency, not the package's, and it is never committed.
+demo/node_modules/

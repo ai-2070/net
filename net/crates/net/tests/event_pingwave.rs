@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
 
 fn slow_heartbeat_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -121,7 +121,7 @@ async fn new_session_installs_multihop_route_at_flood_speed() {
     let b_addr_for_c = b.local_addr();
     assert_eq!(
         next_hop,
-        Some(b_addr_for_c),
+        Some(PeerAddr::Udp(b_addr_for_c)),
         "C's route to A must go via B (the forwarding peer)",
     );
 }

@@ -110,6 +110,7 @@ from net_sdk.mesh import (
     MeshStream,
     NotConnectedError,
     Reliability,
+    SessionSupersededError,
     StreamStats,
 )
 from net_sdk.node import NetNode
@@ -132,6 +133,7 @@ __all__ = [
     "Reliability",
     "BackpressureError",
     "NotConnectedError",
+    "SessionSupersededError",
     # Capability-aggregation surface (Phase 6c).
     "Aggregation",
     "AggregationCls",

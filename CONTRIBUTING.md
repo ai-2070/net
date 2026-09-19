@@ -64,6 +64,38 @@ cargo test --lib
 
 Go bindings live in `go/` (`go test ./...`), the web docs in `web/`.
 
+### The `webrtc` feature needs a C toolchain (off by default)
+
+`--features webrtc` (Stage 3: the native WebRTC DataChannel
+transport) is the only feature in this repository whose build is not
+pure Rust. `str0m`'s pinned `rust-crypto` configuration still resolves
+`aws-lc-rs` / `aws-lc-sys`, whose build script compiles C:
+
+- **cmake** on `PATH`;
+- a C compiler — MSVC (`cl.exe`, via a Developer Prompt or
+  `vcvarsall`) on Windows, `gcc`/`clang` elsewhere;
+- **NASM** on x86_64, or the `aws-lc-sys/prebuilt-nasm` feature.
+
+Nothing else in the tree needs any of that, and a default
+`cargo build` / `cargo test` stays C-free — which is the reason the
+feature is off by default rather than merely optional. CI keeps it in
+one Linux-only job (`webrtc-feature`), where the runner already has
+cmake and gcc, so no default job pays the cost; that job also prints
+the dependency-build seconds so the trade-off can be revisited
+against a measurement.
+
+If you are only touching non-RTC code you can ignore all of this. If
+you are working on `src/adapter/net/rtc/`, the two harnesses are:
+
+```bash
+cargo test --features "webrtc fixtures" --test rtc_loopback
+cargo test --features "webrtc fixtures" --test rtc_backpressure
+```
+
+`fixtures` is required: `connect_rtc_loopback` and the driver's
+fault-injection hooks are `cfg(any(test, feature = "fixtures"))` so a
+production build cannot reach them.
+
 ### Faster local builds (optional: sccache)
 
 The pre-push checklist rebuilds the workspace several times over — three clippy
@@ -100,42 +132,31 @@ the wrapper before it compiles anything, so a committed `rustc-wrapper` setting
 is a hard build failure (`could not execute process 'sccache rustc -vV'`) for
 anyone without the binary installed. Keep it in your shell.
 
-### Focused runs, and why they should use nextest
+### Debug info: the dev profile ships line tables, not full DWARF
 
-Use `cargo nextest run` rather than `cargo test` whenever you are running one
-named test or one module — a RED/GREEN mutation loop, a bisect, a "does this
-witness still fail without the fix" check.
+`[profile.dev]` sets `debug = "line-tables-only"`
+(`net/crates/net/Cargo.toml`). This workspace links a large number of
+integration test binaries against one big crate, and full debug info
+dominated both link time and artifact size. Panics still resolve to
+file:line; what you lose is variable inspection in a debugger.
+
+Turn it back on for the target you are actually stepping through, without
+editing the manifest:
 
 ```bash
-# One named test.
-cargo nextest run --lib --features "$UNIT_FEATURES" --no-tests=fail --retries 0 \
-  -E 'test(=adapter::net::mesh::org_routing_wiring_tests::the_exact_test)'
-
-# A whole module.
-cargo nextest run --lib --features "$UNIT_FEATURES" --no-tests=fail --retries 0 \
-  -E 'test(/^adapter::net::mesh::org_routing_wiring_tests::/)'
+cargo --config 'profile.dev.debug=2' nextest run --test <name> --features "..."
+CARGO_PROFILE_DEV_DEBUG=2 cargo test --lib --features "$UNIT_FEATURES" <filter>
 ```
 
-`$UNIT_FEATURES` is the feature list the `unit-tests` job pins in
-`.github/workflows/ci.yml`; a narrower set silently compiles feature-gated
-modules to nothing.
+Both re-fingerprint the crates they touch, so point them at one target rather
+than the whole workspace. The measurements behind this default are in
+`docs/internal/misc/PERF_AUDIT_2026_09_13_TEST_EXECUTION.md`.
 
-Why these flags, specifically:
+### Running the tests
 
-- **`--no-tests=fail`.** `cargo test -- <filter>` exits **0** when the filter
-  matches nothing, so a typo or a renamed module is indistinguishable from a
-  pass. This has already turned a real CI job into a green no-op once. An empty
-  filterset must be an error.
-- **`--retries 0`.** `.config/nextest.toml` grants two retries by default to
-  absorb transport-saturation noise in the multi-node suites. That is exactly
-  wrong for a mutation loop: you want the first attempt's verdict, not a
-  best-of-three.
-- **Process isolation and the `terminate-after` timeout** come along for free,
-  so a mutation that hangs a test fails by name instead of stalling.
-
-For a batch of mutations, reuse ONE detached worktree and ONE target directory
-across the whole batch. Building a fresh target dir per mutation is where a
-RED/GREEN loop actually goes slow — not in the test execution.
+See [TESTS.md](TESTS.md): which commands to use, the `cargo t` / `cargo tl`
+aliases that keep a session on one feature graph, why an empty test filter
+must be an error, and what is actually slow (compilation, not execution).
 
 ## Reporting security issues
 

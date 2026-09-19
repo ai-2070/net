@@ -1,0 +1,5674 @@
+//! Session and stream state management for Net.
+//!
+//! This module manages session state after Noise handshake completion,
+//! including per-stream state for multiplexing.
+
+use bytes::Bytes;
+use crossbeam_queue::SegQueue;
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+// Monotonic readings go through the `Clock` seam (see
+// `crate::clock`): plain `std::time::SystemClock::now()` panics at
+// runtime on wasm32.
+use crate::clock::{Clock, Instant, SystemClock};
+
+use crate::event::StoredEvent;
+
+use crate::crypto::{PacketCipher, SessionKeys};
+use crate::peer_addr::PeerAddr;
+use crate::route_hop::SharedHopReplayWindow;
+// `SharedPacketPool` is intentionally absent — `NetSession` uses
+// only `SharedLocalPool` as the single TX-side AEAD source.
+use crate::parsed_packet::ParsedPacket;
+use crate::pool::SharedLocalPool;
+use crate::reliability::{
+    create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor, StreamMode,
+};
+use crate::stream::DEFAULT_STREAM_WINDOW_BYTES;
+
+/// TIME_WAIT-style quarantine window after `close_stream`. A
+/// `StreamWindow` grant that arrives for a stream closed within
+/// this window is dropped — protects a reopened stream from
+/// being credited by in-flight grants minted against the previous
+/// lifetime.
+///
+/// Sized to comfortably exceed grant RTT on LAN / typical mesh
+/// deployments. Callers that rapidly reopen the same `stream_id`
+/// will see a brief stall (the reopened stream won't receive
+/// grants until the quarantine expires) — an acceptable trade-off
+/// for correct credit accounting across lifetimes.
+pub const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
+
+/// One gapped stream's proactive-tick report (STREAM_ACK_BATCHING
+/// R-4), produced by [`NetSession::collect_gap_reports`] under a
+/// single reliability lock per stream so the NACK and the SACK ranges
+/// describe the same received-range snapshot.
+#[derive(Debug, Clone)]
+pub struct GapReport {
+    /// Stream the gap is on.
+    pub stream_id: u64,
+    /// Legacy negative ack for the gap (always present — every gapped
+    /// stream emits one, capability-independent).
+    pub nack: crate::protocol::NackPayload,
+    /// Cumulative ack (`next_expected`) captured in the same snapshot
+    /// as `ranges`, so the outgoing `StreamAckRanges` is internally
+    /// consistent (every range strictly above `ack_seq`).
+    pub ack_seq: u64,
+    /// Positive SACK ranges, newest-first. Empty when the peer does
+    /// not advertise the ack-ranges capability (`want_ranges = false`).
+    pub ranges: Vec<(u64, u64)>,
+}
+
+/// Session state after handshake completion.
+pub struct NetSession {
+    /// Session ID (derived from handshake)
+    session_id: u64,
+    /// Remote peer address
+    peer_addr: PeerAddr,
+    /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
+    rx_cipher: PacketCipher,
+    // No `tx_key` field: `thread_local_pool` is the only surface
+    // that holds the TX key on a live `NetSession`. Storing an
+    // extra copy here would re-open a cross-pool nonce-reuse
+    // hazard — independent counters under the same ChaCha20-
+    // Poly1305 key — and would only be read back through a
+    // `tx_key()` accessor whose only consumers are misuses (e.g.
+    // a fresh `PacketBuilder::new` that bypasses the
+    // thread-local pool's nonce sequencing).
+    /// Per-stream state
+    streams: DashMap<u64, StreamState>,
+    /// Out-of-order arrivals this session's reliable streams are
+    /// holding, summed across streams.
+    ///
+    /// Exists so the dispatch path's post-delivery release check is
+    /// one relaxed load on the overwhelmingly common path — no
+    /// reordering in flight, nothing held, nothing to release —
+    /// instead of a `DashMap` probe plus two mutex acquisitions per
+    /// inbound packet. Maintained by
+    /// [`Self::hold_in_order_frame`] / [`Self::take_in_order_frame`]
+    /// and by every path that drops a hold.
+    inorder_held: AtomicUsize,
+    /// Last activity timestamp (for session timeout)
+    last_activity: AtomicU64,
+    /// Thread-local pool for zero-contention hot path. The single
+    /// authoritative source of TX-side AEAD encryptions for this
+    /// session — see the `tx_key` comment above for the
+    /// cross-pool nonce-reuse rationale.
+    thread_local_pool: SharedLocalPool,
+    /// Default reliability mode for new streams
+    default_reliable: bool,
+    /// Session is active.
+    ///
+    /// A LOCAL, ADVISORY marker, and deliberately nothing more: it
+    /// means "this handle is not currently considered live here". It
+    /// is set by session replacement, by shutdown, by tests, and by
+    /// the SDK on a session it no longer wants to treat as live —
+    /// while the peer remains a legitimate selection and traffic on
+    /// the session keeps flowing. See
+    /// [`Self::is_receive_lifetime_retired`] for the DIFFERENT
+    /// question "is this incarnation's receive lifetime over", which
+    /// must never be answered with this flag.
+    active: AtomicBool,
+    /// This incarnation's RECEIVE LIFETIME is over (**NR3**).
+    ///
+    /// One-way, expires with nothing, and orthogonal to `active`.
+    /// Where `active` says "not considered live right now", this says
+    /// "this exact incarnation has been retired: nothing captured
+    /// against it may be decrypted, dispatched or reassembled, ever
+    /// again". Only the retirement paths set it — session
+    /// replacement/eviction and node shutdown — and it is the
+    /// authority the ingress uses to refuse a frame that was admitted
+    /// against this handle before the retirement landed.
+    ///
+    /// The two are separate ON PURPOSE. They were briefly the same
+    /// flag, and the conflation broke a real contract: a session the
+    /// SDK had locally deactivated — still pinned, still the sensed
+    /// selection, still sending — had its peer's replies silently
+    /// refused at its own ingress. `active` has many local writers
+    /// and no retirement meaning; this flag has exactly one meaning
+    /// and only retirement writes it.
+    receive_lifetime_retired: AtomicBool,
+    /// Monotonic generator for per-`StreamState` epochs. Each opened
+    /// stream captures a unique epoch at construction time so that
+    /// stale `Stream` handles or `TxSlotGuard`s from a previous
+    /// open/close cycle can't silently operate on a new stream that
+    /// reuses the same `stream_id`.
+    stream_epoch_counter: AtomicU64,
+    /// Stream IDs closed within the last `GRANT_QUARANTINE_WINDOW`.
+    /// Used to drop in-flight `StreamWindow` grants minted against a
+    /// previous lifetime of a `stream_id` so they can't credit a
+    /// subsequent reopen. Entries are inserted on `close_stream` and
+    /// lazily garbage-collected by `is_grant_quarantined` on read.
+    recently_closed: DashMap<u64, Instant>,
+    /// Streams whose RECEIVE half ended locally and whose peer has
+    /// not been told yet (NR2/NR4).
+    ///
+    /// The send-side give-up already has a channel — the per-stream
+    /// `take_failed` flag that [`Self::take_failed_stream_ids`]
+    /// collects — but a receive-half terminal has no stream state
+    /// left to carry it: the reason it is terminal is that the state
+    /// was destroyed (a reassembly group that acknowledged bytes it
+    /// can never deliver, a cap sweep evicting frames this receiver
+    /// alone still held). So it is recorded on the session, and the
+    /// retransmit tick drains it into the same `StreamReset` the
+    /// send-side give-up emits. Bounded by the number of distinct
+    /// stream ids, deduplicated on push: one stream ends once.
+    receive_terminals: parking_lot::Mutex<Vec<u64>>,
+    /// Monotonic sequence counter for subprotocol control packets
+    /// (grants, membership acks, etc.) that don't belong to a
+    /// user-opened stream. Using a separate counter keeps control
+    /// traffic out of the `streams` map, so a caller who opens a
+    /// stream with a numerically-equal id (e.g., `0x0B00`, the
+    /// `SUBPROTOCOL_STREAM_WINDOW` constant) can't have their
+    /// sequence space polluted by control packets.
+    control_tx_seq: AtomicU64,
+    /// Per-session cache of the resolved peer `NodeId`.
+    ///
+    /// Pre-fix [discovery-routing perf #108 in
+    /// `docs/internal/performance/net-discovery-routing-analysis.md`] the
+    /// inbound dispatcher's RPC hook ran the
+    /// `addr_to_node → peers.get → session_id-match → fallback
+    /// O(N) peer scan` resolution chain on **every** inbound RPC
+    /// packet. The session itself is stable — once we've resolved
+    /// `session → node_id` for an established session, that
+    /// mapping doesn't change.
+    ///
+    /// The cache uses `0` as the "unresolved" sentinel — real
+    /// `NodeId`s are non-zero in production (`0` is the test /
+    /// loopback sentinel that already gets rejected by the
+    /// dispatcher's `Some(from_node) else { drop }` guard).
+    /// `Relaxed` ordering is enough: a tear in the published
+    /// value would only manifest as a re-resolution on the next
+    /// packet (which then re-publishes the same value), and the
+    /// resolver itself is the source of truth.
+    cached_node_id: AtomicU64,
+    /// Key for MACing route-hop envelopes this node sends on this
+    /// edge. See [`Self::seal_route_hop`].
+    route_hop_tx_key: [u8; 32],
+    /// Key for verifying route-hop envelopes received on this edge.
+    route_hop_rx_key: [u8; 32],
+    /// This edge's outbound hop sequence — separate from the packet
+    /// AEAD counter by design.
+    route_hop_tx_seq: AtomicU64,
+    /// Sliding replay window over inbound hop sequences.
+    ///
+    /// Lock-free single-writer state, not a mutex: the production
+    /// protected-ingress path is single-consumer (one receive loop,
+    /// synchronous dispatch), so admission never contends there, and
+    /// the ordinary path pays no locking. A second concurrent caller
+    /// — only reachable by breaking that ownership rule — is refused
+    /// immediately and its packet dropped
+    /// ([`crate::route_hop::RouteHopError::Contended`]).
+    route_hop_replay: SharedHopReplayWindow,
+}
+
+/// Sentinel `stream_id` used in the header of subprotocol control
+/// packets (credit grants, etc.). Chosen at the top of the u64
+/// range so it cannot collide with practical user-chosen ids or
+/// with the output of `stream_id_from_key`. The receiver dispatches
+/// these packets by `subprotocol_id`, not `stream_id`, so the
+/// sentinel is purely there to keep sender-side per-stream state
+/// clean.
+pub const CONTROL_STREAM_ID: u64 = u64::MAX;
+
+impl NetSession {
+    /// Create a new session from handshake results
+    pub fn new(
+        keys: SessionKeys,
+        peer_addr: PeerAddr,
+        pool_size: usize,
+        default_reliable: bool,
+    ) -> Self {
+        let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
+
+        // Only `thread_local_pool` is constructed with the TX key.
+        // Independently constructing a `tx_cipher` and a
+        // `packet_pool` with the same key but independent counters
+        // would re-open a cross-pool nonce-reuse hazard — see the
+        // `tx_key` comment above. The data path uses
+        // `thread_local_pool` exclusively.
+        let thread_local_pool =
+            crate::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
+
+        // `tx_key` is consumed only by `shared_local_pool` above.
+        // Copying it into a struct field would be dead storage and
+        // a cross-pool footgun (see the `tx_key` comment on the
+        // struct above).
+        Self {
+            session_id: keys.session_id,
+            peer_addr,
+            rx_cipher,
+            streams: DashMap::new(),
+            inorder_held: AtomicUsize::new(0),
+            last_activity: AtomicU64::new(current_timestamp()),
+            thread_local_pool,
+            default_reliable,
+            active: AtomicBool::new(true),
+            receive_lifetime_retired: AtomicBool::new(false),
+            stream_epoch_counter: AtomicU64::new(1),
+            recently_closed: DashMap::new(),
+            receive_terminals: parking_lot::Mutex::new(Vec::new()),
+            control_tx_seq: AtomicU64::new(0),
+            cached_node_id: AtomicU64::new(0),
+            // Unlike `tx_key`, the route-hop keys ARE retained: a
+            // relay MACs every forwarded hop, and a MAC has no
+            // nonce-reuse hazard to route around — the sequence is an
+            // explicit transcript field, not derived counter state.
+            route_hop_tx_key: keys.route_hop_tx_key,
+            route_hop_rx_key: keys.route_hop_rx_key,
+            route_hop_tx_seq: AtomicU64::new(0),
+            route_hop_replay: SharedHopReplayWindow::new(),
+        }
+    }
+
+    /// Wrap `inner` in an authenticated route-hop envelope for this
+    /// edge, writing into a caller-owned buffer
+    /// (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// The sequence is this edge's own, independent of the packet
+    /// AEAD counter, so hop accounting can never disturb the
+    /// end-to-end session being carried.
+    ///
+    /// This is the form the forwarding path uses: the buffer belongs
+    /// to the forwarder and is reused across packets, so relaying does
+    /// not allocate. Size it with
+    /// [`route_hop::sealed_len`](crate::route_hop::sealed_len).
+    ///
+    /// A too-small buffer is refused *before* a sequence is taken —
+    /// burning one on a local sizing mistake would open a gap in this
+    /// edge's sequence space for no reason.
+    pub fn seal_route_hop_into(
+        &self,
+        out: &mut [u8],
+        header: &crate::route_codec::RoutingHeader,
+        inner: &[u8],
+    ) -> Result<usize, crate::route_hop::RouteHopError> {
+        if out.len() < crate::route_hop::sealed_len(inner.len()) {
+            return Err(crate::route_hop::RouteHopError::BufferTooSmall);
+        }
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        crate::route_hop::seal_into(
+            out,
+            &self.route_hop_tx_key,
+            self.session_id,
+            seq,
+            header,
+            inner,
+        )
+    }
+
+    /// Allocating form of [`Self::seal_route_hop_into`], for callers
+    /// off the forwarding path.
+    pub fn seal_route_hop(
+        &self,
+        header: &crate::route_codec::RoutingHeader,
+        inner: &[u8],
+    ) -> Vec<u8> {
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        crate::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
+    }
+
+    /// Verify an inbound route-hop envelope and admit its sequence
+    /// exactly once.
+    ///
+    /// Returns the opened hop on success. A bad tag is rejected before
+    /// the replay window is touched, so a forged packet cannot burn a
+    /// sequence slot the legitimate peer still needs.
+    pub fn open_route_hop<'a>(
+        &self,
+        buf: &'a [u8],
+    ) -> Result<crate::route_hop::OpenedHop<'a>, crate::route_hop::RouteHopError> {
+        let opened = crate::route_hop::open(&self.route_hop_rx_key, buf)?;
+        self.route_hop_replay.admit(opened.hop_sequence)?;
+        Ok(opened)
+    }
+
+    /// Read the cached peer `NodeId` resolution. Returns `None`
+    /// until the dispatcher's first resolution call publishes a
+    /// value via [`Self::cache_node_id`]. See the field doc for
+    /// the perf rationale.
+    #[inline]
+    pub fn cached_node_id(&self) -> Option<u64> {
+        match self.cached_node_id.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Publish the resolved peer `NodeId` for subsequent calls.
+    /// Idempotent — concurrent first-resolution callers all write
+    /// the same value (the resolver is deterministic for a given
+    /// `session_id`), so a `store` over an existing identical value
+    /// is correct. Callers should pass non-zero `node_id`; `0` is
+    /// the reserved "unresolved" sentinel and is a no-op.
+    #[inline]
+    pub fn cache_node_id(&self, node_id: u64) {
+        if node_id != 0 {
+            self.cached_node_id.store(node_id, Ordering::Relaxed);
+        }
+    }
+
+    /// Allocate the next sequence number for a subprotocol control
+    /// packet. Uses a session-level counter separate from any
+    /// user stream's sequence space — see `CONTROL_STREAM_ID`.
+    #[inline]
+    pub fn next_control_tx_seq(&self) -> u64 {
+        self.control_tx_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Allocate a unique epoch for a freshly-created stream.
+    ///
+    /// Monotonic **within one session** — a stream closed and reopened
+    /// on the same session gets a new epoch, which is how stale
+    /// `Stream` handles, `TxSlotGuard`s and `ControlDebitGuard`s are
+    /// kept off a different lifetime of the same `stream_id` *on that
+    /// session*.
+    ///
+    /// Every creation path allocates one, **including the implicit
+    /// ones** ([`Self::implicit_stream_state`]). An implicit stream is
+    /// exactly as replaceable as an explicitly opened one — its id is
+    /// derived from a channel or a subprotocol, so close+recreate
+    /// under the same id is the normal case — and when implicit
+    /// creation left the epoch at a shared sentinel, a predecessor's
+    /// uncommitted `ControlDebitGuard` passed the equality check
+    /// against its *successor* and refunded the successor's committed
+    /// bytes plus its sequence (Kyra R3-5).
+    ///
+    /// It says nothing across sessions. The counter restarts at 1 for
+    /// every `NetSession`, so the first stream of a successor session
+    /// carries the same epoch as the first stream of the session it
+    /// replaced. A handle is therefore only safe to resolve after its
+    /// recorded session incarnation has been matched against
+    /// [`Self::session_id`] — which is what
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] requires and
+    /// `MeshNode::send_on_stream` / `close_stream` check before they
+    /// touch any stream state.
+    #[inline]
+    fn next_stream_epoch(&self) -> u64 {
+        self.stream_epoch_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Build the `StreamState` for an **implicit** creation: a control
+    /// producer or an arriving packet touching a `stream_id` nobody
+    /// explicitly opened.
+    ///
+    /// Identical to `StreamState::new(reliable)` except that it
+    /// allocates a lifetime id from the same counter
+    /// `open_stream_full` uses. See [`Self::next_stream_epoch`] for
+    /// why sharing one sentinel across implicit lifetimes is not an
+    /// ownership identity.
+    #[inline]
+    fn implicit_stream_state(&self, reliable: bool) -> StreamState {
+        StreamState::new_full_with_epoch(
+            reliable,
+            1,
+            DEFAULT_STREAM_WINDOW_BYTES,
+            self.next_stream_epoch(),
+        )
+    }
+
+    /// Get the session ID
+    #[inline]
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Get the peer address
+    #[inline]
+    pub fn peer_addr(&self) -> PeerAddr {
+        self.peer_addr
+    }
+
+    // No `tx_key()` accessor exists — it would be a public
+    // footgun with no legitimate callers. Any caller using
+    // `session.tx_key()` to construct a fresh `PacketBuilder`
+    // would re-introduce a cross-pool nonce-reuse hazard
+    // (independent counters under the same ChaCha20-Poly1305 key).
+    // All TX-side AEAD operations flow through `thread_local_pool`
+    // via `build_heartbeat` and the normal `send_*` paths.
+
+    /// Get the RX cipher
+    #[inline]
+    pub fn rx_cipher(&self) -> &PacketCipher {
+        &self.rx_cipher
+    }
+
+    /// Get or create stream state.
+    ///
+    /// A stream created here is *implicit* — nobody opened it through
+    /// the typed handle API — but it still gets a unique lifetime id,
+    /// because guards minted against it (notably
+    /// [`ControlDebitGuard`]) compare that id before they refund.
+    pub fn get_or_create_stream(
+        &self,
+        stream_id: u64,
+    ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
+        self.streams
+            .entry(stream_id)
+            .or_insert_with(|| self.implicit_stream_state(self.default_reliable))
+    }
+
+    /// Allocate the next TX sequence on `stream_id`, debit
+    /// `wire_bytes` against the same stream's send ledger under one
+    /// map lookup, and return the debit **bound to the lifetime of
+    /// the send it pays for**.
+    ///
+    /// The control-plane counterpart of the admission path
+    /// ([`Self::try_acquire_tx_credit_for_lifetime`], which returns
+    /// credit and sequence together for exactly this reason): a
+    /// producer that took its sequence from one lookup and its debit
+    /// from another could have a close+reopen land in between and
+    /// charge the predecessor's ledger for the successor's sequence.
+    ///
+    /// See [`StreamState::note_tx_bytes_sent`] for why the debit has
+    /// no refusal path. `wire_bytes` must be what the *receiver*
+    /// charges for the same packet — payload plus fixed per-packet
+    /// wire overhead — or the two halves of the ledger drift.
+    /// `wire_bytes == 0` allocates the sequence and charges nothing,
+    /// for the producers whose frames the receiver does not account.
+    ///
+    /// The caller MUST [`ControlDebitGuard::commit`] the returned
+    /// guard once the transport has accepted the packet. Dropping it
+    /// uncommitted is the never-admitted path: the bytes go back and
+    /// the sequence is reclaimed. See [`ControlDebitGuard`] for why
+    /// accepted-then-lost is deliberately not that path.
+    pub fn next_tx_seq_charged(
+        self: &Arc<Self>,
+        stream_id: u64,
+        wire_bytes: u32,
+    ) -> ControlDebitGuard {
+        let (epoch, seq) = {
+            let stream = self.get_or_create_stream(stream_id);
+            stream.note_tx_bytes_sent(wire_bytes);
+            (stream.epoch(), stream.next_tx_seq())
+        };
+        ControlDebitGuard {
+            session: Arc::clone(self),
+            stream_id,
+            epoch,
+            bytes: wire_bytes,
+            seq,
+            active: true,
+        }
+    }
+
+    /// Like [`Self::get_or_create_stream`], but the receiver-side stream
+    /// is made reliable when the arriving packet is `RELIABLE`-flagged
+    /// — the sender's reliability is a property of the traffic, not of
+    /// the receiver's `default_reliable`. Without this the receive
+    /// stream is `FireAndForget` and never builds a NACK, so a
+    /// reliable sender's lost packets are unrecoverable.
+    ///
+    /// This holds for an **existing** stream too, not only at
+    /// first-touch: a channel's publish stream id is derived from the
+    /// channel, so fire-and-forget and reliable traffic to one
+    /// channel share one id, and whichever arrived first used to pin
+    /// the mode for the session's lifetime. See
+    /// [`StreamState::ensure_reliable`] — the upgrade is one-way, so
+    /// unreliable traffic on a reliable stream changes nothing.
+    ///
+    /// `mode_boundary` is the arriving packet's stated boundary —
+    /// `Some(header.sequence)` exactly when it carries
+    /// [`PacketFlags::MODE_BOUNDARY`](crate::protocol::PacketFlags::MODE_BOUNDARY)
+    /// — and it is applied HERE, on the one call every receive path
+    /// already makes, for two reasons.
+    ///
+    /// It has to be applied **before** the sequence is offered to
+    /// the reliability mode: the boundary decides whether the
+    /// sequences below it are a conceded fire-and-forget prefix or a
+    /// reliable gap this receiver must keep NACKing, so a boundary
+    /// applied afterwards measures the arrival against a cursor it
+    /// was about to move.
+    ///
+    /// And it has to be applied by the **wire**, not by each
+    /// receiver. A receive path that promotes with
+    /// [`StreamState::ensure_reliable`] alone gets the conservative
+    /// ASSUMED boundary — its own contiguous frontier — which names
+    /// the sender's last fire-and-forget sequence whenever that
+    /// sequence was lost. Nothing can ever rebuild it (its sender
+    /// retained no descriptor), so every reliable arrival above it
+    /// is held behind a permanent hole, the cumulative ack never
+    /// advances, and the sender's retransmits exhaust into a typed
+    /// stream failure on a stream that lost nothing reliable. That
+    /// was live: the native core promoted here and dropped the
+    /// signal on the floor, because the boundary was applied by one
+    /// caller instead of by the call they share.
+    pub fn get_or_create_stream_for_packet(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+        mode_boundary: Option<u64>,
+    ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| self.implicit_stream_state(reliable));
+        match mode_boundary {
+            // A stated boundary promotes as well as places: it is
+            // the sender saying "reliable from here", which is
+            // strictly more than `ensure_reliable` would have
+            // inferred from the flag alone.
+            Some(boundary) => {
+                stream.ensure_reliable_at(boundary);
+            }
+            None if reliable => {
+                stream.ensure_reliable();
+            }
+            None => {}
+        }
+        stream
+    }
+
+    /// Collect retransmit descriptors for every reliable stream whose
+    /// oldest unacked packet has exceeded its RTO. Drives the timeout
+    /// backstop (STREAM_RETRANSMIT D-4) that recovers tail loss — the
+    /// last packets dropped, with no later arrival to trigger a
+    /// receiver NACK. Each call advances the per-packet retry clock, so
+    /// a descriptor isn't re-emitted until another RTO elapses, and a
+    /// packet past `max_retries` is dropped from the window.
+    pub fn collect_timed_out_retransmits(&self) -> Vec<Arc<RetransmitDescriptor>> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            let mut due = entry.value().with_reliability(|r| r.get_timed_out());
+            out.append(&mut due);
+        }
+        out
+    }
+
+    /// Collect the per-stream gap report for every stream that
+    /// currently has a gap (H-4 + STREAM_ACK_BATCHING R-4), in ONE
+    /// walk taking each stream's reliability lock exactly once.
+    ///
+    /// The proactive retransmit tick needs two things for a gapped
+    /// stream — the legacy NACK and (for capable peers) the positive
+    /// SACK ranges — and both derive from the same received-range
+    /// index (`build_nack` and `build_ack_ranges` are non-empty under
+    /// the identical `has_gaps()` condition). Snapshotting them under
+    /// one lock keeps a tick's NACK and SACK for a stream mutually
+    /// consistent and halves the tick's per-stream lock/DashMap cost
+    /// versus the old two-walk shape (`collect_gap_nacks` +
+    /// `collect_ack_ranges`).
+    ///
+    /// `ranges` is only built when `want_ranges` (the peer advertises
+    /// the ack-ranges capability); otherwise it is left empty so a
+    /// non-advertising peer pays nothing for the SACK build. Streams
+    /// without gaps contribute nothing — the grant's piggybacked
+    /// `ack_seq` already covers the contiguous case.
+    pub fn collect_gap_reports(&self, want_ranges: bool, max_ranges: usize) -> Vec<GapReport> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            let report = entry.value().with_reliability(|r| {
+                r.build_nack().map(|nack| {
+                    let ranges = if want_ranges {
+                        r.build_ack_ranges(max_ranges)
+                    } else {
+                        Vec::new()
+                    };
+                    (nack, r.rx_ack_seq(), ranges)
+                })
+            });
+            if let Some((nack, ack_seq, ranges)) = report {
+                out.push(GapReport {
+                    stream_id: *entry.key(),
+                    nack,
+                    ack_seq,
+                    ranges,
+                });
+            }
+        }
+        out
+    }
+
+    /// Take-and-clear the "given up" flag across all streams, returning
+    /// the ids of streams whose reliable layer exhausted retransmits on
+    /// some packet (H-3). The caller signals a reset to the peer so the
+    /// receiver fails fast instead of stalling to a timeout.
+    pub fn take_failed_stream_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            if entry.value().with_reliability(|r| r.take_failed()) {
+                out.push(*entry.key());
+            }
+        }
+        out
+    }
+
+    /// Record that `stream_id`'s RECEIVE half ended locally, so the
+    /// peer is told instead of waiting on data that will never come
+    /// (NR2/NR4).
+    ///
+    /// Idempotent per stream: a burst of destroyed groups on one
+    /// stream is one terminal, exactly as the leaf's receive-half
+    /// latch produces one `StreamFailed` per stream rather than one
+    /// per group.
+    pub fn note_receive_terminal(&self, stream_id: u64) {
+        let mut pending = self.receive_terminals.lock();
+        if !pending.contains(&stream_id) {
+            pending.push(stream_id);
+        }
+    }
+
+    /// Take-and-clear the receive-half terminals this session owes
+    /// its peer. Drained by the retransmit tick, which emits the
+    /// `StreamReset` for each.
+    pub fn take_receive_terminals(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.receive_terminals.lock())
+    }
+
+    /// Look up stream state without creating it. Returns `None` if the
+    /// stream was never opened or has been closed.
+    pub fn try_stream(
+        &self,
+        stream_id: u64,
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, StreamState>> {
+        self.streams.get(&stream_id)
+    }
+
+    /// Try to acquire `bytes` of send credit on `stream_id` with RAII
+    /// refund semantics.
+    ///
+    /// Returns:
+    ///   * [`TxAdmit::Acquired`] with a [`TxSlotGuard`] that refunds
+    ///     `bytes` back to `tx_credit_remaining` when dropped —
+    ///     including on async cancellation, panic, and early return —
+    ///     unless the caller invokes [`TxSlotGuard::commit`] to
+    ///     suppress the refund after a successful socket send. This
+    ///     is the cure for the credit-leak that a plain "decrement /
+    ///     await / maybe-refund" shape would hit when the sending
+    ///     future is dropped mid-`.await` (e.g., `tokio::select!`
+    ///     cancel).
+    ///   * [`TxAdmit::WindowFull`] if `tx_credit_remaining` is below
+    ///     `bytes`. `backpressure_events` has already been bumped.
+    ///   * [`TxAdmit::StreamClosed`] if the stream isn't registered
+    ///     (never opened, closed, or idle-evicted).
+    pub fn try_acquire_tx_credit_guard(self: &Arc<Self>, stream_id: u64, bytes: u32) -> TxAdmit {
+        self.try_acquire_tx_credit_inner(stream_id, None, bytes)
+    }
+
+    /// Like [`Self::try_acquire_tx_credit_guard`], but admits only for
+    /// one exact stream lifetime: the caller's `session_id` must be
+    /// this session's own incarnation, and the live `StreamState`'s
+    /// epoch must equal `expected_epoch`.
+    ///
+    /// Both halves are needed and neither implies the other. The epoch
+    /// catches a close+reopen *within* one session; the session id
+    /// catches a handle minted against a session that has since been
+    /// replaced — whose first stream reuses epoch 1 and would
+    /// otherwise admit here (see `next_stream_epoch`, private).
+    ///
+    /// Use from the typed-handle `send_on_stream` path.
+    pub fn try_acquire_tx_credit_for_lifetime(
+        self: &Arc<Self>,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+        bytes: u32,
+    ) -> TxAdmit {
+        if session_id != self.session_id {
+            return TxAdmit::SessionSuperseded;
+        }
+        self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
+    }
+
+    /// Like [`Self::try_acquire_tx_credit_guard`], but additionally
+    /// rejects the admission if the live `StreamState`'s epoch
+    /// differs from `expected_epoch`.
+    ///
+    /// **Epoch-only, and therefore unfenced against peer
+    /// replacement.** The epoch counter restarts at 1 for every
+    /// session incarnation, so a successor's first stream carries
+    /// exactly the epoch the predecessor's first stream carried and
+    /// admits here. Callers that hold the session incarnation their
+    /// handle was minted against want
+    /// [`Self::try_acquire_tx_credit_for_lifetime`], which checks
+    /// both halves; this entrypoint is retained for callers
+    /// addressing whatever lifetime is current under `stream_id`.
+    pub fn try_acquire_tx_credit_matching_epoch(
+        self: &Arc<Self>,
+        stream_id: u64,
+        expected_epoch: u64,
+        bytes: u32,
+    ) -> TxAdmit {
+        self.try_acquire_tx_credit_inner(stream_id, Some(expected_epoch), bytes)
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "seq is set Some on every code path that reaches the Acquired branch; the if-admitted flow guarantees this"
+    )]
+    fn try_acquire_tx_credit_inner(
+        self: &Arc<Self>,
+        stream_id: u64,
+        expected_epoch: Option<u64>,
+        bytes: u32,
+    ) -> TxAdmit {
+        // Look up the stream and do admission + sequence allocation
+        // under ONE DashMap lookup. Splitting these into two lookups
+        // would allow a close+reopen race in between — credit would
+        // debit the old state while the sequence came from the new
+        // state, cross-contaminating accounting across lifetimes and
+        // defeating the epoch guard.
+        //
+        // Capture the state's epoch so the guard's Drop knows whether
+        // the stream has been reopened in the interim (naive refund
+        // would credit back bytes on the fresh state, which never
+        // saw this acquire).
+        //
+        // Release the DashMap ref before returning so the guard's
+        // Drop doesn't deadlock trying to re-acquire it.
+        let (admitted, epoch, seq) = match self.streams.get(&stream_id) {
+            None => return TxAdmit::StreamClosed,
+            Some(state) => {
+                // Cache `epoch` once — pre-fix [perf #42 in
+                // `docs/internal/performance/net-perf-analysis.md`] the field
+                // was read twice through the `Ref`, once for the
+                // epoch-mismatch check and once on the return tuple.
+                // Trivial field access today but the cache also makes
+                // it obvious that both checks observe the same
+                // snapshot (rather than reading mid-mutation between
+                // the two reads — a defensive read against a future
+                // change that makes `epoch` mutable under `&self`).
+                let current_epoch = state.epoch();
+                if let Some(expected) = expected_epoch {
+                    if current_epoch != expected {
+                        // The handle is stale: the stream was closed
+                        // and reopened since the handle was issued.
+                        // Surface this as StreamClosed so the caller
+                        // maps it to `StreamError::NotConnected`.
+                        return TxAdmit::StreamClosed;
+                    }
+                }
+                let admitted = state.try_acquire_tx_credit(bytes);
+                // Only consume a sequence if admission succeeded —
+                // otherwise we'd waste sequence numbers on rejected
+                // sends.
+                let seq = if admitted {
+                    Some(state.next_tx_seq())
+                } else {
+                    None
+                };
+                (admitted, current_epoch, seq)
+            }
+        };
+        if !admitted {
+            return TxAdmit::WindowFull;
+        }
+        TxAdmit::Acquired {
+            guard: TxSlotGuard {
+                session: Arc::clone(self),
+                stream_id,
+                epoch,
+                bytes,
+                active: true,
+            },
+            seq: seq.expect("seq is Some when admitted is true"),
+        }
+    }
+
+    /// Roll back a TX sequence allocated by
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] when the packet it
+    /// was minted for never reached the wire (scheduler/socket
+    /// backpressure after the seq was consumed). Guarded by `epoch` so a
+    /// close+reopen race can't roll back a sequence on a fresh stream
+    /// state that never issued it — the exact discipline
+    /// [`TxSlotGuard::drop`] uses for the byte-credit refund.
+    ///
+    /// Returns `true` if the sequence was reclaimed (it was the most-
+    /// recently-issued seq and no concurrent send raced ahead), leaving
+    /// no receiver-visible gap; `false` otherwise.
+    pub fn try_rollback_tx_seq(self: &Arc<Self>, stream_id: u64, epoch: u64, seq: u64) -> bool {
+        if let Some(state) = self.try_stream(stream_id) {
+            if state.epoch() == epoch {
+                return state.try_rollback_tx_seq(seq);
+            }
+        }
+        false
+    }
+
+    /// Admit ONE stream send on ONE exact lifetime: its byte credit,
+    /// a run of `seqs` CONSECUTIVE sequences, and — when this is the
+    /// stream's first reliable send — the reliable-mode boundary
+    /// claim, all under the single map lookup that finds the state.
+    ///
+    /// **Why the whole group, and why here.** A multi-piece message
+    /// that takes one sequence per piece through separate
+    /// admissions does not own a contiguous range: a small
+    /// concurrent send on the same stream can take a sequence
+    /// between two pieces. Both sends succeed, and both receivers
+    /// then refuse the group, because a fragment group is defined
+    /// by consecutive sequences. Nothing the sender does afterwards
+    /// repairs it — retransmission preserves the interleaving. The
+    /// sequence space belongs to this state, so the reservation
+    /// that makes the range indivisible belongs here too, and it is
+    /// one `fetch_add` rather than a lock held across the caller's
+    /// awaits (there is no await inside this call, and the map ref
+    /// is released before the guard is built).
+    ///
+    /// **Why the boundary claim is in the same call.** The claim
+    /// names the first reliable sequence on the stream, and the
+    /// receiver concedes everything below it. Claiming it AFTER the
+    /// allocation lets two concurrent first-reliable sends claim
+    /// out of order — the send that took sequence 6 can win the
+    /// claim over the one that took 5 — and the receiver then
+    /// concedes reliable 5. Claiming under the allocating lookup
+    /// makes the claim the lowest reliable sequence by
+    /// construction: whoever allocates first claims first, and the
+    /// loser's `promote_tx_at` compare-exchange fails.
+    ///
+    /// `boundary` is `Some(first_seq)` exactly when this call won
+    /// the claim, which is at most once per stream lifetime; the
+    /// caller stamps [`crate::protocol::PacketFlags::MODE_BOUNDARY`]
+    /// on that packet and nothing else has to infer the split.
+    ///
+    /// A refusal consumes NOTHING: no credit, no sequence, no
+    /// boundary claim. `seqs` is clamped to at least one, so a
+    /// zero-piece send allocates one sequence rather than adding a
+    /// failure mode. `bytes` is charged once for the whole group
+    /// and held by the returned guard — commit it after the last
+    /// piece reaches the wire, refund an undelivered tail with
+    /// [`StreamState::refund_tx_credit`], and reclaim unused
+    /// sequences from the top with [`Self::try_rollback_tx_seq`].
+    pub fn try_admit_stream_send(
+        self: &Arc<Self>,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+        bytes: u32,
+        seqs: u32,
+        reliable: bool,
+    ) -> TxSendAdmit {
+        if session_id != self.session_id {
+            return TxSendAdmit::SessionSuperseded;
+        }
+        let seqs = seqs.max(1);
+        // One lookup for the epoch check, the credit, the sequence
+        // range and the boundary claim — see
+        // `try_acquire_tx_credit_inner` for why splitting them
+        // cross-contaminates lifetimes. The ref is released before
+        // the guard is constructed so the guard's Drop cannot
+        // deadlock re-acquiring it.
+        let (epoch, first_seq, boundary) = match self.streams.get(&stream_id) {
+            None => return TxSendAdmit::StreamClosed,
+            Some(state) => {
+                let epoch = state.epoch();
+                if epoch != expected_epoch {
+                    return TxSendAdmit::StreamClosed;
+                }
+                if !state.try_acquire_tx_credit(bytes) {
+                    return TxSendAdmit::WindowFull;
+                }
+                let first_seq = state.reserve_tx_seq_range(seqs);
+                let boundary = (reliable && state.promote_tx_at(first_seq)).then_some(first_seq);
+                (epoch, first_seq, boundary)
+            }
+        };
+        TxSendAdmit::Admitted {
+            guard: TxSlotGuard {
+                session: Arc::clone(self),
+                stream_id,
+                epoch,
+                bytes,
+                active: true,
+            },
+            first_seq,
+            boundary,
+        }
+    }
+}
+
+/// Outcome of [`NetSession::close_stream_for_lifetime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCloseOutcome {
+    /// The named lifetime was live and has been removed.
+    Closed,
+    /// No stream was open under that id at the instant the write
+    /// guard was taken. Nothing was removed — a stream opened after
+    /// that instant is a different lifetime and is left alone.
+    Absent,
+    /// A stream is open under that id, but it is a different
+    /// lifetime (a close+reopen on this same session). Nothing was
+    /// removed.
+    LifetimeMismatch,
+    /// The caller addressed a session incarnation this is not.
+    /// Nothing was removed.
+    SessionSuperseded,
+}
+
+/// Outcome of [`NetSession::drain_state_for_lifetime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDrainState {
+    /// The named lifetime is live and its reliability layer has no
+    /// unacked packets.
+    Drained,
+    /// The named lifetime is live and still has unacked packets.
+    Pending,
+    /// Nothing is open under that id — nothing left to drain.
+    Absent,
+    /// A different lifetime holds that id now. Its unacked data is
+    /// not the caller's to wait for.
+    LifetimeMismatch,
+    /// The caller addressed a session incarnation this is not.
+    SessionSuperseded,
+}
+
+/// Outcome of [`NetSession::try_acquire_tx_credit_for_lifetime`].
+#[derive(Debug)]
+pub enum TxAdmit {
+    /// Admission succeeded; the guard holds the credit until dropped
+    /// or committed. `seq` was allocated under the same DashMap
+    /// lookup as the credit acquire — credit and sequence are
+    /// guaranteed to belong to the same `StreamState` lifetime.
+    Acquired {
+        /// RAII credit holder.
+        guard: TxSlotGuard,
+        /// Sequence number for this send, allocated atomically with
+        /// the admission decision.
+        seq: u64,
+    },
+    /// `tx_credit_remaining` was below the requested bytes. The
+    /// `backpressure_events` counter was incremented as a side effect.
+    WindowFull,
+    /// The stream isn't currently open on this session.
+    StreamClosed,
+    /// The caller addressed a session incarnation this is not: its
+    /// handle was minted against a predecessor that has since been
+    /// replaced. Never retryable with the same handle — the stream
+    /// id may be open on the successor, but it is a different
+    /// lifetime with its own credit, sequence space and config.
+    SessionSuperseded,
+}
+
+/// Outcome of [`NetSession::try_admit_stream_send`].
+///
+/// The three refusals are deliberately distinct facts and a caller
+/// must not collapse them: [`Self::WindowFull`] is the only one a
+/// retry can clear, [`Self::StreamClosed`] says this lifetime is
+/// over (retrying needs a new handle, and the id may belong to a
+/// successor), and [`Self::SessionSuperseded`] says the whole
+/// session incarnation the caller addressed has been replaced —
+/// its credit, sequence space and config are gone, so a retry
+/// against the same handle can only ever address the wrong stream.
+#[derive(Debug)]
+pub enum TxSendAdmit {
+    /// Admission succeeded. The guard holds the group's byte credit,
+    /// `first_seq..first_seq + seqs` are this send's and no other's,
+    /// and `boundary` is `Some(first_seq)` when this call also won
+    /// the stream's reliable-mode boundary claim.
+    Admitted {
+        /// RAII credit holder for the whole group.
+        guard: TxSlotGuard,
+        /// First of the reserved consecutive sequences.
+        first_seq: u64,
+        /// The reliable-mode boundary this send claimed, if any.
+        boundary: Option<u64>,
+    },
+    /// `tx_credit_remaining` was below the requested bytes. Nothing
+    /// was reserved. `backpressure_events` was incremented.
+    WindowFull,
+    /// No stream is open under that id on this session, or the live
+    /// one is a different lifetime than `expected_epoch`.
+    StreamClosed,
+    /// The caller addressed a session incarnation this is not.
+    SessionSuperseded,
+}
+
+/// RAII guard holding a byte credit acquired from a stream's
+/// `tx_credit_remaining`.
+///
+/// On `Drop` without a preceding [`Self::commit`], the guard re-looks
+/// up the stream and refunds the credit — the intended slot never
+/// made it onto the wire (socket send cancelled, early return,
+/// panic). After a successful socket send the caller must invoke
+/// `commit()` so the bytes stay consumed; the receiver will replenish
+/// them via a `StreamWindow` grant.
+///
+/// If the stream was closed and reopened before the guard drops, the
+/// refund is suppressed — the credit belonged to a state that no
+/// longer exists.
+pub struct TxSlotGuard {
+    session: Arc<NetSession>,
+    stream_id: u64,
+    /// Epoch of the `StreamState` that admitted this guard.
+    epoch: u64,
+    /// Byte credit this guard holds. Refunded on `Drop` unless
+    /// [`Self::commit`] has cleared `active` first.
+    bytes: u32,
+    active: bool,
+}
+
+impl std::fmt::Debug for TxSlotGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxSlotGuard")
+            .field("stream_id", &format_args!("{:#x}", self.stream_id))
+            .field("epoch", &self.epoch)
+            .field("bytes", &self.bytes)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl TxSlotGuard {
+    /// Which stream this guard is holding credit on.
+    #[inline]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Bytes of credit this guard holds.
+    #[inline]
+    pub fn bytes(&self) -> u32 {
+        self.bytes
+    }
+
+    /// Mark the send as committed. The guard's Drop will NOT refund —
+    /// the bytes are now the receiver's to credit back via a
+    /// `StreamWindow` grant.
+    #[inline]
+    pub fn commit(mut self) {
+        self.active = false;
+    }
+
+    /// Consume the guard without refunding. Used by tests that want
+    /// to simulate a leaked slot; production code should prefer
+    /// `commit`.
+    #[doc(hidden)]
+    pub fn forget(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TxSlotGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(state) = self.session.try_stream(self.stream_id) {
+            // Only refund if the live state is the same state that
+            // admitted us. After a close+reopen the new state has a
+            // different epoch — refunding would spuriously credit
+            // bytes on a slot we never acquired.
+            if state.epoch() == self.epoch {
+                state.refund_tx_credit(self.bytes);
+            }
+        }
+    }
+}
+
+/// RAII guard over a **pre-send control debit**: the sequence a
+/// control-plane producer stamped, plus the ledger coordinates needed
+/// to give the debit back if the transport never took the packet.
+///
+/// A control producer has no caller to refuse
+/// ([`StreamState::note_tx_bytes_sent`]), so it debits, stamps a
+/// sequence, and only then reaches asynchronous transport admission.
+/// Every outcome of that admission that is not acceptance — a refused
+/// enqueue, a send that failed or exceeded its deadline, a queue that
+/// evicted the datagram, a producer cancelled while suspended before
+/// the send — leaves bytes recorded as sent that the receiver can
+/// never report as consumed, and on a stream shared with application
+/// traffic those bytes close the application window permanently.
+///
+/// So the debit is scoped to the send's lifetime: `Drop` without a
+/// preceding [`Self::commit`] refunds the bytes
+/// ([`StreamState::refund_control_debit`]) and rolls the sequence back
+/// when it is still the most recently issued one, leaving no
+/// receiver-visible gap.
+///
+/// **`commit` means the transport accepted the packet, not that the
+/// peer received it.** Wire loss after acceptance is the receiver's to
+/// reconcile through the next grant and must NEVER be refunded: the
+/// packet may still arrive and be charged, and a sender that refunded
+/// it would credit those bytes twice. Admission is the line this guard
+/// draws; delivery is not.
+///
+/// Epoch-fenced exactly like [`TxSlotGuard`]: if the stream was closed
+/// and reopened under a new epoch before the guard dropped, neither
+/// the refund nor the rollback touches the successor's ledger.
+pub struct ControlDebitGuard {
+    session: Arc<NetSession>,
+    stream_id: u64,
+    /// Epoch of the `StreamState` this debit was charged against.
+    epoch: u64,
+    /// Wire bytes debited. `0` for a producer whose frame the receiver
+    /// does not charge (the sequence is still rolled back).
+    bytes: u32,
+    /// The sequence stamped on the packet this debit paid for.
+    seq: u64,
+    active: bool,
+}
+
+impl std::fmt::Debug for ControlDebitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlDebitGuard")
+            .field("stream_id", &format_args!("{:#x}", self.stream_id))
+            .field("epoch", &self.epoch)
+            .field("bytes", &self.bytes)
+            .field("seq", &self.seq)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl ControlDebitGuard {
+    /// The sequence this debit paid for. Stamp it on the packet.
+    #[inline]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Which stream the debit was charged on.
+    #[inline]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Wire bytes this guard would refund.
+    #[inline]
+    pub fn bytes(&self) -> u32 {
+        self.bytes
+    }
+
+    /// The transport ACCEPTED the packet. Drop refunds nothing and
+    /// rolls nothing back — the bytes are the receiver's to report
+    /// consumed, and the sequence is on the wire.
+    #[inline]
+    pub fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ControlDebitGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(state) = self.session.try_stream(self.stream_id) {
+            if state.epoch() == self.epoch {
+                state.refund_control_debit(self.bytes);
+                // Same order as the admitted path: refund the bytes,
+                // then reclaim the sequence if nothing raced ahead.
+                state.try_rollback_tx_seq(self.seq);
+            }
+        }
+    }
+}
+
+impl NetSession {
+    /// Open a stream with an explicit reliability mode and fair-scheduler
+    /// weight.
+    ///
+    /// Idempotent for an existing stream: the window and the weight are
+    /// the first opener's and a later disagreement is **ignored with a
+    /// warning log**. Reliability is not first-open-wins — a reliable
+    /// open UPGRADES a fire-and-forget stream in place
+    /// ([`StreamState::ensure_reliable`]); a fire-and-forget open on a
+    /// reliable stream is the ignored direction. Callers that want to
+    /// change a stream's window or weight must close + re-open it.
+    pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) -> u64 {
+        // Inherit `DEFAULT_STREAM_WINDOW_BYTES` so callers that go
+        // through this convenience wrapper (notably `publish_to_peer`)
+        // pick up v2 backpressure by default. Callers that want the
+        // v1-style unbounded-queue behavior use `open_stream_full`
+        // with `tx_window = 0` explicitly.
+        self.open_stream_full(
+            stream_id,
+            reliable,
+            fairness_weight,
+            DEFAULT_STREAM_WINDOW_BYTES,
+        )
+    }
+
+    /// Extended open that also sets the per-stream TX window for
+    /// backpressure. `tx_window == 0` keeps the pre-backpressure
+    /// behavior (unbounded local queue).
+    ///
+    /// Returns the epoch of the live `StreamState` for `stream_id` —
+    /// either the fresh one created for a new stream, or the existing
+    /// one if the stream is already open (first-open-wins). Callers
+    /// embed this in their `Stream` handle so later sends can reject
+    /// stale handles after close+reopen.
+    pub fn open_stream_full(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+        fairness_weight: u8,
+        tx_window: u32,
+    ) -> u64 {
+        // Window and weight are first-open-wins: warn when a
+        // caller's disagrees with the live stream's. Shared by the
+        // read-probe hit and the lost-creation-race Occupied arm
+        // below so both occupied shapes keep the pre-§2.12 warning
+        // behavior.
+        //
+        // Reliability is deliberately NOT in this comparison: a
+        // reliable open is applied rather than warned about, and the
+        // reverse direction is reported by `ensure_reliable`'s own
+        // caller below. A warning is what a caller can do nothing
+        // about; silent loss on a stream whose contract says there
+        // is none is not.
+        fn warn_if_config_conflicts(
+            existing: &StreamState,
+            stream_id: u64,
+            fairness_weight: u8,
+            tx_window: u32,
+        ) {
+            if existing.fairness_weight() != fairness_weight.max(1)
+                || existing.tx_window() != tx_window
+            {
+                tracing::warn!(
+                    stream_id = format!("{:#x}", stream_id),
+                    existing_weight = existing.fairness_weight(),
+                    new_weight = fairness_weight,
+                    existing_tx_window = existing.tx_window(),
+                    new_tx_window = tx_window,
+                    "open_stream: ignoring conflicting config; first open wins"
+                );
+            }
+        }
+
+        /// Apply the reliability half of an open to a stream that
+        /// already exists: upgrade to reliable, or report the
+        /// downgrade that is not happening.
+        fn reconcile_reliability(existing: &StreamState, stream_id: u64, reliable: bool) {
+            if reliable {
+                if existing.ensure_reliable() {
+                    tracing::debug!(
+                        stream_id = format!("{:#x}", stream_id),
+                        "open_stream: upgraded a fire-and-forget stream to reliable"
+                    );
+                }
+            } else if existing.reliable_mode() {
+                tracing::warn!(
+                    stream_id = format!("{:#x}", stream_id),
+                    "open_stream: ignoring a fire-and-forget open on a reliable \
+                     stream; reliability never downgrades"
+                );
+            }
+        }
+
+        // PERF_AUDIT §2.12 — read-only fast path. `publish_to_peer`
+        // calls `open_stream_with` on every publish, but the stream
+        // is almost always already open after the first call —
+        // pre-fix this took a DashMap write `entry()` lock per
+        // publish just to land in the Occupied arm and return the
+        // existing epoch. The `get` probe holds a read lock so
+        // concurrent opens on other streams don't contend.
+        if let Some(existing_ref) = self.streams.get(&stream_id) {
+            let existing = existing_ref.value();
+            warn_if_config_conflicts(existing, stream_id, fairness_weight, tx_window);
+            reconcile_reliability(existing, stream_id, reliable);
+            return existing.epoch();
+        }
+        // Slow path: stream missing. Take the write lock and
+        // either create the entry or pick up a concurrent
+        // creator's epoch on the race.
+        use dashmap::mapref::entry::Entry;
+        match self.streams.entry(stream_id) {
+            Entry::Occupied(existing) => {
+                // Lost the creation race to a concurrent opener —
+                // same first-open-wins semantics (and the same
+                // conflict warning) as the read-probe hit above.
+                let existing = existing.get();
+                warn_if_config_conflicts(existing, stream_id, fairness_weight, tx_window);
+                reconcile_reliability(existing, stream_id, reliable);
+                existing.epoch()
+            }
+            Entry::Vacant(v) => {
+                let epoch = self.next_stream_epoch();
+                v.insert(StreamState::new_full_with_epoch(
+                    reliable,
+                    fairness_weight,
+                    tx_window,
+                    epoch,
+                ));
+                epoch
+            }
+        }
+    }
+
+    /// Close a stream: mark it inactive and remove its state.
+    ///
+    /// Idempotent — closing a non-existent stream is a no-op. After
+    /// close, a subsequent `open_stream_with` creates a fresh stream.
+    ///
+    /// Also records `stream_id` in the grant-quarantine set so that
+    /// any `StreamWindow` grant still in flight from a peer who was
+    /// communicating with the just-closed lifetime is dropped rather
+    /// than spuriously crediting a later reopen — see
+    /// `GRANT_QUARANTINE_WINDOW` and [`Self::is_grant_quarantined`].
+    pub fn close_stream(&self, stream_id: u64) {
+        if let Some((_, state)) = self.streams.remove(&stream_id) {
+            state.deactivate();
+            self.recently_closed.insert(stream_id, SystemClock::now());
+            // Whatever it was holding goes with it: the consumer
+            // that was owed those frames is the one closing.
+            self.forget_in_order_hold(&state);
+        }
+    }
+
+    /// Close `stream_id` **only if** the live state is the exact
+    /// lifetime `(session_id, expected_epoch)` names.
+    ///
+    /// The unconditional [`Self::close_stream`] cannot be made safe
+    /// for a handle-addressed caller by checking first and removing
+    /// after: `try_stream` hands back a `DashMap` read guard that is
+    /// released when the comparison ends, so a concurrent
+    /// close+reopen of the same id lands in the gap and the removal
+    /// takes the *successor's* state — dropping a live retransmit
+    /// window, credit ledger and buffered delivery that belong to
+    /// somebody else. An absent-at-check stream followed by a
+    /// concurrent open in the same gap is removed the same way.
+    ///
+    /// The comparison and the removal therefore happen under ONE
+    /// `Entry` write guard. Both halves of the lifetime are checked
+    /// and neither implies the other, for the reason
+    /// [`Self::try_acquire_tx_credit_for_lifetime`] documents: the
+    /// epoch counter restarts at 1 per incarnation.
+    pub fn close_stream_for_lifetime(
+        &self,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+    ) -> StreamCloseOutcome {
+        if session_id != self.session_id {
+            return StreamCloseOutcome::SessionSuperseded;
+        }
+        use dashmap::mapref::entry::Entry;
+        match self.streams.entry(stream_id) {
+            Entry::Vacant(_) => StreamCloseOutcome::Absent,
+            Entry::Occupied(occupied) => {
+                if occupied.get().epoch() != expected_epoch {
+                    return StreamCloseOutcome::LifetimeMismatch;
+                }
+                let (_, state) = occupied.remove_entry();
+                state.deactivate();
+                self.recently_closed.insert(stream_id, SystemClock::now());
+                self.forget_in_order_hold(&state);
+                StreamCloseOutcome::Closed
+            }
+        }
+    }
+
+    /// Whether the exact lifetime `(session_id, expected_epoch)`
+    /// names still has unacked reliable data.
+    ///
+    /// One lookup, and the guard is released before returning, so a
+    /// caller polling this in a graceful-close loop holds nothing
+    /// across its `await`. Distinguishing
+    /// [`StreamDrainState::LifetimeMismatch`] from
+    /// [`StreamDrainState::Pending`] is what stops a stale handle
+    /// from waiting out its whole timeout on a *successor* stream's
+    /// retransmit window.
+    pub fn drain_state_for_lifetime(
+        &self,
+        stream_id: u64,
+        session_id: u64,
+        expected_epoch: u64,
+    ) -> StreamDrainState {
+        if session_id != self.session_id {
+            return StreamDrainState::SessionSuperseded;
+        }
+        match self.streams.get(&stream_id) {
+            None => StreamDrainState::Absent,
+            Some(state) if state.epoch() != expected_epoch => StreamDrainState::LifetimeMismatch,
+            Some(state) if state.with_reliability(|r| r.has_pending()) => StreamDrainState::Pending,
+            Some(_) => StreamDrainState::Drained,
+        }
+    }
+
+    /// Drop the **receive** half of a stream the peer has given up
+    /// sending on (a `StreamReset`), leaving everything this side
+    /// sends on that id untouched.
+    ///
+    /// A stream id names one bidirectional conversation: the same
+    /// [`StreamState`] holds the sequence counter and retransmit
+    /// window for what we send AND the receive tracking for what the
+    /// peer sends. A reset is a statement about the peer's outbound
+    /// half only, so answering it with [`Self::close_stream`] let a
+    /// peer destroy our send state — restarting `tx_seq` at 0 mid-
+    /// conversation (every later packet then looks like a duplicate
+    /// to the peer) and quarantining the very grants that would have
+    /// credited it.
+    ///
+    /// Resetting the receive tracking is what the reset is *for*: the
+    /// gap will never be filled, and the peer may reopen the id from
+    /// sequence 0. That is a whole receive LIFETIME ending, so the
+    /// receive-boundary authority goes with the cursors — see
+    /// [`StreamState::reset_rx_lifetime`] — and the next lifetime's
+    /// `MODE_BOUNDARY` statement is the one that governs. The
+    /// receive-credit ledger stays as it is — cumulative-consumed is
+    /// monotonic by contract, and a reopened sender clamps our
+    /// grants to its own send watermark.
+    ///
+    /// Idempotent; a no-op for a stream that does not exist.
+    pub fn reset_rx_stream(&self, stream_id: u64) {
+        if let Some(state) = self.streams.get(&stream_id) {
+            state.reset_rx_seq();
+            state.reset_rx_lifetime();
+            // The gap those frames are queued behind is the gap the
+            // peer just gave up on, so it never fills. Releasing
+            // them now would be delivery out of order; keeping them
+            // would be a hold nothing can drain. They are data this
+            // receiver accepted and will not deliver, so the drop is
+            // reported rather than silent.
+            let discarded = self.forget_in_order_hold(&state);
+            if discarded > 0 {
+                tracing::warn!(
+                    stream_id = format!("{stream_id:#x}"),
+                    discarded,
+                    "stream reset: the sender gave up on a gap, so arrivals held \
+                     behind it can never be delivered in order"
+                );
+            }
+        }
+    }
+
+    /// Whether this stream is holding any out-of-order arrival.
+    ///
+    /// The dispatch path asks before delivering an in-order packet
+    /// directly: if anything is already parked, the packet joins the
+    /// hold instead, so ONE drain releases the whole run in sequence
+    /// order. Delivering it first would put it ahead of frames that
+    /// precede it — which is what a conceded boundary gap looks like.
+    /// One relaxed load when nothing is held anywhere.
+    pub fn holds_in_order(&self, stream_id: u64) -> bool {
+        self.inorder_held.load(Ordering::Relaxed) != 0
+            && self
+                .streams
+                .get(&stream_id)
+                .is_some_and(|state| state.reorder_held() != 0)
+    }
+
+    /// Hold one out-of-order arrival on `stream_id` until the
+    /// sequences in front of it have been delivered.
+    ///
+    /// **NR4: the hold is bound to the exact lifetime that accepted
+    /// the sequence.** The accepting stream's `(session_id, epoch)`
+    /// travels with the frame from acceptance to insertion, and this
+    /// re-acquisition refuses to insert into anything else. Without
+    /// it, the ingress dropped the stream's map guard after
+    /// acceptance and looked the stream up again by ID: a
+    /// close/reopen landing in between put the OLD frame into the
+    /// REPLACEMENT's reorder buffer, where it could be released
+    /// under a frontier that never accepted its sequence and never
+    /// reserved its bytes. "The stream vanished, so the consumer is
+    /// gone" was sound; "the stream was REPLACED" was not.
+    ///
+    /// `false` means the frame was not held: either the stream is
+    /// gone (its consumer with it), the lifetime no longer matches,
+    /// or the reorder buffer refused the sequence.
+    pub fn hold_in_order_frame(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        lifetime: StreamLifetime,
+        frame: HeldFrame,
+    ) -> bool {
+        if lifetime.session_id != self.session_id {
+            tracing::warn!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                accepted_on = lifetime.session_id,
+                session_id = self.session_id,
+                "in-order hold refused: the frame was accepted by another \
+                 session's incarnation"
+            );
+            return false;
+        }
+        let Some(state) = self.streams.get(&stream_id) else {
+            return false;
+        };
+        if state.epoch() != lifetime.epoch {
+            tracing::warn!(
+                stream_id = format!("{stream_id:#x}"),
+                seq,
+                accepted_epoch = lifetime.epoch,
+                live_epoch = state.epoch(),
+                "in-order hold refused: the stream was replaced between the \
+                 sequence's acceptance and its insertion, and the \
+                 replacement never accepted it"
+            );
+            return false;
+        }
+        if state.hold_out_of_order(seq, frame) {
+            self.inorder_held.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Take the next arrival a reliable stream is holding that is
+    /// now in order, or `None` when there is nothing to release.
+    ///
+    /// The dispatch path calls this in a loop after every packet it
+    /// delivers: one arrival filling a head gap can release
+    /// everything queued behind it, and `next_expected` — the
+    /// receiver's contiguous frontier — is what decides how much.
+    /// Nothing held anywhere in the session is one relaxed load.
+    pub fn take_in_order_frame(&self, stream_id: u64) -> Option<HeldFrame> {
+        if self.inorder_held.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let state = self.streams.get(&stream_id)?;
+        let next_expected = state.with_reliability(|r| r.rx_ack_seq());
+        let frame = state.take_in_order_below(next_expected)?;
+        self.inorder_held.fetch_sub(1, Ordering::Relaxed);
+        Some(frame)
+    }
+
+    /// Drop a stream's hold and take its frames out of the session's
+    /// count. The one path allowed to discard held bytes, because it
+    /// is the one place that knows they can never be released in
+    /// order: the peer reset the stream, or the stream is gone.
+    fn forget_in_order_hold(&self, state: &StreamState) -> usize {
+        let dropped = state.clear_in_order_hold();
+        if dropped > 0 {
+            self.inorder_held.fetch_sub(dropped, Ordering::Relaxed);
+        }
+        dropped
+    }
+
+    /// Whether a `StreamWindow` grant for `stream_id` should be
+    /// dropped because the stream was closed within
+    /// `GRANT_QUARANTINE_WINDOW`. Lazily garbage-collects expired
+    /// entries on call.
+    pub fn is_grant_quarantined(&self, stream_id: u64) -> bool {
+        let elapsed = match self.recently_closed.get(&stream_id) {
+            Some(entry) => entry.value().elapsed(),
+            None => return false,
+        };
+        if elapsed < GRANT_QUARANTINE_WINDOW {
+            return true;
+        }
+        // Entry is past the window — clean it up so the map doesn't
+        // grow with stale ids.
+        self.recently_closed.remove(&stream_id);
+        false
+    }
+
+    /// Remove streams whose `last_activity` is older than `max_idle`,
+    /// keeping the active count at or below `max_streams` by LRU-evicting
+    /// the oldest if still over cap. Returns the number of streams
+    /// evicted. Called from the session owner's heartbeat loop.
+    ///
+    /// **NR4 / R4-9: an eviction that discards ACCEPTED data is
+    /// terminal.** A gapped reliable stream can be holding arrivals
+    /// this receiver has already acknowledged — after which the
+    /// sender has dropped its only copy — so dropping the
+    /// `StreamState` destroys data nothing can rebuild. Pre-fix both
+    /// removal branches did exactly that behind an eviction log, and
+    /// left the session's `inorder_held` fast-path count counting
+    /// frames that no longer existed. Now the hold is released
+    /// through the one path allowed to discard it (so the count
+    /// stays true) and the stream's receive half ends typed: the
+    /// peer gets a `StreamReset` and fails its pending read instead
+    /// of waiting out a timeout for bytes this node threw away.
+    ///
+    /// **The obligation is acceptance, not buffering.** An arrival
+    /// is accepted by the reliability mode (which records it in the
+    /// range index the SACK is built from) BEFORE it reaches the
+    /// in-order hold, and the ingress releases its map guard in
+    /// between. An eviction landing in that interval finds an empty
+    /// hold and a range index that already says "I have sequence n"
+    /// — and the feedback tick may already have told the sender so,
+    /// which is the moment its descriptor goes away. Keying the
+    /// terminal on the discarded hold ALONE therefore lost exactly
+    /// the frames whose loss cannot be recovered: positively
+    /// acknowledged, never delivered, no terminal, and
+    /// `hold_in_order_frame` then refusing the absent stream with
+    /// nothing but a log. Both branches now ask
+    /// [`ReliabilityMode::rx_accepted_undelivered`] as well, so the
+    /// receive half ends typed for accepted bytes whether or not
+    /// they had reached the buffer yet.
+    pub fn evict_idle_streams(
+        &self,
+        max_idle: Duration,
+        max_streams: usize,
+        reason_tag: &'static str,
+    ) -> usize {
+        let mut evicted = 0;
+        let now = current_timestamp();
+        let max_idle_ns = u64::try_from(max_idle.as_nanos()).unwrap_or(u64::MAX);
+
+        // Pass 1: drop idle streams.
+        let idle: Vec<u64> = self
+            .streams
+            .iter()
+            .filter(|e| now.saturating_sub(e.value().last_activity_ns()) > max_idle_ns)
+            .map(|e| *e.key())
+            .collect();
+        for sid in idle {
+            if let Some((_, state)) = self.streams.remove(&sid) {
+                state.deactivate();
+                self.recently_closed.insert(sid, SystemClock::now());
+                evicted += 1;
+                let discarded = self.forget_in_order_hold(&state);
+                let accepted_undelivered = state.with_reliability(|r| r.rx_accepted_undelivered());
+                if discarded > 0 || accepted_undelivered {
+                    self.note_receive_terminal(sid);
+                    tracing::warn!(
+                        stream_id = format!("{:#x}", sid),
+                        reason = reason_tag,
+                        discarded,
+                        accepted_undelivered,
+                        "stream evicted: idle timeout discarded arrivals this \
+                         receiver had accepted, so its receive half ends typed"
+                    );
+                } else {
+                    tracing::debug!(
+                        stream_id = format!("{:#x}", sid),
+                        reason = reason_tag,
+                        "stream evicted: idle timeout"
+                    );
+                }
+            }
+        }
+
+        // Pass 2: if still over the cap, LRU-evict the oldest.
+        //
+        // The (key, last_activity) pair is captured in the same
+        // iteration that selects the victim, then `remove_if`
+        // re-checks the activity stamp atomically before
+        // removing. If a concurrent `open_stream_full` reused the
+        // same `stream_id` slot or `touch`-ed it between selection
+        // and removal, the stamp differs and we skip the eviction
+        // for this round (it'll be re-evaluated on the next sweep
+        // if the cap is still exceeded). Pre-fix the iter then
+        // remove pair was non-atomic, so a freshly-opened stream
+        // could be torn down in the gap between selection and
+        // removal — observed as "stream just opened, immediately
+        // closed" in production logs.
+        while self.streams.len() > max_streams {
+            let oldest = self
+                .streams
+                .iter()
+                .min_by_key(|e| e.value().last_activity_ns())
+                .map(|e| (*e.key(), e.value().last_activity_ns()));
+            match oldest {
+                Some((sid, expected_activity_ns)) => {
+                    let removed = self
+                        .streams
+                        .remove_if(&sid, |_, v| v.last_activity_ns() == expected_activity_ns);
+                    match removed {
+                        Some((_, state)) => {
+                            state.deactivate();
+                            self.recently_closed.insert(sid, SystemClock::now());
+                            evicted += 1;
+                            // NR4: the cap branch is the sharper half
+                            // — it can take a gapped stream that is
+                            // still owed recovery, not merely one the
+                            // sender has given up on. R4-9: and it is
+                            // the branch that fires with an EMPTY
+                            // hold, because the frame whose
+                            // acceptance opened the gap is still on
+                            // its way to `hold_in_order_frame`.
+                            let discarded = self.forget_in_order_hold(&state);
+                            let accepted_undelivered =
+                                state.with_reliability(|r| r.rx_accepted_undelivered());
+                            if discarded > 0 || accepted_undelivered {
+                                self.note_receive_terminal(sid);
+                            }
+                            tracing::warn!(
+                                stream_id = format!("{:#x}", sid),
+                                reason = "cap_exceeded",
+                                total_streams = self.streams.len(),
+                                max_streams = max_streams,
+                                discarded,
+                                accepted_undelivered,
+                                "stream evicted: max_streams cap"
+                            );
+                        }
+                        None => {
+                            // The stream was touched / replaced
+                            // between selection and removal. Pick a
+                            // new victim on the next loop iteration.
+                            // Bail if the cap is no longer exceeded,
+                            // otherwise the loop terminates anyway.
+                            continue;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // Piggyback on this idle-stream sweep: drop any
+        // `recently_closed` entry whose insertion time is past
+        // `GRANT_QUARANTINE_WINDOW`. Without this sweep,
+        // `recently_closed` would only get GC'd by
+        // `is_grant_quarantined`, which is called only when an
+        // inbound `StreamWindow` grant arrives for that exact
+        // `stream_id`. A long-lived peer that opens/closes many
+        // distinct stream IDs (e.g., one short-lived stream per
+        // RPC) and never receives a late grant for each closed
+        // stream would accumulate one entry per closed stream
+        // forever — N streams/sec → ~N×T entries after T seconds,
+        // unbounded. The sweep itself is bounded by the existing
+        // eviction cadence so there's no extra wakeup cost.
+        self.recently_closed
+            .retain(|_, inserted_at| inserted_at.elapsed() < GRANT_QUARANTINE_WINDOW);
+
+        evicted
+    }
+
+    /// Get stream state (read-only)
+    pub fn get_stream(
+        &self,
+        stream_id: u64,
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, StreamState>> {
+        self.streams.get(&stream_id)
+    }
+
+    /// Get the thread-local pool for zero-contention packet building
+    #[inline]
+    pub fn thread_local_pool(&self) -> &SharedLocalPool {
+        &self.thread_local_pool
+    }
+
+    /// Build an AEAD-authenticated heartbeat packet for this session.
+    ///
+    /// Routes through `thread_local_pool` so the heartbeat shares
+    /// its TX counter with data-path packets — heartbeats and data
+    /// interleave cleanly on the wire, and the receiver's replay
+    /// window admits them in either order.
+    ///
+    /// Wrapping heartbeat construction in this method removes the
+    /// surface that would otherwise let callers build heartbeats
+    /// with a fresh `PacketBuilder::new(&[0u8; 32], session_id)`,
+    /// which (a) would use the wrong key so the receiver's AEAD
+    /// verify would reject every heartbeat, and (b) would reuse
+    /// counter=0 across successive heartbeats so the replay window
+    /// would reject every heartbeat after the first.
+    #[inline]
+    pub fn build_heartbeat(&self) -> Bytes {
+        self.thread_local_pool.get().build_heartbeat()
+    }
+
+    /// Verify an inbound heartbeat's AEAD tag against this session's
+    /// RX cipher, commit the counter into the replay window, and
+    /// refresh `last_activity`. Returns `true` if the packet was
+    /// accepted; the session is mutated only on success.
+    ///
+    /// Verify and touch are fused into a single call so callers
+    /// cannot get the order wrong (verify-then-touch, never the
+    /// reverse) or forget to touch (which would defeat session
+    /// idle-timeout for legitimate heartbeats).
+    ///
+    /// Source-address validation (legacy adapter: 1:1 source per
+    /// session) and any post-accept observation (mesh:
+    /// `failure_detector.heartbeat`) remain the caller's
+    /// responsibility — those policies vary by adapter and don't
+    /// belong inside the helper.
+    ///
+    /// Heartbeats MUST decrypt the AEAD tag rather than be fast-
+    /// pathed through to `failure_detector.heartbeat` and
+    /// `session.touch()` based on `is_heartbeat()` alone — without
+    /// the decrypt step, an off-path attacker who observed the
+    /// cleartext `session_id` and source UDP address could spoof
+    /// heartbeats indefinitely.
+    pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        // A heartbeat encrypts an empty payload, so the on-wire
+        // ciphertext is exactly the 16-byte AEAD tag (see
+        // `PacketBuilder::build_heartbeat`). Reject any other
+        // length BEFORE invoking the cipher: the AEAD will
+        // catch a length mismatch on its own, but a cheap
+        // up-front check shortcuts a cleartext-flood attacker
+        // who sends short / empty / oversized packets to drain
+        // CPU on the decrypt path. ChaCha20-Poly1305 isn't
+        // hugely expensive per packet, but the gate is free
+        // and removes the cipher from the per-probe budget.
+        if parsed.payload.len() != crate::protocol::TAG_SIZE {
+            return false;
+        }
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        // Per crypto-session perf #129, route through the
+        // verify-only API: heartbeats encrypt an empty plaintext
+        // to a 16-byte Poly1305 tag, and the legacy
+        // `decrypt(...).is_err()` materialized that empty
+        // plaintext into a fresh `Vec<u8>` per call only to drop
+        // it. `verify` runs the AEAD tag check without producing
+        // a plaintext buffer.
+        if self
+            .rx_cipher
+            .verify(counter, &aad, &parsed.payload)
+            .is_err()
+        {
+            return false;
+        }
+        // Per crypto-session perf #132: single-lock admit replaces
+        // the legacy `is_valid_rx_counter` (pre-verify) +
+        // `update_rx_counter` (post-verify) two-step. Heartbeat
+        // replays now pay the AEAD verify before being rejected at
+        // admit, but the AEAD verify on a 16-byte heartbeat is the
+        // cheapest case of ChaCha20-Poly1305 and the saved Mutex
+        // op per non-replay heartbeat (which dominates the rate at
+        // healthy steady state) is the actual hot path.
+        if !self.rx_cipher.try_admit_rx_counter(counter) {
+            return false;
+        }
+        self.touch();
+        true
+    }
+
+    /// Update last activity timestamp
+    #[inline]
+    pub fn touch(&self) {
+        self.last_activity
+            .store(current_timestamp(), Ordering::Release);
+    }
+
+    /// Nanoseconds since epoch of the last activity. Useful for
+    /// tests / diagnostics that need to observe whether `touch`
+    /// has been called.
+    #[inline]
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
+    /// Check if session has timed out
+    #[inline]
+    pub fn is_timed_out(&self, timeout: Duration) -> bool {
+        let last = self.last_activity.load(Ordering::Acquire);
+        let now = current_timestamp();
+        let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        now.saturating_sub(last) > timeout_ns
+    }
+
+    /// Is this session considered live LOCALLY?
+    ///
+    /// Advisory local state (see the `active` field). NOT a
+    /// receive-lifetime predicate: an inactive session is still a
+    /// legitimate peer whose frames must be processed, so an ingress
+    /// asking "may I still process work captured against this
+    /// incarnation?" MUST ask
+    /// [`Self::is_receive_lifetime_retired`] instead.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Mark the session not-live locally. See [`Self::is_active`];
+    /// this does NOT retire the receive lifetime.
+    #[inline]
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// End this incarnation's receive lifetime (**NR3**). One-way.
+    ///
+    /// Called only by the retirement paths. Deliberately distinct
+    /// from [`Self::deactivate`] — see the
+    /// `receive_lifetime_retired` field for why merging them is a
+    /// bug, not a simplification.
+    #[inline]
+    pub fn retire_receive_lifetime(&self) {
+        self.receive_lifetime_retired.store(true, Ordering::Release);
+    }
+
+    /// Has this incarnation's receive lifetime ended (**NR3**)?
+    ///
+    /// `true` ⇒ the handle a captured frame carries names a retired
+    /// incarnation, and that frame must be refused before decrypt,
+    /// dispatch or reassembly. Unlike the reassembly retirement
+    /// marker this never expires and is never evicted, so it still
+    /// answers for a frame that outlived `GROUP_TTL` or lost its
+    /// marker to `MAX_RETIRED_SESSIONS` churn.
+    #[inline]
+    pub fn is_receive_lifetime_retired(&self) -> bool {
+        self.receive_lifetime_retired.load(Ordering::Acquire)
+    }
+
+    /// Get all stream IDs
+    pub fn stream_ids(&self) -> Vec<u64> {
+        self.streams.iter().map(|r| *r.key()).collect()
+    }
+
+    /// Get the number of streams
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// `true` if any application stream is currently open on this
+    /// session. Control-plane traffic rides a separate sequence space
+    /// and is not counted. Used by the NAT-traversal direct-path
+    /// upgrade's busy gate (`NAT_TRAVERSAL_V2_PLAN.md` C3): a session
+    /// carrying live streams must not be swapped out from under them.
+    pub fn has_open_streams(&self) -> bool {
+        !self.streams.is_empty()
+    }
+
+    /// `true` if any stream on this session has unacked in-flight
+    /// reliable data (a non-empty retransmit window). Walks the live
+    /// streams and short-circuits on the first with pending packets.
+    /// Companion to [`Self::has_open_streams`] for the upgrade busy
+    /// gate — swapping the session would drop this in-flight data with
+    /// no retransmit on the new session.
+    pub fn has_unacked(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|entry| entry.value().with_reliability(|r| r.has_pending()))
+    }
+}
+
+impl std::fmt::Debug for NetSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetSession")
+            .field("session_id", &format!("{:016x}", self.session_id))
+            .field("peer_addr", &self.peer_addr)
+            .field("stream_count", &self.streams.len())
+            .field("active", &self.active.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Per-stream state for multiplexing.
+pub struct StreamState {
+    /// Next sequence number to send
+    tx_seq: AtomicU64,
+    /// Last received sequence number
+    rx_seq: AtomicU64,
+    /// Reliability mode for this stream
+    reliability: parking_lot::Mutex<Box<dyn ReliabilityMode>>,
+    /// Inbound event queue (for poll_shard)
+    inbound: SegQueue<StoredEvent>,
+    /// Stream is active
+    active: AtomicBool,
+    /// Nanoseconds since epoch of the last activity (send or receive).
+    /// Used by the session's idle-eviction sweep.
+    last_activity: AtomicU64,
+    /// Whether this stream's reliability mode is the reliable one.
+    /// Mirrors the boxed mode behind `reliability` so the common
+    /// "is this stream reliable" question costs one atomic load
+    /// instead of a mutex acquisition.
+    ///
+    /// **Monotonic, never a downgrade.** A stream opens with the
+    /// mode its first opener asked for, but RELIABLE is a strictly
+    /// stronger contract than fire-and-forget and the traffic, not
+    /// the first open, is what decides whether it is owed: see
+    /// [`Self::ensure_reliable`].
+    reliable_mode: AtomicBool,
+    /// **Where** this stream became reliable on the RECEIVE side:
+    /// the first reliable sequence the peer put on it, or
+    /// `u64::MAX` while the stream is still fire-and-forget.
+    ///
+    /// `reliable_mode` says the contract changed;
+    /// [`Self::rx_stream_mode`] pairs it with this to say where, and
+    /// that is the fact the ACK accounting and the consumer cursor
+    /// both need: below the boundary a gap is a fire-and-forget loss
+    /// no retransmit can fill, at or above it a gap is a reliable
+    /// obligation that must never be acknowledged unreceived.
+    rx_mode_boundary: AtomicU64,
+    /// Whether `rx_mode_boundary` is the sender's STATED boundary
+    /// ([`crate::protocol::PacketFlags::MODE_BOUNDARY`]) or the
+    /// conservative one this receiver assumed on seeing reliable
+    /// traffic without the signal. An assumed boundary may be
+    /// raised by the signal; a stated one is final, so a peer
+    /// cannot re-signal a higher boundary to make this receiver
+    /// concede reliable sequences it already holds.
+    rx_boundary_signalled: AtomicBool,
+    /// **Where** this stream became reliable on the SEND side: the
+    /// first reliable sequence this sender put on it, or `u64::MAX`
+    /// while it has sent none.
+    ///
+    /// Tracked separately from the receive half because the two
+    /// directions of one stream id are independent: a peer sending
+    /// us reliable traffic does not promote what we send, and only
+    /// the send half may stamp the boundary flag. Its other job is
+    /// the producer contract — once a stream is promoted, a
+    /// still-open fire-and-forget handle's flag is a *request* and
+    /// this is the contract (see `LeafSession::build_packets`).
+    tx_mode_boundary: AtomicU64,
+    /// Fair-scheduler quantum multiplier (1 = equal share).
+    fairness_weight: u8,
+    /// Configured initial credit window in **bytes** for this stream's
+    /// send path. `0` disables backpressure entirely (v1 "unbounded"
+    /// escape hatch). Non-zero: `tx_credit_remaining` starts here and
+    /// is decremented on each socket send.
+    tx_window: u32,
+    /// Bytes of send credit the sender may still use on this stream
+    /// before `send_on_stream` returns `StreamError::Backpressure`.
+    /// Decremented on each socket send (atomic CAS). Recomputed
+    /// authoritatively from `tx_bytes_sent - max_consumed_seen` on
+    /// every inbound `StreamWindow` grant. When `tx_window == 0`,
+    /// admission short-circuits and this counter is not consulted.
+    tx_credit_remaining: AtomicU32,
+    /// Cumulative bytes this sender has committed to the wire on
+    /// this stream, across all lifetime credit acquisitions. Bumped
+    /// when `try_acquire_tx_credit` admits; rolled back when a
+    /// guard drops without commit (refund). The grant handler
+    /// reconciles `tx_credit_remaining` against this and
+    /// `max_consumed_seen`, so lost grants self-heal on the next
+    /// grant arrival.
+    tx_bytes_sent: AtomicU64,
+    /// Highest `total_consumed` observed from the receiver on this
+    /// stream. Monotonic — out-of-order / duplicate grants are
+    /// ignored. Updated under CAS to protect the monotonicity
+    /// invariant against concurrent grant-dispatch tasks.
+    max_consumed_seen: AtomicU64,
+    /// Control-plane bytes this sender put on the wire that
+    /// `tx_credit_remaining` could not pay for: **debt**, not
+    /// forgiveness.
+    ///
+    /// An unconditional control debit
+    /// ([`StreamState::note_tx_bytes_sent`]) has no caller to refuse,
+    /// so the remaining credit floors at zero and the shortfall
+    /// accrues here. Without the debt term the next authoritative
+    /// grant credited the control frame's newly-consumed delta back
+    /// into `tx_credit_remaining` while the application bytes that
+    /// were holding the window were still outstanding — the window
+    /// reopened for data the receiver had never seen.
+    ///
+    /// [`StreamState::apply_authoritative_grant`] retires debt before
+    /// it reopens application credit, and a never-admitted control
+    /// send gives its debt back through
+    /// [`StreamState::refund_control_debit`]. The conservation
+    /// identity every operation on this ledger preserves is
+    /// `tx_credit_remaining + (tx_bytes_sent - max_consumed_seen)
+    /// == tx_window + overdraft`.
+    overdraft: AtomicU64,
+    /// Number of `send_on_stream` calls that returned
+    /// `StreamError::Backpressure` since this stream opened.
+    backpressure_events: AtomicU64,
+    /// Cumulative `StreamWindow` grants received on this stream
+    /// (sender side). Does not count bytes — counts grant packets.
+    credit_grants_received: AtomicU64,
+    /// Cumulative `StreamWindow` grants emitted on this stream
+    /// (receiver side). Counts grant packets, not bytes.
+    credit_grants_sent: AtomicU64,
+    /// Receive-side credit bookkeeping. See [`RxCreditState`].
+    rx_credit: RxCreditState,
+    /// Monotonic lifetime id issued by the owning `NetSession` when
+    /// this state was created. Close + recreate of the same
+    /// `stream_id` produces a fresh `StreamState` with a new epoch;
+    /// stale `Stream` handles, `TxSlotGuard`s and `ControlDebitGuard`s
+    /// must fail an equality check against this value before acting
+    /// on the state.
+    ///
+    /// **Every** session-owned state carries a real one: the implicit
+    /// creation paths (`get_or_create_stream`,
+    /// `get_or_create_stream_for_packet`) allocate from the same
+    /// counter `open_stream_full` uses. `0` only appears on a
+    /// `StreamState` built standalone through
+    /// [`Self::new`]/[`Self::new_full`] and never installed in a
+    /// session's map, where there is no successor to confuse it with.
+    epoch: u64,
+    /// Out-of-order arrivals this receiver is holding so a reliable
+    /// stream delivers in sequence order. Empty for every
+    /// fire-and-forget stream and for every reliable stream on a
+    /// link that is not reordering, which is why it is created lazily
+    /// rather than allocated per stream. See [`InOrderBuffer`].
+    inorder: parking_lot::Mutex<InOrderBuffer>,
+}
+
+/// The exact stream lifetime one arrival was accepted by (NR4).
+///
+/// A stream id is reusable: close and reopen produces a fresh
+/// [`StreamState`] with a new [`StreamState::epoch`] under the same
+/// id, and a fresh handshake produces a whole new session whose
+/// epoch counter restarts. So neither half identifies a lifetime on
+/// its own — the pair does. It is captured where a sequence is
+/// ACCEPTED and checked where its frame is INSERTED, which is the
+/// only way a receive path that releases its map guard between the
+/// two can prove it is still talking to the same stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLifetime {
+    /// The session incarnation that accepted the sequence.
+    pub session_id: u64,
+    /// That session's per-stream lifetime id.
+    pub epoch: u64,
+}
+
+/// One arrival a reliable stream is holding until the sequences
+/// before it are delivered.
+///
+/// Keeps the decrypted bytes and the header they were parsed from,
+/// because that is what the dispatch path consumes: the packet has
+/// already paid AEAD and been admitted by the replay window, and
+/// neither is repeatable.
+pub struct HeldFrame {
+    /// The header (and source) the frame arrived with.
+    pub parsed: ParsedPacket,
+    /// The frame's decrypted payload.
+    pub decrypted: Bytes,
+}
+
+/// The bounded per-stream hold that makes reliable delivery FIFO.
+///
+/// **Why the receiver holds rather than the consumer reassembling.**
+/// `Reliability::Reliable` promises gap-free delivery *in sequence
+/// order*; a receiver that pushed arrivals through in wire order
+/// delegated that promise to every consumer, and the consumers that
+/// did not implement a reorder buffer (an nRPC service handler, for
+/// one) simply observed the wire's order — so a link that reordered,
+/// or a retransmit that healed a gap late, was silently delivered
+/// out of order on the one mode whose contract forbids it.
+///
+/// **The bound is the receive window, and the refusal is the point.**
+/// Capacity is reserved *before* the sequence is accepted, because
+/// accepting one records it as received (and SACKs it), after which
+/// the sender drops it from its retransmit window and this side is
+/// the only copy. A frame that does not fit is therefore never
+/// accepted: the sequence stays outstanding, the sender keeps its
+/// descriptor, and the ordinary NACK/RTO path brings it back.
+/// Holding is bounded by the bytes this receiver already promised as
+/// credit — the window the sender may have in flight is exactly the
+/// window that may need holding.
+#[derive(Default)]
+struct InOrderBuffer {
+    /// Held frames by sequence. A repeat of a held sequence replaces
+    /// its entry rather than queueing a second copy of it.
+    held: std::collections::BTreeMap<u64, HeldFrame>,
+    /// Decrypted bytes currently held, for the budget check.
+    bytes: usize,
+}
+
+/// Receive-side credit bookkeeping for the v2 round-trip window.
+///
+/// Tracks how much credit this receiver has extended to the sender
+/// vs how much it has "consumed" (accepted off the wire).
+///
+/// **Accounting cadence:** this is receive-time accounting, NOT
+/// application-drain accounting. Every accepted packet calls
+/// [`Self::on_bytes_consumed`] from
+/// the dispatch loop (`mesh.rs::process_local_packet`), which
+/// bumps both `consumed` and `granted` by the on-wire byte
+/// count. The "outstanding" credit (`granted - consumed`)
+/// therefore stays pinned at the initial window — every byte
+/// received is paired with a matching grant.
+///
+/// This shape exists to close the v1 io::Error-on-full-kernel-
+/// buffer gap (a single serial sender used to run
+/// `Transport(io::Error)` into a full kernel buffer). Per-stream
+/// kernel-buffer protection comes from the round-trip grant
+/// loop; per-application throttling comes from a separate
+/// mechanism (per-shard queue-depth limits).
+///
+/// An earlier version of this docstring described a
+/// threshold-emit pattern ("when outstanding dips below half
+/// the window, a grant is emitted"). That description didn't
+/// match the implementation and contradicted the v2 design
+/// goal — it has been superseded by the description above.
+///
+/// `window_bytes` is the per-grant chunk size — also the size of the
+/// sender's implicit initial window at open time. `0` disables
+/// receive-side bookkeeping entirely (matches the "unbounded" sender
+/// escape hatch).
+pub struct RxCreditState {
+    /// Total credit granted to the sender since stream open, including
+    /// the implicit initial window. Saturating u64 — 2^64 bytes is
+    /// ~18 exabytes, no realistic workload wraps.
+    granted: AtomicU64,
+    /// Total inbound bytes this receiver has accepted. Incremented on
+    /// the receive path as packets land on this stream. Invariant:
+    /// `consumed <= granted` (unless the sender overshoots the initial
+    /// window before the first grant — recoverable transient).
+    consumed: AtomicU64,
+    /// Per-grant chunk size (bytes). Equal to the sender's initial
+    /// window at open time. Used by the caller to size grant emission
+    /// — see [`Self::on_bytes_consumed`]. `0` disables emission
+    /// (the v1 unbounded escape hatch).
+    window_bytes: u32,
+}
+
+impl RxCreditState {
+    fn new(window_bytes: u32) -> Self {
+        Self {
+            // Prime `granted` with the implicit initial window —
+            // matches the sender's starting `tx_credit_remaining`, so
+            // the first `on_bytes_consumed` calls reduce "outstanding"
+            // rather than go negative.
+            granted: AtomicU64::new(window_bytes as u64),
+            consumed: AtomicU64::new(0),
+            window_bytes,
+        }
+    }
+
+    /// Bytes of credit outstanding — what the sender believes it can
+    /// still send before hitting backpressure, from this receiver's
+    /// local view.
+    #[inline]
+    pub fn outstanding(&self) -> u64 {
+        // Read `consumed` first, then `granted`. Paired with the
+        // publication order in `on_bytes_consumed` (granted first,
+        // then consumed), this guarantees `granted >= consumed`:
+        // if our `consumed` load observes a writer's increment, the
+        // writer's earlier `granted` increment is already visible to
+        // our subsequent `granted` load. Pre-fix the loads ran in
+        // the opposite order and `saturating_sub` masked transient
+        // `consumed > granted` to zero, surfacing a false "no
+        // outstanding bytes" reading to metrics during contention.
+        let c = self.consumed.load(Ordering::Acquire);
+        let g = self.granted.load(Ordering::Acquire);
+        g.saturating_sub(c)
+    }
+
+    /// Total bytes consumed since stream open.
+    #[inline]
+    pub fn consumed(&self) -> u64 {
+        self.consumed.load(Ordering::Acquire)
+    }
+
+    /// Total bytes granted (including the implicit initial window).
+    #[inline]
+    pub fn granted(&self) -> u64 {
+        self.granted.load(Ordering::Acquire)
+    }
+
+    /// Per-grant chunk size this receiver extends.
+    #[inline]
+    pub fn window_bytes(&self) -> u32 {
+        self.window_bytes
+    }
+
+    /// Record `bytes` consumed off the wire and return the receiver's
+    /// new cumulative consumed-byte count, which the caller ships as
+    /// the `total_consumed` field of an authoritative `StreamWindow`
+    /// grant. Returns `None` when receive-side bookkeeping is
+    /// disabled (`window_bytes == 0`).
+    ///
+    /// Authoritative grants are self-healing: each grant carries the
+    /// receiver's full picture, so a single lost grant is reconciled
+    /// by the next one. That's what keeps the sender's credit from
+    /// permanently draining when data packets OR grants are dropped
+    /// on the wire. One grant per inbound packet is the simplest
+    /// cadence; on lossy links the receiver may emit more frequently,
+    /// and a future enhancement can batch grants without changing
+    /// the wire format.
+    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u64> {
+        if self.window_bytes == 0 {
+            return None;
+        }
+        // The v2 design intentionally accounts at receive time
+        // (not application-drain time) — see `mesh.rs:3110-3135`
+        // ("Accounting runs at receive time (not drain time); this
+        // closes the v1 gap where a single serial sender ran
+        // `Transport(io::Error)` into a full kernel buffer"). The
+        // credit window is for kernel-buffer protection, not
+        // application-side throttling; the latter is provided by
+        // per-shard queue-depth limits.
+        //
+        // Every call mints a matching grant of `bytes`, returning
+        // the running cumulative consumed count for the caller to
+        // ship as `total_consumed` in an authoritative
+        // `StreamWindow` packet.
+        //
+        // Order matters: bump `granted` BEFORE `consumed` so a
+        // concurrent `outstanding()` reader that observes the new
+        // `consumed` is guaranteed to see the matching `granted`
+        // bump as well. With the opposite order, the reader's
+        // computation `granted - consumed` could transiently see
+        // `consumed > granted` (saturated to zero), surfacing a
+        // false "window drained" snapshot to metrics under
+        // contention.
+        self.granted.fetch_add(bytes, Ordering::AcqRel);
+        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        Some(new_consumed)
+    }
+}
+
+impl std::fmt::Debug for RxCreditState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RxCreditState")
+            .field("granted", &self.granted.load(Ordering::Relaxed))
+            .field("consumed", &self.consumed.load(Ordering::Relaxed))
+            .field("window_bytes", &self.window_bytes)
+            .finish()
+    }
+}
+
+impl StreamState {
+    /// Create a new stream state
+    pub fn new(reliable: bool) -> Self {
+        Self::new_with_weight(reliable, 1)
+    }
+
+    /// Create a new stream state with a fair-scheduler weight.
+    ///
+    /// Uses [`DEFAULT_STREAM_WINDOW_BYTES`] for the initial credit
+    /// window — implicitly created receive-side streams (via
+    /// `NetSession::get_or_create_stream`) inherit the default so
+    /// `RxCreditState` can mint grants on threshold crossings.
+    /// Callers that need a specific window go through
+    /// [`Self::new_full`].
+    pub fn new_with_weight(reliable: bool, fairness_weight: u8) -> Self {
+        Self::new_full(reliable, fairness_weight, DEFAULT_STREAM_WINDOW_BYTES)
+    }
+
+    /// Create a new stream state with full config (weight + tx window)
+    /// and **no** lifetime id.
+    ///
+    /// Epoch `0` is only safe for a state the caller owns outright and
+    /// never installs in a `NetSession`'s stream map: with no
+    /// predecessor or successor under the same id, nothing compares
+    /// against it. Every session-owned state — explicit
+    /// (`open_stream_full`) or implicit
+    /// (`NetSession::implicit_stream_state`) — allocates a real one
+    /// through [`Self::new_full_with_epoch`].
+    pub fn new_full(reliable: bool, fairness_weight: u8, tx_window: u32) -> Self {
+        Self::new_full_with_epoch(reliable, fairness_weight, tx_window, 0)
+    }
+
+    /// Create a new stream state with a caller-supplied lifetime id.
+    ///
+    /// Sessions call this from `open_stream_full` and
+    /// `implicit_stream_state` with a monotonic epoch; stale `Stream`
+    /// handles, `TxSlotGuard`s and `ControlDebitGuard`s from a prior
+    /// lifetime of the same `stream_id` fail the epoch check against
+    /// the new state.
+    pub fn new_full_with_epoch(
+        reliable: bool,
+        fairness_weight: u8,
+        tx_window: u32,
+        epoch: u64,
+    ) -> Self {
+        // Size the retransmit window to the tx-credit window so the
+        // sender can never have more packets in flight than it can
+        // retransmit (H-1). Cheap: `pending` grows on demand, so a large
+        // window costs no up-front memory.
+        let max_pending = ReliableStream::max_pending_for_window(tx_window);
+        Self {
+            tx_seq: AtomicU64::new(0),
+            rx_seq: AtomicU64::new(0),
+            reliability: parking_lot::Mutex::new(create_reliability_mode(reliable, max_pending)),
+            inbound: SegQueue::new(),
+            active: AtomicBool::new(true),
+            last_activity: AtomicU64::new(current_timestamp()),
+            reliable_mode: AtomicBool::new(reliable),
+            rx_mode_boundary: AtomicU64::new(if reliable { 0 } else { u64::MAX }),
+            rx_boundary_signalled: AtomicBool::new(false),
+            tx_mode_boundary: AtomicU64::new(u64::MAX),
+            fairness_weight: fairness_weight.max(1),
+            tx_window,
+            // Implicit initial window: the sender starts with full
+            // credit so the first send doesn't eat a handshake round
+            // trip.
+            tx_credit_remaining: AtomicU32::new(tx_window),
+            tx_bytes_sent: AtomicU64::new(0),
+            max_consumed_seen: AtomicU64::new(0),
+            overdraft: AtomicU64::new(0),
+            backpressure_events: AtomicU64::new(0),
+            credit_grants_received: AtomicU64::new(0),
+            credit_grants_sent: AtomicU64::new(0),
+            rx_credit: RxCreditState::new(tx_window),
+            epoch,
+            inorder: parking_lot::Mutex::new(InOrderBuffer::default()),
+        }
+    }
+
+    /// Refresh last-activity timestamp. Called on every send and on
+    /// every receive that lands packets/events into the stream.
+    #[inline]
+    pub fn touch(&self) {
+        self.last_activity
+            .store(current_timestamp(), Ordering::Release);
+    }
+
+    /// Nanoseconds since epoch of the last activity.
+    #[inline]
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
+    /// Whether this stream's reliability mode is the reliable one
+    /// **right now** — see [`Self::ensure_reliable`] for why that is
+    /// not always the mode it was created with.
+    #[inline]
+    pub fn reliable_mode(&self) -> bool {
+        self.reliable_mode.load(Ordering::Acquire)
+    }
+
+    /// Make this stream reliable if it is not already. Returns
+    /// whether the mode was upgraded.
+    ///
+    /// **Why reliability is not first-open-wins.** A stream's window
+    /// and fair-share weight are the first opener's to choose: they
+    /// are local resource policy, and a second opener's disagreement
+    /// is nothing worse than a preference that lost. Reliability is
+    /// not policy. It is the delivery contract, it is strictly
+    /// stronger than fire-and-forget, and the traffic decides who is
+    /// owed it: a reliable sender's packets carry
+    /// `PacketFlags::RELIABLE`, register retransmit descriptors,
+    /// and require the receiver to hold gap state to NACK against.
+    ///
+    /// Ignoring a reliable open because some earlier fire-and-forget
+    /// traffic created the id first — which is ordinary, since a
+    /// channel's publish stream id is derived from the channel, so
+    /// every mode publishing to one channel shares one id — admitted
+    /// the reliable sender onto fire-and-forget machinery:
+    /// `FireAndForget::on_send` retains nothing, so nothing could
+    /// be rebuilt, `FireAndForget::build_nack` is `None`, so no gap
+    /// was ever reported, and the loss was therefore silent on the
+    /// one mode whose whole contract is that it is not.
+    ///
+    /// The upgrade is one-way. A fire-and-forget open on a reliable
+    /// stream stays ignored (and warned about): downgrading would
+    /// abandon descriptors the peer is still owed.
+    ///
+    /// **What carries over.** The receive cursor, and only it.
+    /// Fire-and-forget retained no descriptor for anything it sent,
+    /// so there is no in-flight obligation for the new mode to
+    /// inherit and `pending` starts empty. The receive half must
+    /// resume at the next sequence the peer will send: starting a
+    /// fresh reliable cursor at zero would open a phantom hole as
+    /// deep as the traffic the id already carried, NACK sequences
+    /// that were never lost, and hold every later arrival behind a
+    /// gap nothing can fill.
+    ///
+    /// This is the **assumed** boundary — the conservative one, for
+    /// a receiver that has seen reliable traffic but not yet the
+    /// sender's [`crate::protocol::PacketFlags::MODE_BOUNDARY`]
+    /// signal. It concedes nothing above what has already arrived
+    /// contiguously, so a reliable packet lost at the boundary is
+    /// NACKed rather than acknowledged away. When the signal lands,
+    /// [`Self::ensure_reliable_at`] raises the boundary and concedes
+    /// what was genuinely fire-and-forget.
+    pub fn ensure_reliable(&self) -> bool {
+        self.promote_rx(None)
+    }
+
+    /// Make this stream reliable at the sender's **stated**
+    /// boundary, or raise an assumed boundary to it. Returns
+    /// whether anything changed.
+    ///
+    /// `boundary` is the sequence of a packet carrying
+    /// [`crate::protocol::PacketFlags::MODE_BOUNDARY`]: the first
+    /// reliable sequence its sender put on this stream. Everything
+    /// below it is fire-and-forget — unrebuildable, so conceded —
+    /// and everything from it on is reliable.
+    ///
+    /// The first stated boundary is final. A later one is ignored:
+    /// mode promotion happens once, so a second signal naming a
+    /// higher boundary could only be a peer asking this receiver to
+    /// concede reliable sequences it is already holding.
+    pub fn ensure_reliable_at(&self, boundary: u64) -> bool {
+        self.promote_rx(Some(boundary))
+    }
+
+    /// The receive-side promotion, whichever half asked for it.
+    ///
+    /// One function because the two halves are one transition seen
+    /// at different times, and splitting them is what let the wire's
+    /// accounting and the consumer's cursor disagree about where the
+    /// boundary was.
+    fn promote_rx(&self, signalled: Option<u64>) -> bool {
+        // Lock-free fast path: every reliable arrival asks for this
+        // (`get_or_create_stream_for_packet`), and for a stream
+        // already promoted at a stated boundary — or asked without
+        // a signal — there is nothing to do. Two atomic loads
+        // instead of the reliability mutex.
+        if self.reliable_mode.load(Ordering::Acquire)
+            && (signalled.is_none() || self.rx_boundary_signalled.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        let mut guard = self.reliability.lock();
+        if self.reliable_mode.load(Ordering::Acquire) {
+            // Already reliable. The only thing left to do is raise
+            // an assumed boundary to a stated one.
+            let Some(boundary) = signalled else {
+                return false;
+            };
+            if self.rx_boundary_signalled.swap(true, Ordering::AcqRel) {
+                return false;
+            }
+            self.rx_mode_boundary.store(boundary, Ordering::Release);
+            let moved = guard.concede_rx_below(boundary);
+            drop(guard);
+            return moved;
+        }
+        // Always a RESUME, never a fresh cursor: an upgraded stream
+        // has a peer that is already mid-sequence. The boundary is
+        // the sender's if it stated one, and otherwise the
+        // contiguous frontier — the only sequence this receiver can
+        // name without claiming receipt of something it never got.
+        //
+        // R4-1: that "otherwise" used to be the previous mode's
+        // HIGH-WATER mark plus one, which claims receipt of every
+        // hole below it. A producer taking reliability per handle
+        // puts reliable sequences between fire-and-forget ones on
+        // one shared space, so the hole can be reliable — held by a
+        // sender that would have rebuilt it — and conceding it is a
+        // false ACK for data nobody now owns.
+        // `ReliabilityMode::rx_resume_point` answers with the
+        // frontier instead, so the hole is NACKed and a stated
+        // boundary is still free to raise the concession later.
+        let boundary = match signalled {
+            Some(boundary) => boundary,
+            None => guard.rx_resume_point().unwrap_or(0),
+        };
+        let mut upgraded =
+            create_reliability_mode(true, ReliableStream::max_pending_for_window(self.tx_window));
+        upgraded.resume_rx_at(boundary);
+        *guard = upgraded;
+        self.rx_mode_boundary.store(boundary, Ordering::Release);
+        self.rx_boundary_signalled
+            .store(signalled.is_some(), Ordering::Release);
+        self.reliable_mode.store(true, Ordering::Release);
+        drop(guard);
+        true
+    }
+
+    /// This stream's receive-side mode and, if it is reliable,
+    /// where it became so.
+    ///
+    /// The single fact the wire's ACK accounting, the consumer's
+    /// reorder cursor and the stream's producers all read.
+    #[inline]
+    pub fn rx_stream_mode(&self) -> StreamMode {
+        match self.rx_mode_boundary.load(Ordering::Acquire) {
+            u64::MAX => StreamMode::FireAndForget,
+            boundary => StreamMode::Reliable {
+                boundary,
+                signalled: self.rx_boundary_signalled.load(Ordering::Acquire),
+            },
+        }
+    }
+
+    /// Whether this sender has already promoted its send half of
+    /// this stream to reliable.
+    ///
+    /// **The stream's mode is the contract; a handle's flag is a
+    /// request.** After promotion a still-open fire-and-forget
+    /// producer's packets are sent reliable: reliability is strictly
+    /// stronger, so upgrading a fire-and-forget send violates
+    /// nothing its caller asked for, whereas leaving it
+    /// fire-and-forget puts an unrebuildable sequence inside the
+    /// reliable region of a shared sequence space — which the
+    /// receiver must then either hold forever or skip, and skipping
+    /// it discards the reliable records behind it.
+    #[inline]
+    pub fn tx_promoted(&self) -> bool {
+        self.tx_mode_boundary.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// Claim `seq` as this send half's reliable-mode boundary.
+    ///
+    /// `true` exactly once per stream — for the first reliable
+    /// packet it sends, whose header then carries
+    /// [`crate::protocol::PacketFlags::MODE_BOUNDARY`] so the
+    /// receiver never has to infer the split.
+    #[inline]
+    pub fn promote_tx_at(&self, seq: u64) -> bool {
+        self.tx_mode_boundary
+            .compare_exchange(u64::MAX, seq, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Bytes of out-of-order frames this stream may hold at once.
+    ///
+    /// The receive window is the natural budget: it is the amount
+    /// this receiver has already told the sender it may have in
+    /// flight, so it is exactly the amount that can need holding.
+    /// A window of `0` disables backpressure rather than the hold,
+    /// so the floor keeps at least one maximum-size packet holdable
+    /// — otherwise the first reordered arrival on such a stream
+    /// would be refused forever.
+    #[inline]
+    fn reorder_budget(&self) -> usize {
+        (self.tx_window as usize).max(crate::protocol::MAX_PACKET_SIZE)
+    }
+
+    /// Whether a `bytes`-long frame can be held without exceeding
+    /// this stream's reorder budget.
+    ///
+    /// Asked BEFORE the sequence is offered to the reliability mode:
+    /// a sequence that is accepted is recorded as received and
+    /// SACKed, and the sender then stops owning it.
+    #[inline]
+    pub fn has_reorder_room(&self, bytes: usize) -> bool {
+        let buffer = self.inorder.lock();
+        buffer.held.is_empty() || buffer.bytes.saturating_add(bytes) <= self.reorder_budget()
+    }
+
+    /// Hold one out-of-order arrival until the sequences before it
+    /// have been delivered. Returns whether this was a NEW hold.
+    ///
+    /// A repeat of a sequence already held replaces it: the bytes are
+    /// the same bytes, and a second copy would be delivered twice.
+    /// Prefer [`NetSession::hold_in_order_frame`], which keeps the
+    /// session's release fast path in step.
+    pub fn hold_out_of_order(&self, seq: u64, frame: HeldFrame) -> bool {
+        let mut buffer = self.inorder.lock();
+        let bytes = frame.decrypted.len();
+        let replaced = buffer.held.insert(seq, frame);
+        buffer.bytes = buffer.bytes.saturating_add(bytes);
+        match replaced {
+            Some(previous) => {
+                buffer.bytes = buffer.bytes.saturating_sub(previous.decrypted.len());
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Take the lowest held frame whose sequence is now covered —
+    /// strictly below `next_expected`, the receiver's contiguous
+    /// frontier — or `None` when the hold is empty or still gapped.
+    ///
+    /// Called in a loop by the dispatch path, so one arrival that
+    /// fills a gap releases everything that was queued behind it, in
+    /// sequence order.
+    pub fn take_in_order_below(&self, next_expected: u64) -> Option<HeldFrame> {
+        let mut buffer = self.inorder.lock();
+        let &seq = buffer.held.keys().next()?;
+        if seq >= next_expected {
+            return None;
+        }
+        let frame = buffer.held.remove(&seq)?;
+        buffer.bytes = buffer.bytes.saturating_sub(frame.decrypted.len());
+        Some(frame)
+    }
+
+    /// How many out-of-order arrivals this stream is holding.
+    #[inline]
+    pub fn reorder_held(&self) -> usize {
+        self.inorder.lock().held.len()
+    }
+
+    /// Drop everything held, returning how many frames went. The
+    /// peer reset the stream or gave up on the gap, so the sequences
+    /// in front of these frames are never arriving and releasing
+    /// them would be delivery out of order.
+    pub fn clear_in_order_hold(&self) -> usize {
+        let mut buffer = self.inorder.lock();
+        let dropped = buffer.held.len();
+        buffer.held.clear();
+        buffer.bytes = 0;
+        dropped
+    }
+
+    /// Fair-scheduler weight for this stream.
+    #[inline]
+    pub fn fairness_weight(&self) -> u8 {
+        self.fairness_weight
+    }
+
+    /// Monotonic per-session lifetime id captured at construction
+    /// time. Unique across every creation on its session, explicit or
+    /// implicit. `0` only on a session-less standalone state
+    /// ([`Self::new_full`]).
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Configured initial credit window in bytes. `0` means "no limit"
+    /// — backpressure is disabled for this stream (v1 escape hatch).
+    #[inline]
+    pub fn tx_window(&self) -> u32 {
+        self.tx_window
+    }
+
+    /// Current remaining send credit in bytes. Approaches `0` as the
+    /// sender pushes packets without a corresponding receiver grant;
+    /// the next acquire at `0` returns Backpressure.
+    #[inline]
+    pub fn tx_credit_remaining(&self) -> u32 {
+        self.tx_credit_remaining.load(Ordering::Acquire)
+    }
+
+    /// Cumulative number of Backpressure rejections since the stream opened.
+    #[inline]
+    pub fn backpressure_events(&self) -> u64 {
+        self.backpressure_events.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative `StreamWindow` grants received on this stream.
+    #[inline]
+    pub fn credit_grants_received(&self) -> u64 {
+        self.credit_grants_received.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative `StreamWindow` grants emitted on this stream.
+    #[inline]
+    pub fn credit_grants_sent(&self) -> u64 {
+        self.credit_grants_sent.load(Ordering::Relaxed)
+    }
+
+    /// Access the receive-side credit bookkeeping.
+    #[inline]
+    pub fn rx_credit(&self) -> &RxCreditState {
+        &self.rx_credit
+    }
+
+    /// Try to acquire `bytes` of send credit via a CAS loop.
+    ///
+    /// Returns `true` on success — `tx_credit_remaining` is
+    /// decremented and `tx_bytes_sent` is bumped so the
+    /// authoritative-grant reconciliation sees a consistent view.
+    /// Returns `false` when remaining credit is below `bytes`;
+    /// caller returns `StreamError::Backpressure` and the rejection
+    /// counter bumps.
+    ///
+    /// `tx_window == 0` disables the check; all requests admit and
+    /// the counter is not touched.
+    pub fn try_acquire_tx_credit(&self, bytes: u32) -> bool {
+        if self.tx_window == 0 {
+            return true;
+        }
+        loop {
+            let cur = self.tx_credit_remaining.load(Ordering::Acquire);
+            if cur < bytes {
+                self.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if self
+                .tx_credit_remaining
+                .compare_exchange_weak(cur, cur - bytes, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Bump the committed-bytes counter only after the
+                // CAS wins. The reverse order (bump then CAS) lets
+                // a concurrent grant observe the bumped watermark,
+                // mint credit up to the window, and then the
+                // pending admission's CAS subtracts that credit —
+                // net loss of one unit per grant-vs-admission race.
+                // The narrow truncation window the audit highlighted
+                // (#97) is self-healing via the next grant; the
+                // window-invariant violation in the alternative
+                // ordering is not.
+                self.tx_bytes_sent
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                return true;
+            }
+            // CAS lost — retry with the fresh value.
+        }
+    }
+
+    /// Debit `bytes` against this stream's send ledger **without
+    /// admission** — the ledger half of [`Self::try_acquire_tx_credit`]
+    /// with no refusal path.
+    ///
+    /// Sender and receiver keep two halves of one ledger. The receiver
+    /// charges every packet it accepts on a stream to
+    /// `rx_credit.consumed` and ships that cumulative total in its
+    /// authoritative `StreamWindow` grant; the sender reconciles the
+    /// grant against `tx_bytes_sent`. A producer that puts bytes on the
+    /// wire without moving `tx_bytes_sent` therefore lets the
+    /// receiver's total run ahead of the sender's watermark, and the
+    /// next grant refunds credit for bytes some *other* producer on
+    /// that stream still has in flight — the window re-opens for data
+    /// the receiver never saw. Clamping the grant to `tx_bytes_sent`
+    /// bounds the total at the ceiling; it does not make the refunded
+    /// bytes have arrived.
+    ///
+    /// Control-plane producers have no caller to return
+    /// `Backpressure` to (a membership ack or a capability
+    /// announcement is protocol progress, not application traffic), so
+    /// they debit unconditionally and the remaining credit floors at
+    /// zero rather than refusing. Feedback is never put behind the
+    /// window it exists to refill.
+    ///
+    /// Flooring at zero is not forgiveness. The part of the debit the
+    /// remaining credit could not pay for is carried as
+    /// [`overdraft`](Self::tx_overdraft) — debt the next
+    /// authoritative grant retires *before* it reopens application
+    /// credit. Forgetting it let a grant reporting only the control
+    /// frame's own bytes as consumed hand that credit to the
+    /// application window while every admitted application byte was
+    /// still outstanding.
+    ///
+    /// Same publication order as `try_acquire_tx_credit`: remaining
+    /// first, then the watermark.
+    pub fn note_tx_bytes_sent(&self, bytes: u32) {
+        if self.tx_window == 0 {
+            return;
+        }
+        // `fetch_update` returns the PREVIOUS value on success, and
+        // the closure is infallible, so `prev` is always the credit
+        // this debit found. `prev.min(bytes)` is what the window
+        // actually paid; the rest is the overdraft.
+        let prev = self
+            .tx_credit_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(bytes))
+            })
+            .unwrap_or(bytes);
+        let shortfall = bytes.saturating_sub(prev);
+        if shortfall > 0 {
+            self.overdraft.fetch_add(shortfall as u64, Ordering::AcqRel);
+        }
+        self.tx_bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Give back a control debit taken by
+    /// [`Self::note_tx_bytes_sent`] for work the transport **never
+    /// admitted** — a refused enqueue, a send that failed its
+    /// deadline, or a producer cancelled while suspended before
+    /// admission.
+    ///
+    /// Unlike [`Self::refund_tx_credit`], this reverses a debit that
+    /// may have landed partly or wholly in
+    /// [`overdraft`](Self::tx_overdraft), so it pays the debt down
+    /// first and only returns the remainder to
+    /// `tx_credit_remaining`. Applied in that order it is the exact
+    /// inverse of the debit: a frame whose whole cost floored at zero
+    /// clears exactly its own debt and mints no credit.
+    ///
+    /// **Never call this for a packet the transport accepted.** Wire
+    /// loss after admission is the receiver's to reconcile through the
+    /// next grant — refunding it would credit the sender for bytes
+    /// that may still arrive and be charged, which is the
+    /// double-credit this whole ledger exists to prevent. The
+    /// distinction is admission, not delivery.
+    pub fn refund_control_debit(&self, bytes: u32) {
+        if self.tx_window == 0 {
+            return;
+        }
+        let paid = self.retire_overdraft(bytes as u64) as u32;
+        let back = bytes - paid;
+        if back > 0 {
+            self.tx_credit_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_add(back))
+                })
+                .ok();
+        }
+        self.tx_bytes_sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes as u64))
+            })
+            .ok();
+    }
+
+    /// Pay up to `amount` off the outstanding control overdraft and
+    /// return how much was actually retired. The remainder is the
+    /// caller's to spend on application credit.
+    fn retire_overdraft(&self, amount: u64) -> u64 {
+        if amount == 0 {
+            return 0;
+        }
+        let prev = self
+            .overdraft
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+                Some(d.saturating_sub(amount))
+            })
+            .unwrap_or(0);
+        prev.min(amount)
+    }
+
+    /// Refund `bytes` of send credit. Called by `TxSlotGuard::drop`
+    /// when a previously acquired slot never made it to the wire
+    /// (socket send cancelled, early return, etc.). Rolls back both
+    /// `tx_credit_remaining` and the `tx_bytes_sent` bump recorded at
+    /// admission — the bytes never left the sender, so neither
+    /// counter should reflect them. No clamp at `tx_window`: grants
+    /// may have pushed the counter past the initial window, and
+    /// refunding those bytes back to a `tx_window` ceiling would
+    /// strand legitimately-granted credit.
+    pub fn refund_tx_credit(&self, bytes: u32) {
+        if self.tx_window == 0 {
+            return;
+        }
+        self.tx_credit_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_add(bytes))
+            })
+            .ok();
+        self.tx_bytes_sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes as u64))
+            })
+            .ok();
+    }
+
+    /// Attempt to roll back a TX sequence number that was allocated via
+    /// [`Self::next_tx_seq`] but whose packet never reached the wire
+    /// (e.g. the FairScheduler queue was full and `deliver_stream_packet`
+    /// returned `Backpressure` *after* the seq was consumed). Unlike the
+    /// byte credit — which `TxSlotGuard::drop` always refunds — the seq
+    /// is a monotonic `fetch_add` counter, so a blind decrement is unsafe:
+    /// a concurrent sender on the same stream may already have consumed
+    /// `seq + 1`, and decrementing would re-issue that sender's sequence.
+    ///
+    /// We therefore roll back **only** via a CAS `seq + 1 -> seq`, which
+    /// succeeds exactly when `seq` was the most-recently-issued sequence
+    /// (the common case for the backpressure-on-the-last-flush scenario)
+    /// and no other send has advanced the counter in between. Returns
+    /// `true` if the rollback won the CAS (no gap left behind), `false`
+    /// if another allocation raced ahead — in which case the gap is
+    /// genuinely unavoidable and the reliable-stream retransmit/NACK
+    /// machinery must recover it instead.
+    pub fn try_rollback_tx_seq(&self, seq: u64) -> bool {
+        self.tx_seq
+            .compare_exchange(
+                seq.wrapping_add(1),
+                seq,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Apply a receiver grant reporting the receiver's **absolute**
+    /// cumulative consumed-byte count on this stream. Monotonic —
+    /// grants arriving with `total_consumed` below the already-observed
+    /// maximum are treated as stale duplicates and only bump the
+    /// `credit_grants_received` counter. Self-healing: a single lost
+    /// grant is reconciled by the next one because each grant carries
+    /// the receiver's full accounting.
+    ///
+    /// Reconciliation adds the **delta** of newly-acknowledged bytes
+    /// (`total_consumed - prev_max_consumed`) to `tx_credit_remaining`
+    /// via `fetch_update`. The additive form composes atomically with
+    /// the CAS in `try_acquire_tx_credit` and the `fetch_update` in
+    /// `refund_tx_credit`: every operation preserves the invariant
+    /// `remaining + (sent - max_consumed) == window + overdraft`
+    /// regardless of interleaving. An earlier `.store()`-based
+    /// implementation recomputed from a racy snapshot of
+    /// `tx_bytes_sent`, which could silently overwrite a concurrent
+    /// acquire's CAS result.
+    ///
+    /// **The delta pays control debt first.** Newly-consumed bytes
+    /// are the sender's only evidence that anything left the window,
+    /// and an unconditional control debit
+    /// ([`Self::note_tx_bytes_sent`]) can have spent window the
+    /// application had already been admitted against. Crediting the
+    /// delta straight into `tx_credit_remaining` therefore reopened
+    /// the window for application bytes the receiver had never seen —
+    /// the grant "refunded" a debit that was only floored, not paid.
+    /// So the delta retires [`overdraft`](Self::tx_overdraft) first
+    /// and only the remainder becomes application credit. The
+    /// `min(window)` clamp bounds a hostile grant; it never
+    /// substituted for this.
+    ///
+    /// **And it pays at full width.** The debt ledger is `u64`; the
+    /// application-credit representation is `u32`. Narrowing the delta
+    /// before repayment capped one grant's repayment at `u32::MAX`
+    /// while the *full* consumed total had already advanced
+    /// `max_consumed_seen` — so the unpaid excess could never be
+    /// re-presented and the window stayed shut forever. Settle from
+    /// the `u64` delta, then narrow what survives.
+    pub fn apply_authoritative_grant(&self, total_consumed: u64) {
+        self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
+        if self.tx_window == 0 {
+            return;
+        }
+        // Clamp `total_consumed` to the sender-side `tx_bytes_sent`
+        // watermark before the CAS. Without this, a malformed or
+        // hostile grant carrying `total_consumed = u64::MAX` advanced
+        // `max_consumed_seen` to MAX, and every subsequent honest
+        // grant tripped the `total_consumed <= prev` early-return —
+        // the stream stalled forever. The clamp is safe under honest
+        // operation (a receiver can't have consumed bytes the sender
+        // hasn't committed) and acts as a safety bound
+        // otherwise.
+        let sent_watermark = self.tx_bytes_sent.load(Ordering::Acquire);
+        let total_consumed = total_consumed.min(sent_watermark);
+        // Monotonic CAS update — the value advanced by the successful
+        // CAS is the amount of newly-acknowledged bytes.
+        let mut prev = self.max_consumed_seen.load(Ordering::Acquire);
+        let delta = loop {
+            if total_consumed <= prev {
+                return; // stale / duplicate grant — ignore
+            }
+            match self.max_consumed_seen.compare_exchange_weak(
+                prev,
+                total_consumed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break total_consumed - prev,
+                Err(current) => prev = current,
+            }
+        };
+        // Order matters, and so does width. `overdraft` and the
+        // consumed watermarks are `u64`; only the application-credit
+        // *representation* (`tx_credit_remaining`) is `u32`. So the
+        // delta settles control debt at full width first, and only the
+        // surviving remainder is narrowed to that representation.
+        //
+        // Clamping first was Kyra R3-6: a debt above `u32::MAX` got
+        // `u32::MAX` of repayment out of a larger delta, the excess
+        // was dropped on the floor, and because the *full* consumed
+        // total had already advanced `max_consumed_seen`, no later
+        // grant could re-present those bytes — the remaining debt was
+        // stranded and the application window never reopened.
+        //
+        // Under honest receiver accounting
+        // (`total_consumed <= tx_bytes_sent`) the remainder is bounded
+        // by the outstanding window, so `saturating_add` is a no-op
+        // against overflow and the final value naturally stays at or
+        // below `tx_window`.
+        //
+        // A malformed or buggy grant can report `total_consumed`
+        // above what the sender has actually committed, which would
+        // otherwise mint credit past the window and let the sender
+        // exceed its configured ceiling. The `min(self.tx_window)`
+        // clamp caps credit at the configured window regardless of
+        // the reported delta — a safety bound, not a correctness
+        // requirement under honest operation.
+        //
+        // `retire_overdraft` returns `prev.min(amount)`, so the
+        // subtraction cannot underflow.
+        let paid = self.retire_overdraft(delta);
+        let credit_add = (delta - paid).min(u32::MAX as u64) as u32;
+        if credit_add == 0 {
+            return;
+        }
+        let window = self.tx_window;
+        self.tx_credit_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_add(credit_add).min(window))
+            })
+            .ok();
+    }
+
+    /// Cumulative bytes committed to the wire on this stream.
+    /// Admission bumps it; uncommitted-guard drops roll it back.
+    #[inline]
+    pub fn tx_bytes_sent(&self) -> u64 {
+        self.tx_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Highest `total_consumed` this sender has observed from the
+    /// receiver on this stream. Monotonic.
+    #[inline]
+    pub fn max_consumed_seen(&self) -> u64 {
+        self.max_consumed_seen.load(Ordering::Acquire)
+    }
+
+    /// Outstanding control debt in bytes: the part of the
+    /// unconditional control debits on this stream that
+    /// `tx_credit_remaining` could not pay for.
+    ///
+    /// Non-zero means the application window is closed *and* owes
+    /// bytes — the next grant retires this before it reopens
+    /// application credit. Zero on a stream that has never
+    /// overdrawn, which is every stream carrying application traffic
+    /// alone.
+    #[inline]
+    pub fn tx_overdraft(&self) -> u64 {
+        self.overdraft.load(Ordering::Acquire)
+    }
+
+    /// Record that the receiver side has accepted `bytes` off the
+    /// wire on this stream. Returns `Some(total_consumed)` — the
+    /// receiver's new cumulative consumed count — so the caller can
+    /// emit an authoritative `StreamWindow` grant. Returns `None`
+    /// when receive-side bookkeeping is disabled (`window_bytes == 0`).
+    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u64> {
+        self.rx_credit.on_bytes_consumed(bytes)
+    }
+
+    /// Increment the "grants emitted" counter. Called after a grant
+    /// packet has been successfully handed to the socket send path.
+    #[inline]
+    pub fn note_grant_sent(&self) {
+        self.credit_grants_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get and increment the TX sequence number. Refreshes `last_activity`.
+    #[inline]
+    pub fn next_tx_seq(&self) -> u64 {
+        self.touch();
+        self.tx_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Reserve `count` CONSECUTIVE send sequences and return the
+    /// first. `count == 0` reserves one.
+    ///
+    /// The indivisible form of [`Self::next_tx_seq`], for a message
+    /// whose pieces are only a message if their sequences are
+    /// consecutive. Taking them one at a time lets a concurrent
+    /// send on the same stream land inside the run, which every
+    /// receiver refuses and no retransmission repairs. One
+    /// `fetch_add`, so the reservation is atomic without any lock
+    /// the caller could hold across an await.
+    #[inline]
+    pub fn reserve_tx_seq_range(&self, count: u32) -> u64 {
+        self.touch();
+        self.tx_seq
+            .fetch_add(u64::from(count.max(1)), Ordering::Relaxed)
+    }
+
+    /// Get the current TX sequence number
+    #[inline]
+    pub fn current_tx_seq(&self) -> u64 {
+        self.tx_seq.load(Ordering::Relaxed)
+    }
+
+    /// Update the RX sequence number. Refreshes `last_activity`.
+    #[inline]
+    pub fn update_rx_seq(&self, seq: u64) {
+        self.touch();
+        self.rx_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// Get the current RX sequence number
+    #[inline]
+    pub fn current_rx_seq(&self) -> u64 {
+        self.rx_seq.load(Ordering::Relaxed)
+    }
+
+    /// Forget the highest received sequence, so a peer that reopens
+    /// this stream id from 0 is not measured against the previous
+    /// lifetime's high-water mark. Send-side state is untouched —
+    /// see [`NetSession::reset_rx_stream`].
+    #[inline]
+    pub fn reset_rx_seq(&self) {
+        self.touch();
+        self.rx_seq.store(0, Ordering::Relaxed);
+    }
+
+    /// End the RECEIVE lifetime this stream has been tracking: drop
+    /// the mode's receive cursor AND the receive-boundary authority,
+    /// so the next lifetime's own statement governs.
+    ///
+    /// **The boundary is part of the receive lifetime, not of the
+    /// stream id.** `rx_mode_boundary`/`rx_boundary_signalled` name
+    /// where the PEER's send half became reliable, and the first
+    /// stated boundary is final *within one lifetime* — that is what
+    /// stops a peer conceding reliable sequences this receiver is
+    /// already holding. A reset says the lifetime those sequences
+    /// belonged to is over and the peer may reopen the id from zero,
+    /// so keeping its boundary latched made `promote_rx` treat the
+    /// NEXT lifetime's `MODE_BOUNDARY` as that forbidden second
+    /// statement and ignore it: cursors restarted at zero while the
+    /// feedback half still answered to the previous statement, and a
+    /// fresh consumer that accepted the new boundary got an ACK
+    /// stream that never conceded the new lifetime's
+    /// fire-and-forget prefix.
+    ///
+    /// The SEND half is untouched — `reliable_mode` (which owns the
+    /// retransmit window), `tx_seq` and `tx_mode_boundary` all
+    /// belong to what THIS side sends, and a peer's reset is not a
+    /// statement about them. The boundary returns to the unstated
+    /// value for the mode the receive half is in, exactly as
+    /// `NetSession::implicit_stream_state` starts it, so a
+    /// reliable stream keeps a coherent `rx_stream_mode` (assumed
+    /// boundary 0 against a cursor at 0) instead of claiming to be
+    /// fire-and-forget while reliable machinery tracks it.
+    ///
+    /// Taken under the reliability lock together with the cursor
+    /// reset: an arrival that promotes concurrently then sees both
+    /// halves of one lifetime, never a new cursor against an old
+    /// boundary.
+    pub fn reset_rx_lifetime(&self) {
+        let mut guard = self.reliability.lock();
+        guard.reset_rx();
+        let unstated = if self.reliable_mode.load(Ordering::Acquire) {
+            0
+        } else {
+            u64::MAX
+        };
+        self.rx_mode_boundary.store(unstated, Ordering::Release);
+        self.rx_boundary_signalled.store(false, Ordering::Release);
+        drop(guard);
+    }
+
+    /// Access the reliability mode
+    #[inline]
+    pub fn with_reliability<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Box<dyn ReliabilityMode>) -> R,
+    {
+        let mut guard = self.reliability.lock();
+        f(&mut guard)
+    }
+
+    /// Push an event to the inbound queue
+    #[inline]
+    pub fn push_event(&self, event: StoredEvent) {
+        self.inbound.push(event);
+    }
+
+    /// Pop an event from the inbound queue
+    #[inline]
+    pub fn pop_event(&self) -> Option<StoredEvent> {
+        self.inbound.pop()
+    }
+
+    /// Get the number of pending inbound events
+    #[inline]
+    pub fn inbound_len(&self) -> usize {
+        self.inbound.len()
+    }
+
+    /// Check if stream is active
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Deactivate the stream
+    #[inline]
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for StreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamState")
+            .field("tx_seq", &self.tx_seq.load(Ordering::Relaxed))
+            .field("rx_seq", &self.rx_seq.load(Ordering::Relaxed))
+            .field("inbound_len", &self.inbound.len())
+            .field("active", &self.active.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Session manager for handling multiple sessions.
+///
+/// Currently supports single-peer operation, but designed for
+/// future multi-peer extension.
+pub struct SessionManager {
+    /// Current session (single-peer mode)
+    session: parking_lot::RwLock<Option<Arc<NetSession>>>,
+    /// Session timeout
+    timeout: Duration,
+}
+
+impl SessionManager {
+    /// Create a new session manager
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            session: parking_lot::RwLock::new(None),
+            timeout,
+        }
+    }
+
+    /// Set the current session
+    pub fn set_session(&self, session: NetSession) {
+        let mut guard = self.session.write();
+        *guard = Some(Arc::new(session));
+    }
+
+    /// Set the current session from an existing Arc
+    pub fn set_session_arc(&self, session: Arc<NetSession>) {
+        let mut guard = self.session.write();
+        *guard = Some(session);
+    }
+
+    /// Get the current session
+    pub fn get_session(&self) -> Option<Arc<NetSession>> {
+        self.session.read().clone()
+    }
+
+    /// Clear the current session
+    pub fn clear_session(&self) {
+        let mut guard = self.session.write();
+        if let Some(session) = guard.take() {
+            session.deactivate();
+        }
+    }
+
+    /// Check if there's an active session
+    pub fn has_session(&self) -> bool {
+        self.session.read().is_some()
+    }
+
+    /// Check session health and clean up if timed out
+    pub fn check_session(&self) -> bool {
+        let guard = self.session.read();
+        if let Some(session) = guard.as_ref() {
+            if session.is_timed_out(self.timeout) {
+                drop(guard);
+                self.clear_session();
+                return false;
+            }
+            session.is_active()
+        } else {
+            false
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManager")
+            .field("has_session", &self.has_session())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+use crate::time::current_timestamp;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_keys() -> SessionKeys {
+        SessionKeys {
+            tx_key: [0x42u8; 32],
+            rx_key: [0x24u8; 32],
+            session_id: 0x1234567890ABCDEF,
+            // Zero-filled sentinel — this helper bypasses the Noise
+            // handshake, so there is no real X25519 peer key to
+            // surface. `MeshNode::peer_static_x25519` treats zeros
+            // as "not available" and returns `None`.
+            remote_static_pub: [0u8; 32],
+            // Same story: no handshake hash to derive route-hop keys
+            // from. Distinct constants rather than zeros so a test
+            // that accidentally relied on tx == rx would fail.
+            route_hop_tx_key: [0x51u8; 32],
+            route_hop_rx_key: [0x15u8; 32],
+        }
+    }
+
+    /// A refused seal must not consume a hop sequence.
+    ///
+    /// `seal_route_hop_into` takes the next sequence with a
+    /// `fetch_add`, which is not undoable. Checking capacity after
+    /// taking it would burn a sequence number on a purely local sizing
+    /// mistake, opening a gap in this edge's sequence space that the
+    /// peer's replay window then has to absorb for no reason. The
+    /// capacity check therefore runs first, and this pins that ordering
+    /// by observing the sequence actually emitted.
+    #[test]
+    fn a_refused_seal_does_not_consume_a_hop_sequence() {
+        use crate::route_codec::RoutingHeader;
+        use crate::route_hop::{parse_prefix, sealed_len, RouteHopError};
+
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+            4,
+            false,
+        );
+        let header = RoutingHeader::new(0xDEAD_BEEF, 0x1234, 8);
+        let inner = b"an inner packet the relay never looks inside";
+        let needed = sealed_len(inner.len());
+
+        // Burn sequence 0 so the test is about the *next* one rather
+        // than about a fresh counter reading zero either way.
+        let mut ok_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut ok_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(sequence_of(&ok_buf), 0);
+
+        // Several refusals, each one byte short of enough.
+        for short in [0usize, 1, needed - 1] {
+            let mut tiny = vec![0u8; short];
+            assert_eq!(
+                session.seal_route_hop_into(&mut tiny, &header, inner),
+                Err(RouteHopError::BufferTooSmall),
+                "a {short}-byte buffer must be refused",
+            );
+        }
+
+        // The next accepted seal gets sequence 1, not 4.
+        let mut next_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut next_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(
+            sequence_of(&next_buf),
+            1,
+            "refused seals must not advance the hop sequence",
+        );
+
+        fn sequence_of(buf: &[u8]) -> u64 {
+            // The sequence sits in the prefix; read it back off the
+            // wire rather than trusting an internal counter.
+            parse_prefix(buf).expect("a sealed envelope parses");
+            u64::from_le_bytes(buf[10..18].try_into().expect("8 bytes"))
+        }
+    }
+
+    #[test]
+    fn test_session_creation() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+
+        let session = NetSession::new(keys.clone(), peer_addr, 4, false);
+
+        assert_eq!(session.session_id(), keys.session_id);
+        assert_eq!(session.peer_addr(), peer_addr);
+        assert!(session.is_active());
+        assert_eq!(session.stream_count(), 0);
+    }
+
+    /// Review GRANTLOSS: a batched grant datagram carries many streams'
+    /// credit grants at once, and a lost one is NOT re-queued by the
+    /// drainer. That is safe because grants are AUTHORITATIVE and
+    /// cumulative — any later grant for the stream carries the full
+    /// `total_consumed`, so a dropped grant is subsumed by the next one
+    /// and the stream never wedges. This pins the per-stream property
+    /// (a dropped batch is just N of these); the 30 s committed-flush
+    /// budget is the backstop for the pathological "no later grant ever
+    /// arrives" case.
+    #[test]
+    fn dropped_grant_recovers_via_next_authoritative_grant() {
+        let st = StreamState::new_full(true, 1, 1000);
+        assert_eq!(st.tx_credit_remaining(), 1000, "full initial window");
+
+        // Sender commits 600 bytes to the wire → credit falls, the
+        // committed-bytes watermark rises.
+        assert!(st.try_acquire_tx_credit(600));
+        assert_eq!(st.tx_credit_remaining(), 400);
+
+        // The receiver consumed 300, then 600. Its first grant
+        // (total_consumed = 300) rode a batched datagram that was
+        // dropped — never applied. Only the second, cumulative grant
+        // (total_consumed = 600) lands.
+        st.apply_authoritative_grant(600);
+
+        // Credit fully recovers to the window despite the dropped
+        // grant: the later authoritative grant conveyed the whole
+        // cumulative amount. The stream is not wedged.
+        assert_eq!(
+            st.tx_credit_remaining(),
+            1000,
+            "dropped grant is subsumed by the next authoritative grant"
+        );
+        assert_eq!(
+            st.credit_grants_received(),
+            1,
+            "only the second grant applied"
+        );
+
+        // A late-arriving straggler of the dropped grant is an
+        // idempotent no-op (monotonic `max_consumed_seen`) — it cannot
+        // double-credit past the window.
+        st.apply_authoritative_grant(300);
+        assert_eq!(st.tx_credit_remaining(), 1000, "stale grant ignored");
+    }
+
+    /// Review HORIZON: a stream is built from ONE `tx_window` that sizes
+    /// BOTH the sender retransmit window (`max_pending`) AND the
+    /// receiver reorder-acceptance horizon — [`Self::new_full_with_epoch`]
+    /// feeds `tx_window` through [`ReliableStream::max_pending_for_window`],
+    /// and `reorder_horizon` re-clamps that same value. This pins the
+    /// exact acceptance boundary against the tx-window-derived budget,
+    /// so that giving the receiver an INDEPENDENT rx window later fails
+    /// HERE (a deliberate update) instead of silently shifting reorder
+    /// acceptance / memory semantics.
+    #[test]
+    fn reorder_horizon_shares_the_tx_window_budget() {
+        for tx_window in [0u32, 4096, 1 << 16, 1 << 24, u32::MAX] {
+            let expected_horizon = (ReliableStream::max_pending_for_window(tx_window) as u64)
+                .clamp(64, ReliableStream::MAX_REORDER_PACKETS);
+            let st = StreamState::new_full(true, 1, tx_window);
+            st.with_reliability(|r| {
+                assert!(r.on_receive(0)); // next_expected = 1
+                assert!(
+                    r.on_receive(1 + expected_horizon),
+                    "offset == horizon ({expected_horizon}) accepted (window={tx_window})"
+                );
+                assert!(
+                    !r.on_receive(1 + expected_horizon + 1),
+                    "offset horizon+1 rejected (window={tx_window})"
+                );
+            });
+        }
+    }
+
+    /// Pin discovery-routing perf #108: the per-session NodeId
+    /// cache starts empty, accepts the first non-zero publish,
+    /// and ignores the `0` sentinel.
+    #[test]
+    fn cached_node_id_returns_none_until_published_then_caches() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Fresh session: no cached resolution.
+        assert_eq!(session.cached_node_id(), None);
+
+        // `0` is the "unresolved" sentinel — callers passing it
+        // should be a no-op so the cache stays empty.
+        session.cache_node_id(0);
+        assert_eq!(
+            session.cached_node_id(),
+            None,
+            "0 is the unresolved sentinel; caching it must be a no-op",
+        );
+
+        // First real publish lands.
+        session.cache_node_id(0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(session.cached_node_id(), Some(0xDEAD_BEEF_CAFE_F00D));
+
+        // Subsequent publish of the same value is a no-op (writes
+        // are idempotent for a stable session — see field doc).
+        session.cache_node_id(0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(session.cached_node_id(), Some(0xDEAD_BEEF_CAFE_F00D));
+    }
+
+    #[test]
+    fn test_stream_state() {
+        let stream = StreamState::new(false);
+
+        // TX sequence
+        assert_eq!(stream.next_tx_seq(), 0);
+        assert_eq!(stream.next_tx_seq(), 1);
+        assert_eq!(stream.current_tx_seq(), 2);
+
+        // RX sequence
+        stream.update_rx_seq(5);
+        assert_eq!(stream.current_rx_seq(), 5);
+        stream.update_rx_seq(3); // Lower value ignored
+        assert_eq!(stream.current_rx_seq(), 5);
+
+        // Inbound queue
+        // `StoredEvent::new` rather than `from_value`: the queue
+        // never inspects the payload, and `from_value` rides the
+        // `json` feature the wasm build deliberately does not enable.
+        let event = StoredEvent::new("1".into(), Bytes::from_static(br#"{"test":1}"#), 100, 0);
+        stream.push_event(event);
+        assert_eq!(stream.inbound_len(), 1);
+
+        let popped = stream.pop_event().unwrap();
+        assert_eq!(popped.id, "1");
+        assert_eq!(stream.inbound_len(), 0);
+    }
+
+    #[test]
+    fn test_session_streams() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Create streams
+        {
+            let stream = session.get_or_create_stream(0);
+            assert_eq!(stream.next_tx_seq(), 0);
+        }
+
+        {
+            let stream = session.get_or_create_stream(1);
+            assert_eq!(stream.next_tx_seq(), 0);
+        }
+
+        assert_eq!(session.stream_count(), 2);
+
+        let ids = session.stream_ids();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&1));
+    }
+
+    /// **A reliable open is applied, not warned about.** A channel's
+    /// publish stream id is derived from the channel, so
+    /// fire-and-forget and reliable traffic to one channel share one
+    /// id. First-open-wins on the reliability mode left the reliable
+    /// half on fire-and-forget machinery: nothing retained to
+    /// retransmit, and `build_nack` permanently `None`, so its loss
+    /// was silent.
+    ///
+    /// The cursor half matters as much as the mode: the upgrade must
+    /// resume where the peer's traffic actually is. Starting a fresh
+    /// reliable cursor at zero would report the sequences the
+    /// fire-and-forget half already delivered as a hole nothing can
+    /// fill.
+    #[test]
+    fn a_reliable_open_upgrades_a_fire_and_forget_stream_and_keeps_its_cursor() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+        let id = 0x5B;
+
+        // Three fire-and-forget arrivals, then the reliable open.
+        session.open_stream_with(id, false, 1);
+        for seq in 0..3 {
+            let stream = session.get_or_create_stream_for_packet(id, false, None);
+            assert!(stream.with_reliability(|r| r.on_receive(seq)));
+        }
+        assert!(!session.try_stream(id).expect("open").reliable_mode());
+
+        session.open_stream_with(id, true, 1);
+        let stream = session.try_stream(id).expect("still open");
+        assert!(stream.reliable_mode(), "a reliable open must be applied");
+        assert!(
+            session.collect_gap_reports(false, 0).is_empty(),
+            "the sequences the fire-and-forget half delivered are not a gap"
+        );
+
+        // The next sequence the peer sends is the one the upgraded
+        // cursor expects, and only a genuine hole after it reports.
+        assert!(
+            stream.with_reliability(|r| r.on_receive(3)),
+            "sequence 3 is the peer's next, not a duplicate"
+        );
+        assert!(session.collect_gap_reports(false, 0).is_empty());
+        assert!(stream.with_reliability(|r| r.on_receive(5)));
+        let gaps = session.collect_gap_reports(false, 0);
+        assert_eq!(gaps.len(), 1, "sequence 4 is missing and must be NACKed");
+        assert_eq!(gaps[0].nack.next_expected, 4);
+        drop(stream);
+
+        // One-way: a later fire-and-forget open cannot abandon the
+        // descriptors the peer is owed.
+        session.open_stream_with(id, false, 1);
+        assert!(session.try_stream(id).expect("open").reliable_mode());
+    }
+
+    #[test]
+    fn test_session_timeout() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Should not be timed out immediately
+        assert!(!session.is_timed_out(Duration::from_secs(1)));
+
+        // Touch and verify
+        session.touch();
+        assert!(!session.is_timed_out(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_session_manager() {
+        let manager = SessionManager::new(Duration::from_secs(30));
+
+        assert!(!manager.has_session());
+
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        manager.set_session(session);
+        assert!(manager.has_session());
+
+        let retrieved = manager.get_session().unwrap();
+        assert!(retrieved.is_active());
+
+        manager.clear_session();
+        assert!(!manager.has_session());
+    }
+
+    #[test]
+    fn test_open_stream_with_idempotent() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // First open creates state.
+        session.open_stream_with(42, true, 3);
+        assert_eq!(session.stream_count(), 1);
+        let state = session.get_stream(42).unwrap();
+        assert!(state.reliable_mode());
+        assert_eq!(state.fairness_weight(), 3);
+        drop(state);
+
+        // Second open with matching config is a no-op.
+        session.open_stream_with(42, true, 3);
+        assert_eq!(session.stream_count(), 1);
+
+        // Second open with DIFFERENT config is also a no-op
+        // (first open wins). We log a warning but don't mutate.
+        session.open_stream_with(42, false, 7);
+        let state = session.get_stream(42).unwrap();
+        assert!(
+            state.reliable_mode(),
+            "first open wins — reliable still true"
+        );
+        assert_eq!(
+            state.fairness_weight(),
+            3,
+            "first open wins — weight still 3"
+        );
+    }
+
+    /// PERF_AUDIT §2.12 regression: `open_stream_full` now probes
+    /// with a read-only `get` before falling back to the write
+    /// `entry()`. Two racers that both miss the probe must NOT
+    /// duplicate the stream or observe different epochs — the
+    /// `entry()` fallback serializes creation, and the loser picks
+    /// up the winner's epoch. Hammer the race across many fresh
+    /// stream ids; any TOCTOU between the probe and the entry
+    /// surfaces as an epoch mismatch or a stream-count anomaly.
+    #[test]
+    fn open_stream_full_racing_creators_agree_on_one_epoch() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = Arc::new(NetSession::new(keys, peer_addr, 4, false));
+
+        const RACERS: usize = 4;
+        const ROUNDS: u64 = 200;
+        for round in 0..ROUNDS {
+            let stream_id = 0x1000 + round; // fresh id per round
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let session = Arc::clone(&session);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        session.open_stream_full(stream_id, true, 2, 0)
+                    })
+                })
+                .collect();
+            let epochs: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(
+                epochs.windows(2).all(|w| w[0] == w[1]),
+                "round {round}: all racers must observe the creation winner's epoch, got {epochs:?}"
+            );
+            let live = session
+                .get_stream(stream_id)
+                .expect("stream must exist after the race");
+            assert_eq!(
+                live.epoch(),
+                epochs[0],
+                "round {round}: live stream's epoch must match what the racers returned"
+            );
+        }
+        assert_eq!(
+            session.stream_count() as u64,
+            ROUNDS,
+            "exactly one stream per id — racing creators must never duplicate"
+        );
+    }
+
+    #[test]
+    fn test_close_stream_removes_state() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        session.open_stream_with(1, false, 1);
+        session.open_stream_with(2, true, 2);
+        assert_eq!(session.stream_count(), 2);
+
+        session.close_stream(1);
+        assert_eq!(session.stream_count(), 1);
+        assert!(session.get_stream(1).is_none());
+        assert!(session.get_stream(2).is_some());
+
+        // Closing a non-existent stream is a no-op.
+        session.close_stream(99);
+        assert_eq!(session.stream_count(), 1);
+
+        // Re-open after close creates fresh state with new config.
+        session.close_stream(2);
+        session.open_stream_with(2, false, 5);
+        let state = session.get_stream(2).unwrap();
+        assert!(!state.reliable_mode());
+        assert_eq!(state.fairness_weight(), 5);
+    }
+
+    #[test]
+    fn test_evict_idle_streams_timeout_and_cap() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Open three streams; touch only one so the other two look idle.
+        session.open_stream_with(1, false, 1);
+        session.open_stream_with(2, false, 1);
+        session.open_stream_with(3, false, 1);
+        std::thread::sleep(Duration::from_millis(10));
+        session.get_or_create_stream(2).touch();
+
+        // With a tight idle timeout, streams 1 and 3 should be evicted;
+        // stream 2 was just touched so it survives.
+        let evicted = session.evict_idle_streams(Duration::from_millis(5), usize::MAX, "test");
+        assert_eq!(evicted, 2);
+        assert_eq!(session.stream_count(), 1);
+        assert!(session.get_stream(2).is_some());
+
+        // Cap eviction: open two more streams so we have 3, then cap at 1.
+        session.open_stream_with(4, false, 1);
+        session.open_stream_with(5, false, 1);
+        assert_eq!(session.stream_count(), 3);
+        let evicted = session.evict_idle_streams(Duration::from_nanos(u64::MAX), 1, "test");
+        assert_eq!(evicted, 2);
+        assert_eq!(session.stream_count(), 1);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #105: pre-fix
+    /// `recently_closed` only got garbage-collected by
+    /// `is_grant_quarantined` on inbound `StreamWindow` grants.
+    /// A peer churning short-lived streams without receiving a
+    /// late grant for each accumulates one entry per closed
+    /// stream forever. Post-fix `evict_idle_streams` also
+    /// sweeps `recently_closed`, dropping entries past
+    /// `GRANT_QUARANTINE_WINDOW`.
+    #[test]
+    fn evict_idle_streams_sweeps_recently_closed_past_quarantine_window() {
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Manually pre-populate `recently_closed` with entries
+        // whose timestamps are well past the quarantine window.
+        let stale_inserted_at =
+            SystemClock::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
+        session.recently_closed.insert(0xAAAA, stale_inserted_at);
+        session.recently_closed.insert(0xBBBB, stale_inserted_at);
+
+        // Add a fresh entry that should NOT be swept yet.
+        session
+            .recently_closed
+            .insert(0xFEEDC0DE, SystemClock::now());
+
+        assert_eq!(session.recently_closed.len(), 3);
+
+        // Run the sweep. No streams to evict (we didn't open
+        // any), but the recently_closed sweep should still fire.
+        session.evict_idle_streams(Duration::from_millis(1), usize::MAX, "test");
+
+        // Stale entries dropped; fresh entry kept.
+        assert!(
+            !session.recently_closed.contains_key(&0xAAAA),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            !session.recently_closed.contains_key(&0xBBBB),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            session.recently_closed.contains_key(&0xFEEDC0DE),
+            "fresh recently_closed entry within quarantine window must survive"
+        );
+    }
+
+    #[test]
+    fn test_session_manager_arc_shares_touch_updates() {
+        let manager = SessionManager::new(Duration::from_millis(50));
+
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = Arc::new(NetSession::new(keys, peer_addr, 4, false));
+
+        manager.set_session_arc(session.clone());
+
+        std::thread::sleep(Duration::from_millis(30));
+        session.touch();
+
+        assert!(
+            manager.check_session(),
+            "session should be healthy because touch() updated the shared Arc"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !manager.check_session(),
+            "session should have timed out after 60ms with no touch"
+        );
+    }
+
+    #[test]
+    fn test_stream_state_tx_credit_trips_backpressure() {
+        // 100-byte window: two 40-byte acquires fit; third fails.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(40), "first acquire fits");
+        assert!(state.try_acquire_tx_credit(40), "second acquire fits");
+        assert!(
+            !state.try_acquire_tx_credit(40),
+            "third acquire must be refused — only 20 bytes remain"
+        );
+        assert_eq!(state.backpressure_events(), 1);
+        assert_eq!(state.tx_credit_remaining(), 20);
+    }
+
+    #[test]
+    fn test_stream_state_refund_restores_credit() {
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(80));
+        assert!(
+            !state.try_acquire_tx_credit(40),
+            "window saturated after 80-byte acquire"
+        );
+
+        // Refund simulates a cancelled send — credit flows back.
+        state.refund_tx_credit(80);
+        assert_eq!(state.tx_credit_remaining(), 100);
+        assert!(state.try_acquire_tx_credit(100));
+    }
+
+    #[test]
+    fn test_stream_state_tx_window_zero_is_unbounded() {
+        let state = StreamState::new_full(false, 1, 0);
+        // `tx_window == 0` short-circuits — no admission check at all.
+        for _ in 0..10_000 {
+            assert!(state.try_acquire_tx_credit(1));
+        }
+        assert_eq!(state.backpressure_events(), 0);
+    }
+
+    #[test]
+    fn test_stream_state_refund_saturates_at_u32_max() {
+        // Refund uses saturating u32 addition with no clamp at
+        // `tx_window`: a refunded uncommitted guard must return
+        // bytes to `tx_credit_remaining` without stranding any
+        // credit, and a pathological caller must not wrap the
+        // counter.
+        let state = StreamState::new_full(false, 1, 100);
+        // Manually push tx_credit_remaining near the top so we can
+        // exercise the saturating edge.
+        state
+            .tx_credit_remaining
+            .store(u32::MAX - 50, Ordering::Release);
+        state.refund_tx_credit(1000);
+        assert_eq!(state.tx_credit_remaining(), u32::MAX);
+    }
+
+    #[test]
+    fn test_authoritative_grant_recomputes_from_absolute_consumed() {
+        // Commit 60 bytes, then apply an authoritative grant
+        // reporting `total_consumed = 60`. Outstanding = 0, so the
+        // sender's remaining credit returns to the full 100-byte
+        // window — even though the grant didn't "add" anything.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(60));
+        assert_eq!(state.tx_credit_remaining(), 40);
+        assert_eq!(state.tx_bytes_sent(), 60);
+
+        state.apply_authoritative_grant(60);
+        assert_eq!(state.tx_credit_remaining(), 100);
+        assert_eq!(state.max_consumed_seen(), 60);
+        assert_eq!(state.credit_grants_received(), 1);
+    }
+
+    #[test]
+    fn test_authoritative_grant_self_heals_lost_grants() {
+        // Simulate a lost grant: sender commits 30 bytes, grant A
+        // (total_consumed = 30) is "lost" — never applied. Sender
+        // commits another 40 bytes (total = 70 on sender's side).
+        // Grant B arrives with total_consumed = 70; sender
+        // reconciles directly to remaining = 100 - (70 - 70) = 100,
+        // fully recovering the credit that Grant A would have
+        // refunded. This is the self-healing property.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(30));
+        assert!(state.try_acquire_tx_credit(40));
+        assert_eq!(state.tx_credit_remaining(), 30);
+        assert_eq!(state.tx_bytes_sent(), 70);
+
+        state.apply_authoritative_grant(70); // Grant B — Grant A was dropped
+        assert_eq!(state.tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_authoritative_grant_monotonic_ignores_stale() {
+        // Out-of-order grants: apply 60, then a stale grant of 40.
+        // The stale one must be ignored — `max_consumed_seen` stays
+        // at 60 and `tx_credit_remaining` is unchanged.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(80));
+        state.apply_authoritative_grant(60);
+        let remaining = state.tx_credit_remaining();
+
+        state.apply_authoritative_grant(40); // stale
+        assert_eq!(state.max_consumed_seen(), 60);
+        assert_eq!(state.tx_credit_remaining(), remaining);
+    }
+
+    #[test]
+    fn test_authoritative_grant_clamps_to_window_on_malformed_total_consumed() {
+        // Regression: a malformed or buggy grant whose
+        // `total_consumed` claims more bytes than the sender has
+        // actually committed would otherwise mint credit above
+        // `tx_window` — the sender could then exceed its configured
+        // ceiling on subsequent admits.
+        //
+        // BUG_REPORT.md #12 (additional fix): we now clamp
+        // `total_consumed.min(tx_bytes_sent)` *before* the CAS so
+        // the malformed advancement isn't sticky either. Previously
+        // a single malformed grant of `u64::MAX` advanced
+        // `max_consumed_seen` to MAX, and every subsequent honest
+        // grant tripped the `total_consumed <= prev` early-return
+        // — the stream stalled forever. With the clamp, a
+        // malformed `total_consumed` is bounded by the actual
+        // sender-side watermark, so honest grants below the
+        // (genuinely sent) watermark remain admittable.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(40));
+        assert_eq!(state.tx_credit_remaining(), 60);
+        assert_eq!(state.tx_bytes_sent(), 40);
+
+        // Malformed grant: reports 500 consumed against only 40 sent.
+        state.apply_authoritative_grant(500);
+
+        assert_eq!(
+            state.tx_credit_remaining(),
+            100,
+            "malformed grant must not push credit above tx_window",
+        );
+        // Per the #12 clamp, max_consumed_seen advances to the
+        // sender-side watermark (40), NOT to the malformed value.
+        assert_eq!(
+            state.max_consumed_seen(),
+            40,
+            "max_consumed_seen must be clamped to tx_bytes_sent (#12)",
+        );
+        // A subsequent honest grant of 50 — but only after another
+        // 50 bytes are actually sent (so tx_bytes_sent rises to 90).
+        // The clamp keeps the watermark accurate.
+        assert!(state.try_acquire_tx_credit(50));
+        state.apply_authoritative_grant(70);
+        assert_eq!(state.max_consumed_seen(), 70);
+    }
+
+    /// Regression: BUG_REPORT.md #12 — a single malformed grant
+    /// claiming `total_consumed = u64::MAX` used to permanently
+    /// lock out future grants. The clamp prevents the stuck-state.
+    #[test]
+    fn test_authoritative_grant_u64_max_does_not_lock_out_future_grants() {
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(40));
+
+        // Hostile grant: claims the receiver consumed every
+        // representable byte. Pre-fix this would set
+        // max_consumed_seen to u64::MAX and every subsequent
+        // grant would early-return.
+        state.apply_authoritative_grant(u64::MAX);
+        assert_eq!(
+            state.max_consumed_seen(),
+            40,
+            "max_consumed_seen must be clamped to tx_bytes_sent, \
+             not advanced to u64::MAX"
+        );
+
+        // Send more, then the receiver issues an honest grant.
+        // Pre-fix: rejected as stale because 80 < u64::MAX.
+        // Post-fix: accepted because max_consumed_seen is at 40.
+        assert!(state.try_acquire_tx_credit(40));
+        state.apply_authoritative_grant(80);
+        assert_eq!(
+            state.max_consumed_seen(),
+            80,
+            "honest grants must not be locked out by a prior malformed \
+             u64::MAX grant (#12)"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_grant_does_not_clobber_concurrent_acquire() {
+        // Regression: the earlier `.store()`-based reconciliation
+        // computed `remaining = window - (sent - consumed)` from a
+        // racy snapshot of `tx_bytes_sent` and then *overwrote*
+        // `tx_credit_remaining`. A concurrent `try_acquire_tx_credit`
+        // that had already CAS'd its debit but not yet bumped
+        // `tx_bytes_sent` would have its debit silently undone — the
+        // sender could then exceed its window.
+        //
+        // Hand-drive the interleaving by performing the first half of
+        // an acquire (the CAS on `tx_credit_remaining`) before
+        // applying the grant, and the second half (the bump of
+        // `tx_bytes_sent`) after. If the invariant
+        // `remaining + (sent - max_consumed) == window` still holds
+        // at the end, the grant respected the in-flight acquire.
+        let state = StreamState::new_full(false, 1, 100);
+        // Commit 60 bytes up front so `tx_bytes_sent` is non-zero.
+        assert!(state.try_acquire_tx_credit(60));
+        assert_eq!(state.tx_credit_remaining(), 40);
+        assert_eq!(state.tx_bytes_sent(), 60);
+
+        // Step 1 of a would-be `try_acquire_tx_credit(30)`: CAS the
+        // credit debit. Defer the `tx_bytes_sent` bump to simulate a
+        // thread that has stalled between the two atomic ops.
+        state
+            .tx_credit_remaining
+            .compare_exchange(40, 10, Ordering::AcqRel, Ordering::Acquire)
+            .expect("no contention in test harness");
+
+        // Grant arrives while the acquire is mid-flight: sees
+        // `tx_bytes_sent = 60` (pre-bump), advances `max_consumed` to 60.
+        state.apply_authoritative_grant(60);
+
+        // Step 2: finish the acquire by bumping `tx_bytes_sent`.
+        state.tx_bytes_sent.fetch_add(30, Ordering::Relaxed);
+
+        let remaining = state.tx_credit_remaining() as u64;
+        let sent = state.tx_bytes_sent();
+        let consumed = state.max_consumed_seen();
+        assert_eq!(
+            remaining + (sent - consumed),
+            100,
+            "invariant violated: remaining={} sent={} consumed={} (grant clobbered the in-flight acquire)",
+            remaining,
+            sent,
+            consumed,
+        );
+    }
+
+    #[test]
+    fn test_authoritative_grant_invariant_under_thread_contention() {
+        // Stress: many interleaved acquires and grants must preserve
+        // the end-state invariant `remaining + (sent - consumed) == window`.
+        // Each acquire takes 1 byte and each grant advances consumed
+        // by 1; running both loops to completion on separate threads
+        // exercises the ordering between the acquire's two-step
+        // (CAS remaining, then bump sent) and the grant's credit
+        // update.
+        //
+        // The granter mirrors honest receiver accounting by waiting
+        // until the sender has actually committed `target` bytes
+        // before reporting `total_consumed = target`. Without this
+        // ordering the test would synthesize malformed grants that
+        // report consumption ahead of sent bytes — the window clamp
+        // would then strand the over-grant and fail the equality
+        // check even though both operations are behaving correctly.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::thread;
+
+        const WINDOW: u32 = 64;
+        const ITERATIONS: u64 = 2_000;
+
+        for _trial in 0..8 {
+            let state = Arc::new(StreamState::new_full(false, 1, WINDOW));
+            let go = Arc::new(AtomicBool::new(false));
+
+            let state_a = state.clone();
+            let go_a = go.clone();
+            let acquirer = thread::spawn(move || {
+                while !go_a.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..ITERATIONS {
+                    while !state_a.try_acquire_tx_credit(1) {
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+
+            let state_g = state.clone();
+            let go_g = go.clone();
+            let granter = thread::spawn(move || {
+                while !go_g.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                for target in 1..=ITERATIONS {
+                    while state_g.tx_bytes_sent() < target {
+                        std::hint::spin_loop();
+                    }
+                    state_g.apply_authoritative_grant(target);
+                }
+            });
+
+            go.store(true, Ordering::Release);
+            acquirer.join().unwrap();
+            granter.join().unwrap();
+
+            let remaining = state.tx_credit_remaining() as u64;
+            let sent = state.tx_bytes_sent();
+            let consumed = state.max_consumed_seen();
+            assert_eq!(sent, ITERATIONS);
+            assert_eq!(consumed, ITERATIONS);
+            assert_eq!(
+                remaining + (sent - consumed),
+                WINDOW as u64,
+                "invariant violated after contention: remaining={} sent={} consumed={}",
+                remaining,
+                sent,
+                consumed,
+            );
+        }
+    }
+
+    #[test]
+    fn test_rx_credit_emits_authoritative_total_consumed() {
+        // Every `on_bytes_consumed` returns the receiver's running
+        // cumulative consumed count, which the caller ships as the
+        // `total_consumed` field of an authoritative grant. The
+        // function bumps both `consumed` and `granted` by `bytes`
+        // — receive-time accounting, see `RxCreditState` rustdoc
+        // and BUG_AUDIT_2026_04_30_CORE.md.
+        let state = StreamState::new_full(false, 1, 100);
+        assert_eq!(state.on_bytes_consumed(60), Some(60));
+        assert_eq!(state.on_bytes_consumed(14), Some(74));
+        assert_eq!(state.on_bytes_consumed(1), Some(75));
+    }
+
+    /// Regression: the v2 receive-time-accounting design
+    /// keeps `outstanding = granted - consumed`
+    /// pinned at the initial window size. The credit window is
+    /// for kernel-buffer protection — application-side throttling
+    /// is provided by per-shard queue-depth limits, not this
+    /// counter. This test pins the invariant.
+    #[test]
+    fn rx_credit_outstanding_stays_at_window_under_receive_time_accounting() {
+        let state = StreamState::new_full(false, 1, 100);
+        let rx = state.rx_credit();
+        // Initial: granted=100, consumed=0, outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        state.on_bytes_consumed(30);
+        // Receive-time grant: granted=130, consumed=30. outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        state.on_bytes_consumed(70);
+        // granted=200, consumed=100. outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        // The pre-fix audit framing claimed this was a bug; closer
+        // inspection showed it's the documented v2 design. See
+        // `RxCreditState` rustdoc + `mesh.rs:3110-3135`.
+    }
+
+    /// Regression (#19): a TX sequence consumed for a packet that never
+    /// reached the wire (scheduler/socket backpressure after the seq was
+    /// allocated) must be reclaimable so the receiver sees no permanent
+    /// gap. `try_rollback_tx_seq` rolls the counter back exactly when the
+    /// seq was the most-recently-issued one.
+    #[test]
+    fn try_rollback_tx_seq_reclaims_last_issued_seq() {
+        let state = StreamState::new_full(true, 1, 100);
+
+        // Consume two sequences (0 then 1).
+        let s0 = state.next_tx_seq();
+        let s1 = state.next_tx_seq();
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+
+        // The packet for s1 hit backpressure and never went out. Roll it
+        // back: the CAS `2 -> 1` wins because s1 was the last seq issued.
+        assert!(
+            state.try_rollback_tx_seq(s1),
+            "rolling back the most-recent seq must succeed"
+        );
+
+        // No gap: the next allocation re-uses the reclaimed value.
+        assert_eq!(
+            state.next_tx_seq(),
+            s1,
+            "after rollback the counter must re-issue the reclaimed seq, leaving no hole"
+        );
+    }
+
+    /// Regression (#19): if a *concurrent* sender on the same stream
+    /// already consumed the next sequence, the rollback must NOT corrupt
+    /// the counter — a blind decrement would re-issue the concurrent
+    /// sender's seq as a duplicate. The CAS-guarded rollback fails
+    /// cleanly and leaves the counter untouched.
+    #[test]
+    fn try_rollback_tx_seq_refuses_when_a_newer_seq_was_issued() {
+        let state = StreamState::new_full(true, 1, 100);
+
+        let stale = state.next_tx_seq(); // 0 — this packet hit backpressure
+        let newer = state.next_tx_seq(); // 1 — a concurrent send already took it
+        assert_eq!(stale, 0);
+        assert_eq!(newer, 1);
+
+        // Rolling back the stale seq must fail: the counter is at 2, not
+        // `stale + 1`, so the CAS cannot win.
+        assert!(
+            !state.try_rollback_tx_seq(stale),
+            "rollback must refuse once a newer seq has been issued"
+        );
+
+        // Counter is intact — the next allocation is still 2, so the
+        // concurrent sender's seq 1 is never re-issued as a duplicate.
+        assert_eq!(state.next_tx_seq(), 2);
+    }
+
+    /// The session-level wrapper is epoch-guarded: a rollback aimed at a
+    /// different epoch (post close+reopen) is a no-op and never touches
+    /// the live stream state, mirroring the credit-refund discipline in
+    /// `TxSlotGuard::drop`.
+    #[test]
+    fn session_try_rollback_tx_seq_is_epoch_guarded() {
+        let keys = test_keys();
+        let addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
+        let session = Arc::new(NetSession::new(keys, addr, 4, false));
+
+        let stream_id = 0x55;
+        // Consume a seq, then release the DashMap `RefMut` before the
+        // session-level rollback re-locks the same map.
+        let (epoch, seq) = {
+            let state = session.get_or_create_stream(stream_id);
+            (state.epoch(), state.next_tx_seq())
+        };
+
+        // Wrong epoch: no-op, returns false, counter untouched.
+        assert!(!session.try_rollback_tx_seq(stream_id, epoch.wrapping_add(1), seq));
+        assert_eq!(session.try_stream(stream_id).unwrap().current_tx_seq(), 1);
+
+        // Correct epoch: reclaims the seq.
+        assert!(session.try_rollback_tx_seq(stream_id, epoch, seq));
+        assert_eq!(session.try_stream(stream_id).unwrap().current_tx_seq(), 0);
+    }
+
+    /// Regression: `outstanding()` must never observe a transient
+    /// `consumed > granted` inversion under contention.
+    ///
+    /// Pre-fix `on_bytes_consumed` bumped `consumed` before
+    /// `granted`, while `outstanding()` loaded `granted` then
+    /// `consumed`. A reader catching the in-flight window saw
+    /// `granted` from before a writer's bump but `consumed` from
+    /// after — `consumed > granted`, masked by `saturating_sub` to
+    /// zero. With the writer-side priming `granted = window_bytes`,
+    /// the post-fix invariant is `outstanding() >= window_bytes` at
+    /// every instant: the publication order (granted first, then
+    /// consumed) plus the matching reader order (consumed first,
+    /// then granted) guarantees any observed `consumed` increment is
+    /// paired with its `granted` increment by the time the reader
+    /// loads `granted`.
+    ///
+    /// Setup: `window_bytes = K`, every writer call mints `K`
+    /// matched bytes. Pre-fix the reader sees outstanding=0 mid-flight;
+    /// post-fix the reader always sees outstanding >= K.
+    #[test]
+    fn rx_credit_outstanding_never_inverts_under_contention() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+        use std::thread;
+
+        const WINDOW: u32 = 64;
+        const WRITERS: usize = 6;
+        const ITERATIONS: usize = 50_000;
+
+        let state = Arc::new(StreamState::new_full(false, 1, WINDOW));
+        let stop = Arc::new(AtomicBool::new(false));
+        let min_seen = Arc::new(AtomicU64::new(u64::MAX));
+        let reader_loops = Arc::new(AtomicU64::new(0));
+
+        // Reader: spin on `outstanding()` and record the minimum
+        // value observed. Stops as soon as the writers signal done.
+        let reader = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            let min_seen = Arc::clone(&min_seen);
+            let reader_loops = Arc::clone(&reader_loops);
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let v = state.rx_credit().outstanding();
+                    let mut current = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+                    while v < current {
+                        match min_seen.compare_exchange_weak(
+                            current,
+                            v,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(seen) => current = seen,
+                        }
+                    }
+                    reader_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Writers: pound `on_bytes_consumed(WINDOW)` so each call
+        // moves both counters by exactly the priming window. With
+        // K == WINDOW, any inversion of the publication order
+        // surfaces as `consumed > granted` and saturates to zero.
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        let _ = state.on_bytes_consumed(WINDOW as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // Sanity: the reader actually got CPU time. Without this,
+        // the assertion below would silently pass on a single-core
+        // / over-subscribed runner.
+        assert!(
+            reader_loops.load(std::sync::atomic::Ordering::Relaxed) > 1_000,
+            "reader did not get enough CPU time to exercise the race",
+        );
+
+        // The strong invariant: outstanding never drops below the
+        // priming window. Pre-fix this falls to 0 under contention.
+        let observed_min = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            observed_min >= WINDOW as u64,
+            "outstanding() inverted under contention: min observed = {} (must be >= {})",
+            observed_min,
+            WINDOW,
+        );
+    }
+
+    #[test]
+    fn test_rx_credit_window_zero_disables_grants() {
+        let state = StreamState::new_full(false, 1, 0);
+        // No backpressure → no grants.
+        assert_eq!(state.on_bytes_consumed(1_000_000), None);
+    }
+
+    #[test]
+    fn test_regression_reliable_duplicate_must_not_mint_grant() {
+        // Regression: the mesh dispatcher (`process_local_packet`)
+        // must gate `on_bytes_consumed` on the reliability layer's
+        // `on_receive` return. Otherwise retransmissions / replays
+        // of already-acked sequences on Reliable streams refund
+        // sender credit through the grant path, inflating
+        // `tx_credit_remaining` on the sender and distorting the
+        // `backpressure_events` picture.
+        //
+        // This test exercises the primitives the dispatcher
+        // composes. The dispatcher's gate itself is verified
+        // implicitly by the three-node integration suite; this
+        // primitive-level check is the tight loop that fails
+        // fastest if the invariant regresses.
+        let state = StreamState::new_full(true, 1, 100); // reliable
+
+        // First packet at seq=0: accepted → credit the bytes.
+        assert!(
+            state.with_reliability(|r| r.on_receive(0)),
+            "new seq must be accepted"
+        );
+        assert_eq!(state.on_bytes_consumed(40), Some(40));
+
+        // Replay of seq=0: rejected. The dispatcher MUST NOT call
+        // `on_bytes_consumed` in this branch. We document that
+        // invariant by NOT calling it here — if the dispatcher
+        // ever un-gates, the matching integration test would
+        // observe inflated grants / distorted credit accounting.
+        assert!(
+            !state.with_reliability(|r| r.on_receive(0)),
+            "duplicate seq must be rejected by the reliability layer"
+        );
+
+        // Sanity: the rx-credit state reflects only the one
+        // accepted packet — `granted = window_bytes + 40`,
+        // `consumed = 40`.
+        let rx = state.rx_credit();
+        assert_eq!(rx.consumed(), 40);
+        assert_eq!(rx.granted(), 100 + 40);
+    }
+
+    fn session_with_stream(stream_id: u64, tx_window: u32) -> Arc<NetSession> {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+            4,
+            false,
+        ));
+        session.open_stream_full(stream_id, false, 1, tx_window);
+        session
+    }
+
+    #[test]
+    fn test_regression_tx_credit_guard_refunds_on_drop() {
+        // Regression: without the RAII guard, `send_on_stream`'s
+        // acquire-await-commit shape leaks credit if the send future
+        // is dropped mid-`.await` (tokio::select! racing a shutdown,
+        // caller abort, panic). Over many cancellations the window
+        // would drift toward permanent exhaustion.
+        //
+        // Fix: `try_acquire_tx_credit_guard` returns a `TxSlotGuard`
+        // that refunds the acquired bytes in its Drop impl — unless
+        // the caller calls `commit()` first to signal a successful
+        // wire send.
+        let stream_id = 0x7u64;
+        let session = session_with_stream(stream_id, 100);
+
+        let guard = match session.try_acquire_tx_credit_guard(stream_id, 100) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            0,
+            "guard's acquire drained the window"
+        );
+        assert!(matches!(
+            session.try_acquire_tx_credit_guard(stream_id, 1),
+            TxAdmit::WindowFull
+        ));
+
+        // Drop without commit → bytes flow back.
+        drop(guard);
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            100,
+            "dropping an uncommitted guard refunds the credit"
+        );
+        assert!(matches!(
+            session.try_acquire_tx_credit_guard(stream_id, 50),
+            TxAdmit::Acquired { .. }
+        ));
+    }
+
+    #[test]
+    fn test_tx_credit_guard_commit_suppresses_refund() {
+        // commit() marks the bytes as "gone on the wire" — Drop must
+        // NOT refund them. The receiver is responsible for replenishing
+        // via a StreamWindow grant.
+        let stream_id = 0x17u64;
+        let session = session_with_stream(stream_id, 100);
+
+        let guard = match session.try_acquire_tx_credit_guard(stream_id, 40) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        guard.commit();
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            60,
+            "committed bytes stay consumed"
+        );
+    }
+
+    #[test]
+    fn test_tx_credit_guard_stream_closed_variant() {
+        let session = session_with_stream(0x9, 100);
+        session.close_stream(0x9);
+        assert!(matches!(
+            session.try_acquire_tx_credit_guard(0x9, 10),
+            TxAdmit::StreamClosed
+        ));
+    }
+
+    #[test]
+    fn test_tx_credit_guard_close_between_acquire_and_drop_no_panic() {
+        // Scenario: caller acquires, another task closes, caller
+        // drops. The Drop impl's `try_stream` lookup returns None →
+        // no-op. Must not panic / resurrect state.
+        let stream_id = 0xAu64;
+        let session = session_with_stream(stream_id, 100);
+        let guard = match session.try_acquire_tx_credit_guard(stream_id, 40) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        session.close_stream(stream_id);
+        assert!(session.try_stream(stream_id).is_none());
+        drop(guard); // no-op (state is gone); must not panic
+        assert!(session.try_stream(stream_id).is_none());
+    }
+
+    #[test]
+    fn test_tx_credit_guard_forget_leaves_credit_consumed() {
+        // forget() is a test-only escape hatch simulating a leaked
+        // slot — same effect as commit() but semantically labelled as
+        // "don't refund because the bytes are lost, not sent."
+        let session = session_with_stream(0xF, 100);
+        let g = match session.try_acquire_tx_credit_guard(0xF, 40) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        g.forget();
+        assert_eq!(
+            session.try_stream(0xF).unwrap().tx_credit_remaining(),
+            60,
+            "forget() skips the Drop refund"
+        );
+    }
+
+    #[test]
+    fn test_regression_guard_drop_after_reopen_does_not_corrupt_new_stream() {
+        // Regression: `TxSlotGuard::drop` must not refund credit onto
+        // a fresh `StreamState` that never issued the guard. Epoch
+        // check gates the refund.
+        let sid = 0x42u64;
+        let session = session_with_stream(sid, 100);
+
+        let g = match session.try_acquire_tx_credit_guard(sid, 60) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        let first_epoch = g.epoch_for_test();
+        assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 40);
+
+        // Close + reopen → fresh state with a new epoch + full credit.
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 100);
+        let second_epoch = session.try_stream(sid).unwrap().epoch();
+        assert_ne!(first_epoch, second_epoch, "reopen allocates a new epoch");
+        assert_eq!(
+            session.try_stream(sid).unwrap().tx_credit_remaining(),
+            100,
+            "fresh stream starts at full credit"
+        );
+
+        // Drop the stale guard — must NOT inflate the new stream's
+        // credit beyond its configured window.
+        drop(g);
+        assert_eq!(
+            session.try_stream(sid).unwrap().tx_credit_remaining(),
+            100,
+            "stale guard must NOT refund onto the new stream's counter"
+        );
+    }
+
+    #[test]
+    fn test_regression_acquire_with_expected_epoch_rejects_after_reopen() {
+        let sid = 0x88u64;
+        let session = session_with_stream(sid, 100);
+        let original_epoch = session.try_stream(sid).unwrap().epoch();
+
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 100);
+
+        assert!(matches!(
+            session.try_acquire_tx_credit_for_lifetime(
+                sid,
+                session.session_id(),
+                original_epoch,
+                10
+            ),
+            TxAdmit::StreamClosed
+        ));
+        assert_eq!(
+            session.try_stream(sid).unwrap().tx_credit_remaining(),
+            100,
+            "rejected acquire leaves new stream's credit untouched"
+        );
+
+        let cur_epoch = session.try_stream(sid).unwrap().epoch();
+        assert!(matches!(
+            session.try_acquire_tx_credit_for_lifetime(sid, session.session_id(), cur_epoch, 10),
+            TxAdmit::Acquired { .. }
+        ));
+    }
+
+    /// The stream epoch restarts at 1 for every session, so a
+    /// successor's first stream carries the *same* epoch as the
+    /// predecessor's first stream. The epoch check alone therefore
+    /// admits a handle from the displaced session. Only the session
+    /// incarnation separates them.
+    ///
+    /// Inverse: drop the `session_id != self.session_id` guard in
+    /// `try_acquire_tx_credit_for_lifetime` — the first assertion
+    /// gets `Acquired` and the predecessor's handle debits the
+    /// successor's credit.
+    #[test]
+    fn test_regression_equal_epochs_across_sessions_are_not_the_same_lifetime() {
+        let sid = 0x776u64;
+        let incarnation = |session_id: u64| {
+            let mut keys = test_keys();
+            keys.session_id = session_id;
+            let session = Arc::new(NetSession::new(
+                keys,
+                PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+                4,
+                false,
+            ));
+            session.open_stream_full(sid, false, 1, 100);
+            session
+        };
+        let predecessor = incarnation(0xAAAA_0000_0000_0001);
+        let successor = incarnation(0xBBBB_0000_0000_0002);
+        assert_eq!(
+            predecessor.try_stream(sid).unwrap().epoch(),
+            successor.try_stream(sid).unwrap().epoch(),
+            "the premise: per-session epochs collide across incarnations",
+        );
+        assert_ne!(
+            predecessor.session_id(),
+            successor.session_id(),
+            "two incarnations must be distinguishable at all",
+        );
+
+        let stale_epoch = predecessor.try_stream(sid).unwrap().epoch();
+        assert!(
+            matches!(
+                successor.try_acquire_tx_credit_for_lifetime(
+                    sid,
+                    predecessor.session_id(),
+                    stale_epoch,
+                    10
+                ),
+                TxAdmit::SessionSuperseded
+            ),
+            "a predecessor's lifetime must not admit on the successor",
+        );
+        assert_eq!(
+            successor.try_stream(sid).unwrap().tx_credit_remaining(),
+            100,
+            "and it must not have debited the successor's credit",
+        );
+
+        assert!(matches!(
+            successor.try_acquire_tx_credit_for_lifetime(
+                sid,
+                successor.session_id(),
+                stale_epoch,
+                10
+            ),
+            TxAdmit::Acquired { .. }
+        ));
+    }
+
+    #[test]
+    fn test_regression_no_double_counting_grant_and_refund() {
+        // Double-counting trap: if both a grant AND a successful-send
+        // refund credit the window for the same bytes, every round
+        // trip doubles effective capacity. The v2 invariant: commit()
+        // suppresses the refund; only a grant replenishes committed
+        // bytes.
+        let stream_id = 0x100u64;
+        let session = session_with_stream(stream_id, 200);
+
+        // Send: acquire 100 bytes, commit.
+        let g = match session.try_acquire_tx_credit_guard(stream_id, 100) {
+            TxAdmit::Acquired { guard, .. } => guard,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        g.commit();
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            100,
+            "after commit, 100 bytes consumed against a 200-byte window"
+        );
+
+        // Authoritative grant reporting total_consumed=100: the
+        // receiver has accepted the 100 bytes we committed, so
+        // outstanding = 0 and credit returns to the full window.
+        session
+            .try_stream(stream_id)
+            .unwrap()
+            .apply_authoritative_grant(100);
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            200,
+            "grant restores committed credit exactly once"
+        );
+
+        // CRITICAL: replaying the same grant (stale duplicate) is
+        // ignored by the monotonic `max_consumed_seen` check. No
+        // spurious inflation past the original window — the
+        // authoritative-grant design makes double-counting
+        // impossible even if the grant arrives multiple times.
+        session
+            .try_stream(stream_id)
+            .unwrap()
+            .apply_authoritative_grant(100);
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            200,
+            "replaying a stale grant must not inflate credit",
+        );
+    }
+
+    #[test]
+    fn test_regression_stale_grant_quarantined_after_close_reopen() {
+        // Regression (P1): a `StreamWindow` grant keyed only by
+        // stream_id could credit a reopened stream with credit
+        // minted against the previous lifetime's `StreamState`.
+        // Fix: `close_stream` stamps the stream_id into
+        // `recently_closed`; `is_grant_quarantined` tells the
+        // dispatcher to drop grants that arrive within
+        // `GRANT_QUARANTINE_WINDOW`.
+        let sid = 0x2077u64;
+        let session = session_with_stream(sid, 100);
+
+        // Mid-flight: close the stream, reopen with the same id.
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 100);
+
+        // An arriving grant for `sid` must be quarantined because
+        // the original lifetime was closed inside the window.
+        assert!(
+            session.is_grant_quarantined(sid),
+            "grants for recently-closed stream must be dropped"
+        );
+
+        // The reopened stream's credit is untouched — we don't call
+        // apply_authoritative_grant under quarantine.
+        assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_grant_quarantine_does_not_fire_without_close() {
+        // Baseline: streams that were never closed aren't in the
+        // quarantine set. Grants flow normally.
+        let sid = 0x2099u64;
+        let session = session_with_stream(sid, 100);
+        assert!(!session.is_grant_quarantined(sid));
+    }
+
+    #[test]
+    fn test_regression_control_seq_isolated_from_user_stream() {
+        // Regression: `spawn_stream_window_grant` used to draw the
+        // grant packet's sequence from
+        // `get_or_create_stream(SUBPROTOCOL_STREAM_WINDOW as u64)`,
+        // so a user stream opened with the numerically-equal id
+        // (0x0B00) would share sequence state with control traffic.
+        //
+        // Fix: grants ride on the `CONTROL_STREAM_ID` sentinel
+        // (`u64::MAX`) with a dedicated session-level
+        // `next_control_tx_seq` counter. This test verifies that
+        // opening a user stream at the old-collision id leaves its
+        // tx_seq untouched while control-seq advances independently.
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9999".parse().unwrap()),
+            4,
+            false,
+        ));
+        let user_sid = 0x0B00u64; // the old collision target
+        session.open_stream_full(user_sid, false, 1, 100);
+        let user_tx_seq_before = session.try_stream(user_sid).unwrap().current_tx_seq();
+
+        // Burn some control-seq as though grants had gone out.
+        let ctrl_a = session.next_control_tx_seq();
+        let ctrl_b = session.next_control_tx_seq();
+        let ctrl_c = session.next_control_tx_seq();
+        assert_eq!((ctrl_a, ctrl_b, ctrl_c), (0, 1, 2));
+
+        // User stream's tx_seq must NOT have moved.
+        assert_eq!(
+            session.try_stream(user_sid).unwrap().current_tx_seq(),
+            user_tx_seq_before,
+        );
+
+        // Conversely, a user send on the same stream must not
+        // advance the control-seq counter.
+        session.try_stream(user_sid).unwrap().next_tx_seq();
+        assert_eq!(session.next_control_tx_seq(), 3);
+    }
+
+    #[test]
+    fn test_regression_admit_and_seq_atomic_across_reopen_race() {
+        // Regression (P2): `send_on_stream` used to acquire credit
+        // and then re-look up the stream to fetch `next_tx_seq`.
+        // A concurrent close+reopen between the two lookups would
+        // debit credit on the old state while the sequence came
+        // from the new state — crossing lifetimes and defeating
+        // the epoch guard's safety.
+        //
+        // Fix: `try_acquire_tx_credit_*` now returns both the guard
+        // and the sequence under one DashMap lookup. This test
+        // verifies that the admitted sequence belongs to the same
+        // `StreamState` as the one that was debited.
+        let sid = 0x3141u64;
+        let session = session_with_stream(sid, 100);
+        let epoch_before = session.try_stream(sid).unwrap().epoch();
+        let tx_seq_before = session.try_stream(sid).unwrap().current_tx_seq();
+
+        let (guard, seq) = match session.try_acquire_tx_credit_for_lifetime(
+            sid,
+            session.session_id(),
+            epoch_before,
+            40,
+        ) {
+            TxAdmit::Acquired { guard, seq } => (guard, seq),
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        guard.commit();
+
+        // The sequence must come from the state that was debited —
+        // i.e., the next `current_tx_seq` is one greater than the
+        // value observed before, not zero (as it would be if the
+        // seq had come from a fresh state after an intervening
+        // reopen).
+        let after = session.try_stream(sid).unwrap();
+        assert_eq!(seq, tx_seq_before);
+        assert_eq!(after.current_tx_seq(), tx_seq_before + 1);
+        assert_eq!(after.epoch(), epoch_before);
+        assert_eq!(after.tx_credit_remaining(), 60);
+    }
+
+    impl TxSlotGuard {
+        /// Test-only accessor for the captured epoch.
+        fn epoch_for_test(&self) -> u64 {
+            self.epoch
+        }
+    }
+
+    /// CR-12: pin that no `tx_key` method exists on `NetSession`.
+    /// This is a source-string tripwire — if a future maintainer
+    /// reintroduces the accessor, the test fires loudly. The hazard
+    /// it gates (cross-pool nonce reuse) is dormant
+    /// unless someone calls a `tx_key()` method, so a behavioural
+    /// test would not catch the regression in time. We assemble
+    /// the forbidden token at runtime so the test's OWN source
+    /// doesn't contain the literal it scans for.
+    #[test]
+    fn cr12_tx_key_accessor_must_not_exist_on_net_session() {
+        // Build the forbidden token at runtime: `fn` + space + `tx_key` + `(`.
+        // The literal `fn tx_key(` shape is what we must NOT see in
+        // a non-comment line in the source.
+        let needle = format!("{} {}{}", "fn", "tx_key", "(");
+
+        let src = include_str!("session.rs");
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // doc-comment / line comment
+            }
+            assert!(
+                !trimmed.contains(&needle),
+                "CR-12 regression: tx_key accessor reintroduced into session.rs:\n  {}",
+                line
+            );
+        }
+    }
+
+    /// Regression: `verify_and_touch_heartbeat` short-circuits
+    /// any `parsed.payload.len() != TAG_SIZE` packet before
+    /// invoking the cipher. AEAD decryption would catch the
+    /// mismatch on its own, but the pre-check shortcuts a
+    /// cleartext-flood attacker spamming undersized / oversized
+    /// payloads to drain CPU on the decrypt path. The
+    /// session must be unmutated on rejection — a flood that
+    /// nudged `last_activity` would still be a side-channel for
+    /// liveness inference.
+    #[test]
+    fn verify_and_touch_heartbeat_rejects_wrong_length_before_decrypt() {
+        use crate::protocol::{NetHeader, PacketFlags, TAG_SIZE};
+        use bytes::Bytes;
+
+        let keys = test_keys();
+        let peer_addr: PeerAddr = PeerAddr::Udp("127.0.0.1:9999".parse().unwrap());
+        let session = NetSession::new(keys.clone(), peer_addr, 4, false);
+
+        // Capture last_activity before the spoof attempts so we
+        // can assert no mutation.
+        let baseline_activity = session.last_activity.load(Ordering::Acquire);
+
+        // Build a fake heartbeat header with a ciphertext that
+        // ISN'T 16 bytes — the AEAD would reject this anyway,
+        // but we want to assert the length gate fires first
+        // (no cipher work, no last_activity nudge).
+        let mut nonce = [0u8; 12];
+        nonce[0..4].copy_from_slice(&crate::crypto::session_prefix_from_id(keys.session_id));
+        nonce[4..12].copy_from_slice(&0u64.to_le_bytes());
+
+        let header = NetHeader::new(
+            keys.session_id,
+            0, // stream_id
+            0, // sequence
+            nonce,
+            0, // payload_len
+            0, // event_count
+            PacketFlags::HEARTBEAT,
+        );
+
+        for bad_len in [0usize, 1, TAG_SIZE - 1, TAG_SIZE + 1, 64] {
+            let parsed = ParsedPacket {
+                header,
+                payload: Bytes::from(vec![0u8; bad_len]),
+                source: peer_addr,
+            };
+            assert!(
+                !session.verify_and_touch_heartbeat(&parsed),
+                "wrong-length payload ({bad_len} bytes, expected {TAG_SIZE}) \
+                 must be rejected before AEAD decrypt"
+            );
+            assert_eq!(
+                session.last_activity.load(Ordering::Acquire),
+                baseline_activity,
+                "rejected heartbeat must not advance last_activity ({bad_len} bytes)"
+            );
+        }
+    }
+
+    /// N2: the four outcomes of a lifetime-conditional close, and the
+    /// one that matters — a stale epoch must leave the live state
+    /// alone rather than remove "whatever is current".
+    #[test]
+    fn a_conditional_close_removes_only_the_lifetime_it_names() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9001".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let e1 = session.open_stream_full(7, true, 1, 4096);
+
+        // Wrong incarnation: refused, nothing removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid ^ 1, e1),
+            StreamCloseOutcome::SessionSuperseded
+        );
+        assert!(
+            session.try_stream(7).is_some(),
+            "a predecessor's close must not remove the current lifetime"
+        );
+
+        // Right incarnation, wrong epoch: refused, nothing removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1 + 1),
+            StreamCloseOutcome::LifetimeMismatch
+        );
+        assert_eq!(
+            session.try_stream(7).map(|s| s.epoch()),
+            Some(e1),
+            "a stale epoch must not remove the live stream"
+        );
+
+        // Exact lifetime: removed.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::Closed
+        );
+        assert!(session.try_stream(7).is_none());
+
+        // Idempotent: closing a lifetime that is already gone is
+        // `Absent`, not an error.
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::Absent
+        );
+
+        // Reopen allocates a new epoch, and the old handle's close
+        // cannot reach it.
+        let e2 = session.open_stream_full(7, true, 1, 4096);
+        assert_ne!(e2, e1, "a reopen is a new lifetime");
+        assert_eq!(
+            session.close_stream_for_lifetime(7, sid, e1),
+            StreamCloseOutcome::LifetimeMismatch
+        );
+        assert!(session.try_stream(7).is_some());
+    }
+
+    /// N2, the race itself: a close that names one lifetime must
+    /// never remove a successor installed between its comparison and
+    /// its removal.
+    ///
+    /// Pre-fix these were two operations —
+    /// `try_stream(id).is_some_and(|s| s.epoch() != want)` released
+    /// its read guard, then `close_stream(id)` removed
+    /// **unconditionally**. Two reachable schedules follow, and Kyra
+    /// named both:
+    ///
+    /// - The close observes its own matching epoch, a concurrent
+    ///   close+reopen installs a successor, and the resumed close
+    ///   removes the successor — returning `Ok(())` while a live
+    ///   stream's credit ledger, sequence space and retransmit
+    ///   window are destroyed.
+    /// - The close observes *nothing* open (not stale either), a
+    ///   concurrent open lands, and the same unconditional removal
+    ///   takes it.
+    ///
+    /// Each round drives one of the two, and the invariant is the
+    /// one the gap breaks: **the reopener's stream is always open at
+    /// the end of a round.** The reopener installs its lifetime
+    /// last, so the only way for it to be missing is a close that
+    /// removed state it does not own.
+    ///
+    /// Inverse: replace the `Entry`-guarded body of
+    /// `close_stream_for_lifetime` with the two-step
+    /// check-then-`close_stream` form.
+    #[test]
+    fn a_conditional_close_never_removes_a_concurrent_reopen() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9002".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        const ROUNDS: usize = 20_000;
+
+        let barrier = Arc::new(Barrier::new(2));
+        // The epoch the closing side will name this round: the live
+        // one, so its comparison PASSES and it proceeds to remove.
+        let target_epoch = Arc::new(AtomicU64::new(0));
+        let lost = Arc::new(AtomicUsize::new(0));
+
+        let reopener = {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            let lost = Arc::clone(&lost);
+            std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    if round % 2 == 0 {
+                        // Successor under the same id.
+                        session.close_stream(1_000);
+                    }
+                    session.open_stream_full(1_000, true, 1, 4096);
+                    barrier.wait();
+                    if session.try_stream(1_000).is_none() {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                    }
+                    barrier.wait();
+                }
+            })
+        };
+
+        for round in 0..ROUNDS {
+            // Set up this round's starting lifetime. On odd rounds
+            // leave the id ABSENT so the closing side sees nothing
+            // open — the second schedule above.
+            if round % 2 == 0 {
+                let epoch = session.open_stream_full(1_000, true, 1, 4096);
+                target_epoch.store(epoch, Ordering::Relaxed);
+            } else {
+                session.close_stream(1_000);
+                target_epoch.store(u64::MAX, Ordering::Relaxed);
+            }
+            barrier.wait();
+            let _ =
+                session.close_stream_for_lifetime(1_000, sid, target_epoch.load(Ordering::Relaxed));
+            barrier.wait();
+            barrier.wait();
+        }
+        reopener.join().expect("reopener thread");
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            0,
+            "a lifetime-conditional close removed a stream it does not \
+             own in {} of {ROUNDS} races",
+            lost.load(Ordering::Relaxed)
+        );
+    }
+
+    /// N2 complement: the lifetime-scoped drain probe distinguishes
+    /// "my stream still has unacked data" from "a different lifetime
+    /// holds this id now", so a graceful close cannot wait out its
+    /// timeout on a successor's retransmit window.
+    #[test]
+    fn the_drain_probe_separates_pending_from_a_replaced_lifetime() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9003".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let e1 = session.open_stream_full(11, true, 1, 4096);
+
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::Drained,
+            "a stream with nothing outstanding is drained"
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid ^ 1, e1),
+            StreamDrainState::SessionSuperseded
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1 + 1),
+            StreamDrainState::LifetimeMismatch
+        );
+        assert_eq!(
+            session.drain_state_for_lifetime(404, sid, e1),
+            StreamDrainState::Absent
+        );
+
+        // Register one unacked reliable packet, then re-probe.
+        {
+            let state = session.try_stream(11).expect("stream");
+            let descriptor = Arc::new(RetransmitDescriptor {
+                seq: 0,
+                stream_id: 11,
+                events: vec![Bytes::from_static(b"x")],
+                flags: crate::protocol::PacketFlags::RELIABLE,
+                fragment: None,
+            });
+            state.with_reliability(|r| r.on_send(descriptor));
+        }
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::Pending,
+            "an unacked packet is what a graceful close waits for"
+        );
+        // And a reopen under the same id stops being our wait:
+        // the successor's unacked data is not ours to drain.
+        session.close_stream(11);
+        session.open_stream_full(11, true, 1, 4096);
+        assert_eq!(
+            session.drain_state_for_lifetime(11, sid, e1),
+            StreamDrainState::LifetimeMismatch
+        );
+    }
+
+    /// N1: the unconditional ledger debit moves BOTH halves, so the
+    /// grant that reports those bytes consumed refunds exactly them
+    /// — a control frame costs the application window only while it
+    /// is in flight.
+    #[test]
+    fn an_unadmitted_debit_is_refunded_by_the_grant_that_reports_it() {
+        let state = StreamState::new_full(false, 1, 100);
+
+        // 30 bytes of control traffic: no refusal, ledger moves.
+        state.note_tx_bytes_sent(30);
+        assert_eq!(state.tx_credit_remaining(), 70);
+        assert_eq!(state.tx_bytes_sent(), 30);
+
+        // 50 bytes of application traffic through admission.
+        assert!(state.try_acquire_tx_credit(50));
+        assert_eq!(state.tx_credit_remaining(), 20);
+        assert_eq!(state.tx_bytes_sent(), 80);
+
+        // The receiver consumed the control frame and the first 50
+        // application bytes: full window back.
+        state.apply_authoritative_grant(80);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            100,
+            "every byte the receiver charged was debited here, so the \
+             grant returns the whole window"
+        );
+
+        // Now the discriminating half: 40 bytes sent, only the
+        // control-free prefix of 10 consumed. Credit must be the
+        // window minus the 30 bytes still unconsumed — a grant can
+        // only refund what it reports.
+        state.note_tx_bytes_sent(10);
+        assert!(state.try_acquire_tx_credit(30));
+        state.apply_authoritative_grant(90);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            70,
+            "remaining + (sent - consumed) == window at every settled point"
+        );
+        assert_eq!(state.tx_bytes_sent(), 120);
+        assert_eq!(state.max_consumed_seen(), 90);
+    }
+
+    /// The debit floors at zero instead of refusing: a control frame
+    /// has no caller to return `Backpressure` to, and wedging the
+    /// credit loop behind the window it refills would deadlock the
+    /// stream.
+    #[test]
+    fn an_unadmitted_debit_floors_at_zero_and_never_refuses() {
+        let state = StreamState::new_full(false, 1, 10);
+        state.note_tx_bytes_sent(4);
+        assert_eq!(state.tx_credit_remaining(), 6);
+        state.note_tx_bytes_sent(100);
+        assert_eq!(
+            state.tx_credit_remaining(),
+            0,
+            "remaining floors at zero rather than wrapping"
+        );
+        assert_eq!(
+            state.tx_bytes_sent(),
+            104,
+            "the watermark records what actually went on the wire"
+        );
+        // An unbounded stream keeps ignoring the ledger entirely.
+        let unbounded = StreamState::new_full(false, 1, 0);
+        unbounded.note_tx_bytes_sent(1234);
+        assert_eq!(unbounded.tx_bytes_sent(), 0);
+    }
+
+    /// R4-2: the receive boundary is part of the receive LIFETIME.
+    ///
+    /// Her schedule: a lifetime that stated "reliable from 0" ends
+    /// with `reset_rx_stream`, and the peer's next lifetime states
+    /// "reliable from 1" after losing its fire-and-forget 0. The
+    /// second statement is the one that governs, and the send half
+    /// — sequence counter and unacknowledged descriptors — is not a
+    /// party to any of it.
+    ///
+    /// Inverse: drop `state.reset_rx_lifetime()` back to a bare
+    /// `with_reliability(|r| r.reset_rx())` and the latched
+    /// `rx_boundary_signalled` makes `promote_rx` discard the new
+    /// statement as a forbidden second one — the cursor restarts at
+    /// 0 while feedback still answers to boundary 0, so the ACK
+    /// never concedes the new lifetime's fire-and-forget prefix
+    /// (ACK 0 where 2 is owed).
+    #[test]
+    fn a_reset_receive_lifetime_answers_to_the_next_boundary_statement() {
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9104".parse().unwrap()),
+            4,
+            false,
+        );
+        const ID: u64 = 73;
+
+        // Lifetime 1: the peer stated reliable-from-0 and we took it.
+        session.get_or_create_stream_for_packet(ID, true, Some(0));
+        {
+            let old = session.try_stream(ID).expect("stream");
+            assert!(old.with_reliability(|r| r.on_receive(0)));
+            assert_eq!(
+                old.rx_stream_mode(),
+                StreamMode::Reliable {
+                    boundary: 0,
+                    signalled: true
+                }
+            );
+            // One unacknowledged packet of OUR OWN on the send half.
+            old.with_reliability(|r| {
+                r.on_send(Arc::new(RetransmitDescriptor {
+                    seq: 0,
+                    stream_id: ID,
+                    events: vec![Bytes::from_static(b"ours")],
+                    flags: crate::protocol::PacketFlags::RELIABLE,
+                    fragment: None,
+                }))
+            });
+            assert_eq!(old.next_tx_seq(), 0);
+        }
+
+        session.reset_rx_stream(ID);
+
+        // Lifetime 2: reliable from 1, its 0 lost as fire-and-forget.
+        session.get_or_create_stream_for_packet(ID, true, Some(1));
+        let new = session.try_stream(ID).expect("stream");
+        assert_eq!(
+            new.rx_stream_mode(),
+            StreamMode::Reliable {
+                boundary: 1,
+                signalled: true
+            },
+            "the boundary that governs is the one this receive lifetime \
+             was told, not the one its predecessor was"
+        );
+        assert!(new.with_reliability(|r| r.on_receive(1)));
+        assert_eq!(
+            new.with_reliability(|r| r.rx_ack_seq()),
+            2,
+            "sequence 1 arrived in order above a conceded fire-and-forget 0"
+        );
+        assert!(
+            new.with_reliability(|r| r.build_nack()).is_none(),
+            "a conceded fire-and-forget prefix is not a reliable gap to NACK"
+        );
+
+        // And the send half never moved.
+        assert_eq!(
+            new.current_tx_seq(),
+            1,
+            "a peer's receive reset does not rewind our sequence counter"
+        );
+        assert!(
+            new.with_reliability(|r| r.has_pending()),
+            "nor does it discard descriptors the peer is still owed"
+        );
+    }
+
+    /// R4-9: a positively SACKed arrival keeps delivery-or-terminal
+    /// ownership across eviction-before-hold.
+    ///
+    /// The production interval: ingress accepts out-of-order
+    /// reliable 1 under this lifetime and releases the state guard,
+    /// so the frame is in flight to `hold_in_order_frame` and the
+    /// reorder hold is still EMPTY. The feedback tick emits the
+    /// positive SACK for it, which is DELIVERED to the sender here —
+    /// that is the moment the sender's copy goes away, and it is
+    /// what makes the loss unrecoverable rather than merely local.
+    /// Cap eviction then removes the stream. Pre-fix the terminal
+    /// was keyed on the discarded hold alone, which is zero in this
+    /// interval, so nothing was owed: the sender had released
+    /// sequence 1, the consumer never got it, and
+    /// `hold_in_order_frame` refused the absent stream with a log.
+    ///
+    /// Inverse: remove `accepted_undelivered` from either eviction
+    /// branch's condition and the terminal disappears while the
+    /// SACK still leaves the sender with nothing to resend.
+    #[test]
+    fn a_sacked_arrival_evicted_before_its_hold_still_owes_a_terminal() {
+        let receiver = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9105".parse().unwrap()),
+            4,
+            false,
+        );
+        let sender = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9106".parse().unwrap()),
+            4,
+            false,
+        ));
+        const GAPPED: u64 = 73;
+        const CLEAN: u64 = 74;
+
+        // Receiver: reliable 0 is lost in flight, reliable 1 is
+        // accepted out of order. Nothing is in the hold yet.
+        receiver.get_or_create_stream_for_packet(GAPPED, true, Some(0));
+        assert!(receiver
+            .try_stream(GAPPED)
+            .expect("stream")
+            .with_reliability(|r| r.on_receive(1)));
+        assert!(
+            !receiver.holds_in_order(GAPPED),
+            "the defect's interval is exactly the one where acceptance has \
+             happened and insertion has not"
+        );
+        // Control: a stream whose every arrival was delivered in
+        // order owes nothing when it is evicted.
+        receiver.get_or_create_stream_for_packet(CLEAN, true, Some(0));
+        assert!(receiver
+            .try_stream(CLEAN)
+            .expect("stream")
+            .with_reliability(|r| r.on_receive(0)));
+
+        // Sender: both sequences are still in its retransmit window.
+        sender.open_stream_full(GAPPED, true, 1, 4096);
+        for seq in [0u64, 1] {
+            sender
+                .try_stream(GAPPED)
+                .expect("stream")
+                .with_reliability(|r| {
+                    r.on_send(Arc::new(RetransmitDescriptor {
+                        seq,
+                        stream_id: GAPPED,
+                        events: vec![Bytes::from_static(b"payload")],
+                        flags: crate::protocol::PacketFlags::RELIABLE,
+                        fragment: None,
+                    }))
+                });
+        }
+
+        // DELIVER THE SACK: the receiver's own feedback build, applied
+        // through the sender's own ack path.
+        let reports = receiver.collect_gap_reports(true, 8);
+        let report = reports
+            .iter()
+            .find(|r| r.stream_id == GAPPED)
+            .expect("a gapped stream reports its gap");
+        assert_eq!(report.ack_seq, 0, "nothing is contiguously received yet");
+        assert_eq!(
+            report.ranges,
+            vec![(1, 2)],
+            "sequence 1 is positively acknowledged to its sender"
+        );
+        sender
+            .try_stream(GAPPED)
+            .expect("stream")
+            .with_reliability(|r| r.on_ack_ranges(report.ack_seq, &report.ranges));
+
+        // The sender's recovery surface now holds 0 and only 0.
+        let recoverable: Vec<u64> =
+            sender
+                .try_stream(GAPPED)
+                .expect("stream")
+                .with_reliability(|r| {
+                    r.on_nack(&crate::protocol::NackPayload {
+                        next_expected: 0,
+                        missing_bitmap: 0b1,
+                    })
+                    .iter()
+                    .map(|d| d.seq)
+                    .collect()
+                });
+        assert_eq!(
+            recoverable,
+            vec![0],
+            "the SACK released sequence 1: no later NACK can bring it back"
+        );
+
+        // Cap eviction takes both streams, both with empty holds.
+        assert_eq!(
+            receiver.evict_idle_streams(Duration::from_secs(3600), 0, "cap_witness"),
+            2
+        );
+        assert_eq!(
+            receiver.take_receive_terminals(),
+            vec![GAPPED],
+            "an eviction that throws away an arrival this receiver had \
+             accepted — and told its sender it had — ends that stream's \
+             receive half typed; the stream that delivered everything it \
+             accepted owes nothing"
+        );
+    }
+
+    /// R4-1 (wire half): an UNSIGNALLED promotion concedes only the
+    /// prefix it can prove arrived.
+    ///
+    /// Her schedule is a producer that takes reliability per handle
+    /// on one shared sequence space: fire-and-forget 0, reliable 1
+    /// LOST, fire-and-forget 2, then reliable 3, and no sender
+    /// states a boundary anywhere. Conceding the high-water mark
+    /// acknowledges sequence 1 — whose sender is still holding a
+    /// descriptor for it — and the stream then runs on with a
+    /// reliable record silently missing. The conservative frontier
+    /// NACKs it instead, so the hole is the sender's to rebuild.
+    ///
+    /// Sequence 2 is named missing as well, and that is the honest
+    /// answer rather than a second defect: nothing in this mode
+    /// retains the runs that would prove 2 arrived, and a producer
+    /// that states its boundary raises the concession over both
+    /// (the control below, and `ensure_reliable_at`). What a
+    /// receiver may not do is claim receipt to make the bookkeeping
+    /// tidy.
+    ///
+    /// Inverse: make `FireAndForget::on_receive` advance its
+    /// frontier to `seq + 1` for any `seq` at or above it — the
+    /// high-water behaviour — and the ACK jumps to 4 with reliable
+    /// 1 never received.
+    #[test]
+    fn an_unsignalled_promotion_never_concedes_a_hole_it_cannot_prove_arrived() {
+        let session = NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9107".parse().unwrap()),
+            4,
+            false,
+        );
+        const MIXED: u64 = 73;
+        const CONTIGUOUS: u64 = 74;
+
+        for (seq, reliable) in [(0u64, false), (2, false), (3, true)] {
+            session.get_or_create_stream_for_packet(MIXED, reliable, None);
+            let state = session.try_stream(MIXED).expect("stream");
+            assert!(state.with_reliability(|r| r.on_receive(seq)));
+            state.update_rx_seq(seq);
+        }
+        let state = session.try_stream(MIXED).expect("stream");
+        assert_eq!(
+            state.with_reliability(|r| r.rx_ack_seq()),
+            1,
+            "sequence 1 was never received, so nothing may acknowledge it"
+        );
+        let missing: Vec<u64> = state
+            .with_reliability(|r| r.build_nack())
+            .expect("the hole is reported")
+            .missing_sequences()
+            .collect();
+        assert!(
+            missing.contains(&1),
+            "the hole is NACKed, which is what lets its sender rebuild it: \
+             {missing:?}"
+        );
+        drop(state);
+
+        // Control: an unbroken fire-and-forget history promotes
+        // exactly where it always did — the frontier and the
+        // high-water mark agree when nothing was lost, so the
+        // conceded prefix is the whole of it and there is no gap to
+        // report.
+        for (seq, reliable) in [(0u64, false), (1, false), (2, false), (3, true)] {
+            session.get_or_create_stream_for_packet(CONTIGUOUS, reliable, None);
+            let state = session.try_stream(CONTIGUOUS).expect("stream");
+            assert!(state.with_reliability(|r| r.on_receive(seq)));
+        }
+        let state = session.try_stream(CONTIGUOUS).expect("stream");
+        assert_eq!(state.with_reliability(|r| r.rx_ack_seq()), 4);
+        assert!(
+            state.with_reliability(|r| r.build_nack()).is_none(),
+            "a fire-and-forget prefix that arrived whole is not a gap"
+        );
+    }
+
+    /// R5-N1 / R4-1 (send side): one send owns a CONTIGUOUS
+    /// sequence range, and the reliable boundary is claimed by the
+    /// lowest reliable sequence because the claim happens under the
+    /// allocating lookup.
+    ///
+    /// Inverse: allocate with `next_tx_seq()` per piece, or claim
+    /// the boundary after the allocation returns, and a concurrent
+    /// send can take a sequence inside the group / win the claim
+    /// with a higher sequence than the one it is meant to name.
+    #[test]
+    fn a_group_admission_reserves_its_whole_range_and_the_lowest_boundary() {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            PeerAddr::Udp("127.0.0.1:9108".parse().unwrap()),
+            4,
+            false,
+        ));
+        let sid = session.session_id();
+        let epoch = session.open_stream_full(11, true, 1, 64);
+
+        // Every refusal is its own fact, and none of them consumes
+        // credit, a sequence, or the boundary claim.
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid ^ 1, epoch, 1, 3, true),
+            TxSendAdmit::SessionSuperseded
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid, epoch + 1, 1, 3, true),
+            TxSendAdmit::StreamClosed
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(404, sid, epoch, 1, 3, true),
+            TxSendAdmit::StreamClosed
+        ));
+        assert!(matches!(
+            session.try_admit_stream_send(11, sid, epoch, 65, 1, true),
+            TxSendAdmit::WindowFull
+        ));
+        {
+            let state = session.try_stream(11).expect("stream");
+            assert_eq!(state.current_tx_seq(), 0, "no refusal burned a sequence");
+            assert_eq!(state.tx_credit_remaining(), 64);
+            assert!(!state.tx_promoted(), "no refusal claimed the boundary");
+        }
+
+        let (group, first_seq, boundary) =
+            match session.try_admit_stream_send(11, sid, epoch, 30, 3, true) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                other => panic!("expected admission, got {other:?}"),
+            };
+        assert_eq!(first_seq, 0);
+        assert_eq!(
+            boundary,
+            Some(0),
+            "the first reliable send on the stream states the boundary"
+        );
+        assert_eq!(
+            session
+                .try_stream(11)
+                .expect("stream")
+                .tx_credit_remaining(),
+            34,
+            "the whole group's bytes are charged once"
+        );
+
+        // The next send starts past the WHOLE group — a concurrent
+        // single-packet send cannot land between pieces 0 and 2 —
+        // and it cannot restate a boundary already claimed.
+        let (second, second_seq, second_boundary) =
+            match session.try_admit_stream_send(11, sid, epoch, 10, 2, true) {
+                TxSendAdmit::Admitted {
+                    guard,
+                    first_seq,
+                    boundary,
+                } => (guard, first_seq, boundary),
+                other => panic!("expected admission, got {other:?}"),
+            };
+        assert_eq!(
+            second_seq, 3,
+            "sequences 0, 1 and 2 belong to the first group and nothing else"
+        );
+        assert_eq!(
+            second_boundary, None,
+            "the boundary is claimed once per lifetime, by the lowest \
+             reliable sequence"
+        );
+
+        // Neither group reached the wire, so both refund.
+        drop(group);
+        drop(second);
+        assert_eq!(
+            session
+                .try_stream(11)
+                .expect("stream")
+                .tx_credit_remaining(),
+            64
+        );
+    }
+}

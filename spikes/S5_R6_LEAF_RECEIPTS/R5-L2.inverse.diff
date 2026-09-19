@@ -1,0 +1,19 @@
+--- /c/Users/chief/orca/workspaces/net/.r6leaf-receipts/wasm.rs.pristine	2026-09-17 10:59:49.004289400 +0200
++++ net/crates/net/leaf/src/wasm.rs	2026-09-17 11:01:06.184388200 +0200
+@@ -3523,16 +3523,6 @@
+     /// for which "it was already gone" is the outcome the caller
+     /// wanted.
+     pub fn close(&self) {
+-        // The subscriptions first, and unconditionally: they are
+-        // this object's own bookkeeping, and a stale handle whose
+-        // `close_stream` is refused must still stop listening.
+-        let owned = core::mem::take(&mut *self.subscriptions.borrow_mut());
+-        {
+-            let mut guard = self.inner.borrow_mut();
+-            for id in owned {
+-                guard.remove_listener(id);
+-            }
+-        }
+         with_node(&self.inner, |guard| {
+             if let Err(e) = guard.node.close_stream(self.handle) {
+                 console_error(&format!("net-mesh-leaf: stream close: {e}"));

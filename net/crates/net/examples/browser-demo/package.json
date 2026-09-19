@@ -1,0 +1,11 @@
+{
+  "name": "net-browser-demo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stage 6 slice 6: the 60 Hz two-tab position demo plus its signalling prober. `three` is the page's renderer; `playwright-core` is what driver.mjs launches the three browsing contexts with (headed by hand, headless under --check).",
+  "dependencies": {
+    "playwright-core": "1.56.0",
+    "three": "0.186.0"
+  }
+}

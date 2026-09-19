@@ -4,12 +4,18 @@
 //! for high-throughput UDP communication.
 
 use bytes::{Bytes, BytesMut};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 
-use super::protocol::{NetHeader, HEADER_SIZE, MAX_PACKET_SIZE};
+use crate::error::AdapterError;
+
+use super::protocol::MAX_PACKET_SIZE;
+#[cfg(test)]
+use super::protocol::{NetHeader, HEADER_SIZE};
 
 // --- Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN) --------
 //
@@ -331,48 +337,224 @@ impl std::fmt::Debug for NetSocket {
     }
 }
 
-/// Parsed packet for processing
-#[derive(Debug)]
-pub struct ParsedPacket {
-    /// Packet header
-    pub header: NetHeader,
-    /// Encrypted payload (includes auth tag)
-    pub payload: Bytes,
-    /// Source address
-    pub source: SocketAddr,
+/// Where a peer is reached — re-exported from `net-mesh-wire`, which
+/// owns the type since Stage 2 so the wire layer needs nothing native.
+pub use net_wire::peer_addr::PeerAddr;
+
+/// The one outbound submission surface for peer-addressed packets.
+///
+/// Three entry points, one per blocking shape the send inventory
+/// (`docs/internal/spikes/S0D_SEND_INGRESS_INVENTORY.md` §3.1) actually
+/// contains. UDP behaviour is **identical** to the raw socket calls these
+/// replace: [`Self::send`] is `NetSocket::send_to(..).await`,
+/// [`Self::try_send`] is `NetSocket::try_send_to`, and
+/// [`Self::send_bounded`] is `bound_datagram_send` around the former.
+/// Nothing here converts a UDP `WouldBlock` into application backpressure.
+///
+/// Stage 3 adds the RTC half beside `udp`; the entry points and their
+/// contracts do not change when it does.
+#[derive(Clone)]
+pub struct PeerSink {
+    udp: Arc<NetSocket>,
+    /// The RTC half (Stage 3). `None` until a node is configured with
+    /// `MeshNodeConfig::rtc`, so compiling the feature changes nothing.
+    #[cfg(feature = "webrtc")]
+    rtc: Option<Arc<super::rtc::RtcTransport>>,
 }
 
-impl ParsedPacket {
-    /// Parse a raw packet
-    pub fn parse(data: Bytes, source: SocketAddr) -> Option<Self> {
-        if data.len() < HEADER_SIZE {
-            return None;
+impl PeerSink {
+    /// Build a sink over the node's UDP socket.
+    #[inline]
+    pub fn new(udp: Arc<NetSocket>) -> Self {
+        Self {
+            udp,
+            #[cfg(feature = "webrtc")]
+            rtc: None,
         }
-
-        let header = NetHeader::from_bytes(&data)?;
-        if !header.validate() {
-            return None;
-        }
-
-        let payload = data.slice(HEADER_SIZE..);
-
-        Some(Self {
-            header,
-            payload,
-            source,
-        })
     }
 
-    /// Get the expected payload length (ciphertext + tag)
-    pub fn expected_payload_len(&self) -> usize {
-        self.header.payload_len as usize + super::protocol::TAG_SIZE
+    /// Attach the RTC admission side (Stage 3).
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    #[inline]
+    pub fn with_rtc(mut self, rtc: Arc<super::rtc::RtcTransport>) -> Self {
+        self.rtc = Some(rtc);
+        self
     }
 
-    /// Validate payload length
-    pub fn is_valid_length(&self) -> bool {
-        self.payload.len() == self.expected_payload_len()
+    /// The RTC admission side, when this node has one.
+    #[cfg(feature = "webrtc")]
+    #[inline]
+    pub fn rtc(&self) -> Option<&Arc<super::rtc::RtcTransport>> {
+        self.rtc.as_ref()
+    }
+
+    /// Submit to a DataChannel. Synchronous and total: the reserved
+    /// slots/bytes and the published advisory decide here, and nothing
+    /// refuses after acceptance.
+    ///
+    /// Awaiting is not an option on this half — the driver is the one
+    /// task that owns every `str0m::Rtc`, so a sender that blocked
+    /// waiting for room would stall every other peer's `poll_output`,
+    /// not just its own. That is why `send` and `send_bounded` below
+    /// delegate here rather than waiting.
+    #[cfg(feature = "webrtc")]
+    #[inline]
+    fn submit_rtc(&self, packet: &[u8], id: super::rtc::RtcPeerId) -> io::Result<usize> {
+        let Some(rtc) = self.rtc.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "rtc endpoint addressed on a node with no RTC transport configured",
+            ));
+        };
+        rtc.submit(packet, id)
+            .map(|()| packet.len())
+            .map_err(io::Error::from)
+    }
+
+    /// The UDP socket this sink submits on.
+    ///
+    /// For the paths that need the socket itself rather than a submission:
+    /// receive loops, `local_addr`, and the two handshake `recv_from`
+    /// bypasses. Not a send path.
+    #[inline]
+    pub fn udp_socket(&self) -> &Arc<NetSocket> {
+        &self.udp
+    }
+
+    /// Awaited submission. UDP: exactly `socket.send_to(..).await`.
+    #[inline]
+    pub async fn send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
+        match to {
+            PeerAddr::Udp(addr) => self.udp.send_to(packet, addr).await,
+            // RTC: there is nothing to await. Admission is total and
+            // the driver owns what it accepts, so the awaited entry
+            // point is the synchronous one. `WouldBlock` reaches the
+            // caller unchanged and each row maps it per its
+            // disposition (S0d §3.2).
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
+            // R5-A: the endpoint type lives in the wire crate, and a
+            // *downstream* consumer can turn on `net-mesh-wire/webrtc`
+            // without the core's `webrtc`. The variant then exists in
+            // the shared type while this crate has no RTC driver to
+            // hand it to, so the match must still be total. It is not
+            // reachable: nothing in a core without `webrtc` can mint
+            // an `Rtc` endpoint.
+            #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
+        }
+    }
+
+    /// Non-blocking submission. UDP: exactly `socket.try_send_to(..)`,
+    /// including its `WouldBlock` — the deliberate-shed call sites depend
+    /// on that error reaching them unchanged.
+    #[inline]
+    pub fn try_send(&self, packet: &[u8], to: PeerAddr) -> io::Result<usize> {
+        match to {
+            PeerAddr::Udp(addr) => self.udp.try_send_to(packet, addr),
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id),
+            // R5-A: the endpoint type lives in the wire crate, and a
+            // *downstream* consumer can turn on `net-mesh-wire/webrtc`
+            // without the core's `webrtc`. The variant then exists in
+            // the shared type while this crate has no RTC driver to
+            // hand it to, so the match must still be total. It is not
+            // reachable: nothing in a core without `webrtc` can mint
+            // an `Rtc` endpoint.
+            #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rtc endpoint without the core's webrtc feature",
+            )),
+        }
+    }
+
+    /// Awaited submission under a caller-chosen deadline. UDP: today's
+    /// `bound_datagram_send(socket.send_to(..), addr, deadline)`.
+    ///
+    /// The deadline is the caller's: the ordered organization egress queue
+    /// passes its own, the caller-facing datagram seam passes
+    /// `DATAGRAM_SEND_DEADLINE`. They are not unified.
+    #[inline]
+    pub async fn send_bounded(
+        &self,
+        packet: &[u8],
+        to: PeerAddr,
+        deadline: Duration,
+    ) -> Result<(), AdapterError> {
+        match to {
+            PeerAddr::Udp(addr) => {
+                bound_datagram_send(self.udp.send_to(packet, addr), to, deadline).await
+            }
+            // A deadline around a synchronous decision is a no-op by
+            // construction; the RTC half cannot block, so there is
+            // nothing for the deadline to bound. The refusal is mapped
+            // to the same `AdapterError::Connection` shape a UDP send
+            // failure produces, so callers' error handling is
+            // unchanged.
+            #[cfg(feature = "webrtc")]
+            PeerAddr::Rtc(id) => self.submit_rtc(packet, id).map(|_| ()).map_err(|e| {
+                AdapterError::Connection(format!("rtc submission to {to} refused: {e}"))
+            }),
+            // R5-A: total over the shared wire type; see `send`.
+            #[cfg(not(feature = "webrtc"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "R5-A: reachable only when a downstream consumer enables `net-mesh-wire/webrtc` without the core's feature; with neither, `PeerAddr` has one variant and this arm is dead"
+            )]
+            _ => Err(AdapterError::Connection(
+                "rtc endpoint without the core's webrtc feature".into(),
+            )),
+        }
     }
 }
+
+impl std::fmt::Debug for PeerSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSink")
+            .field("udp", &self.udp.local_addr())
+            .finish()
+    }
+}
+
+/// Bound one ALREADY-ISSUED datagram send future by `deadline`.
+///
+/// The single place the datagram-send bound is expressed. Taking the future
+/// rather than the socket is what lets both [`PeerSink::send_bounded`] and
+/// the ordered organization egress share the exact same retirement policy —
+/// and lets an instrumented witness substitute a send that never resolves
+/// without duplicating the deadline wrapper it is meant to exercise.
+pub(crate) async fn bound_datagram_send<F>(
+    send: F,
+    addr: PeerAddr,
+    deadline: Duration,
+) -> Result<(), AdapterError>
+where
+    F: Future<Output = io::Result<usize>>,
+{
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AdapterError::Connection(format!("send failed: {e}"))),
+        Err(_) => Err(AdapterError::Connection(format!(
+            "send to {addr} exceeded the {deadline:?} datagram deadline"
+        ))),
+    }
+}
+
+/// Parsed packet for processing — re-exported from `net-mesh-wire`.
+pub use net_wire::parsed_packet::ParsedPacket;
 
 /// Receiver task for handling inbound packets
 pub struct PacketReceiver {
@@ -418,7 +600,8 @@ impl PacketReceiver {
     /// Parse the next packet
     pub async fn recv_parsed(&mut self) -> io::Result<Option<ParsedPacket>> {
         let (data, addr) = self.recv().await?;
-        Ok(ParsedPacket::parse(data, addr))
+        // Receive boundary: the socket tuple becomes the peer endpoint.
+        Ok(ParsedPacket::parse(data, PeerAddr::Udp(addr)))
     }
 }
 
@@ -814,7 +997,11 @@ mod tests {
         data.extend_from_slice(&header.to_bytes());
         data.extend_from_slice(&[0u8; 26]); // 10 bytes payload + 16 bytes tag
 
-        let parsed = ParsedPacket::parse(data.freeze(), "127.0.0.1:1234".parse().unwrap()).unwrap();
+        let parsed = ParsedPacket::parse(
+            data.freeze(),
+            PeerAddr::Udp("127.0.0.1:1234".parse().unwrap()),
+        )
+        .unwrap();
 
         assert_eq!(parsed.header.session_id, 0x1234);
         assert_eq!(parsed.header.stream_id, 0x5678);

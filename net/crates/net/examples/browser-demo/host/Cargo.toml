@@ -1,0 +1,47 @@
+[package]
+name = "net-browser-demo-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stage 6 slice 6: the anchor, the bootstrap listener, the page server and the live per-pair counter behind the 60 Hz two-tab position demo — and, with --check, the headless Playwright assertion of the counter's shape."
+
+# Its own workspace root, exactly like the browser harness under
+# `tests/rtc_browser/runner`: this is a demo binary living inside the
+# `net-mesh` crate directory, not a member of its workspace, and
+# `net/crates/net/Cargo.toml` is not ours to edit (Stage 6 is strictly
+# additive).
+[workspace]
+
+[[bin]]
+name = "net-browser-demo"
+path = "src/main.rs"
+
+[dependencies]
+# The anchor: a real `MeshNode` with WebRTC, whose per-pair
+# `forwarded_app_packets` counter is what the demo displays.
+net-mesh = { path = "../../..", features = ["webrtc", "cortex"] }
+# The real bootstrap listener and the browser credential the page
+# `connect()`s with.
+net-mesh-sdk = { path = "../../../sdk", features = ["rtc-bootstrap"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The enrollment provider the anchor serves: an `RpcHandler` is an
+# `async_trait`, and its response body is `Bytes`.
+async-trait = "0.1"
+bytes = "1"
+# The repo disallows `std::sync::Mutex::lock` (clippy.toml): parking_lot's
+# guards are infallible, so the panic-on-poison surface never appears.
+parking_lot = "0.12"
+# The local CA + leaf for `https://localhost`, so the page reaches the
+# real HTTPS bootstrap listener rather than a weakened one.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
+# `--ignore-certificate-errors-spki-list` takes
+# base64(SHA-256(SubjectPublicKeyInfo)) of the leaf this process
+# mints, so the pin is computed here.
+sha2 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }

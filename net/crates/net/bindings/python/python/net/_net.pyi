@@ -1019,7 +1019,20 @@ class NetMesh:
     def send_on_stream(self, stream: "NetStream", events: List[bytes]) -> None:
         """Send a batch of events on a stream. Raises
         `BackpressureError` if the window is full, `NotConnectedError`
-        if the peer session is gone."""
+        if the peer session is gone.
+
+        Raises `ValueError` when any ONE event is larger than the
+        stream can carry to its peer. The message names both numbers
+        — the refused event's size and the limit that applied, which
+        is 8104 (`MAX_PAYLOAD_SIZE` minus the event frame's 4-byte
+        length prefix) for a peer that does not reassemble fragments
+        and the eight-packet fragmentation ceiling for one that does
+        — because a caller that cannot see the limit has no way to
+        discover its send bound except by being refused. Nothing in
+        the batch is sent: the check runs before the peer is even
+        resolved. It is not a transport fault and retrying cannot
+        help, so `ValueError` rather than `RuntimeError`; split the
+        payload, or carry it on a producer that fragments."""
         ...
     def send_with_retry(
         self,
@@ -1028,11 +1041,15 @@ class NetMesh:
         max_retries: int = 8,
     ) -> None:
         """Retry `BackpressureError` with 5–200 ms exponential backoff
-        up to `max_retries` times. Transport errors propagate."""
+        up to `max_retries` times. Transport errors propagate, and so
+        does the oversize `ValueError` — it is the payload, not the
+        window, so no number of retries clears it."""
         ...
     def send_blocking(self, stream: "NetStream", events: List[bytes]) -> None:
         """Retry until the send succeeds or the ~13-minute upper bound
-        is hit. Releases the GIL while waiting."""
+        is hit. Releases the GIL while waiting. Only
+        `BackpressureError` is absorbed; the oversize `ValueError`
+        propagates immediately."""
         ...
     def stream_stats(
         self, peer_node_id: int, stream_id: int
@@ -1216,6 +1233,14 @@ class BackpressureError(Exception):
 class NotConnectedError(Exception):
     """Raised when a stream's peer session is gone (disconnected,
     never connected, or the stream was closed)."""
+
+class SessionSupersededError(Exception):
+    """Raised when the stream handle's session has been replaced by a
+    successor incarnation of the same peer (S5-R12). Distinct from
+    `NotConnectedError`: the peer is connected and the stream id may
+    even be open — on a different session, with its own credit,
+    sequence space and reliability config. Never retryable with the
+    same handle; re-open against the current session."""
 
 class ChannelError(Exception):
     """Raised when a channel operation fails for a non-auth reason:

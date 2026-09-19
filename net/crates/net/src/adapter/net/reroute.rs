@@ -20,7 +20,7 @@
 //! This module is wired into `MeshNode` via the `FailureDetector`'s
 //! `on_failure` and `on_recovery` callbacks.
 
-use std::net::SocketAddr;
+use super::transport::PeerAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -48,11 +48,11 @@ pub struct PeerSnapshot {
     /// The incarnation this reading is of.
     pub session_id: u64,
     /// Where datagrams for this peer go.
-    pub send_addr: SocketAddr,
+    pub send_addr: PeerAddr,
     /// `Some(addr)` when the peer OWNS `send_addr` — i.e. the session
     /// terminates where it points, and the peer is adjacent. `None`
     /// for a peer reached through a relay.
-    pub owned_addr: Option<SocketAddr>,
+    pub owned_addr: Option<PeerAddr>,
 }
 
 /// Policy that removes invalidated routes when peers fail.
@@ -74,7 +74,7 @@ pub struct ReroutePolicy {
     /// Routing table to update
     routing_table: Arc<RoutingTable>,
     /// Connected peers (node_id → addr mapping)
-    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    peer_addrs: Arc<DashMap<u64, PeerAddr>>,
     /// One coherent reading of a peer — incarnation and transport
     /// together — so a delayed failure/recovery callback can tell both
     /// that the peer it is about has been replaced and whether the
@@ -100,10 +100,7 @@ pub struct ReroutePolicy {
 
 impl ReroutePolicy {
     /// Create a new reroute policy.
-    pub fn new(
-        routing_table: Arc<RoutingTable>,
-        peer_addrs: Arc<DashMap<u64, SocketAddr>>,
-    ) -> Self {
+    pub fn new(routing_table: Arc<RoutingTable>, peer_addrs: Arc<DashMap<u64, PeerAddr>>) -> Self {
         Self {
             routing_table,
             peer_addrs,
@@ -288,7 +285,7 @@ impl ReroutePolicy {
         &self,
         dest_id: u64,
         failed_node_id: u64,
-        failed_addr: SocketAddr,
+        failed_addr: PeerAddr,
         failed_incarnation: Option<u64>,
         verdict_seq: u64,
     ) -> bool {
@@ -482,8 +479,8 @@ mod tests {
         let rt = make_routing_table();
         let peers = Arc::new(DashMap::new());
 
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
 
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
@@ -509,9 +506,9 @@ mod tests {
     #[test]
     fn a_surviving_candidate_wins_without_synthesis() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
 
@@ -537,9 +534,9 @@ mod tests {
     #[test]
     fn a_failed_protected_candidate_is_removed_not_shadowed() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
 
@@ -567,9 +564,9 @@ mod tests {
     #[test]
     fn failure_invalidation_never_affects_another_identity_at_a_reused_address() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let x: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let drifted: SocketAddr = "127.0.0.1:2999".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let x: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let drifted: PeerAddr = PeerAddr::Udp("127.0.0.1:2999".parse().unwrap());
         peers.insert(0x2222u64, x); // failing peer B, at X
 
         // Bound to C at B's address (reuse), legacy at B's address,
@@ -606,9 +603,9 @@ mod tests {
         use std::time::Duration;
 
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
 
@@ -634,8 +631,8 @@ mod tests {
     #[test]
     fn a_fresh_route_landing_mid_failure_is_not_clobbered() {
         let rt = make_routing_table();
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         rt.add_route(0x4444, addr_b);
 
         // Model the race directly against the conditional writer: the
@@ -662,9 +659,9 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
 
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
         rt.add_authenticated_route(0x4444, addr_b, 0x2222);
@@ -715,9 +712,9 @@ mod tests {
     #[test]
     fn a_superseded_failure_verdict_refuses_at_the_mutation() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_c: PeerAddr = PeerAddr::Udp("127.0.0.1:3000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
         peers.insert(0x3333u64, addr_c);
         rt.add_route(0x4444, addr_b);
@@ -768,8 +765,8 @@ mod tests {
     #[test]
     fn recovery_does_not_restore_downstream_candidates() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
 
         // Downstream ordinary (3 hops) and downstream protected, both
@@ -818,8 +815,8 @@ mod tests {
     #[test]
     fn recovery_installs_the_peers_own_route_from_its_live_transport() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
 
         // B's own direct route — the shape `add_direct_route` installs.
@@ -863,8 +860,8 @@ mod tests {
     #[test]
     fn recovery_of_a_now_routed_peer_installs_only_an_ordinary_candidate() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let relay: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let relay: PeerAddr = PeerAddr::Udp("127.0.0.1:9000".parse().unwrap());
         peers.insert(0x2222u64, relay);
 
         rt.add_authenticated_route(0x2222, relay, 0x2222);
@@ -900,9 +897,9 @@ mod tests {
     #[test]
     fn recovery_installs_at_the_current_address_after_a_rebind() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b_old: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let addr_b_new: SocketAddr = "127.0.0.1:2999".parse().unwrap(); // post-rebind
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b_old: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
+        let addr_b_new: PeerAddr = PeerAddr::Udp("127.0.0.1:2999".parse().unwrap()); // post-rebind
         peers.insert(0x2222u64, addr_b_old);
 
         rt.add_route(0x2222, addr_b_old);
@@ -934,8 +931,8 @@ mod tests {
     #[test]
     fn a_stale_recovery_for_a_replaced_session_installs_nothing() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
 
         let policy =
@@ -967,8 +964,8 @@ mod tests {
     #[test]
     fn a_superseded_recovery_verdict_installs_nothing() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
 
         let policy =
@@ -1000,8 +997,8 @@ mod tests {
     #[test]
     fn recovery_skips_when_the_peers_route_is_already_current() {
         let rt = make_routing_table();
-        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
-        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let peers: Arc<DashMap<u64, PeerAddr>> = Arc::new(DashMap::new());
+        let addr_b: PeerAddr = PeerAddr::Udp("127.0.0.1:2000".parse().unwrap());
         peers.insert(0x2222u64, addr_b);
 
         rt.add_authenticated_route(0x2222, addr_b, 0x2222);

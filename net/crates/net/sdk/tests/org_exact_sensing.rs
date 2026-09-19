@@ -1711,33 +1711,58 @@ async fn a_missing_canonical_member_is_recovered_under_an_unchanged_expectation(
     )
     .await;
 
-    // More authorized, pinned providers than the cap, so truncation is real.
-    let crowd: Vec<EntityKeypair> = (0..MAX_SENSED_POPULATION + 8)
-        .map(|_| EntityKeypair::generate())
-        .collect();
+    // More authorized, pinned providers than the cap, so truncation is
+    // real — plus ONE more whose node id is below every other member of
+    // the expectation, so it is unambiguously inside core's canonical
+    // prefix.
+    //
+    // **How the lowest member is chosen matters.** This used to fix the
+    // crowd first and then rejection-sample fresh keypairs hoping one
+    // landed below the crowd's minimum, with a budget of 4096 draws. A
+    // node id is a BLAKE2s output, i.e. uniform over `u64`, so the
+    // failure probability of that shape is not the naive
+    // `(1 - 1/N)^4096` — the floor is itself a random minimum with a
+    // heavy tail. Unconditionally it is "the global minimum of all
+    // 4136 draws fell among the first 40", i.e. `40/4136` ≈ **1 % of
+    // runs**, which is exactly what failed CI run 34727420769.
+    //
+    // The fix is to stop sampling against a minimum: draw the whole
+    // pool, then TAKE its minimum as the lowest member and use the rest
+    // as the crowd. That is deterministic with respect to the crowd by
+    // construction. Only the providers, which `stand_up` already fixed,
+    // still have to be beaten, and that is a 2-way comparison retried
+    // as a whole pool — `(2/(pool+2))^16`, i.e. ~1e-21.
+    let provider_floor = cell
+        .providers
+        .iter()
+        .map(|p| p.node.node_id())
+        .min()
+        .expect("a non-empty provider set");
+    let mut pool: Vec<EntityKeypair> = Vec::new();
+    for _ in 0..16 {
+        let mut candidates: Vec<EntityKeypair> = (0..MAX_SENSED_POPULATION + 9)
+            .map(|_| EntityKeypair::generate())
+            .collect();
+        candidates.sort_by_key(|member| member.entity_id().node_id());
+        if candidates[0].entity_id().node_id() < provider_floor {
+            pool = candidates;
+            break;
+        }
+    }
+    assert!(
+        !pool.is_empty(),
+        "sixteen pools of {} keys and none held an id below the providers' \
+         floor {provider_floor} — a uniform-node-id assumption is broken, not \
+         a bad roll",
+        MAX_SENSED_POPULATION + 9
+    );
+    let mut pool = pool.into_iter();
+    let lowest = pool.next().expect("the pool's minimum");
+    let crowd: Vec<EntityKeypair> = pool.collect();
     for member in &crowd {
         discover_synthetic(&cell.consumer, &org(), member, unix_now() + 3600);
     }
 
-    // ...plus ONE more whose node id is below every other member of the
-    // expectation, so it is unambiguously inside core's canonical prefix. Node
-    // ids come from entity bytes, so this is found by generating rather than
-    // chosen.
-    let floor_id = crowd
-        .iter()
-        .map(|member| member.entity_id().node_id())
-        .chain(cell.providers.iter().map(|p| p.node.node_id()))
-        .min()
-        .expect("a non-empty crowd");
-    let mut lowest = None;
-    for _ in 0..4096 {
-        let candidate = EntityKeypair::generate();
-        if candidate.entity_id().node_id() < floor_id {
-            lowest = Some(candidate);
-            break;
-        }
-    }
-    let lowest = lowest.expect("a provider below every other id");
     let lowest_id = lowest.entity_id().node_id();
     // Every row, including this one, outlives the witness: the expiry that
     // matters happens INSIDE the attempt, below, so the first capture cannot

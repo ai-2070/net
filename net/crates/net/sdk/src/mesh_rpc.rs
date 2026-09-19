@@ -40,6 +40,36 @@ pub use net::adapter::net::mesh_rpc_metrics::{
 use crate::error::{Result, SdkError};
 use crate::mesh::Mesh;
 
+/// A handler whose bodies are already bytes (R6): nothing is
+/// encoded on the way in or out.
+struct RawBytesRpcHandler<F> {
+    inner: Arc<F>,
+}
+
+#[async_trait::async_trait]
+impl<F, Fut> RpcHandler for RawBytesRpcHandler<F>
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send + 'static,
+{
+    async fn call(
+        &self,
+        ctx: RpcContext,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let body = (self.inner)(ctx.payload.body.to_vec())
+            .await
+            .map_err(|message| RpcHandlerError::Application {
+                code: NRPC_TYPED_HANDLER_ERROR,
+                message,
+            })?;
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: body.into(),
+        })
+    }
+}
+
 // ============================================================================
 // Application-status code reservations for the typed wrappers.
 //
@@ -374,6 +404,56 @@ impl Mesh {
         };
         self.auto_register_rpc_channels(service);
         self.node().serve_rpc(service, Arc::new(typed))
+    }
+
+    /// Register a service whose request and response bodies travel
+    /// **raw** (R6).
+    ///
+    /// `serve_rpc_typed` with `Codec::Json` encodes the handler's
+    /// return value, so a `Vec<u8>` reaches the caller as a JSON
+    /// array of numbers. For enrollment that is fatal: the core's
+    /// promotion gate reads the response body itself and expects it
+    /// to begin with the raw `NMO1` magic, so a legitimate
+    /// `JoinOutcome::Admitted` could never promote an RTC session.
+    /// Bodies that are already a serialized protocol — enrollment,
+    /// renewal — use this instead of a codec that would re-encode
+    /// them.
+    pub fn serve_rpc_raw_bytes<F, Fut>(
+        &self,
+        service: &str,
+        handler: F,
+    ) -> std::result::Result<ServeHandle, ServeError>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send + 'static,
+    {
+        let raw = RawBytesRpcHandler {
+            inner: Arc::new(handler),
+        };
+        self.auto_register_rpc_channels(service);
+        self.node().serve_rpc(service, Arc::new(raw))
+    }
+
+    /// Direct-addressed call whose request and response bodies are
+    /// **raw bytes** (R6) — the caller half of
+    /// [`Self::serve_rpc_raw_bytes`].
+    pub async fn call_raw_bytes(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let reply = self
+            .node()
+            .call(
+                target_node_id,
+                service,
+                bytes::Bytes::from(request),
+                Default::default(),
+            )
+            .await
+            .map_err(|e| SdkError::Config(format!("call: {e}")))?;
+        Ok(reply.body.to_vec())
     }
 
     /// Direct-addressed typed call. Encodes `request` via
@@ -1505,8 +1585,8 @@ mod auto_register_covers_every_serve_variant {
         }
 
         assert_eq!(
-            checked, 8,
-            "expected 8 `serve_rpc*` variants; found {checked}. If a variant \
+            checked, 9,
+            "expected 9 `serve_rpc*` variants; found {checked}. If a variant \
              was added or removed, update this count deliberately — the point \
              is that the set is enumerated, not discovered."
         );

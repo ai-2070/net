@@ -46,6 +46,7 @@ export {
   MeshNode,
   BackpressureError,
   NotConnectedError,
+  SessionSupersededError,
   ChannelError,
   ChannelAuthError,
 } from './mesh';
