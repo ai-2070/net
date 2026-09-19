@@ -10,6 +10,10 @@ transport layer cannot: _what does this cost? did the payment reach the required
 verification tier? am I allowed to spend this? what usage fact do I bill?_ Net Payments answers those by
 **signing the commercial facts** around an invocation. It does not move money.
 
+The unit being sold is usually one invocation. It can also be a bounded job
+another agent runs over minutes — the same envelopes in a different order, on
+[Paid agent work](/docs/payments/paid-agent-work).
+
 ## The boundary
 
 > **Net standardizes the commercial facts around capability invocation; it does

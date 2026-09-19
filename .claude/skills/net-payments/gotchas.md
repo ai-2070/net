@@ -70,6 +70,8 @@ they go red (`testing.md`).
 | "add a branch for network X" (outside `src/x402/`) | Networks are config packs + registry entries, not code. |
 | "the facilitator confirmed finality" | A facilitator receipt is **`observed`, full stop.** `confirmed(n)`/`final` come only from the independent chain check. |
 | "just auto-refund the overpayment" | Overpayment is a verification *exception* for provider policy. The verifier never auto-satisfies; no auto-refunds in v1. |
+| "the task purchase failed, so quote it again" | Only if the refusal was *unexposed*. `unknown` and `denied{funds_ambiguous: true}` mean a bearer authorization may already have settled — re-send the stored payload, or resolve the attempt. A fresh quote is a second charge (`a2a.md`). |
+| "the provider won't run it, so refund the task" | `PaidUnexecutable` keeps the proof and billing event and waits for an operator. Net has no refund semantics to invoke, and relabelling it "refused" destroys the evidence. |
 
 ## Migration / integration traps
 
@@ -87,6 +89,10 @@ they go red (`testing.md`).
 - **Retries:** `accept_payment` is idempotent by `{caller, provider,
   capability, quote}` — do not add your own dedup on top; you'll fight the
   replay index. Concurrent same-key attempts correctly return `InProgress`.
+  Redemption has two idempotency rules, not one: `redeem_for_invocation` is
+  strictly at-most-once, `redeem_for_task` is idempotent for the *same*
+  purchase hash (`a2a.md`). Don't "harmonize" them — the task path is
+  reconciling a crash between two durable files.
 - **Expiry:** there's no global clock. Use signer timestamps + the engine's
   bounded `expiry_tolerance_ns`; don't compare against `SystemTime::now()`
   directly in the money path.
@@ -102,10 +108,12 @@ they go red (`testing.md`).
 - **Adding a durable write to a read-only branch is a DoS regression.** Denials
   deliberately skip the store write (`mutate_json_if_changed`); a denial that
   fsyncs lets a caller spraying quote ids force one global-lock + fsync per
-  attempt. If you touch `redeem_for_invocation`, `accept_payment`'s claim
-  transaction, or `check_and_reserve`, keep the dirty flag derived from the
-  same branch that mutated — and note the two traps (housekeeping pruning makes
-  a nominal denial dirty; a re-requested identical pending approval is clean).
+  attempt. If you touch `redeem_for_invocation`, `redeem_for_task`,
+  `accept_payment`'s claim transaction, or `check_and_reserve`, keep the dirty
+  flag derived from the same branch that mutated — and note the two traps
+  (housekeeping pruning makes a nominal denial dirty; a re-requested identical
+  pending approval is clean). On the task path the input-mismatch arm and the
+  idempotent re-admission arm are both read-only for exactly this reason.
 - **`engine.status()` is not an audit surface.** Terminal quote records are
   compacted 6h past quote expiry by default, so `status()` returns `None` for a
   payment that completed and settled fine. The durable evidence is the
@@ -132,6 +140,14 @@ they go red (`testing.md`).
   flow the honest answer is still Rust/Python/Node. `@net-mesh/payments` stays a
   reservable re-export name; everything ships in `@net-mesh/core`. See
   `bindings.md`.
+- **Paid A2A is the one exception to that parity, and it is symmetric.** Only
+  **Rust and Python** can serve a paid task catalog (`serve_a2a_configured`)
+  **and** only Rust and Python can buy one (`A2aCallerFlow` /
+  `CapabilityGateway.prepare_task` → `purchase_task` → `submit_task`). Node has
+  neither half — its `submitTask` is the *free* requester verb and there is no
+  paid twin — and Go and C have no A2A at all. State both directions when you
+  answer: "paid serving is deferred in Node" alone reads as though buying
+  works, and it does not. See `a2a.md`.
 - Both Python and Node bind the payment identity to the **node's mesh
   identity** and wire signers under **all three** namespaces — eip155 / solana /
   xrpl, each pair both-or-neither and requiring the policy store. Node's signer

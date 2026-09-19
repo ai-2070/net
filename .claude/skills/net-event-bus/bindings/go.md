@@ -100,7 +100,8 @@ shut down both.
 
 Check `bindings/coverage.md` before promising anything. The three to know:
 
-- **No A2A.** Not partial, not core-only — there is no A2A symbol in the Go
+- **No A2A.** Free or paid, serving or calling: not partial, not core-only
+  — there is no A2A symbol in the Go
   tree at all.
 - **No consumer-side filter DSL.** No predicate surface, no `where` RPC header.
   `CapabilityFilter` in `go/mesh.go` is channel *authorisation*, and

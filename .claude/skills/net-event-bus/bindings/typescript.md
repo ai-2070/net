@@ -117,7 +117,13 @@ running against a shut-down bus.
 ## Gaps
 
 `bindings/coverage.md` is authoritative. The one to know up front: A2A is
-`core-only` here — `serveA2a` is on `@net-mesh/core`, not the wrapper.
+`core-only` here — `serveA2a` is on `@net-mesh/core`, not the wrapper. And it
+is the **free** A2A path only: `submitTask` gained optional `taskId` /
+`service` / `revision`, but those address a catalog's free entries. There is
+no paid A2A on Node in either direction — no `describeA2a`, no
+prepare/purchase pair, no `submitTaskPaid` — so a paid catalog entry refuses
+an uncharged submit with `no_reservation` before the executor runs. Paid
+serving and paid buying are Rust + Python.
 
 ## Where to look when this page is not enough
 
