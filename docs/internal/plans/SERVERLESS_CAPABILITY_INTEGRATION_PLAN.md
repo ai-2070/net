@@ -278,9 +278,15 @@ retention contract and must not be implied by reconnecting a socket.
 
 Acceptance requires the named consumer's real platform path, including slow
 consumers, interruption, late-frame fencing and terminal error propagation.
-Reuse existing mesh-side nRPC streaming semantics where they satisfy that
-contract; do not infer bridge support merely because native streaming exists.
-No streaming work is authorized by recording this deferral.
+**Independent substrate prerequisite:** org-protected streaming is currently
+unsupported in the core, including Rust; public nRPC streaming and its capability
+gate do not supply organization admission. The separate
+[Organization-Scoped Streaming RPC Plan](ORG_SCOPED_STREAMING_PLAN.md) owns that
+protocol gap. An org-scoped streaming adapter requires acceptance of the relevant
+core shape as well as its own platform bridge evidence. Do not bypass the gap
+with public streaming, handwritten org headers or a WebSocket wrapper. Neither
+substrate streaming nor adapter streaming is a prerequisite for this plan's
+unary release, and no streaming work is authorized by recording this deferral.
 
 ## Proposed implementation surfaces
 
