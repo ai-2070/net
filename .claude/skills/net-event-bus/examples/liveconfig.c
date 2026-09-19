@@ -43,6 +43,12 @@ static void seed_hex(char *out, unsigned char b) {
     out[64] = '\0';
 }
 
+/* How many times `build` re-reserves a port after losing the race
+ * between releasing the reservation and the node binding it. Small:
+ * the ephemeral range is large, so a repeated loss means something
+ * is wrong rather than unlucky. */
+#define BIND_ATTEMPTS 8
+
 /* Ask the kernel for a free loopback port and report the address it handed
  * out. A hard-coded port fails the moment it is taken — including when two
  * copies of this example run at once. */
@@ -70,15 +76,25 @@ static int reserve_addr(char *out, size_t out_len) {
  * address a peer connects to come from one place. */
 static int build(unsigned char seed_byte, net_meshnode_t **out, char *addr_out,
                  size_t addr_len) {
-    if (reserve_addr(addr_out, addr_len) != 0) return -1;
     char seed[65];
     seed_hex(seed, seed_byte);
-    char cfg[512];
-    snprintf(cfg, sizeof cfg,
-             "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
-             "\"identity_seed_hex\":\"%s\"}",
-             addr_out, PSK_HEX, seed);
-    return net_mesh_new(cfg, out);
+    /* Reserving a port and then closing it leaves a window: another
+     * process can take it before net_mesh_new binds. The reservation
+     * cannot simply be held, because the node needs to bind the port
+     * itself, and the C ABI exposes no "what did you actually bind"
+     * accessor to read back instead. So the window is closed by
+     * retrying rather than by pretending it is not there — a lost race
+     * yields a different free port on the next attempt. */
+    for (int attempt = 0; attempt < BIND_ATTEMPTS; attempt++) {
+        if (reserve_addr(addr_out, addr_len) != 0) return -1;
+        char cfg[512];
+        snprintf(cfg, sizeof cfg,
+                 "{\"bind_addr\":\"%s\",\"psk_hex\":\"%s\","
+                 "\"identity_seed_hex\":\"%s\"}",
+                 addr_out, PSK_HEX, seed);
+        if (net_mesh_new(cfg, out) == 0) return 0;
+    }
+    return -1;
 }
 
 typedef struct {

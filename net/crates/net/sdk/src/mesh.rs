@@ -791,7 +791,10 @@ impl Mesh {
             if out.len() >= limit {
                 break;
             }
-            let shard = (start + offset) % shards;
+            // One definition of the arithmetic, shared with the Node
+            // binding's `poll` — see `rotating_shard` for why the
+            // obvious `(start + offset) % shards` is wrong in `u16`.
+            let shard = ::net::shard::rotating_shard(start, offset, shards);
             let remaining = limit - out.len();
             let result = self.node.poll_shard(shard, None, remaining).await?;
             out.extend(result.events);

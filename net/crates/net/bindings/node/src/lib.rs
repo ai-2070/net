@@ -1943,7 +1943,11 @@ mod mesh_bindings {
                 if events.len() >= limit as usize {
                     break;
                 }
-                let shard = (start + offset) % shards;
+                // One definition of the arithmetic, shared with the
+                // Rust SDK's `Mesh::recv` — see `rotating_shard` for
+                // why the obvious `(start + offset) % shards` is wrong
+                // in `u16`.
+                let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit as usize - events.len();
                 let result = node
                     .poll_shard(shard, None, remaining)

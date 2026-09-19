@@ -36,9 +36,14 @@ const jobs = 6
 // Job 3 is refused by the first worker that sees it, so the retry is observable.
 const poison = 3
 
-// The wire status rides in the message the binding formats:
-// `server_error: status=0x8001 message=...`.
-var refusalStatus = fmt.Sprintf("status=0x%04x", mesh.NrpcTypedHandlerError)
+// The binding formats a server error as `server_error: status=0x8001
+// message=<body>`, and `parseRpcError` hands us everything after the
+// kind — so the status is the LEADING field of `Message`, and this is
+// a prefix test, not a substring search. A handler whose own message
+// happened to contain `status=0x8001` would otherwise be read as the
+// typed refusal and re-issued, which is the duplicate execution the
+// guard below exists to prevent.
+var refusalStatus = fmt.Sprintf("status=0x%04x ", mesh.NrpcTypedHandlerError)
 
 type job struct {
 	ID int `json:"id"`
@@ -242,7 +247,7 @@ func main() {
 			// Those are fatal here; duplicates=0 is a claim this guard earns.
 			var rpcErr *mesh.RpcError
 			if !errors.As(err, &rpcErr) || rpcErr.Kind != mesh.RpcKindServerError ||
-				!strings.Contains(rpcErr.Message, refusalStatus) {
+				!strings.HasPrefix(rpcErr.Message, refusalStatus) {
 				log.Fatalf("job %d failed on 0x%x, not refused: %v", current.ID, targets[primary], err)
 			}
 			retried++

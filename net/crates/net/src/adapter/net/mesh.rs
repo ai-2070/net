@@ -29730,12 +29730,22 @@ impl MeshNode {
     /// did not complete inside
     /// `MeshNodeConfig::identity_proof_timeout`.
     pub async fn prove_identity_to(&self, verifier_node_id: u64) -> Result<(), AdapterError> {
-        let Some(session_id) = self.peer_session_id(verifier_node_id) else {
-            return Err(AdapterError::Connection(format!(
-                "no session to identity verifier {:#x}",
-                verifier_node_id
-            )));
+        // Read per exchange below, not once here: the retry can span a
+        // reconnect, and a proof signed over the previous incarnation's
+        // id is refused as `BadSignature` — the transcript binds the
+        // session deliberately, so a stale capture turns the recovery
+        // path into a guaranteed failure.
+        let live_session = || {
+            self.peer_session_id(verifier_node_id).ok_or_else(|| {
+                AdapterError::Connection(format!(
+                    "no session to identity verifier {:#x}",
+                    verifier_node_id
+                ))
+            })
         };
+        // Fail fast when there is no session at all, so the caller gets
+        // that answer rather than a challenge timeout.
+        live_session()?;
 
         // Two exchanges at most, and the documented budget covers both:
         // each exchange is two legs, so a leg gets a quarter of it.
@@ -29756,6 +29766,9 @@ impl MeshNode {
 
         let mut last_reject = None;
         for exchange in 0..MAX_EXCHANGES {
+            // The incarnation this exchange signs over, and the one the
+            // memo below is keyed on.
+            let session_id = live_session()?;
             let challenge_reply = self
                 .identity_proof_leg(verifier_node_id, per_leg, attempts, |nonce| {
                     IdentityProofMsg::ChallengeRequest { nonce }
@@ -54108,5 +54121,149 @@ mod identity_readiness_tests {
             IdentityProofReject::PinConflict,
         );
         assert!(!node.peer_identity_established(peer));
+    }
+}
+
+/// Lifecycle invariants that a cubic review pass found broken and that
+/// nothing else pins.
+///
+/// Both properties here are about work the node schedules on the
+/// caller's behalf: one that must happen exactly once, and one that
+/// must be cleaned up even when the caller walks away.
+#[cfg(test)]
+mod lifecycle_regression_tests {
+    use super::*;
+
+    async fn node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x71u8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    /// `start` is documented idempotent, and it spawns the
+    /// direct-upgrade scanner. It used to spawn unconditionally, so
+    /// every repeated call added another detached scan loop to a node
+    /// that started once — upgrade probes multiplying with each call.
+    ///
+    /// The spawn is gated on this predicate, so this is the observable
+    /// that decides it: exactly one call reports the transition.
+    #[tokio::test]
+    async fn only_the_first_start_reports_a_transition() {
+        let node = node().await;
+        assert!(
+            node.start_inner(),
+            "the first start moves the node from stopped to started"
+        );
+        for _ in 0..3 {
+            assert!(
+                !node.start_inner(),
+                "an idempotent re-start must not report a transition — the \
+                 upgrade scanner is spawned on this answer"
+            );
+        }
+    }
+
+    /// A start refused because an `accept()` is mid-handshake has not
+    /// started anything either, so it must not schedule the scanner.
+    /// The refusal path rolls `started` back, which made it easy to
+    /// miss: the node looks stopped afterwards, but the spawn had
+    /// already happened.
+    #[tokio::test]
+    async fn a_start_refused_against_an_inflight_accept_reports_no_transition() {
+        let node = node().await;
+        // Stand in for an accept that is mid-handshake.
+        node.accept_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !node.start_inner(),
+            "a refused start must not report a transition"
+        );
+        assert!(
+            !node.started.load(Ordering::SeqCst),
+            "the refusal rolls the flag back, so a later start can succeed"
+        );
+
+        node.accept_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            node.start_inner(),
+            "once the accept completes, start transitions normally"
+        );
+    }
+
+    /// The identity-proof leg registers a pending nonce and awaits a
+    /// reply. Every await in it is a cancellation point, and the
+    /// removals used to sit on the exit paths — so a caller that
+    /// dropped the future (a `select!`, an outer timeout, a cancelled
+    /// task) left the nonce behind, and a caller that retried grew the
+    /// map without bound.
+    ///
+    /// Dropping the future mid-flight is exactly the case no exit path
+    /// covers, which is why the guard is RAII.
+    #[tokio::test]
+    async fn a_cancelled_identity_proof_leg_leaves_no_pending_entry() {
+        let node = node().await;
+        // A peer the send path can reach. Without one,
+        // `send_subprotocol_to_node` fails immediately and the leg
+        // returns instead of parking — the test would then assert
+        // nothing about cancellation. Nobody is listening at the
+        // address, so no reply ever arrives and the leg waits out its
+        // budget.
+        let peer = 0xDEAD_BEEFu64;
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        node.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct { owned_addr: addr },
+                session: Arc::new(NetSession::new(
+                    crate::adapter::net::crypto::SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: 0x9001,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    addr,
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+            },
+        );
+        // `Box::pin`, not `tokio::pin!`: the latter shadows the future
+        // with a `Pin<&mut _>` borrow, so dropping that name drops the
+        // borrow and leaves the future itself alive to the end of
+        // scope — the test would pass without the guard existing.
+        let mut leg = Box::pin(node.identity_proof_leg(
+            peer,
+            Duration::from_secs(30),
+            1,
+            |nonce| IdentityProofMsg::ChallengeRequest { nonce },
+        ));
+
+        // Poll it once so the pending entry is registered, then drop.
+        let polled = tokio::time::timeout(Duration::from_millis(50), &mut leg).await;
+        assert!(polled.is_err(), "premise: the leg cannot complete here");
+        assert_eq!(
+            node.pending_identity_proofs.len(),
+            1,
+            "premise: the leg registered its nonce"
+        );
+
+        drop(leg);
+        assert!(
+            node.pending_identity_proofs.is_empty(),
+            "a dropped leg must release its nonce — otherwise a cancelled \
+             or retried caller grows this map for the node's lifetime"
+        );
     }
 }

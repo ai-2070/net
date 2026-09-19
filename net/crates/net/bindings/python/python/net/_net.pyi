@@ -3332,6 +3332,12 @@ class AsyncMeshRpc:
         request: bytes,
         opts: Optional[Dict[str, Any]] = None,
     ) -> AsyncRpcStream: ...
+    async def call_service_streaming(
+        self,
+        service: str,
+        request: bytes,
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> AsyncRpcStream: ...
     async def call_client_stream(
         self,
         target_node_id: int,
@@ -3354,6 +3360,12 @@ class AsyncMeshRpc:
         self,
         service: str,
         handler: Callable[..., Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> ServeHandle: ...
+    def serve_streaming(
+        self,
+        service: str,
+        handler: Callable[[bytes, ResponseSinkSend], Any],
         handler_timeout_ms: Optional[int] = None,
     ) -> ServeHandle: ...
 
