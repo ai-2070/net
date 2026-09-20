@@ -62,6 +62,10 @@ use serde::{Deserialize, Serialize};
 use crate::delegation::DelegationChain;
 use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECOMMENDED};
 
+/// Membership-only invitation policy for the V3 enrollment path under construction.
+/// Does not change the legacy delegation-based enrollment APIs in this module.
+pub mod policy;
+
 // Re-export the anchor type so `net_sdk::enrollment` is a complete surface.
 pub use crate::delegation::RevocationRegistry;
 
