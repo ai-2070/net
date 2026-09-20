@@ -2,7 +2,7 @@
 
 `net-mesh` — the unified command-line interface for the NET mesh.
 
-The non-interactive counterpart to [`net-deck`](https://github.com/ai-2070/net/tree/master/net/crates/net/deck): a one-shot tool for operator scripts, CI pipelines, daemon authoring, and ad-hoc cluster inspection. Same SDK underneath, same signed admin chain, no TUI.
+Tools for capability publishers and consumers: host a stdio MCP server on the mesh, connect an MCP client, generate typed contracts, and manage local artifacts and stores. Execution scope depends on the command; mesh attachment does not provide remote Deck administration.
 
 ![net-mesh](https://github.com/ai-2070/net/blob/master/images/net-cli-1.png?raw=true)
 
@@ -27,25 +27,26 @@ The crate is `net-cli` but the binary it installs is **`net-mesh`**. Prebuilt ta
 ## Quick start
 
 ```sh
-# Generate an operator identity (ed25519 seed + pubkey + fingerprint)
+# Generate an identity file; this does not grant remote invocation authority.
 net-mesh identity generate --out ~/.config/net-mesh/identity.toml
 
-# One-shot snapshot of the supervisor this command starts. `--local` is
-# required: it cannot attach to a running deployment, so without the flag it
-# refuses rather than printing an empty snapshot that looks like a live read.
+# Inspect publisher and consumer options before supplying your mesh target.
+net-mesh wrap --help
+net-mesh mcp serve --help
+
+# Offline generation from an existing descriptor snapshot; no mesh required.
+net-mesh typegen generate --language ts --from-snapshot tools.json --out ./generated
+```
+
+`wrap` keeps the publisher subprocess alive and is owner-only by default. Consumers need the configured target and appropriate permission; an identity or successful handshake alone is not permission. Live typegen currently uses inline schemas and does not fetch oversized metadata. These examples are entry points, not an accepted cross-computer deployment recipe.
+
+### Temporary-supervisor development commands
+
+**Starts a temporary supervisor for this command; does not inspect a running node.** This applies to admin/ICE, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection. `snapshot` already requires explicit `--local`; sibling commands do not yet have that safety gate. Admin `--dry-run` is an offline preview. Gateway export is unsupported.
+
+```sh
 net-mesh snapshot get --local
-# ...or just the peer / daemon counts and health rollup
 net-mesh snapshot status --local
-
-# Tail substrate logs as ndjson, follow mode, filtered to one daemon
-net-mesh log tail --daemon 0x000007 --follow --output ndjson
-
-# Signed admin commit — drain a node, propagated on the admin chain via RedEX
-net-mesh admin drain 0x1a2b --drain-for 10m
-
-# Break-glass ICE — print the blast radius first, commit only when it looks right
-net-mesh ice force-restart-daemon 0x000007 --name indexer --dry-run
-net-mesh ice force-restart-daemon 0x000007 --name indexer
 ```
 
 Upgrading? [CHANGELOG.md](CHANGELOG.md) records what an operator or a CI
@@ -58,23 +59,23 @@ script has to do differently — 0.35 makes `--local` mandatory on both
 |---------------|---------------------------------------------------------------------------------|
 | `version`     | SDK version + build metadata.                                                   |
 | `identity`    | Generate / inspect / fingerprint operator identity files.                       |
-| `admin`       | Signed admin-chain commits — drain, cordon, maintenance, drop-replicas, etc.    |
-| `ice`         | Break-glass ICE — simulate then commit freeze-cluster / thaw-cluster / flush-avoid-lists / force-evict-replica / force-restart-daemon / force-cutover / kill-migration. |
+| `admin`       | Offline previews or signed commits against a temporary supervisor. |
+| `ice`         | Simulate/commit break-glass operations against a temporary supervisor. |
 | `snapshot`    | One-shot substrate reads, both requiring `--local`: `get` prints the `MeshOsSnapshot`; `status` prints the typed `StatusSummary`. |
-| `audit`       | Read-only queries against the RedEX-committed audit ledger.                     |
+| `audit`       | Read/stream the temporary supervisor's audit ring. |
 | `log tail`    | Substrate log stream (`--follow`, `--daemon`, `--min-level`).                   |
 | `failures tail` | Substrate failure stream — same shape as `log tail`.                          |
-| `cap`         | Capability advertisement + discovery.                                           |
-| `peer`        | Peer + NAT-traversal helpers (`peer ls` today; reflex/NAT in Phase 2).          |
+| `cap`         | Temporary snapshot reads; `announce` authors a signed artifact offline, not a broadcast. |
+| `peer`        | `ls` reads the temporary snapshot; no NAT-management verbs. |
 | `daemon`      | Per-daemon listing from the local snapshot.                                     |
 | `netdb`       | NetDB local KV adapter — Cortex-backed tasks + memories.                        |
 | `org`         | Organization root authority authoring (keygen / issue-cert / issue-floors).     |
 | `node`        | Node ownership provisioning (`adopt`).                                          |
-| `subnet`      | Hierarchical subnet inspection (`show`, `ls`, `tree`).                          |
-| `gateway`     | `SubnetGateway` stats + export-table operator surface.                          |
+| `subnet`      | Temporary topology reads; offline authority issuance and decode-only inspection. |
+| `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
 | `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
-| `aggregator`  | `AggregatorDaemon` inspection + remote query.                                   |
-| `transfer`    | Blob + directory transfer (`recv-blob` / `send-blob` / `recv-dir` / `send-dir` / `ls` / `status` / `cancel`). |
+| `aggregator`  | Temporary inspect/default list; remote query, spawn, scale, and explicitly remote list. |
+| `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
 | `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
 | `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
 | `forwarding`  | Caller-side credential/header forwarding policy + audit (deny-by-default).      |
@@ -93,11 +94,13 @@ Applied to every subcommand; environment-variable fallbacks in brackets:
 - `--quiet` / `-q` — suppress stderr diagnostics.
 - `--verbose` / `-v` — `-v` info, `-vv` debug, `-vvv` trace. `NET_MESH_LOG=` env-filter overrides.
 - `--no-color` `[NO_COLOR]` — disable ANSI in table / text output.
-- `--timeout <dur>` — global per-call timeout (e.g. `500ms`, `1h30m`). Default `30s`.
+- `--timeout <dur>` — parsed duration (e.g. `500ms`, `1h30m`; default `30s`), currently not forwarded by dispatch. It is not an enforced universal deadline.
+
+Errors are plain `net-mesh: ...` messages on stderr. ICE may emit separate preview and commit JSON values; do not assume all commands have single-value framing. ICE still requires typed `YES` on interactive stdin even with `--yes`; dry-run needs no confirmation. `mcp serve` stdout is protocol traffic.
 
 ## Config + identity
 
-The profile file is optional — every flag has a sensible default. When present, it lives at `$XDG_CONFIG_HOME/net-mesh/config.toml` (or the platform equivalent) and looks like:
+The default profile file is optional. Remote commands still need a complete target and credentials. The file lives at `$XDG_CONFIG_HOME/net-mesh/config.toml` (or the platform equivalent):
 
 ```toml
 [default]
@@ -108,6 +111,7 @@ default_timeout_ms = 30000
 [profiles.prod]
 identity   = "~/.config/net-mesh/ops-identity.toml"
 node_addr  = "10.0.0.4:7700"
+node_id    = 4
 node_pubkey = "abcd…"      # 64 hex
 psk_hex     = "1234…"      # 64 hex
 ```
@@ -127,9 +131,9 @@ Typed via `ExitCodeKind`. Scripts can match on the discriminator:
 - `6` — connection failure
 - `7` — timeout
 - `8` — confirmation refused
-- `10` — `daemon`: factory id not registered
-- `11` — `db`: query JSON failed to parse
-- `12` — `db`: predicate DSL (`--where` / `--filter`) failed to parse
+- `10` — reserved daemon-factory error
+- `11` — reserved MeshDB query parse error
+- `12` — reserved predicate parse error
 - `13` — `ice`: a supplied operator signature failed verification
 - `14` — `typegen diff --exit-code`: a breaking schema change was detected
 

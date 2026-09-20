@@ -4,126 +4,97 @@ description: "The net-mesh binary exposes the substrate's operator surface."
 ---
 # CLI Reference
 
-The `net-mesh` binary exposes the substrate's operator surface. Its command groups include `daemon` (run stateful daemons), `transfer` (move blobs and directories between nodes), `wrap` and `mcp` (the MCP bridge — wrap a stdio MCP server as mesh capabilities, or serve the mesh to a local MCP host), `forwarding` (credential-forwarding config), `typegen` (generate typed bindings from discovered AI tools), and `org` plus `node adopt` (organization capability-auth issuance and node ownership).
+The `net-mesh` binary provides capability hosting/consumption, typed contract generation, local stores, and offline authority tools. `wrap` hosts a stdio MCP server as mesh capabilities; `mcp serve` bridges mesh capabilities to a local MCP client. `daemon` only lists a temporary snapshot: there is no `daemon run` command.
 
 The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.
 
-Most commands operate against a live `MeshNode` resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Pass `--node-addr <ip:port> --node-pubkey <hex>` to target a remote daemon, or omit them to connect to the local node started by the surrounding environment. The `org` group is the exception: it authors signed files offline and never touches a node.
+Execution scope is command-specific. Identity/org/subnet issuance, capability announcement artifacts, and saved typegen input are offline. NetDB, MCP pins, forwarding policy, and staged transfers use local persistent files. Transfer receive/admin, live typegen, and remote aggregator operations use explicit mesh attachment; mesh attachment does not make the Deck client remote.
+
+For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection: **Starts a temporary supervisor for this command; does not inspect a running node.** Snapshot requires `--local`; the other families do not yet require that opt-in. Admin `--dry-run` is an offline preview. Gateway export is unsupported. Profile `endpoint` accepts only `in-process`; omitting remote flags does not attach these commands to an existing deployment. Profile remote fields alone currently do not select remote `aggregator ls`; use `--remote`.
+
+Global `--timeout` is currently parsed but not forwarded by dispatch: it does not enforce a universal deadline. One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE can emit separate preview and commit JSON values and still prompts for typed `YES` on interactive stdin even with `--yes`. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
 
 `--no-color` is global. `$NO_COLOR` is honored per [the convention](https://no-color.org): color is disabled when the variable is **present and non-empty**, whatever its value — `NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it, and only absent or empty leaves it on.
 
 ## `net-mesh transfer`
 
-Six subcommands for blob and directory transport. All progress is rendered as a determinate byte-progress bar for sized fetches and a spinner for unknown sizes; pass `--quiet` to suppress.
+Seven verbs. Receive and administration commands create a mesh client and require a remote target: `--node-addr <IP:PORT> --node-pubkey <HEX> --node-id <N> --psk-hex <HEX>`, with corresponding profile defaults supported. `--from <NODE>` selects a content holder other than the handshaken target; it is not a relay flag. `--node` names the temporary local supervisor, not the remote provider.
+
+Progress appears on stderr only for human output with an interactive stderr; `--quiet` suppresses it. Sized blob fetches use a byte bar, unknown-size fetches and directory fetches use a spinner. Use global `--output json` for structured results.
 
 ### `recv-blob`
 
-Fetch a single blob from a peer and stream it to disk.
+Fetch verified chunks into a file:
 
+```sh
+net-mesh transfer recv-blob --blob-ref <REF> --out <PATH> [--from <NODE>] [REMOTE FLAGS]
 ```
-net-mesh transfer recv-blob <SOURCE> <REF> --out <PATH> [OPTIONS]
-```
 
-| Argument | Description |
-|---|---|
-| `<SOURCE>` | Node ID of the holder (decimal or hex) |
-| `<REF>` | `BlobRef` to fetch (encoded string) |
-| `--out <PATH>` | Destination file path |
-| `--via <RELAY>` | Optional relay node ID for indirect transfer |
-| `--quiet` | Suppress progress output |
-
-The blob streams chunk-at-a-time through an atomic-rename writer: the destination either becomes the complete file on success, or stays untouched on failure (a `<PATH>.partial` remains for inspection). Peak memory is one chunk (~4 MiB) regardless of total size.
-
-Exit codes follow the global table below: `0` on success, `2` for a malformed source/ref, and `3` for a transfer/SDK failure — the fetch yields already-verified chunks, so a fetch error, an integrity mismatch, and a disk-write failure all surface as an SDK error (code `3`), not separate codes.
+Writes go to `<PATH>.partial`, then flush/close and rename to the final path. A failed fetch leaves the previous final file untouched and may leave the partial file for inspection. Local I/O failures and SDK failures need not have the same exit code.
 
 ### `send-blob`
 
-Chunk a file (or stdin), optionally persist each chunk to the local Dataforts adapter, and print the resulting `BlobRef`.
+Compute a reference, optionally staging bytes in a local persistent store:
 
+```sh
+net-mesh transfer send-blob <PATH> [--store <DIR>]
 ```
-net-mesh transfer send-blob <PATH> [--store] [OPTIONS]
-```
 
-| Argument | Description |
-|---|---|
-| `<PATH>` | Source file path, or `-` for stdin |
-| `--store` | Persist each chunk locally as it's hashed (default: compute ref only) |
-| `--uri <URI>` | URI to associate with the blob (default: derived from path) |
-| `--encoding <ENC>` | Encoding hint (default: `application/octet-stream`) |
+Use `-` for stdin. Without `--store`, no content is persisted. With it, chunks are written locally as they are hashed. The process exits: it neither pushes to a peer nor keeps a holder serving that directory. Another running holder is required for remote retrieval.
 
-Without `--store`, the command hashes the source and prints the `BlobRef` without persisting bytes — useful for computing references in dry-run mode or for content-addressed deduplication checks. With `--store`, each chunk is written through `store_blob_reader` as it's read, so peak memory is one chunk regardless of source size.
-
-Standard output is the `BlobRef` followed by a JSON metadata line describing chunk count and total size. Redirect stdout to pipe the ref into another command.
+In JSON mode stdout is one object containing `blob_ref`, `hash`, `size`, `chunks`, and optional `staged_to` metadata, not a bare reference followed by another JSON line. Extract `blob_ref` with a JSON parser.
 
 ### `recv-dir`
 
-Materialize a directory tree atomically from a manifest blob.
+Materialize a directory from its manifest:
 
+```sh
+net-mesh transfer recv-dir --remote-ref <REF> --out <PATH> [--from <NODE>] [--concurrency <N>] [REMOTE FLAGS]
 ```
-net-mesh transfer recv-dir <SOURCE> <ROOT-REF> --dest <PATH> [OPTIONS]
-```
 
-| Argument | Description |
-|---|---|
-| `<SOURCE>` | Node ID of the holder |
-| `<ROOT-REF>` | `BlobRef` of the root manifest |
-| `--dest <PATH>` | Destination directory path |
-| `--inflight-budget-bytes <BYTES>` | Aggregate in-flight cap across leaves (default: 256 MiB) |
-| `--quiet` | Suppress progress output |
-
-The destination either becomes the complete tree (success) or stays exactly as it was before the call (failure). The runtime writes the entire tree into a sibling temp path on the same filesystem, then renames into place once every file, directory, and symlink has materialized successfully.
-
-Large leaves stream to disk via the same chunk-at-a-time path as `recv-blob`; the inflight-budget caps aggregate concurrency across small leaves.
+The SDK builds a temporary directory and renames it into place on success. `--concurrency 0` selects the SDK default. There is no `--dest` or `--inflight-budget-bytes` CLI option.
 
 ### `send-dir`
 
-Walk a local directory, hash every entry, and print the root manifest's `BlobRef`.
+Compute a manifest reference, optionally staging the manifest and content locally:
 
+```sh
+net-mesh transfer send-dir <PATH> [--store <DIR>]
 ```
-net-mesh transfer send-dir <PATH> [--store] [OPTIONS]
-```
 
-| Argument | Description |
-|---|---|
-| `<PATH>` | Source directory path |
-| `--store` | Persist every chunk locally as it's hashed |
-| `--exclude <GLOB>` | Skip entries matching a glob pattern (repeatable) |
-
-The directory walk follows standard symlink and hidden-file conventions. With `--store`, the command publishes every chunk and the manifest blob to the local adapter; without, it computes and prints the ref tree without persistence.
+This is local preparation, not publication or hosting. There is no `--exclude` option. JSON output contains `remote_ref`, `manifest_size`, and optional `staged_to`.
 
 ### `ls`
 
-List in-flight transfers on the local node.
+List the remote target's requester-side pending fetches, not transfers it is serving or a completed-transfer history:
 
+```sh
+net-mesh transfer ls --output json [REMOTE FLAGS]
 ```
-net-mesh transfer ls [--json]
-```
-
-Output columns: transfer ID, direction (recv/send), source/destination node, content ref, bytes transferred, total bytes (if known), state (running / paused / completed / failed). Pass `--json` for machine-readable output.
 
 ### `status`
 
-Inspect a single transfer by ID.
+Inspect a requester-side transfer on the target:
 
-```
-net-mesh transfer status <TRANSFER-ID>
+```sh
+net-mesh transfer status <TRANSFER-ID> [REMOTE FLAGS]
 ```
 
-Returns the same fields as `ls` plus per-chunk progress, average throughput, and the most recent error (if any).
+An unknown ID reports `found: false` with exit 0. Do not assume throughput/history fields.
 
 ### `cancel`
 
-Abort an in-flight transfer.
+Request cancellation on the target:
 
-```
-net-mesh transfer cancel <TRANSFER-ID>
+```sh
+net-mesh transfer cancel <TRANSFER-ID> [REMOTE FLAGS]
 ```
 
-The substrate sends a CANCEL signal, the in-flight stream is torn down, and any `.partial` file is left in place for inspection. The transfer ID stays in `ls` output as `cancelled` until it's pruned by the next reaping cycle.
+The response reports whether cancellation occurred. `cancelled: false` is a successful query outcome, not an error exit; this command does not promise retention in a transfer history.
 
 ## `net-mesh typegen`
 
-Code generation from discovered AI tool descriptors. The command walks the local node's capability fold for `ai-tool:*` tags, fetches each matching descriptor's metadata via `tool.metadata.fetch`, and emits typed bindings in the requested language.
+Code generation from live-discovered tool descriptors or a saved snapshot. The current live path uses inline schemas; it does not fetch oversized metadata through `tool.metadata.fetch`. Generation skips missing inline input schemas and unsupported schemas with diagnostics. A successful generation is not proof that every requested tool was captured.
 
 ### `generate`
 
@@ -140,16 +111,16 @@ net-mesh typegen generate --language <LANG> [--out <PATH>] [SELECTOR]
 | `--tag <TAG>` | Repeatable — include a tool if *any* of its tags match (e.g. `--tag weather --tag location`) |
 | `--tool <TOOL_ID>` | Repeatable — include a tool by exact id (e.g. `--tool acme/web-search`) |
 | `--from-snapshot <PATH>` | Regenerate from a saved snapshot instead of querying the mesh |
-| `--node <ID>` | Query a specific node's fold instead of the default supervisor |
+| `--node <ID>` | Local supervisor node label, not remote provider selection |
 
-Selectors (`--tag`, `--tool`) compose: tools matching *any* `--tag` OR *any* `--tool` are emitted. With neither selector, every discovered tool is emitted. Live discovery also takes the remote-attach flags (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`), each defaultable in the profile; `--from-snapshot` needs none of them.
+Selectors match ANY within tags and ANY within tool IDs, but both groups must match when both are supplied. With neither, all observed descriptors are selected, subject to supported schemas. Live discovery takes remote-attach flags (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`), each defaultable in the profile; `--from-snapshot` needs none. Live observation currently stops at the first nonempty unfiltered tool list or five seconds, then filters: it is not a complete inventory or a wait for all requested IDs.
 
 Output is one module per tool. The tool's JSON Schema lowers to TypeScript interfaces (for `ts`) or Pydantic v2 models (for `python`); each module also exports:
 
 - A typed call helper: `callAcmeWebSearch(mesh, request)` for TS, `call_acme_web_search(mesh, request)` for Python.
 - A `…Meta` constant carrying the descriptor metadata: tool id, version, description, streaming flag, stateless flag, estimated time, tags.
 
-TypeScript output ships as `.ts` files and assumes `@net-mesh/core` is available at runtime. Python output ships as `.py` modules plus `.pyi` stubs and assumes `net-mesh` is installed.
+TypeScript output includes per-tool `.ts` modules, an index, and `meta.json`; its call helpers use a structural client interface, without importing a runtime SDK package. Python output includes models, `.pyi` stubs, call helpers, package initializers, and `_meta.json`; models require Pydantic v2 and helpers accept a structural client protocol.
 
 ### `snapshot`
 
@@ -173,7 +144,7 @@ Output lists added tools, removed tools, version bumps, and schema deltas (added
 
 ## `net-mesh org`
 
-Offline authoring of organization capability-auth credentials against an org root key. Unlike every other group on this page, these commands are ceremonies over files — they need no live node, and none of them connects to the mesh. The conceptual model is in [Organizations](/docs/concepts/organizations); the end-to-end flow is in [Private capabilities](/docs/guides/private-capabilities).
+Offline authoring of organization capability-auth credentials against an org root key. These commands are ceremonies over files: they need no live node and do not connect to the mesh. The conceptual model is in [Organizations](/docs/concepts/organizations); the end-to-end flow is in [Private capabilities](/docs/guides/private-capabilities).
 
 ### `keygen`
 
@@ -239,7 +210,7 @@ Three behaviors of these two commands surprise people:
 
 ## `net-mesh subnet`
 
-Two unrelated groups share this verb. `show`, `ls`, and `tree` inspect a live node's *topology* view (where traffic propagates). Everything below authors subnet *authority* — the signed credentials and control facts that gate protected attachment, routing, and export. Like `net-mesh org`, these are offline ceremonies over files: no node, no mesh, no network. Every signed artifact is written as its framed **canonical wire bytes** (the exact form `install`/`apply` on a node consumes), never a JSON mirror.
+`show`, `ls`, and `tree` read a temporary supervisor's topology view. **Starts a temporary supervisor for this command; does not inspect a running node.** The issuance commands below author subnet authority offline: signed credentials and control facts for protected attachment, routing, and export. Signed artifacts use framed **canonical wire bytes**, not a JSON mirror. `inspect` decodes an artifact; it does not verify its signature.
 
 ### `keygen`
 
@@ -278,7 +249,7 @@ net-mesh subnet issue-delegated --issuer-grant <PATH> --issuer-key <PATH> --subj
 `issue-delegated` writes **one complete framed credential set** containing both the issuer grant and the leaf. A leaf scope escaping the issuer scope or rights exceeding the issuer maximum are refused up front with the core's own predicates — and re-checked by every verifier regardless.
 
 :::caution[Issuance validates structure and attenuation, not root authenticity]
-`issue-delegated` checks that the leaf stays inside the issuer grant it was handed. It does **not** verify that issuer grant's signature against an authority root — this is an offline ceremony and no trusted root is supplied to it. A forged or corrupted `--issuer-grant` therefore frames cleanly and produces a credential set that **every node will reject**. Successful issuance is not proof of deployability. Verify an artifact before distributing it with `net-mesh subnet inspect`, and confirm the authority id is the one you expect.
+`issue-delegated` checks that the leaf stays inside the issuer grant it was handed. It does **not** verify that grant's signature against a trusted authority root. Successful issuance is not proof of deployability. `net-mesh subnet inspect` lets you inspect decoded fields and authority IDs, but cannot authenticate them; signature verification against the trusted authority is a separate requirement.
 :::
 
 ### `issue-control-fact`
@@ -331,10 +302,10 @@ Across all `net-mesh` subcommands:
 | `6` | Connection failure (no holder, unreachable peer, session refused) |
 | `7` | Timeout |
 | `8` | Confirmation refused (a required confirmation was declined) |
-| `10` | `net-mesh daemon`: factory id not registered |
-| `11` | `net-mesh db`: query JSON failed to parse |
-| `12` | `net-mesh db`: predicate DSL (`--where` / `--filter`) failed to parse |
+| `10` | Reserved daemon-factory error |
+| `11` | Reserved MeshDB query parse error |
+| `12` | Reserved predicate parse error |
 | `13` | `net-mesh ice`: an operator signature failed cryptographic verification |
 | `14` | `net-mesh typegen diff --exit-code`: a BREAKING change was detected |
 
-Subcommands may attach a JSON `{"error": …, "detail": …}` line to stderr alongside the human-readable message; tools that script against the CLI should prefer the JSON line.
+Errors are plain `net-mesh: ...` messages on stderr, not a JSON error-envelope contract. Use exit codes for failure handling.
