@@ -1927,7 +1927,7 @@ fn read_object_security_handle(
 /// path-based [`validate_audience_file_acl`] leaves open. Same verdict logic
 /// ([`validate_audience_acl_view`]); only the acquisition differs.
 #[cfg(windows)]
-fn validate_audience_file_acl_handle(
+pub(crate) fn validate_audience_file_acl_handle(
     file: &std::fs::File,
     path: &Path,
 ) -> Result<(), OrgAuthorityError> {
@@ -1992,7 +1992,7 @@ fn create_missing_components_0700(dir: &Path) -> std::io::Result<()> {
 ///
 /// The returned path is the one EVERY subsequent step (prevalidation, creation,
 /// postvalidation, lock acquisition, file operations) must use.
-fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
     let base = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -2040,7 +2040,7 @@ fn normalize_authority_dir(dir: &Path) -> std::io::Result<PathBuf> {
 ///   fails closed unless every write-capable ACE grants only a trusted
 ///   principal. The user account, SYSTEM, and local administrators are trusted
 ///   principals.
-fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
+pub(crate) fn ensure_secure_authority_dir(dir: &Path) -> Result<(), OrgAuthorityError> {
     let io = |e: std::io::Error| OrgAuthorityError::Io {
         path: dir.display().to_string(),
         reason: format!("authority directory: {e}"),

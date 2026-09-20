@@ -1092,7 +1092,7 @@ impl BackingId {
 /// crate in this workspace — so we declare the one call we need directly, the
 /// same hand-rolled `extern "system"` idiom the crate already uses elsewhere.
 #[cfg(windows)]
-fn windows_file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64, u32)> {
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64, u32)> {
     use std::os::windows::io::AsRawHandle;
 
     // `BY_HANDLE_FILE_INFORMATION`; `FILETIME` is two `DWORD`s. `#[repr(C)]`

@@ -5110,10 +5110,10 @@ jobs:
       #     pinned to a step" guard in the integration job exists to prevent.
       #     That guard was never applied to its own neighbour. `--no-tests=fail`
       #     closes it natively: an empty filterset is an error, not a pass.
-      - name: Org + authority unit tests
+      - name: Org + authority + enrollment storage unit tests
         run: >
           cargo nextest run --features net --lib --no-tests=fail
-          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
+          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/) + test(/^adapter::net::behavior::enrollment_storage::/)'
 
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
