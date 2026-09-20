@@ -1,0 +1,24 @@
+.claude/skills/README.md
+  h_64425bc75e3f3d 102
+.claude/skills/net-event-bus/SKILL.md
+  h_64425bc75e3f3d 6-7,44,87
+.claude/skills/net-event-bus/cli.md
+  h_64425bc75e3f3d 3,7,9,12-17,20,22,24,26,28-34,36,38,40,42,44-48,51-54,56,58,60-67,69-71,73,75-87,89-100,103-234,236-237,240-255,259,263-268,272-277,281,283,285,289-294,298-302,304,306,308,315-317,321-323
+.claude/skills/net-event-bus/dataforts.md
+  h_64425bc75e3f3d 286,290-294,296
+.claude/skills/net-event-bus/nrpc.md
+  h_64425bc75e3f3d 543
+net/crates/net/cli/README.md
+  h_64425bc75e3f3d 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e19c3cda822834ae93cc57654e709775f71264b5",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
