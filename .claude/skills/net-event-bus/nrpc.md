@@ -540,7 +540,7 @@ Output is one module per tool: the tool's JSON Schema lowers to TypeScript inter
 | `net-mesh typegen snapshot --tag weather --out <file>` | capture currently-discoverable descriptors into a versioned snapshot |
 | `net-mesh typegen diff --from <a> --to <b> [--exit-code]` | added/removed tools + schema deltas; `--exit-code` exits 14 on a BREAKING change (CI gate) |
 
-The actual flags are singular-and-repeatable (`--tag`, `--tool`) and `diff` takes `--from` / `--to`, **not** positional args. Ships behind the `cli` feature flag. Source: `cli/src/commands/typegen/`. **Full `generate` / `snapshot` / `diff` flag surface + exit codes: `cli.md`.**
+The actual flags are singular-and-repeatable (`--tag`, `--tool`), the two selector groups **intersect** when both are given, and `diff` takes `--from` / `--to`, **not** positional args. Live discovery waits up to 5 s for every explicit `--tool` ID and hydrates missing schemas from the exact advertising provider; missing/unusable input refuses before output. The command ships in the separate **`net-cli` crate** (binary `net-mesh`), not behind a core feature flag. Source: `net/crates/net/cli/src/commands/typegen/`. **Full `generate` / `snapshot` / `diff` flag surface + exit codes: `cli.md`.**
 
 ---
 

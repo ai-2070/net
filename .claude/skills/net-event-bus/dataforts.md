@@ -283,17 +283,17 @@ files, n = _net.fetch_dir(mesh, source_id, manifest_ref, "/dest")
 
 ### Operator CLI — `net-mesh transfer`
 
-When a `MeshNode` is reachable through the standard `CliContext`, the operator CLI (`net-mesh` binary) moves blobs without writing code:
+The `net-mesh` CLI (crate `net-cli`) moves blobs without writing code. **Receive and administration verbs are mesh clients**: they require an explicit remote attach (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`, each defaultable from the profile). Send verbs are local.
 
 | Command | Does |
 |---|---|
-| `net-mesh transfer send-blob <path> [--store]` | chunk a file (or stdin via `-`), optionally persist each chunk, print the `BlobRef` hex |
-| `net-mesh transfer recv-blob <source> <ref> --out <path>` | fetch one blob from a peer, stream to disk (temp-and-rename) |
-| `net-mesh transfer send-dir <path>` | walk + hash a directory, print the root manifest `BlobRef` hex |
-| `net-mesh transfer recv-dir <source> <root-ref> --dest <path>` | materialize a directory tree **atomically** |
-| `net-mesh transfer ls` / `status <id>` / `cancel <id>` | list / inspect / abort in-flight transfers |
+| `net-mesh transfer send-blob <path\|-> [--store <dir>]` | chunk a file (or stdin via `-`), optionally stage chunks locally, print the `BlobRef` hex |
+| `net-mesh transfer recv-blob --blob-ref <ref> --out <path> [--from <node>] [REMOTE FLAGS]` | fetch one blob from a peer, stream to disk (temp-and-rename) |
+| `net-mesh transfer send-dir <path> [--store <dir>]` | walk + hash a directory, print the root manifest `BlobRef` hex |
+| `net-mesh transfer recv-dir --remote-ref <ref> --out <path> [--from <node>] [--concurrency N] [REMOTE FLAGS]` | materialize a directory tree **atomically** |
+| `net-mesh transfer ls` / `status <id>` / `cancel <id>` `[REMOTE FLAGS]` | query the **target's requester-side in-flight fetches** (what it is fetching), not a completed-transfer history |
 
-The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to stdout) and render a determinate byte-progress bar for sized fetches. They ship behind the `cli` feature flag. **Full flag surface, atomic-write / exit-code semantics, and scripting notes: `cli.md`.**
+`--from <node>` selects a content holder other than the handshaken target; it is not a relay flag. `send-*` **stages** bytes locally (with `--store`) for a separately running holder to serve — it does not push, host, or publish. Sized fetches render a determinate byte-progress bar on stderr. **Full flag surface, staging-vs-hosting semantics, atomic-write behavior, exit codes, and scripting notes: `cli.md`.**
 
 ---
 
