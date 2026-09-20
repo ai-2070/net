@@ -8,6 +8,14 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — MCP startup budget
+
+- `mcp serve --timeout` bounds configuration, identity loading and mesh
+  attachment. After startup, it continues serving until stdin closes or the
+  operator stops it; the startup budget is not a session lifetime limit.
+- Startup expiry exits 7 with no protocol stdout. `--output json` still does
+  not add status/result envelopes to MCP JSON-RPC traffic.
+
 ## Unreleased — blob receive acquisition budgets
 
 - `transfer recv-blob --timeout` bounds configuration, attachment and network

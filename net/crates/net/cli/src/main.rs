@@ -125,7 +125,7 @@ struct Cli {
 
     /// Total budget for remote aggregator ls/query/spawn/scale, transfer
     /// ls/status/cancel, recv-blob network acquisition, and live typegen
-    /// acquisition (not output writes).
+    /// acquisition (not output writes), plus mcp serve startup (not lifetime).
     /// Unsupported combinations fail before execution.
     /// Omitting this retains the command's existing limits.
     #[arg(long, global = true, value_parser = humantime::parse_duration)]
@@ -301,16 +301,19 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
                 a.from_snapshot.is_none() && !a.attach.inspect_target
             }
             Command::Typegen(TypegenCommand::Snapshot(a)) => !a.attach.inspect_target,
+            Command::Mcp(commands::mcp::McpCommand::Serve(a)) => !a.remote.inspect_target,
             _ => false,
         };
         if !supported {
-            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel/recv-blob and live typegen acquisition. Remove --timeout to use the command's existing limits"));
+            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel/recv-blob, live typegen acquisition and mcp serve startup. Remove --timeout to use the command's existing limits"));
         }
         let deadline = deadline::Deadline::after(timeout)?;
         // These commands bound acquisition internally without cancelling writes.
         if matches!(
             &cli.command,
-            Command::Typegen(_) | Command::Transfer(TransferCommand::RecvBlob(_))
+            Command::Typegen(_)
+                | Command::Transfer(TransferCommand::RecvBlob(_))
+                | Command::Mcp(commands::mcp::McpCommand::Serve(_))
         ) {
             return Box::pin(dispatch_inner(cli, Some(deadline))).await;
         }
@@ -375,7 +378,16 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
             .await
         }
         Command::Wrap(args) => commands::wrap::run(args, output, config_path, profile).await,
-        Command::Mcp(cmd) => commands::mcp::run(cmd, output, config_path, profile).await,
+        Command::Mcp(cmd) => {
+            Box::pin(commands::mcp::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                deadline,
+            ))
+            .await
+        }
         Command::Forwarding(cmd) => {
             commands::forwarding::run(cmd, output, config_path, profile).await
         }

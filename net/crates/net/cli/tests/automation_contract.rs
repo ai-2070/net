@@ -69,7 +69,7 @@ fn unsupported_timeouts_refuse_before_local_effects() {
         vec!["audit", "stream", "--local"],
         vec!["aggregator", "ls", "--local"],
         vec!["aggregator", "ls", "--inspect-target"],
-        vec!["mcp", "serve"],
+        vec!["mcp", "serve", "--inspect-target"],
         vec!["transfer", "ls", "--inspect-target"],
         vec![
             "transfer",
@@ -290,6 +290,140 @@ fn aggregator_timeout_is_exit_seven_without_success_or_zero_budget_packets() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("does not prove cancellation"));
     assert!(!stderr.contains(&key));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_startup_budget_does_not_limit_protocol_lifetime() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let holder = net_sdk::MeshBuilder::new("127.0.0.1:0", &[0x42; 32])
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    holder.start();
+    let dir = fixture();
+    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"))
+        .env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .arg("--config")
+        .arg(dir.path().join("config.toml"))
+        .args([
+            "--output",
+            "json",
+            "--timeout",
+            "2s",
+            "mcp",
+            "serve",
+            "--identity",
+        ])
+        .arg(dir.path().join("operator.toml"))
+        .arg("--pin-store")
+        .arg(dir.path().join("pins.json"))
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--node-addr",
+            &holder.local_addr().to_string(),
+            "--node-id",
+            &holder.node_id().to_string(),
+            "--node-pubkey",
+            &hex::encode(holder.public_key()),
+            "--psk-hex",
+            &"42".repeat(32),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"deadline-test\",\"version\":\"1\"}}}\n").await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let first: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["id"], 1);
+    assert!(first.get("result").is_some(), "{first}");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "startup deadline killed the running service"
+    );
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n").await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let second: Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(second["id"], 2);
+    assert!(second.get("result").is_some(), "{second}");
+    drop(stdin);
+    let result = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        lines.next_line().await.unwrap().is_none(),
+        "unexpected non-protocol stdout"
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(&"42".repeat(32)));
+}
+
+#[test]
+fn mcp_startup_expiry_emits_no_protocol_payload() {
+    let dir = fixture();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let key = "42".repeat(32);
+    let identity = dir.path().join("operator.toml");
+    for budget in ["0s", "200ms"] {
+        let out = run(
+            dir.path(),
+            &[
+                "mcp",
+                "serve",
+                "--identity",
+                identity.to_str().unwrap(),
+                "--node-addr",
+                &addr,
+                "--node-id",
+                "9",
+                "--node-pubkey",
+                &key,
+                "--psk-hex",
+                &key,
+                "--bind",
+                "127.0.0.1:0",
+                "--timeout",
+                budget,
+            ],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(&key));
+        if budget == "0s" {
+            assert_eq!(
+                socket.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 }
 
 #[test]

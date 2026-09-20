@@ -121,12 +121,15 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     match cmd {
         // Ordinary `serve` ignores `output`: stdout is MCP JSON-RPC traffic.
         // Explicit inspection exits before protocol startup and, like `pin`,
         // uses the ordinary one-shot output pipeline.
-        McpCommand::Serve(args) => run_serve(args, output, config_path, profile_name).await,
+        McpCommand::Serve(args) => {
+            run_serve(args, output, config_path, profile_name, deadline).await
+        }
         McpCommand::Pin(cmd) => run_pin(cmd, output, config_path, profile_name).await,
     }
 }
@@ -136,8 +139,10 @@ async fn run_serve(
     output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let profile = resolve_profile(config_path, profile_name).await?;
+    let profile =
+        crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
 
     // A mesh peer to join — the running node this shim reads capabilities from
     // and routes invocations through. Without one there is nothing to serve.
@@ -159,39 +164,45 @@ async fn run_serve(
         .emit(output);
     }
 
-    // Operator identity — the shim's origin (and thus which owner-scoped tools
-    // admit it) derives from it.
-    let identity_path = args
-        .identity
-        .as_deref()
-        .or(profile.identity.as_deref())
-        .ok_or_else(|| {
-            invalid_args(
-                "net-mesh mcp serve needs an operator identity: pass --identity <PATH> or set \
+    let (mesh, shim) = crate::deadline::run_optional(deadline, async {
+        // Operator identity — the shim's origin (and thus which owner-scoped tools
+        // admit it) derives from it.
+        let identity_path = args
+            .identity
+            .as_deref()
+            .or(profile.identity.as_deref())
+            .ok_or_else(|| {
+                invalid_args(
+                    "net-mesh mcp serve needs an operator identity: pass --identity <PATH> or set \
                  `identity = \"...\"` in your profile. Wrapped tools admit callers by origin, \
                  so use the same identity as your `net-mesh wrap` side (or have it `--allow` this \
                  shim's origin).",
-            )
-        })?;
-    let identity = load_operator_identity(identity_path).await?;
+                )
+            })?;
+        let identity = load_operator_identity(identity_path).await?;
 
-    let mesh = build_attached_mesh(Some(identity), &remote).await?;
-    let mesh = Arc::new(mesh);
+        let mesh = build_attached_mesh(Some(identity), &remote).await?;
+        let mesh = Arc::new(mesh);
 
-    // Seed the shim consent allowlist from `--allow-capability`.
-    let mut consent = ConsentPolicy::new();
-    for raw in &args.allow_capability {
-        let id = CapabilityId::parse(raw)
-            .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
-        consent.allow(id);
-    }
+        // Seed the shim consent allowlist from `--allow-capability`.
+        let mut consent = ConsentPolicy::new();
+        for raw in &args.allow_capability {
+            let id = CapabilityId::parse(raw)
+                .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
+            consent.allow(id);
+        }
 
-    let gateway = MeshGateway::new(Arc::clone(&mesh))
-        .trust_equivalent_providers(args.trust_equivalent_providers);
-    let shim = Shim::new(gateway)
-        .with_consent(consent)
-        .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
+        let gateway = MeshGateway::new(Arc::clone(&mesh))
+            .trust_equivalent_providers(args.trust_equivalent_providers);
+        let shim = Shim::new(gateway)
+            .with_consent(consent)
+            .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
+        Ok((mesh, shim))
+    })
+    .await?;
 
+    // Startup budget ends here. Protocol input and service lifetime are not
+    // bounded by --timeout; an idle host must not lose its running listener.
     // Serve until the host closes stdin (EOF) or the operator hits Ctrl-C.
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
