@@ -1,0 +1,81 @@
+# Native large RPC responses — bounded implementation brief
+
+Authorized in the CLI working session after `0c1ad066b`. This is a prerequisite
+to closing the live-typegen transport-size finding, not permission to start V3.
+
+## Outcome
+
+The existing typed unary call must receive a complete 22 KB metadata response
+over native UDP without increasing the 8192-byte packet bound. Partial data
+must never escape as a successful response. Cancellation, deadline expiry and
+peer/session retirement must release incomplete state. Unsupported peers and
+over-limit responses must fail explicitly rather than time out after a
+successful local socket send.
+
+## Source findings
+
+- `mesh_rpc.rs::publish_response_to_caller` publishes the complete encoded
+  response via `mesh.rs::try_publish_to_peer`. That method constructs one
+  packet; it is not the fragmenting `send_on_stream` producer.
+- Existing fragment receive support in `mesh.rs::reassemble_rtc_fragments`
+  is RTC-gated and carries stream/session retirement, credit and abandoned-group
+  behavior. Merely removing the transport gate is not a UDP implementation.
+- `cortex/rpc.rs::RpcClientPending` already owns unary completion and caller
+  cancellation, and binds responses to the expected session peer. A large
+  response must preserve that authority and complete the same waiter once.
+- Wire status `RpcStatus::Internal` already communicates a terminal server
+  failure to old clients; no new status is necessary for the first refusal unit.
+
+## Review units
+
+### 1. Explicit refusal at the existing single-packet boundary
+
+Implemented in `0180e9b66`; execution evidence and outstanding validation are
+recorded in [the V2 plan](NET_CLI_PLAN_V2.md). Unit 2 remains unimplemented.
+
+Guard direct publish before opening/charging its stream. Count event framing,
+not just application bytes. Replace an oversized RESPONSE with a small terminal
+Internal response carrying the same call identity, a size/limit diagnostic and
+an uncertain-effect/no-automatic-retry warning. Never echo response contents.
+Do not redirect a failed send to another provider or replay the handler.
+
+Witnesses: exact largest accepted response; one byte over; 22 KB response;
+oversized request with zero handler calls and a successful subsequent small
+request; CLI preservation of existing snapshot/no generated directory.
+This unit improves failure semantics only and does **not** close this brief.
+
+### 2. Negotiated bounded large-response delivery
+
+Prefer a response-specific extension scoped to an already-pending unary call
+over widening the general UDP fragment ingress as a side effect of CLI work.
+Before coding, pin the request/response negotiation representation and the
+fragment envelope against existing cross-language nRPC codecs. Use explicit
+opt-in so older callers never receive a fragment as a complete response.
+Reuse existing framing and reliability primitives where their semantics fit;
+do not raise packet size or implement a second metadata service.
+
+Required bounds: maximum assembled response bytes, maximum fragment count,
+per-call and aggregate retained bytes, and the existing call deadline. A
+conservative initial logical-response target is 1 MiB, subject to confirming
+the codec/credit bounds; this is not a current supported limit. Reject claimed
+lengths before allocating. Bind every fragment to call identity and expected
+peer/session, reject inconsistent totals/overlap, tolerate valid duplicate or
+reordered delivery, and keep partial buffers owned by pending-call cleanup.
+No handler retry or cross-provider fallback after partial progress.
+
+Required evidence: 22 KB and the selected maximum; maximum+1; old-peer refusal;
+wrong peer/call/session; duplicate/reordered/missing/contradictory pieces;
+cancellation/deadline/session teardown cleanup; aggregate-budget exhaustion;
+small-response behavior unchanged; restored large live-typegen capture and
+offline regeneration. Include cross-language golden fixtures for any new wire
+semantics. Request-body fragmentation and general pub/sub large messages are
+separate scope; until implemented, preserve explicit pre-send refusal.
+
+## Validation / acceptance
+
+Use existing `integration_nrpc_mesh` and related response-routing, hijack and
+streaming families; extend CLI metadata witnesses. Follow `TESTS.md` feature
+aliases for the core. Run the affected feature matrix, formatting, strict
+production clippy and rustdoc before calling the transport ready. Native
+Windows evidence is not exact-head Unix/platform CI acceptance. Keep the
+implementation and V2 evidence receipt as separate commits; do not push.
