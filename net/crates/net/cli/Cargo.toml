@@ -137,6 +137,7 @@ pkg-fmt = "tgz"
 pkg-fmt = "zip"
 
 [dev-dependencies]
+portable-pty = "0.9"
 async-trait = "0.1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 # Drive the binary in integration tests.

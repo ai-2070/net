@@ -321,33 +321,15 @@ where
     writeln!(io::stderr(), "ICE preview: {preview_json}")
         .map_err(|e| generic(format!("write ICE preview: {e}")))?;
 
-    // --yes acknowledges confirmation in TTY and unattended use. It does
-    // not bypass signature verification, quorum or admission policy.
-    //
-    // Run the gate on a blocking-pool task so the operator's wait
-    // at the prompt doesn't park a tokio worker. Pre-fix
-    // `prompt_for_yes` did `io::stdin().lock().read_line(...)`
-    // synchronously on the SDK runtime, freezing background tasks
-    // (logging dispatcher, mesh ticks) for the duration of the
-    // confirmation typing.
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
-    let yes_flag = common.yes;
-    tokio::task::spawn_blocking(move || check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes))
-        .await
-        .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
-
-    // Sign locally now that the gate has passed.
-    let local_sig = ctx.identity().sign_proposal(
-        simulated.action(),
-        simulated.issued_at_ms(),
-        &simulated.blast_hash(),
-    );
-    signatures.push(local_sig);
-
-    let commit: ChainCommit = simulated
-        .commit(&signatures)
-        .await
-        .map_err(|e| map_ice_error(&format!("commit: {e}"), e.kind))?;
+    let commit = confirm_and_commit(
+        simulated,
+        ctx.identity(),
+        signatures,
+        stdin_is_tty,
+        common.yes,
+    )
+    .await?;
     let payload = ChainCommitMirror {
         commit_id: commit.commit_id(),
         operator_id: commit.operator_id(),
@@ -367,6 +349,29 @@ where
     )
     .map_err(|e| generic(format!("write commit: {e}")))?;
     Ok(())
+}
+
+/// Confirmation acknowledges intent, never replaces the real commit gate.
+async fn confirm_and_commit(
+    simulated: net_sdk::deck::SimulatedIceProposal<'_>,
+    identity: &net_sdk::deck::OperatorIdentity,
+    mut signatures: Vec<OperatorSignature>,
+    stdin_is_tty: bool,
+    yes_flag: bool,
+) -> Result<ChainCommit, CliError> {
+    // Keep interactive input off the async runtime's worker threads.
+    tokio::task::spawn_blocking(move || check_confirm_gate(stdin_is_tty, yes_flag, prompt_for_yes))
+        .await
+        .map_err(|e| generic(format!("confirm-gate task panicked: {e}")))??;
+    signatures.push(identity.sign_proposal(
+        simulated.action(),
+        simulated.issued_at_ms(),
+        &simulated.blast_hash(),
+    ));
+    simulated
+        .commit(&signatures)
+        .await
+        .map_err(|e| map_ice_error(&format!("commit: {e}"), e.kind))
 }
 
 /// Confirmation-gate logic extracted so the code-8 exit path
@@ -484,6 +489,53 @@ struct IceCommitOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn yes_cannot_bypass_real_commit_quorum() {
+        use net_sdk::deck::{DeckClient, DeckClientConfig, OperatorIdentity};
+        use net_sdk::meshos::{LoggingDispatcher, MeshOsConfig, MeshOsDaemonSdk};
+        let runtime = MeshOsDaemonSdk::start(
+            MeshOsConfig::default(),
+            std::sync::Arc::new(LoggingDispatcher::new()),
+        );
+        let identity = OperatorIdentity::generate();
+        let deck = DeckClient::from_runtime(runtime.runtime(), identity.clone()).with_config(
+            DeckClientConfig {
+                ice_signature_threshold: 2,
+                ..Default::default()
+            },
+        );
+        for tty in [false, true] {
+            let proposal = deck
+                .ice()
+                .freeze_cluster(Duration::from_secs(30))
+                .simulate()
+                .await
+                .unwrap();
+            let err = confirm_and_commit(proposal, &identity, vec![], tty, true)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ExitCodeKind::OperatorPolicyRejected);
+            assert!(runtime.runtime().snapshot().freeze_remaining_ms.is_none());
+        }
+        // Same gate, a valid second operator signature: confirmation and quorum
+        // both succeed. This is SDK policy evidence, not remote administration.
+        let proposal = deck
+            .ice()
+            .freeze_cluster(Duration::from_secs(30))
+            .simulate()
+            .await
+            .unwrap();
+        let second = OperatorIdentity::generate();
+        let sig = second.sign_proposal(
+            proposal.action(),
+            proposal.issued_at_ms(),
+            &proposal.blast_hash(),
+        );
+        confirm_and_commit(proposal, &identity, vec![sig], false, true)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn non_tty_without_yes_refuses_with_code_8() {
