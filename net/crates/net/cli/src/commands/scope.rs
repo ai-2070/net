@@ -13,6 +13,47 @@ pub struct LocalScope {
     pub local: bool,
 }
 
+/// Read-only views that can resolve their temporary context without starting it.
+#[derive(Args, Debug)]
+pub struct InspectableLocalScope {
+    #[arg(long, help = NOTICE)]
+    pub local: bool,
+    /// Inspect context selection without starting a temporary supervisor.
+    #[arg(long)]
+    pub inspect_target: bool,
+}
+
+pub(super) async fn inspect_temporary(
+    profile: &crate::config::Profile,
+    identity: Option<&std::path::Path>,
+    node: u64,
+    output: Option<crate::output::OutputFormat>,
+) -> Result<(), CliError> {
+    crate::context::validate_endpoint(profile)?;
+    let target = crate::target::inspect(
+        profile,
+        &super::aggregator::RemoteAttachArgs::default(),
+        identity,
+        None,
+        "temporary_supervisor",
+    )
+    .await?;
+    #[derive(serde::Serialize)]
+    struct View {
+        #[serde(flatten)]
+        target: crate::target::TargetInspection,
+        supervisor_node_id: u64,
+    }
+    crate::output::emit_value(
+        crate::output::OutputFormat::resolve_oneshot(output),
+        &View {
+            target,
+            supervisor_node_id: node,
+        },
+    )
+    .map_err(|e| crate::error::generic(format!("write inspection: {e}")))
+}
+
 pub(super) fn validate_local(local: bool, command: &str) -> Result<(), CliError> {
     if !local {
         return Err(invalid_args(format!(

@@ -75,7 +75,7 @@ pub enum SubnetCommand {
 #[derive(Args, Debug)]
 pub struct ShowArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -87,7 +87,7 @@ pub struct ShowArgs {
 #[derive(Args, Debug)]
 pub struct LsArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -99,7 +99,7 @@ pub struct LsArgs {
 #[derive(Args, Debug)]
 pub struct TreeArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -242,8 +242,18 @@ async fn run_show(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "subnet show")?;
+    super::scope::validate_local(args.scope.local, "subnet show")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet show")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let view = ShowView {
@@ -262,8 +272,18 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "subnet ls")?;
+    super::scope::validate_local(args.scope.local, "subnet ls")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet ls")?;
     let local_node_id = args.node;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), local_node_id, false).await?;
     let deck = ctx.deck();
@@ -292,8 +312,18 @@ async fn run_tree(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "subnet tree")?;
+    super::scope::validate_local(args.scope.local, "subnet tree")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet tree")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let mut all_subnets: BTreeSet<u32> = BTreeSet::new();

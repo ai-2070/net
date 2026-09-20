@@ -27,6 +27,104 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn temporary_read_inspection_resolves_identity_without_starting_supervisor() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    // A bind alone must be disclosed as an ignored remote default.
+    config(&cfg, "[default]\nbind = 'unused-invalid-bind'\n");
+    let commands: &[&[&str]] = &[
+        &["cap", "show"],
+        &["cap", "query", "--tag", "example"],
+        &["cap", "nodes"],
+        &["subnet", "show"],
+        &["subnet", "ls"],
+        &["subnet", "tree"],
+        &["gateway", "stats"],
+        &["gateway", "exports"],
+    ];
+    for command in commands {
+        let mut args = vec!["--config", cfg.to_str().unwrap()];
+        args.extend_from_slice(command);
+        args.push("--inspect-target");
+        assert_eq!(run(&args).status.code(), Some(2));
+        args.extend(["--local", "--node", "123"]);
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["mode"], "temporary_supervisor");
+        assert_eq!(view["supervisor_node_id"], 123);
+        assert_eq!(view["provenance"]["mode"], "flag");
+        assert_eq!(view["identity"]["state"], "unavailable");
+        assert_eq!(view["authorization"], "not_checked");
+        assert_eq!(view["ignored_profile_remote_defaults"], true);
+        assert!(view["target"].is_null() && view["bind"].is_null());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("ephemeral") && !stderr.contains("Starts a temporary supervisor"));
+        // Read-only temporary views do not accept remote attachment flags.
+        args.extend(["--node-addr", "127.0.0.1:12345"]);
+        assert_eq!(run(&args).status.code(), Some(2));
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    let identity = dir.path().join("identity.toml");
+    assert!(
+        run(&["identity", "generate", "--out", identity.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let bytes = std::fs::read(&identity).unwrap();
+    let data: toml::Value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    let hash = Sha256::digest(hex::decode(data["public_key_hex"].as_str().unwrap()).unwrap());
+    let fingerprint = hash[..8]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    config(
+        &cfg,
+        &format!("[default]\nidentity = '{}'\n", identity.display()),
+    );
+    for command in commands {
+        let mut args = vec!["--config", cfg.to_str().unwrap()];
+        args.extend_from_slice(command);
+        args.extend(["--local", "--inspect-target"]);
+        let out = run(&args);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["identity"]["fingerprint"], fingerprint);
+        assert_eq!(view["provenance"]["identity"], "profile");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(data["seed_hex"].as_str().unwrap()));
+    }
+    config(&cfg, "[default]\nidentity = 'missing-identity'\n");
+    let args = [
+        "--config",
+        cfg.to_str().unwrap(),
+        "cap",
+        "nodes",
+        "--local",
+        "--inspect-target",
+    ];
+    assert!(!run(&args).status.success());
+    let mut override_args = args.to_vec();
+    override_args.extend(["--identity", identity.to_str().unwrap()]);
+    let out = run(&override_args);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["identity"]["fingerprint"], fingerprint);
+    assert_eq!(view["provenance"]["identity"], "flag");
+    assert_eq!(std::fs::read(&identity).unwrap(), bytes);
+    config(
+        &cfg,
+        "[default]\nendpoint = 'https://unsupported.invalid'\n",
+    );
+    assert!(!run(&args).status.success());
+}
+
+#[test]
 fn bootstrap_inspection_never_reads_psk_or_emits_credentials() {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();

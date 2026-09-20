@@ -8,6 +8,14 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — temporary read-context inspection
+
+- Capability show/query/nodes, subnet show/ls/tree and gateway stats/exports
+  accept `--local --inspect-target` without starting a supervisor or generating
+  an identity. Reports the supervisor node ID and configured public fingerprint.
+- Inspection now discloses ignored profile bind defaults even when no remote
+  target tuple is configured.
+
 ## Unreleased — bootstrap credential target inspection
 
 - `anchor credential mint/inspect --inspect-target` reports input/output

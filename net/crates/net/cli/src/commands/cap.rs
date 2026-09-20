@@ -52,7 +52,7 @@ pub enum CapCommand {
 #[derive(Args, Debug)]
 pub struct ShowArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     /// Peer node id. Defaults to the local node configured by
     /// `--node`.
@@ -69,7 +69,7 @@ pub struct ShowArgs {
 #[derive(Args, Debug)]
 pub struct QueryArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     /// One or more required tags. A node matches when its
     /// advertised capability set contains every tag listed.
@@ -86,7 +86,7 @@ pub struct QueryArgs {
 #[derive(Args, Debug)]
 pub struct NodesArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -189,8 +189,18 @@ async fn run_show(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "cap show")?;
+    super::scope::validate_local(args.scope.local, "cap show")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "cap show")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let target = args.peer.unwrap_or(args.node);
@@ -214,8 +224,18 @@ async fn run_query(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "cap query")?;
+    super::scope::validate_local(args.scope.local, "cap query")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "cap query")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let required: BTreeSet<String> = args.tags.into_iter().collect();
@@ -240,8 +260,18 @@ async fn run_nodes(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "cap nodes")?;
+    super::scope::validate_local(args.scope.local, "cap nodes")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "cap nodes")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
     let rows: Vec<CapNodesRow> = snapshot

@@ -161,6 +161,8 @@ Subnet `keygen`, `issue-direct`, `issue-issuer`, `issue-delegated`, all four `is
 
 `anchor credential mint/inspect --inspect-target` reports offline input/output selection without reading PSK or credential payloads. Mint loads the actual issuer through its normal identity-file gate and reports its public fingerprint, optional output file and PSK source (`file` or `inline`), never the PSK value. Normal mint includes the secret credential on stdout even with `--out`; inspection makes this explicit with `credential_stdout_on_execution: true` but emits no credential itself. Credential inspect reports a file path or inline provenance, never inline contents. Profile identity/remote defaults are unused. Inspection does not validate credential content, TTL, bootstrap URL, trust-domain match or output permissions.
 
+Capability `show/query/nodes`, subnet `show/ls/tree` and gateway `stats/exports` support `--local --inspect-target`. Inspection reports `mode: temporary_supervisor`, `supervisor_node_id` and the actual configured identity fingerprint (`--identity` > profile identity), or an unavailable identity when execution would generate one. It validates the profile endpoint but does not start a supervisor or generate an ephemeral identity. Remote profile target/bind defaults are ignored and disclosed, not connected to. `--local` remains required; `--node` names the temporary supervisor, not a remote deployment. Inspection does not query topology or capability state, validate all filters or approve authority.
+
 Inspection is not yet CLI-wide: other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes

@@ -154,7 +154,8 @@ pub(crate) async fn inspect(
         bind: remote.map(|remote| remote.bind.to_string()),
         identity,
         provenance,
-        ignored_profile_remote_defaults: remote.is_none() && has_profile_target(profile),
+        ignored_profile_remote_defaults: remote.is_none()
+            && (has_profile_target(profile) || profile.bind.is_some()),
         authorization: "not_checked",
     })
 }
