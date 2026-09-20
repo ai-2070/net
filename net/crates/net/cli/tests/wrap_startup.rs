@@ -3,7 +3,7 @@
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-async fn exercise(stall: bool) {
+async fn exercise(stall: bool, listen: bool) {
     let dir = tempfile::tempdir().unwrap();
     let fixture = dir
         .path()
@@ -51,8 +51,8 @@ async fn exercise(stall: bool) {
         .unwrap();
     mesh.start();
     let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"))
-        .env_remove("NET_MESH_CONFIG")
+    let mut cmd = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"));
+    cmd.env_remove("NET_MESH_CONFIG")
         .env_remove("NET_MESH_PROFILE")
         .arg("--config")
         .arg(&config)
@@ -65,8 +65,11 @@ async fn exercise(stall: bool) {
             "fixture",
             "--identity",
         ])
-        .arg(&identity)
-        .args([
+        .arg(&identity);
+    if listen {
+        cmd.arg("--listen");
+    } else {
+        cmd.args([
             "--bind",
             "127.0.0.1:0",
             "--node-addr",
@@ -75,10 +78,10 @@ async fn exercise(stall: bool) {
             &mesh.node_id().to_string(),
             "--node-pubkey",
             &hex::encode(mesh.public_key()),
-            "--psk-hex",
-            &"42".repeat(32),
-            "--",
-        ])
+        ]);
+    }
+    let mut child = cmd
+        .args(["--psk-hex", &"42".repeat(32), "--"])
         .arg(&fixture)
         .arg(control.local_addr().unwrap().to_string())
         .arg(if stall { "stall" } else { "serve" })
@@ -154,10 +157,15 @@ async fn exercise(stall: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_timeout_kills_unresponsive_wrapped_child() {
-    exercise(true).await;
+    exercise(true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrapped_provider_outlives_startup_budget_and_emits_ndjson() {
-    exercise(false).await;
+    exercise(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listener_startup_timeout_kills_child_without_readiness() {
+    exercise(true, true).await;
 }

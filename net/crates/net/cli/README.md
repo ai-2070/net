@@ -26,6 +26,12 @@ The crate is `net-cli` but the binary it installs is **`net-mesh`**. Prebuilt ta
 
 ## Quick start
 
+For a runnable source-checkout example, start with the
+[two-node capability journey](tests/fixtures/README.md). It starts separate
+`wrap --listen` and `mcp serve` processes, proves both permission boundaries,
+and checks the returned value against a provider-side invocation record.
+It runs on loopback on one machine; it is not off-host acceptance evidence.
+
 ```sh
 # Generate an identity file; this does not grant remote invocation authority.
 net-mesh identity generate --out ~/.config/net-mesh/identity.toml
@@ -39,6 +45,32 @@ net-mesh typegen generate --language ts --from-snapshot tools.json --out ./gener
 ```
 
 `wrap` keeps the publisher subprocess alive and is owner-only by default. Consumers need the configured target and appropriate permission; an identity or successful handshake alone is not permission. Live typegen fetches missing schemas from the exact advertising provider, subject to existing unary RPC transport limits, and refuses mismatched or unusable contracts before output. These examples are entry points, not an accepted cross-computer deployment recipe.
+
+### Starting the first publisher
+
+`wrap --listen` starts without a bootstrap peer. Supply an operator identity,
+a 32-byte PSK through `--psk-hex` or a protected profile, and the stdio server
+command after `--`. Listener bind precedence is `--bind`, profile `bind`, then
+`127.0.0.1:0`. Remote peer settings conflict with `--listen`, including profile
+defaults; select a dedicated profile. The ordinary attached mode is unchanged.
+
+With `--output ndjson`, the initial `wrapped` event includes `connection.bind`
+(the actual port), `connection.node_id` (hex string), `connection.node_pubkey`
+(the live public Noise key), and `connection.origin_hash` (hex string). Give
+the first three to the consumer's `--node-addr`, `--node-id`, and
+`--node-pubkey`; supply the same PSK separately. The event contains no PSK or
+identity seed. The Noise key belongs to this running process: use a fresh
+readiness event after restarting it. A wildcard bind is not a dialable address;
+choose a reachable interface address yourself. Cross-host reachability and
+firewall configuration are not established by the loopback journey.
+
+Readiness means the local tool services were published, not that a peer has
+discovered them or has permission to invoke. `--allow <consumer-origin>` widens
+the provider policy only for the named identity; `mcp pin approve` is separate
+consumer consent and cannot override that policy. `--inspect-target` validates
+listener selection without binding a port or starting the child; it cannot
+report a live port or Noise key. Startup `--timeout` ends at publication; it
+does not stop a healthy published service later.
 
 ### Temporary-supervisor development commands
 

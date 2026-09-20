@@ -4,6 +4,12 @@ description: "The net-mesh binary exposes the substrate's operator surface."
 ---
 # CLI Reference
 
+For a runnable two-node loopback publisher/consumer example, see the
+[CLI capability journey](https://github.com/ai-2070/net/blob/master/net/crates/net/cli/tests/fixtures/README.md).
+`wrap --listen` starts the first publisher without a peer, defaults to loopback,
+and requires a PSK and identity. Its `wrapped` event includes live connection
+details for a consumer; local pins do not override provider authorization.
+
 The `net-mesh` binary provides capability hosting/consumption, typed contract generation, local stores, and offline authority tools. `wrap` hosts a stdio MCP server as mesh capabilities; `mcp serve` bridges mesh capabilities to a local MCP client. `daemon` only lists a temporary snapshot: there is no `daemon run` command.
 
 The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.

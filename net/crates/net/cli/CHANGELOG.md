@@ -8,6 +8,17 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — standalone capability publisher
+
+- `wrap --listen` starts a publisher without a bootstrap peer. It requires a
+  PSK, defaults to loopback, and rejects remote peer settings from flags or
+  profiles. Explicit/profile bind selection and startup deadlines still apply.
+- The `wrapped` event now includes `connection` with the live bind address,
+  hex-string node ID, public Noise key and origin hash in both startup modes.
+  No secret is included. Consumers must refresh these details after restart.
+- A two-node subprocess harness covers local consent, provider owner-scope
+  denial, one authorized invocation and cleanup; it is not off-host evidence.
+
 ## Unreleased — bounded large RPC responses
 
 - Updated native peers negotiate unary responses up to 1 MiB including encoded

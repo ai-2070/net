@@ -171,6 +171,18 @@ pub(crate) fn public_fingerprint(key: &[u8]) -> String {
 }
 
 impl TargetInspection {
+    pub(crate) fn listener_bind(
+        &mut self,
+        bind: String,
+        bind_source: &'static str,
+        psk_source: &'static str,
+    ) {
+        self.bind = Some(bind);
+        self.ignored_profile_remote_defaults = false;
+        self.provenance("mode", "flag");
+        self.provenance("bind", bind_source);
+        self.provenance("psk", psk_source);
+    }
     #[cfg(feature = "rtc-bootstrap")]
     pub(crate) fn standalone_service(profile: &crate::config::Profile, bind: String) -> Self {
         let mut view = Self::local(profile, "hosted_service");
