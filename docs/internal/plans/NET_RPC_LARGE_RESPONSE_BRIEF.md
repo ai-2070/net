@@ -86,12 +86,41 @@ tests passed with zero retries. Default check/strict production clippy and
 targeted formatting passed. Full CLI feature suites and the broad pre-push
 matrix were not rerun for this correction; V2 records the outstanding gates.
 
-**Next:** queue saturation, shared server transfer deadline/cancellation and
-sender lifecycle review. The current bounded drainer can drop pieces under
-load and its one-second credit bound is per packet, not a transfer-wide server
-deadline; do not mark the brief accepted until that behavior is reviewed and
-the remaining witnesses land. Then complete the broad feature/rustdoc gates,
-two-node CI journey and exact-head platform acceptance. V3 remains unstarted.
+**Sender ownership: `e8e65ea37` (2026-09-20).** Large native replies now bypass
+the per-fragment response queue. The existing handler task owns one bounded
+logical-response pump; eight node-wide admission slots cover all services.
+Saturation refuses the entire response before sending fragments, with a
+same-session Internal diagnostic. Small replies retain their existing drainer
+and do not consume these slots. The single transfer deadline is the remaining
+absolute request deadline, capped at 30 seconds even without a caller deadline.
+The one-second packet-credit stall bound remains an additional limit. CANCEL
+ownership now lasts through delivery, and cancellation, session retirement,
+shutdown, expiry or the first send failure drops the pump, remaining fragments
+and its slot. Terminal diagnostics are best effort and independently capped at
+50 ms; a broken transport may prevent even an error from arriving.
+
+Completion removes only its own in-flight cancellation token, so an old
+transfer unwinding after CANCEL cannot remove a newer call with a reused key.
+The reply-route cache is retired before the pump starts awaiting; fragments
+and diagnostics use the original authenticated peer/session, never a fallback.
+
+Witnesses cover node-wide admission saturation across two services, small
+responses while saturated, capacity recovery, cancellation after the handler
+returns, a shared request deadline while credit is blocked (caller CANCEL is
+deliberately suppressed), server shutdown without caller cancellation, the
+30-second ceiling, and reused-call-ID ownership. Saturation is injected by
+occupying the actual semaphore; it is not a network throughput benchmark.
+Validation passed: 109 focused RPC units, 281 integration tests across 30
+binaries, 312 default / 325 rtc-bootstrap CLI tests (one existing ignored
+aggregator test each), default check/strict production clippy, targeted fmt
+and diff hygiene. Typegen downstream TS checks were enabled. Wire layout is
+unchanged from the existing shared golden fixtures.
+
+**Next:** broad feature/workspace/rustdoc gates, two-node CI journey and
+exact-head platform acceptance. Local sender/lifecycle witnesses do not close
+these gates or claim arbitrary packet-loss/reordering interoperability.
+The previously recorded default-feature rustdoc link failure remains open.
+V3 remains unstarted.
 
 Prefer a response-specific extension scoped to an already-pending unary call
 over widening the general UDP fragment ingress as a side effect of CLI work.
@@ -103,8 +132,8 @@ do not raise packet size or implement a second metadata service.
 
 Required bounds: maximum assembled response bytes, maximum fragment count,
 per-call and aggregate retained bytes, and the existing call deadline. A
-conservative initial logical-response target is 1 MiB, subject to confirming
-the codec/credit bounds; this is not a current supported limit. Reject claimed
+conservative initial logical-response target was 1 MiB; the implementation
+and local maximum-size witness above now pin that bound. Reject claimed
 lengths before allocating. Bind every fragment to call identity and expected
 peer/session, reject inconsistent totals/overlap, tolerate valid duplicate or
 reordered delivery, and keep partial buffers owned by pending-call cleanup.
