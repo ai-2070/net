@@ -8,6 +8,22 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — NetDB restore preflight
+
+- NetDB commands now propagate configuration read, permission, and parse
+  errors instead of silently falling back to another store. Optional absent
+  configuration still uses the existing defaults; valid store precedence is
+  unchanged.
+- `netdb restore` loads the snapshot once, checks its byte ceiling and decodes
+  its envelope, and rejects an envelope without adapters before creating or
+  clearing the destination. Snapshots inside the destination are captured
+  before `--clear` removes their original path. Actual bytes read are bounded
+  even if the file grows after its metadata check.
+- Restore advice distinguishes `--force` (merge) from `--clear` (remove the
+  existing store before restoration). This is preflight protection, not
+  transactional replacement: use an offline store, and expect storage or
+  adapter replay failures after preflight to be able to leave incomplete state.
+
 ## Unreleased — targets 0.35.0
 
 > **Security defaults changed.** Seven defaults went fail-closed in this

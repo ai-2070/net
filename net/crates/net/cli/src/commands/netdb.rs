@@ -16,6 +16,7 @@ use std::sync::Arc;
 use clap::{Args, Subcommand};
 use net_sdk::cortex::{Memory, NetDb, NetDbBuilder, Redex, Task};
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 
 use crate::error::{generic, sdk, CliError};
 use crate::parsers::parse_u64_flexible;
@@ -150,8 +151,8 @@ pub struct RestoreArgs {
     /// Redex** — `--force` does NOT clear `--store` first. The
     /// effective operation is therefore "merge snapshot into the
     /// current store," not "replace store with snapshot." If you
-    /// need a clean restore, remove `--store` manually before
-    /// running, or pass `--clear` to have the CLI do it for you.
+    /// need a clean restore, pass `--clear` to remove the store
+    /// after snapshot preflight succeeds.
     /// Without `--force` we refuse if `--store` already contains
     /// data.
     #[arg(long)]
@@ -161,6 +162,9 @@ pub struct RestoreArgs {
     /// clean restore rather than a merge. Implies `--force`. Use
     /// when the snapshot is the authoritative state and any
     /// existing chains under `--store` should be discarded.
+    /// Configuration and snapshot envelope validation happen first.
+    /// Use an offline store: application is not crash-atomic, and
+    /// storage or adapter replay failures can leave incomplete state.
     #[arg(long)]
     pub clear: bool,
 }
@@ -251,9 +255,8 @@ pub async fn run(
     // default `$XDG_DATA_HOME/net/netdb` and write mutations into
     // the wrong store.
     let profile_netdb = crate::context::resolve_profile(config_path, profile_name)
-        .await
-        .ok()
-        .and_then(|p| p.netdb);
+        .await?
+        .netdb;
     let profile_netdb = profile_netdb.as_deref();
     match cmd {
         NetdbCommand::Tasks(TasksCommand::Ls(args)) => {
@@ -540,19 +543,78 @@ async fn run_restore(
             })?,
         },
     };
+    // Capture and validate the input BEFORE any destination mutation. The
+    // source can itself live inside the directory --clear removes.
+    // This bounds input bytes, not all allocations made by the decoder.
+    const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    let file = tokio::fs::File::open(&args.from).await.map_err(|e| {
+        generic(format!(
+            "failed to open snapshot file {}: {e}",
+            args.from.display()
+        ))
+    })?;
+    let meta = file.metadata().await.map_err(|e| {
+        generic(format!(
+            "failed to stat snapshot file {}: {e}",
+            args.from.display()
+        ))
+    })?;
+    if meta.len() > SNAPSHOT_MAX_BYTES {
+        return Err(crate::error::invalid_args(format!(
+            "snapshot file {} is {} bytes, exceeds the {} byte ceiling; \
+             pass a smaller snapshot or raise SNAPSHOT_MAX_BYTES",
+            args.from.display(),
+            meta.len(),
+            SNAPSHOT_MAX_BYTES
+        )));
+    }
+    let mut bytes = Vec::new();
+    // Bound the read too: the file may grow after metadata was inspected.
+    // The extra byte distinguishes a file at the ceiling from an oversized one.
+    file.take(SNAPSHOT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| {
+            generic(format!(
+                "failed to read snapshot file {}: {e}",
+                args.from.display()
+            ))
+        })?;
+    if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return Err(crate::error::invalid_args(format!(
+            "snapshot file {} exceeds the {} byte ceiling; pass a smaller snapshot",
+            args.from.display(),
+            SNAPSHOT_MAX_BYTES
+        )));
+    }
+    let snap = net_sdk::cortex::NetDbSnapshot::decode(&bytes)
+        .map_err(|e| sdk(format!("netdb snapshot decode: {e}")))?;
+    if snap.tasks.is_none() && snap.memories.is_none() {
+        return Err(crate::error::invalid_args(
+            "snapshot file carries neither tasks nor memories; nothing to restore",
+        ));
+    }
+
+    // Preflight ends here. Persistent open/replay is not transactional.
+    let dest_exists = tokio::fs::try_exists(&dest).await.map_err(|e| {
+        generic(format!(
+            "failed to stat target store {}: {e}",
+            dest.display()
+        ))
+    })?;
     // `--clear` implies `--force` and produces an actual restore
     // (snapshot replaces existing store). Plain `--force` keeps
     // the pre-fix merge semantic — re-documented honestly above
     // so the verb-vs-behavior gap is visible to operators.
     let force = args.force || args.clear;
-    if args.clear && dest.exists() {
+    if args.clear && dest_exists {
         tokio::fs::remove_dir_all(&dest).await.map_err(|e| {
             generic(format!(
                 "--clear: failed to remove existing store {}: {e}",
                 dest.display()
             ))
         })?;
-    } else if args.force && dest.exists() {
+    } else if args.force && dest_exists {
         eprintln!(
             "warning: --force on a non-empty store {} merges the snapshot's chains \
              into the existing Redex (this is a fold, not a replace). Pass --clear \
@@ -560,7 +622,7 @@ async fn run_restore(
             dest.display()
         );
     }
-    if !force && dest.exists() {
+    if !force && dest_exists {
         // The non-empty check must distinguish empty-dir from
         // read-error: pre-fix `read_dir`'s `Err(_) => false` and
         // `next_entry`'s `.unwrap_or(None)` both swallowed I/O
@@ -594,43 +656,12 @@ async fn run_restore(
         };
         if non_empty {
             return Err(crate::error::invalid_args(format!(
-                "target store {} already contains data; pass --force to overwrite",
+                "target store {} already contains data; pass --force to merge \
+                 or --clear to remove the existing store before restoring",
                 dest.display()
             )));
         }
     }
-    // Hard cap on snapshot file size before letting postcard
-    // touch operator-supplied bytes. Postcard is memory-safe but
-    // obeys the decoded `Vec` length prefixes; a crafted `--from`
-    // blob can request multi-GB allocations and OOM the daemon.
-    // 4 GiB is generous for any legitimate snapshot
-    // (`bindings/python/tests/test_netdb.py` exercises this path
-    // with byte-sized blobs); raise the bound here when a real
-    // workload pushes past it.
-    const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    let meta = tokio::fs::metadata(&args.from).await.map_err(|e| {
-        generic(format!(
-            "failed to stat snapshot file {}: {e}",
-            args.from.display()
-        ))
-    })?;
-    if meta.len() > SNAPSHOT_MAX_BYTES {
-        return Err(crate::error::invalid_args(format!(
-            "snapshot file {} is {} bytes, exceeds the {} byte ceiling; \
-             pass a smaller snapshot or raise SNAPSHOT_MAX_BYTES",
-            args.from.display(),
-            meta.len(),
-            SNAPSHOT_MAX_BYTES
-        )));
-    }
-    let bytes = tokio::fs::read(&args.from).await.map_err(|e| {
-        generic(format!(
-            "failed to read snapshot file {}: {e}",
-            args.from.display()
-        ))
-    })?;
-    let snap = net_sdk::cortex::NetDbSnapshot::decode(&bytes)
-        .map_err(|e| sdk(format!("netdb snapshot decode: {e}")))?;
     tokio::fs::create_dir_all(&dest).await.map_err(|e| {
         generic(format!(
             "failed to create netdb directory {}: {e}",
@@ -652,11 +683,6 @@ async fn run_restore(
     }
     if snap.memories.is_some() {
         builder = builder.with_memories();
-    }
-    if snap.tasks.is_none() && snap.memories.is_none() {
-        return Err(crate::error::invalid_args(
-            "snapshot file carries neither tasks nor memories; nothing to restore",
-        ));
     }
     let netdb = builder
         .build_from_snapshot(&snap)
