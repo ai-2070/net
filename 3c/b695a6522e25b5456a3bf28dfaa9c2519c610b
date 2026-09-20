@@ -1,0 +1,47 @@
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_7b89b400d59d78 11-22
+net/crates/net/cli/src/commands/identity.rs
+  s_38828de26a56bb::t_058015b52ee4ed 120,122-125,134-141,146-154,156-163,166-173,177-178,180-187,398-399
+  s_38828de26a56bb::t_e180433994f69d 51-53,70-72,86-88,99-101,126-133,143-145,155,164-165,174-176,179,188-191,383,397,400-407,757-761
+  s_38828de26a56bb::t_98a9d01d2e6eda 121,142
+net/crates/net/cli/src/target.rs
+  s_38828de26a56bb::t_e180433994f69d 17-20,142-143,190-191,224,230-232,238
+  s_38828de26a56bb::t_058015b52ee4ed 225-229,233-237
+  s_38828de26a56bb::t_6de2b53e239372 239
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_7b89b400d59d78 152-156
+net/crates/net/cli/src/commands/cap.rs
+  s_38828de26a56bb::t_058015b52ee4ed 338-343,358-361
+  s_38828de26a56bb::t_e180433994f69d 100-102,182,350-357,362-363
+  s_38828de26a56bb::t_98a9d01d2e6eda 349,402,425-439
+  s_38828de26a56bb::t_0f4095009cbcb7 440-441
+net/crates/net/cli/tests/local_target_inspection.rs
+  s_38828de26a56bb::t_08b51ff4ce2ce1 52,65-80,100-101,110-112,123,508-509,513-525,541-545
+  s_38828de26a56bb::t_21a6627d8ed578 30-32,37-43,51,53-56,62-64,81-82,90-92,97-99,128-129
+  s_38828de26a56bb::t_058015b52ee4ed 33-36,44-50,57-61,83-89,93-96,463-466,468-475,482-493,497-501,527-531
+  s_38828de26a56bb::t_5b26b7b36c87a4 102-109,113-122,124-127
+  s_38828de26a56bb::t_3a817ae6f89c7e 460-462,467,476-481,494-496,502-507,510-512,526,532,546-547
+  s_38828de26a56bb::t_bd60bc954cb5ed 536
+  s_38828de26a56bb::t_0e0c1c22fef13f 533-535,537-540
+  s_38828de26a56bb::t_4946e1a54485eb 29,459
+net/crates/net/cli/src/main.rs
+  s_38828de26a56bb::t_e180433994f69d 294
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_7b89b400d59d78 53-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3cb695a6522e25b5456a3bf28dfaa9c2519c610b",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
