@@ -1,0 +1,22 @@
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  s_38828de26a56bb::t_81341462c5ca68 5
+  s_38828de26a56bb::t_50d716edbb6d4e 333-352
+  s_38828de26a56bb::t_61562e84c10911 354-375
+  s_38828de26a56bb::t_3b6bb653148b64 353
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c013da7d573750451d45ca737270326eba762fa5",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
