@@ -1,0 +1,31 @@
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_43ab651d8c643a 11-16
+net/crates/net/cli/tests/local_target_inspection.rs
+  s_38828de26a56bb::t_ca99a63097798a 34-37,43-45,50-57,60-62,67-71,73-147,158-171,173-177,184-191,198-203,209-216,220-236
+  s_38828de26a56bb::t_b607aa2697676c 30-33,38-42,46-49,58-59,63-66,72,148-157,172,178-183,192-197,204-208,217-219,237-240
+  s_38828de26a56bb::t_c655f9d427e097 29
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_43ab651d8c643a 53,59
+  s_38828de26a56bb::t_342c0704046723 60
+net/crates/net/cli/src/commands/subnet.rs
+  s_38828de26a56bb::t_4a6c1a67aeeea3 117-119,134-144,148-152,160-172,185-192,202-203,207-213,228-238,416-418,443-445,505-507,561-563,635-637,734-736,1276-1280
+  s_38828de26a56bb::t_7443acf781fca5 145-147,153-159,173-184,193-201,204-206,214-227
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_43ab651d8c643a 160-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2868c5c3ea4bbcdad4528b423a6665982113c8f2",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
