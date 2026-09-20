@@ -4911,16 +4911,18 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install mypy + pydantic
-        run: python -m pip install --upgrade mypy pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
 
       - name: Run net-cli tests
         run: |
           set -o pipefail
           cargo test -p net-cli 2>&1 | tee /tmp/cli_default.log
-          # Two CLI mesh nodes on loopback, not two computers. Pin the
-          # authorization witnesses so a renamed/cfg'd test cannot vanish.
+          # MCP uses two CLI mesh nodes; the native leg uses SDK nodes and a
+          # sequential capture CLI. Neither is two-computer evidence. Pin
+          # authorization + contract witnesses so they cannot silently vanish.
           for t in two_node_mcp_consent_then_authorized_invocation \
-                   two_node_mcp_pin_does_not_override_provider_owner_scope; do
+                   two_node_mcp_pin_does_not_override_provider_owner_scope \
+                   native_typed_call_and_generated_consumer_reuse_captured_contract_offline; do
             grep -q "test $t ... ok" /tmp/cli_default.log || {
               echo "::error::$t did not run"; exit 1; }
           done

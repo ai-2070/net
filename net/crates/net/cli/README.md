@@ -31,6 +31,10 @@ For a runnable source-checkout example, start with the
 `wrap --listen` and `mcp serve` processes, proves both permission boundaries,
 and checks the returned value against a provider-side invocation record.
 It runs on loopback on one machine; it is not off-host acceptance evidence.
+The same guide includes native Rust typed calls, live contract capture,
+generated Python consumption over a real-mesh fixture adapter, and offline
+Python/TypeScript regeneration. It distinguishes public native tools from
+MCP's owner/pin authorization policy.
 
 ```sh
 # Generate an identity file; this does not grant remote invocation authority.

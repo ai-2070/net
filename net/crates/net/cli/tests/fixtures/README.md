@@ -58,5 +58,56 @@ not bound later MCP invocation lifetime; the harness supplies its own ceiling.
 This proves two-process, two-node loopback behavior—not two computers, arbitrary
 packet-loss recovery, production credential management, or process-tree cleanup
 for arbitrary wrapped programs. The Python fixture has no descendants.
-The native typed provider/caller and live-contract capture/offline-reuse journey
-remain subsequent acceptance slices; passing this harness does not close them.
+The native contract leg below complements this MCP policy witness; it does not
+inherit MCP's authorization rules.
+
+## Native typed calls and contract reuse
+
+The second harness uses the public Rust SDK `serve_tool` / `call_typed` path,
+CLI live capture, and a generated Python client. Install Pydantic v2 into the
+Python interpreter on PATH, then run from `net/crates/net/`:
+
+```sh
+python -m pip install "pydantic>=2,<3"
+cargo nextest run -p net-cli --test native_contract_workflow --no-tests=fail --retries 0
+```
+
+Use `python3` for the installation command on Unix. Missing Python/Pydantic is
+a failure, not a skipped witness. CI supplies Python 3.12 and Pydantic v2.
+
+The runnable source is `../native_contract_workflow.rs`; generated consumption
+is in `native_consumer.py`. It performs these bounded stages:
+
+1. Start one SDK provider, then a separate `typegen snapshot` CLI process with
+   its explicit peer address, Noise key, node ID and test PSK. Observe attachment
+   before registering and announcing `native_echo`. This sequencing avoids
+   racing the default announcement coalescer against the CLI's five-second
+   discovery window; it does not claim arbitrary startup order succeeds.
+2. Capture input **and** output schemas and compare them to the served
+   descriptor. Capture must leave the business-handler record empty. The small
+   schemas may arrive inline; this is not another large-metadata hydration test.
+3. Generate Python and TypeScript from that snapshot while the provider is
+   alive. The capture CLI has exited before the SDK caller starts, so no stage
+   has more than two live mesh nodes. The Rust provider and caller run within
+   the harness process with separate identities, UDP binds and sessions.
+4. A malformed native request gets the exact typed bad-request status before
+   handler effect. A valid Rust typed call returns the expected message and
+   provider node ID. The generated Python request rejects invalid input locally.
+   Its call helper then sends one valid request through a one-connection local
+   TCP adapter that forwards to the Rust SDK caller's real `call_typed` method.
+   The adapter never synthesizes the provider response. Compare both successful
+   responses, in order, with exactly two provider-side records; do not retry.
+5. Stop caller and provider. Regenerate **every** Python and TypeScript file
+   from the same saved snapshot into fresh directories and compare bytes.
+
+This executes the generated Python models and call helper, **not** the native
+Python SDK binding. TypeScript is regenerated and compared, not invoked in this
+leg. The local adapter is fixture plumbing, not a shipped CLI RPC command.
+Offline regeneration proves contract reuse, never offline invocation.
+
+**Authorization limit:** this native example deliberately uses a public
+`serve_tool` service on an isolated, disposable-PSK mesh. Typed validation is
+not caller authorization; it does not demonstrate org grants, private native
+capabilities, or an identity-based native denial. The MCP leg above proves its
+own owner/consent boundary. Protected native authorization remains an explicit
+acceptance item; do not deploy this public echo as a sensitive capability.
