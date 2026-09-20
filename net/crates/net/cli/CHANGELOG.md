@@ -8,6 +8,13 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — bootstrap credential target inspection
+
+- `anchor credential mint/inspect --inspect-target` reports input/output
+  selection without PSK/credential reads or minting. Mint reports its actual
+  signer and warns that normal execution includes the credential on stdout,
+  even when `--out` also writes a file.
+
 ## Unreleased — subnet artifact inspection
 
 - Offline subnet key generation, issuance, all four control-fact types and

@@ -159,7 +159,9 @@ All five `org` verbs support `--inspect-target`. Keygen reports an unavailable i
 
 Subnet `keygen`, `issue-direct`, `issue-issuer`, `issue-delegated`, all four `issue-control-fact` subcommands and `inspect` support `--inspect-target`. Keygen reports an explicit destination or a runtime filename pattern without generating a key. Issuance loads the selected root/issuer key through its normal permission/parse gate and reports the public signer fingerprint and destination. Delegated issuance also reports `issuer_grant_source` without reading it. Artifact `inspect --inspect-target` reports only the source path without decoding it. Profile identity/remote defaults are unused. Inspection does not validate grant/signing authority, delegation containment, policy, TTL, path aliases or output permissions; normal issuance keeps those checks and publication safeguards.
 
-Inspection is not yet CLI-wide: bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
+`anchor credential mint/inspect --inspect-target` reports offline input/output selection without reading PSK or credential payloads. Mint loads the actual issuer through its normal identity-file gate and reports its public fingerprint, optional output file and PSK source (`file` or `inline`), never the PSK value. Normal mint includes the secret credential on stdout even with `--out`; inspection makes this explicit with `credential_stdout_on_execution: true` but emits no credential itself. Credential inspect reports a file path or inline provenance, never inline contents. Profile identity/remote defaults are unused. Inspection does not validate credential content, TTL, bootstrap URL, trust-domain match or output permissions.
+
+Inspection is not yet CLI-wide: other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

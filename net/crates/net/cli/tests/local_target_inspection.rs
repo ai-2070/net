@@ -27,6 +27,141 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn bootstrap_inspection_never_reads_psk_or_emits_credentials() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let identity = dir.path().join("issuer.toml");
+    let psk = dir.path().join("psk.txt");
+    let artifact = dir.path().join("credential.txt");
+    assert!(
+        run(&["identity", "generate", "--out", identity.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let identity_bytes = std::fs::read(&identity).unwrap();
+    let data: toml::Value = toml::from_str(std::str::from_utf8(&identity_bytes).unwrap()).unwrap();
+    let public = data["public_key_hex"].as_str().unwrap();
+    let hash = Sha256::digest(hex::decode(public).unwrap());
+    let fingerprint = hash[..8]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let base = [
+        "--config",
+        cfg.to_str().unwrap(),
+        "anchor",
+        "credential",
+        "mint",
+        "--issuer-identity",
+        identity.to_str().unwrap(),
+        "--root",
+        public,
+        "--anchor-noise-pubkey",
+        public,
+        "--url",
+        "https://example.invalid/PRIVATE_URL",
+    ];
+    for existing in [false, true] {
+        if existing {
+            config(&psk, "PRIVATE_PSK invalid hex");
+            config(&artifact, "PRIVATE_CREDENTIAL");
+        }
+        for file in [false, true] {
+            let mut args = base.to_vec();
+            args.extend(if file {
+                ["--psk-file", psk.to_str().unwrap()]
+            } else {
+                ["--psk-hex", "PRIVATE_PSK"]
+            });
+            args.extend([
+                "--out",
+                artifact.to_str().unwrap(),
+                "--force",
+                "--inspect-target",
+            ]);
+            let out = run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(view["identity"]["fingerprint"], fingerprint);
+            assert_eq!(view["source"], identity.to_str().unwrap());
+            assert_eq!(view["destination"], artifact.to_str().unwrap());
+            assert_eq!(view["psk_source"], if file { "file" } else { "inline" });
+            if file {
+                assert_eq!(view["psk_file"], psk.to_str().unwrap());
+            }
+            assert_eq!(view["authorization"], "not_checked");
+            assert_eq!(view["ignored_profile_remote_defaults"], true);
+            assert!(view.get("credential").is_none());
+            assert_eq!(view["credential_stdout_on_execution"], true);
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!text.contains("PRIVATE_"));
+            assert!(!text.contains(data["seed_hex"].as_str().unwrap()));
+            assert_eq!(artifact.exists(), existing);
+            // Execution must still reject the missing/corrupt PSK.
+            assert!(!run(&args[..args.len() - 1]).status.success());
+        }
+        let at_path = format!("@{}", artifact.display());
+        for credential in [at_path.as_str(), "PRIVATE_CREDENTIAL"] {
+            let out = run(&[
+                "anchor",
+                "credential",
+                "inspect",
+                "--credential",
+                credential,
+                "--psk-hex",
+                "PRIVATE_PSK",
+                "--inspect-target",
+            ]);
+            assert!(out.status.success());
+            let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(view["identity"]["state"], "unused");
+            assert_eq!(view["psk_source"], "inline");
+            assert_eq!(view["credential_stdout_on_execution"], false);
+            if credential.starts_with('@') {
+                assert_eq!(view["source"], artifact.to_str().unwrap());
+            } else {
+                assert!(view.get("source").is_none());
+            }
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("PRIVATE_"));
+        }
+    }
+    let mut args = base.to_vec();
+    args.extend(["--psk-file", psk.to_str().unwrap(), "--inspect-target"]);
+    let out = run(&args);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["provenance"]["destination"], "stdout");
+    assert!(view.get("destination").is_none());
+    let mut missing = base.to_vec();
+    missing.push("--inspect-target");
+    assert!(!run(&missing).status.success());
+    assert_eq!(std::fs::read(&identity).unwrap(), identity_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "PRIVATE_CREDENTIAL"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&psk).unwrap(),
+        "PRIVATE_PSK invalid hex"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+    config(&identity, "seed_hex = 'PRIVATE_SEED'");
+    let out = run(&args);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE_SEED"));
+}
+
+#[test]
 fn subnet_inspection_resolves_all_offline_artifacts_without_issuance() {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();

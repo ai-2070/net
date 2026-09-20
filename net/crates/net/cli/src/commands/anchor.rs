@@ -143,6 +143,9 @@ pub enum CredentialCommand {
 
 #[derive(Args, Debug)]
 pub struct MintArgs {
+    /// Inspect signer, PSK source and output without reading the PSK or minting.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The mesh root entity id (64 hex chars, optional `0x`) — the
     /// key a joining browser anchor-verifies its grant against.
     #[arg(long, value_name = "HEX")]
@@ -206,6 +209,9 @@ pub struct MintArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    /// Inspect input selection without reading or decoding the credential.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The credential string, or `@PATH` to read it from a file.
     #[arg(long, value_name = "STRING|@PATH")]
     pub credential: String,
@@ -342,18 +348,66 @@ const ICE_CAVEAT: &str = "Reported, never gated. NOT a success rate for sessions
 pub async fn run(
     cmd: AnchorCommand,
     output: Option<OutputFormat>,
-    #[cfg_attr(
-        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
-        allow(unused_variables)
-    )]
     config_path: Option<&std::path::Path>,
-    #[cfg_attr(
-        not(any(feature = "webrtc", feature = "rtc-bootstrap")),
-        allow(unused_variables)
-    )]
     profile_name: &str,
 ) -> Result<(), CliError> {
     match cmd {
+        AnchorCommand::Credential(CredentialCommand::Mint(args)) if args.inspect_target => {
+            let psk_source = psk_source(&args)?;
+            let issuer = load_credential_issuer(&args).await?;
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut target = crate::target::TargetInspection::local(&profile, "offline");
+            target.configured_identity(issuer.entity_id().as_bytes());
+            target.source = Some(args.issuer_identity);
+            target.destination = args.out;
+            target.provenance("identity", "flag");
+            target.provenance("source", "flag");
+            target.provenance(
+                "destination",
+                if target.destination.is_some() {
+                    "flag"
+                } else {
+                    "stdout"
+                },
+            );
+            target.provenance("psk", psk_source);
+            emit_value(
+                OutputFormat::resolve_oneshot(output),
+                &CredentialTargetInspection {
+                    target,
+                    psk_source,
+                    psk_file: args.psk_file,
+                    credential_stdout_on_execution: true,
+                },
+            )
+            .map_err(|e| generic(format!("write inspection: {e}")))
+        }
+        AnchorCommand::Credential(CredentialCommand::Inspect(args)) if args.inspect_target => {
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut target = crate::target::TargetInspection::local(&profile, "offline");
+            if let Some(path) = args.credential.strip_prefix('@') {
+                target.source = Some(PathBuf::from(path));
+                target.provenance("source", "file");
+            } else {
+                target.provenance("source", "inline");
+            }
+            let psk_source = if args.psk_hex.is_some() {
+                "inline"
+            } else {
+                "unused"
+            };
+            target.provenance("psk", psk_source);
+            emit_value(
+                OutputFormat::resolve_oneshot(output),
+                &CredentialTargetInspection {
+                    target,
+                    psk_source,
+                    psk_file: None,
+                    credential_stdout_on_execution: false,
+                },
+            )
+            .map_err(|e| generic(format!("write inspection: {e}")))
+        }
         AnchorCommand::Credential(CredentialCommand::Mint(args)) => run_mint(args, output).await,
         AnchorCommand::Credential(CredentialCommand::Inspect(args)) => {
             run_inspect(args, output).await
@@ -365,6 +419,34 @@ pub async fn run(
         #[cfg(feature = "rtc-bootstrap")]
         AnchorCommand::Serve(args) => run_serve(*args, output, config_path, profile_name).await,
     }
+}
+
+#[derive(Serialize)]
+struct CredentialTargetInspection {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    psk_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psk_file: Option<PathBuf>,
+    /// Mint's normal report includes the secret credential even with --out.
+    credential_stdout_on_execution: bool,
+}
+
+fn psk_source(args: &MintArgs) -> Result<&'static str, CliError> {
+    match (&args.psk_file, &args.psk_hex) {
+        (Some(_), _) => Ok("file"),
+        (None, Some(_)) => Ok("inline"),
+        (None, None) => Err(invalid_args(
+            "one of --psk-hex or --psk-file is required: the credential IS the PSK plus an invite",
+        )),
+    }
+}
+
+async fn load_credential_issuer(args: &MintArgs) -> Result<net_sdk::identity::Identity, CliError> {
+    let issuer_file = read_identity_file(&args.issuer_identity, args.insecure_permissions).await?;
+    let seed = hex_decode_32(&issuer_file.seed_hex)
+        .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
+    Ok(net_sdk::identity::Identity::from_seed(seed))
 }
 
 #[cfg(feature = "rtc-bootstrap")]
@@ -556,10 +638,7 @@ async fn run_mint(args: MintArgs, output: Option<OutputFormat>) -> Result<(), Cl
         ));
     }
 
-    let issuer_file = read_identity_file(&args.issuer_identity, args.insecure_permissions).await?;
-    let seed = hex_decode_32(&issuer_file.seed_hex)
-        .map_err(|e| invalid_args(format!("--issuer-identity: seed_hex: {e}")))?;
-    let issuer = net_sdk::identity::Identity::from_seed(seed);
+    let issuer = load_credential_issuer(&args).await?;
     let invite = InviteToken::mint(
         &root,
         args.url.clone(),
@@ -663,6 +742,7 @@ async fn run_inspect(args: InspectArgs, output: Option<OutputFormat>) -> Result<
 /// order. Exactly one is required: minting without a PSK would
 /// produce a credential no browser could handshake with.
 async fn read_psk(args: &MintArgs) -> Result<[u8; 32], CliError> {
+    psk_source(args)?;
     let hex = match (args.psk_file.as_ref(), args.psk_hex.as_ref()) {
         (Some(path), _) => tokio::fs::read_to_string(path)
             .await
