@@ -1,0 +1,53 @@
+.github/workflows/ci.yml
+  s_38828de26a56bb::t_4ecc9703144db2 4917-4926
+net/crates/net/cli/tests/capability_workflow.rs
+  s_38828de26a56bb::t_3718cdfe2746f7 8-11,15-22,27-36,46-47,57-79,81-84,86-94,99-102,108-122,124-125,141,158-167,180-187,190-197,199-205,207-211,214-216,218-220
+  s_38828de26a56bb::t_52a1abdaac17ea 1-7,12-14,23-26,37-45,48-56,80,85,95-98,103-107,123,126-127,143,148,168-179,188-189,198,206,212-213,217
+  s_38828de26a56bb::t_7e2369501d90e0 128,147,149,157
+  s_38828de26a56bb::t_0a3da21a8e5e46 129-140,142,144-146,150-156
+net/crates/net/cli/src/commands/wrap.rs
+  s_38828de26a56bb::t_a40119f99c0ff4 49-50,81-88,94-98,182,189,193,196-197,213-214,235-237,243-249,338-343,427,434-436,443,454,456-459,571,589,622-623
+  s_38828de26a56bb::t_31a6c2b6441a9d 166-180,183-186,198-212,239-241,250-251,423-426,428-433,437-442,444-453,624-630
+  s_38828de26a56bb::t_8b3c25b5a590d3 5-6,35,238,242,455
+net/crates/net/cli/src/target.rs
+  s_38828de26a56bb::t_a40119f99c0ff4 180-185
+  s_38828de26a56bb::t_31a6c2b6441a9d 174-179
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_4ecc9703144db2 29-34,49-73
+  s_38828de26a56bb::t_e08b9d991ad289 74
+net/crates/net/cli/tests/wrap_startup.rs
+  s_38828de26a56bb::t_37e75aad03c35e 6,54-55,68-72,81-82,160,165-170
+  s_38828de26a56bb::t_f549e2e6e7724b 83-84
+net/crates/net/cli/tests/fixtures/capability_server.py
+  s_38828de26a56bb::t_52a1abdaac17ea 1-42
+net/crates/net/cli/tests/fixtures/README.md
+  s_38828de26a56bb::t_4ecc9703144db2 1-62
+net/crates/net/cli/tests/fixtures/capability_client.rs
+  s_38828de26a56bb::t_3718cdfe2746f7 15-19,26-29,32-37,43-46,48-50,53-59,61-64,67-68
+  s_38828de26a56bb::t_52a1abdaac17ea 1-14,20-25,30-31,38-42,47,51-52,60,65-66,69-73
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_4ecc9703144db2 7-12
+net/crates/net/cli/tests/wrap_listen.rs
+  s_38828de26a56bb::t_f549e2e6e7724b 55-69
+  s_38828de26a56bb::t_8c87a01b647a36 1-7,10-14,27-34,39,45-53,74-81,117-127
+  s_38828de26a56bb::t_8b3c25b5a590d3 54,70-73
+  s_38828de26a56bb::t_f920042c092091 8-9,15-26,35-38,40-44,82-116
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_4ecc9703144db2 11-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a34a47c291744e1f82050d39c82b62af93f20d88",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
