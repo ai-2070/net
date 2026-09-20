@@ -1,0 +1,28 @@
+net/crates/net/cli/tests/fixtures/protected_consumer.py
+  s_38828de26a56bb::t_3cda65b57e93fb 1-64
+net/crates/net/cli/tests/fixtures/README.md
+  s_38828de26a56bb::t_3f0b9fcd53941a 136,140-156,160
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_3f0b9fcd53941a 15-16
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_3f0b9fcd53941a 37-38
+net/crates/net/cli/tests/protected_native_workflow.rs
+  s_38828de26a56bb::t_3cda65b57e93fb 14,16-25,32-33,45,51-52,55,69-75,234-235,247-254,257-260,268-269,293-294,299,303-304,311-314,321
+  s_38828de26a56bb::t_f9be4deb825108 26-31,46-50,53-54,56-68,76-93,236-246,255-256,261-267,270-292,295-298,300-302,305-308,315-320
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9a4323d330a8b1cb4e950968d247f810cb6b9e44",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
