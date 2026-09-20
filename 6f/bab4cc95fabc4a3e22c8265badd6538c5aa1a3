@@ -1,0 +1,28 @@
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_9ae406107dd720 14-15
+net/crates/net/cli/tests/fixtures/README.md
+  s_38828de26a56bb::t_9ae406107dd720 112-144
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_9ae406107dd720 36-38
+.github/workflows/ci.yml
+  s_38828de26a56bb::t_9ae406107dd720 4925-4926
+net/crates/net/cli/tests/protected_native_workflow.rs
+  s_38828de26a56bb::t_b1cdc215487361 1-48,51-92,104-107,118-119,123-128,132,136-138,159,165-182
+  s_38828de26a56bb::t_54e96242488284 49-50,93-103,108-117,120-122,129-131,133-135,139-158,160-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6fbab4cc95fabc4a3e22c8265badd6538c5aa1a3",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
