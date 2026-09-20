@@ -27,11 +27,16 @@ cannot replace it. Partial data never reaches an application as success.
 Reassembly belongs to the pending unary call and is bound to its expected
 authenticated peer and session. Completion, malformed input, cancellation and
 deadline cleanup release its reservation. A live call also checks session
-retirement every 100 ms, including calls without a deadline. The normal caller
+retirement and node shutdown every 100 ms, including calls without a deadline.
+This checks the receive lifetime, not just the session ID: shutdown may retain
+retired sessions in the peer table. Advisory inactivity alone is not retirement.
+The normal caller
 deadline is not restarted for each fragment. No automatic handler retry occurs.
 
 Fragment sends remain on the request's session and do not fall back to a roster
-route. The sender can wait up to one second for packet credit before declaring
+route. Each credit-admission attempt checks shutdown and receive-lifetime
+retirement, so a credit refund cannot revive a retired session's blocked send.
+The sender can wait up to one second for packet credit before declaring
 a send failure; this is a credit-stall bound, not a new application deadline.
 The existing bounded response drainer can still overflow under load; failed or
 missing delivery cannot complete reassembly and remains subject to the caller's

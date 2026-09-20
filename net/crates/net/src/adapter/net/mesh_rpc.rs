@@ -6011,7 +6011,7 @@ impl MeshNode {
                 tokio::select! {
                     result = &mut rx => return result,
                     _ = check.tick() => {
-                        if self.peer_session_id(target_node_id) != Some(expected_session) {
+                        if !self.rpc_session_is_live(target_node_id, expected_session) {
                             pending.cancel(call_id);
                         }
                     }

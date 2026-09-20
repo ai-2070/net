@@ -19624,6 +19624,17 @@ impl MeshNode {
         self.peers.get(&node_id).map(|p| p.session.session_id())
     }
 
+    /// A pending unary call must not outlive its receive incarnation. The
+    /// table can retain a retired session (notably on shutdown), so identity
+    /// alone is insufficient. Advisory inactivity is deliberately not a fence.
+    pub(super) fn rpc_session_is_live(&self, node_id: u64, session_id: u64) -> bool {
+        !self.is_shutdown()
+            && self.peers.get(&node_id).is_some_and(|peer| {
+                peer.session.session_id() == session_id
+                    && !peer.session.is_receive_lifetime_retired()
+            })
+    }
+
     /// Topology epoch this node evaluates subnet authority against.
     pub fn subnet_topology_epoch(&self) -> u32 {
         self.subnet_topology_epoch.load(Ordering::Acquire)
@@ -41775,7 +41786,8 @@ impl MeshNode {
         let (guard, seq) = loop {
             if fragment_session.is_some_and(|expected| {
                 session.session_id() != expected
-                    || self.peer_session_id(peer_node_id) != Some(expected)
+                    || session.is_receive_lifetime_retired()
+                    || !self.rpc_session_is_live(peer_node_id, expected)
             }) {
                 return PeerPublishOutcome::SendFailed(AdapterError::Connection(
                     "RPC response session retired".into(),
@@ -60534,6 +60546,10 @@ mod exported_discovery_pin_coherence_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "cortex"))]
+#[path = "mesh_rpc_large_response_tests.rs"]
+mod rpc_large_response_lifecycle_tests;
 
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.

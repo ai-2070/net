@@ -4256,6 +4256,15 @@ impl RpcClientPending {
         self.senders.remove(&call_id);
     }
 
+    /// Test-only observation of actual pending ownership, not a second counter.
+    #[cfg(test)]
+    pub(crate) fn retained_for_test(&self) -> (usize, usize) {
+        (
+            self.senders.len(),
+            self.fragment_bytes.load(Ordering::Acquire),
+        )
+    }
+
     /// Deliver `resp` to the waiter for `call_id`, if any.
     ///
     /// `from_node` is the wire-session peer of the inbound
