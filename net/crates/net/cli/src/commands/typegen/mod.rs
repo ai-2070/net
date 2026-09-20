@@ -196,8 +196,18 @@ async fn run_generate(
 ) -> Result<(), CliError> {
     let (descriptors, meta) = match &args.from_snapshot {
         Some(path) => {
-            if args.attach.has_target_flags() || args.attach.inspect_target {
-                return Err(invalid_args("remote target/bind flags and --inspect-target are for live typegen; remove them when using --from-snapshot (offline inspection is not available yet)"));
+            if args.attach.has_target_flags() {
+                return Err(invalid_args("remote target/bind flags are for live typegen; remove them when using --from-snapshot"));
+            }
+            if args.attach.inspect_target {
+                let profile = resolve_profile(config_path, profile_name).await?;
+                let mut view = crate::target::TargetInspection::local(&profile, "offline");
+                view.source = Some(path.clone());
+                view.destination = Some(args.out.clone());
+                view.provenance("mode", "flag");
+                view.provenance("source", "flag");
+                view.provenance("destination", "flag");
+                return view.emit(output);
             }
             load_snapshot_source(path, &args.tags, &args.tools)?
         }

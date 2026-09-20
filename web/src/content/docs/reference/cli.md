@@ -32,9 +32,21 @@ Flags override corresponding profile fields. A complete profile tuple selects re
 
 `--bind <IP:PORT>` overrides profile `bind` on these remote clients. Existing defaults are unchanged: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. Loopback-to-non-loopback attachment is rejected early; explicitly select a reachable local interface or wildcard (`0.0.0.0:0` for IPv4, `[::]:0` for IPv6). Bind and peer address families must agree. This does not alter admission policy or guarantee firewall/NAT reachability. The automated non-loopback witness uses two participants on one runner, not two computers.
 
-Offline/persistent commands and standalone `anchor serve` do not yet support this inspection surface. `typegen generate --from-snapshot` rejects remote target/bind flags and `--inspect-target`; ordinary offline generation remains unchanged.
+Other inspection support is described below. Standalone `anchor serve` and local commands not listed here do not yet support this surface.
 
-Profile-backed commands reject missing explicit config files and unknown profile names; only a missing implicit default config remains optional. Commands that bypass profile loading, including offline admin previews, retain their existing behavior for now.
+Every dispatched command now validates explicit `--config` / `--profile` selections before work, including offline admin previews and selections from `NET_MESH_CONFIG` / `NET_MESH_PROFILE`. Missing files, unknown profiles, parse failures and permission failures are errors; flags override environment selections. Remove obsolete selectors rather than relying on them being ignored. Commands that do not use configuration still do not load an implicit default just to execute; profile-backed commands allow its absence. Parser-only help/version flags bypass dispatch.
+
+## Inspect local stores and saved typegen input
+
+```sh
+net-mesh netdb tasks ls --store ./state --inspect-target --output json
+net-mesh netdb restore --store ./state --from ./backup.bin --clear --inspect-target
+net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./generated --inspect-target
+```
+
+All NetDB verbs support `--inspect-target`. The result identifies `mode: persistent_store`, the resolved store (`--store` > profile `netdb` > data-directory default), and snapshot source/destination where applicable. Normal dispatch uses the inspected store selection. Saved typegen reports `mode: offline`, source and destination, and rejects explicit remote target/bind flags.
+
+These local operations report unused remote defaults, `identity.state: unused`, null remote target/bind, and `authorization: not_checked`. Inspection reads profile configuration but neither signing identities nor artifact payloads. It does not open, create or clear stores, so nonexistent inputs and outputs can be inspected safely. It is not snapshot/restore preflight, content validation, or a writability guarantee; normal execution retains those checks. Other offline/persistent commands remain follow-up work.
 
 ## `net-mesh transfer`
 

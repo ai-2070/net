@@ -68,6 +68,9 @@ pub enum MemoriesCommand {
 
 #[derive(Args, Debug)]
 pub struct TasksLsArgs {
+    /// Report the resolved store without opening it or reading its contents.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the NetDB persistent directory. Defaults to
     /// `$XDG_DATA_HOME/net/netdb`.
     #[arg(long)]
@@ -81,6 +84,9 @@ pub struct TasksLsArgs {
 
 #[derive(Args, Debug)]
 pub struct MemoriesLsArgs {
+    /// Report the resolved store without opening it or reading its contents.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub store: Option<PathBuf>,
 
@@ -90,6 +96,9 @@ pub struct MemoriesLsArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotArgs {
+    /// Report paths only; do not open the store or write a snapshot.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub store: Option<PathBuf>,
 
@@ -121,6 +130,10 @@ pub struct SnapshotArgs {
 
 #[derive(Args, Debug)]
 pub struct RestoreArgs {
+    /// Report paths only; do not read the snapshot or open/clear the store.
+    /// This is target inspection, not snapshot or restore preflight validation.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub store: Option<PathBuf>,
 
@@ -235,6 +248,9 @@ pub struct MemoriesIdArgs {
 
 #[derive(Args, Debug)]
 pub struct NetdbCommon {
+    /// Report the resolved store without opening or modifying it.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub store: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
@@ -242,7 +258,7 @@ pub struct NetdbCommon {
 }
 
 pub async fn run(
-    cmd: NetdbCommand,
+    mut cmd: NetdbCommand,
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
@@ -254,10 +270,39 @@ pub async fn run(
     // with `netdb = "/srv/netdb"` in `prod` would land in the
     // default `$XDG_DATA_HOME/net/netdb` and write mutations into
     // the wrong store.
-    let profile_netdb = crate::context::resolve_profile(config_path, profile_name)
-        .await?
-        .netdb;
-    let profile_netdb = profile_netdb.as_deref();
+    let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+    let (source, destination) = match &cmd {
+        NetdbCommand::Snapshot(args) => (None, Some(args.out.clone())),
+        NetdbCommand::Restore(args) => (Some(args.from.clone()), None),
+        _ => (None, None),
+    };
+    let (store, inspect) = cmd.store_selection();
+    let provenance = if store.is_some() {
+        "flag"
+    } else if profile.netdb.is_some() {
+        "profile"
+    } else {
+        "default"
+    };
+    let resolved_store = resolve_store_path(store.as_deref(), profile.netdb.as_deref())?;
+    if inspect {
+        let mut view = crate::target::TargetInspection::local(&profile, "persistent_store");
+        view.store = Some(resolved_store);
+        view.source = source;
+        view.destination = destination;
+        view.provenance("store", provenance);
+        if view.source.is_some() {
+            view.provenance("source", "flag");
+        }
+        if view.destination.is_some() {
+            view.provenance("destination", "flag");
+        }
+        return view.emit(output);
+    }
+    // Freeze the same resolved path into the command. Every execution branch
+    // consumes this value, so neither a default nor a profile is reselected.
+    *store = Some(resolved_store);
+    let profile_netdb = profile.netdb.as_deref();
     match cmd {
         NetdbCommand::Tasks(TasksCommand::Ls(args)) => {
             run_tasks_ls(args, output, profile_netdb).await
@@ -295,6 +340,43 @@ pub async fn run(
         NetdbCommand::Snapshot(args) => run_snapshot(args, output, profile_netdb).await,
         NetdbCommand::Restore(args) => run_restore(args, output, profile_netdb).await,
     }
+}
+
+impl NetdbCommand {
+    fn store_selection(&mut self) -> (&mut Option<PathBuf>, bool) {
+        let common = match self {
+            Self::Tasks(TasksCommand::Ls(args)) => return (&mut args.store, args.inspect_target),
+            Self::Memories(MemoriesCommand::Ls(args)) => {
+                return (&mut args.store, args.inspect_target)
+            }
+            Self::Snapshot(args) => return (&mut args.store, args.inspect_target),
+            Self::Restore(args) => return (&mut args.store, args.inspect_target),
+            Self::Tasks(TasksCommand::Create(args)) => &mut args.common,
+            Self::Tasks(TasksCommand::Rename(args)) => &mut args.common,
+            Self::Tasks(TasksCommand::Complete(args) | TasksCommand::Delete(args)) => {
+                &mut args.common
+            }
+            Self::Memories(MemoriesCommand::Store(args)) => &mut args.common,
+            Self::Memories(MemoriesCommand::Retag(args)) => &mut args.common,
+            Self::Memories(
+                MemoriesCommand::Pin(args)
+                | MemoriesCommand::Unpin(args)
+                | MemoriesCommand::Delete(args),
+            ) => &mut args.common,
+        };
+        (&mut common.store, common.inspect_target)
+    }
+}
+
+fn resolve_store_path(
+    store: Option<&std::path::Path>,
+    profile_netdb: Option<&std::path::Path>,
+) -> Result<PathBuf, CliError> {
+    store
+        .or(profile_netdb)
+        .map(std::path::Path::to_path_buf)
+        .or_else(default_netdb_path)
+        .ok_or_else(|| generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>"))
 }
 
 // =========================================================================
@@ -534,15 +616,7 @@ async fn run_restore(
             ));
         }
     };
-    let dest = match args.store.as_deref() {
-        Some(p) => p.to_path_buf(),
-        None => match profile_netdb {
-            Some(p) => p.to_path_buf(),
-            None => default_netdb_path().ok_or_else(|| {
-                generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
-            })?,
-        },
-    };
+    let dest = resolve_store_path(args.store.as_deref(), profile_netdb)?;
     // Capture and validate the input BEFORE any destination mutation. The
     // source can itself live inside the directory --clear removes.
     // This bounds input bytes, not all allocations made by the decoder.
@@ -986,15 +1060,7 @@ async fn open_netdb(
     // `netdb = "/srv/netdb"` in their `prod` profile and
     // `net --profile prod netdb tasks ls` landed in the default
     // path and writes mutations into the wrong store.
-    let path = match store {
-        Some(p) => p.to_path_buf(),
-        None => match profile_netdb {
-            Some(p) => p.to_path_buf(),
-            None => default_netdb_path().ok_or_else(|| {
-                generic("no $XDG_DATA_HOME / data dir available; pass --store <PATH>")
-            })?,
-        },
-    };
+    let path = resolve_store_path(store, profile_netdb)?;
     if create_if_missing {
         tokio::fs::create_dir_all(&path).await.map_err(|e| {
             generic(format!(

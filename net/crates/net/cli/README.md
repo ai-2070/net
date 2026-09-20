@@ -119,7 +119,7 @@ bind        = "0.0.0.0:0" # explicit IPv4 off-host client bind
 
 Operator identity files are authored by `net-mesh identity generate` — ed25519 seed + public key + SHA-256 fingerprint, the same format the deck loads from the maintenance node. Every signed `admin` / `ice` command picks the identity up from the active profile (or `--identity`).
 
-Profile-backed commands reject missing explicitly selected config files and unknown profile names. Only absence of the implicit default config is optional. Offline commands that do not load profiles are not yet covered by this selection check.
+Every dispatched command validates explicitly selected config files and profiles before doing work, including offline commands and selections from `NET_MESH_CONFIG` / `NET_MESH_PROFILE`. Missing files, unknown profiles and malformed/unsafe config files fail; flags override environment selections. Remove an obsolete selector if the command does not need it. Commands that do not use configuration still do not load the implicit default merely to execute; profile-backed commands allow its absence. Parser-only help/version flags remain available without dispatch.
 
 ### Inspect mesh targeting
 
@@ -135,7 +135,17 @@ With a complete profile target, `aggregator ls` now uses remote RPC even without
 
 For these clients, `--bind <IP:PORT>` overrides profile `bind`, then the existing default applies: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. A loopback bind with a non-loopback peer is rejected before attachment; select a reachable local interface or explicitly opt into wildcard binding. IPv6 peers require an IPv6 bind, for example `[::]:0`. No default exposure is widened, and a valid bind does not prove firewall/NAT reachability or authorization. The non-loopback integration test uses two participants on one runner, not two computers.
 
-Inspection is not yet CLI-wide: offline/persistent commands and standalone `anchor serve` are outside this surface. Offline `typegen generate --from-snapshot` rejects remote target/bind flags and `--inspect-target` instead of silently ignoring them.
+All NetDB commands and saved typegen input also support inspection:
+
+```sh
+net-mesh netdb tasks ls --profile prod --inspect-target --output json
+net-mesh netdb restore --store ./state --from ./backup.bin --clear --inspect-target
+net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./generated --inspect-target
+```
+
+NetDB reports `mode: persistent_store`, the store (`--store` > profile `netdb` > data-directory default), and snapshot input/output paths where applicable. Saved typegen reports `mode: offline` and its input/output paths. Both report unused remote defaults and `identity.state: unused`: they do not consume a signing identity. Inspection reads profile configuration but does not open/create/clear a store or read artifact payloads. Missing input/output paths can therefore be inspected. This is resolution inspection, not restore preflight, content validation or proof that a path is writable. Execution retains its existing validation gates. Offline typegen continues to reject explicit remote target/bind flags.
+
+Inspection is not yet CLI-wide: other offline/persistent commands and standalone `anchor serve` remain outside this surface.
 
 ## Exit codes
 

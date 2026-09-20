@@ -122,10 +122,20 @@ fn explicit_local_reads_keep_json_shapes_and_disclose_scope() {
 }
 
 #[test]
-fn admin_offline_preview_needs_neither_local_nor_configuration() {
+fn admin_offline_preview_needs_no_configuration_but_checks_explicit_selection() {
     let dir = config();
     std::fs::write(dir.path().join("config.toml"), "invalid=[").unwrap();
     let out = run(&["admin", "cordon", "1", "--dry-run"], dir.path());
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .args(["admin", "cordon", "1", "--dry-run", "--output", "json"])
+        .assert()
+        .get_output()
+        .clone();
     assert!(out.status.success());
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["dry_run"], true);

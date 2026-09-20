@@ -226,11 +226,7 @@ fn offline_typegen_refuses_remote_only_flags_before_output() {
     let path = config(&dir, "127.0.0.1:9", None);
     let input = dir.path().join("not-read.json");
     let dest = dir.path().join("not-created");
-    for flag in [
-        &["--inspect-target"][..],
-        &["--bind", "0.0.0.0:0"],
-        &["--node-id", "7"],
-    ] {
+    for flag in [&["--bind", "0.0.0.0:0"][..], &["--node-id", "7"]] {
         let mut args = vec![
             "typegen",
             "generate",
@@ -245,7 +241,7 @@ fn offline_typegen_refuses_remote_only_flags_before_output() {
         let out = run(&path, &args);
         assert_eq!(out.status.code(), Some(2));
         assert!(out.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("offline inspection"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("for live typegen"));
         assert!(!dest.exists());
     }
 }

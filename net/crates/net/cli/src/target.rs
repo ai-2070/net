@@ -15,6 +15,10 @@ pub(crate) fn has_profile_target(profile: &crate::config::Profile) -> bool {
 #[derive(Serialize)]
 pub(crate) struct TargetInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<std::path::PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_node_id: Option<u64>,
@@ -131,6 +135,8 @@ pub(crate) async fn inspect(
         },
     };
     Ok(TargetInspection {
+        store: None,
+        source: None,
         destination: None,
         provider_node_id: None,
         mode,
@@ -158,6 +164,42 @@ fn public_fingerprint(key: &[u8]) -> String {
 }
 
 impl TargetInspection {
+    /// Local operations here do not consume a signing identity. In particular,
+    /// an unrelated profile identity must not be read or generated to inspect.
+    pub(crate) fn local(profile: &crate::config::Profile, mode: &'static str) -> Self {
+        Self {
+            store: None,
+            source: None,
+            destination: None,
+            provider_node_id: None,
+            mode,
+            target: None,
+            bind: None,
+            identity: InspectionIdentity {
+                state: "unused",
+                fingerprint: None,
+                reason: Some("this operation does not use a signing identity"),
+            },
+            provenance: [
+                ("mode", "command"),
+                ("identity", "unused"),
+                ("bind", "unused"),
+                ("node_addr", "unused"),
+                ("node_pubkey", "unused"),
+                ("node_id", "unused"),
+                ("psk", "unused"),
+            ]
+            .into_iter()
+            .collect(),
+            ignored_profile_remote_defaults: has_profile_target(profile) || profile.bind.is_some(),
+            authorization: "not_checked",
+        }
+    }
+
+    pub(crate) fn provenance(&mut self, field: &'static str, source: &'static str) {
+        self.provenance.insert(field, source);
+    }
+
     pub(crate) fn explicit_mode(&mut self) {
         self.provenance.insert("mode", "flag");
     }

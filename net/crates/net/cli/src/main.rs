@@ -65,14 +65,9 @@ struct Cli {
     #[arg(long, global = true, env = "NET_MESH_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Named profile within the config file.
-    #[arg(
-        long,
-        global = true,
-        env = "NET_MESH_PROFILE",
-        default_value = "default"
-    )]
-    profile: String,
+    /// Named profile within the config file (default: default).
+    #[arg(long, global = true, env = "NET_MESH_PROFILE")]
+    profile: Option<String>,
 
     /// Read the profile even when it is group/world-accessible or
     /// owned by another user.
@@ -285,7 +280,14 @@ async fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let output = cli.output;
     let config_path = cli.config.as_deref();
-    let profile = cli.profile.as_str();
+    let profile = cli.profile.as_deref().unwrap_or("default");
+    // Explicit selectors (including environment selections and an explicit
+    // "default") are never silently ignored by offline/utility commands.
+    // Do not load implicit configuration here: commands that do not use it
+    // remain independent of unrelated default configuration and credentials.
+    if cli.config.is_some() || cli.profile.is_some() {
+        context::resolve_profile(config_path, profile).await?;
+    }
     let quiet = cli.quiet;
     match cli.command {
         Command::Version => commands::version::run(output).await,

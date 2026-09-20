@@ -8,6 +8,21 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — local target inspection and explicit selector validation
+
+- Every dispatched command validates explicit config/profile selections,
+  including environment selections, before work. Offline commands no longer
+  silently ignore missing/malformed explicit config or unknown profiles.
+  Remove obsolete selectors; implicit config is still not a new dependency
+  for commands that do not use it. Parser-only help/version remain available.
+- All NetDB commands accept `--inspect-target`, reporting the actual store
+  and snapshot input/output paths without opening, creating or clearing them.
+  Store precedence is unchanged: flag, profile, then data-directory default.
+- Saved typegen input now supports `--inspect-target`; explicit remote
+  target/bind flags remain invalid. Local inspection reports unused signing
+  identity/remote defaults and does not read artifact payloads. It is not
+  content validation, restore preflight or a writability guarantee.
+
 ## Unreleased — remote inspection and explicit client binding
 
 - Extend `--inspect-target` to aggregator query/spawn/scale, transfer
