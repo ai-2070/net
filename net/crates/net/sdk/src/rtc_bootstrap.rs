@@ -1351,6 +1351,11 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
             .await
             .is_err()
         {
+            // A leaf can finish its handback immediately after upgrade,
+            // before this first send. It owns the same retirement as EOF.
+            if state.attempts.retire(&token) {
+                state.node.end_bootstrap_dialog(node_id, dialog).await;
+            }
             return;
         }
     }
@@ -1397,7 +1402,9 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
                         reason: e.to_string().into(),
                     })))
                     .await;
-                state.attempts.retire(&token);
+                if state.attempts.retire(&token) {
+                    state.node.end_bootstrap_dialog(node_id, dialog).await;
+                }
                 return;
             }
         }

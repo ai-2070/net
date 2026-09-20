@@ -5172,6 +5172,7 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
             )
             .await;
         let fault_fired = stat_u64(&after, "fault_fired") > 0;
+        let fault_trickle_state = stat_str(&after, "fault_trickle_state");
         let connections_after = stat_u64(&after, "connection_count");
         let built_a_connection = connections_after > connections_before;
         // The handback, on the anchor. A CONDITION with a ceiling far
@@ -5219,13 +5220,11 @@ pub async fn run(cx: Cx<'_>, ledger: &mut Ledger) -> Result<(), String> {
                  its rejection for {GUARD_FAULT_DELAY_MS} ms, and while the attempt was \
                  still in flight the anchor's open-dialog count for this identity ROSE \
                  above its baseline — {dialogs_before} → {dialogs_peak} \
-                 (registered={registered}). The delay is not a tolerance: the anchor \
-                 registers its accepted attempt when it answers the offer, but the thing \
-                 that RETIRES it is the trickle socket's own handler, which only exists \
-                 once that socket has completed its WebSocket upgrade — a socket closed \
-                 while still CONNECTING never reaches it. Rejecting immediately after \
-                 the answer therefore fails before the attempt is retirable, which is a \
-                 fact about the listener and not about the guard. \
+                 (registered={registered}). This proves offer acceptance, NOT a completed \
+                 WebSocket upgrade. Trickle readyState at rejection was \
+                 {fault_trickle_state} (0=CONNECTING, 1=OPEN). Handback must give a \
+                 still-connecting socket a bounded upgrade window before closing it; \
+                 otherwise the anchor's socket cleanup handler never runs. \
                  THE ASSERTION is the HANDBACK, which nothing but the guard performs on \
                  this path: that count must return to at most {dialogs_before} within \
                  20 s — observed {dialogs_after} (handed_back={handed_back}). The \

@@ -312,7 +312,8 @@ async fn metadata_failures_do_not_publish_or_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_fetches_share_remaining_budget_without_partial_publication() {
     use net_sdk::tool::{ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     let mesh = discovery_host().await;
     let calls = Arc::new(Mutex::new(Vec::new()));
     let observed = calls.clone();
@@ -321,8 +322,9 @@ async fn metadata_fetches_share_remaining_budget_without_partial_publication() {
             TOOL_METADATA_FETCH_SERVICE,
             net_sdk::mesh_rpc::Codec::Json,
             move |request| {
-                observed.lock().unwrap().push(request.name.clone());
+                let observed = observed.clone();
                 async move {
+                    observed.lock().await.push(request.name.clone());
                     tokio::time::sleep(Duration::from_millis(1200)).await;
                     let mut descriptor = descriptor();
                     descriptor.tool_id = request.name.clone();
@@ -366,7 +368,7 @@ async fn metadata_fetches_share_remaining_budget_without_partial_publication() {
     assert_eq!(std::fs::read(output).unwrap(), b"old snapshot");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(
-        *calls.lock().unwrap(),
+        *calls.lock().await,
         vec!["a", "b", "c"],
         "each fetch started once; the last uses only the remaining budget"
     );

@@ -52364,7 +52364,7 @@ mod heartbeat_aead_tests {
     /// fix doesn't get reverted before the dispatch path catches up.
     ///
     /// R2-6 moved the packet-build body into the atomic
-    /// [`MeshNode::try_publish_to_peer`] delegate (`publish_to_peer` is
+    /// [`MeshNode::try_publish_to_peer_bound`] delegate (`publish_to_peer` is
     /// now a thin `Result`-flattening wrapper), so the pin scans there —
     /// that is where the wire packet, and thus the `reliable` flag, is
     /// built.
@@ -52372,17 +52372,13 @@ mod heartbeat_aead_tests {
     fn publish_to_peer_propagates_reliable_to_packet_flags() {
         let src = include_str!("mesh.rs");
         let start = src
-            .find("async fn try_publish_to_peer(")
-            .expect("try_publish_to_peer must exist");
-        // Round down to a char boundary — the source has multibyte
-        // box-drawing characters in doc comments, and a fixed-byte
-        // window can land mid-UTF-8 sequence after edits to the
-        // surrounding code shift offsets.
-        let mut scan_end = (start + 6000).min(src.len());
-        while scan_end < src.len() && !src.is_char_boundary(scan_end) {
-            scan_end += 1;
-        }
-        let body = &src[start..scan_end];
+            .find("async fn try_publish_to_peer_bound(")
+            .expect("try_publish_to_peer_bound must exist");
+        // Scan the actual method, not a fixed byte window that silently
+        // stops before packet construction when admission logic grows.
+        let tail = &src[start..];
+        let end = tail.find("\n    }").expect("method must end");
+        let body = &tail[..end];
 
         assert!(
             body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
