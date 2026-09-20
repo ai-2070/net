@@ -1,0 +1,64 @@
+net/crates/net/docs/cli/TYPEGEN.md
+  s_38828de26a56bb::t_14e82233559dac 85-91
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_38828de26a56bb::t_3ea22c145bd04c 281-282
+  s_38828de26a56bb::t_1b21593a80eead 4128-4138,4142-4147,4149-4159,4288-4293,4298-4300,4318-4326,4333-4337,4339-4341,4527-4532
+  s_38828de26a56bb::t_be1604a598aee4 28-30,2011,2137-2139,4307
+  s_38828de26a56bb::t_03dd31f61bff24 1668-1670,4007-4008
+  s_38828de26a56bb::t_bf42e0eb48be49 4009-4013,4094,4102,4139-4141,4148,4285-4287,4317,4327-4332,4338,4342
+  s_38828de26a56bb::t_9559e7915bb344 4284
+go/nrpc_large_response_vectors_test.go
+  s_38828de26a56bb::t_6ef06e1156e188 1-59
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_38828de26a56bb::t_a019407e344a0f 3136,3142,3149,3153,3729-3730,5768,5908,6005-6008,6010-6020
+  s_38828de26a56bb::t_03dd31f61bff24 3790-3792
+  s_38828de26a56bb::t_b3e5dc338a5722 7089-7126
+  s_38828de26a56bb::t_9503f47294eb93 7127
+  s_38828de26a56bb::t_1b21593a80eead 2997-3004,3150-3152,3723-3728,5902-5907
+  s_38828de26a56bb::t_6174a7f21ec330 6009
+  s_38828de26a56bb::t_6956b7bc9e3774 6021
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_large_response.json
+  s_38828de26a56bb::t_b942fc0985434a 1-47
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  s_38828de26a56bb::t_3ea22c145bd04c 66,250,287
+net/crates/net/tests/integration_nrpc_mesh.rs
+  s_38828de26a56bb::t_055aac22332492 128,158-159,171-172,179,190
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_14e82233559dac 171
+net/crates/net/bindings/node/test/large_response_vectors.test.ts
+  s_38828de26a56bb::t_76decf8bb0fe6d 1-31
+net/crates/net/src/adapter/net/mesh.rs
+  s_38828de26a56bb::t_1b21593a80eead 41718-41726,41777-41778,41785-41814
+  s_38828de26a56bb::t_a019407e344a0f 41727-41738,41774-41776,41779-41784
+  s_38828de26a56bb::t_967edbf9d393b9 41717
+net/crates/net/docs/NRPC_LARGE_RESPONSES.md
+  s_38828de26a56bb::t_e3c10825dd526b 1-45
+net/crates/net/src/adapter/net/cortex/rpc_large_response.rs
+  s_38828de26a56bb::t_3ea22c145bd04c 137
+  s_38828de26a56bb::t_bf42e0eb48be49 1-3,9-16,24-25,39-70,74-76,82-83,87-94,98-99,103,108,116,123,127-131,135-136,146-148
+  s_38828de26a56bb::t_1b21593a80eead 4-8,17-23,26-30,35-38,71-73,77-81,84-86,95-97,100-102,104-107,109-115,117-122,124-126,132-134,138-145
+  s_38828de26a56bb::t_52bcc584224486 149-152,194-217,228-229,233-278,282-287,291-303,311-323,328-335,343-359
+  s_38828de26a56bb::t_be1604a598aee4 31-34
+  s_38828de26a56bb::t_4381803410efca 153-158,161-168,174-179,192-193,218-227,230-232,279-281,288-290,304-310,324-327,336-342
+  s_38828de26a56bb::t_9dbf65b6059223 159-160,169-173,180-191
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_14e82233559dac 11-17,23-24
+net/crates/net/bindings/python/tests/test_large_response_vectors.py
+  s_38828de26a56bb::t_76decf8bb0fe6d 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5ead88e8a6356e20c0098a4eb4d67e52ece79565",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
