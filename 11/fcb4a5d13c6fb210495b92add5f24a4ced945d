@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/mesh_rpc_large_response_tests.rs
+  s_38828de26a56bb::t_6a2a800d304c85 1-19,21-22,24-59,61-67,69-82,84-87,89,91-115,119-132,134-135,137-150,152-197,199-200,214-229,231-233,236-253,264-293,295-317
+  s_38828de26a56bb::t_a5fec0e8257be9 136
+  s_38828de26a56bb::t_c8d6f758340926 318-320,327-328,331-334,343-344,346,350-353,357-358,363-364,368-371,375-376,380-383,390-392,406
+  s_38828de26a56bb::t_9bdcdeaedf6389 202-210,321-326,329-330,335-342,347-349,354-356,359-362,365-367,372-374,377-379,384-389,393-405
+  s_38828de26a56bb::t_8e6aac37f3cb20 345
+  s_38828de26a56bb::t_4c1ab3c0f29037 68,88,234-235
+  s_38828de26a56bb::t_af78dd911b5265 117-118,198,201,211-213,230,254-263
+  s_38828de26a56bb::t_e0735d1e869be0 20,23,60,83,90,116,133,151,294
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_38828de26a56bb::t_6a2a800d304c85 4259-4263,4265-4267
+  s_38828de26a56bb::t_8b0f636fcba69a 4264
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_38828de26a56bb::t_9a16daaa217609 6014
+net/crates/net/docs/NRPC_LARGE_RESPONSES.md
+  s_38828de26a56bb::t_8d15caeb22a18f 30-33,37-39
+net/crates/net/src/adapter/net/mesh.rs
+  s_38828de26a56bb::t_738679f0581d54 60550-60553
+  s_38828de26a56bb::t_9a16daaa217609 19627-19630,19636-19637,41789-41790
+  s_38828de26a56bb::t_9bdcdeaedf6389 19631-19635
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "11fcb4a5d13c6fb210495b92add5f24a4ced945d",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
