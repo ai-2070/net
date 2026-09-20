@@ -1,0 +1,19 @@
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_eb3d90fdf51c44::t_1e243581d64423 4,7,11,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5373daf727cf5143c98f48ab64f0ef1e2a44988e",
+  "prompts": {},
+  "sessions": {
+    "s_eb3d90fdf51c44": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bfae-f163-7301-ac99-f0cd8300e4be",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
