@@ -1,0 +1,38 @@
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_a834aa0853b99c 49-53
+net/crates/net/cli/src/commands/transfer.rs
+  s_38828de26a56bb::t_78fc7e70a383f2 195-200,205-212
+  s_38828de26a56bb::t_3f904124579283 100-102,139-141,194,201-204,213-218
+net/crates/net/cli/src/commands/forwarding.rs
+  s_38828de26a56bb::t_3f904124579283 51-53,115,117-118,120,124-128,134-143
+  s_38828de26a56bb::t_78fc7e70a383f2 121-123,129-133
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_a834aa0853b99c 11-20
+net/crates/net/cli/src/commands/mcp.rs
+  s_38828de26a56bb::t_78fc7e70a383f2 251-256,258-260
+  s_38828de26a56bb::t_3f904124579283 65-67,78-80,130,257,261-272
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_a834aa0853b99c 148-150
+net/crates/net/cli/tests/local_target_inspection.rs
+  s_38828de26a56bb::t_4319752003642e 30-32,37-41,51-52,61-68,72-76,82-88,93-94,99,108-115,415
+  s_38828de26a56bb::t_78fc7e70a383f2 33-36,42-50,53-60,69-71,77-81,89-92,95-98,100-107
+  s_38828de26a56bb::t_78dd9657aec76e 29,358-364,370-381,387-404,413-414
+  s_38828de26a56bb::t_3e97e78568ce06 365-369,382-386,405-412
+  s_38828de26a56bb::t_5dd0d83f0de8b2 416
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d3f64c80a460569ba74e2d3ec33ce81f419ca61e",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
