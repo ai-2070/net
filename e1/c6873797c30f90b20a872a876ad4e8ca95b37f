@@ -1,0 +1,36 @@
+net/crates/net/.config/nextest.toml
+  s_38828de26a56bb::t_adb48c03ef0528 34-38
+.github/workflows/ci.yml
+  s_38828de26a56bb::t_e453413590806d 5113,5116
+net/crates/net/src/adapter/net/behavior/org_authority.rs
+  s_38828de26a56bb::t_f174150880ed65 1930,1995,2043
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_38828de26a56bb::t_f174150880ed65 1095
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_38828de26a56bb::t_f174150880ed65 51-53
+net/crates/net/src/adapter/net/behavior/enrollment_storage.rs
+  s_38828de26a56bb::t_a2f9410d9851a2 59,71-74,76-79
+  s_38828de26a56bb::t_f174150880ed65 1-11,21-58,60-61,65-67,69-70,75,80-81,84-88,94-103,107-108,114-120,124,128,134-142,154,166,170-178,182-186,189-196,204-222,232-234,266-270,275-294,300,308,313,318-326,368-372,374-377,382-388
+  s_38828de26a56bb::t_a32ab95fa5df92 155-158,163-165
+  s_38828de26a56bb::t_55038cc2b9ace7 159-162,359-362
+  s_38828de26a56bb::t_7d93218e0a4048 262-265
+  s_38828de26a56bb::t_e453413590806d 223-224,230-231,243-244,249-250,255,259-261,327-333,340-351,357-358,363
+  s_38828de26a56bb::t_085b1b5baa605b 12-20,62-64,68,82-83,89-93,104-106,109-113,121-123,125-127,129-133,143-153,167-169,179-181,187-188,197-203,225-228,235-242,245-248,251-254,256-258,271-274,295-299,301-307,309-312,314-317,334-339,352-356,364-367,373,378-381
+  s_38828de26a56bb::t_f4d3f18413829d 229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e1c6873797c30f90b20a872a876ad4e8ca95b37f",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
