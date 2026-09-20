@@ -31,7 +31,8 @@ successful local socket send.
 ### 1. Explicit refusal at the existing single-packet boundary
 
 Implemented in `0180e9b66`; execution evidence and outstanding validation are
-recorded in [the V2 plan](NET_CLI_PLAN_V2.md). Unit 2 remains unimplemented.
+recorded in [the V2 plan](NET_CLI_PLAN_V2.md). Unit 2 now has an initial
+implementation; its remaining acceptance work is recorded below.
 
 Guard direct publish before opening/charging its stream. Count event framing,
 not just application bytes. Replace an oversized RESPONSE with a small terminal
@@ -45,6 +46,34 @@ request; CLI preservation of existing snapshot/no generated directory.
 This unit improves failure semantics only and does **not** close this brief.
 
 ### 2. Negotiated bounded large-response delivery
+
+**Initial implementation: `5ead88e8a` (2026-09-20), acceptance still open.**
+Request bit 6 opts native unary calls in before proof signing. Existing RESPONSE
+envelopes carry one reserved header containing total encoded length and fragment
+index; 4096-byte slices reconstruct the original status/headers/body. Limits are
+1 MiB encoded response, 256 fragments and 8 MiB incomplete payload storage per
+caller. The packet cap is unchanged. Fragments bind to the pending call's peer
+and session; response sends wait at most one second for packet credit, with no
+roster fallback. Pending-call cleanup releases partial storage, and calls watch
+session turnover even without a deadline. See the
+[wire/implementation contract](../../../net/crates/net/docs/NRPC_LARGE_RESPONSES.md).
+
+Evidence: actual two-node native UDP succeeds at the old single-packet boundary,
+boundary+1, 22 KB and the 1 MiB encoded maximum; maximum+1 is explicit Internal,
+with one handler invocation per call. Live metadata capture/offline regeneration
+now uses roughly 22 KB schemas; over-limit failures still preserve outputs.
+Unit witnesses cover reordered/duplicate/contradictory pieces, invalid bounds,
+wrong peer/call/session, cancellation cleanup, aggregate exhaustion/reuse and
+old-caller refusal. Shared Rust/TS/Python/Go fixtures pin the byte layout, not
+cross-binding network interoperability. Full executed counts are in V2.
+
+**Next:** deterministic partial-transfer deadline/session-teardown tests through
+the live call path, queue saturation and stalled-credit failure/cleanup tests,
+and sender lifecycle review. The current bounded drainer can drop pieces under
+load and its one-second credit bound is per packet, not a transfer-wide server
+deadline; do not mark the brief accepted until that behavior is reviewed and
+the missing witnesses land. Then complete the broad feature/rustdoc gates,
+two-node CI journey and exact-head platform acceptance. V3 remains unstarted.
 
 Prefer a response-specific extension scoped to an already-pending unary call
 over widening the general UDP fragment ingress as a side effect of CLI work.
