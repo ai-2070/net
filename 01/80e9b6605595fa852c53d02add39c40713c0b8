@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_38828de26a56bb::t_6c14a6a32be10d 41723-41733
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  s_38828de26a56bb::t_34a9af590ea05d 222,287
+  s_38828de26a56bb::t_7ce7870bc16f1f 249-251
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_38828de26a56bb::t_6c14a6a32be10d 2996,3172-3180,3186-3200
+  s_38828de26a56bb::t_7ce7870bc16f1f 3181-3185
+  s_38828de26a56bb::t_00bc05d46361de 3201-3202
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_f98d9ceb1da7e5 171
+net/crates/net/docs/cli/TYPEGEN.md
+  s_38828de26a56bb::t_f98d9ceb1da7e5 88-89
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_f98d9ceb1da7e5 11-18
+net/crates/net/tests/integration_nrpc_mesh.rs
+  s_38828de26a56bb::t_34a9af590ea05d 127-134,140-145,154-158,170-173,177-179,184-197,218-220,230-233
+  s_38828de26a56bb::t_7ce7870bc16f1f 135-139,146-153,159-169,174-176,180-183,198-217,221-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0180e9b6605595fa852c53d02add39c40713c0b8",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
