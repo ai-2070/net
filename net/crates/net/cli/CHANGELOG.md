@@ -8,6 +8,12 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — subnet artifact inspection
+
+- Offline subnet key generation, issuance, all four control-fact types and
+  artifact inspection accept `--inspect-target`. Resolve the signer and paths
+  without generating keys, signing credentials or decoding issuer grants.
+
 ## Unreleased — organization artifact inspection
 
 - All five `org` verbs accept `--inspect-target`. Keygen does not generate

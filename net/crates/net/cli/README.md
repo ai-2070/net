@@ -157,7 +157,9 @@ Identity `generate/show/fingerprint/revoke` and `cap announce` also support `--i
 
 All five `org` verbs support `--inspect-target`. Keygen reports an unavailable identity and either an explicit destination or an `org-<generated-org-id-prefix>.toml` filename pattern, without generating a key. Issuance/grant inspection reads the explicit org key through its normal permission/parse gate and reports the signer's public fingerprint and output path. Discovery grants also report `audience_destination` without minting an audience secret. Profile identity/remote defaults are unused. Grant `--force` refusal and discovery/audience-output pairing still apply; inspection does not check all grant policy, TTL, aliases or output permissions and does not approve issuance. Normal publication safeguards are unchanged.
 
-Inspection is not yet CLI-wide: subnet/bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
+Subnet `keygen`, `issue-direct`, `issue-issuer`, `issue-delegated`, all four `issue-control-fact` subcommands and `inspect` support `--inspect-target`. Keygen reports an explicit destination or a runtime filename pattern without generating a key. Issuance loads the selected root/issuer key through its normal permission/parse gate and reports the public signer fingerprint and destination. Delegated issuance also reports `issuer_grant_source` without reading it. Artifact `inspect --inspect-target` reports only the source path without decoding it. Profile identity/remote defaults are unused. Inspection does not validate grant/signing authority, delegation containment, policy, TTL, path aliases or output permissions; normal issuance keeps those checks and publication safeguards.
+
+Inspection is not yet CLI-wide: bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

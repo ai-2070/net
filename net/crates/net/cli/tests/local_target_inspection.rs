@@ -27,6 +27,218 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn subnet_inspection_resolves_all_offline_artifacts_without_issuance() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let key = dir.path().join("subnet.toml");
+    let artifact = dir.path().join("credential.bin");
+    let grant = dir.path().join("issuer.bin");
+    for explicit in [false, true] {
+        let mut args = vec!["subnet", "keygen", "--inspect-target"];
+        if explicit {
+            args.extend(["--out", key.to_str().unwrap()]);
+        }
+        let out = run(&args);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["identity"]["state"], "unavailable");
+        if explicit {
+            assert_eq!(view["destination"], key.to_str().unwrap());
+        } else {
+            assert!(view["destination_pattern"]
+                .as_str()
+                .unwrap()
+                .contains("<generated-entity-id-prefix>"));
+        }
+        assert!(!key.exists());
+    }
+    assert!(run(&["subnet", "keygen", "--out", key.to_str().unwrap()])
+        .status
+        .success());
+    let key_bytes = std::fs::read(&key).unwrap();
+    let data: toml::Value = toml::from_str(std::str::from_utf8(&key_bytes).unwrap()).unwrap();
+    let public = data["entity_id_hex"].as_str().unwrap();
+    let hash = Sha256::digest(hex::decode(public).unwrap());
+    let fingerprint = hash[..8]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let commands = [
+        vec![
+            "issue-direct",
+            "--subject",
+            public,
+            "--rights",
+            "attach",
+            "--authority",
+            public,
+        ],
+        vec![
+            "issue-issuer",
+            "--issuer",
+            public,
+            "--max-rights",
+            "attach",
+            "--authority",
+            public,
+        ],
+        vec![
+            "issue-delegated",
+            "--subject",
+            public,
+            "--rights",
+            "attach",
+            "--issuer-grant",
+            grant.to_str().unwrap(),
+        ],
+        vec![
+            "issue-control-fact",
+            "descriptor",
+            "--authority",
+            public,
+            "--topology-epoch",
+            "0",
+            "--revision",
+            "1",
+        ],
+        vec![
+            "issue-control-fact",
+            "gateway-advertisement",
+            "--authority",
+            public,
+            "--topology-epoch",
+            "0",
+            "--revision",
+            "1",
+            "--gateway",
+            public,
+            "--gateway-node",
+            "1",
+        ],
+        vec![
+            "issue-control-fact",
+            "export-policy",
+            "--authority",
+            public,
+            "--topology-epoch",
+            "0",
+            "--revision",
+            "1",
+            "--channel",
+            "test",
+        ],
+        vec![
+            "issue-control-fact",
+            "revocation-floor",
+            "--authority",
+            public,
+            "--topology-epoch",
+            "0",
+            "--revision",
+            "1",
+            "--minimum-generation",
+            "2",
+        ],
+    ];
+    for existing in [false, true] {
+        if existing {
+            config(&artifact, "PRIVATE_SENTINEL");
+            config(&grant, "PRIVATE_SENTINEL invalid grant");
+        }
+        for command in &commands {
+            let delegated = command[0] == "issue-delegated";
+            let mut args = vec!["--config", cfg.to_str().unwrap(), "subnet"];
+            args.extend(command.iter().copied());
+            args.extend([
+                if delegated {
+                    "--issuer-key"
+                } else {
+                    "--root-key"
+                },
+                key.to_str().unwrap(),
+                "--scope",
+                "global",
+                "--out",
+                artifact.to_str().unwrap(),
+                "--force",
+                "--inspect-target",
+            ]);
+            let out = run(&args);
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(view["identity"]["fingerprint"], fingerprint);
+            assert_eq!(view["source"], key.to_str().unwrap());
+            assert_eq!(view["destination"], artifact.to_str().unwrap());
+            assert_eq!(view["authorization"], "not_checked");
+            assert_eq!(view["ignored_profile_remote_defaults"], true);
+            if delegated {
+                assert_eq!(view["issuer_grant_source"], grant.to_str().unwrap());
+            } else {
+                assert!(view.get("issuer_grant_source").is_none());
+            }
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains(data["seed_hex"].as_str().unwrap())
+            );
+            assert_eq!(artifact.exists(), existing);
+            if delegated {
+                // The actual operation must still read and validate the grant.
+                assert!(!run(&args[..args.len() - 1]).status.success());
+            }
+        }
+        let out = run(&[
+            "subnet",
+            "inspect",
+            grant.to_str().unwrap(),
+            "--inspect-target",
+        ]);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["source"], grant.to_str().unwrap());
+        assert_eq!(view["identity"]["state"], "unused");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "PRIVATE_SENTINEL"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&grant).unwrap(),
+        "PRIVATE_SENTINEL invalid grant"
+    );
+    assert_eq!(std::fs::read(&key).unwrap(), key_bytes);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+    config(&key, "seed_hex = 'PRIVATE_SENTINEL'");
+    let out = run(&[
+        "subnet",
+        "issue-direct",
+        "--root-key",
+        key.to_str().unwrap(),
+        "--authority",
+        public,
+        "--subject",
+        public,
+        "--scope",
+        "global",
+        "--rights",
+        "attach",
+        "--out",
+        artifact.to_str().unwrap(),
+        "--inspect-target",
+    ]);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE_SENTINEL"));
+}
+
+#[test]
 fn org_inspection_reports_signer_and_outputs_without_issuing_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
