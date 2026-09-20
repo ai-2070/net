@@ -1,0 +1,53 @@
+net/crates/net/src/adapter/net/cortex/checkpoint.rs
+  s_38828de26a56bb::t_0ddd231c9e38c8 1-68,72-92,97-135
+  s_38828de26a56bb::t_b73ced8fc4016f 69-71,93-96
+net/crates/net/tests/integration_netdb.rs
+  s_38828de26a56bb::t_2e6d55db18e887 28-34,38-41,48-54,59-65,92-96,105-111,120-123,127-136,139-149
+  s_38828de26a56bb::t_34feda7e29709c 17-27,35-37,42-47,55-58,66-91,97-104,112-119,124-126,137-138,150-154
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_38828de26a56bb::t_6244e295912538 76-87,91-98,154,163,440-450,454-455,462-465
+  s_38828de26a56bb::t_b73ced8fc4016f 88-90,151-153,155-162,431-439,456-461
+  s_38828de26a56bb::t_03c82136cfe64f 75,139-140,422-423
+  s_38828de26a56bb::t_aed23646853500 466
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_267fedce0d05de 13-28
+net/crates/net/src/adapter/net/redex/manager.rs
+  s_38828de26a56bb::t_0ddd231c9e38c8 212-226
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_38828de26a56bb::t_0ddd231c9e38c8 21-22
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_38828de26a56bb::t_03c82136cfe64f 74,116-117,419-420
+  s_38828de26a56bb::t_6d5ce8e74a27b4 75-86,90-97,131,140,437-447,451-452,459-462
+  s_38828de26a56bb::t_b73ced8fc4016f 87-89,128-130,132-139,428-436,453-458
+  s_38828de26a56bb::t_aed700b6337d29 463
+net/crates/net/src/adapter/net/netdb/db.rs
+  s_38828de26a56bb::t_1b603b75701aaf 33-45
+  s_38828de26a56bb::t_267fedce0d05de 293-296,305-314
+net/crates/net/cli/tests/netdb_restore_preflight.rs
+  s_38828de26a56bb::t_72ece729044b23 590-603,613-628,637-642,646-668,671-678,691-697
+  s_38828de26a56bb::t_7bcdf306e6817c 683,699-705,712,721-728,735-740,746-753
+  s_38828de26a56bb::t_3b949ad005af81 706-711,713-720,729-734,741-745
+  s_38828de26a56bb::t_7340daf89f7b17 589,609-612,629-636,643-645,669-670,679-682,684-690,698
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_38828de26a56bb::t_59f95bc9033ec7 3,183-185
+  s_38828de26a56bb::t_85c728a5469894 186
+net/crates/net/cli/src/commands/netdb.rs
+  s_38828de26a56bb::t_b73ced8fc4016f 704-706,708-709
+  s_38828de26a56bb::t_1b603b75701aaf 592-593,707,711-712
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0d96833561520488c868d343d4280b5dd32352c8",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
