@@ -1,13 +1,14 @@
 # Exported symbol set of the single libnet cdylib (bindings/go/net-ffi).
 # Checked by .github/scripts/check-ffi-exports.py; regenerate with --update
 # ONLY for an intended C-ABI change, and say so in that commit.
-# generated-at: 4738f06c5296addd6384af68b78e30d5535cea98
+# generated-at: 9ab4a22c6d61a28e8957ddd4ce655667f0abf92f
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 570
+# count: 572
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
+net_blob_ref_hash
 net_blob_register_callback_adapter
 net_blob_register_fs_adapter
 net_blob_resolve
@@ -269,6 +270,7 @@ net_mesh_blob_adapter_overflow_active
 net_mesh_blob_adapter_overflow_config
 net_mesh_blob_adapter_overflow_enabled
 net_mesh_blob_adapter_prometheus_text
+net_mesh_blob_adapter_publish
 net_mesh_blob_adapter_set_overflow_config
 net_mesh_blob_adapter_set_overflow_enabled
 net_mesh_blob_adapter_store
