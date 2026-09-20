@@ -1,0 +1,73 @@
+net/crates/net/cli/tests/remote_inspection.rs
+  s_38828de26a56bb::t_2994d8611fd050 346-350
+  s_38828de26a56bb::t_d3cc826802f763 187-189,203-208,212-213,219-220
+  s_38828de26a56bb::t_5789b53da2e21c 176-186,214-218
+  s_38828de26a56bb::t_068835d51ba07f 222-228,244-259,265-276,280-282,290-299,304-308,316-319,339-345,354,359-363,380-381,387-388,401,410-411
+  s_38828de26a56bb::t_8133d5bd28cc0d 1-51,53-60,64-73,75-84,86-93,95-105,107-113,115-164,167-175,190-197,199-202,209-211,221
+  s_38828de26a56bb::t_cf2f41700203ca 61-62
+  s_38828de26a56bb::t_f04fb044ad77f1 302-303
+  s_38828de26a56bb::t_932063edf47d31 229-243,260-264,277-279,283-289,300-301,309-315,320-338,351-353,355-358,364-379,382-386,389-400,402-409
+  s_38828de26a56bb::t_cb648fd5d9737a 52,63,74,85,94,106,114,165-166,198
+net/crates/net/cli/src/commands/anchor.rs
+  s_38828de26a56bb::t_71a53d5928f45f 386,388-393,395-399,461,463-468,470-474
+  s_38828de26a56bb::t_86bc1d9a43bef0 377,385,394,457,460,469
+net/crates/net/cli/src/commands/aggregator.rs
+  s_38828de26a56bb::t_dd4967f09431fe 78-87
+  s_38828de26a56bb::t_6da63ca8087be9 406,414-416
+  s_38828de26a56bb::t_1fce1992177f60 45-48
+  s_38828de26a56bb::t_6772d1cf779b10 367
+  s_38828de26a56bb::t_321ac4b816d876 51-59
+  s_38828de26a56bb::t_c2ff2c19b2c282 43,376,378,400-405,407-410,412-413,417
+  s_38828de26a56bb::t_a7ad6764f76a43 300-305,307-311,493-498,500-503,541-546,548-551
+  s_38828de26a56bb::t_846fa33ad1cdec 306,379,411,499,547
+net/crates/net/cli/src/main.rs
+  s_38828de26a56bb::t_321ac4b816d876 33
+net/crates/net/cli/src/config.rs
+  s_38828de26a56bb::t_321ac4b816d876 115-119
+net/crates/net/cli/src/commands/transfer.rs
+  s_38828de26a56bb::t_9a0d334dcb3b8d 489-490,493-498,501
+  s_38828de26a56bb::t_a7ad6764f76a43 216-221,223-228,374-379,381-386
+  s_38828de26a56bb::t_24b6d5dd965ebf 510,517,519-522,545,552,554-557,582,589,591-594
+  s_38828de26a56bb::t_097e05d46385a7 222,380
+net/crates/net/cli/src/context.rs
+  s_38828de26a56bb::t_2994d8611fd050 309,313,316-318
+  s_38828de26a56bb::t_321ac4b816d876 38,47,310,323-324,401,419-437,443-461,463-466,468-471,473-481
+  s_38828de26a56bb::t_96dd749dae7214 462
+  s_38828de26a56bb::t_2e4434b1f394d3 467
+  s_38828de26a56bb::t_7b6591ea6d321d 472
+net/crates/net/cli/src/commands/wrap.rs
+  s_38828de26a56bb::t_185035aaf62a86 32,149-155,158-167,170-172,190
+  s_38828de26a56bb::t_99fcb81ff80aca 168
+net/crates/net/cli/src/commands/mcp.rs
+  s_38828de26a56bb::t_185035aaf62a86 38,123,130,138-141,143-149,151-154,172
+  s_38828de26a56bb::t_6772d1cf779b10 120-122
+  s_38828de26a56bb::t_f98ceb9925a152 142,150
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_38828de26a56bb::t_dd4967f09431fe 198-203,205,211-212,215-218,303,309-310,312-316,431,437-439,448-464
+  s_38828de26a56bb::t_d3cc826802f763 430
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_9008be35cc681e 29,31-35
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_9008be35cc681e 77,117,124,134-138
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_9008be35cc681e 11-23
+net/crates/net/cli/src/target.rs
+  s_38828de26a56bb::t_6da63ca8087be9 161-164
+  s_38828de26a56bb::t_ad69d937234580 1-160,165-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3f0be1c123716eb0740cfc4c2a0242262491dd32",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
