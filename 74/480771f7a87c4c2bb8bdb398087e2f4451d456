@@ -1,0 +1,45 @@
+net/crates/net/cli/src/deadline.rs
+  s_38828de26a56bb::t_2a506224e6be67 37-47
+net/crates/net/cli/tests/transfer_cli_admin.rs
+  s_38828de26a56bb::t_42b87699f53290 113-119
+net/crates/net/cli/tests/automation_contract.rs
+  s_38828de26a56bb::t_d67bdc9af020b1 77
+  s_38828de26a56bb::t_f3d2ea1e807f77 73,90,192-195,207-222,224-229,236-240,244-246
+  s_38828de26a56bb::t_df65fccf1d7be2 189-191,196-206,223,230-235,241-243,247-248
+  s_38828de26a56bb::t_a8b9cba815e8a0 114-118
+  s_38828de26a56bb::t_5796867621eff4 135-148,152-163,165-170,178-181
+  s_38828de26a56bb::t_2203be0673c035 124-134,149-151,164,171-177,182-188
+  s_38828de26a56bb::t_42b87699f53290 74-76,78-89,91-107
+  s_38828de26a56bb::t_791005db70aa56 123
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_f3d2ea1e807f77 97
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_38828de26a56bb::t_2a506224e6be67 177,181,184,197,318
+  s_38828de26a56bb::t_518f0e93da2c6d 217-227,233-234,320-330,336-338
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_f3d2ea1e807f77 17
+net/crates/net/cli/src/main.rs
+  s_38828de26a56bb::t_2a506224e6be67 286-287,295-301,305-309,319,328,369,380
+  s_38828de26a56bb::t_2203be0673c035 126-128
+  s_38828de26a56bb::t_55d30c7fc40f6e 372-379
+  s_38828de26a56bb::t_e5fec6a089c2fb 370-371
+  s_38828de26a56bb::t_71bc35797c032b 310,312,314-316
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_f3d2ea1e807f77 11-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "74480771f7a87c4c2bb8bdb398087e2f4451d456",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
