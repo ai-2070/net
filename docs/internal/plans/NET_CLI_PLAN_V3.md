@@ -373,6 +373,114 @@ Locally committed, not pushed. Next: close the durable receipt-store contract
 and bootstrap/control feature boundary before wiring this policy into issuance;
 do not mistake this initial primitive for completed V3-0 or V3-1.
 
+#### Durable receipt-store contract — next V3-1 boundary
+
+Source review after `c013da7d5` confirms that SDK `devices.rs::save_atomic`
+and `revocation.rs::save_atomic` are not sufficient templates for this secret
+store: their parent-directory flush is best-effort. Core
+`behavior/org_revocation.rs::write_atomic_phased` distinguishes pre-publication
+and post-rename uncertainty, uses a fresh create-new temporary file, requires
+Unix parent-directory flush, and uses Windows write-through replacement.
+Core `behavior/org_authority.rs` owns secure directory creation/validation,
+including inheritable Windows DACL rules. Those helpers are internal, not a
+ready-made public SDK receipt-store API. Do not copy the weaker inventory writer
+or provision a fake organization merely to obtain a protected directory.
+
+**Selected storage shape:** a bounded, versioned snapshot owned by one live
+service, rather than a database service or a generic transaction framework.
+Keep the semantic ledger in proposed `sdk/src/enrollment_store.rs`. The next
+code-bearing prerequisite is a narrow reusable protected-file owner around the
+existing core I/O/security mechanisms, with its own Unix/Windows tests and no
+changes to organization revocation semantics. The precise extraction/API must
+be reviewed before widening internal helpers; do not export arbitrary unchecked
+paths or a write primitive that silently creates insecure parent directories.
+
+**Owner and transaction rules:**
+
+- Initialization is explicit and creates a protected directory, stable lock,
+  issuer-bound store header and empty snapshot. Ordinary open requires them;
+  missing/corrupt/unsupported state never becomes an empty ledger. A full issuer
+  mismatch refuses open. Root keys are not serialized into this store.
+- Hold an exclusive, nonblocking lifetime lock on the stable sidecar. A second
+  owner refuses startup rather than waiting indefinitely. Keep the handle alive
+  through all tasks and shutdown; never unlink the lock to recover a stale PID.
+  The eventual local control endpoint belongs to this owner. Other CLI processes
+  do not read credential-bearing snapshots or write their own copies.
+- Within the owner, serialize state transitions under a short mutex. Build and
+  validate the candidate from the current revision, persist it, then publish its
+  in-memory view and answer. Do not hold this mutex while waiting for a human or
+  network operation. Revision/counter exhaustion is an error, never wrapping.
+- A pre-rename failure returns an error and leaves the previous committed view.
+  A post-rename durability failure places the owner in an **uncertain** state:
+  no issue/recovery response or further mutation until explicit reopen/recovery
+  has established which complete snapshot is durable. Do not report rollback or
+  retry issuance blindly. No secret response or external credential publication
+  may occur before the corresponding successful durability boundary.
+- On restart, acquire the lifetime lock, validate security/header/bounds and the
+  complete snapshot, and establish durability before serving. In this single-file
+  design, an interrupted unpublished mutation may recover as the previous or
+  candidate snapshot; neither result may forget an earlier acknowledged commit.
+  Do not automatically merge a backup or reconstruct spent records from inventory.
+  This is crash consistency, not protection against an administrator restoring an
+  old disk image. Org/subnet issuance with external effects needs explicit staged
+  receipts in V3-2; this snapshot does not claim distributed atomicity.
+
+**Minimal record and transitions:** store issuer/invitation ID, digest of the
+complete signed invite, immutable `InvitationPolicy`, exact scope and optional
+intended subject. Claim binds full device `EntityId` plus canonical intent digest.
+Approval is for that exact claim; a later approval message cannot replace it.
+Keep public operation IDs distinct from bearer invitation material.
+
+| Current state | Allowed transition | Required condition / retry result |
+|---|---|---|
+| Offered, preauthorized | Claimed/ready | Verified current invite and device proof; subject/scope match; still within first-issuance window. Persist the winning identity/intent before any issuance. |
+| Offered, require-approval | Claimed/pending | Same checks; no credentials. Approval changes only this claim to ready after current-policy and expiry recheck. |
+| Claimed/pending or ready | Same state | Same identity **and** intent may resume. A different claimant or changed intent is refused; an invalid proof cannot reserve state. |
+| Claimed/ready | Issued | Recheck expiry, policy and current authority; persist exact result bytes and issuance/recovery times before returning them. |
+| Offered or claimed | Revoked/denied | Owner-authorized terminal transition. Revoke/deny winning before issuance prevents later approval or issuance. No automatic reset to offered. |
+| Issued | Issued | Fresh same-device proof and identical intent may recover the original bytes within the recovery window, subject to current credential/transport validity. Never reissue on retry. |
+| Issued | No invitation-revoke transition | Return already-issued with its non-secret receipt ID; revoke the actual membership/grants separately. Expiring/revoking an invite cannot undo a delivered PSK. |
+
+The verified-proof and current-authority checks belong to the authenticated
+redemption/issuer owner, not to a caller-supplied boolean in an exposed ledger
+API. A store test may supply trusted fixture inputs but cannot be advertised as
+proof of the signature gate. Connection challenges are short-lived and separate
+from the durable claim: a restart invalidates old challenges, not the claim.
+
+**Recovery/retention direction:** propose a fixed 24-hour receipt-recovery window
+from successful issuance, independent of the invitation's 24-hour first-issuance
+window. Persist its exclusive deadline with the receipt; retries never extend it.
+This is an engineering proposal, not the user's invitation-TTL decision. A fresh
+proof may recover after invitation expiry, but never after recovery expiry or
+current membership/transport invalidation. Transport rotation must not cause a
+retry to silently return newly issued material; return a typed stale-receipt result.
+Once recovery closes, discard secret payload only through a durable compaction
+that retains a spent/revoked tombstone until the signed invitation cannot be used
+again. An issued receipt is never replaced by a new offer with the same ID.
+
+Set separate record-count, per-receipt-byte and total-store-byte ceilings before
+exposure; capacity refusal is before mutation and never evicts live replay state.
+Bound reads before allocation and strictly reject unknown schema/state, duplicate
+IDs, impossible transitions/timestamps and invalid lengths. Decoder errors and
+Debug output must not echo receipt bytes, bearer material, PSKs or proofs. Secret
+file removal is not secure erasure; no such claim is made.
+
+**First persistence witnesses (not yet executed):** second process cannot own the
+same store; an insecure/symlink/non-regular path refuses; repeated replacement
+retains Unix modes/Windows DACL; missing/corrupt state refuses open; injected
+pre-rename failure preserves old committed state; injected post-rename failure
+returns uncertainty and blocks secret delivery; reopen resolves only a complete
+durable snapshot. Then place barriers at claim/issue/revoke commit and exercise
+two real processes, exact-byte lost-response recovery, expiry and approval races,
+wrong subject/intent, crash points and capacity. These must reach production
+transitions, followed by inverse mutations in a disposable review worktree.
+
+**Handoff:** contract/source audit only, no new store implementation or durability
+test result claimed. Next bounded implementation is the protected persistence
+owner/reuse boundary, then the ledger transitions above. Bootstrap feature/release
+inclusion, final recovery/retention bounds, lifecycle fencing, selective subnet
+semantics and V2 exact-head acceptance remain open; V3-0 is not complete.
+
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
 2. Select one real operator-service ownership/control path and prove no per-command fresh-store split. Document root-key custody and supported local/remote management boundary.
