@@ -30,18 +30,35 @@ deadline cleanup release its reservation. A live call also checks session
 retirement and node shutdown every 100 ms, including calls without a deadline.
 This checks the receive lifetime, not just the session ID: shutdown may retain
 retired sessions in the peer table. Advisory inactivity alone is not retirement.
-The normal caller
-deadline is not restarted for each fragment. No automatic handler retry occurs.
+The normal caller deadline is not restarted for each fragment. No automatic
+handler retry occurs.
 
 Fragment sends remain on the request's session and do not fall back to a roster
 route. Each credit-admission attempt checks shutdown and receive-lifetime
 retirement, so a credit refund cannot revive a retired session's blocked send.
-The sender can wait up to one second for packet credit before declaring
-a send failure; this is a credit-stall bound, not a new application deadline.
-The existing bounded response drainer can still overflow under load; failed or
-missing delivery cannot complete reassembly and remains subject to the caller's
-deadline. Queue-pressure/fault-injection and real-network acceptance remain
-separate from the successful local two-node size tests.
+Large native replies do not enqueue individual fragments. The existing handler
+task owns one response pump, with at most eight admitted pumps across all
+services on a node. Admission failure sends a bounded Internal diagnostic
+before any fragment is emitted. Small replies retain the existing bounded
+drainer and do not consume these slots. Each admitted response retains at most
+1 MiB of encoded fragment backing storage; encoding temporarily also holds the
+handler's original response. This is not a bound on application-handler memory.
+
+One monotonic deadline, set at transfer start, covers encoding and every send:
+the remaining absolute request deadline, capped at 30 seconds even when the
+caller chose no deadline. Each packet's credit stall is also capped at one
+second. The fold keeps the call's cancellation token until delivery ends, so
+CANCEL remains effective after the handler returns. Cancellation, session
+retirement, shutdown, deadline expiry or the first send error stops the pump
+and drops all remaining fragments and its admission slot. Old completion cannot
+remove a newer call's cancellation entry if the call identity is reused.
+
+Capacity, deadline and send failures attempt one same-session terminal error,
+with at most 50 ms for that diagnostic. This is best effort: a dead or stalled
+transport may also prevent error delivery. Missing delivery never completes
+reassembly; callers should retain a deadline. These sender bounds do not
+replace the caller's deadline or promise remote success. Real-network/platform
+acceptance remains separate from local two-node and fault-injection witnesses.
 
 The shared fixture at `tests/cross_lang_nrpc/golden_vectors_large_response.json`
 pins the byte layout in Rust, Node/TypeScript, Python and Go tests. The latter

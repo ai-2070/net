@@ -404,3 +404,205 @@ async fn inactive_but_unretired_session_still_accepts_fragment_send() {
         PeerPublishOutcome::Sent
     ));
 }
+
+struct SizedHandler(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl RpcHandler for SizedHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: Bytes::from(vec![
+                b'x';
+                if ctx.payload.body.is_empty() {
+                    22_000
+                } else {
+                    5
+                }
+            ]),
+        })
+    }
+}
+
+#[tokio::test]
+async fn large_sender_capacity_refuses_whole_response_without_blocking_small_replies() {
+    let (caller, server) = connected_pair(true).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _a = server
+        .serve_rpc("capacity_a", Arc::new(SizedHandler(calls.clone())))
+        .unwrap();
+    let _b = server
+        .serve_rpc("capacity_b", Arc::new(SizedHandler(calls.clone())))
+        .unwrap();
+    let held = server
+        .rpc_large_response_slots
+        .clone()
+        .try_acquire_many_owned(8)
+        .unwrap();
+    for service in ["capacity_a", "capacity_b"] {
+        let result = caller
+            .call(
+                server.node_id(),
+                service,
+                Bytes::new(),
+                CallOptions {
+                    deadline: Some(Instant::now() + Duration::from_secs(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(result, RpcError::ServerError { status, ref message, .. }
+            if status == RpcStatus::Internal.to_wire() && message.contains("sender capacity exhausted"))
+        );
+        assert_eq!(caller.rpc_client_pending_arc().retained_for_test(), (0, 0));
+    }
+    let small = caller
+        .call(
+            server.node_id(),
+            "capacity_a",
+            Bytes::from_static(b"small"),
+            CallOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(small.body.len(), 5);
+    drop(held);
+    let large = caller
+        .call(
+            server.node_id(),
+            "capacity_a",
+            Bytes::new(),
+            CallOptions {
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(large.body.len(), 22_000);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(server.rpc_large_response_slots.available_permits(), 8);
+    caller.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+enum SenderEnd {
+    Cancel,
+    Deadline,
+    Shutdown,
+}
+
+async fn stopped_sender_returns_slot(end: SenderEnd) {
+    let deadline = matches!(end, SenderEnd::Deadline);
+    let (caller, server) = connected_pair(true).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = server
+        .serve_rpc("blocked_delivery", Arc::new(SizedHandler(calls.clone())))
+        .unwrap();
+    let channel = ChannelName::new(&format!(
+        "blocked_delivery.replies.{:016x}",
+        caller.identity.entity_id().origin_hash()
+    ))
+    .unwrap();
+    let stream = MeshNode::publish_stream_id(&ChannelId::new(channel));
+    let session = server.peers.get(&caller.node_id()).unwrap().session.clone();
+    session.open_stream_with(stream, true, 1);
+    assert!(session
+        .try_stream(stream)
+        .unwrap()
+        .try_acquire_tx_credit(DEFAULT_STREAM_WINDOW_BYTES));
+    let token = caller.reserve_cancel_token();
+    let call = {
+        let caller = caller.clone();
+        let server_id = server.node_id();
+        tokio::spawn(async move {
+            caller
+                .call(
+                    server_id,
+                    "blocked_delivery",
+                    Bytes::new(),
+                    CallOptions {
+                        deadline: deadline.then(|| Instant::now() + Duration::from_millis(500)),
+                        cancel_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_millis(400), async {
+        while server.rpc_large_response_slots.available_permits() == 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("handler returned and pump is blocked on credit");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.rpc_large_response_slots.available_permits(), 7);
+    if matches!(end, SenderEnd::Shutdown) {
+        server.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while server.rpc_large_response_slots.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server shutdown stops the pump without a caller CANCEL");
+        caller.cancel(token);
+    } else if deadline {
+        // Suppress the caller's automatic CANCEL on timeout: the sender must
+        // stop on the request deadline itself, not pass because CANCEL arrived.
+        caller
+            .partition_filter
+            .insert(PeerAddr::Udp(server.local_addr()));
+    } else {
+        caller.cancel(token);
+    }
+    let result = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .unwrap()
+        .unwrap();
+    if deadline {
+        assert!(matches!(result, Err(RpcError::Timeout { .. })));
+    } else {
+        assert!(matches!(result, Err(RpcError::Cancelled)));
+    }
+    tokio::time::timeout(Duration::from_millis(300), async {
+        while server.rpc_large_response_slots.available_permits() != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel/deadline releases server ownership before per-packet stall timeout");
+    assert_eq!(caller.rpc_client_pending_arc().retained_for_test(), (0, 0));
+    session
+        .try_stream(stream)
+        .unwrap()
+        .refund_tx_credit(DEFAULT_STREAM_WINDOW_BYTES);
+    // No queued fragment may consume newly available credit after completion.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        session.try_stream(stream).unwrap().tx_credit_remaining(),
+        DEFAULT_STREAM_WINDOW_BYTES
+    );
+    caller.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_after_handler_return_stops_large_sender_and_releases_slot() {
+    stopped_sender_returns_slot(SenderEnd::Cancel).await;
+}
+
+#[tokio::test]
+async fn shared_request_deadline_stops_large_sender_before_credit_stall_timeout() {
+    stopped_sender_returns_slot(SenderEnd::Deadline).await;
+}
+
+#[tokio::test]
+async fn server_shutdown_stops_large_sender_and_releases_slot() {
+    stopped_sender_returns_slot(SenderEnd::Shutdown).await;
+}

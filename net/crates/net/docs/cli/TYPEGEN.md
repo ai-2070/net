@@ -89,6 +89,8 @@ covered, including offline regeneration after provider shutdown. Incomplete
 responses never become successful metadata. Older providers may still refuse
 responses above the single-packet limit. Over-limit responses return an explicit
 RPC size error. The handler may have completed; do not automatically retry.
+The [bounded response contract](../NRPC_LARGE_RESPONSES.md) describes sender
+admission limits, transfer deadlines and cancellation after handler completion.
 
 ### Filtering
 

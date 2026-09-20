@@ -1708,6 +1708,7 @@ type UnaryInFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64, u64), RpcCancellatio
 pub struct RpcServerFold {
     handler: Arc<dyn RpcHandler>,
     emit: RpcResponseEmitter,
+    large_emit: Option<large_response::Emitter>,
     /// The **receiving incarnation** of the frame currently being
     /// applied (R2-A), set by `apply_inbound*` from the event and
     /// handed to the emitter with the response. `0` on
@@ -1750,12 +1751,18 @@ impl RpcServerFold {
         Self {
             handler,
             emit,
+            large_emit: None,
             session_id: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
         }
+    }
+
+    pub(crate) fn with_large_response_emitter(mut self, emit: large_response::Emitter) -> Self {
+        self.large_emit = Some(emit);
+        self
     }
 
     /// Attach a per-service metrics handle. Hooks the spawned
@@ -1985,6 +1992,8 @@ impl RpcServerFold {
                 self.in_flight.lock().insert(key, cancellation.clone());
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
+                let large_emit = self.large_emit.clone();
+                let deadline_ns = payload.deadline_ns;
                 let in_flight = self.in_flight.clone();
                 // R2-A: the receiving incarnation rides into the
                 // spawned handler task with the rest of the call's
@@ -2133,10 +2142,33 @@ impl RpcServerFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
-                    large_response::emit(resp, large_response_enabled, |part| {
-                        emit(from_node, session_id, caller_origin, call_id, part);
-                    });
+                    if let Some(delivery) = large_emit
+                        .filter(|_| large_response_enabled && large_response::needs_transfer(&resp))
+                    {
+                        delivery(large_response::Transfer {
+                            from_node,
+                            session_id,
+                            caller_origin,
+                            call_id,
+                            deadline_ns,
+                            cancellation: cancel_probe.clone(),
+                            response: resp,
+                        })
+                        .await;
+                    } else {
+                        large_response::emit(resp, large_response_enabled, |part| {
+                            emit(from_node, session_id, caller_origin, call_id, part);
+                        });
+                    }
+                    // CANCEL may have removed this entry and a new request
+                    // reused the key while delivery was unwinding.
+                    let mut calls = in_flight.lock();
+                    if calls
+                        .get(&key)
+                        .is_some_and(|token| Arc::ptr_eq(&token.inner, &cancel_probe.inner))
+                    {
+                        calls.remove(&key);
+                    }
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -5443,6 +5475,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         pred()
+    }
+
+    #[tokio::test]
+    async fn old_large_delivery_cannot_remove_reused_call_cancellation_entry() {
+        let (emit, _) = capturing_emitter();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished = Arc::new(Notify::new());
+        let large_emit: large_response::Emitter = {
+            let finished = finished.clone();
+            Arc::new(move |transfer| {
+                let tx = tx.clone();
+                let finished = finished.clone();
+                Box::pin(async move {
+                    let (release, wait) = tokio::sync::oneshot::channel();
+                    tx.send((transfer.cancellation, release)).unwrap();
+                    let _ = wait.await;
+                    finished.notify_one();
+                })
+            })
+        };
+        let mut fold =
+            RpcServerFold::new(Arc::new(EchoHandler), emit).with_large_response_emitter(large_emit);
+        let event = rpc_request_event(
+            42,
+            7,
+            RpcRequestPayload {
+                service: "echo".into(),
+                deadline_ns: 0,
+                flags: large_response::FLAG,
+                headers: vec![],
+                body: Bytes::from(vec![b'x'; 22_000]),
+            },
+        );
+        fold.apply(&event, &mut ()).unwrap();
+        let (first, release_first) = rx.recv().await.unwrap();
+        fold.apply(&rpc_cancel_event(42, 7), &mut ()).unwrap();
+        assert!(first.is_cancelled());
+        fold.apply(&event, &mut ()).unwrap();
+        let (second, release_second) = rx.recv().await.unwrap();
+        assert!(!second.is_cancelled());
+        release_first.send(()).unwrap();
+        // On this current-thread runtime the old task finishes its synchronous
+        // map cleanup before the notified test can resume.
+        finished.notified().await;
+        assert_eq!(fold.in_flight_keys(), vec![(0, 0, 42, 7)]);
+        fold.apply(&rpc_cancel_event(42, 7), &mut ()).unwrap();
+        assert!(
+            second.is_cancelled(),
+            "new call still owns its cancellation entry"
+        );
+        release_second.send(()).unwrap();
+        finished.notified().await;
+        assert!(fold.in_flight_keys().is_empty());
     }
 
     /// Happy path: a REQUEST event triggers the handler; the fold

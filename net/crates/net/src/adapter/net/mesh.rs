@@ -11603,6 +11603,9 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
+    /// Eight node-wide logical response pumps, with no fragment queue.
+    #[cfg(feature = "cortex")]
+    rpc_large_response_slots: Arc<tokio::sync::Semaphore>,
     /// Independent fetch_add counter used by `RoutingPolicy::
     /// RoundRobin` and `Random` to pick the next target node.
     /// Sequential is correct here — the cursor is local-only and
@@ -14074,6 +14077,8 @@ impl MeshNode {
             rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
+            #[cfg(feature = "cortex")]
+            rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -32585,6 +32590,11 @@ impl MeshNode {
             }
             None => false,
         }
+    }
+
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_large_response_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.rpc_large_response_slots.clone()
     }
 
     /// Per-Mesh shared `RpcClientPending` — accessor for the

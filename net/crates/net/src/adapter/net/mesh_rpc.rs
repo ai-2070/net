@@ -3214,6 +3214,112 @@ fn bound_response_packet(payload: Bytes) -> Result<Bytes, AdapterError> {
     Ok(Bytes::from(bounded))
 }
 
+/// One handler-owned pump per admitted logical response. No individual fragment
+/// enters the shared response queue, and no detached task outlives this future.
+async fn deliver_large_response(
+    mesh: &MeshNode,
+    service: &str,
+    transfer: crate::adapter::net::cortex::rpc::large_response::Transfer,
+) {
+    use crate::adapter::net::cortex::rpc::large_response;
+    let deadline = large_response::transfer_deadline(transfer.deadline_ns);
+    if transfer.cancellation.is_cancelled()
+        || !mesh.rpc_session_is_live(transfer.from_node, transfer.session_id)
+    {
+        return;
+    }
+    let Ok(channel) = ChannelName::new(&format!(
+        "{service}.replies.{:016x}",
+        transfer.caller_origin
+    )) else {
+        return;
+    };
+    let channel_id = ChannelId::new(channel.clone());
+    let hash = channel_id.hash();
+    let stream = MeshNode::publish_stream_id(&channel_id);
+    let meta = EventMeta::new(
+        crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+        0,
+        mesh.identity_origin_hash(),
+        transfer.call_id,
+        0,
+    );
+    let from_node = transfer.from_node;
+    let session_id = transfer.session_id;
+    let refuse = |reason: &'static str| async move {
+        // Even a saturated sender's diagnostic is direct, session-bound and
+        // bounded. It cannot re-enter a shared queue or reflect via a roster.
+        let mut frame = meta.to_bytes().to_vec();
+        encode_rpc_route(&mut frame, hash);
+        large_response::error(reason).encode_into(&mut frame);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            mesh.try_publish_to_peer_bound(
+                from_node,
+                hash,
+                stream,
+                true,
+                &[Bytes::from(frame)],
+                Some(session_id),
+            ),
+        )
+        .await;
+    };
+    let Ok(_slot) = mesh.rpc_large_response_slots().try_acquire_owned() else {
+        drop(transfer.response);
+        refuse("sender capacity exhausted; no fragments sent").await;
+        return;
+    };
+    let mut pieces = Vec::new();
+    large_response::emit(transfer.response, true, |piece| pieces.push(piece));
+    let send = async {
+        for piece in pieces {
+            if transfer.cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("transfer deadline exhausted");
+            }
+            let mut frame = meta.to_bytes().to_vec();
+            piece.encode_into(&mut frame);
+            publish_response_to_caller(
+                mesh,
+                transfer.caller_origin,
+                transfer.call_id,
+                transfer.session_id,
+                Some(transfer.from_node),
+                &channel,
+                hash,
+                stream,
+                Bytes::from(frame),
+                ResponseRouteFallback::DirectOnly,
+            )
+            .await
+            .map_err(|_| "fragment send failed")?;
+        }
+        Ok(())
+    };
+    let session_ended = async {
+        let mut check = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            check.tick().await;
+            if !mesh.rpc_session_is_live(transfer.from_node, transfer.session_id) {
+                break;
+            }
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = transfer.cancellation.cancelled() => Ok(()),
+        _ = tokio::time::sleep_until(deadline) => Err("transfer deadline exhausted"),
+        _ = session_ended => Ok(()),
+        result = send => result,
+    };
+    if let Err(reason) = result {
+        refuse(reason).await;
+    }
+}
+
 /// The runtime a client call was opened on, for [`spawn_cancel_publish`]
 /// to fall back to when Drop runs somewhere else.
 ///
@@ -3806,8 +3912,25 @@ impl MeshNode {
         // (The denial itself is emitted by `emit_capability_denial`,
         // which unicasts to the authenticated session peer — NC2.)
         let metrics_for_bridge = Arc::clone(&metrics_handle);
+        let large_emit: crate::adapter::net::cortex::rpc::large_response::Emitter = {
+            let mesh = Arc::clone(self);
+            let service = service.to_string();
+            let cache = Arc::clone(&origin_node_cache);
+            Arc::new(move |transfer| {
+                let mesh = mesh.clone();
+                let service = service.clone();
+                let cache = cache.clone();
+                Box::pin(async move {
+                    let key = (transfer.from_node, transfer.caller_origin, transfer.call_id);
+                    cache.remove(key);
+                    deliver_large_response(&mesh, &service, transfer).await;
+                })
+            })
+        };
         let fold = Arc::new(Mutex::new(
-            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit)
+                .with_metrics(metrics_handle)
+                .with_large_response_emitter(large_emit),
         ));
 
         // Register the inbound dispatcher. Push into the mpsc;

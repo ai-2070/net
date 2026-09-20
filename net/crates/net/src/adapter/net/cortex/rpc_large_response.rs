@@ -13,6 +13,46 @@ pub(crate) const CHUNK: usize = 4096;
 pub(crate) const MAX: usize = 1024 * 1024;
 const AGGREGATE: usize = 8 * MAX;
 
+/// The native sender owns this logical response until delivery stops. Keeping
+/// the token in the server fold makes CANCEL effective after the handler.
+pub(crate) struct Transfer {
+    pub from_node: u64,
+    pub session_id: u64,
+    pub caller_origin: u64,
+    pub call_id: u64,
+    pub deadline_ns: u64,
+    pub cancellation: super::RpcCancellationToken,
+    pub response: RpcResponsePayload,
+}
+
+pub(crate) type Emitter =
+    Arc<dyn Fn(Transfer) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+pub(crate) fn needs_transfer(response: &RpcResponsePayload) -> bool {
+    let len = response.encoded_len();
+    len + EVENT_META_SIZE + RPC_ROUTE_V1_SIZE > net_wire::protocol::MAX_EVENT_SIZE
+        && len <= MAX
+        && !response.headers.iter().any(|(name, _)| name == HEADER)
+}
+
+/// One monotonic deadline covers encoding and every send. The absolute request
+/// deadline can shorten, never extend, the 30-second server transfer ceiling.
+pub(crate) fn transfer_deadline(deadline_ns: u64) -> tokio::time::Instant {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let ceiling = Duration::from_secs(30);
+    let remaining = if deadline_ns == 0 {
+        ceiling
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Duration::from_nanos(deadline_ns)
+            .saturating_sub(now)
+            .min(ceiling)
+    };
+    tokio::time::Instant::now() + remaining
+}
+
 pub(crate) fn error(message: &str) -> RpcResponsePayload {
     RpcResponsePayload {
         status: RpcStatus::Internal,
@@ -151,6 +191,18 @@ impl Assembly {
 mod tests {
     use super::super::RpcClientPending;
     use super::*;
+
+    #[test]
+    fn transfer_deadline_caps_missing_or_far_future_deadlines_and_preserves_expiry() {
+        use std::time::Duration;
+        for deadline in [0, u64::MAX] {
+            let before = tokio::time::Instant::now();
+            let end = transfer_deadline(deadline);
+            assert!(end >= before + Duration::from_secs(29));
+            assert!(end <= tokio::time::Instant::now() + Duration::from_secs(30));
+        }
+        assert!(transfer_deadline(1) <= tokio::time::Instant::now());
+    }
 
     #[test]
     fn shared_large_response_wire_vector() {
