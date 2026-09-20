@@ -1,0 +1,30 @@
+net/crates/net/cli/tests/rpc_deadline.rs
+  s_38828de26a56bb::t_5f247781e58dd6 1-6,10-37,41-46,52-58,64-65,92-93,97,108-116,120-124,134-138
+  s_38828de26a56bb::t_5ba060b8ded626 59-63
+  s_38828de26a56bb::t_3fd7da5bc2cf46 7-9,38-40,47-51,66-91,94-96,98-107,117-119,125-133
+net/crates/net/cli/tests/wrap_startup.rs
+  s_38828de26a56bb::t_5ba060b8ded626 30-34
+net/crates/net/cli/Cargo.toml
+  s_38828de26a56bb::t_5f247781e58dd6 140
+  s_38828de26a56bb::t_4d9e6bcaa0401e 141
+net/crates/net/cli/tests/automation_contract.rs
+  s_38828de26a56bb::t_1962dbeda03042 70-71
+net/crates/net/Cargo.lock
+  s_38828de26a56bb::t_7a0051915c9054 3143,3156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a846359d0a02dd3de929b0bd1e839e57e3b0b6a3",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
