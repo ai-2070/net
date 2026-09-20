@@ -41715,6 +41715,28 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> PeerPublishOutcome {
+        self.try_publish_to_peer_bound(
+            peer_node_id,
+            channel_hash,
+            stream_id,
+            reliable,
+            events,
+            None,
+        )
+        .await
+    }
+
+    /// Fragment sends may wait for credit, but must stay on the request's session.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_publish_to_peer_bound(
+        &self,
+        peer_node_id: u64,
+        channel_hash: ChannelHash,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+        fragment_session: Option<u64>,
+    ) -> PeerPublishOutcome {
         let (dest_addr, session) = match self.peers.get(&peer_node_id) {
             Some(p) => (p.value().addr(), p.value().session.clone()),
             None => return PeerPublishOutcome::NoSession,
@@ -41749,30 +41771,47 @@ impl MeshNode {
         // we `commit()` after a successful socket send, so a failed
         // send doesn't strand credit.
         let needed = wire_bytes_for_payload(payload_bytes);
-        let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
-            TxAdmit::Acquired { guard, seq } => (guard, seq),
-            TxAdmit::WindowFull => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} backpressured",
-                    stream_id
-                )));
+        let credit_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (guard, seq) = loop {
+            if fragment_session.is_some_and(|expected| {
+                session.session_id() != expected
+                    || self.peer_session_id(peer_node_id) != Some(expected)
+            }) {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(
+                    "RPC response session retired".into(),
+                ));
             }
-            TxAdmit::StreamClosed => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} closed",
-                    stream_id
-                )));
-            }
-            // `try_acquire_tx_credit_guard` carries no handle and so
-            // no incarnation to mismatch: the publish path resolved
-            // this `session` itself moments ago. Unreachable, and
-            // reported as the closed stream it effectively is rather
-            // than silently treated as success.
-            TxAdmit::SessionSuperseded => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} belongs to a superseded session",
-                    stream_id
-                )));
+            match session.try_acquire_tx_credit_guard(stream_id, needed) {
+                TxAdmit::Acquired { guard, seq } => break (guard, seq),
+                TxAdmit::WindowFull
+                    if fragment_session.is_some()
+                        && tokio::time::Instant::now() < credit_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                TxAdmit::WindowFull => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} backpressured",
+                        stream_id
+                    )));
+                }
+                TxAdmit::StreamClosed => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} closed",
+                        stream_id
+                    )));
+                }
+                // `try_acquire_tx_credit_guard` carries no handle and so
+                // no incarnation to mismatch: the publish path resolved
+                // this `session` itself moments ago. Unreachable, and
+                // reported as the closed stream it effectively is rather
+                // than silently treated as success.
+                TxAdmit::SessionSuperseded => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} belongs to a superseded session",
+                        stream_id
+                    )));
+                }
             }
         };
 

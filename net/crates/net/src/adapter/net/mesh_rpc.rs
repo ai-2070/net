@@ -2994,6 +2994,14 @@ async fn publish_response_to_caller(
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
     let payload = bound_response_packet(payload)?;
+    let fragmented = EventMeta::from_bytes(&payload)
+        .is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
+        && RpcResponsePayload::decode(payload.slice(EVENT_META_SIZE..)).is_ok_and(|response| {
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name == crate::adapter::net::cortex::rpc::large_response::HEADER)
+        });
     // OA2-E0.2: every server→caller frame (RESPONSE / DEADLINE /
     // REQUEST_GRANT / STREAM_GRANT built for the reply channel)
     // funnels through here, so insert the RpcRouteV1 discriminator —
@@ -3125,18 +3133,24 @@ async fn publish_response_to_caller(
     //                  transmitted. Safe to fall back per `fallback`.
     if let Some(target_node_id) = resolved {
         match mesh
-            .try_publish_to_peer(
+            .try_publish_to_peer_bound(
                 target_node_id,
                 reply_channel_hash,
                 reply_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
+                fragmented.then_some(receiving_session_id),
             )
             .await
         {
             PeerPublishOutcome::Sent => return Ok(()),
             PeerPublishOutcome::SendFailed(e) => return Err(e),
             PeerPublishOutcome::NoSession => {
+                if fragmented {
+                    return Err(AdapterError::Connection(
+                        "RPC response session retired".into(),
+                    ));
+                }
                 if fallback == ResponseRouteFallback::DirectOnly {
                     // The authenticated peer's session vanished. Drop the
                     // frame — a denial must never reflect onto a claimed
@@ -3706,8 +3720,14 @@ impl MeshNode {
         let resp_tx_for_denials = resp_tx.clone();
         let emit: RpcResponseEmitter =
             Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
-                let target_hint =
-                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                let fragmented = resp.headers.iter().any(|(name, _)| {
+                    name == crate::adapter::net::cortex::rpc::large_response::HEADER
+                });
+                let target_hint = if fragmented {
+                    Some(from_node)
+                } else {
+                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id))
+                };
                 // Resolve the reply channel from cache (Arc bump on hit; one
                 // `format!` + `ChannelName::new` the first time we see a caller).
                 let cached = match reply_channel_cache.get(caller_origin) {
@@ -3767,9 +3787,9 @@ impl MeshNode {
                         "rpc serve_rpc: response drainer at capacity; dropping response"
                     );
                 }
-                // AV-4 item 4: a unary call emits exactly one, always-
-                // terminal RESPONSE — retire its cached response route now
-                // (target_hint for THIS response was already captured above).
+                // Retire the cached route on first emission. Negotiated
+                // fragments use the authenticated from_node directly, so
+                // subsequent pieces do not depend on this cache entry.
                 origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
             });
 
@@ -5745,7 +5765,7 @@ impl MeshNode {
         let mut req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
-            flags,
+            flags: flags | crate::adapter::net::cortex::rpc::large_response::FLAG,
             headers,
             body: payload.clone(),
         };
@@ -5879,7 +5899,13 @@ impl MeshNode {
         // somewhere to land (S-4 part 2: bound to target_node_id, so the deliver
         // gate rejects a RESPONSE spoofed from any other session peer).
         let pending = self.rpc_client_pending();
-        let rx = pending.register(call_id, target_node_id);
+        let expected_session =
+            self.peer_session_id(target_node_id)
+                .ok_or_else(|| RpcError::NoRoute {
+                    target: target_node_id,
+                    reason: "RPC target session retired before dispatch".into(),
+                })?;
+        let rx = pending.register_large(call_id, target_node_id, expected_session);
 
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
@@ -5975,6 +6001,23 @@ impl MeshNode {
         // grow unboundedly.
         let cancel_token = opts.cancel_token.unwrap_or(0);
         let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+
+        // The pending entry owns all incomplete fragments. Retire it on
+        // session turnover even when the caller chose no deadline.
+        let rx = async {
+            tokio::pin!(rx);
+            let mut check = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    result = &mut rx => return result,
+                    _ = check.tick() => {
+                        if self.peer_session_id(target_node_id) != Some(expected_session) {
+                            pending.cancel(call_id);
+                        }
+                    }
+                }
+            }
+        };
 
         // Race the receiver against the deadline AND the cancel
         // signal. Each branch lifts to the same outcome shape
@@ -7043,6 +7086,45 @@ fn _ensure_send_sync() {
 
 #[cfg(test)]
 mod reply_subscribe_retry_tests {
+    #[cfg(test)]
+    mod large_response_compat_tests {
+        use super::super::*;
+
+        #[test]
+        fn old_caller_receives_one_bounded_error_with_original_call_identity() {
+            let original = EventMeta::new(
+                crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE,
+                0,
+                42,
+                99,
+                0,
+            );
+            let mut output = Vec::new();
+            crate::adapter::net::cortex::rpc::large_response::emit(
+                RpcResponsePayload {
+                    status: crate::adapter::net::cortex::RpcStatus::Ok,
+                    headers: vec![],
+                    body: Bytes::from(vec![b'x'; 22_000]),
+                },
+                false,
+                |response| {
+                    let mut frame = original.to_bytes().to_vec();
+                    response.encode_into(&mut frame);
+                    output.push(bound_response_packet(Bytes::from(frame)).unwrap());
+                },
+            );
+            assert_eq!(output.len(), 1);
+            let frame = &output[0];
+            assert!(frame.len() + RPC_ROUTE_V1_SIZE <= net_wire::protocol::MAX_EVENT_SIZE);
+            assert_eq!(&frame[..EVENT_META_SIZE], original.to_bytes());
+            let response = RpcResponsePayload::decode(frame.slice(EVENT_META_SIZE..)).unwrap();
+            assert_eq!(
+                response.status,
+                crate::adapter::net::cortex::RpcStatus::Internal
+            );
+            assert!(String::from_utf8_lossy(&response.body).contains("single-packet limit"));
+        }
+    }
     /// The retry condition and the corrective-announce latch are two
     /// separate decisions, and re-fusing them is a silent regression:
     /// the loop still compiles, still retries once, and only misbehaves

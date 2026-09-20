@@ -63,7 +63,7 @@ fn command_with_budget(
 fn descriptor() -> net_sdk::tool::ToolDescriptor {
     serde_json::from_value(serde_json::json!({
         "tool_id":"hydrated", "name":"hydrated", "version":"1.0.0",
-        "input_schema": serde_json::json!({"type":"object", "description":"large contract ".repeat(400), "properties":{"value":{"type":"string"}}, "required":["value"]}).to_string(),
+        "input_schema": serde_json::json!({"type":"object", "description":"large contract ".repeat(1500), "properties":{"value":{"type":"string"}}, "required":["value"]}).to_string(),
         "output_schema":null, "requires":[], "estimated_time_ms":0,
         "stateless":true, "streaming":false, "tags":[], "node_count":0
     })).unwrap()
@@ -247,7 +247,7 @@ async fn metadata_failures_do_not_publish_or_retry() {
                             "missing_input" => descriptor.input_schema = None,
                             "bad_schema" => descriptor.input_schema = Some("not json".into()),
                             "oversized_response" => {
-                                descriptor.input_schema = Some("x".repeat(22_000))
+                                descriptor.input_schema = Some("x".repeat(1024 * 1024))
                             }
                             _ => {}
                         }
@@ -284,7 +284,7 @@ async fn metadata_failures_do_not_publish_or_retry() {
                 "wrong_id" | "wrong_version" => "metadata mismatch",
                 "missing_input" => "no input schema",
                 "bad_schema" => "unusable input schema",
-                "oversized_response" => "single-packet limit",
+                "oversized_response" => "1048576-byte limit",
                 _ => "exceeded --timeout",
             };
             assert!(

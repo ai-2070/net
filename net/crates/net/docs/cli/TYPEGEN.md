@@ -82,11 +82,13 @@ observation and all metadata fetches. If omitted, acquisition after attachment
 has one 30-second limit; observation still lasts at most five seconds and SDK
 RPC limits still apply. Schema/metadata failure preserves existing output.
 Publication after successful acquisition is not a crash-atomic transaction.
-Metadata uses the existing unary RPC transport: arbitrarily large contracts
-are not supported by this change (a roughly 22 KB response exceeded the current
-8 KB packet receive path in local testing; a roughly 6 KB contract is covered).
-Oversized responses now return an explicit RPC size error rather than waiting
-for the CLI timeout. The handler may have completed; do not automatically retry.
+Metadata uses the existing unary RPC transport. Updated native peers negotiate
+responses up to 1 MiB **including encoded status and headers**, split into bounded
+packets; the 8 KiB packet limit is unchanged. A roughly 22 KB live contract is
+covered, including offline regeneration after provider shutdown. Incomplete
+responses never become successful metadata. Older providers may still refuse
+responses above the single-packet limit. Over-limit responses return an explicit
+RPC size error. The handler may have completed; do not automatically retry.
 
 ### Filtering
 

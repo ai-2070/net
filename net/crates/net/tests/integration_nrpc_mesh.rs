@@ -125,7 +125,7 @@ impl RpcHandler for SlowHandler {
 // ============================================================================
 
 #[tokio::test]
-async fn rpc_oversized_response_is_explicit_and_preserves_packet_boundary() {
+async fn rpc_large_response_preserves_packet_boundary_and_rejects_over_limit() {
     struct SizedResponse(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl RpcHandler for SizedResponse {
@@ -155,7 +155,8 @@ async fn rpc_oversized_response_is_explicit_and_preserves_packet_boundary() {
         - net::adapter::net::cortex::EVENT_META_SIZE
         - net::adapter::net::cortex::RPC_ROUTE_V1_SIZE
         - empty.encoded_len();
-    for size in [boundary, boundary + 1, 22_000] {
+    let maximum = 1024 * 1024 - empty.encoded_len();
+    for size in [boundary, boundary + 1, 22_000, maximum, maximum + 1] {
         let result = caller
             .call(
                 server.node_id(),
@@ -167,15 +168,15 @@ async fn rpc_oversized_response_is_explicit_and_preserves_packet_boundary() {
                 },
             )
             .await;
-        if size == boundary {
-            assert_eq!(result.unwrap().body.len(), size);
+        if size <= maximum {
+            assert_eq!(result.unwrap().body, Bytes::from(vec![b'x'; size]));
         } else {
             match result.unwrap_err() {
                 RpcError::ServerError {
                     status, message, ..
                 } => {
                     assert_eq!(status, RpcStatus::Internal.to_wire());
-                    assert!(message.contains("single-packet limit"), "{message}");
+                    assert!(message.contains("1048576-byte limit"), "{message}");
                     assert!(message.contains("handler may have completed"), "{message}");
                     assert!(
                         !message.contains("xxxxx"),
@@ -186,7 +187,7 @@ async fn rpc_oversized_response_is_explicit_and_preserves_packet_boundary() {
             }
         }
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 3, "no automatic retries");
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "no automatic retries");
 }
 
 #[tokio::test]

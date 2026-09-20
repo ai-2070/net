@@ -1,0 +1,47 @@
+{
+  "description": "Unary large-response v1 codec vectors. Integers are little-endian. Body repetition is a compact fixture, not a wire encoding.",
+  "request_flag": 64,
+  "header_name": "nrpc-response-fragment-v1",
+  "chunk_bytes": 4096,
+  "max_response_bytes": 1048576,
+  "max_fragments": 256,
+  "response": {
+    "status": 0,
+    "headers": [],
+    "body_byte": 120,
+    "body_length": 22000
+  },
+  "encoded_response_bytes": 22007,
+  "fragments": [
+    {
+      "index": 0,
+      "header_value_hex": "f75500000000",
+      "body_bytes": 4096
+    },
+    {
+      "index": 1,
+      "header_value_hex": "f75500000100",
+      "body_bytes": 4096
+    },
+    {
+      "index": 2,
+      "header_value_hex": "f75500000200",
+      "body_bytes": 4096
+    },
+    {
+      "index": 3,
+      "header_value_hex": "f75500000300",
+      "body_bytes": 4096
+    },
+    {
+      "index": 4,
+      "header_value_hex": "f75500000400",
+      "body_bytes": 4096
+    },
+    {
+      "index": 5,
+      "header_value_hex": "f75500000500",
+      "body_bytes": 1527
+    }
+  ]
+}

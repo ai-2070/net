@@ -8,13 +8,20 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — bounded large RPC responses
+
+- Updated native peers negotiate unary responses up to 1 MiB including encoded
+  status and headers. The packet cap remains 8 KiB. Live typegen capture and
+  offline regeneration now cover roughly 22 KB metadata; incomplete responses
+  cannot publish output. Older peers retain their single-packet limit.
+
 ## Unreleased — explicit oversized RPC failure
 
 - An oversized metadata response now returns a small RPC error naming the
   single-packet limit instead of silently waiting for the CLI deadline.
   The handler may have completed; the CLI does not retry. Snapshot/generated
-  output remains unpublished. Multi-packet large-response delivery is still
-  pending; the packet-size limit is unchanged.
+  output remains unpublished. This remains the compatibility behavior for
+  callers that do not negotiate large responses; the packet limit is unchanged.
 
 ## Unreleased — provider-bound live typegen metadata
 

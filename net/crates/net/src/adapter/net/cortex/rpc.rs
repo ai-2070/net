@@ -25,6 +25,9 @@ use tokio::sync::Notify;
 use super::super::redex::{RedexError, RedexEvent, RedexFold};
 use super::meta::{EventMeta, EVENT_META_SIZE};
 
+#[path = "rpc_large_response.rs"]
+pub(crate) mod large_response;
+
 // ============================================================================
 // `EventMeta::dispatch` byte assignments for nRPC.
 //
@@ -275,7 +278,8 @@ pub const FLAG_RPC_CLIENT_STREAMING_REQUEST: u16 = 1 << 4;
 /// Bidi streaming plan (Phase A).
 pub const FLAG_RPC_REQUEST_END: u16 = 1 << 5;
 
-// Bits `6..=15` reserved; producers MUST write zero, consumers MUST
+// Bit 6 opts unary callers into bounded response fragmentation (see
+// `large_response`). Bits `7..=15` reserved; producers MUST write zero, consumers MUST
 // ignore unknown bits (forward-compat with future flags).
 
 // ============================================================================
@@ -1661,9 +1665,9 @@ pub type RpcResponseEmitter =
 /// The streaming pump awaits each emit before reading the next
 /// chunk from the sink — this guarantees that chunks for one
 /// `call_id` reach the network publish path in the order the
-/// handler emitted them. (The unary fold has no such requirement
-/// — it emits exactly one RESPONSE per call — so it sticks with
-/// the simpler sync `RpcResponseEmitter`.)
+/// handler emitted them. The unary fold emits one logical response;
+/// negotiated fragments may arrive in any order and are assembled before
+/// completion, so it retains the synchronous `RpcResponseEmitter`.
 pub type RpcAsyncResponseEmitter = Arc<
     dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
         + Send
@@ -2004,6 +2008,7 @@ impl RpcServerFold {
                 // a CANCEL that fired during handler execution and
                 // override its response with `RpcStatus::Cancelled`.
                 let cancel_probe = cancellation.clone();
+                let large_response_enabled = payload.flags & large_response::FLAG != 0;
                 // One task per call. The fold does not block on the
                 // handler and does not order handlers against each
                 // other — see `RpcHandler::call`'s ordering note.
@@ -2129,7 +2134,9 @@ impl RpcServerFold {
                         }
                     };
                     in_flight.lock().remove(&key);
-                    emit(from_node, session_id, caller_origin, call_id, resp);
+                    large_response::emit(resp, large_response_enabled, |part| {
+                        emit(from_node, session_id, caller_origin, call_id, part);
+                    });
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -3997,9 +4004,13 @@ impl RedexFold<()> for RpcDuplexFold {
 /// mpsc). The fold dispatches to the right variant based on
 /// what's registered for the `call_id`.
 enum PendingEntry {
-    /// Unary call — exactly one RESPONSE expected. Completes the
-    /// oneshot with the decoded payload.
-    Unary(tokio::sync::oneshot::Sender<RpcResponsePayload>),
+    /// Unary call — one logical response, optionally assembled from bounded
+    /// fragments. Completes the oneshot with the decoded payload.
+    Unary {
+        tx: tokio::sync::oneshot::Sender<RpcResponsePayload>,
+        session: Option<u64>,
+        assembly: Option<large_response::Assembly>,
+    },
     /// Server-streaming call — multiple non-terminal `Continue`
     /// chunks followed by one terminal frame. Each non-terminal
     /// chunk pushes a `StreamItem::Chunk(body)` onto the mpsc;
@@ -4080,6 +4091,7 @@ pub struct RpcClientPending {
     /// `expected_target == 0` entry opts out of the binding
     /// (loopback tests + paths with no session).
     senders: dashmap::DashMap<u64, (super::super::behavior::placement::NodeId, PendingEntry)>,
+    fragment_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RpcClientPending {
@@ -4087,6 +4099,7 @@ impl RpcClientPending {
     pub fn new() -> Self {
         Self {
             senders: dashmap::DashMap::new(),
+            fragment_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -4112,8 +4125,38 @@ impl RpcClientPending {
         target_node: super::super::behavior::placement::NodeId,
     ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.senders
-            .insert(call_id, (target_node, PendingEntry::Unary(tx)));
+        self.senders.insert(
+            call_id,
+            (
+                target_node,
+                PendingEntry::Unary {
+                    tx,
+                    session: None,
+                    assembly: None,
+                },
+            ),
+        );
+        rx
+    }
+
+    pub(crate) fn register_large(
+        &self,
+        call_id: u64,
+        target: u64,
+        session: u64,
+    ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.senders.insert(
+            call_id,
+            (
+                target,
+                PendingEntry::Unary {
+                    tx,
+                    session: Some(session),
+                    assembly: None,
+                },
+            ),
+        );
         rx
     }
 
@@ -4239,18 +4282,29 @@ impl RpcClientPending {
         from_node: super::super::behavior::placement::NodeId,
         resp: RpcResponsePayload,
     ) {
+        self.deliver_session(call_id, from_node, 0, resp);
+    }
+
+    fn deliver_session(
+        &self,
+        call_id: u64,
+        from_node: u64,
+        session_id: u64,
+        resp: RpcResponsePayload,
+    ) {
         // Look up the entry — but DON'T remove it yet, because for
         // streaming we may want to keep it for non-terminal chunks.
         // The remove decision is per-variant.
-        let entry = self.senders.get(&call_id);
-        let Some(entry) = entry else { return };
+        let dashmap::mapref::entry::Entry::Occupied(mut entry) = self.senders.entry(call_id) else {
+            return;
+        };
         // S-4 part 2 gate. The pending registry binds each call
         // to the AEAD-verified `target_node` the request was
         // dispatched to; any other session peer publishing on the
         // shared reply channel with a guessed call_id is dropped
         // here without touching the waiter. `0` opts out — used
         // by loopback paths that have no session peer.
-        let (target_node, _entry_value) = entry.value();
+        let (target_node, _entry_value) = entry.get();
         if *target_node != 0 && *target_node != from_node {
             tracing::trace!(
                 call_id,
@@ -4260,10 +4314,32 @@ impl RpcClientPending {
             );
             return;
         }
-        match entry.value() {
-            (_, PendingEntry::Unary(_)) => {
-                drop(entry);
-                if let Some((_, (_, PendingEntry::Unary(tx)))) = self.senders.remove(&call_id) {
+        match entry.get_mut() {
+            (
+                _,
+                PendingEntry::Unary {
+                    session, assembly, ..
+                },
+            ) => {
+                if session.is_some_and(|expected| expected != session_id) {
+                    return;
+                }
+                let resp = if session.is_some() {
+                    match large_response::Assembly::accept(assembly, &self.fragment_bytes, resp) {
+                        Ok(None) => return,
+                        Ok(Some(response)) => response,
+                        Err(message) => large_response::error(message),
+                    }
+                } else if resp
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == large_response::HEADER)
+                {
+                    large_response::error("unsolicited response fragment")
+                } else {
+                    resp
+                };
+                if let (_, PendingEntry::Unary { tx, .. }) = entry.remove() {
                     let _ = tx.send(resp);
                 }
             }
@@ -4448,7 +4524,12 @@ impl RpcClientFold {
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
                 match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
-                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
+                    Ok(resp) => self.pending.deliver_session(
+                        meta.seq_or_ts,
+                        ev.from_node,
+                        ev.session_id,
+                        resp,
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
