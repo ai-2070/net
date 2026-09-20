@@ -2,7 +2,7 @@
 
 > **For Hermes:** After V2 acceptance and explicit implementation authorization, use the subagent-driven-development skill for one accepted slice at a time, with independent review. This document authorizes planning, not production edits or protocol publication.
 
-**Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, but accepted exact-head CI evidence is still outstanding. No V3 production implementation or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
+**Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, but accepted exact-head CI evidence is still outstanding. The first narrow V3 code slice implements local invitation policy only; no working enrollment service or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
 **Goal:** An operator sends a join link; a new device joins the intended mesh, optionally its organization and exact subnet, survives restart, can voluntarily leave, and can be selectively removed by an operator with verifiable, honestly scoped enforcement.
 **Architecture:** Thin Rust/Clap commands over reusable SDK enrollment and authority mechanisms, backed by an explicitly running operator service and durable local state. Enrollment, observation, and removal refer to real identities and real enforcement points; temporary supervisors, inventory records, and credential files never stand in for deployment effects.
 **Tech stack:** Existing `net-cli` / `net-mesh` executable, Tokio, `net-mesh-sdk`, signed organization/subnet credentials, current native transport and optional bootstrap adapters. No new global control plane.
@@ -329,6 +329,49 @@ not just a model or mocked successful response.
 adapter/control proposal. It does not complete V3-0: feature/release inclusion,
 receipt retention/persistence details, lifecycle fencing, selective subnet floor
 semantics/compatibility and V2 exact-head acceptance still require closure.
+
+#### First code slice — local invitation policy
+
+The user's subsequent “let's start” authorizes a narrow implementation of the
+settled policy while those wider gates remain open. This is not acceptance of
+the proposed bootstrap protocol or permission to expose an enrollment listener.
+Owner: `sdk/src/enrollment/policy.rs`; witnesses: `sdk/tests/enrollment_policy.rs`.
+The policy carries creation/expiry times and preauthorized versus require-approval
+mode, defaults to exactly 86,400 seconds, and accepts positive whole-second TTL
+overrides with checked timestamp arithmetic. There is no selected product TTL
+ceiling yet; overflow is an error, never saturation. Redemption-time inspection
+refuses times before creation or at/after expiry and cannot mutate the policy.
+
+This is an input policy primitive, **not an authorization verifier**: its result
+does not verify a signature, consume an invitation, approve a request, issue a
+credential or deliver a PSK. No serializer/wire version, CLI command, listener,
+new Cargo feature or legacy enrollment behavior is changed. The eventual durable
+owner must apply this policy together with authenticated invite/proof validation,
+single-use state, current authority and explicit optional approval. Committed
+receipt recovery is a separate path and must not reset or reuse first-issuance
+expiry checks as an excuse to mint again.
+
+**Implementation receipt (`43b4f1f5c`, 2026-09-20):** RED was the new integration
+binary failing to compile because `enrollment::policy` did not exist; this was
+API-absence evidence, not an observed pre-existing runtime defect. GREEN:
+`cargo nextest run -p net-mesh-sdk --test enrollment_policy --no-tests=fail --retries 0`
+passed all **7** tests. An in-place, temporary inverse changed the production
+expiry comparison from `>=` to `>`: the exact-boundary witness failed with
+`Ok(Preauthorized)` instead of `Expired`. Restoring the comparison restored all
+7 passes; no inverse edit remains. This is a local policy-boundary inverse, not
+a durable authority/transport enforcement witness.
+
+Compatibility: the focused SDK lib filter `test(enrollment::) + test(operator::)`
+passed **42** tests with zero retries (274 unrelated tests filtered out).
+`cargo clippy -p net-mesh-sdk --lib -- -D warnings`, SDK formatting and
+`git diff --check` passed on Windows/Rust 1.98.1 with default SDK features.
+The ccc skill guided navigation/index maintenance; ccc/CodeGraph refreshed.
+Existing Rust SDK CI auto-discovers this new integration binary with `net`
+enabled; no new root integration pin is required. Full-feature rustdoc, broad
+workspace/optional-feature gates and exact-head CI were not run locally.
+Locally committed, not pushed. Next: close the durable receipt-store contract
+and bootstrap/control feature boundary before wiring this policy into issuance;
+do not mistake this initial primitive for completed V3-0 or V3-1.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
