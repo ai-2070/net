@@ -74,7 +74,7 @@ script has to do differently. Temporary-supervisor scripts must now add
 | `subnet`      | Temporary topology reads; offline authority issuance and decode-only inspection. |
 | `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
 | `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
-| `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. `ls --inspect-target` inspects resolution only. |
+| `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. Remote verbs and `ls` support `--inspect-target`. |
 | `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
 | `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
 | `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
@@ -114,13 +114,14 @@ node_addr  = "10.0.0.4:7700"
 node_id    = "4"
 node_pubkey = "abcd…"      # 64 hex
 psk_hex     = "1234…"      # 64 hex
+bind        = "0.0.0.0:0" # explicit IPv4 off-host client bind
 ```
 
 Operator identity files are authored by `net-mesh identity generate` — ed25519 seed + public key + SHA-256 fingerprint, the same format the deck loads from the maintenance node. Every signed `admin` / `ice` command picks the identity up from the active profile (or `--identity`).
 
 Profile-backed commands reject missing explicitly selected config files and unknown profile names. Only absence of the implicit default config is optional. Offline commands that do not load profiles are not yet covered by this selection check.
 
-### Inspect aggregator list targeting
+### Inspect mesh targeting
 
 ```sh
 net-mesh aggregator ls --profile prod --inspect-target --output json
@@ -130,7 +131,11 @@ net-mesh aggregator ls --profile prod --local --inspect-target --output json
 
 With a complete profile target, `aggregator ls` now uses remote RPC even without `--remote`. Flags override individual profile fields; partial tuples fail. `--local` selects a temporary supervisor despite profile defaults and discloses that choice, but conflicts with explicit remote flags. Remote failure never falls back locally.
 
-`--inspect-target` is currently specific to `aggregator ls`. It reports mode, peer address/id, public fingerprints, identity availability, current bind, provenance, and ignored remote defaults. It does not connect, start a supervisor, mint an identity, or check authorization; normal execution consumes the same resolved target. An unconfigured identity has no fingerprint until execution generates one. The current client bind remains `127.0.0.1:0`; this sub-slice does not establish off-host connectivity or CLI-wide inspection.
+`--inspect-target` is available on aggregator `ls/query/spawn/scale`, transfer receive/admin, live typegen, `wrap`, `mcp serve`, and feature-gated anchor `ls/stats`. It reports mode, peer address/id, public fingerprints, identity availability, bind and provenance, plus output destination/provider ID where applicable. It reads configured files but does not connect, start a supervisor or child process, create output, mint an identity, or check authorization. Execution consumes the same resolved target and bind. An unconfigured identity has no fingerprint; hosted services still require one to execute. `mcp serve --inspect-target` emits ordinary one-shot output and exits without starting the MCP protocol.
+
+For these clients, `--bind <IP:PORT>` overrides profile `bind`, then the existing default applies: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. A loopback bind with a non-loopback peer is rejected before attachment; select a reachable local interface or explicitly opt into wildcard binding. IPv6 peers require an IPv6 bind, for example `[::]:0`. No default exposure is widened, and a valid bind does not prove firewall/NAT reachability or authorization. The non-loopback integration test uses two participants on one runner, not two computers.
+
+Inspection is not yet CLI-wide: offline/persistent commands and standalone `anchor serve` are outside this surface. Offline `typegen generate --from-snapshot` rejects remote target/bind flags and `--inspect-target` instead of silently ignoring them.
 
 ## Exit codes
 

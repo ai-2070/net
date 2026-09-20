@@ -40,16 +40,23 @@ use crate::context::{resolve_profile, CliContext, RemoteAttach};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::{parse_u16_flexible, parse_u64_flexible};
 use crate::prelude::{emit_value, OutputFormat};
+use crate::target::has_profile_target;
 
-/// Flags every aggregator verb accepts for remote-attach. Each
-/// is also resolvable from the profile (`node_addr` / `node_pubkey`
-/// / `node_id` / `psk_hex`) — the CLI flag wins when both are
-/// set. Resolution is centralised in
-/// [`crate::context::resolve_remote_attach`]; when every field is
-/// `None` and the profile has no defaults, the subcommand runs
-/// in-process.
+/// Shared remote-client target, bind and inspection flags. Target/bind
+/// flags override profile fields through [`crate::context::resolve_attach_args`].
+/// Missing targets fail for remote-only clients; aggregator list additionally
+/// supports an explicitly selected temporary-supervisor mode.
 #[derive(Args, Debug, Default)]
 pub struct RemoteAttachArgs {
+    /// Inspect resolution and exit without connecting, starting a supervisor,
+    /// creating files or starting the hosted protocol/subprocess.
+    #[arg(long)]
+    pub inspect_target: bool,
+
+    /// Local UDP bind IP:port. Overrides profile bind; :0 selects an ephemeral
+    /// port. Use a reachable interface/wildcard for a non-loopback peer.
+    #[arg(long, value_parser = crate::parsers::parse_socket_addr_string)]
+    pub bind: Option<String>,
     /// Remote daemon `IP:port`. Operators copy this from the
     /// daemon's `--print-bootstrap` output.
     #[arg(long, value_parser = crate::parsers::parse_socket_addr_string)]
@@ -66,6 +73,16 @@ pub struct RemoteAttachArgs {
     /// common case.
     #[arg(long, value_parser = crate::parsers::parse_hex32_string)]
     pub psk_hex: Option<String>,
+}
+
+impl RemoteAttachArgs {
+    pub(crate) fn has_target_flags(&self) -> bool {
+        self.bind.is_some()
+            || self.node_addr.is_some()
+            || self.node_pubkey.is_some()
+            || self.remote_node_id.is_some()
+            || self.psk_hex.is_some()
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -125,11 +142,6 @@ pub struct LsArgs {
     /// already selects remote execution, without this flag.
     #[arg(long, default_value_t = false)]
     pub remote: bool,
-
-    /// Print resolved scope, target, public fingerprints and provenance only.
-    /// Does not start a supervisor, connect, mint an identity or verify authority.
-    #[arg(long)]
-    pub inspect_target: bool,
 
     #[command(flatten)]
     pub attach: RemoteAttachArgs,
@@ -285,6 +297,18 @@ async fn run_query(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "query")?;
+    if args.attach.inspect_target {
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        view.provider_node_id = Some(target);
+        return view.emit(output);
+    }
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -334,23 +358,13 @@ fn require_remote_attach(
     })
 }
 
-fn has_profile_target(profile: &crate::config::Profile) -> bool {
-    profile.node_addr.is_some()
-        || profile.node_pubkey.is_some()
-        || profile.node_id.is_some()
-        || profile.psk_hex.is_some()
-}
-
 /// The single mode/target decision consumed by both inspection and execution.
 fn resolve_ls_target(
     profile: &crate::config::Profile,
     args: &LsArgs,
 ) -> Result<Option<RemoteAttach>, CliError> {
     crate::context::validate_endpoint(profile)?;
-    let explicit_target = args.attach.node_addr.is_some()
-        || args.attach.node_pubkey.is_some()
-        || args.attach.remote_node_id.is_some()
-        || args.attach.psk_hex.is_some();
+    let explicit_target = args.attach.has_target_flags();
     if args.scope.local {
         if args.remote || explicit_target {
             return Err(invalid_args(
@@ -359,12 +373,10 @@ fn resolve_ls_target(
         }
         return Ok(None);
     }
-    let remote = crate::context::resolve_remote_attach(
+    let remote = crate::context::resolve_attach_args(
         profile,
-        args.attach.node_addr.as_deref(),
-        args.attach.node_pubkey.as_deref(),
-        args.attach.remote_node_id.as_deref(),
-        args.attach.psk_hex.as_deref(),
+        &args.attach,
+        crate::context::DEFAULT_CLIENT_BIND,
     )?;
     if remote.is_none() {
         if args.remote {
@@ -377,147 +389,6 @@ fn resolve_ls_target(
     Ok(remote)
 }
 
-#[derive(Serialize)]
-struct TargetInspection {
-    mode: &'static str,
-    target: Option<PublicTarget>,
-    bind: Option<&'static str>,
-    identity: InspectionIdentity,
-    provenance: std::collections::BTreeMap<&'static str, &'static str>,
-    ignored_profile_remote_defaults: bool,
-    authorization: &'static str,
-}
-
-#[derive(Serialize)]
-struct PublicTarget {
-    address: String,
-    node_id: u64,
-    peer_key_fingerprint: String,
-}
-
-#[derive(Serialize)]
-struct InspectionIdentity {
-    state: &'static str,
-    fingerprint: Option<String>,
-    reason: Option<&'static str>,
-}
-
-async fn inspect_ls_target(
-    profile: &crate::config::Profile,
-    args: &LsArgs,
-    remote: Option<&RemoteAttach>,
-) -> Result<TargetInspection, CliError> {
-    let source = |flag: bool, configured: bool| {
-        if flag {
-            "flag"
-        } else if configured {
-            "profile"
-        } else {
-            "default"
-        }
-    };
-    let mut provenance = std::collections::BTreeMap::new();
-    provenance.insert(
-        "mode",
-        if args.scope.local || args.remote {
-            "flag"
-        } else {
-            source(
-                args.attach.node_addr.is_some()
-                    || args.attach.node_pubkey.is_some()
-                    || args.attach.remote_node_id.is_some()
-                    || args.attach.psk_hex.is_some(),
-                has_profile_target(profile),
-            )
-        },
-    );
-    for (name, flag, configured) in [
-        (
-            "node_addr",
-            args.attach.node_addr.is_some(),
-            profile.node_addr.is_some(),
-        ),
-        (
-            "node_pubkey",
-            args.attach.node_pubkey.is_some(),
-            profile.node_pubkey.is_some(),
-        ),
-        (
-            "node_id",
-            args.attach.remote_node_id.is_some(),
-            profile.node_id.is_some(),
-        ),
-        (
-            "psk",
-            args.attach.psk_hex.is_some(),
-            profile.psk_hex.is_some(),
-        ),
-    ] {
-        provenance.insert(
-            name,
-            if remote.is_some() {
-                source(flag, configured)
-            } else {
-                "unused"
-            },
-        );
-    }
-    provenance.insert(
-        "identity",
-        source(args.identity.is_some(), profile.identity.is_some()),
-    );
-    provenance.insert(
-        "bind",
-        if remote.is_some() {
-            "default"
-        } else {
-            "unused"
-        },
-    );
-    let identity = match args.identity.as_deref().or(profile.identity.as_deref()) {
-        Some(path) => {
-            let keypair = crate::context::load_identity_keypair(path).await?;
-            InspectionIdentity {
-                state: "configured",
-                fingerprint: Some(public_fingerprint(keypair.entity_id().as_bytes())),
-                reason: None,
-            }
-        }
-        None => InspectionIdentity {
-            state: "unavailable",
-            fingerprint: None,
-            reason: Some("no configured identity; execution would generate an ephemeral identity"),
-        },
-    };
-    Ok(TargetInspection {
-        mode: if remote.is_some() {
-            "remote"
-        } else {
-            "temporary_supervisor"
-        },
-        target: remote.map(|remote| PublicTarget {
-            address: remote.addr.to_string(),
-            node_id: remote.node_id,
-            peer_key_fingerprint: public_fingerprint(&remote.public_key),
-        }),
-        bind: remote.map(|_| crate::context::DEFAULT_CLIENT_BIND),
-        identity,
-        provenance,
-        ignored_profile_remote_defaults: remote.is_none() && has_profile_target(profile),
-        authorization: "not_checked",
-    })
-}
-
-fn public_fingerprint(key: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(key)
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 async fn run_ls(
     args: LsArgs,
     output: Option<OutputFormat>,
@@ -526,10 +397,24 @@ async fn run_ls(
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = resolve_ls_target(&profile, &args)?;
-    if args.inspect_target {
-        let view = inspect_ls_target(&profile, &args, remote.as_ref()).await?;
-        return emit_value(OutputFormat::resolve_oneshot(output), &view)
-            .map_err(|e| generic(format!("write target inspection: {e}")));
+    if args.attach.inspect_target {
+        let mode = if remote.is_some() {
+            "remote"
+        } else {
+            "temporary_supervisor"
+        };
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            remote.as_ref(),
+            mode,
+        )
+        .await?;
+        if args.remote {
+            view.explicit_mode();
+        }
+        return view.emit(output);
     }
     if let Some(remote) = remote {
         return run_ls_remote(args, output, &profile, remote).await;
@@ -605,6 +490,17 @@ async fn run_spawn(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "spawn")?;
+    if args.attach.inspect_target {
+        let view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        return view.emit(output);
+    }
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
@@ -642,6 +538,17 @@ async fn run_scale(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "scale")?;
+    if args.attach.inspect_target {
+        let view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        return view.emit(output);
+    }
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)

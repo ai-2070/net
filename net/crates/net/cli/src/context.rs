@@ -35,6 +35,7 @@ use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
 /// Current short-lived client bind, shared with target inspection.
 pub(crate) const DEFAULT_CLIENT_BIND: &str = "127.0.0.1:0";
+pub(crate) const DEFAULT_SERVICE_BIND: &str = "0.0.0.0:0";
 
 /// Resolved remote-attach target. Built from subcommand flags +
 /// profile fallbacks via [`resolve_remote_attach`]. Carrying it
@@ -43,6 +44,7 @@ pub(crate) const DEFAULT_CLIENT_BIND: &str = "127.0.0.1:0";
 /// resolve time.
 #[derive(Debug, Clone)]
 pub struct RemoteAttach {
+    pub bind: SocketAddr,
     pub addr: SocketAddr,
     pub public_key: [u8; 32],
     pub node_id: u64,
@@ -304,22 +306,22 @@ async fn build_remote_mesh(
     remote: RemoteAttach,
     identity: Option<net_sdk::identity::Identity>,
 ) -> Result<net_sdk::Mesh, CliError> {
-    // Loopback bind; identity per the caller.
-    build_attached_mesh(DEFAULT_CLIENT_BIND, identity, &remote).await
+    // Bind and identity have already been resolved for this invocation.
+    build_attached_mesh(identity, &remote).await
 }
 
-/// Build a local mesh bound to `bind`, optionally under an operator
+/// Build a local mesh bound to `remote.bind`, optionally under an operator
 /// `identity`, and join `remote` via the routed handshake. The single
 /// implementation behind the in-process attach ([`build_remote_mesh`],
-/// anonymous + loopback) and the `net-mesh wrap` / `net-mesh mcp serve` shims (which pass
-/// their operator identity and bind `0.0.0.0:0` so the served / consumed
-/// capabilities carry a stable, owner-scoped origin reachable by the peer).
+/// client path) and the `net-mesh wrap` / `net-mesh mcp serve` shims. Clients
+/// default to loopback and services to wildcard; explicit/profile overrides
+/// are resolved and validated before either inspection or execution.
 pub(crate) async fn build_attached_mesh(
-    bind: &str,
     identity: Option<net_sdk::identity::Identity>,
     remote: &RemoteAttach,
 ) -> Result<net_sdk::Mesh, CliError> {
-    let mut builder = net_sdk::MeshBuilder::new(bind, &remote.psk)
+    validate_bind(remote.bind, remote.addr)?;
+    let mut builder = net_sdk::MeshBuilder::new(&remote.bind.to_string(), &remote.psk)
         .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?;
     if let Some(id) = identity {
         builder = builder.identity(id);
@@ -396,6 +398,7 @@ pub fn resolve_remote_attach(
     let psk = hex_decode_32(psk_str).map_err(|e| invalid_args(format!("--psk-hex: {e}")))?;
 
     Ok(Some(RemoteAttach {
+        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         addr,
         public_key,
         node_id,
@@ -413,14 +416,69 @@ pub fn require_remote_attach(
     args: &crate::commands::aggregator::RemoteAttachArgs,
     missing: impl FnOnce() -> CliError,
 ) -> Result<RemoteAttach, CliError> {
-    resolve_remote_attach(
+    require_remote_attach_with_bind(profile, args, DEFAULT_CLIENT_BIND, missing)
+}
+
+pub(crate) fn require_remote_attach_with_bind(
+    profile: &Profile,
+    args: &crate::commands::aggregator::RemoteAttachArgs,
+    default_bind: &str,
+    missing: impl FnOnce() -> CliError,
+) -> Result<RemoteAttach, CliError> {
+    resolve_attach_args(profile, args, default_bind)?.ok_or_else(missing)
+}
+
+pub(crate) fn resolve_attach_args(
+    profile: &Profile,
+    args: &crate::commands::aggregator::RemoteAttachArgs,
+    default_bind: &str,
+) -> Result<Option<RemoteAttach>, CliError> {
+    validate_endpoint(profile)?;
+    let mut remote = resolve_remote_attach(
         profile,
         args.node_addr.as_deref(),
         args.node_pubkey.as_deref(),
         args.remote_node_id.as_deref(),
         args.psk_hex.as_deref(),
-    )?
-    .ok_or_else(missing)
+    )?;
+    if let Some(remote) = &mut remote {
+        remote.bind = args
+            .bind
+            .as_deref()
+            .or(profile.bind.as_deref())
+            .unwrap_or(default_bind)
+            .parse()
+            .map_err(|_| invalid_args("--bind/profile bind must be an IP:port literal"))?;
+        validate_bind(remote.bind, remote.addr)?;
+    } else if args.bind.is_some() {
+        return Err(invalid_args("--bind requires a complete remote target"));
+    }
+    Ok(remote)
+}
+
+fn validate_bind(bind: SocketAddr, target: SocketAddr) -> Result<(), CliError> {
+    if target.ip().is_unspecified() || target.ip().is_multicast() || target.port() == 0 {
+        return Err(invalid_args(
+            "remote target must be a unicast peer IP with a nonzero port",
+        ));
+    }
+    if bind.is_ipv4() != target.is_ipv4() {
+        return Err(invalid_args(
+            "--bind and remote target must use the same IP address family",
+        ));
+    }
+    if bind.ip().is_multicast() {
+        return Err(invalid_args(
+            "--bind must be a local interface or wildcard, not multicast",
+        ));
+    }
+    if bind.ip().is_loopback() && !target.ip().is_loopback() {
+        return Err(invalid_args(
+            "loopback bind cannot reach a non-loopback peer; set --bind to a reachable local \
+             interface or wildcard (IPv4: 0.0.0.0:0; IPv6: [::]:0)",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {

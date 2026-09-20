@@ -8,6 +8,19 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — remote inspection and explicit client binding
+
+- Extend `--inspect-target` to aggregator query/spawn/scale, transfer
+  receive/admin, live typegen, wrap, MCP serve, and optional anchor ls/stats.
+  Inspection reads configuration but performs no network, child-process or
+  output-file work. MCP inspection exits before starting protocol traffic.
+- Remote clients accept `--bind`, overriding profile `bind`. Existing
+  loopback client and wildcard hosted-service defaults remain unchanged.
+  Loopback-to-non-loopback targets and incompatible address families fail
+  early with actionable errors; execution consumes the inspected bind.
+- Offline typegen refuses remote-only target/bind/inspection flags.
+  Offline/persistent-wide inspection remains follow-up work.
+
 ## Unreleased — aggregator list target resolution
 
 - `aggregator ls` now selects remote RPC from a complete profile target,

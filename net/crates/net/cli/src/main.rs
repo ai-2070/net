@@ -30,6 +30,7 @@ mod output;
 mod parsers;
 mod prelude;
 mod secret;
+mod target;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

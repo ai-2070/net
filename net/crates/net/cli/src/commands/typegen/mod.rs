@@ -195,18 +195,27 @@ async fn run_generate(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let (descriptors, meta) = match &args.from_snapshot {
-        Some(path) => load_snapshot_source(path, &args.tags, &args.tools)?,
+        Some(path) => {
+            if args.attach.has_target_flags() || args.attach.inspect_target {
+                return Err(invalid_args("remote target/bind flags and --inspect-target are for live typegen; remove them when using --from-snapshot (offline inspection is not available yet)"));
+            }
+            load_snapshot_source(path, &args.tags, &args.tools)?
+        }
         None => {
-            fetch_live_source(
-                &args.tags,
-                &args.tools,
+            let Some(ctx) = prepare_live_context(
                 &args.attach,
                 args.identity.as_deref(),
                 args.node,
                 config_path,
                 profile_name,
+                output,
+                &args.out,
             )
             .await?
+            else {
+                return Ok(());
+            };
+            fetch_live_source(&args.tags, &args.tools, ctx).await?
         }
     };
 
@@ -291,16 +300,20 @@ async fn run_snapshot(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    let (descriptors, _meta) = fetch_live_source(
-        &args.tags,
-        &args.tools,
+    let Some(ctx) = prepare_live_context(
         &args.attach,
         args.identity.as_deref(),
         args.node,
         config_path,
         profile_name,
+        output,
+        &args.out,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
+    let (descriptors, _meta) = fetch_live_source(&args.tags, &args.tools, ctx).await?;
 
     let schema_bytes: u64 = descriptors
         .iter()
@@ -414,17 +427,16 @@ fn read_snapshot(path: &Path) -> Result<TypegenSnapshot, CliError> {
     Ok(snapshot)
 }
 
-/// Discover descriptors live: remote-attach, let the fold populate, then
-/// `list_tools`, filtered by `--tag` / `--tool`.
-async fn fetch_live_source(
-    tags: &[String],
-    tools: &[String],
+/// Resolve once, then either emit inspection or attach for live discovery.
+async fn prepare_live_context(
     attach: &RemoteAttachArgs,
     identity: Option<&Path>,
     node: u64,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
-) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
+    output: Option<OutputFormat>,
+    destination: &Path,
+) -> Result<Option<CliContext>, CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, attach, || {
         invalid_args(
@@ -433,7 +445,23 @@ async fn fetch_live_source(
              profile), or use --from-snapshot for offline generation.",
         )
     })?;
-    let ctx = CliContext::build_with_remote(&profile, identity, node, false, remote).await?;
+    if attach.inspect_target {
+        let mut view =
+            crate::target::inspect(&profile, attach, identity, Some(&remote), "remote").await?;
+        view.destination = Some(destination.to_path_buf());
+        view.emit(output)?;
+        return Ok(None);
+    }
+    CliContext::build_with_remote(&profile, identity, node, false, remote)
+        .await
+        .map(Some)
+}
+
+async fn fetch_live_source(
+    tags: &[String],
+    tools: &[String],
+    ctx: CliContext,
+) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
     let mesh = ctx.require_mesh()?;
 
     // The fold populates asynchronously after attach. Poll until it

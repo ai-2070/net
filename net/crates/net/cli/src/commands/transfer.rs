@@ -213,6 +213,19 @@ async fn run_recv_blob(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "recv-blob")?;
+    if args.attach.inspect_target {
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        view.destination = Some(args.out.clone());
+        view.provider_node_id = Some(args.from.unwrap_or(remote.node_id));
+        return view.emit(output);
+    }
     // `--from` overrides the attach target (fetch via a relay you
     // handshook with); otherwise the holder is the node you connected to.
     // (Parsed to `u64` at argv time, so no fallible re-parse here.)
@@ -358,6 +371,19 @@ async fn run_recv_dir(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "recv-dir")?;
+    if args.attach.inspect_target {
+        let mut view = crate::target::inspect(
+            &profile,
+            &args.attach,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?;
+        view.destination = Some(args.out.clone());
+        view.provider_node_id = Some(args.from.unwrap_or(remote.node_id));
+        return view.emit(output);
+    }
     // `--from` is parsed to `u64` at argv time; default to the attach target.
     let attached = remote.node_id;
     let source = args.from.unwrap_or(attached);
@@ -460,12 +486,19 @@ async fn transfer_client(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
     verb: &str,
-) -> Result<(CliContext, u64), CliError> {
+    output: Option<OutputFormat>,
+) -> Result<Option<(CliContext, u64)>, CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, attach, verb)?;
+    if attach.inspect_target {
+        crate::target::inspect(&profile, attach, identity, Some(&remote), "remote")
+            .await?
+            .emit(output)?;
+        return Ok(None);
+    }
     let target = remote.node_id;
     let ctx = CliContext::build_with_remote(&profile, identity, node, false, remote).await?;
-    Ok((ctx, target))
+    Ok(Some((ctx, target)))
 }
 
 async fn run_ls(
@@ -474,15 +507,19 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    let (ctx, target) = transfer_client(
+    let Some((ctx, target)) = transfer_client(
         &args.attach,
         args.identity.as_deref(),
         args.node,
         config_path,
         profile_name,
         "ls",
+        output,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
     let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
     let transfers = client
         .list(target)
@@ -505,15 +542,19 @@ async fn run_status(
 ) -> Result<(), CliError> {
     let stream_id = parse_u64_flexible(&args.transfer_id)
         .map_err(|e| invalid_args(format!("transfer-id `{}`: {e}", args.transfer_id)))?;
-    let (ctx, target) = transfer_client(
+    let Some((ctx, target)) = transfer_client(
         &args.attach,
         args.identity.as_deref(),
         args.node,
         config_path,
         profile_name,
         "status",
+        output,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
     let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
     let found = client.get(target, stream_id).await.map_err(|e| {
         sdk(format!(
@@ -538,15 +579,19 @@ async fn run_cancel(
 ) -> Result<(), CliError> {
     let stream_id = parse_u64_flexible(&args.transfer_id)
         .map_err(|e| invalid_args(format!("transfer-id `{}`: {e}", args.transfer_id)))?;
-    let (ctx, target) = transfer_client(
+    let Some((ctx, target)) = transfer_client(
         &args.attach,
         args.identity.as_deref(),
         args.node,
         config_path,
         profile_name,
         "cancel",
+        output,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
     let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
     let cancelled = client.cancel(target, stream_id).await.map_err(|e| {
         sdk(format!(

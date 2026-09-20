@@ -374,7 +374,7 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+    use crate::context::{require_remote_attach, resolve_profile, CliContext};
 
     let profile = resolve_profile(config_path, profile_name).await?;
     // **R6: the rows come from a live mesh.** The in-process Deck
@@ -382,27 +382,21 @@ async fn run_ls(
     // structurally empty — the listing could never show an anchor no
     // matter how many announced. Attaching to the daemon is the same
     // path every other cross-node listing uses.
-    let remote_node_id = args
-        .remote
-        .remote_node_id
-        .clone()
-        .or_else(|| profile.node_id.clone())
-        .ok_or_else(|| {
-            invalid_args("anchor ls needs --node-id (or a profile default) to address the daemon")
-        })?;
-    let remote = resolve_remote_attach(
-        &profile,
-        args.remote.node_addr.as_deref(),
-        args.remote.node_pubkey.as_deref(),
-        args.remote.remote_node_id.as_deref(),
-        args.remote.psk_hex.as_deref(),
-    )?
-    .ok_or_else(|| {
-        invalid_args(
-            "anchor ls reads announcements from a live mesh: pass --node-addr / \
-             --node-pubkey / --node-id / --psk-hex, or set them in your profile",
-        )
+    let remote = require_remote_attach(&profile, &args.remote, || {
+        invalid_args("anchor ls needs a live mesh target: pass --node-addr/--node-pubkey/--node-id/--psk-hex or set profile defaults")
     })?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?
+        .emit(output);
+    }
+    let target = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -413,8 +407,6 @@ async fn run_ls(
     // listing used to be structurally empty. The anchor answers for
     // itself over `net.mesh.anchors`.
     let mesh = ctx.require_mesh()?;
-    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
-        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
     let raw = tokio::time::timeout(
         std::time::Duration::from_secs(args.wait_secs.max(1)),
         mesh.call_raw_bytes(
@@ -462,42 +454,28 @@ async fn run_stats(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+    use crate::context::{require_remote_attach, resolve_profile, CliContext};
 
     let profile = resolve_profile(config_path, profile_name).await?;
-    let remote_node_id = args
-        .remote
-        .remote_node_id
-        .clone()
-        .or_else(|| profile.node_id.clone())
-        .ok_or_else(|| {
-            invalid_args(
-                "anchor stats reads an ICE attempt ledger from the node that owns it, and a \
-                 ledger is never announced — so there is nothing local to fall back on: pass \
-                 --node-id (or set a profile default) to address the anchor",
-            )
-        })?;
-    let remote = resolve_remote_attach(
-        &profile,
-        args.remote.node_addr.as_deref(),
-        args.remote.node_pubkey.as_deref(),
-        args.remote.remote_node_id.as_deref(),
-        args.remote.psk_hex.as_deref(),
-    )?
-    .ok_or_else(|| {
-        invalid_args(
-            "an ICE attempt ledger belongs to the node that owns it and is never \
-             announced, so anchor stats has nothing local to read: pass \
-             --node-addr / --node-pubkey / --node-id / --psk-hex, or set them in \
-             your profile",
-        )
+    let remote = require_remote_attach(&profile, &args.remote, || {
+        invalid_args("anchor stats needs a live mesh target: pass --node-addr/--node-pubkey/--node-id/--psk-hex or set profile defaults")
     })?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "remote",
+        )
+        .await?
+        .emit(output);
+    }
+    let target = remote.node_id;
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
     let mesh = ctx.require_mesh()?;
-    let target = crate::parsers::parse_u64_flexible(remote_node_id.as_str())
-        .map_err(|e| invalid_args(format!("--node-id: {e}")))?;
     let raw = tokio::time::timeout(
         Duration::from_secs(args.wait_secs.max(1)),
         mesh.call_raw_bytes(

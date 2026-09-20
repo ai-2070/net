@@ -35,7 +35,7 @@ use tokio::io::BufReader;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{
-    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+    build_attached_mesh, load_operator_identity, require_remote_attach_with_bind, resolve_profile,
 };
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -117,16 +117,17 @@ pub async fn run(
     profile_name: &str,
 ) -> Result<(), CliError> {
     match cmd {
-        // `serve` ignores `output` — stdout is the MCP JSON-RPC transport (see
-        // the module docs); emitting through the output pipeline would corrupt
-        // it. The `pin` verbs are ordinary one-shot commands and do use it.
-        McpCommand::Serve(args) => run_serve(args, config_path, profile_name).await,
+        // Ordinary `serve` ignores `output`: stdout is MCP JSON-RPC traffic.
+        // Explicit inspection exits before protocol startup and, like `pin`,
+        // uses the ordinary one-shot output pipeline.
+        McpCommand::Serve(args) => run_serve(args, output, config_path, profile_name).await,
         McpCommand::Pin(cmd) => run_pin(cmd, output).await,
     }
 }
 
 async fn run_serve(
     args: ServeArgs,
+    output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
@@ -134,7 +135,23 @@ async fn run_serve(
 
     // A mesh peer to join — the running node this shim reads capabilities from
     // and routes invocations through. Without one there is nothing to serve.
-    let remote = require_remote_attach(&profile, &args.remote, || generic(MSG_NO_DAEMON))?;
+    let remote = require_remote_attach_with_bind(
+        &profile,
+        &args.remote,
+        crate::context::DEFAULT_SERVICE_BIND,
+        || generic(MSG_NO_DAEMON),
+    )?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "hosted_service",
+        )
+        .await?
+        .emit(output);
+    }
 
     // Operator identity — the shim's origin (and thus which owner-scoped tools
     // admit it) derives from it.
@@ -152,7 +169,7 @@ async fn run_serve(
         })?;
     let identity = load_operator_identity(identity_path).await?;
 
-    let mesh = build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?;
+    let mesh = build_attached_mesh(Some(identity), &remote).await?;
     let mesh = Arc::new(mesh);
 
     // Seed the shim consent allowlist from `--allow-capability`.

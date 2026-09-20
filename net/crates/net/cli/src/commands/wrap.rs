@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{
-    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+    build_attached_mesh, load_operator_identity, require_remote_attach_with_bind, resolve_profile,
 };
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::output::{emit_stream_row, OutputFormat};
@@ -146,13 +146,30 @@ pub async fn run(
     let profile = resolve_profile(config_path, profile_name).await?;
 
     // The mesh peer to join. `net-mesh wrap` must join a mesh to be reachable.
-    let remote = require_remote_attach(&profile, &args.remote, || {
-        invalid_args(
-            "net-mesh wrap needs a mesh peer to join. Pass \
+    let remote = require_remote_attach_with_bind(
+        &profile,
+        &args.remote,
+        crate::context::DEFAULT_SERVICE_BIND,
+        || {
+            invalid_args(
+                "net-mesh wrap needs a mesh peer to join. Pass \
              --node-addr/--node-pubkey/--node-id/--psk-hex (or set them in your \
              profile) pointing at a running mesh node.",
+            )
+        },
+    )?;
+
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "hosted_service",
         )
-    })?;
+        .await?
+        .emit(output);
+    }
 
     // Operator identity — owner-only keys on this node's origin.
     let identity_path = args
@@ -170,8 +187,7 @@ pub async fn run(
 
     // Build a mesh under that identity and join via the peer. `Arc` because
     // the publisher (and each publication) holds the mesh alongside us.
-    let mesh =
-        std::sync::Arc::new(build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?);
+    let mesh = std::sync::Arc::new(build_attached_mesh(Some(identity), &remote).await?);
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args

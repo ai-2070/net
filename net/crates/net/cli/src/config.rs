@@ -112,6 +112,11 @@ pub struct Profile {
     /// hex). Subcommand `--node-id` overrides.
     #[serde(default)]
     pub node_id: Option<String>,
+
+    /// Local UDP bind for attached mesh clients/services; explicit --bind wins.
+    /// Absent preserves the command's existing loopback or wildcard default.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 impl ConfigFile {
