@@ -62,7 +62,8 @@ Every dispatched command now validates explicit `--config` / `--profile` selecti
 ```sh
 net-mesh netdb tasks ls --store ./state --inspect-target --output json
 net-mesh netdb restore --store ./state --from ./backup.bin --clear --inspect-target
-net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./generated --inspect-target
+net-mesh typegen generate --language ts --from-snapshot ./tools.json \
+  --out ./generated --inspect-target
 ```
 
 All NetDB verbs support `--inspect-target`. The result identifies `mode: persistent_store`, the resolved store (`--store` > profile `netdb` > data-directory default), and snapshot source/destination where applicable. Normal dispatch uses the inspected store selection. Saved typegen reports `mode: offline`, source and destination, and rejects explicit remote target/bind flags.
@@ -132,7 +133,8 @@ In JSON mode stdout is one object containing `blob_ref`, `size`, `chunks`, and o
 Materialize a directory from its manifest:
 
 ```sh
-net-mesh transfer recv-dir --remote-ref <REF> --out <PATH> [--from <NODE>] [--concurrency <N>] [REMOTE FLAGS]
+net-mesh transfer recv-dir --remote-ref <REF> --out <PATH> [--from <NODE>] \
+                           [--concurrency <N>] [REMOTE FLAGS]
 ```
 
 The SDK builds a temporary directory and renames it into place on success. `--concurrency 0` selects the SDK default. There is no `--dest` or `--inflight-budget-bytes` CLI option.
