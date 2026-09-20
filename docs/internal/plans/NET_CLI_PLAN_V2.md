@@ -1,6 +1,6 @@
 # Net CLI — current implementation and next bounded work
 
-**Status:** Refreshed plan; implementation is not authorized by this document refresh.
+**Status:** Implementation authorized in the working session. CLI-1 preflight is committed; durable restoration is the next authorized correction, followed by the remaining slices below.
 **Source baseline:** `d7b749983199012978e69867f3c3694c4df96f69` on `master`, reviewed 2026-09-20.
 **Package / executable:** `net-cli` / `net-mesh`; package version at the baseline is `0.36.0`.
 **Goal:** Enable capability publishers and consumers to expose, discover, and invoke an authorized capability across processes and computers, know where each operation runs, and capture reusable typed contracts. Repair destructive preflight behavior and misleading execution semantics on the way, using existing SDK mechanisms.
@@ -149,7 +149,7 @@ A new developer must be able to complete one useful authorized capability workfl
 | Slice | Outcome | Reason for order |
 |---|---|---|
 | **DOC-0 — Immediate expectation correction** | Public reference and README describe shipped behavior | Separate docs-only change alongside CLI-1; do not wait for feature completion |
-| **CLI-1 — NetDB restore preflight** | Invalid source/configuration cannot erase or redirect a store before restoration starts | Immediate bounded data-safety correction; scope unchanged |
+| **CLI-1 — NetDB restore preflight and persistence** | Reject bad inputs before mutation; restored records survive reopening | Preflight committed; persistence defect found by positive controls |
 | **CLI-2A — Explicit fresh-supervisor scope** | New empty runtimes cannot be mistaken for deployed state | Extend existing `snapshot --local` precedent with explicit explanation |
 | **CLI-2B — Target resolution** | Resolve mode, target, identity, and supported bind consistently before acting | Separate review unit; no remote Deck or context-management framework |
 | **CLI-DX — Automation contract** | Predictable framing, deadlines, and noninteractive confirmation | Explicit compatibility change after targeting; not hidden in CLI-1 |
@@ -158,7 +158,7 @@ A new developer must be able to complete one useful authorized capability workfl
 | Later — transfer holder | Stage, host, and fetch with shipped CLI processes alone | Supporting workflow; needs lifecycle, exposure policy, and non-loopback proof |
 | Later — unary RPC | Invoke a known service from shell/CI | Reuse current Mesh and typed calls; no invented method/codec abstraction |
 
-These are independent reviewable slices, not an all-or-nothing release train. **CLI-1 remains the next proposed implementation authorization; DOC-0 can proceed independently alongside it.** CLI-2A/2B, CLI-DX, CLI-3, and journey delivery are explicit follow-ups, not permission to expand CLI-1. Retain CLI-3's identifier for existing references. Implementers may further split coherent review units without weakening cumulative acceptance.
+These are independent reviewable slices, not an all-or-nothing release train. The user authorized committing the preflight patch, updating this plan, fixing and committing durable restoration, then continuing the plan. Finish CLI-1 persistence next, then DOC-0 and the subsequent slices in order. Retain CLI-3's identifier for existing references. Implementers may further split coherent review units without weakening cumulative acceptance. Two-computer evidence still requires actual available hosts; local fixtures cannot substitute for it.
 
 ### DOC-0 — correct expectations before adding features
 
@@ -168,13 +168,32 @@ Use the wording **“Starts a temporary supervisor for this command; does not in
 
 Acceptance: inspect every corrected claim against its implementation; check examples' argv and links; run applicable docs checks from `web/` using `npm run check`, separating unrelated baseline failures. Parser/help tests validate syntax only. DOC-0 does not claim an unexecuted journey works, nor does it wait for all later CLI slices to finish.
 
-## 5. CLI-1 — next bounded implementation plan
+## 5. CLI-1 — preflight repair and durable restoration
+
+### Implementation status — 2026-09-20
+
+Preflight patch: `5924174fb` (parent `ad540dcbe5e461e31b5d84ca1482aaa708820a48`). Changed only CLI `netdb.rs`, its changelog, and the new `netdb_restore_preflight.rs` subprocess suite. Profile errors now propagate; a single bounded source read and envelope validation precede destination mutation. Destination inspection failures remain errors.
+
+Windows evidence: full default CLI suite **237 passed, 5 failed, 1 existing ignored**; the new suite accounts for 12 passes and all 5 failures. CLI all-target check, strict binary clippy, and package formatting passed. Workspace-wide formatting failed to launch due to Windows command-length error 206. Linux default-directory isolation and Unix permission-gate tests remain platform-specific CI work. Both inverse checks succeeded: clear-before-read breaks the missing/malformed preservation tests, and swallowed profile errors break the configuration test. Inverse edits were removed and the disposable checkout deleted. Reusing a target directory across checkouts left a stale inverse executable; the reported full-suite result is from a package-clean candidate rebuild.
+
+**Discovered pre-existing defect:** a valid snapshot restores into the SDK's in-memory adapter state, but `netdb restore` exits without persisting that initial state for the next ordinary open. A separate CLI read returns no restored records. The snapshot fixture successfully restores the expected record through the public SDK in memory, ruling out an empty input fixture. The five active failing controls cover clear, source-inside-destination, profile destination, tasks-only, and memories-only restoration. They must stay active until the defect is fixed.
+
+### Authorized persistence extension
+
+Implement the smallest coherent persistence/reopen correction using the existing NetDB/CortEX/RedEX mechanisms. CLI, SDK, and core storage changes are allowed where necessary for this defect; unrelated wire, networking, and command families remain outside CLI-1. Preserve the public snapshot encoding and ordinary command output unless a concrete incompatibility is discovered and documented.
+
+- A successful restore must survive process exit and ordinary reopening, without the original source file. Persist the restored state and the replay position together; do not reconstruct domain events and silently lose timestamps, deletion state, provenance, or sequence semantics.
+- Reopening and subsequent writes must preserve restored records and replay new events exactly once across further restarts. Keep origin attribution explicit and guard against accidentally applying a checkpoint under another origin.
+- Preserve the existing `--force` fold/merge boundary, including adapters absent from the incoming snapshot. `--clear` removes prior state. Cover both adapters and post-restore writes; do not claim arbitrary conflict resolution beyond the existing fold contract.
+- Validate nested adapter input before destructive replacement using existing decoders where possible. Do not turn an invalid embedded payload into another clear-before-validation path.
+- Fail persistence errors before emitting restore success. Full crash-atomic replacement and concurrent writers remain separate work; do not claim them merely because a checkpoint file is atomically published.
+- Add focused persistence/reopen witnesses at the owning layer and retain the CLI subprocess acceptance controls. Run the appropriate existing storage family once after focused closure, plus the CLI sweep and touched-crate lint/doc gates. Commit the defect fix separately from preflight and this plan update.
 
 ### Goal and limit
 
 For `net-mesh netdb restore`, invalid configuration or unusable snapshot input must fail before mutating the destination. Preserve origin rules, store precedence for valid configuration, merge/clear distinction, and successful output shape.
 
-This is a **preflight ordering repair**, not atomic/crash-safe replacement, a journal, live-store migration, or a RedEX redesign. Once valid restoration begins, interruption or storage failure may still leave incomplete state. Operate only on an offline store; this slice does not establish safe concurrent writers.
+The original preflight ordering repair is committed. The authorized extension adds persistence and reopening as described above; it is not atomic/crash-safe replacement, live-store migration, or a general RedEX redesign. Once valid restoration begins, interruption or storage failure may still leave incomplete state. Operate only on an offline store; this slice does not establish safe concurrent writers.
 
 ### Files
 
@@ -185,7 +204,7 @@ Modify:
 Create:
 - `net/crates/net/cli/tests/netdb_restore_preflight.rs` — real CLI subprocess witnesses with disposable stores and isolated config/data locations.
 
-No SDK/core/wire changes, new dependencies, command renames, new exit codes, or CI feature-set changes. New CLI integration files are auto-discovered. Private helper factoring within the module is implementer judgment, not an invitation to restructure unrelated commands.
+The original preflight patch required no SDK/core/wire changes. The persistence extension may touch the owning SDK/core storage modules and their tests as necessary; identify exact files during the implementation survey. No unrelated dependencies, command renames, new exit codes, or CI feature-set changes. New CLI integration files are auto-discovered; new root integration binaries must be pinned according to repository policy.
 
 ### Required behavior
 
