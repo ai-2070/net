@@ -1,0 +1,34 @@
+net/crates/net/cli/src/commands/anchor.rs
+  s_38828de26a56bb::t_e9b509ccc04498 380,406,431-432
+  s_38828de26a56bb::t_96bdb1772ae868 365-372,374-379,381-383,394-398,400-405,407-409,439-441
+  s_38828de26a56bb::t_31e475702e2bab 146-148,212-214,355-364,373,384-393,399,410,424-430,433-438,443-451,641,745
+  s_38828de26a56bb::t_b14f4d54ca322e 442
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_f0ea393f69faa1 53
+  s_38828de26a56bb::t_e9b509ccc04498 61-62
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_e9b509ccc04498 11-17
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_e9b509ccc04498 162-164
+net/crates/net/cli/tests/local_target_inspection.rs
+  s_38828de26a56bb::t_e9b509ccc04498 105,129
+  s_38828de26a56bb::t_3123660c5adb87 30-33,38-40,46-49,70-76,88,94-98,102-104,106-114,125-128,135-148,157-163
+  s_38828de26a56bb::t_6cf691eb1b821e 34-37,41-45,50-69,77-87,89-93,99-101,115-124,130-134,149-156
+  s_38828de26a56bb::t_ef14199aaf91f2 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e9fbc25d14622e852778789c771cb68f826eb64c",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
