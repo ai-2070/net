@@ -27,7 +27,7 @@ V2's deferred transfer holder, generic unary RPC, remote Deck, and crash-safe Ne
 1. On operator A, select the real identity, authority stores, trust domain, and reachable listener. Start or attach to the explicitly named enrollment service. The listener's lifetime is visible.
 2. Create a short-lived join link for the intended target. Mesh and organization invitations can carry an explicitly authorized subnet attachment scope. A device already on the mesh can receive a standalone subnet link.
 3. On device B, inspect the link locally, confirm the intended roots/scope, generate or load its own persistent identity, and explicitly redeem. Root private keys never leave A.
-4. A validates B's proof of identity, checks the issuing authority and current policy, and approves the exact bundle. Approval defaults to a human decision; headless preauthorization is explicit and bounded.
+4. A validates B's proof of identity, the invitation and current policy, and issues exactly the preauthorized bundle. Creating the invitation is the inviter's authorization: by default there is no second human approval. Only invitations explicitly created with `--require-approval` wait for a subsequent operator decision.
 5. B durably installs the returned configuration/credentials and proves the requested live admission. A membership certificate is not yet an admitted subnet session. If only part completes, report the individual stages and provide a same-identity resume path.
 6. B starts an ordinary provider/caller using the saved enrollment/profile through existing SDK/CLI paths. The operator sees identity, credential state, actual observed admission, and the source/freshness of that observation.
 7. An invocation without separately granted execution authority is denied. Apply the explicit existing dispatcher/capability/provider permissions and prove the authorized call reaches the exact provider.
@@ -109,19 +109,20 @@ Use current production identity bindings; document where `EntityId`, transport k
 - Join links are the primary interface; QR encoding, hosted landing pages, OS URL-handler installation, and mobile-specific UI are deferred.
 - Explicit `join` performs redemption. Inspection, preview GET/HEAD, unfurling, completion and help must not redeem or approve anything. If no HTTP landing page ships, test the offline inspector and any existing bootstrap endpoints that a preview could reach.
 - A versioned, integrity-bound invitation names issuer/root, allowed operation, exact target scope, expiry, single-use identifier, and optional intended device identity. Org and subnet authority must be independently verifiable; one issuer's signature does not grant another authority's rights.
-- The default is approve-before-issue. A headless invite is explicit preauthorization for a bounded operation, one redeeming identity and expiry; document its bearer risk. Never silently select `serve_enrollment_auto` for convenience.
-- Prefer the existing authenticated bootstrap mechanisms for obtaining first-contact transport material after approval. V3-0 must prove a native CLI path from a clean device with no PSK. If those mechanisms require an adapter, scope that adapter explicitly before implementation; do not require the parked serverless project.
+- **Default: preauthorized invitation, secure redemption.** Creating a link authorizes its exact operation/scope for one redeeming identity within its expiry. This is the normal interactive and headless flow, not a special auto-approve shortcut. No second inviter prompt is required. An optional full intended-device identity restricts who can redeem; without it the link is bearer authorization and the first valid, durably committed claimant wins. Creation/inspection must disclose that risk. Possession of a link is not generic management or invocation authority.
+- **Optional: request-and-approve.** `--require-approval` on invitation creation records a signed, durable policy requiring a subsequent operator decision for the exact claimant/intent. Neither the device nor a service-wide convenience flag may downgrade it. This mode remains useful when the inviter wants to verify an unknown device before issuing credentials. Do not route either mode through legacy `serve_enrollment_auto`: its delegation outcome is not V3 membership-only enrollment.
+- Obtain first-contact transport material through authenticated redemption, after invitation validation, identity proof and durable authorization/claim commit (plus human approval only in the optional mode). V3-0 must prove a native CLI path from a clean device with no PSK. Scope the required adapter explicitly; do not require the parked serverless project. Secure delivery and human approval are separate decisions.
 - Do not embed an existing private deployment's standing PSK in a supposedly harmless invite. Any chosen secret-bearing link mode requires explicit operator opt-in, a named trust domain, secret-file/stdin support and a clear warning: invite expiry/revocation does not expire or erase the standing PSK. Never call that mode approval-only transport access.
 - No root private keys in links, device responses, examples, logs or generated profiles. Redact bearer strings, PSKs, audience secrets and request proofs from diagnostics/traces; only explicit secret export may emit credential material to a protected destination.
 - Validate size, version, signature, expiry, operation, endpoint scheme/address and trust binding before connection or mutation. Do not follow redirects to an unpinned authority, fetch arbitrary URLs while inspecting a link, or claim a self-signed root is independently trusted. Human confirmation trusts the intended issuer; crypto preserves that binding thereafter.
 
 ### 5.3 Durable identity and redemption
 
-Model the minimal durable transitions: offered → identity-bound approval/claim → issued receipt → device installed → live admission observed. Expired/revoked/denied and partial states are explicit, not exceptions hidden by a success message.
+Model the minimal durable transitions: preauthorized offer → identity-bound claim → issued receipt → device installed → live admission observed. The optional request-and-approve mode inserts pending approval → approved before issuance. Expired/revoked/denied and partial states are explicit, not exceptions hidden by a success message.
 
 - Persist the device key before the first redeem request. A retry uses that key, not a regenerated identity.
 - Persist the winning identity and exact scope/result before returning issued credentials. Same-identity retry returns the same committed result; another identity cannot redeem the same invitation. Bind the complete request intent, not only its nonce.
-- Serialize competing redeem/revoke/expiry operations at the owner. Approval completion rechecks current policy and expiry. Do not hold a storage mutex across an unbounded human prompt.
+- Serialize competing redeem/revoke/expiry operations at the owner. Claim/issuance and optional approval completion recheck current policy and expiry. Do not hold a storage mutex across an unbounded human prompt. Invalid proofs cannot consume or reserve an invitation. Optional approval binds one verified claimant; replacing a denied claimant requires explicit operator action or a new invite, not automatic takeover by a racing request.
 - Partial bundle issuance does not claim distributed atomicity. Record which authorities issued which credentials; resume only the same approved intent and identity, rechecking current revocation. Never undo an already-issued grant merely by deleting local files.
 - File failures leave a recoverable state and no final `joined` result. Profile publication must not point at missing identity/credential files. Avoid clobbering existing ownership, credentials or profiles; conflicting ownership is a refusal, not an implicit migration.
 - Bound outstanding requests, receipts, pending approvals and retained history; fail closed on capacity. Retain replay protection for its required lifetime and require tested cleanup rules across restart.
@@ -203,14 +204,14 @@ design direction requiring the listed proof, not an implemented mechanism.
 | Boundary | Re-survey finding | V3 direction / remaining decision |
 |---|---|---|
 | Operator ownership | `sdk/src/operator.rs::OperatorEnrollment` owns an in-memory `pending` map; `EnrollmentAuthority` separately tracks spent nonces. Inventory/revocation file persistence does not persist either invitation ledger. | Proposed: one foreground service holds a lifetime lock on its selected authority store and owns durable invite/claim/receipt transitions. Mint/approve/revoke clients must talk to that owner; never instantiate a fresh coordinator. Root keys stay with that owner. Choose and test protected local IPC on Unix and Windows before adding mutation commands; remote management stays unavailable. |
-| Native first contact | `sdk/src/mesh_enroll.rs::Rendezvous` contains address, Noise public key and routing ID, but explicitly assumes an out-of-band PSK. `Mesh::join` starts from an already-built mesh. | Existing join cannot satisfy clean-device bootstrap. Recommended: a narrow authenticated enrollment bootstrap adapter that releases transport material only after approval. Its endpoint/key binding, encryption, dependency/feature placement and challenge protocol must be accepted before implementation. No public/default PSK workaround. A secret-bearing link is an alternative only with explicit operator opt-in and its standing-secret warning; product choice requested. |
-| Existing browser bootstrap | `sdk/src/bootstrap_credential.rs::BrowserBootstrapCredential` is signed and secret-bearing. SDK HTTP/TLS dependencies and the CLI listener are gated by `rtc-bootstrap`, which also enables WebRTC. | Reuse verification/secret-redaction concepts, not a silent browser-feature dependency. This is not evidence for a native approval-first bootstrap. Do not enable `rtc-bootstrap` globally to make a new default command appear to work. |
+| Native first contact | `sdk/src/mesh_enroll.rs::Rendezvous` contains address, Noise public key and routing ID, but explicitly assumes an out-of-band PSK. `Mesh::join` starts from an already-built mesh. | Product choice resolved: preauthorized, single-use invitations redeemed through an authenticated adapter, without a standing PSK in the link or a second approval by default. Optional `--require-approval` is invitation-bound policy. The concrete transport/control proposal below remains subject to security witnesses and V3-0 exit, not a shipped guarantee. No public/default PSK workaround or secret-bearing mode is selected for V3-1. |
+| Existing browser bootstrap | `sdk/src/bootstrap_credential.rs::BrowserBootstrapCredential` is signed and secret-bearing. SDK HTTP/TLS dependencies and the CLI listener are gated by `rtc-bootstrap`, which also enables WebRTC. | Reuse verification/secret-redaction concepts, not a silent browser-feature dependency. This is not evidence for native secure redemption. Do not enable `rtc-bootstrap` globally to make a new default command appear to work. |
 | Membership-only outcome | `sdk/src/enrollment.rs::JoinOutcome::Admitted` contains a delegation chain; `sdk/src/delegation.rs::derive_device` issues `INVOKE_ACTION | DELEGATE`. `InviteToken` itself has no issuer signature or operation/scope fields. | Preserve existing agent enrollment and `NMI1`/`NMO1` behavior. V3 needs a separately versioned integrity-bound invite and membership-only receipt/bundle, never an empty/fake delegation chain. Proposed receipt binds issuer, full subject, invitation/operation ID, exact requested relations, request-intent digest and committed result; finalize encoding after transport/store decisions. |
 | Ordinary consumer / leave | CLI `config.rs` and `context.rs` have no enrollment-intent or renewal lifecycle integration. A saved profile alone cannot fence a running independent SDK process. | Proposed: shared SDK durable intent/receipt owner and an enrollment reference in existing profile resolution; controlled CLI consumers register instance/incarnation with a protected local lifecycle owner. Leave first persists disabled intent, then requires scoped stop acknowledgements. Unmanaged consumers remain stop-unconfirmed. Pin IPC, liveness and fail-closed startup semantics before promising live stop. |
 | Selective subnet removal | `src/adapter/net/subnet/auth.rs::SubnetGrant` has subject, rights and generation; `SubnetRevocationFloor` has scope/epoch/generation but no subject. `control.rs::SubnetFactKind` accepts four strict V1 tags. | No existing per-subject floor can simply be invoked. Proposed root-signed subject floor keyed by qualified scope, topology epoch, full subject and explicitly covered rights, with monotone floor/revision and explicit reissue. Ancestor credential coverage, ATTACH versus independent ROUTE/EXPORT, durable load, active-context invalidation and unsupported-peer refusal remain mandatory design decisions. Do not allocate a new wire tag yet. |
 
-**Next bounded work:** resolve the native-bootstrap product choice, then specify
-the exact authenticated transport and protected local control ownership. Only
+**Next bounded work:** validate the concrete transport/control proposal below,
+including its feature boundary, before implementing command wrappers. Only
 after those decisions and V2 acceptance evidence are recorded should V3-1 start
 with RED witnesses for clean-device first contact, shared durable state and no
 implicit execution grant. V3-0's other tasks below remain open; this table is
@@ -222,6 +223,109 @@ CI still owns separate default/`rtc-bootstrap` CLI runs and the existing subnet
 integration pins; new root test binaries will need explicit pins. No production
 files, existing wire formats, feature defaults or public command documentation
 are changed by this preparatory slice.
+
+#### Invitation policy decision and secure-redemption design — 2026-09-20
+
+**Accepted product decision:** sending an invitation normally is the inviter's
+authorization. The user explicitly selected preauthorized invitations with
+secure redemption, not mandatory second approval and not PSK-bearing links.
+The standard journey is **create → send → confirm issuer/scope → redeem → join**.
+`--require-approval` is an explicit alternate creation policy, signed into the
+invite and stored by its owner. It adds a pending decision; it is not the default.
+Creation requires existing local operator authority in either mode.
+
+**Proposed V3-1 adapter boundary:** one native HTTPS redemption listener owned
+by `enrollment serve`, separate from the mesh UDP listener and local management
+IPC. Reuse the workspace's rustls/Tokio/HTTP dependency versions and explicit
+crypto-provider construction, not the browser RTC offer/trickle service.
+Initially use operator-provisioned TLS certificates with normal certificate,
+validity and hostname verification plus the endpoint-key pin bound into the
+signed invite. No plaintext fallback, redirects, certificate-ignore switch,
+WebRTC prerequisite, ACME automation or public management routes are added.
+Local CI uses a disposable test CA trusted only by the fixture client; never
+modify the workstation trust store. Certificate/pin rotation invalidates old
+unredeemed links unless a later explicit rotation contract is accepted.
+
+Dependency placement is an explicit review item: propose a separate optional
+SDK/CLI `enrollment-bootstrap` feature for native HTTP/TLS, independent of
+`rtc-bootstrap`. Offline inspect and typed receipt/store mechanisms must not
+need the listener feature. A build lacking it must refuse live enrollment
+before effects with a precise feature diagnostic, not fall back to a permissive
+transport. Decide release-binary inclusion and add a real feature-enabled CI job
+before claiming the advertised join journey is available in shipped binaries.
+This proposal does not change current Cargo features.
+
+**Invite/request/response contract (semantic, not allocated wire bytes):**
+
+1. The versioned issuer-signed invite binds full issuer identity, named trust
+   domain, HTTPS endpoint and transport key pin, random invitation identifier,
+   expiry, exact authorized relations, optional intended full device identity
+   and approval policy. The link contains no standing PSK, root key or audience
+   secret, but **is still sensitive bearer authorization** when subject-unbound.
+   Signature verification preserves the supplied issuer binding; the recipient
+   must confirm that this is the intended issuer, not trust any self-signed root.
+2. Offline inspect verifies what it can and performs no network request or claim.
+   Redemption/receipt recovery use POST bodies, never secret query parameters.
+   GET/HEAD cannot reserve, approve, issue or return a credential bundle. Redact
+   invitation identifiers/proofs/bearer material from diagnostics; return only
+   non-secret operation identifiers by default.
+3. Before redeeming, the device persists its identity and canonical request intent.
+   Over verified TLS it requests a fresh, bounded, short-lived server challenge.
+   The device signs a domain-separated transcript binding that challenge, the
+   signed invite digest, full subject and complete intent digest. The challenge
+   is bound to this live TLS connection and consumed once; a captured signature
+   cannot obtain the secret response on another connection. Capacity limits,
+   expiry and refusal paths must be tested before exposing the listener.
+4. The owner verifies the invite against its durable record, proof, subject,
+   scope, expiry, current policy and revocation before claiming it. Under a short
+   store transaction, exactly one verified identity/intent wins. Default mode
+   proceeds to issuance; require-approval mode records pending intent and releases
+   the transaction before waiting. Approval cannot change the winning intent or
+   bypass a revoke/expiry that wins before issuance commit.
+5. Persist the exact winning receipt/bundle before returning secrets on the same
+   authenticated connection. The bundle contains transport configuration and
+   only the explicitly requested membership/attachment artifacts; no legacy
+   delegation chain or implicit execution/management rights. A receipt must bind
+   its full subject and intent. A retry needs a fresh connection challenge and
+   proof from that same device, then returns the same committed issuance rather
+   than minting again. Current revocation blocks renewed secret delivery; expired
+   unspent invites cannot issue. Already-committed receipt recovery after invite
+   expiry is bounded by a separately recorded recovery deadline, does not extend
+   credential lifetime, and must be distinguished from first redemption.
+6. The device verifies and installs the receipt, then uses normal authenticated
+   mesh attachment. Report credential installation and observed live admission
+   separately. Once delivered, a standing PSK cannot be reclaimed by expiring or
+   revoking the invitation; org/subnet admission continues to be independent.
+
+The existing `JoinRequest` signs device/name/tags/nonce/root, not these additional
+policy, intent and connection-challenge fields. Do not reuse its signature domain
+or reinterpret `NMJ1`/`NMO1`; keep legacy APIs unchanged. New formats need bounded
+decoding, explicit versions and compatibility witnesses before publication.
+
+**Proposed local control owner:** Unix domain socket inside an owner-only service
+directory; on Windows a local-only named pipe restricted to the owning user with
+explicit DACL and remote-client rejection. Both require client identity/access
+checks and an exclusive lifetime store lock, not trust in a pathname or PID alone.
+The service publishes non-secret endpoint/instance metadata only after ownership
+is acquired; clients never instantiate a replacement store on connection failure.
+Local mint/approve/revoke/status use this owner. Device-side lifecycle control is
+a separate local instance, not an assumption that the remote issuer can stop
+arbitrary consumers. Exact runtime registration/stop fencing remains open.
+
+**Required first witnesses:** default redemption without any approver callback;
+require-approval cannot issue until approved; tampered policy/scope/pin refusal;
+wrong-subject and invalid-proof attempts leave the invite unclaimed; two distinct
+claimants have one durable winner; replay on a different connection yields no
+PSK; fresh same-device recovery returns byte-identical issuance; revoked/expired
+unspent invites fail; GET/HEAD/inspect have no effects; membership-only success
+cannot invoke a protected handler until an explicit independent grant is added.
+Store-crash and live transport witnesses must exercise production transitions,
+not just a model or mocked successful response.
+
+**Gate remaining:** this resolves the invitation UX choice and supplies a concrete
+adapter/control proposal. It does not complete V3-0: feature/release inclusion,
+receipt retention/persistence details, lifecycle fencing, selective subnet floor
+semantics/compatibility and V2 exact-head acceptance still require closure.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
@@ -242,11 +346,11 @@ Tasks:
 Tasks:
 1. Write RED tests for clean-device bootstrap, preview-without-redemption, no implicit INVOKE/DELEGATE, and mint/serve using the same durable state.
 2. Implement the selected listener lifecycle, reusable receipt store and membership-only SDK path; reuse current crypto/parser/storage conventions.
-3. Add invite create/inspect/revoke and join with explicit scope, redaction, approval and protected link input. Keep the default CLI build usable without silently enabling browser/server features.
+3. Add invite create/inspect/revoke and join with explicit scope, redaction and protected link input. Default creation preauthorizes one scoped redemption; optional `--require-approval` adds a later human decision. Show bearer-versus-intended-subject policy without exposing the link. Keep the default CLI build usable without silently enabling browser/server features.
 4. Persist device identity and enrollment/profile references; consume them through one existing V2 hosted/client path after CLI exit and restart.
-5. Prove concurrent same/different identity redemption, lost response after commit, operator/device crash points, revoke during approval, corruption and saturation. A second redemption is not an implicit grant reissue.
+5. Prove default redemption succeeds without a second approval and optional approval cannot be bypassed. Cover concurrent same/different identity redemption, lost response after commit, operator/device crash points, revoke during claim/approval, corruption and saturation. A second redemption is not an implicit grant reissue.
 
-**Exit:** Two clean participants enroll through a link without manual PSK handling; restart and retry recover the same identity/result; an unapproved or mismatched requester cannot get application authority. No org/subnet success is claimed yet.
+**Exit:** Two clean participants enroll through a link without manual PSK handling or a second approval in default mode; restart and retry recover the same identity/result. Invalid/mismatched requesters cannot redeem; optional approval cannot be bypassed. Even a valid enrolled device receives no implicit application authority. No org/subnet success is claimed yet.
 
 ### V3-2 — organization and subnet-scoped enrollment
 
@@ -324,9 +428,9 @@ All rows are required unless explicitly marked feature-conditional; narrow slice
 
 | ID | Required positive and negative evidence |
 |---|---|
-| E1 | Mesh link joins a clean device without hand-installed PSK; wrong issuer/pin/domain fails. |
+| E1 | A default preauthorized mesh link joins a clean device without hand-installed PSK or a second human approval; wrong issuer/pin/domain fails. Optional require-approval mode cannot issue before its exact-claim approval. |
 | E2 | Inspect/preview leaves nonce and stores untouched; revoked/expired/altered link cannot issue credentials. |
-| E3 | Two concurrent redeemers produce one bound identity; same-identity lost-response retry returns committed receipt; crash/restart cannot duplicate issuance. |
+| E3 | Two concurrent redeemers produce one bound identity; intended-subject mismatch and invalid proofs cannot claim an invite. Same-identity lost-response retry proves fresh key possession and returns the committed receipt, not a new grant; crash/restart cannot duplicate issuance. |
 | E4 | Join never implicitly emits agent INVOKE/DELEGATE, org dispatcher rights, capability grants or subnet ROUTE/EXPORT. A separately authorized positive control works. |
 | E5 | Mesh+subnet, mesh+org+subnet and already-connected standalone subnet joins bind the same proven identity and exact qualified scope. |
 | E6 | Wrong owner/issuer/epoch/subject or broadened scope refuses; existing owner is not replaced. |
