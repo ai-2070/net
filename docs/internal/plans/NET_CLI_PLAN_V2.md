@@ -3,7 +3,9 @@
 **Status:** Refreshed plan; implementation is not authorized by this document refresh.
 **Source baseline:** `d7b749983199012978e69867f3c3694c4df96f69` on `master`, reviewed 2026-09-20.
 **Package / executable:** `net-cli` / `net-mesh`; package version at the baseline is `0.36.0`.
-**Goal:** Make the existing CLI's execution targets and supported workflows explicit, repair the nearest destructive failure path, then complete useful workflows using existing SDK mechanisms.
+**Goal:** Enable capability publishers and consumers to expose, discover, and invoke an authorized capability across processes and computers, know where each operation runs, and capture reusable typed contracts. Repair destructive preflight behavior and misleading execution semantics on the way, using existing SDK mechanisms.
+**Primary audience:** Capability publishers and consumers. MCP is one compatibility path; native typed consumption is also part of the destination. Artifact transfer supports this workflow, so live typegen precedes the transfer holder.
+**Plan revision checkout:** `66771b27775fb8b029a7d081e51c360b0e96ed37`; the CLI, SDK, and public CLI reference are unchanged from the source baseline above. This revision changes the plan only, not shipped behavior or public documentation.
 **Architecture:** Retain the existing Rust/Clap command modules and typed SDK clients. Distinguish offline authoring, persistent local stores, fresh in-process supervisors, and real mesh clients; none is an implicit substitute for another.
 **Tech stack:** Rust, Clap, Tokio, `net-mesh-sdk`, the existing MCP adapter, and existing storage/transport implementations.
 
@@ -107,7 +109,7 @@ Old identity codes 17/18/19 are not implemented. Reserved variants are not reach
 
 One-shot format resolution chooses table for TTY and JSON otherwise; streaming chooses text/NDJSON. Generic table rendering can fall back to JSON. Main prints plain `net-mesh: ...` errors on stderr, not JSON error envelopes. ICE may print preview and commit result separately; do not promise every successful command produces exactly one JSON value. On interactive stdin, ICE still requires typed `YES` even with `--yes`; dry-run exits before confirmation.
 
-Global `--timeout` is parsed but not forwarded by `dispatch`. It is not an enforced universal deadline. Timeout propagation is a distinct follow-up, not a guarantee to copy from the old plan.
+Global `--timeout` is parsed but not forwarded by `dispatch`. It is not an enforced universal deadline. These are baseline behaviors, not desired permanent contracts: CLI-DX below owns timeout propagation, output framing, and confirmation changes. Do not present its planned behavior as shipped.
 
 ### NetDB behavior
 
@@ -125,17 +127,46 @@ Global `--timeout` is parsed but not forwarded by `dispatch`. It is not an enfor
 - `web/src/content/docs/reference/cli.md` overstates generic live-node attachment, daemon run, and metadata fetching. Transfer argv/progress descriptions need comparison with the parser. The crate README still has deployment-sounding local admin/log examples.
 - Historical [transfer](TRANSFER_CLI_PLAN.md), [typegen](TYPEGEN_CLI_PLAN.md), and [aggregator](AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md) plans are provenance, not proof that every example or closure claim remains correct. Their status does not override this inventory.
 
-## 4. Recommended order
+## 4. Developer destination and recommended order
+
+### End-to-end journey — define now, accept as prerequisites close
+
+A new developer must be able to complete one useful authorized capability workflow from public instructions, identify where every command ran, and distinguish a local artifact from an effect on the mesh without reading this plan or source code.
+
+1. **Prepare two participants.** State runtime/build prerequisites, feature requirements, identity, bind address, target selection, and authority setup. Explain identity and permissions at the step that needs them; do not begin with temporary-supervisor administration.
+2. **Expose a small capability.** Start a provider with a deterministic response and an observable provider-side invocation record. The MCP compatibility route uses `wrap` with a supplied small stdio tool server. A native SDK provider/caller example must also exercise the existing typed capability path; no new generic CLI RPC command is a prerequisite.
+3. **Discover and invoke from another process.** For the compatibility route, use `mcp serve` and a supplied runnable MCP client. Identify the actual invoking participant and any pin/consent or provider policy involved. Keep defaults restrictive; do not substitute blanket admission for a working permission setup.
+4. **Prove the result and boundary.** Match the caller's response to the provider's invocation record and identity. Show an unauthorized attempt refused before handler effect, then an authorized positive control. Creating a signed file or completing a handshake is not invocation success.
+5. **Capture and reuse the contract.** After CLI-3, capture full descriptors, generate and exercise typed consumption while the provider is available, then stop it and reproduce the generated artifacts from the saved snapshot. Offline generation does not imply offline invocation.
+6. **Clean up and explain failure.** Document stop/cleanup, unreachable provider, denied invocation, deadline, and uncertain-effect behavior. No automatic retry after an ambiguous effect.
+
+**Topology acceptance:** Keep a repeatable two-process loopback fixture for fast regression. Separately run the documented workflow on two computers with non-loopback addresses, explicit bind/firewall prerequisites, and exact peer attribution before claiming between-computer readiness. The generic client's loopback bind is an open prerequisite, not something the tutorial may paper over. Address the selected workflow's bind path within CLI-2B; do not imply arbitrary NAT traversal or every topology is covered.
+
+**Deliverables:** Rework onboarding in `net/crates/net/cli/README.md` and link it from `web/src/content/docs/reference/cli.md`; supply runnable fixtures and a harness under `net/crates/net/cli/tests/fixtures/` (new deliverables), with new subprocess coverage `net/crates/net/cli/tests/capability_workflow.rs`. Reuse `net/crates/net/adapters/mcp/tests/wrap_end_to_end.rs` and `net/crates/net/sdk/tests/tool_serve_round_trip.rs` as evidence starting points, not substitutes for the public journey. Record the two-computer commands, versions, topology, and actual results as acceptance evidence. Public instructions must remain limited to behavior already accepted at that release.
+
+### Sequence and ownership
 
 | Slice | Outcome | Reason for order |
 |---|---|---|
-| **CLI-1 — NetDB restore preflight** | Invalid source/configuration cannot erase or redirect a store before restoration starts | Immediate bounded data-safety correction; detailed below |
-| **CLI-2 — Explicit fresh-supervisor scope** | Operator scripts cannot mistake new empty runtimes for deployed state | Extend existing `snapshot --local` precedent; keep remote Deck work out |
-| **CLI-3 — Complete live typegen inputs** | Out-of-line schemas produce usable snapshots and bindings | First feature-completion slice; metadata SDK already exists |
-| Later — transfer holder | Stage, host, and fetch with shipped CLI processes alone | Needs lifecycle, exposure policy, and non-loopback proof |
+| **DOC-0 — Immediate expectation correction** | Public reference and README describe shipped behavior | Separate docs-only change alongside CLI-1; do not wait for feature completion |
+| **CLI-1 — NetDB restore preflight** | Invalid source/configuration cannot erase or redirect a store before restoration starts | Immediate bounded data-safety correction; scope unchanged |
+| **CLI-2A — Explicit fresh-supervisor scope** | New empty runtimes cannot be mistaken for deployed state | Extend existing `snapshot --local` precedent with explicit explanation |
+| **CLI-2B — Target resolution** | Resolve mode, target, identity, and supported bind consistently before acting | Separate review unit; no remote Deck or context-management framework |
+| **CLI-DX — Automation contract** | Predictable framing, deadlines, and noninteractive confirmation | Explicit compatibility change after targeting; not hidden in CLI-1 |
+| **CLI-3 — Complete live typegen inputs** | Capture full contracts and regenerate bindings offline | First feature-completion slice for the selected publisher/consumer audience |
+| **Journey acceptance** | Documented MCP and native typed paths demonstrate authorized capability use | Specify now and exercise incrementally; two-computer evidence gates off-host claims |
+| Later — transfer holder | Stage, host, and fetch with shipped CLI processes alone | Supporting workflow; needs lifecycle, exposure policy, and non-loopback proof |
 | Later — unary RPC | Invoke a known service from shell/CI | Reuse current Mesh and typed calls; no invented method/codec abstraction |
 
-These are independent reviewable slices, not an all-or-nothing release train. **CLI-1 is the next proposed implementation authorization.** CLI-2/3 are follow-ups, not permission to expand CLI-1. Source safety findings take precedence over adding command families.
+These are independent reviewable slices, not an all-or-nothing release train. **CLI-1 remains the next proposed implementation authorization; DOC-0 can proceed independently alongside it.** CLI-2A/2B, CLI-DX, CLI-3, and journey delivery are explicit follow-ups, not permission to expand CLI-1. Retain CLI-3's identifier for existing references. Implementers may further split coherent review units without weakening cumulative acceptance.
+
+### DOC-0 — correct expectations before adding features
+
+Files: `web/src/content/docs/reference/cli.md` and `net/crates/net/cli/README.md`. Compare each affected example with the parser and execution target. Remove claims of generic live-node attachment, daemon execution, and completed metadata hydration; state current limits rather than publishing planned behavior. Describe `subnet inspect` as decoding/inspection, not signature verification. Distinguish transfer staging from hosting/publication and correct argv against the parser.
+
+Use the wording **“Starts a temporary supervisor for this command; does not inspect a running node.”** wherever a development-only supervisor is presented. Demote those examples from onboarding. Do not describe `--local` alone as sufficient explanation or publish new scope gates before they ship.
+
+Acceptance: inspect every corrected claim against its implementation; check examples' argv and links; run applicable docs checks from `web/` using `npm run check`, separating unrelated baseline failures. Parser/help tests validate syntax only. DOC-0 does not claim an unexecuted journey works, nor does it wait for all later CLI slices to finish.
 
 ## 5. CLI-1 — next bounded implementation plan
 
@@ -216,17 +247,47 @@ cargo clippy -p net-cli --bin net-mesh -- -D warnings
 
 Verify target discovery and nonzero counts. The CLI has no library target. Typegen downstream tests require TypeScript and mypy/Pydantic; report unrelated local skips honestly. Windows success does not establish Unix permission behavior. Required exact-head CI and repository pre-push checks remain implementation/release gates.
 
-## 6. CLI-2 — explicit invocation scope
+## 6. CLI-2 — execution scope and target resolution
+
+### CLI-2A — explicit fresh-supervisor scope
 
 **Outcome:** Fresh-supervisor reads/streams and admin/ICE operations cannot masquerade as live deployment operations.
 
-Reuse `snapshot --local`: default refusal where deployment attachment is unsupported; explicit `--local` opt-in for development-only operations with a scope diagnostic. Keep admin's offline `--dry-run` useful without implying contact with a node. Do not gate existing real mesh clients or offline issuance as local demonstrations.
+Reuse `snapshot --local`: default refusal where deployment attachment is unsupported; explicit `--local` opt-in for development-only operations. Help and scope diagnostics must say: **“Starts a temporary supervisor for this command; does not inspect a running node.”** Emit diagnostics on stderr, not inside existing result payloads. Keep admin's offline `--dry-run` useful without implying contact with a node. Do not gate existing real mesh clients or offline issuance as local demonstrations.
 
-Affected fresh-supervisor paths: `admin.rs`, `ice.rs`, `audit.rs`, `logs.rs`, `cap.rs`, `peer.rs`, `daemon.rs`, `subnet.rs`, `gateway.rs`, `channel.rs`, and local `aggregator.rs` branches. Keep `gateway export` unsupported. Define aggregator list selection from flags/profile; no local fallback after failed remote connection.
+Affected fresh-supervisor paths under `net/crates/net/cli/src/commands/`: `admin.rs`, `ice.rs`, `audit.rs`, `logs.rs`, `cap.rs`, `peer.rs`, `daemon.rs`, `subnet.rs`, `gateway.rs`, `channel.rs`, and local `aggregator.rs` branches. Keep `gateway export` unsupported. Also update `snapshot.rs`, parser/help where necessary, CLI changelog, README, and public reference.
 
-Acceptance: defaults refuse without plausible deployment success data; explicit local calls work and disclose scope; remote aggregator/transfer/typegen fixtures remain remote; help/man/completion and crate README/public reference agree. Correct snapshot's suggestion of `peer` as a live alternative. Preserve source/target distinctions without silently breaking existing machine payload shapes.
+Acceptance: defaults refuse without plausible deployment success data; explicit local calls work and disclose scope; remote aggregator/transfer/typegen fixtures remain remote; help/man/completion and docs agree. Correct snapshot's suggestion of `peer` as a live alternative. Add subprocess scope witnesses alongside `net/crates/net/cli/tests/snapshot_no_false_success.rs`; preserve existing machine result shapes. This deliberately changes scripts relying on implicit local contexts: document the opt-in migration. It does not implement remote Deck. Cover the full inventory before claiming CLI-wide closure.
 
-This changes scripts relying on implicit local contexts and needs a changelog note. It does **not** implement remote Deck or another control plane. Implementers may split by command family; do not call the CLI-wide boundary complete before covering the inventory.
+### CLI-2B — one understandable target-resolution contract
+
+**Outcome:** A user can determine the resolved execution mode, target, and public identity before the operation, using the same resolution that dispatch consumes.
+
+Files likely to change under `net/crates/net/cli/src/`: `context.rs`, `config.rs`, `main.rs`, `commands/aggregator.rs`, and relevant mesh-client constructors; CLI changelog, README, and public reference. New deliverable: `net/crates/net/cli/tests/target_resolution.rs`. Reuse current configuration and mesh builders rather than adding a context registry or control plane.
+
+Required behavior:
+
+- Explicit flags override corresponding selected-profile values. Reject incomplete or contradictory effective target tuples before connection or mutation. Never silently fall back to a temporary supervisor after remote resolution or connection failure.
+- For mixed-mode commands such as `aggregator ls`, a complete remote target resolved from the profile selects remote execution just as explicit remote flags do. No resolved remote target means the explicit temporary-supervisor gate applies. Reject conflicting local and explicit remote selections. An explicit local opt-in may select local despite profile remote defaults, but must disclose that choice.
+- Explicit target flags on commands that cannot use them fail with an actionable error instead of suggesting remote execution. Ordinary offline commands need not fail merely because the selected profile contains unrelated remote defaults; their inspection must identify offline mode and unused defaults.
+- Unknown explicitly selected profiles and missing explicitly selected config files fail; optional absence of the default config retains documented defaults. Loading/permission/parse failures remain errors. Keep CLI-1's narrower profile-error fix independent.
+- Provide side-effect-free resolution inspection through the same resolver as dispatch: mode, target/store or artifact destination, public identity fingerprint or unavailable state, bind address where relevant, and flag/profile/default provenance. Do not connect, mint identities, create stores, start supervisors, print keys/PSKs, or claim authorization succeeded. Prefer a small flag or existing diagnostic surface; select and document syntax in the implementation brief rather than inventing an unimplemented command here.
+- Resolve the selected journey's cross-host bind using existing mesh configuration. Expose only a documented supported selection; reject incompatible loopback-only routing early. Do not silently widen hosted-service exposure, admission policy, or imply universal NAT reachability.
+
+Acceptance matrix: flags-only, profile-only, overrides, partial targets, explicit local with remote defaults, local/explicit-remote conflicts, unavailable peer, unsupported target flags, malformed/missing explicit config, unknown explicit profile, offline operations, and secret-free inspection with no filesystem/network side effects. Assert the execution consumes the inspected resolution. Include a real remote aggregator control and non-loopback evidence for the chosen capability journey.
+
+Compatibility: profile-only `aggregator ls` changes from local to remote; unsafe fallback becomes an error. Record old/new behavior and migration examples in the changelog and public docs. Do not silently reinterpret identities or automatically retry against another target.
+
+### CLI-DX — automation contract (separate review unit)
+
+Files likely to change under `net/crates/net/cli/src/`: `main.rs`, `output.rs`, `error.rs`, `commands/ice.rs`, and commands consuming deadlines/output; CLI changelog, README, and public reference. New deliverable: `net/crates/net/cli/tests/automation_contract.rs`. Reuse existing renderers and error codes; do not add a general job framework.
+
+- **Framing:** In JSON mode, successful one-shot operations emit exactly one JSON value and a newline; warnings/progress/prompts remain on stderr. For ICE commit, emit one result containing preview and commit outcome rather than concatenated JSON values; dry-run emits its preview only. Streams use one documented NDJSON event per line. Failures exit nonzero with no success payload; prior stream events remain valid. Keep plain secret-free stderr errors unless a separately specified structured-error mode is selected. Do not apply generic JSON framing to `mcp serve` protocol stdout, generated source/binary artifacts, or other explicitly documented protocol streams.
+- **Deadlines:** Carry the parsed timeout through bounded connection/discovery/invocation stages as a remaining budget, not a fresh full timeout per stage. Document exactly what it bounds for each command. Long-running services/streams use it for startup/attachment only, not an implicit lifetime limit. Local noninterruptible mutation must finish or report its actual failure; do not kill restoration halfway through merely to claim timeout compliance. If a command cannot honor an explicit deadline, reject that combination before effects rather than ignore it. Timeout is exit 7 where applicable, not proof that a remote effect was cancelled; never automatically retry an ambiguous operation.
+- **Confirmation:** `--yes` acknowledges the documented operation in both TTY and non-TTY use; it bypasses prompting, not policy/admission or required parameters. Without it, interactive execution may prompt on stderr; unattended execution refuses without blocking. Preserve dry-run's no-confirmation behavior.
+- **Compatibility:** Preserve existing ordinary one-shot payloads and exit codes. Treat ICE framing, confirmation, timeout enforcement, and targeted stream changes as explicit behavior changes, with release notes and before/after scripting examples. Do not hide these inside the safety fix. No indefinite dual-output compatibility framework is required.
+
+Acceptance: parse complete stdout (not its first line) for one-shot JSON; validate NDJSON event-by-event; assert clean protocol stdout and secret-free stderr; test TTY/non-TTY with/without `--yes`, refusal, policy denial, dry-run, slow connection/handler/discovery, an already partially consumed deadline, and continued service lifetime after startup. Use a handler-side effect counter to prove no retry after timeout. Verify unsupported deadlines fail before mutation. Planned gate after the new deliverables exist, from `net/crates/net/`: `cargo nextest run -p net-cli --test target_resolution --test automation_contract --no-tests=fail --retries 0`. CLI-3 consumes this deadline contract if already merged; otherwise its local budget remains explicit and must later converge, not compete with it.
 
 ## 7. CLI-3 — feature completion: live typegen
 
@@ -253,7 +314,7 @@ Current generation skips missing inline input schemas and says metadata fetch ha
 - Hydrate selected incomplete descriptors at an exact advertising provider. Check returned identity/version against the selected descriptor. Establish provider provenance from live capability data; do not assume `list_tools` retains it.
 - Missing requested input, failed hydration, or unusable selected input contract fails before writing final snapshot/generated output. Do not succeed after silently skipping requested work. Preserve genuinely optional output-schema semantics.
 - Retain snapshot v1 unless a required provenance change needs a format bump. No new metadata service, schema IR, or renderer framework.
-- Specify bounded discovery/fetch timeout without pretending global timeout already works; a global propagation repair remains separate.
+- Specify bounded discovery/fetch timeout using CLI-DX remaining-budget semantics when available. Until that slice lands, keep the local budget explicit without pretending global timeout already works; do not reset a fresh full budget per metadata fetch.
 
 Acceptance: real SDK host and CLI subprocess; oversized schemas retrieved through metadata RPC; requested tool arriving after unrelated tool; NotFound/timeout/provider mismatch failures without final output; deterministic offline regeneration after host shutdown; existing downstream language checks. Loopback tests prove integration, not cross-computer reachability.
 
@@ -266,7 +327,7 @@ Likely changes: `net/crates/net/cli/src/commands/typegen/mod.rs`, existing typeg
 - **Remote Deck:** Requires real provider endpoints, deployed state ownership, operator verification, and client targeting. Mesh attachment alone is not remote Deck. Start only for a named workflow.
 - **Aggregator query:** Its ignored integration fixture is an open evidence gap, not a proven workflow. Resolve actual addressing/lifecycle prerequisites before un-ignoring.
 - **Browser enrollment:** Anchor bootstrap/credentials exist; production issuer/enrollment policy cannot be supplied by copying a permissive demo handler.
-- **Config/deadlines:** Global timeout propagation, unknown-profile fallback, cross-host bind selection, and concurrent stable-identity invocations need bounded contracts and witnesses, not hidden changes inside unrelated commands.
+- **Concurrent stable-identity invocations:** Require their own lifecycle/ownership contract if the selected journey needs them; do not assume concurrent processes may reuse one identity safely. Target/profile/bind resolution and deadlines are no longer indefinitely deferred: CLI-2B and CLI-DX own them.
 - **Crash-safe NetDB replacement:** Staged construction, publication/rollback, and concurrent-writer ownership are outside CLI-1. Preflight does not supply those guarantees.
 - **Agent migration:** No filesystem sync, session failover, memory journaling, or harness adapters. This refresh is separate from the earlier migration discussion.
 - **Old wish list:** Daemon factory registries, all MeshDB/NetDB predicate commands, blob absorption, metrics/bench tools, broad SDK parity, and a universal workflow engine are not automatic obligations.
@@ -275,7 +336,7 @@ Likely changes: `net/crates/net/cli/src/commands/typegen/mod.rs`, existing typeg
 
 ### Refresh validation
 
-Check Markdown structure, relative links, referenced current paths, new-target labeling, and `git diff --check`; verify only this plan changed and HEAD remains pinned. No implementation, build/test run, commit, push, or release is part of this refresh.
+Check Markdown structure, relative links, referenced current paths, new-target labeling, and `git diff --check`; verify only this plan changed and HEAD remains at the plan-revision checkout recorded above. Preserve the separate original source baseline. No implementation, build/test run, commit, push, or release is part of this refresh.
 
 ### Implementation evidence
 
@@ -292,6 +353,6 @@ Handoffs must name exact HEAD, changed files, executed tests/counts, inverse wit
 - [Existing snapshot refusal witnesses](../../../net/crates/net/cli/tests/snapshot_no_false_success.rs)
 - [Typegen implementation](../../../net/crates/net/cli/src/commands/typegen/mod.rs)
 - [SDK metadata round trip](../../../net/crates/net/sdk/tests/tool_serve_round_trip.rs)
-- [Public reference — later reconciliation required](../../../web/src/content/docs/reference/cli.md)
+- [Public reference — immediate DOC-0 correction](../../../web/src/content/docs/reference/cli.md)
 - [Repository test guide](../../../TESTS.md)
 - [CI configuration](../../../.github/workflows/ci.yml)
