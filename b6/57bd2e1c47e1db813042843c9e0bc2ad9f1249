@@ -1,0 +1,21 @@
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_38828de26a56bb::t_07b4804a8c50a9 431-435
+docs/internal/plans/NET_RPC_LARGE_RESPONSE_BRIEF.md
+  s_38828de26a56bb::t_07b4804a8c50a9 89-123,135-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b657bd2e1c47e1db813042843c9e0bc2ad9f1249",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
