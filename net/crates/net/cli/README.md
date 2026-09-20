@@ -155,7 +155,9 @@ Identity `generate/show/fingerprint/revoke` and `cap announce` also support `--i
 
 `node adopt --inspect-target` reports the certificate/floors input paths, explicit/default authority directory, three authority filenames and public node fingerprint. With `--identity`, it reads the identity through the normal file gate; the identity is a subject, not a signer. Inspection does not read certificate/floors payloads, open the authority directory or install ownership. Skew and entity selection are checked, but certificate validity, directory permissions and authorization are not.
 
-Inspection is not yet CLI-wide: organization/subnet/bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
+All five `org` verbs support `--inspect-target`. Keygen reports an unavailable identity and either an explicit destination or an `org-<generated-org-id-prefix>.toml` filename pattern, without generating a key. Issuance/grant inspection reads the explicit org key through its normal permission/parse gate and reports the signer's public fingerprint and output path. Discovery grants also report `audience_destination` without minting an audience secret. Profile identity/remote defaults are unused. Grant `--force` refusal and discovery/audience-output pairing still apply; inspection does not check all grant policy, TTL, aliases or output permissions and does not approve issuance. Normal publication safeguards are unchanged.
+
+Inspection is not yet CLI-wide: subnet/bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

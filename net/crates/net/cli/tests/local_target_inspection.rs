@@ -27,6 +27,152 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn org_inspection_reports_signer_and_outputs_without_issuing_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let key = dir.path().join("org.toml");
+    let artifact = dir.path().join("artifact.json");
+    let audience = dir.path().join("audience.key");
+    let out = run(&[
+        "org",
+        "keygen",
+        "--out",
+        key.to_str().unwrap(),
+        "--inspect-target",
+    ]);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["destination"], key.to_str().unwrap());
+    assert_eq!(view["identity"]["state"], "unavailable");
+    assert!(!key.exists());
+    let out = run(&["org", "keygen", "--inspect-target"]);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(view["destination_pattern"]
+        .as_str()
+        .unwrap()
+        .contains("<generated-org-id-prefix>"));
+    assert!(view.get("destination").is_none());
+    assert!(run(&["org", "keygen", "--out", key.to_str().unwrap()])
+        .status
+        .success());
+    let key_bytes = std::fs::read(&key).unwrap();
+    let key_data: toml::Value = toml::from_str(std::str::from_utf8(&key_bytes).unwrap()).unwrap();
+    let subject = "0101010101010101010101010101010101010101010101010101010101010101";
+    let floor = format!("{subject}=1");
+    let commands = [
+        vec!["issue-cert", "--member", subject],
+        vec!["issue-floors", "--floor", &floor],
+        vec![
+            "grant-dispatcher",
+            "--dispatcher",
+            subject,
+            "--any-capability",
+        ],
+        vec![
+            "grant-capability",
+            "--grantee-org",
+            subject,
+            "--capability",
+            "nrpc:test",
+            "--target-node",
+            subject,
+            "--discover",
+            "--audience-out",
+            audience.to_str().unwrap(),
+        ],
+    ];
+    let mut fingerprint = None;
+    for existing in [false, true] {
+        if existing {
+            config(&artifact, "PRIVATE_SENTINEL");
+            config(&audience, "PRIVATE_SENTINEL");
+        }
+        for command in &commands {
+            let mut args = vec!["--config", cfg.to_str().unwrap(), "org"];
+            args.extend(command.iter().copied());
+            args.extend([
+                "--org-key",
+                key.to_str().unwrap(),
+                "--out",
+                artifact.to_str().unwrap(),
+                "--inspect-target",
+            ]);
+            let out = run(&args);
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(view["mode"], "offline");
+            assert_eq!(view["source"], key.to_str().unwrap());
+            assert_eq!(view["destination"], artifact.to_str().unwrap());
+            assert_eq!(view["identity"]["state"], "configured");
+            assert_eq!(view["authorization"], "not_checked");
+            assert_eq!(view["ignored_profile_remote_defaults"], true);
+            let current = view["identity"]["fingerprint"].as_str().unwrap().to_owned();
+            if let Some(expected) = &fingerprint {
+                assert_eq!(&current, expected);
+            }
+            fingerprint = Some(current);
+            if command[0] == "grant-capability" {
+                assert_eq!(view["audience_destination"], audience.to_str().unwrap());
+            } else {
+                assert!(view.get("audience_destination").is_none());
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!text.contains(key_data["seed_hex"].as_str().unwrap()));
+            assert!(!text.contains("PRIVATE_SENTINEL"));
+            assert_eq!(artifact.exists(), existing);
+            assert_eq!(audience.exists(), existing);
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "PRIVATE_SENTINEL"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&audience).unwrap(),
+        "PRIVATE_SENTINEL"
+    );
+    assert_eq!(std::fs::read(&key).unwrap(), key_bytes);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+    let base = [
+        "org",
+        "grant-capability",
+        "--org-key",
+        key.to_str().unwrap(),
+        "--out",
+        artifact.to_str().unwrap(),
+        "--grantee-org",
+        subject,
+        "--capability",
+        "nrpc:test",
+        "--target-node",
+        subject,
+        "--inspect-target",
+    ];
+    let mut invalid = base.to_vec();
+    invalid.push("--discover");
+    assert!(!run(&invalid).status.success());
+    invalid = base.to_vec();
+    invalid.extend(["--invoke", "--audience-out", audience.to_str().unwrap()]);
+    assert!(!run(&invalid).status.success());
+    invalid = base.to_vec();
+    invalid.extend(["--invoke", "--force"]);
+    assert!(!run(&invalid).status.success());
+    config(&key, "seed_hex = 'PRIVATE_SENTINEL'");
+    let out = run(&base);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE_SENTINEL"));
+}
+
+#[test]
 fn adoption_inspection_never_opens_authority_or_certificate_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");

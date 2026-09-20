@@ -310,7 +310,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
-        Command::Org(cmd) => commands::org::run(cmd, output).await,
+        Command::Org(cmd) => commands::org::run(cmd, output, config_path, profile).await,
         Command::Node(cmd) => commands::node::run(cmd, output, config_path, profile).await,
         Command::Anchor(cmd) => commands::anchor::run(cmd, output, config_path, profile).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,

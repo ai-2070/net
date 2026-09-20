@@ -8,6 +8,12 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — organization artifact inspection
+
+- All five `org` verbs accept `--inspect-target`. Keygen does not generate
+  a key; issuance reports the actual signer's fingerprint and output paths
+  without signing or minting discovery audience secrets.
+
 ## Unreleased — adoption target inspection
 
 - `node adopt --inspect-target` reports authority and input paths plus the
