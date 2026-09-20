@@ -67,12 +67,30 @@ wrong peer/call/session, cancellation cleanup, aggregate exhaustion/reuse and
 old-caller refusal. Shared Rust/TS/Python/Go fixtures pin the byte layout, not
 cross-binding network interoperability. Full executed counts are in V2.
 
-**Next:** deterministic partial-transfer deadline/session-teardown tests through
-the live call path, queue saturation and stalled-credit failure/cleanup tests,
-and sender lifecycle review. The current bounded drainer can drop pieces under
+**Lifecycle correction: `11fcb4a5d` (2026-09-20).** Real UDP calls receiving
+only their first fragment now witness retained storage and its release on
+deadline, dropped future, cancel token, session-table eviction, receive-lifetime
+retirement and node shutdown. Retirement/shutdown tests failed against the
+initial implementation: the session ID remains in the table, so identity-only
+watching left no-deadline calls pending. Caller watching and fragment credit
+admission now check receive lifetime and shutdown, not advisory inactivity.
+Credit tests verify the one-second stall bound, credit reuse/refund, refusal
+after retirement while blocked, and acceptance of an inactive but unretired
+session. Eviction/retirement are deterministic owning-table/session injections;
+the shutdown witness invokes real node shutdown. They do not claim heartbeat
+expiry or cross-computer teardown coverage.
+
+Validation: 103 focused units (including ten new lifecycle/credit witnesses),
+281 existing integration tests across 30 binaries, and five live metadata CLI
+tests passed with zero retries. Default check/strict production clippy and
+targeted formatting passed. Full CLI feature suites and the broad pre-push
+matrix were not rerun for this correction; V2 records the outstanding gates.
+
+**Next:** queue saturation, shared server transfer deadline/cancellation and
+sender lifecycle review. The current bounded drainer can drop pieces under
 load and its one-second credit bound is per packet, not a transfer-wide server
 deadline; do not mark the brief accepted until that behavior is reviewed and
-the missing witnesses land. Then complete the broad feature/rustdoc gates,
+the remaining witnesses land. Then complete the broad feature/rustdoc gates,
 two-node CI journey and exact-head platform acceptance. V3 remains unstarted.
 
 Prefer a response-specific extension scoped to an already-pending unary call
