@@ -1,0 +1,62 @@
+net/crates/net/cli/src/commands/aggregator.rs
+  s_38828de26a56bb::t_61e1bd5420408d 11-12,124-125,129-132
+  s_38828de26a56bb::t_00e32068c44fa9 337-355,359-370,374-410,418-419,434,455,464,477-481,483-492,498-502,504-512,519-520
+  s_38828de26a56bb::t_e1919f10766174 356-358,371-373,411-417,435-454,456-463,465-476,493-497,513-518
+  s_38828de26a56bb::t_73ee9e72310e50 528-535,537-538,565
+  s_38828de26a56bb::t_d2f378c80cf9e9 503
+  s_38828de26a56bb::t_df0ea210b2fdee 482
+  s_38828de26a56bb::t_10b878e2b4e099 420-433
+  s_38828de26a56bb::t_bda37f8a0d8166 133
+net/crates/net/cli/src/commands/scope.rs
+  s_38828de26a56bb::t_61e1bd5420408d 16,25-29
+net/crates/net/cli/tests/netdb_restore_preflight.rs
+  s_38828de26a56bb::t_57d06eef180d97 530
+  s_38828de26a56bb::t_10b878e2b4e099 527-529,531,533-534
+  s_38828de26a56bb::t_edcdb82a910ce6 523,532,535-536
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_7f6f524f19bcfd 77,114,121-133
+  s_38828de26a56bb::t_dfd0cd4c72aa7b 134
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_70fae8a89fe9ed 11-28
+net/crates/net/cli/tests/target_resolution.rs
+  s_38828de26a56bb::t_ce3bab6a582bfa 1-26,28-39,45-62,73-89,94-137
+  s_38828de26a56bb::t_d2f378c80cf9e9 27
+  s_38828de26a56bb::t_edcdb82a910ce6 138-143,163-172,177-192,202-211,216,223-230,233,248-251
+  s_38828de26a56bb::t_e1919f10766174 40-44,63-72,90-93
+  s_38828de26a56bb::t_10b878e2b4e099 144-162,173-176,193-201,212-215,217-222,231-232,234-247
+net/crates/net/cli/tests/aggregator_remote.rs
+  s_38828de26a56bb::t_10b878e2b4e099 175-176,179-180,182-203
+  s_38828de26a56bb::t_1c46e060120d6e 173-174,177-178,181,204-206,224
+  s_38828de26a56bb::t_57d06eef180d97 207-208,221-223
+  s_38828de26a56bb::t_02078df35845b0 209-220
+net/crates/net/cli/src/context.rs
+  s_38828de26a56bb::t_e1919f10766174 53-57
+  s_38828de26a56bb::t_d2f378c80cf9e9 36-38,308
+  s_38828de26a56bb::t_00e32068c44fa9 52,58-65,189
+  s_38828de26a56bb::t_61e1bd5420408d 533-534
+net/crates/net/cli/src/config.rs
+  s_38828de26a56bb::t_61e1bd5420408d 118-119,121,123,126-127,156,175,177,317
+  s_38828de26a56bb::t_e1919f10766174 385-388
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_38828de26a56bb::t_e77456c90a4bee 3,293-299
+  s_38828de26a56bb::t_67a50cc5bcd16e 300
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_7f6f524f19bcfd 13
+  s_38828de26a56bb::t_70fae8a89fe9ed 21-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4beeb64ac79ebfec7e0f71cae18b26c2fc9181c5",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
