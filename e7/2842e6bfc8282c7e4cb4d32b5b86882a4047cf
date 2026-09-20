@@ -1,0 +1,70 @@
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_34f555bb573edb 11-28
+net/crates/net/cli/src/commands/audit.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 22-24,56-58,93,123
+net/crates/net/cli/src/commands/ice.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 129-131,261
+net/crates/net/cli/src/commands/channel.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 35-37,51-53,81,106
+net/crates/net/cli/src/commands/cap.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 54-56,71-73,88-90,189,214,240
+net/crates/net/cli/src/commands/daemon.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 44-46,60
+net/crates/net/cli/src/commands/aggregator.rs
+  s_38828de26a56bb::t_20da28e6bb29d3 348
+  s_38828de26a56bb::t_60dac39820ec1a 345-347,349-350,354,358
+  s_38828de26a56bb::t_13f3cb6888a748 351-353
+  s_38828de26a56bb::t_2b17b5c3110ef6 103-105,115-117,234
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_38828de26a56bb::t_972b8fbf54c67e 3,279-281
+  s_38828de26a56bb::t_9251e7ca5a2e46 282
+net/crates/net/cli/tests/temporary_scope.rs
+  s_38828de26a56bb::t_463385067d5a8f 134-186,188-201,207-217,231
+  s_38828de26a56bb::t_34f555bb573edb 187,218-230
+  s_38828de26a56bb::t_8d228e6a489743 1-20,23,25-105,110-133
+  s_38828de26a56bb::t_088a5c20f8d0ea 202-206
+  s_38828de26a56bb::t_3552c7fdd354ac 21-22,24
+  s_38828de26a56bb::t_13f3cb6888a748 106-109
+net/crates/net/cli/src/main.rs
+  s_38828de26a56bb::t_fc404373cd88e0 148,151,154,157,160,163,166,169,172,189,192,195,198
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_fc404373cd88e0 45,53-54,94
+net/crates/net/cli/tests/snapshot_no_false_success.rs
+  s_38828de26a56bb::t_13f3cb6888a748 150-152
+net/crates/net/cli/tests/exit_codes.rs
+  s_38828de26a56bb::t_13f3cb6888a748 105-112
+net/crates/net/cli/src/commands/gateway.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 50-52,62-64,111,129
+net/crates/net/cli/src/commands/admin.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 103-105,269
+net/crates/net/cli/src/commands/scope.rs
+  s_38828de26a56bb::t_3552c7fdd354ac 1-29
+net/crates/net/cli/src/commands/logs.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 21-23,76,137-139,157
+net/crates/net/cli/src/commands/subnet.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 77-79,89-91,101-103,137,157,187
+net/crates/net/cli/src/commands/peer.rs
+  s_38828de26a56bb::t_2b17b5c3110ef6 24-26,40
+net/crates/net/cli/src/commands/snapshot.rs
+  s_38828de26a56bb::t_60dac39820ec1a 36,59,71,83,92
+net/crates/net/cli/src/commands/mod.rs
+  s_38828de26a56bb::t_3552c7fdd354ac 36
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_fc404373cd88e0 13-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e72842e6bfc8282c7e4cb4d32b5b86882a4047cf",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
