@@ -157,7 +157,8 @@ async fn ls_remote_lists_configured_groups() {
     let home = TempDir::new().expect("home tempdir");
     let (booted, _cfg) = boot_daemon(&toml).await;
 
-    let (code, stdout, stderr) = run_cli(&booted, &home, "ls", &["--remote"]).await;
+    let (code, stdout, stderr) =
+        run_cli(&booted, &home, "ls", &["--remote", "--timeout", "10s"]).await;
     assert_eq!(code, 0, "ls --remote failed: stderr={stderr}");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));

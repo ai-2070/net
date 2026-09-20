@@ -50,6 +50,83 @@ fn ice_args(identity: &Path) -> Vec<&str> {
 }
 
 #[test]
+fn unsupported_timeouts_refuse_before_local_effects() {
+    let dir = fixture();
+    let artifact = dir.path().join("must-not-exist");
+    let commands = [
+        vec!["identity", "generate", "--out", artifact.to_str().unwrap()],
+        vec![
+            "netdb",
+            "tasks",
+            "create",
+            "1",
+            "--title",
+            "test",
+            "--store",
+            artifact.to_str().unwrap(),
+        ],
+        vec!["admin", "cordon", "1", "--dry-run"],
+        vec!["audit", "stream", "--local"],
+        vec!["aggregator", "ls", "--local"],
+        vec!["aggregator", "ls", "--inspect-target"],
+        vec!["mcp", "serve"],
+    ];
+    for mut args in commands {
+        args.extend(["--timeout", "1s"]);
+        let out = run(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--timeout is not supported"));
+        assert!(!artifact.exists());
+    }
+}
+
+#[test]
+fn aggregator_timeout_is_exit_seven_without_success_or_zero_budget_packets() {
+    let dir = fixture();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let key = "42".repeat(32);
+    let base = [
+        "aggregator",
+        "ls",
+        "--remote",
+        "--node-addr",
+        &addr,
+        "--node-id",
+        "9",
+        "--node-pubkey",
+        &key,
+        "--psk-hex",
+        &key,
+    ];
+    let mut args = base.to_vec();
+    args.extend(["--timeout", "0s"]);
+    let out = run(dir.path(), &args);
+    assert_eq!(out.status.code(), Some(7));
+    assert!(out.stdout.is_empty());
+    let mut packet = [0; 2048];
+    assert_eq!(
+        socket.recv_from(&mut packet).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    args.pop();
+    args.push("200ms");
+    let out = run(dir.path(), &args);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not prove cancellation"));
+    assert!(!stderr.contains(&key));
+}
+
+#[test]
 fn ice_commit_is_one_complete_json_result_and_dry_run_remains_preview_only() {
     let dir = fixture();
     let identity = dir.path().join("operator.toml");

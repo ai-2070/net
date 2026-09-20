@@ -25,6 +25,7 @@
 mod commands;
 mod config;
 mod context;
+mod deadline;
 mod error;
 mod output;
 mod parsers;
@@ -122,10 +123,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-    /// Global per-call timeout. Subcommand-specific timeouts
-    /// override this when explicitly set.
-    #[arg(long, global = true, value_parser = humantime::parse_duration, default_value = "30s")]
-    timeout: std::time::Duration,
+    /// Total budget for supported bounded operations (currently remote aggregator
+    /// ls/query/spawn/scale). Unsupported combinations fail before execution.
+    /// Omitting this retains the command's existing limits.
+    #[arg(long, global = true, value_parser = humantime::parse_duration)]
+    timeout: Option<std::time::Duration>,
 
     #[command(subcommand)]
     command: Command,
@@ -278,6 +280,28 @@ async fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
+    if let Some(timeout) = cli.timeout {
+        use commands::aggregator::AggregatorCommand;
+        let supported = match &cli.command {
+            Command::Aggregator(AggregatorCommand::Query(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Spawn(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Scale(a)) => !a.attach.inspect_target,
+            Command::Aggregator(AggregatorCommand::Ls(a)) => {
+                !a.scope.local && !a.attach.inspect_target
+            }
+            _ => false,
+        };
+        if !supported {
+            return Err(error::invalid_args("--timeout is not supported for this command/mode; currently supported for remote aggregator ls/query/spawn/scale execution. Remove --timeout to use the command's existing limits"));
+        }
+        return deadline::Deadline::after(timeout)?
+            .run(dispatch_inner(cli))
+            .await;
+    }
+    dispatch_inner(cli).await
+}
+
+async fn dispatch_inner(cli: Cli) -> Result<(), CliError> {
     let output = cli.output;
     let config_path = cli.config.as_deref();
     let profile = cli.profile.as_deref().unwrap_or("default");

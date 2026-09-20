@@ -8,6 +8,15 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — explicit aggregator deadline budgets
+
+- Remote aggregator ls/query/spawn/scale honor `--timeout` as one total budget,
+  returning exit 7 on expiry without retrying the operation or claiming remote
+  cancellation. Zero budget refuses before effects.
+- Unsupported commands/modes now reject explicit timeouts before work instead
+  of silently ignoring them. Omit the flag to retain existing command limits;
+  the previously advertised but unused global 30-second default is removed.
+
 ## Unreleased — ICE automation framing and confirmation
 
 - ICE commits emit one result with `preview` and `commit`, not two consecutive
