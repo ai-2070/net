@@ -2,7 +2,7 @@
 
 > **For Hermes:** After V2 acceptance and explicit implementation authorization, use the subagent-driven-development skill for one accepted slice at a time, with independent review. This document authorizes planning, not production edits or protocol publication.
 
-**Status:** Proposed follow-on to [NET_CLI_PLAN_V2.md](NET_CLI_PLAN_V2.md). Do not interleave V3 implementation with the active V2 work.
+**Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, but accepted exact-head CI evidence is still outstanding. No V3 production implementation or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
 **Goal:** An operator sends a join link; a new device joins the intended mesh, optionally its organization and exact subnet, survives restart, can voluntarily leave, and can be selectively removed by an operator with verifiable, honestly scoped enforcement.
 **Architecture:** Thin Rust/Clap commands over reusable SDK enrollment and authority mechanisms, backed by an explicitly running operator service and durable local state. Enrollment, observation, and removal refer to real identities and real enforcement points; temporary supervisors, inventory records, and credential files never stand in for deployment effects.
 **Tech stack:** Existing `net-cli` / `net-mesh` executable, Tokio, `net-mesh-sdk`, signed organization/subnet credentials, current native transport and optional bootstrap adapters. No new global control plane.
@@ -185,6 +185,43 @@ Implementers choose coherent factoring and review boundaries. Each code-bearing 
 
 **Files to inspect:** V2 and all source paths in §3; `AGENTS.md`, `TESTS.md`, `.github/workflows/ci.yml`.
 **Modify:** this plan's source/decision table only, after V2 acceptance.
+
+#### Initial source re-survey — 2026-09-20
+
+The user authorized proceeding with V3 after the V2 implementation handoff.
+This record is preparatory design work, not a waiver or fabrication of V2's
+acceptance gate. Candidate baseline: `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`.
+There is **no accepted V2 SHA yet**. The user reported pushing the earlier
+`7c8942dc1` journey head; the generated protected-client follow-through is
+`9a4323d33` with receipt `346b4b8bf`. Do not assume those latter commits have
+run CI. Cross-org generated-client journey coverage was explicitly deferred in
+V2 and is not inherited as V3 release debt.
+
+Paths in this table are relative to `net/crates/net/`. “Proposed” means a
+design direction requiring the listed proof, not an implemented mechanism.
+
+| Boundary | Re-survey finding | V3 direction / remaining decision |
+|---|---|---|
+| Operator ownership | `sdk/src/operator.rs::OperatorEnrollment` owns an in-memory `pending` map; `EnrollmentAuthority` separately tracks spent nonces. Inventory/revocation file persistence does not persist either invitation ledger. | Proposed: one foreground service holds a lifetime lock on its selected authority store and owns durable invite/claim/receipt transitions. Mint/approve/revoke clients must talk to that owner; never instantiate a fresh coordinator. Root keys stay with that owner. Choose and test protected local IPC on Unix and Windows before adding mutation commands; remote management stays unavailable. |
+| Native first contact | `sdk/src/mesh_enroll.rs::Rendezvous` contains address, Noise public key and routing ID, but explicitly assumes an out-of-band PSK. `Mesh::join` starts from an already-built mesh. | Existing join cannot satisfy clean-device bootstrap. Recommended: a narrow authenticated enrollment bootstrap adapter that releases transport material only after approval. Its endpoint/key binding, encryption, dependency/feature placement and challenge protocol must be accepted before implementation. No public/default PSK workaround. A secret-bearing link is an alternative only with explicit operator opt-in and its standing-secret warning; product choice requested. |
+| Existing browser bootstrap | `sdk/src/bootstrap_credential.rs::BrowserBootstrapCredential` is signed and secret-bearing. SDK HTTP/TLS dependencies and the CLI listener are gated by `rtc-bootstrap`, which also enables WebRTC. | Reuse verification/secret-redaction concepts, not a silent browser-feature dependency. This is not evidence for a native approval-first bootstrap. Do not enable `rtc-bootstrap` globally to make a new default command appear to work. |
+| Membership-only outcome | `sdk/src/enrollment.rs::JoinOutcome::Admitted` contains a delegation chain; `sdk/src/delegation.rs::derive_device` issues `INVOKE_ACTION | DELEGATE`. `InviteToken` itself has no issuer signature or operation/scope fields. | Preserve existing agent enrollment and `NMI1`/`NMO1` behavior. V3 needs a separately versioned integrity-bound invite and membership-only receipt/bundle, never an empty/fake delegation chain. Proposed receipt binds issuer, full subject, invitation/operation ID, exact requested relations, request-intent digest and committed result; finalize encoding after transport/store decisions. |
+| Ordinary consumer / leave | CLI `config.rs` and `context.rs` have no enrollment-intent or renewal lifecycle integration. A saved profile alone cannot fence a running independent SDK process. | Proposed: shared SDK durable intent/receipt owner and an enrollment reference in existing profile resolution; controlled CLI consumers register instance/incarnation with a protected local lifecycle owner. Leave first persists disabled intent, then requires scoped stop acknowledgements. Unmanaged consumers remain stop-unconfirmed. Pin IPC, liveness and fail-closed startup semantics before promising live stop. |
+| Selective subnet removal | `src/adapter/net/subnet/auth.rs::SubnetGrant` has subject, rights and generation; `SubnetRevocationFloor` has scope/epoch/generation but no subject. `control.rs::SubnetFactKind` accepts four strict V1 tags. | No existing per-subject floor can simply be invoked. Proposed root-signed subject floor keyed by qualified scope, topology epoch, full subject and explicitly covered rights, with monotone floor/revision and explicit reissue. Ancestor credential coverage, ATTACH versus independent ROUTE/EXPORT, durable load, active-context invalidation and unsupported-peer refusal remain mandatory design decisions. Do not allocate a new wire tag yet. |
+
+**Next bounded work:** resolve the native-bootstrap product choice, then specify
+the exact authenticated transport and protected local control ownership. Only
+after those decisions and V2 acceptance evidence are recorded should V3-1 start
+with RED witnesses for clean-device first contact, shared durable state and no
+implicit execution grant. V3-0's other tasks below remain open; this table is
+not their completion receipt.
+
+**Validation of this record:** source inspection and CodeGraph navigation only;
+no runtime, crash, inverse, cross-language, or CI acceptance evidence. Current
+CI still owns separate default/`rtc-bootstrap` CLI runs and the existing subnet
+integration pins; new root test binaries will need explicit pins. No production
+files, existing wire formats, feature defaults or public command documentation
+are changed by this preparatory slice.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
