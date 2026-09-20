@@ -190,6 +190,7 @@ pub async fn run(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
     quiet: bool,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     let staging = match &cmd {
         TransferCommand::SendBlob(args) if args.inspect_target => {
@@ -218,7 +219,7 @@ pub async fn run(
     }
     match cmd {
         TransferCommand::RecvBlob(args) => {
-            run_recv_blob(args, output, config_path, profile_name, quiet).await
+            run_recv_blob(args, output, config_path, profile_name, quiet, deadline).await
         }
         TransferCommand::SendBlob(args) => run_send_blob(args, output).await,
         TransferCommand::RecvDir(args) => {
@@ -239,10 +240,12 @@ async fn run_recv_blob(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
     quiet: bool,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     let blob_ref = parse_content_ref(&args.blob_ref, "--blob-ref")?;
 
-    let profile = resolve_profile(config_path, profile_name).await?;
+    let profile =
+        crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
     let remote = require_remote_attach(&profile, &args.attach, "recv-blob")?;
     if args.attach.inspect_target {
         let mut view = crate::target::inspect(
@@ -262,9 +265,11 @@ async fn run_recv_blob(
     // (Parsed to `u64` at argv time, so no fallible re-parse here.)
     let attached = remote.node_id;
     let source = args.from.unwrap_or(attached);
-    let ctx =
-        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
-            .await?;
+    let ctx = crate::deadline::run_optional(
+        deadline,
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote),
+    )
+    .await?;
     let mesh = ctx.require_mesh()?;
 
     // Installing the engine is required to fetch, not just to serve:
@@ -292,23 +297,16 @@ async fn run_recv_blob(
     // `fetch_blob_stream` yields verified chunks in manifest order, so
     // writing them sequentially preserves integrity (no whole-blob rehash).
     use futures::StreamExt as _;
-    // `fetch_blob_stream` returns a `!Unpin` stream (an `unfold`), so pin it
-    // on the stack before polling with `next()`.
-    let mut stream = std::pin::pin!(transport::fetch_blob_stream(mesh, source, &blob_ref));
-    let mut writer = AtomicFileWriter::create(&args.out).await?;
-    let mut total: u64 = 0;
-    while let Some(item) = stream.next().await {
-        let chunk = item.map_err(|e| {
+    let stream = transport::fetch_blob_stream(mesh, source, &blob_ref).map(|item| {
+        item.map_err(|e| {
             sdk(format!(
                 "fetch_blob from peer {source} failed: {e}{}",
                 relay_hint(source, attached)
             ))
-        })?;
-        total += chunk.len() as u64;
-        progress.inc(chunk.len() as u64);
-        writer.write_chunk(&chunk).await?;
-    }
-    writer.commit().await?;
+        })
+    });
+    let writer = AtomicFileWriter::create(&args.out).await?;
+    let total = write_blob_stream(stream, writer, &progress, deadline).await?;
     let elapsed = started.elapsed();
     progress.finish();
 
@@ -322,6 +320,32 @@ async fn run_recv_blob(
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write recv-blob result: {e}")))?;
     Ok(())
+}
+
+/// Bound acquisition only, preserving the destination until the complete
+/// stream succeeds. A failure leaves the existing `.partial` staging file.
+async fn write_blob_stream<B: AsRef<[u8]>>(
+    stream: impl futures::Stream<Item = Result<B, CliError>>,
+    mut writer: AtomicFileWriter,
+    progress: &Progress,
+    deadline: Option<crate::deadline::Deadline>,
+) -> Result<u64, CliError> {
+    use futures::StreamExt as _;
+    let mut stream = std::pin::pin!(stream);
+    let mut total = 0;
+    // Writes consume elapsed budget, but are never cancelled. Publication
+    // likewise finishes normally after the stream's terminal success.
+    while let Some(item) =
+        crate::deadline::run_optional(deadline, async { Ok(stream.next().await) }).await?
+    {
+        let chunk = item?;
+        let bytes = chunk.as_ref();
+        total += bytes.len() as u64;
+        progress.inc(bytes.len() as u64);
+        writer.write_chunk(bytes).await?;
+    }
+    writer.commit().await?;
+    Ok(total)
 }
 
 // ── send-blob ───────────────────────────────────────────────────────
@@ -980,6 +1004,29 @@ struct CancelView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blob_budget_expiry_after_a_chunk_never_publishes_partial_content() {
+        use futures::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("blob");
+        std::fs::write(&out, b"original").unwrap();
+        let writer = AtomicFileWriter::create(&out).await.unwrap();
+        let progress = Progress::start("test", false);
+        let stream = futures::stream::once(async { Ok(b"first chunk".as_slice()) })
+            .chain(futures::stream::pending());
+        let deadline =
+            crate::deadline::Deadline::after(std::time::Duration::from_millis(200)).unwrap();
+        let err = write_blob_stream(stream, writer, &progress, Some(deadline))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::error::ExitCodeKind::Timeout);
+        assert_eq!(std::fs::read(&out).unwrap(), b"original");
+        assert_eq!(
+            tokio::fs::read(partial_path(&out)).await.unwrap(),
+            b"first chunk"
+        );
+    }
 
     #[test]
     fn parse_content_ref_accepts_a_bare_32_byte_hash() {

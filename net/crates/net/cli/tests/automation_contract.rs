@@ -74,6 +74,7 @@ fn unsupported_timeouts_refuse_before_local_effects() {
         vec![
             "transfer",
             "recv-blob",
+            "--inspect-target",
             "--blob-ref",
             "00",
             "--out",

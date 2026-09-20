@@ -8,6 +8,16 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — blob receive acquisition budgets
+
+- `transfer recv-blob --timeout` bounds configuration, attachment and network
+  waits with one absolute deadline. Disk writes consume elapsed budget but are
+  not cancelled; final publication runs outside cancellation after acquisition.
+  Expiry exits 7 without success output and preserves the destination. An
+  `<out>.partial` staging file may remain, as with other receive failures.
+- Directory receive still rejects explicit timeouts: its SDK reconstruction
+  tasks and blocking install need a cancellation-safe boundary first.
+
 ## Unreleased — transfer administration and live typegen budgets
 
 - Transfer `ls/status/cancel` and live typegen `generate/snapshot` now honor

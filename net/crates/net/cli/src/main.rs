@@ -124,7 +124,8 @@ struct Cli {
     no_color: bool,
 
     /// Total budget for remote aggregator ls/query/spawn/scale, transfer
-    /// ls/status/cancel and live typegen acquisition (not output writes).
+    /// ls/status/cancel, recv-blob network acquisition, and live typegen
+    /// acquisition (not output writes).
     /// Unsupported combinations fail before execution.
     /// Omitting this retains the command's existing limits.
     #[arg(long, global = true, value_parser = humantime::parse_duration)]
@@ -295,6 +296,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             Command::Transfer(TransferCommand::Ls(a)) => !a.attach.inspect_target,
             Command::Transfer(TransferCommand::Status(a)) => !a.attach.inspect_target,
             Command::Transfer(TransferCommand::Cancel(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::RecvBlob(a)) => !a.attach.inspect_target,
             Command::Typegen(TypegenCommand::Generate(a)) => {
                 a.from_snapshot.is_none() && !a.attach.inspect_target
             }
@@ -302,11 +304,14 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             _ => false,
         };
         if !supported {
-            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel and live typegen acquisition. Remove --timeout to use the command's existing limits"));
+            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel/recv-blob and live typegen acquisition. Remove --timeout to use the command's existing limits"));
         }
         let deadline = deadline::Deadline::after(timeout)?;
-        // Typegen persists local output only after bounded acquisition succeeds.
-        if matches!(&cli.command, Command::Typegen(_)) {
+        // These commands bound acquisition internally without cancelling writes.
+        if matches!(
+            &cli.command,
+            Command::Typegen(_) | Command::Transfer(TransferCommand::RecvBlob(_))
+        ) {
             return Box::pin(dispatch_inner(cli, Some(deadline))).await;
         }
         return deadline.run(Box::pin(dispatch_inner(cli, None))).await;
@@ -359,7 +364,15 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
             commands::aggregator::run(cmd, output, config_path, profile).await
         }
         Command::Transfer(cmd) => {
-            commands::transfer::run(cmd, output, config_path, profile, quiet).await
+            Box::pin(commands::transfer::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                quiet,
+                deadline,
+            ))
+            .await
         }
         Command::Wrap(args) => commands::wrap::run(args, output, config_path, profile).await,
         Command::Mcp(cmd) => commands::mcp::run(cmd, output, config_path, profile).await,
