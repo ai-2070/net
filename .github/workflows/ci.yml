@@ -1794,6 +1794,58 @@ jobs:
                  net/crates/net/guards/fixtures_off_probe and commit it"
           fi
 
+      # === The org + streaming API probe (external consumer) ===============
+      # `ORG_SCOPED_STREAMING_PLAN.md` changes public org and streaming types
+      # (Compatibility ledger C1/C3/C4). Every in-workspace caller of those
+      # types is edited in the same commit as the type itself, so no test in
+      # this repository fails when a DOWNSTREAM build would. This probe is
+      # that downstream: a second external crate, with its own workspace root
+      # and its own committed lockfile, that does nothing but name, construct
+      # and exhaustively match the surface.
+      #
+      # Unlike the fixtures-off probe above it has no negative leg to
+      # classify - both commands are positive, and they run in this order on
+      # purpose:
+      #
+      #   * `cargo metadata --locked` FIRST. The probe resolves independently
+      #     of the workspace, so its lockfile drifts whenever the workspace
+      #     gains or bumps a dependency it also reaches; running it first is
+      #     what makes a stale lockfile read as "regenerate the lockfile"
+      #     instead of surfacing as an unexplained failure of the compile
+      #     leg, which is `--locked` too.
+      #   * `cargo check --locked` must COMPILE. When Stage 1 lands C1/C3/C4
+      #     it will stop compiling - that failure IS the named source break,
+      #     and `guards/org_api_probe` is updated in the same commit, which
+      #     is exactly the review signal the ledger asks for.
+      - name: Organizations — external org/streaming API probe
+        if: ${{ !cancelled() }}
+        working-directory: net/crates/net/guards/org_api_probe
+        run: |
+          set -uo pipefail
+          die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
+
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            die "the probe's Cargo.lock is stale — regenerate it with \
+                 \`cargo generate-lockfile --offline\` in \
+                 net/crates/net/guards/org_api_probe and commit it"
+          fi
+
+          # Captured inside an `if` for the same reason the step above does
+          # it: the runner's shell has errexit on, and `set -uo pipefail`
+          # does not clear it, so a bare assignment from a failing command
+          # would exit before the diagnostic ever printed.
+          probe=""
+          if ! probe=$(cargo check --locked --message-format short 2>&1); then
+            die "the external org/streaming API probe no longer compiles: a \
+                 public org or streaming signature changed. If this is an \
+                 INTENDED source break (ORG_SCOPED_STREAMING_PLAN.md ledger \
+                 C1/C3/C4), update net/crates/net/guards/org_api_probe in \
+                 the SAME commit and record it in the migration notes; if it \
+                 is not, this is an unannounced break of a downstream \
+                 consumer." "$probe"
+          fi
+          echo "external consumer compiles: org + typed-streaming API pinned"
+
       # === NetDB ==========================================================
       - name: NetDB
         if: ${{ !cancelled() }}

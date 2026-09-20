@@ -68,11 +68,19 @@ pub mod org_scoped_ann;
 pub mod org_scoped_ingest;
 pub mod org_scoped_relay;
 pub mod org_scoped_store;
+// Stage 0 executable models for ORG_SCOPED_STREAMING_PLAN (slices 0.3 /
+// 0.4). `#[cfg(test)]`: Stage 0 is explicitly "no production wire,
+// behaviour or export changes", so these carry no public surface and no
+// production caller. Stage 1 ungates them as it wires the folds.
 /// Retained organization exact-provider sensing demand and its refresh
 /// lifecycle — an internal ownership substrate, not application API and not
 /// semver-covered.
 #[doc(hidden)]
 pub mod org_sensing_demand;
+#[cfg(test)]
+pub mod org_stream_lifecycle;
+#[cfg(test)]
+pub mod org_stream_registry;
 pub mod placement;
 pub mod placement_registry;
 pub mod predicate;

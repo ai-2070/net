@@ -1,0 +1,58 @@
+# The org + streaming API probe: an EXTERNAL consumer of the public surface
+# `docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md` is about to change
+# (Stage 0, slice 0.2).
+#
+# Why an external crate at all. Every in-workspace caller of the org and
+# streaming APIs is edited in the same commit as the API itself, so a
+# source-breaking change to `RpcStreamingContext`, `AdmissionContext` or
+# `AdmissionDenied` can land with nothing in CI ever saying "this breaks a
+# downstream build". This crate IS that downstream: it only names, constructs
+# and exhaustively matches the surface, so the compiler reports the break at
+# the exact item, in the same run that introduces it.
+#
+# It is NOT a darkness probe. Unlike `../fixtures_off_probe` there is no
+# negative leg to classify: both of this probe's commands are positive — it
+# must compile at head, and its lockfile must be fresh. The plan's ledger rows
+# C1/C3/C4 are expected to STOP it compiling in Stage 1; that failure is the
+# named break, and the probe is updated in the same commit. `MANIFEST` beside
+# `src/main.rs` lists the pinned names; the doc comments in `src/main.rs` map
+# each one to its ledger row.
+[package]
+name = "net-mesh-org-api-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root. The root workspace at ../../Cargo.toml neither
+# includes nor excludes it, so it resolves against its own committed
+# `Cargo.lock` — which is what CI's `--locked` pins.
+[workspace]
+
+# `package = ` because the lib is named `net`, not `net-mesh`: `use net::…` is
+# what compiles.
+#
+# `net` + `cortex` and nothing else, deliberately. That pair is exactly what
+# the pinned surface lives behind — `sdk/src/lib.rs:66` gates `mesh_rpc` on
+# both, and `sdk/src/org.rs:82-98` gates the call/serve verbs on `cortex` — and
+# every crate NOT pulled into the graph is one fewer source of the `--locked`
+# staleness that has already broken the sibling probe's CI step twice. This
+# probe pins an API surface, not a shipped-default feature claim, so there is
+# no reason to compile the default stack the way `../fixtures_off_probe` must.
+[dependencies.net]
+package = "net-mesh"
+path = "../.."
+default-features = false
+features = ["net", "cortex"]
+
+# The lib target is `net_sdk` (`sdk/Cargo.toml:20`), so `use net_sdk::…` is
+# what compiles whatever the dependency key is; the key is spelled the same
+# way here so the two names never drift apart in a reader's head.
+[dependencies.net_sdk]
+package = "net-mesh-sdk"
+path = "../../sdk"
+default-features = false
+features = ["net", "cortex"]
+
+[[bin]]
+name = "org_api_probe"
+path = "src/main.rs"
