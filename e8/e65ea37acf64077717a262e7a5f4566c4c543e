@@ -1,0 +1,56 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_38828de26a56bb::t_8f300ae34d0f97 11606-11608,14081-14082,32595-32597
+  s_38828de26a56bb::t_13317695bc2427 32598-32599
+net/crates/net/src/adapter/net/cortex/rpc_large_response.rs
+  s_38828de26a56bb::t_aeb0ec1cc72fce 28-29,43-51
+  s_38828de26a56bb::t_cdfe5ebe357386 196-206
+  s_38828de26a56bb::t_8f300ae34d0f97 16-27,30-42,52-55
+  s_eb3d90fdf51c44::t_fe42eefa6f971a 195
+net/crates/net/docs/NRPC_LARGE_RESPONSES.md
+  s_38828de26a56bb::t_17ba571b3746b5 33-34,39-61
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_38828de26a56bb::t_4b242c0df91108 3247-3254,3267-3268,3270-3272,3319,3926
+  s_38828de26a56bb::t_aeb0ec1cc72fce 3227-3228,3231-3236,3240-3246,3277-3282,3285-3298,3306-3308
+  s_38828de26a56bb::t_fb9c983bc3600f 3255-3266
+  s_38828de26a56bb::t_a0840f4f216acc 3269
+  s_38828de26a56bb::t_9a19eb433bae18 3217-3226,3229-3230,3237-3239,3273-3276,3283-3284,3299-3305,3309-3318,3320-3322,3915-3925,3927-3929,3931-3933
+net/crates/net/docs/cli/TYPEGEN.md
+  s_38828de26a56bb::t_ff1b9bad9e03a9 92-93
+net/crates/net/src/adapter/net/mesh_rpc_large_response_tests.rs
+  s_38828de26a56bb::t_c496ed79a46848 407-412,425-431,443,460-461,471-472,485-487,490-491,500-501,510-512,517-518,535-536,543-544,573,580,585-586,593-595,599-600
+  s_38828de26a56bb::t_f45dd6a91b83d8 492-496,548-553
+  s_38828de26a56bb::t_aeb0ec1cc72fce 413-424,432-442,444-459,462-470,473-484,488-489,502-509,513-516,519-534,537-542,562-572,574-579,581-584,587-592,596,598,601,608
+  s_38828de26a56bb::t_fb9c983bc3600f 558-560
+  s_38828de26a56bb::t_3fac8073256418 497-499,545-547,554-555,597,602-607
+  s_38828de26a56bb::t_29ede066c39fea 556-557,561
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_38828de26a56bb::t_aeb0ec1cc72fce 2145-2147,2149-2157,2166-2169
+  s_38828de26a56bb::t_8f300ae34d0f97 1711,1754,1763-1767,1995-1996,2148,2158-2162
+  s_38828de26a56bb::t_9a19eb433bae18 2163-2165,2170-2171
+  s_38828de26a56bb::t_fb9c983bc3600f 5498-5510,5524-5527
+  s_38828de26a56bb::t_cdfe5ebe357386 5480-5497,5511-5523,5528-5532
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e8e65ea37acf64077717a262e7a5f4566c4c543e",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_eb3d90fdf51c44": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bfae-f163-7301-ac99-f0cd8300e4be",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
