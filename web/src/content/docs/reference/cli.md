@@ -125,7 +125,7 @@ net-mesh transfer send-blob <PATH> [--store <DIR>]
 
 Use `-` for stdin. Without `--store`, no content is persisted. With it, chunks are written locally as they are hashed. The process exits: it neither pushes to a peer nor keeps a holder serving that directory. Another running holder is required for remote retrieval.
 
-In JSON mode stdout is one object containing `blob_ref`, `hash`, `size`, `chunks`, and optional `staged_to` metadata, not a bare reference followed by another JSON line. Extract `blob_ref` with a JSON parser.
+In JSON mode stdout is one object containing `blob_ref`, `size`, `chunks`, and optional `staged_to` metadata, not a bare reference followed by another JSON line. `hash` is present **only for single-chunk content** — a chunked blob omits it — so extract `blob_ref` with a JSON parser rather than keying on `hash`.
 
 ### `recv-dir`
 
@@ -365,10 +365,10 @@ Install org ownership on a node. This is the one org-adjacent command that write
 
 ```
 net-mesh node adopt --cert <PATH> (--identity <PATH> | --entity <HEX>)
-                    [--authority-dir <DIR>] [--bundle <PATH>] [--skew-secs <N>]
+                    [--authority-dir <DIR>] [--floors <PATH>] [--skew-secs <N>]
 ```
 
-Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--bundle` optionally merges a revocation-floor bundle during adoption. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
+Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--floors` optionally merges a revocation-floor bundle during adoption. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
 
 Like `keygen`, this command refuses rather than falling back to the working directory when the config directory cannot be resolved — the authority directory holds `owner-audience.key`, the raw owner discovery key.
 

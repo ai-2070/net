@@ -225,7 +225,7 @@ Key facts:
 - `--from <NODE>` selects a content holder other than the handshaken target; it is **not** a relay flag. `--node` names the temporary local supervisor, not the remote provider.
 - `recv-blob` writes `<PATH>.partial`, flushes/closes, then renames. A failed fetch leaves the previous final file untouched and may leave the partial for inspection. `recv-dir` reconstructs a sibling temp tree and renames atomically — the destination either becomes the complete tree or stays exactly as it was.
 - `send-blob`/`send-dir` without `--store` only hash and print the reference (no bytes persisted). With `--store` they **stage** bytes so a running node rooted there can serve them — the process exits and neither pushes to a peer nor hosts the store. Staging is not publication/hosting; another running holder is required for retrieval.
-- JSON mode: `send-blob` stdout is one object with `blob_ref`, `hash`, `size`, `chunks`, optional `staged_to`; `send-dir` has `remote_ref`, `manifest_size`, optional `staged_to`.
+- JSON mode: `send-blob` stdout is one object with `blob_ref`, `size`, `chunks`, optional `staged_to`, and `hash` **only for single-chunk content** (absent for a chunked blob — key on `blob_ref`, not `hash`); `send-dir` has `remote_ref`, `manifest_size`, optional `staged_to`.
 - Progress is on stderr only for human output; `--quiet` suppresses.
 
 ## `net-mesh typegen`
@@ -265,7 +265,7 @@ Offline authoring against an **org root key**. These are *ceremonies over files*
 | `org issue-floors --org-key <path> --floor <MEMBER=GEN> [--floor …] --out <path>` | a signed revocation-floor bundle (monotonic; a lower floor never rolls back). |
 | `org grant-dispatcher --org-key <path> --dispatcher <hex> (--capability <tag> \| --any-capability) [--ttl-secs N] --out <path>` | "entity X may act **for** this org." A→S. |
 | `org grant-capability --org-key <path> --grantee-org <hex> --capability <tag> [--invoke] [--discover --audience-out <path>] (--target-node <hex> \| --target-any-owned-by <hex>) [--ttl-secs N] --out <path>` | "org A holds these rights on capability C over target T." B→A, signed by the *provider* org. |
-| `node adopt --cert <path> (--identity <path> \| --entity <hex>) [--authority-dir <dir>] [--bundle <path>] [--skew-secs N]` | installs `owner-membership.json`, `owner-audience.key`, `revocation-state.json` under `$XDG_CONFIG_HOME/net-mesh/authority`. |
+| `node adopt --cert <path> (--identity <path> \| --entity <hex>) [--authority-dir <dir>] [--floors <path>] [--skew-secs N]` | installs `owner-membership.json`, `owner-audience.key`, `revocation-state.json` under `$XDG_CONFIG_HOME/net-mesh/authority`; `--floors` merges a revocation-floor bundle during adoption. |
 
 Things that will bite:
 
