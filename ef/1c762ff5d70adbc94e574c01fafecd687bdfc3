@@ -1,0 +1,29 @@
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_38828de26a56bb::t_95192ce69ff662 1354-1358,1405-1407
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_38828de26a56bb::t_dd3eca403d8d54 497-507,525-529,543-545,548,1264
+net/crates/net/tests/rtc_browser/runner/src/stage5.rs
+  s_38828de26a56bb::t_dd3eca403d8d54 5175,5223-5227
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  s_38828de26a56bb::t_16ed98ccf21600 315-316,325,327,371
+net/crates/net/src/adapter/net/mesh.rs
+  s_38828de26a56bb::t_16ed98ccf21600 52367,52375-52381
+net/crates/net/leaf/src/anchor_control_plane.rs
+  s_38828de26a56bb::t_16ed98ccf21600 357-376,379-382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef1c762ff5d70adbc94e574c01fafecd687bdfc3",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
