@@ -163,7 +163,9 @@ Subnet `keygen`, `issue-direct`, `issue-issuer`, `issue-delegated`, all four `is
 
 Capability `show/query/nodes`, subnet `show/ls/tree` and gateway `stats/exports` support `--local --inspect-target`. Inspection reports `mode: temporary_supervisor`, `supervisor_node_id` and the actual configured identity fingerprint (`--identity` > profile identity), or an unavailable identity when execution would generate one. It validates the profile endpoint but does not start a supervisor or generate an ephemeral identity. Remote profile target/bind defaults are ignored and disclosed, not connected to. `--local` remains required; `--node` names the temporary supervisor, not a remote deployment. Inspection does not query topology or capability state, validate all filters or approve authority.
 
-Inspection is not yet CLI-wide: other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
+The remaining temporary-supervisor commands—snapshot get/status, audit recent/stream, log/failures tail, peer/daemon/channel reads, aggregator inspect, and admin/ICE operations—also accept `--local --inspect-target`. Streams exit after this one-shot report. Admin/ICE report `identity_required: true` and an unavailable identity when none is configured; inspection does not simulate, prompt or commit. `--inspect-target` conflicts with their `--dry-run`, whose existing behavior is unchanged. Temporary read views report `identity_required: false`; local aggregator listing uses the same view.
+
+With the optional `keychain` feature, `forwarding set-value <ref> --inspect-target` validates the ref name and reports `keychain_service`, `keychain_account` and stdin source provenance without reading stdin or accessing the OS store. This is destination selection, not proof that the keychain is available or durable. The flag is unavailable for this verb in builds without `keychain`. Inspection remains command-specific, not a global flag.
 
 ## Exit codes
 

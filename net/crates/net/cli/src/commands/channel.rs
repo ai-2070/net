@@ -33,7 +33,7 @@ pub enum ChannelCommand {
 #[derive(Args, Debug)]
 pub struct VisibilityArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     /// Channel name (canonical, exact match — falls back through
     /// the registry's prefix table via `get_by_name`).
@@ -49,7 +49,7 @@ pub struct VisibilityArgs {
 #[derive(Args, Debug)]
 pub struct LsArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -78,8 +78,18 @@ async fn run_visibility(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "channel visibility")?;
+    super::scope::validate_local(args.scope.local, "channel visibility")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "channel visibility")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let view = VisibilityView {
@@ -103,8 +113,18 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "channel ls")?;
+    super::scope::validate_local(args.scope.local, "channel ls")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "channel ls")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let rows: Vec<ChannelRow> = deck

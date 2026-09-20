@@ -126,6 +126,9 @@ pub struct KillMigrationArgs {
 
 #[derive(Args, Debug)]
 pub struct CommonIceArgs {
+    /// Inspect context selection without simulation, prompting or committing.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub inspect_target: bool,
     #[command(flatten)]
     pub scope: super::scope::LocalScope,
 
@@ -258,8 +261,18 @@ async fn run_ice<F>(
 where
     F: for<'a> FnOnce(&'a net_sdk::deck::DeckClient) -> net_sdk::deck::IceProposal<'a>,
 {
-    super::scope::require_local(common.scope.local, "ice")?;
+    super::scope::validate_local(common.scope.local, "ice")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if common.inspect_target {
+        return super::scope::inspect_temporary_write(
+            &profile,
+            common.identity.as_deref(),
+            common.supervisor_node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(common.scope.local, "ice")?;
     let ctx = CliContext::build(
         &profile,
         common.identity.as_deref(),

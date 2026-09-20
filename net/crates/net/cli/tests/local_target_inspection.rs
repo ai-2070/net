@@ -27,6 +27,86 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn offline_families_reject_remote_target_flags_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("untouched");
+    let path = dest.to_str().unwrap();
+    let key = "0101010101010101010101010101010101010101010101010101010101010101";
+    let commands = [
+        vec!["identity", "generate", "--out", path],
+        vec!["identity", "revoke", key, "--revocation-store", path],
+        vec!["org", "keygen", "--out", path],
+        vec![
+            "org",
+            "issue-cert",
+            "--org-key",
+            path,
+            "--member",
+            key,
+            "--out",
+            path,
+        ],
+        vec![
+            "node",
+            "adopt",
+            "--cert",
+            path,
+            "--entity",
+            key,
+            "--authority-dir",
+            path,
+        ],
+        vec!["subnet", "keygen", "--out", path],
+        vec!["subnet", "inspect", path],
+        vec![
+            "anchor",
+            "credential",
+            "inspect",
+            "--credential",
+            "not-a-credential",
+        ],
+        vec!["forwarding", "enable", "--store", path],
+        vec!["forwarding", "set-value", "test"],
+        vec!["mcp", "pin", "list", "--pin-store", path],
+        vec!["transfer", "send-blob", path],
+        vec![
+            "netdb", "tasks", "create", "7", "--title", "test", "--store", path,
+        ],
+        vec![
+            "cap", "announce", "--tag", "test", "--key", path, "--out", path,
+        ],
+    ];
+    for command in commands {
+        for flags in [
+            ["--node-addr", "127.0.0.1:9"],
+            ["--node-id", "9"],
+            ["--node-pubkey", key],
+            ["--psk-hex", key],
+            ["--bind", "127.0.0.1:0"],
+        ] {
+            // These names have legitimate offline meanings on these verbs:
+            // trust-domain verification and announcement node-ID confirmation.
+            if (command[0] == "anchor" && flags[0] == "--psk-hex")
+                || (command[0] == "cap" && flags[0] == "--node-id")
+            {
+                continue;
+            }
+            let mut args = command.clone();
+            args.extend(flags);
+            let out = run(&args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(out.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    assert!(!dest.exists());
+}
+
+#[test]
 fn temporary_read_inspection_resolves_identity_without_starting_supervisor() {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
@@ -1300,8 +1380,21 @@ fn policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct() {
         "test",
         "--inspect-target",
     ]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
+    if cfg!(feature = "keychain") {
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["keychain_service"], "net-mesh-forwarding");
+        assert_eq!(view["keychain_account"], "test");
+        assert_eq!(view["provenance"]["source"], "stdin");
+        assert_eq!(view["identity"]["state"], "unused");
+        assert_eq!(view["authorization"], "not_checked");
+        assert_eq!(view["ignored_profile_remote_defaults"], false);
+        let invalid = run(&["forwarding", "set-value", "INVALID REF", "--inspect-target"]);
+        assert!(!invalid.status.success());
+    } else {
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+    }
 }
 
 #[cfg(unix)]

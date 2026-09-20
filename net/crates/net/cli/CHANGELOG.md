@@ -8,6 +8,16 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — remaining temporary and keychain inspection
+
+- Remaining temporary-supervisor commands accept `--local --inspect-target`,
+  including streams and admin/ICE. Inspection does not start, simulate, prompt
+  or commit. Admin/ICE distinguish required identities from ephemeral fallback
+  and reject combining inspection with dry-run.
+- Temporary reports consistently include supervisor node ID and identity
+  requirement; keychain builds can inspect forwarding service/account selection
+  without reading stdin or accessing the credential store.
+
 ## Unreleased — temporary read-context inspection
 
 - Capability show/query/nodes, subnet show/ls/tree and gateway stats/exports

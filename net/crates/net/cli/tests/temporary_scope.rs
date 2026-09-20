@@ -71,6 +71,48 @@ fn run(args: &[&str], config: &std::path::Path) -> std::process::Output {
 }
 
 #[test]
+fn all_temporary_commands_inspect_without_startup_or_commit() {
+    let dir = config();
+    for (index, command) in COMMANDS.iter().enumerate() {
+        let mut args = command.to_vec();
+        args.push("--inspect-target");
+        assert_eq!(run(&args, dir.path()).status.code(), Some(2), "{args:?}");
+        args.push("--local");
+        let out = run(&args, dir.path());
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["mode"], "temporary_supervisor", "{args:?}");
+        assert_eq!(view["identity_required"], index < 16, "{args:?}");
+        assert_eq!(view["identity"]["state"], "unavailable");
+        assert!(view["supervisor_node_id"].is_u64());
+        assert_eq!(view["authorization"], "not_checked");
+        assert!(view["target"].is_null() && view["bind"].is_null());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains(SCOPE),
+            "inspection announced startup: {args:?}"
+        );
+        assert!(!stderr.contains("ephemeral") && !stderr.contains("YES"));
+        if index < 16 {
+            assert!(view["identity"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("requires"));
+            args.push("--dry-run");
+            assert_eq!(run(&args, dir.path()).status.code(), Some(2));
+            args.pop();
+        }
+        args.extend(["--node-addr", "127.0.0.1:9"]);
+        assert_eq!(run(&args, dir.path()).status.code(), Some(2), "{args:?}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn every_temporary_operation_refuses_without_opt_in() {
     let dir = config();
     for args in COMMANDS {

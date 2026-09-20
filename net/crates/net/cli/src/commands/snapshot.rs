@@ -47,6 +47,9 @@ pub enum SnapshotCommand {
 
 #[derive(Args, Debug)]
 pub struct GetArgs {
+    /// Inspect context selection without starting a supervisor.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Operator identity file. Overrides the profile's
     /// `identity` setting.
     #[arg(long)]
@@ -62,6 +65,9 @@ pub struct GetArgs {
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
+    /// Inspect context selection without starting a supervisor.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -80,8 +86,18 @@ pub async fn run(
 ) -> Result<(), CliError> {
     match cmd {
         SnapshotCommand::Get(args) => {
-            super::scope::require_local(args.local, "snapshot get")?;
+            super::scope::validate_local(args.local, "snapshot get")?;
             let profile = resolve_profile(config_path, profile_name).await?;
+            if args.inspect_target {
+                return super::scope::inspect_temporary(
+                    &profile,
+                    args.identity.as_deref(),
+                    args.node,
+                    output,
+                )
+                .await;
+            }
+            super::scope::require_local(args.local, "snapshot get")?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let snapshot: MeshOsSnapshot = ctx.deck().status();
@@ -89,8 +105,18 @@ pub async fn run(
                 .map_err(|e| generic(format!("write snapshot: {e}")))?;
         }
         SnapshotCommand::Status(args) => {
-            super::scope::require_local(args.local, "snapshot status")?;
+            super::scope::validate_local(args.local, "snapshot status")?;
             let profile = resolve_profile(config_path, profile_name).await?;
+            if args.inspect_target {
+                return super::scope::inspect_temporary(
+                    &profile,
+                    args.identity.as_deref(),
+                    args.node,
+                    output,
+                )
+                .await;
+            }
+            super::scope::require_local(args.local, "snapshot status")?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let summary: StatusSummary = ctx.deck().status_summary();

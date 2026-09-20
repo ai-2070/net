@@ -118,7 +118,7 @@ pub enum AggregatorCommand {
 #[derive(Args, Debug)]
 pub struct InspectArgs {
     #[command(flatten)]
-    pub scope: super::scope::LocalScope,
+    pub scope: super::scope::InspectableLocalScope,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -246,8 +246,18 @@ async fn run_inspect(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    super::scope::require_local(args.scope.local, "aggregator inspect")?;
+    super::scope::validate_local(args.scope.local, "aggregator inspect")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "aggregator inspect")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let view = match deck.aggregator_snapshot() {
@@ -398,6 +408,15 @@ async fn run_ls(
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = resolve_ls_target(&profile, &args)?;
     if args.attach.inspect_target {
+        if remote.is_none() {
+            return super::scope::inspect_temporary(
+                &profile,
+                args.identity.as_deref(),
+                args.node,
+                output,
+            )
+            .await;
+        }
         let mode = if remote.is_some() {
             "remote"
         } else {

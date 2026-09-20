@@ -29,8 +29,27 @@ pub(super) async fn inspect_temporary(
     node: u64,
     output: Option<crate::output::OutputFormat>,
 ) -> Result<(), CliError> {
+    inspect_context(profile, identity, node, output, false).await
+}
+
+pub(super) async fn inspect_temporary_write(
+    profile: &crate::config::Profile,
+    identity: Option<&std::path::Path>,
+    node: u64,
+    output: Option<crate::output::OutputFormat>,
+) -> Result<(), CliError> {
+    inspect_context(profile, identity, node, output, true).await
+}
+
+async fn inspect_context(
+    profile: &crate::config::Profile,
+    identity: Option<&std::path::Path>,
+    node: u64,
+    output: Option<crate::output::OutputFormat>,
+    identity_required: bool,
+) -> Result<(), CliError> {
     crate::context::validate_endpoint(profile)?;
-    let target = crate::target::inspect(
+    let mut target = crate::target::inspect(
         profile,
         &super::aggregator::RemoteAttachArgs::default(),
         identity,
@@ -38,17 +57,22 @@ pub(super) async fn inspect_temporary(
         "temporary_supervisor",
     )
     .await?;
+    if identity_required && identity.or(profile.identity.as_deref()).is_none() {
+        target.unavailable_identity("execution requires a configured identity");
+    }
     #[derive(serde::Serialize)]
     struct View {
         #[serde(flatten)]
         target: crate::target::TargetInspection,
         supervisor_node_id: u64,
+        identity_required: bool,
     }
     crate::output::emit_value(
         crate::output::OutputFormat::resolve_oneshot(output),
         &View {
             target,
             supervisor_node_id: node,
+            identity_required,
         },
     )
     .map_err(|e| crate::error::generic(format!("write inspection: {e}")))
