@@ -2993,6 +2993,7 @@ async fn publish_response_to_caller(
     payload: Bytes,
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
+    let payload = bound_response_packet(payload)?;
     // OA2-E0.2: every server→caller frame (RESPONSE / DEADLINE /
     // REQUEST_GRANT / STREAM_GRANT built for the reply channel)
     // funnels through here, so insert the RpcRouteV1 discriminator —
@@ -3166,6 +3167,37 @@ async fn publish_response_to_caller(
     // at send time (nothing was sent).
     let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
     mesh.publish(&publisher, payload).await.map(|_| ())
+}
+
+/// Preserve the call identity while replacing a response this publish path
+/// cannot transport with a small, old-peer-compatible terminal error. Never
+/// echo application bytes or invite a retry: the handler may have committed.
+fn bound_response_packet(payload: Bytes) -> Result<Bytes, AdapterError> {
+    let event_size = payload.len().saturating_add(RPC_ROUTE_V1_SIZE);
+    let limit = net_wire::protocol::MAX_EVENT_SIZE;
+    if event_size <= limit {
+        return Ok(payload);
+    }
+    let meta = payload
+        .get(..EVENT_META_SIZE)
+        .and_then(EventMeta::from_bytes);
+    if !meta.is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
+    {
+        return Err(AdapterError::Connection(format!(
+            "RPC control event of {event_size} bytes exceeds the {limit}-byte single-packet limit; nothing was sent"
+        )));
+    }
+    let response = RpcResponsePayload {
+        status: RpcStatus::Internal,
+        headers: Vec::new(),
+        body: Bytes::from(format!(
+            "RPC response event of {event_size} bytes exceeds the {limit}-byte single-packet limit; large-response transport is not supported on this path. The handler may have completed; do not automatically retry."
+        )),
+    };
+    let mut bounded = Vec::with_capacity(EVENT_META_SIZE + response.encoded_len());
+    bounded.extend_from_slice(&payload[..EVENT_META_SIZE]);
+    response.encode_into(&mut bounded);
+    Ok(Bytes::from(bounded))
 }
 
 /// The runtime a client call was opened on, for [`spawn_cancel_publish`]

@@ -219,6 +219,7 @@ async fn metadata_failures_do_not_publish_or_retry() {
         "wrong_version",
         "missing_input",
         "bad_schema",
+        "oversized_response",
         "timeout",
     ] {
         let mesh = discovery_host().await;
@@ -245,6 +246,9 @@ async fn metadata_failures_do_not_publish_or_retry() {
                             "wrong_version" => descriptor.version = "2.0.0".into(),
                             "missing_input" => descriptor.input_schema = None,
                             "bad_schema" => descriptor.input_schema = Some("not json".into()),
+                            "oversized_response" => {
+                                descriptor.input_schema = Some("x".repeat(22_000))
+                            }
                             _ => {}
                         }
                         Ok(ToolMetadataResponse::Found { descriptor })
@@ -280,6 +284,7 @@ async fn metadata_failures_do_not_publish_or_retry() {
                 "wrong_id" | "wrong_version" => "metadata mismatch",
                 "missing_input" => "no input schema",
                 "bad_schema" => "unusable input schema",
+                "oversized_response" => "single-packet limit",
                 _ => "exceeded --timeout",
             };
             assert!(

@@ -8,6 +8,14 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — explicit oversized RPC failure
+
+- An oversized metadata response now returns a small RPC error naming the
+  single-packet limit instead of silently waiting for the CLI deadline.
+  The handler may have completed; the CLI does not retry. Snapshot/generated
+  output remains unpublished. Multi-packet large-response delivery is still
+  pending; the packet-size limit is unchanged.
+
 ## Unreleased — provider-bound live typegen metadata
 
 - Missing live input schemas are fetched from the advertising provider;

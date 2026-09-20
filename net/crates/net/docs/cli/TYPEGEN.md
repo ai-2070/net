@@ -85,6 +85,8 @@ Publication after successful acquisition is not a crash-atomic transaction.
 Metadata uses the existing unary RPC transport: arbitrarily large contracts
 are not supported by this change (a roughly 22 KB response exceeded the current
 8 KB packet receive path in local testing; a roughly 6 KB contract is covered).
+Oversized responses now return an explicit RPC size error rather than waiting
+for the CLI timeout. The handler may have completed; do not automatically retry.
 
 ### Filtering
 

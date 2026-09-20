@@ -41720,6 +41720,17 @@ impl MeshNode {
             None => return PeerPublishOutcome::NoSession,
         };
 
+        // This path builds ONE packet, unlike the batching/fragmenting stream
+        // sender. Refuse before opening a stream or charging credit: otherwise
+        // the socket can report success for a datagram the peer cannot receive.
+        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
+        if payload_bytes > protocol::MAX_PAYLOAD_SIZE {
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                "publish payload of {payload_bytes} bytes exceeds the {}-byte single-packet limit; nothing was sent",
+                protocol::MAX_PAYLOAD_SIZE,
+            )));
+        }
+
         if self.partition_filter.contains(&dest_addr) {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
                 "publish: peer {:#x} is partitioned",
@@ -41737,7 +41748,6 @@ impl MeshNode {
         // about to build. The `TxSlotGuard` refunds on Drop unless
         // we `commit()` after a successful socket send, so a failed
         // send doesn't strand credit.
-        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
         let needed = wire_bytes_for_payload(payload_bytes);
         let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
             TxAdmit::Acquired { guard, seq } => (guard, seq),
