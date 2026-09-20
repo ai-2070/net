@@ -1,0 +1,16 @@
+.claude/skills/net-event-bus/cli.md
+  h_64425bc75e3f3d 228,268
+web/src/content/docs/reference/cli.md
+  h_64425bc75e3f3d 128,368,371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7d0c5c7a7f049338be8720d0d6904277986d92e7",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
