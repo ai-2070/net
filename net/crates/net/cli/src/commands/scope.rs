@@ -13,7 +13,7 @@ pub struct LocalScope {
     pub local: bool,
 }
 
-pub(super) fn require_local(local: bool, command: &str) -> Result<(), CliError> {
+pub(super) fn validate_local(local: bool, command: &str) -> Result<(), CliError> {
     if !local {
         return Err(invalid_args(format!(
             "`{command}` cannot read a running deployment or administer it. \
@@ -22,6 +22,11 @@ pub(super) fn require_local(local: bool, command: &str) -> Result<(), CliError> 
              RPC is a separate, explicitly targeted operation."
         )));
     }
+    Ok(())
+}
+
+pub(super) fn require_local(local: bool, command: &str) -> Result<(), CliError> {
+    validate_local(local, command)?;
     // Scope is a safety disclosure, not progress: do not hide it under --quiet
     // or let an environment logging filter suppress it.
     eprintln!("net-mesh: --local: {NOTICE}");

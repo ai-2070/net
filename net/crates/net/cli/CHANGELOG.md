@@ -8,6 +8,24 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — aggregator list target resolution
+
+- `aggregator ls` now selects remote RPC from a complete profile target,
+  just as it does from flags. Scripts that intended a development-only
+  snapshot must explicitly add `--local`; incomplete target tuples fail.
+  Explicit flags override individual profile values. Local mode can ignore
+  profile remote defaults, with disclosure, but conflicts with remote flags.
+- `aggregator ls --inspect-target` reports resolved mode/target, public
+  fingerprints, identity availability, current bind and provenance without
+  connecting, minting an identity or starting a supervisor. It does not
+  verify authorization. No keys or PSKs are emitted. The same resolved
+  target is passed to execution, with no local fallback on remote failure.
+- Profile loading now rejects an explicitly selected missing config or an
+  unknown named profile. Remove an obsolete `--config` only when you mean
+  to use the optional implicit default. Commands that do not load profiles
+  retain their existing behavior; CLI-wide inspection/config validation
+  and non-loopback client binding are not part of this sub-slice.
+
 ## Unreleased — explicit temporary-supervisor scope
 
 - Admin commits, ICE simulation/commit, audit/log/failure streams, capability

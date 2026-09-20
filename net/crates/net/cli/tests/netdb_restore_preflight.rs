@@ -520,12 +520,20 @@ fn valid_profile_store_is_honored() {
 }
 
 #[test]
-fn missing_optional_config_keeps_explicit_store_usable() {
+fn missing_explicit_config_refuses_before_creating_store() {
     let f = Fixture::new();
     fs::remove_file(&f.config).unwrap();
     let dest = f.path("destination");
-    f.task(&dest, "1", "17");
-    assert_eq!(f.ids(&dest, "tasks", "17"), [1]);
+    let out = f
+        .command()
+        .args([
+            "tasks", "create", "1", "--title", "test", "--origin", "17", "--store",
+        ])
+        .arg(&dest)
+        .output()
+        .unwrap();
+    failure(out, "config");
+    assert!(!dest.exists());
 }
 
 #[test]

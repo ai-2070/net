@@ -10,13 +10,27 @@ The `net-mesh` binary is produced by the `net-cli` crate (kept separate so libra
 
 Execution scope is command-specific. Identity/org/subnet issuance, capability announcement artifacts, and saved typegen input are offline. NetDB, MCP pins, forwarding policy, and staged transfers use local persistent files. Transfer receive/admin, live typegen, and remote aggregator operations use explicit mesh attachment; mesh attachment does not make the Deck client remote.
 
-For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection: **Starts a temporary supervisor for this command; does not inspect a running node.** These operations require `--local` and disclose scope on stderr, including with `--quiet`. Admin `--dry-run` remains an offline preview without this requirement; ICE simulation requires it. Gateway export is unsupported. Profile `endpoint` accepts only `in-process`; omitting remote flags does not attach these commands to an existing deployment. Profile remote fields alone currently do not select remote `aggregator ls`; use `--remote`. Combining `--local` with explicit remote targeting is refused.
+For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection: **Starts a temporary supervisor for this command; does not inspect a running node.** These operations require `--local` and disclose scope on stderr, including with `--quiet`. Admin `--dry-run` remains an offline preview without this requirement; ICE simulation requires it. Gateway export is unsupported. Profile `endpoint` accepts only `in-process`; it does not provide remote Deck attachment. For `aggregator ls`, a complete remote target from flags or profile selects remote RPC; combining `--local` with explicit remote targeting is refused.
 
 Migration: a script that previously ran `net-mesh peer ls` must use `net-mesh peer ls --local` only if it intentionally wants a fresh development snapshot. The old invocation now fails with exit 2 and no result payload. No remote Deck alternative is implied. Offline issuance, persistent stores, and real remote clients keep their existing syntax and scope.
 
 Global `--timeout` is currently parsed but not forwarded by dispatch: it does not enforce a universal deadline. One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE can emit separate preview and commit JSON values and still prompts for typed `YES` on interactive stdin even with `--yes`. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
 
 `--no-color` is global. `$NO_COLOR` is honored per [the convention](https://no-color.org): color is disabled when the variable is **present and non-empty**, whatever its value — `NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it, and only absent or empty leaves it on.
+
+## `net-mesh aggregator ls`
+
+```sh
+net-mesh aggregator ls --profile prod --inspect-target --output json
+net-mesh aggregator ls --profile prod --output json
+net-mesh aggregator ls --profile prod --local --output json
+```
+
+`--inspect-target` reports the same resolved target normal execution consumes, without connecting, starting a supervisor, or generating an identity. Output includes mode, peer address/node ID, public fingerprints (not raw keys), identity availability, bind, field provenance, ignored profile defaults, and `authorization: "not_checked"`. It reads configured files but creates no store or identity. This inspection flag currently exists only on `aggregator ls`.
+
+Flags override corresponding profile fields. A complete profile tuple selects remote list RPC without `--remote`; partial tuples fail. `--local` may override profile remote defaults and explicitly reports that they were ignored. It cannot be combined with explicit remote targeting. Connection failure does not produce a local snapshot. The short-lived client's bind is currently `127.0.0.1:0`; this is not evidence of off-host usability.
+
+Profile-backed commands reject missing explicit config files and unknown profile names; only a missing implicit default config remains optional. Commands that bypass profile loading, including offline admin previews, retain their existing behavior for now.
 
 ## `net-mesh transfer`
 

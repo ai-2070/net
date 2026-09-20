@@ -33,6 +33,9 @@ use crate::error::{connection_failure, invalid_args, sdk, CliError};
 use crate::parsers::{hex_decode_32, parse_u64_flexible};
 use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
+/// Current short-lived client bind, shared with target inspection.
+pub(crate) const DEFAULT_CLIENT_BIND: &str = "127.0.0.1:0";
+
 /// Resolved remote-attach target. Built from subcommand flags +
 /// profile fallbacks via [`resolve_remote_attach`]. Carrying it
 /// as a typed struct (rather than three optional strings) makes
@@ -44,6 +47,20 @@ pub struct RemoteAttach {
     pub public_key: [u8; 32],
     pub node_id: u64,
     pub psk: [u8; 32],
+}
+
+pub(crate) fn validate_endpoint(profile: &Profile) -> Result<(), CliError> {
+    if profile
+        .endpoint
+        .as_deref()
+        .is_some_and(|value| value != "in-process")
+    {
+        return Err(invalid_args(
+            "profile endpoint is unsupported; use `in-process` for the local supervisor \
+             and node_addr/node_pubkey/node_id/psk_hex for mesh attachment",
+        ));
+    }
+    Ok(())
 }
 
 /// Live substrate context wrapping the SDK + DeckClient.
@@ -169,16 +186,7 @@ impl CliContext {
         require_identity: bool,
         remote: Option<RemoteAttach>,
     ) -> Result<Self, CliError> {
-        // Endpoint check — Phase 1 supports only in-process.
-        if let Some(endpoint) = profile.endpoint.as_deref() {
-            if endpoint != "in-process" {
-                return Err(invalid_args(format!(
-                    "endpoint `{endpoint}` is not supported in this build; \
-                     only `in-process` is available until the substrate \
-                     remote-attach surface lands"
-                )));
-            }
-        }
+        validate_endpoint(profile)?;
 
         // Identity resolution. Generates an ephemeral one as a
         // last resort so read-only subcommands work without
@@ -297,7 +305,7 @@ async fn build_remote_mesh(
     identity: Option<net_sdk::identity::Identity>,
 ) -> Result<net_sdk::Mesh, CliError> {
     // Loopback bind; identity per the caller.
-    build_attached_mesh("127.0.0.1:0", identity, &remote).await
+    build_attached_mesh(DEFAULT_CLIENT_BIND, identity, &remote).await
 }
 
 /// Build a local mesh bound to `bind`, optionally under an operator
@@ -522,7 +530,8 @@ pub async fn resolve_profile(
     let file = crate::config::ConfigFile::load(config_path)
         .await
         .map_err(|e| sdk(format!("config load: {e}")))?;
-    Ok(file.profile(profile_name))
+    file.profile(profile_name)
+        .ok_or_else(|| invalid_args(format!("unknown profile `{profile_name}`")))
 }
 
 #[allow(dead_code)]

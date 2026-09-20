@@ -115,18 +115,16 @@ pub struct Profile {
 }
 
 impl ConfigFile {
-    /// Resolve the named profile (or `default` when none named).
-    /// Returns an empty profile when the named one is absent —
-    /// the CLI degrades gracefully when the file is partial.
-    pub fn profile(&self, name: &str) -> Profile {
+    /// Resolve the named profile. Unknown names are not empty defaults.
+    pub fn profile(&self, name: &str) -> Option<Profile> {
         if name == "default" {
-            return self.default.clone();
+            return Some(self.default.clone());
         }
-        self.profiles.get(name).cloned().unwrap_or_default()
+        self.profiles.get(name).cloned()
     }
 
-    /// Load from disk. Returns `Ok(default)` when the file is
-    /// missing — the binary is usable without a config.
+    /// Load from disk. Only an absent implicit default file is optional;
+    /// an explicitly selected missing file is an error.
     ///
     /// Honours the process-wide override set by
     /// [`set_insecure_permissions`], i.e. the CLI's
@@ -155,6 +153,7 @@ impl ConfigFile {
     /// and a profile that gains a PSK later should not silently lose
     /// the protection.
     pub async fn load_with(path: Option<&Path>, allow_insecure: bool) -> Result<Self, ConfigError> {
+        let explicit = path.is_some();
         let path = match path {
             Some(p) => p.to_path_buf(),
             None => match default_path() {
@@ -173,10 +172,9 @@ impl ConfigFile {
         })?;
         let text = match gated {
             Ok(t) => t,
-            // A missing config is not an error — the binary is usable
-            // without one.
+            // Only absence of the implicit default config is optional.
             Err(::net::adapter::net::secret_file::SecretFileError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
+                if !explicit && source.kind() == std::io::ErrorKind::NotFound =>
             {
                 return Ok(Self::default())
             }
@@ -316,7 +314,7 @@ mod tests {
 
         let cfg = loaded.expect("--insecure-config-permissions must admit the file");
         assert_eq!(
-            cfg.profile("default").psk_hex.as_deref(),
+            cfg.profile("default").unwrap().psk_hex.as_deref(),
             Some("abcd"),
             "the override admitted the file but did not actually parse it"
         );
@@ -384,7 +382,10 @@ mod tests {
         let cfg = ConfigFile::load(Some(&path))
             .await
             .expect("valid TOML loads");
-        assert_eq!(cfg.profile("default").psk_hex.as_deref(), Some("abcd"));
+        assert_eq!(
+            cfg.profile("default").unwrap().psk_hex.as_deref(),
+            Some("abcd")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

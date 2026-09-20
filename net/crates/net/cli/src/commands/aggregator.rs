@@ -8,8 +8,8 @@
 //!   via `DeckClient::aggregator_*` accessors. Empty output when
 //!   no aggregator is installed (same convention as
 //!   `subnet show` / `gateway stats`).
-//! - `ls` — local by default; remote when `--node-addr` is set or
-//!   `--remote` is passed. Local reads through
+//! - `ls` — resolves flags/profile to a remote target, or explicitly
+//!   opts into a temporary supervisor with `--local`. Local reads through
 //!   `DeckClient::aggregator_registry_snapshot`; remote routes
 //!   through `RegistryClient::list`.
 //! - `query` — remote-only. Issues a `fold.query` RPC against
@@ -121,12 +121,15 @@ pub struct LsArgs {
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 
-    /// When set (or implicit via `--node-addr`), route `ls`
-    /// through the registry RPC against the remote daemon
-    /// rather than reading the local registry snapshot. Wired
-    /// in A-5.
+    /// Require remote registry RPC. A complete target from flags or profile
+    /// already selects remote execution, without this flag.
     #[arg(long, default_value_t = false)]
     pub remote: bool,
+
+    /// Print resolved scope, target, public fingerprints and provenance only.
+    /// Does not start a supervisor, connect, mint an identity or verify authority.
+    #[arg(long)]
+    pub inspect_target: bool,
 
     #[command(flatten)]
     pub attach: RemoteAttachArgs,
@@ -331,6 +334,190 @@ fn require_remote_attach(
     })
 }
 
+fn has_profile_target(profile: &crate::config::Profile) -> bool {
+    profile.node_addr.is_some()
+        || profile.node_pubkey.is_some()
+        || profile.node_id.is_some()
+        || profile.psk_hex.is_some()
+}
+
+/// The single mode/target decision consumed by both inspection and execution.
+fn resolve_ls_target(
+    profile: &crate::config::Profile,
+    args: &LsArgs,
+) -> Result<Option<RemoteAttach>, CliError> {
+    crate::context::validate_endpoint(profile)?;
+    let explicit_target = args.attach.node_addr.is_some()
+        || args.attach.node_pubkey.is_some()
+        || args.attach.remote_node_id.is_some()
+        || args.attach.psk_hex.is_some();
+    if args.scope.local {
+        if args.remote || explicit_target {
+            return Err(invalid_args(
+                "--local conflicts with explicit remote target flags",
+            ));
+        }
+        return Ok(None);
+    }
+    let remote = crate::context::resolve_remote_attach(
+        profile,
+        args.attach.node_addr.as_deref(),
+        args.attach.node_pubkey.as_deref(),
+        args.attach.remote_node_id.as_deref(),
+        args.attach.psk_hex.as_deref(),
+    )?;
+    if remote.is_none() {
+        if args.remote {
+            return Err(invalid_args(
+                "--remote requires a complete target from flags or profile",
+            ));
+        }
+        super::scope::validate_local(false, "aggregator ls")?;
+    }
+    Ok(remote)
+}
+
+#[derive(Serialize)]
+struct TargetInspection {
+    mode: &'static str,
+    target: Option<PublicTarget>,
+    bind: Option<&'static str>,
+    identity: InspectionIdentity,
+    provenance: std::collections::BTreeMap<&'static str, &'static str>,
+    ignored_profile_remote_defaults: bool,
+    authorization: &'static str,
+}
+
+#[derive(Serialize)]
+struct PublicTarget {
+    address: String,
+    node_id: u64,
+    peer_key_fingerprint: String,
+}
+
+#[derive(Serialize)]
+struct InspectionIdentity {
+    state: &'static str,
+    fingerprint: Option<String>,
+    reason: Option<&'static str>,
+}
+
+async fn inspect_ls_target(
+    profile: &crate::config::Profile,
+    args: &LsArgs,
+    remote: Option<&RemoteAttach>,
+) -> Result<TargetInspection, CliError> {
+    let source = |flag: bool, configured: bool| {
+        if flag {
+            "flag"
+        } else if configured {
+            "profile"
+        } else {
+            "default"
+        }
+    };
+    let mut provenance = std::collections::BTreeMap::new();
+    provenance.insert(
+        "mode",
+        if args.scope.local || args.remote {
+            "flag"
+        } else {
+            source(
+                args.attach.node_addr.is_some()
+                    || args.attach.node_pubkey.is_some()
+                    || args.attach.remote_node_id.is_some()
+                    || args.attach.psk_hex.is_some(),
+                has_profile_target(profile),
+            )
+        },
+    );
+    for (name, flag, configured) in [
+        (
+            "node_addr",
+            args.attach.node_addr.is_some(),
+            profile.node_addr.is_some(),
+        ),
+        (
+            "node_pubkey",
+            args.attach.node_pubkey.is_some(),
+            profile.node_pubkey.is_some(),
+        ),
+        (
+            "node_id",
+            args.attach.remote_node_id.is_some(),
+            profile.node_id.is_some(),
+        ),
+        (
+            "psk",
+            args.attach.psk_hex.is_some(),
+            profile.psk_hex.is_some(),
+        ),
+    ] {
+        provenance.insert(
+            name,
+            if remote.is_some() {
+                source(flag, configured)
+            } else {
+                "unused"
+            },
+        );
+    }
+    provenance.insert(
+        "identity",
+        source(args.identity.is_some(), profile.identity.is_some()),
+    );
+    provenance.insert(
+        "bind",
+        if remote.is_some() {
+            "default"
+        } else {
+            "unused"
+        },
+    );
+    let identity = match args.identity.as_deref().or(profile.identity.as_deref()) {
+        Some(path) => {
+            let keypair = crate::context::load_identity_keypair(path).await?;
+            InspectionIdentity {
+                state: "configured",
+                fingerprint: Some(public_fingerprint(keypair.entity_id().as_bytes())),
+                reason: None,
+            }
+        }
+        None => InspectionIdentity {
+            state: "unavailable",
+            fingerprint: None,
+            reason: Some("no configured identity; execution would generate an ephemeral identity"),
+        },
+    };
+    Ok(TargetInspection {
+        mode: if remote.is_some() {
+            "remote"
+        } else {
+            "temporary_supervisor"
+        },
+        target: remote.map(|remote| PublicTarget {
+            address: remote.addr.to_string(),
+            node_id: remote.node_id,
+            peer_key_fingerprint: public_fingerprint(&remote.public_key),
+        }),
+        bind: remote.map(|_| crate::context::DEFAULT_CLIENT_BIND),
+        identity,
+        provenance,
+        ignored_profile_remote_defaults: remote.is_none() && has_profile_target(profile),
+        authorization: "not_checked",
+    })
+}
+
+fn public_fingerprint(key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(key)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 async fn run_ls(
     args: LsArgs,
     output: Option<OutputFormat>,
@@ -338,22 +525,17 @@ async fn run_ls(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    // --remote flips the path; --node-addr implies --remote so
-    // an operator who supplied attach flags doesn't accidentally
-    // read the local registry.
-    let want_remote = args.remote || args.attach.node_addr.is_some();
-    if args.scope.local
-        && (want_remote
-            || args.attach.node_pubkey.is_some()
-            || args.attach.remote_node_id.is_some()
-            || args.attach.psk_hex.is_some())
-    {
-        return Err(invalid_args(
-            "--local conflicts with explicit remote target flags",
-        ));
+    let remote = resolve_ls_target(&profile, &args)?;
+    if args.inspect_target {
+        let view = inspect_ls_target(&profile, &args, remote.as_ref()).await?;
+        return emit_value(OutputFormat::resolve_oneshot(output), &view)
+            .map_err(|e| generic(format!("write target inspection: {e}")));
     }
-    if want_remote {
-        return run_ls_remote(args, output, &profile).await;
+    if let Some(remote) = remote {
+        return run_ls_remote(args, output, &profile, remote).await;
+    }
+    if has_profile_target(&profile) {
+        eprintln!("net-mesh: --local explicitly ignores profile remote target defaults");
     }
     super::scope::require_local(args.scope.local, "aggregator ls")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
@@ -380,8 +562,8 @@ async fn run_ls_remote(
     args: LsArgs,
     output: Option<OutputFormat>,
     profile: &crate::config::Profile,
+    remote: RemoteAttach,
 ) -> Result<(), CliError> {
-    let remote = require_remote_attach(profile, &args.attach, "ls --remote")?;
     let target_node_id = remote.node_id;
     let ctx =
         CliContext::build_with_remote(profile, args.identity.as_deref(), args.node, false, remote)

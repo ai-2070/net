@@ -74,7 +74,7 @@ script has to do differently. Temporary-supervisor scripts must now add
 | `subnet`      | Temporary topology reads; offline authority issuance and decode-only inspection. |
 | `gateway`     | Temporary-context reads; `export` refuses without a live gateway. |
 | `channel`     | `ChannelConfigRegistry` inspection (`visibility`, `ls`).                        |
-| `aggregator`  | Temporary inspect/default list; remote query, spawn, scale, and explicitly remote list. |
+| `aggregator`  | Temporary inspect/list with `--local`; remote query/spawn/scale and list selected by flags or profile. `ls --inspect-target` inspects resolution only. |
 | `transfer`    | Receive/admin via mesh; send computes references or stages local content, not hosting or publication. |
 | `wrap`        | Wrap a local stdio MCP server as owner-only mesh capabilities.                  |
 | `mcp`         | MCP bridge — expose mesh capabilities to a local MCP host (`serve`).            |
@@ -111,12 +111,26 @@ default_timeout_ms = 30000
 [profiles.prod]
 identity   = "~/.config/net-mesh/ops-identity.toml"
 node_addr  = "10.0.0.4:7700"
-node_id    = 4
+node_id    = "4"
 node_pubkey = "abcd…"      # 64 hex
 psk_hex     = "1234…"      # 64 hex
 ```
 
 Operator identity files are authored by `net-mesh identity generate` — ed25519 seed + public key + SHA-256 fingerprint, the same format the deck loads from the maintenance node. Every signed `admin` / `ice` command picks the identity up from the active profile (or `--identity`).
+
+Profile-backed commands reject missing explicitly selected config files and unknown profile names. Only absence of the implicit default config is optional. Offline commands that do not load profiles are not yet covered by this selection check.
+
+### Inspect aggregator list targeting
+
+```sh
+net-mesh aggregator ls --profile prod --inspect-target --output json
+net-mesh aggregator ls --profile prod --output json
+net-mesh aggregator ls --profile prod --local --inspect-target --output json
+```
+
+With a complete profile target, `aggregator ls` now uses remote RPC even without `--remote`. Flags override individual profile fields; partial tuples fail. `--local` selects a temporary supervisor despite profile defaults and discloses that choice, but conflicts with explicit remote flags. Remote failure never falls back locally.
+
+`--inspect-target` is currently specific to `aggregator ls`. It reports mode, peer address/id, public fingerprints, identity availability, current bind, provenance, and ignored remote defaults. It does not connect, start a supervisor, mint an identity, or check authorization; normal execution consumes the same resolved target. An unconfigured identity has no fingerprint until execution generates one. The current client bind remains `127.0.0.1:0`; this sub-slice does not establish off-host connectivity or CLI-wide inspection.
 
 ## Exit codes
 
