@@ -5119,6 +5119,21 @@ jobs:
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact
       # aliasing the lexical guard cannot catch).
+      # This full-crate run includes the journey witnesses, and two of them
+      # REQUIRE Python + Pydantic v2 on PATH rather than skipping when it is
+      # missing: `native_contract_workflow` and `protected_native_workflow`
+      # assert `import pydantic; major == 2` before doing anything. The ubuntu
+      # `cli-tests` job installs both; windows-latest's preinstalled Python
+      # does not carry pydantic, so without this step the Windows run is red.
+      # mypy additionally stops `typegen_downstream_python` from silently
+      # self-skipping here.
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install mypy + pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
+
       - name: Net CLI tests
         run: cargo nextest run -p net-cli --no-tests=fail
 
