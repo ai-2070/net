@@ -1,0 +1,39 @@
+net/crates/net/docs/cli/TYPEGEN.md
+  s_38828de26a56bb::t_d60a142d682805 58-64,71-73
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_d60a142d682805 188
+net/crates/net/cli/tests/remote_inspection.rs
+  s_38828de26a56bb::t_64bc3cee6fb88a 415-416
+  s_38828de26a56bb::t_b475600b00b9a3 412,414
+  s_38828de26a56bb::t_682f7e2531087b 409-411,413,417-419,476
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  s_38828de26a56bb::t_0ea8fa7e3288e2 34-35,38-47,56-59,73-75,78-81,83-85,88-98,105-109,119-121,124-126,129-138,140-141,144-146
+  s_38828de26a56bb::t_64bc3cee6fb88a 15-17
+  s_38828de26a56bb::t_5947f94362c017 1-7,24-33,36,48-55,60-64,66-68,71-72,76-77,82,86-87,99-100,148
+  s_38828de26a56bb::t_682f7e2531087b 8-14,18-22,65
+  s_38828de26a56bb::t_fd19a9010ba78a 23,37,69-70,101-104,110-118,122-123,127-128,139,142-143,147
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_38828de26a56bb::t_838c1c90e7619a 489-495,498,513-522,525-543
+  s_38828de26a56bb::t_5947f94362c017 496-497,765-797,801-804,810-819
+  s_38828de26a56bb::t_0ea8fa7e3288e2 545-548,798-800,805-809
+  s_38828de26a56bb::t_b58c7dd1b4fb42 524
+  s_38828de26a56bb::t_cc150acf1dd1e3 820
+net/crates/net/cli/CHANGELOG.md
+  s_38828de26a56bb::t_d60a142d682805 11-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6ff8534219823fc921c5f135f836d3a645ecb743",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
