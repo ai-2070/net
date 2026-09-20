@@ -123,8 +123,9 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-    /// Total budget for supported bounded operations (currently remote aggregator
-    /// ls/query/spawn/scale). Unsupported combinations fail before execution.
+    /// Total budget for remote aggregator ls/query/spawn/scale, transfer
+    /// ls/status/cancel and live typegen acquisition (not output writes).
+    /// Unsupported combinations fail before execution.
     /// Omitting this retains the command's existing limits.
     #[arg(long, global = true, value_parser = humantime::parse_duration)]
     timeout: Option<std::time::Duration>,
@@ -282,6 +283,8 @@ async fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     if let Some(timeout) = cli.timeout {
         use commands::aggregator::AggregatorCommand;
+        use commands::transfer::TransferCommand;
+        use commands::typegen::TypegenCommand;
         let supported = match &cli.command {
             Command::Aggregator(AggregatorCommand::Query(a)) => !a.attach.inspect_target,
             Command::Aggregator(AggregatorCommand::Spawn(a)) => !a.attach.inspect_target,
@@ -289,19 +292,31 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             Command::Aggregator(AggregatorCommand::Ls(a)) => {
                 !a.scope.local && !a.attach.inspect_target
             }
+            Command::Transfer(TransferCommand::Ls(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::Status(a)) => !a.attach.inspect_target,
+            Command::Transfer(TransferCommand::Cancel(a)) => !a.attach.inspect_target,
+            Command::Typegen(TypegenCommand::Generate(a)) => {
+                a.from_snapshot.is_none() && !a.attach.inspect_target
+            }
+            Command::Typegen(TypegenCommand::Snapshot(a)) => !a.attach.inspect_target,
             _ => false,
         };
         if !supported {
-            return Err(error::invalid_args("--timeout is not supported for this command/mode; currently supported for remote aggregator ls/query/spawn/scale execution. Remove --timeout to use the command's existing limits"));
+            return Err(error::invalid_args("--timeout is not supported for this command/mode; supported for remote aggregator ls/query/spawn/scale, transfer ls/status/cancel and live typegen acquisition. Remove --timeout to use the command's existing limits"));
         }
-        return deadline::Deadline::after(timeout)?
-            .run(dispatch_inner(cli))
-            .await;
+        let deadline = deadline::Deadline::after(timeout)?;
+        // Typegen persists local output only after bounded acquisition succeeds.
+        if matches!(&cli.command, Command::Typegen(_)) {
+            return Box::pin(dispatch_inner(cli, Some(deadline))).await;
+        }
+        return deadline.run(Box::pin(dispatch_inner(cli, None))).await;
     }
-    dispatch_inner(cli).await
+    // Each branch otherwise embeds the entire command tree's future in this
+    // frame, overflowing the Windows main stack in optional-feature builds.
+    Box::pin(dispatch_inner(cli, None)).await
 }
 
-async fn dispatch_inner(cli: Cli) -> Result<(), CliError> {
+async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Result<(), CliError> {
     let output = cli.output;
     let config_path = cli.config.as_deref();
     let profile = cli.profile.as_deref().unwrap_or("default");
@@ -310,7 +325,7 @@ async fn dispatch_inner(cli: Cli) -> Result<(), CliError> {
     // Do not load implicit configuration here: commands that do not use it
     // remain independent of unrelated default configuration and credentials.
     if cli.config.is_some() || cli.profile.is_some() {
-        context::resolve_profile(config_path, profile).await?;
+        deadline::run_optional(deadline, context::resolve_profile(config_path, profile)).await?;
     }
     let quiet = cli.quiet;
     match cli.command {
@@ -351,7 +366,18 @@ async fn dispatch_inner(cli: Cli) -> Result<(), CliError> {
         Command::Forwarding(cmd) => {
             commands::forwarding::run(cmd, output, config_path, profile).await
         }
-        Command::Typegen(cmd) => commands::typegen::run(cmd, output, config_path, profile).await,
+        Command::Typegen(cmd) => {
+            // Keep acquisition's nested timeout futures off the dispatch stack,
+            // including for unrelated commands on Windows' smaller main stack.
+            Box::pin(commands::typegen::run(
+                cmd,
+                output,
+                config_path,
+                profile,
+                deadline,
+            ))
+            .await
+        }
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }

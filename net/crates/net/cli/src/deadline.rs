@@ -34,6 +34,17 @@ fn expired() -> CliError {
     CliError::new(ExitCodeKind::Timeout, "operation exceeded --timeout; a remote effect may have committed. Timeout does not prove cancellation; the CLI did not retry the operation")
 }
 
+/// Apply an existing budget without resetting it; omission preserves SDK limits.
+pub(crate) async fn run_optional<T>(
+    deadline: Option<Deadline>,
+    operation: impl Future<Output = Result<T, CliError>>,
+) -> Result<T, CliError> {
+    match deadline {
+        Some(deadline) => deadline.run(operation).await,
+        None => operation.await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

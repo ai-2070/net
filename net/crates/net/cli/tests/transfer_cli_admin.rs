@@ -110,7 +110,13 @@ async fn ls_status_cancel_round_trip_over_rpc() {
     let home = TempDir::new().expect("home");
 
     // ls → empty registry, but a real RPC round-trip (exit 0, valid JSON).
-    let mut args = vec!["ls".into(), "--output".into(), "json".into()];
+    let mut args = vec![
+        "ls".into(),
+        "--output".into(),
+        "json".into(),
+        "--timeout".into(),
+        "10s".into(),
+    ];
     args.extend(attach(&holder));
     let (code, stdout, stderr) = run_transfer(&home, args).await;
     assert_eq!(code, 0, "ls failed: stderr={stderr}\nstdout={stdout}");

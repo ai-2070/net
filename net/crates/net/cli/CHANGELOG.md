@@ -8,6 +8,15 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — transfer administration and live typegen budgets
+
+- Transfer `ls/status/cancel` and live typegen `generate/snapshot` now honor
+  explicit `--timeout` across configuration, attachment and RPC/discovery.
+  Typegen rendering and file publication happen outside cancellation after
+  acquisition succeeds; existing output is untouched on acquisition timeout.
+- Transfer receive/staging and offline typegen still reject explicit timeouts.
+  Live schema hydration and discovery semantics are unchanged by this slice.
+
 ## Unreleased — explicit aggregator deadline budgets
 
 - Remote aggregator ls/query/spawn/scale honor `--timeout` as one total budget,

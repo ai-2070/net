@@ -174,13 +174,14 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     match cmd {
         TypegenCommand::Generate(args) => {
-            run_generate(args, output, config_path, profile_name).await
+            run_generate(args, output, config_path, profile_name, deadline).await
         }
         TypegenCommand::Snapshot(args) => {
-            run_snapshot(args, output, config_path, profile_name).await
+            run_snapshot(args, output, config_path, profile_name, deadline).await
         }
         TypegenCommand::Diff(args) => run_diff(args, output).await,
     }
@@ -193,6 +194,7 @@ async fn run_generate(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     let (descriptors, meta) = match &args.from_snapshot {
         Some(path) => {
@@ -212,20 +214,24 @@ async fn run_generate(
             load_snapshot_source(path, &args.tags, &args.tools)?
         }
         None => {
-            let Some(ctx) = prepare_live_context(
-                &args.attach,
-                args.identity.as_deref(),
-                args.node,
-                config_path,
-                profile_name,
-                output,
-                &args.out,
+            let Some(ctx) = crate::deadline::run_optional(
+                deadline,
+                prepare_live_context(
+                    &args.attach,
+                    args.identity.as_deref(),
+                    args.node,
+                    config_path,
+                    profile_name,
+                    output,
+                    &args.out,
+                ),
             )
             .await?
             else {
                 return Ok(());
             };
-            fetch_live_source(&args.tags, &args.tools, ctx).await?
+            crate::deadline::run_optional(deadline, fetch_live_source(&args.tags, &args.tools, ctx))
+                .await?
         }
     };
 
@@ -309,21 +315,27 @@ async fn run_snapshot(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let Some(ctx) = prepare_live_context(
-        &args.attach,
-        args.identity.as_deref(),
-        args.node,
-        config_path,
-        profile_name,
-        output,
-        &args.out,
+    let Some(ctx) = crate::deadline::run_optional(
+        deadline,
+        prepare_live_context(
+            &args.attach,
+            args.identity.as_deref(),
+            args.node,
+            config_path,
+            profile_name,
+            output,
+            &args.out,
+        ),
     )
     .await?
     else {
         return Ok(());
     };
-    let (descriptors, _meta) = fetch_live_source(&args.tags, &args.tools, ctx).await?;
+    let (descriptors, _meta) =
+        crate::deadline::run_optional(deadline, fetch_live_source(&args.tags, &args.tools, ctx))
+            .await?;
 
     let schema_bytes: u64 = descriptors
         .iter()

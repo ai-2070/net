@@ -70,15 +70,180 @@ fn unsupported_timeouts_refuse_before_local_effects() {
         vec!["aggregator", "ls", "--local"],
         vec!["aggregator", "ls", "--inspect-target"],
         vec!["mcp", "serve"],
+        vec!["transfer", "ls", "--inspect-target"],
+        vec![
+            "transfer",
+            "recv-blob",
+            "--blob-ref",
+            "00",
+            "--out",
+            artifact.to_str().unwrap(),
+        ],
+        vec![
+            "transfer",
+            "recv-dir",
+            "--remote-ref",
+            "00",
+            "--out",
+            artifact.to_str().unwrap(),
+        ],
+        vec!["transfer", "send-blob", artifact.to_str().unwrap()],
+        vec![
+            "typegen",
+            "generate",
+            "--language",
+            "ts",
+            "--from-snapshot",
+            "missing.json",
+            "--out",
+            artifact.to_str().unwrap(),
+        ],
+        vec![
+            "typegen",
+            "snapshot",
+            "--inspect-target",
+            "--out",
+            artifact.to_str().unwrap(),
+        ],
     ];
     for mut args in commands {
         args.extend(["--timeout", "1s"]);
         let out = run(dir.path(), &args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(out.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("--timeout is not supported"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--timeout is not supported"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(!artifact.exists());
     }
+}
+
+#[test]
+fn transfer_and_live_typegen_share_timeout_contract_without_publication() {
+    let dir = fixture();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let key = "42".repeat(32);
+    let destination = dir.path().join("not-published");
+    for command in [
+        vec!["transfer", "ls"],
+        vec!["transfer", "status", "1"],
+        vec!["transfer", "cancel", "1"],
+        vec![
+            "typegen",
+            "generate",
+            "--language",
+            "ts",
+            "--out",
+            destination.to_str().unwrap(),
+        ],
+        vec![
+            "typegen",
+            "snapshot",
+            "--out",
+            destination.to_str().unwrap(),
+        ],
+    ] {
+        for budget in ["0s", "200ms"] {
+            let mut args = command.clone();
+            args.extend([
+                "--node-addr",
+                &addr,
+                "--node-id",
+                "9",
+                "--node-pubkey",
+                &key,
+                "--psk-hex",
+                &key,
+                "--timeout",
+                budget,
+            ]);
+            let out = run(dir.path(), &args);
+            assert_eq!(
+                out.status.code(),
+                Some(7),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stdout.is_empty());
+            assert!(!destination.exists());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("does not prove cancellation"));
+            assert!(!stderr.contains(&key));
+            let mut packet = [0; 2048];
+            if budget == "0s" {
+                assert_eq!(
+                    socket.recv_from(&mut packet).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            } else {
+                while socket.recv_from(&mut packet).is_ok() {}
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_typegen_discovery_budget_preserves_existing_output_on_expiry() {
+    let holder = net_sdk::MeshBuilder::new("127.0.0.1:0", &[0x42; 32])
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    holder.start();
+    let dir = fixture();
+    let destination = dir.path().join("snapshot.json");
+    std::fs::write(&destination, b"previous output").unwrap();
+    let addr = holder.local_addr().to_string();
+    let node = holder.node_id().to_string();
+    let public_key = hex::encode(holder.public_key());
+    let out_path = destination.to_str().unwrap().to_owned();
+    let root = dir.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let key = "42".repeat(32);
+        let mut args = vec![
+            "typegen",
+            "snapshot",
+            "--out",
+            &out_path,
+            "--node-addr",
+            &addr,
+            "--node-id",
+            &node,
+            "--node-pubkey",
+            &public_key,
+            "--psk-hex",
+            &key,
+            "--timeout",
+            "1s",
+        ];
+        let out = run(&root, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"previous output");
+        // Existing empty-discovery semantics are unchanged when the budget allows
+        // the five-second observation to finish; CLI-3 owns richer acquisition.
+        *args.last_mut().unwrap() = "9s";
+        let out = run(&root, &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let snapshot: Value = serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(snapshot["descriptors"], serde_json::json!([]));
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
