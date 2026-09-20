@@ -6,6 +6,136 @@ use std::time::Duration;
 const KEY: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 const PSK: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
+#[cfg(feature = "rtc-bootstrap")]
+#[test]
+fn standalone_anchor_inspects_before_secrets_sockets_or_acme() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(&dir, "192.0.2.7:7700", Some("invalid-unused-profile-bind"));
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = udp.local_addr().unwrap().to_string();
+    let listen = tcp.local_addr().unwrap().to_string();
+    let cache = dir.path().join("not-created");
+    let mut args = vec![
+        "anchor",
+        "serve",
+        "--psk-file",
+        "missing-psk",
+        "--url",
+        "https://anchor.example.com",
+        "--credential-issuer",
+        KEY,
+        "--allow-origin",
+        "https://app.example.com",
+        "--bind",
+        &bind,
+        "--listen",
+        &listen,
+        "--acme-directory",
+        "https://acme.example.com/directory",
+        "--acme-email",
+        "ops@example.com",
+        "--acme-cache",
+        cache.to_str().unwrap(),
+        "--inspect-target",
+    ];
+    let out = run(&path, &args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["mode"], "hosted_service");
+    assert_eq!(view["bind"], bind);
+    assert_eq!(view["listen"], listen);
+    assert_eq!(view["identity"]["state"], "unavailable");
+    assert_eq!(view["ignored_profile_remote_defaults"], true);
+    assert_eq!(view["authorization"], "not_checked");
+    assert_eq!(view["tls"], "acme");
+    assert_eq!(view["acme_cache"], cache.to_str().unwrap());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(KEY));
+    assert!(!cache.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    let bind_index = args.iter().position(|arg| *arg == "--bind").unwrap() + 1;
+    args[bind_index] = "invalid";
+    let out = run(&path, &args);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--bind"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("missing-psk"));
+    args.pop(); // Normal execution rejects the same bad bind before secret IO.
+    let out = run(&path, &args);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--bind"));
+}
+
+#[cfg(feature = "rtc-bootstrap")]
+#[test]
+fn standalone_anchor_defaults_and_dispatch_consume_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(&dir, "192.0.2.7:7700", Some("unused"));
+    let psk = dir.path().join("psk.hex");
+    let mut args = vec![
+        "anchor",
+        "serve",
+        "--psk-file",
+        psk.to_str().unwrap(),
+        "--url",
+        "https://anchor.example.com",
+        "--credential-issuer",
+        KEY,
+        "--allow-origin",
+        "https://app.example.com",
+        "--tls-cert",
+        "missing-cert",
+        "--tls-key",
+        "missing-key",
+    ];
+    let mut inspect = args.clone();
+    inspect.push("--inspect-target");
+    let out = run(&path, &inspect);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["bind"], "0.0.0.0:0");
+    assert_eq!(view["listen"], "0.0.0.0:8443");
+    assert_eq!(view["rtc_bind"], "0.0.0.0:0");
+    assert_eq!(view["provenance"]["bind"], "default");
+    assert_eq!(view["tls"], "operator");
+    assert!(view["rtc_stun_bind"].is_null());
+    assert!(view["acme_challenge_bind"].is_null());
+    assert!(!psk.exists());
+    // A real occupied UDP bind distinguishes consuming the inspected address
+    // from accidentally keeping a wildcard/ephemeral default in dispatch.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = socket.local_addr().unwrap().to_string();
+    args.extend(["--bind", &bind]);
+    let mut inspect = args.clone();
+    inspect.push("--inspect-target");
+    let out = run(&path, &inspect);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["bind"], bind);
+    assert_eq!(view["provenance"]["bind"], "flag");
+    std::fs::write(&psk, PSK).unwrap();
+    let out = run(&path, &args);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("starting the anchor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Missing STUN binding is a resolution error, not a promised endpoint.
+    inspect.extend(["--rtc-stun-public-addr", "192.0.2.1:3478"]);
+    let out = run(&path, &inspect);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires --rtc-stun-bind"));
+}
+
 fn config(dir: &tempfile::TempDir, addr: &str, bind: Option<&str>) -> std::path::PathBuf {
     let path = dir.path().join("config.toml");
     let mut body = format!("[default]\nnode_addr = '{addr}'\nnode_pubkey = '{KEY}'\nnode_id = '9'\npsk_hex = '{PSK}'\n");

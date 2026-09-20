@@ -147,7 +147,9 @@ NetDB reports `mode: persistent_store`, the store (`--store` > profile `netdb` >
 
 Forwarding policy (`enable/disable/allow/rm/audit`), MCP pins (`approve/reject/list`), and transfer `send-blob/send-dir` also support `--inspect-target`. Policy/pin inspection reports the existing per-user default or explicit `--store`/`--pin-store`; profile `netdb` does not select these stores. It does not load their contents, acquire mutation locks or change consent. Transfer inspection reports source and optional staging store: persistent-store mode with `--store`, offline mode without it. `send-blob -` reports stdin without reading it; directory inspection does not walk the source. Staging still does not host or publish bytes. Inspection is not argument/content/policy validation or authorization approval.
 
-Inspection is not yet CLI-wide: offline issuance, other temporary-supervisor commands, standalone `anchor serve`, and keychain-backed `forwarding set-value` remain outside this surface.
+Feature-enabled `anchor serve --inspect-target` resolves mesh/HTTPS/RTC/STUN binds, TLS file paths or ACME cache/challenge settings, and the public issuer fingerprint. It reads profile configuration but not PSK/TLS files; it does not start sockets, order certificates or generate an identity. Normal serving consumes the same resolved selections. The standalone anchor keeps its existing ephemeral identity and ignores profile identity/remote/bind defaults; inspection reports that identity as unavailable. Defaults remain mesh `0.0.0.0:0`, HTTPS `0.0.0.0:8443`, RTC on the mesh IP with an ephemeral port, and no second STUN socket. `:0` is a requested ephemeral port, not a bound address; runtime-announced endpoints, TLS validity, authority and reachability are not verified by inspection.
+
+Inspection is not yet CLI-wide: offline issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

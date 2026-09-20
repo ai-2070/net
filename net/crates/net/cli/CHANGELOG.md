@@ -8,6 +8,16 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — standalone anchor inspection
+
+- `anchor serve --inspect-target` (`rtc-bootstrap`) resolves listener/RTC/TLS
+  selections and issuer fingerprint without reading PSK/TLS files, opening
+  sockets, ordering certificates or minting an identity. Execution consumes
+  the same resolution; malformed addresses fail before mesh startup.
+- Existing binds and ephemeral identity behavior are unchanged. Profile
+  identity/remote/bind defaults remain unused; runtime-assigned endpoints,
+  TLS validity, authorization and reachability are not inspection claims.
+
 ## Unreleased — policy, pin and staging inspection
 
 - Forwarding policy and MCP pin commands accept `--inspect-target`, resolving

@@ -32,7 +32,7 @@ Flags override corresponding profile fields. A complete profile tuple selects re
 
 `--bind <IP:PORT>` overrides profile `bind` on these remote clients. Existing defaults are unchanged: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. Loopback-to-non-loopback attachment is rejected early; explicitly select a reachable local interface or wildcard (`0.0.0.0:0` for IPv4, `[::]:0` for IPv6). Bind and peer address families must agree. This does not alter admission policy or guarantee firewall/NAT reachability. The automated non-loopback witness uses two participants on one runner, not two computers.
 
-Other inspection support is described below. Standalone `anchor serve` and local commands not listed here do not yet support this surface.
+Other inspection support is described below. Commands not listed here do not yet support this surface.
 
 Every dispatched command now validates explicit `--config` / `--profile` selections before work, including offline admin previews and selections from `NET_MESH_CONFIG` / `NET_MESH_PROFILE`. Missing files, unknown profiles, parse failures and permission failures are errors; flags override environment selections. Remove obsolete selectors rather than relying on them being ignored. Commands that do not use configuration still do not load an implicit default just to execute; profile-backed commands allow its absence. Parser-only help/version flags bypass dispatch.
 
@@ -50,7 +50,13 @@ These local operations report unused remote defaults, `identity.state: unused`, 
 
 Forwarding policy (`enable/disable/allow/rm/audit`) and MCP pins (`approve/reject/list`) also support inspection. Store selection remains their own per-user default or explicit `--store`/`--pin-store`, not profile `netdb`. Inspection does not load store contents, create locks or modify policy/consent. Keychain-backed `forwarding set-value` does not support it.
 
-Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Offline issuance, other temporary-supervisor commands and standalone anchor serving remain follow-up work.
+Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Offline issuance and other temporary-supervisor commands remain follow-up work.
+
+## Inspect standalone anchor serving
+
+With `rtc-bootstrap`, add `--inspect-target` to an otherwise configured `anchor serve` invocation. It reports mesh/HTTPS/RTC/STUN bind selections, TLS certificate/key paths or ACME cache/challenge settings, and a public credential-issuer fingerprint. No PSK/TLS file is read, socket opened, certificate ordered or identity generated. Profile configuration is read for selection validation/disclosure; profile identity, remote target and bind defaults remain unused by standalone serving.
+
+The same resolved values drive execution. Existing defaults remain mesh `0.0.0.0:0`, HTTPS `0.0.0.0:8443`, RTC on the mesh IP with an ephemeral port, and no second STUN socket. The identity remains ephemeral and is reported unavailable during inspection. Port `0` means runtime allocation, not an observed bound endpoint; null advertised addresses with runtime provenance are unresolved until startup. Inspection is not TLS/content validation, authorization approval or proof of reachability. Malformed listener addresses and a STUN public override without its bind fail before mesh startup.
 
 ## `net-mesh transfer`
 

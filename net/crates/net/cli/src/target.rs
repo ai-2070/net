@@ -153,7 +153,7 @@ pub(crate) async fn inspect(
     })
 }
 
-fn public_fingerprint(key: &[u8]) -> String {
+pub(crate) fn public_fingerprint(key: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(key)
         .iter()
@@ -164,6 +164,19 @@ fn public_fingerprint(key: &[u8]) -> String {
 }
 
 impl TargetInspection {
+    #[cfg(feature = "rtc-bootstrap")]
+    pub(crate) fn standalone_service(profile: &crate::config::Profile, bind: String) -> Self {
+        let mut view = Self::local(profile, "hosted_service");
+        view.bind = Some(bind);
+        view.identity = InspectionIdentity {
+            state: "unavailable",
+            fingerprint: None,
+            reason: Some("execution generates an ephemeral identity; profile identity is unused"),
+        };
+        view.provenance("identity", "default");
+        view
+    }
+
     /// Local operations here do not consume a signing identity. In particular,
     /// an unrelated profile identity must not be read or generated to inspect.
     pub(crate) fn local(profile: &crate::config::Profile, mode: &'static str) -> Self {
