@@ -8,6 +8,16 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — selection-aware live typegen discovery
+
+- Live `typegen generate/snapshot --tool` waits for every requested ID after
+  tag filtering, rather than stopping on unrelated tools. Missing IDs exit 7
+  before writing output. An explicit global timeout can end the wait sooner.
+- Tag-only/unfiltered discovery observes the full five-second window; this
+  is not a complete inventory. Offline snapshot filtering is unchanged.
+- Provider-bound schema hydration remains follow-up work; missing inline or
+  unsupported schemas can still be skipped during generation.
+
 ## Unreleased — wrapped-provider startup budget
 
 - `wrap --timeout` shares one budget across configuration, identity loading,

@@ -406,13 +406,17 @@ async fn live_typegen_consumes_the_inspected_non_loopback_bind() {
     let ip = route.local_addr().unwrap().ip();
     assert!(!ip.is_loopback() && !ip.is_unspecified());
     let bind = format!("{ip}:0");
-    let host = Arc::new(
-        net_sdk::MeshBuilder::new(&bind, &[0x42; 32])
-            .unwrap()
-            .build()
-            .await
-            .unwrap(),
-    );
+    use net::adapter::net::{ChannelConfigRegistry, EntityKeypair, MeshNode, MeshNodeConfig};
+    // Avoid an automatic handshake announcement consuming the default 10s
+    // coalescing window before this fixture publishes its five-second probe.
+    let node_config = MeshNodeConfig::new(bind.parse().unwrap(), [0x42; 32])
+        .with_min_announce_interval(Duration::from_millis(50));
+    let mut node = MeshNode::new(EntityKeypair::generate(), node_config)
+        .await
+        .unwrap();
+    let channels = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channels.clone());
+    let host = Arc::new(net_sdk::Mesh::from_node_arc(Arc::new(node), channels, None));
     host.start();
     let descriptor: net_sdk::tool::ToolDescriptor = serde_json::from_value(serde_json::json!({
         "tool_id": "bind_probe", "name": "Bind Probe", "version": "1.0.0",
@@ -469,8 +473,7 @@ async fn live_typegen_consumes_the_inspected_non_loopback_bind() {
 
     let announcer_host = Arc::clone(&host);
     let announcer = tokio::spawn(async move {
-        // Publish only after attach: an earlier announcement would consume
-        // the provider's 10s rate-limit window before the CLI's 5s discovery.
+        // Publish only after attach, using the fixture's short announce cadence.
         while announcer_host.inner().peer_addr(client_id).is_none() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

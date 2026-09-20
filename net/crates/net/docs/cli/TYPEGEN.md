@@ -55,15 +55,22 @@ res = await call_acme_web_search(mesh, AcmeWebSearchRequest(query="net mesh", ma
 - **Live discovery** — pass the remote-attach flags (`--node-addr`,
   `--node-pubkey`, `--node-id`, `--psk-hex`, each defaultable in the
   profile). The CLI joins the mesh, lets the capability fold populate, then
-  reads `list_tools`. A short discovery poll (≤ 5 s) avoids racing an empty
-  result.
+  reads `list_tools`. Explicit `--tool` IDs must all be observed after
+  filtering within five seconds; unrelated tools cannot end the wait.
+  Missing IDs fail with exit 7 before snapshot/generated output is written.
+  Without IDs, discovery observes the full five-second window. This is a
+  bounded observation, not a complete mesh inventory or proof of absence.
+  An explicit global `--timeout` can shorten the wait using the remaining
+  budget after attachment; it does not extend the discovery window.
 - **Snapshot** — `generate --from-snapshot <file>` regenerates from a pinned
   capture. Offline and deterministic; this is the path CI and tests use.
 
 ### Filtering
 
 `--tag <T>...` keeps a tool if ANY of its tags match; `--tool <ID>...` keeps
-exact tool ids. Both apply to live and snapshot sources.
+exact tool ids. Both apply to live and snapshot sources. When both groups
+are supplied, a tool must match both. Live discovery requires every requested
+ID to pass that intersection; offline filtering remains a subset operation.
 
 ---
 

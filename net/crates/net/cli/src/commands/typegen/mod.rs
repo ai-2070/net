@@ -486,20 +486,21 @@ async fn fetch_live_source(
 ) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
     let mesh = ctx.require_mesh()?;
 
-    // The fold populates asynchronously after attach. Poll until it
-    // reports tools or the budget elapses, so a single-shot CLI doesn't
-    // race discovery and emit an empty result.
-    let raw = discover_with_timeout(mesh, Duration::from_secs(5)).await;
-    // An empty result here means the poll budget elapsed before any tool
-    // appeared (the only way the loop returns empty). Treating that as a clean
-    // empty set would silently emit nothing, so flag it.
-    if raw.is_empty() {
+    let descriptors = discover_with_timeout(
+        || mesh.list_tools(None),
+        tags,
+        tools,
+        Duration::from_secs(5),
+    )
+    .await?;
+    // Broad observation may legitimately end empty, but must not imply that
+    // the entire mesh has no tools (or that a requested ID was satisfied).
+    if descriptors.is_empty() {
         eprintln!(
             "warning: live discovery found no tools within 5s — the capability fold may still \
              be populating, or this node advertises none; proceeding with an empty set."
         );
     }
-    let descriptors = filter_descriptors(raw, tags, tools);
 
     let meta = GenMeta {
         source_label: "live discovery".to_string(),
@@ -509,16 +510,42 @@ async fn fetch_live_source(
     Ok((descriptors, meta))
 }
 
-/// Poll `list_tools` until it returns at least one descriptor or `budget`
-/// elapses (the fold populates asynchronously after attach).
-async fn discover_with_timeout(mesh: &net_sdk::Mesh, budget: Duration) -> Vec<ToolDescriptor> {
-    let started = std::time::Instant::now();
+/// Await every explicitly requested ID after both filters. Without IDs,
+/// observe the whole bounded window; this is not a complete mesh inventory.
+/// The caller's absolute CLI deadline can interrupt this observation.
+async fn discover_with_timeout(
+    mut observe: impl FnMut() -> Vec<ToolDescriptor>,
+    tags: &[String],
+    requested: &[String],
+    budget: Duration,
+) -> Result<Vec<ToolDescriptor>, CliError> {
+    let end = tokio::time::Instant::now() + budget;
     loop {
-        let tools = mesh.list_tools(None);
-        if !tools.is_empty() || started.elapsed() >= budget {
-            return tools;
+        let selected = filter_descriptors(observe(), tags, requested);
+        let missing: std::collections::BTreeSet<&str> = requested
+            .iter()
+            .filter(|id| !selected.iter().any(|d| d.tool_id == **id))
+            .map(String::as_str)
+            .collect();
+        if !requested.is_empty() && missing.is_empty() {
+            return Ok(selected);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if tokio::time::Instant::now() >= end {
+            if !missing.is_empty() {
+                return Err(CliError::new(
+                    crate::error::ExitCodeKind::Timeout,
+                    format!(
+                        "live discovery budget elapsed; requested tools not observed after filters: {}. This does not prove mesh-wide absence; no output was written.",
+                        missing.into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+            return Ok(selected);
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(200)).min(end),
+        )
+        .await;
     }
 }
 
@@ -733,6 +760,62 @@ mod tests {
             pricing_terms: None,
             node_count: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_waits_for_all_requested_ids_after_tag_filtering() {
+        let mut observations = 0;
+        let result = discover_with_timeout(
+            || {
+                observations += 1;
+                let mut wanted = desc("wanted");
+                if observations > 1 {
+                    wanted.tags.push("selected".into());
+                }
+                vec![desc("unrelated"), wanted, desc("second")]
+            },
+            &["selected".into()],
+            &["wanted".into()],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_id, "wanted");
+    }
+
+    #[tokio::test]
+    async fn discovery_missing_ids_fail_and_broad_selection_observes_full_window() {
+        let error = discover_with_timeout(
+            || vec![desc("present")],
+            &[],
+            &["present".into(), "missing".into(), "missing".into()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requested tools not observed after filters: missing."));
+        let mut observations = 0;
+        let result = discover_with_timeout(
+            || {
+                observations += 1;
+                if observations == 1 {
+                    vec![desc("early")]
+                } else {
+                    vec![desc("early"), desc("late")]
+                }
+            },
+            &[],
+            &[],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

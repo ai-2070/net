@@ -185,7 +185,7 @@ net-mesh typegen generate --language <LANG> [--out <PATH>] [SELECTOR]
 | `--from-snapshot <PATH>` | Regenerate from a saved snapshot instead of querying the mesh |
 | `--node <ID>` | Local supervisor node label, not remote provider selection |
 
-Selectors match ANY within tags and ANY within tool IDs, but both groups must match when both are supplied. With neither, all observed descriptors are selected, subject to supported schemas. Live discovery takes remote-attach flags (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`), each defaultable in the profile; `--from-snapshot` needs none. Live observation currently stops at the first nonempty unfiltered tool list or five seconds, then filters: it is not a complete inventory or a wait for all requested IDs.
+Selectors match ANY within tags and ANY within tool IDs, but both groups must match when both are supplied. With neither, all observed descriptors are selected, subject to supported schemas. Live discovery takes remote-attach flags (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`), each defaultable in the profile; `--from-snapshot` needs none. Live discovery waits up to five seconds for every explicit tool ID to pass both filters; missing IDs exit 7 before writing snapshot/generated output. Without explicit IDs it observes the full five-second window, not a complete mesh inventory. The remaining global `--timeout` budget can shorten, but not extend, that observation. Offline snapshot filtering remains a subset operation.
 
 Output is one module per tool. The tool's JSON Schema lowers to TypeScript interfaces (for `ts`) or Pydantic v2 models (for `python`); each module also exports:
 
