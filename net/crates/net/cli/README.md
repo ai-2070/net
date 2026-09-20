@@ -96,7 +96,9 @@ Applied to every subcommand; environment-variable fallbacks in brackets:
 - `--no-color` `[NO_COLOR]` — disable ANSI in table / text output.
 - `--timeout <dur>` — parsed duration (e.g. `500ms`, `1h30m`; default `30s`), currently not forwarded by dispatch. It is not an enforced universal deadline.
 
-Errors are plain `net-mesh: ...` messages on stderr. ICE may emit separate preview and commit JSON values; do not assume all commands have single-value framing. ICE still requires typed `YES` on interactive stdin even with `--yes`; dry-run needs no confirmation. `mcp serve` stdout is protocol traffic.
+Errors are plain `net-mesh: ...` messages on stderr. ICE commits emit one result containing `preview` and `commit`; the pre-confirmation preview is diagnostic output on stderr. Refusal or failure emits no success payload on stdout. ICE `--yes` skips prompting on both interactive and noninteractive stdin, but does not bypass signature or policy checks. Without it, interactive stdin requires typed `YES`; unattended commits refuse with exit 8. Dry-run needs no confirmation and retains its preview-only shape. `mcp serve` stdout is protocol traffic.
+
+ICE scripting migration: replace parsing two successive JSON values (for example `jq -s '.[1].commit_id'`) with `jq '.commit.commit_id'`. Read the successful simulation from `.preview`; for a dry-run, `jq '.blast_hash'` is unchanged. Do not parse the diagnostic preview on stderr as a committed result.
 
 ## Config + identity
 

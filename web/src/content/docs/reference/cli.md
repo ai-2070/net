@@ -14,7 +14,9 @@ For admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability re
 
 Migration: a script that previously ran `net-mesh peer ls` must use `net-mesh peer ls --local` only if it intentionally wants a fresh development snapshot. The old invocation now fails with exit 2 and no result payload. No remote Deck alternative is implied. Offline issuance, persistent stores, and real remote clients keep their existing syntax and scope.
 
-Global `--timeout` is currently parsed but not forwarded by dispatch: it does not enforce a universal deadline. One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE can emit separate preview and commit JSON values and still prompts for typed `YES` on interactive stdin even with `--yes`. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
+Global `--timeout` is currently parsed but not forwarded by dispatch: it does not enforce a universal deadline. One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE commits emit one `{preview, commit}` result; the pre-confirmation preview goes to stderr, and failure/refusal emits no success payload on stdout. `--yes` skips the ICE prompt in TTY and non-TTY use without bypassing signature or policy checks. Without it, TTY use requires typed `YES` and unattended commits exit 8. Dry-run retains its preview-only shape without confirmation. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
+
+ICE script migration: replace `jq -s '.[1].commit_id'` with `jq '.commit.commit_id'`. Successful simulation data is under `.preview`; dry-run still exposes `.blast_hash` at the top level. Stderr previews are not commit receipts.
 
 `--no-color` is global. `$NO_COLOR` is honored per [the convention](https://no-color.org): color is disabled when the variable is **present and non-empty**, whatever its value — `NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it, and only absent or empty leaves it on.
 

@@ -5,13 +5,12 @@
 //!
 //! 1. Construct an `IceProposal` via the SDK factory.
 //! 2. Call `simulate()` → get a `BlastRadius`.
-//! 3. Render the blast radius as a preview (table on TTY, JSON
-//!    elsewhere).
-//! 4. TTY: prompt for literal `YES` confirmation; non-TTY:
-//!    require `--yes`.
+//! 3. Render the blast radius as a preview on stderr for commits.
+//! 4. `--yes` acknowledges confirmation; otherwise prompt on TTY
+//!    or refuse unattended execution.
 //! 5. `--dry-run` short-circuits before the prompt and exits 0
 //!    with the envelope on stdout.
-//! 6. Commit; emit the resulting `ChainCommit` on stdout.
+//! 6. Commit; emit one result with preview and commit on stdout.
 //!
 //! Operator signatures: with the in-process supervisor's
 //! default `ice_signature_threshold = 1`, the local operator
@@ -137,10 +136,8 @@ pub struct CommonIceArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Skip the interactive `YES` prompt. Required when **stdin**
-    /// is not a TTY (scripts / CI); on an interactive terminal
-    /// the prompt always runs regardless of `--yes` (a stray
-    /// shell-history recall can't ram an ICE commit through).
+    /// Acknowledge confirmation without prompting, on TTY or in scripts.
+    /// Required for non-TTY commits; does not bypass signature or policy checks.
     #[arg(long)]
     pub yes: bool,
 
@@ -298,13 +295,9 @@ where
         blast,
     };
 
-    // Render the preview before the confirm gate. JSON for
-    // non-TTY (script-friendly); table for TTY would ship in a
-    // follow-up — JSON works for both today.
-    emit_value(OutputFormat::resolve_oneshot(output), &preview)
-        .map_err(|e| generic(format!("write ICE preview: {e}")))?;
-
     if common.dry_run {
+        emit_value(OutputFormat::resolve_oneshot(output), &preview)
+            .map_err(|e| generic(format!("write ICE preview: {e}")))?;
         return Ok(());
     }
 
@@ -320,11 +313,16 @@ where
         signatures.push(parse_supplied_sig(raw)?);
     }
 
-    // Confirmation gate. The break-glass surface keeps a dual-key
-    // feel: `--yes` only short-circuits the prompt when stdin is
-    // not a TTY (scripts / CI). On an interactive terminal we
-    // always demand the typed `YES` even with `--yes` so a stray
-    // shell-history recall can't ram an ICE commit through.
+    // The preview is diagnostic until a commit succeeds. Keep stdout empty
+    // on refusal or policy/signature errors, and preserve the preview for an
+    // interactive operator before asking for confirmation.
+    let preview_json = serde_json::to_string_pretty(&preview)
+        .map_err(|e| generic(format!("serialize ICE preview: {e}")))?;
+    writeln!(io::stderr(), "ICE preview: {preview_json}")
+        .map_err(|e| generic(format!("write ICE preview: {e}")))?;
+
+    // --yes acknowledges confirmation in TTY and unattended use. It does
+    // not bypass signature verification, quorum or admission policy.
     //
     // Run the gate on a blocking-pool task so the operator's wait
     // at the prompt doesn't park a tokio worker. Pre-fix
@@ -360,8 +358,14 @@ where
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
-    emit_value(OutputFormat::resolve_oneshot(output), &payload)
-        .map_err(|e| generic(format!("write commit: {e}")))?;
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &IceCommitOutput {
+            preview,
+            commit: payload,
+        },
+    )
+    .map_err(|e| generic(format!("write commit: {e}")))?;
     Ok(())
 }
 
@@ -373,13 +377,16 @@ fn check_confirm_gate<P>(stdin_is_tty: bool, yes_flag: bool, prompt: P) -> Resul
 where
     P: FnOnce() -> Result<bool, CliError>,
 {
-    if !stdin_is_tty && !yes_flag {
+    if yes_flag {
+        return Ok(());
+    }
+    if !stdin_is_tty {
         return Err(CliError::new(
             ExitCodeKind::ConfirmationRefused,
             "stdin is not a TTY; pass --yes to skip the interactive confirm prompt",
         ));
     }
-    if stdin_is_tty && !prompt()? {
+    if !prompt()? {
         return Err(crate::error::confirmation_refused());
     }
     Ok(())
@@ -406,7 +413,7 @@ fn map_ice_error(msg: &str, kind: &'static str) -> CliError {
 }
 
 fn prompt_for_yes() -> Result<bool, CliError> {
-    // Write the prompt to stderr so the preview JSON on stdout
+    // Write the prompt to stderr so the result JSON on stdout
     // stays uncontaminated when an operator pipes the command
     // (`net-mesh ice ... | jq`). The typed response still reads from
     // stdin.
@@ -468,6 +475,12 @@ struct ChainCommitMirror {
     committed_at_ms: u64,
 }
 
+#[derive(Serialize)]
+struct IceCommitOutput {
+    preview: SimulationPreview,
+    commit: ChainCommitMirror,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,14 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn tty_always_prompts_even_with_yes_flag() {
-        // Dual-key behaviour: `--yes` does not short-circuit the
-        // typed prompt on an interactive terminal.
-        let prompted = std::cell::Cell::new(false);
-        let _ = check_confirm_gate(true, true, || {
-            prompted.set(true);
-            Ok(true)
-        });
-        assert!(prompted.get(), "TTY path must always prompt");
+    fn tty_with_yes_never_prompts() {
+        check_confirm_gate(true, true, || panic!("--yes must bypass prompting")).unwrap();
     }
 }

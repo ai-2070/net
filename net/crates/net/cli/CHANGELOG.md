@@ -8,6 +8,15 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — ICE automation framing and confirmation
+
+- ICE commits emit one result with `preview` and `commit`, not two consecutive
+  JSON values. Move scripts from `jq -s '.[1].commit_id'` to
+  `jq '.commit.commit_id'`. Dry-run remains preview-only.
+- Commit previews go to stderr; refusal and failure leave no success payload
+  on stdout. `--yes` now skips the prompt on TTY as well as non-TTY input;
+  identity, signature and policy gates remain in effect.
+
 ## Unreleased — remaining temporary and keychain inspection
 
 - Remaining temporary-supervisor commands accept `--local --inspect-target`,
