@@ -589,6 +589,8 @@ async fn run_restore(
     }
     let snap = net_sdk::cortex::NetDbSnapshot::decode(&bytes)
         .map_err(|e| sdk(format!("netdb snapshot decode: {e}")))?;
+    snap.validate()
+        .map_err(|e| sdk(format!("netdb snapshot validation: {e}")))?;
     if snap.tasks.is_none() && snap.memories.is_none() {
         return Err(crate::error::invalid_args(
             "snapshot file carries neither tasks nor memories; nothing to restore",
@@ -699,12 +701,15 @@ async fn run_restore(
         // "what landed" is tracked separately via the substrate.
         bytes_read: bytes.len() as u64,
     };
-    let r = emit_value(OutputFormat::resolve_oneshot(output), &info)
-        .map_err(|e| generic(format!("write restore result: {e}")));
-    if let Err(e) = netdb.close() {
-        tracing::warn!(error = %e, "netdb close failed at end of restore");
+    netdb
+        .close()
+        .map_err(|e| sdk(format!("netdb restore close: {e}")))?;
+    for file in netdb.redex().open_files() {
+        file.close()
+            .map_err(|e| sdk(format!("netdb restore flush: {e}")))?;
     }
-    r?;
+    emit_value(OutputFormat::resolve_oneshot(output), &info)
+        .map_err(|e| generic(format!("write restore result: {e}")))?;
     Ok(())
 }
 

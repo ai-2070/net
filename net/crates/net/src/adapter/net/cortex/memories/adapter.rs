@@ -72,6 +72,30 @@ pub struct MemoriesAdapter {
 }
 
 impl MemoriesAdapter {
+    #[cfg(feature = "netdb")]
+    pub(crate) fn validate_snapshot(
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<(), CortexAdapterError> {
+        Self::decode_snapshot(state_bytes, last_seq).map(|_| ())
+    }
+
+    fn decode_snapshot(
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<MemoriesSnapshotPayload, CortexAdapterError> {
+        if last_seq == Some(u64::MAX) {
+            return Err(
+                RedexError::Decode("snapshot last_seq at u64::MAX; cannot resume".into()).into(),
+            );
+        }
+        let payload: MemoriesSnapshotPayload = postcard::from_bytes(state_bytes)
+            .map_err(|e| RedexError::Decode(format!("memories snapshot unwrap: {e}")))?;
+        let _: MemoriesState = postcard::from_bytes(&payload.inner)
+            .map_err(|e| RedexError::Decode(format!("memories snapshot state: {e}")))?;
+        Ok(payload)
+    }
+
     /// Open the memories adapter against a `Redex` manager.
     ///
     /// Uses [`MEMORIES_CHANNEL`] (`"cortex/memories"`). Replays the
@@ -112,6 +136,8 @@ impl MemoriesAdapter {
     }
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`.
+    /// Persistent opens first recover any local restore checkpoint. Such
+    /// checkpoints require the same origin used when they were restored.
     pub async fn open_with_config(
         redex: &Redex,
         origin_hash: u64,
@@ -122,6 +148,19 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
+        if let Some(checkpoint) =
+            super::super::checkpoint::load(redex, &name, &redex_config, origin_hash)?
+        {
+            return Self::open_snapshot(
+                redex,
+                origin_hash,
+                redex_config,
+                &checkpoint.state,
+                checkpoint.last_seq,
+                false,
+            )
+            .await;
+        }
         let app_seq = Arc::new(AtomicU64::new(0));
         let fold = WatermarkingFold::new(MemoriesFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open(
@@ -380,6 +419,8 @@ impl MemoriesAdapter {
 
     /// Like [`Self::open_from_snapshot`] but with a caller-supplied
     /// `RedexFileConfig`.
+    /// Persistent restoration publishes a local checkpoint for ordinary
+    /// future opens. Restore offline; concurrent writers are unsupported.
     pub async fn open_from_snapshot_with_config(
         redex: &Redex,
         origin_hash: u64,
@@ -387,14 +428,41 @@ impl MemoriesAdapter {
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
-        let payload: MemoriesSnapshotPayload = postcard::from_bytes(state_bytes).map_err(|e| {
-            CortexAdapterError::Redex(RedexError::Encode(format!(
-                "memories snapshot unwrap: {}",
-                e
-            )))
-        })?;
+        Self::open_snapshot(
+            redex,
+            origin_hash,
+            redex_config,
+            state_bytes,
+            last_seq,
+            true,
+        )
+        .await
+    }
+
+    async fn open_snapshot(
+        redex: &Redex,
+        origin_hash: u64,
+        redex_config: RedexFileConfig,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        persist: bool,
+    ) -> Result<Self, CortexAdapterError> {
+        let payload = Self::decode_snapshot(state_bytes, last_seq)?;
         let name = ChannelName::new(MEMORIES_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
+
+        let last_seq = if persist {
+            super::super::checkpoint::store(
+                redex,
+                &name,
+                &redex_config,
+                origin_hash,
+                state_bytes,
+                last_seq,
+            )?
+        } else {
+            last_seq
+        };
 
         // Pre-load the snapshot's persisted counter into the
         // shared atomic. The wrapper fold then advances it via

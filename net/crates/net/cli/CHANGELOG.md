@@ -10,6 +10,22 @@ and output shape.
 
 ## Unreleased — NetDB restore preflight
 
+- Successful `netdb restore` now persists the restored adapter state for
+  subsequent CLI/SDK opens. Previously it existed only in the restore
+  process, so a later read returned an empty store after replacement.
+  Local `cortex.snapshot` checkpoints live alongside the adapter logs;
+  retain them when copying a restored store. The portable snapshot format
+  is unchanged. Older binaries do not understand these checkpoints and
+  must not be used to open restored stores.
+- Continue using the origin supplied at restore time: reopening a restored
+  adapter under another origin now refuses instead of reusing its counter.
+  Post-restore writes replay from the destination log's position, including
+  when that log is shorter than the snapshot's original source log.
+- Embedded task/memory snapshot payloads are validated before `--clear`.
+  Checkpoint publication or restore flush failures return nonzero without a
+  restore-success payload. This does not make replacement crash-atomic or
+  permit concurrent writers.
+
 - NetDB commands now propagate configuration read, permission, and parse
   errors instead of silently falling back to another store. Optional absent
   configuration still uses the existing defaults; valid store precedence is

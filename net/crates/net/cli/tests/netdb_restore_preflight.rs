@@ -586,14 +586,168 @@ fn single_adapter_and_origin_zero_control(tasks: bool) {
             .output()
             .unwrap(),
     );
-    // The restore should create exactly the same adapter files, without
-    // opening the absent adapter just to inspect it (which creates it).
-    assert_eq!(
-        inventory(&dest).keys().collect::<Vec<_>>(),
-        inventory(&store).keys().collect::<Vec<_>>()
-    );
+    // Inspect paths without opening the absent adapter (which creates it).
+    assert!(dest
+        .join(if tasks {
+            "cortex/tasks"
+        } else {
+            "cortex/memories"
+        })
+        .is_dir());
+    assert!(!dest
+        .join(if tasks {
+            "cortex/memories"
+        } else {
+            "cortex/tasks"
+        })
+        .exists());
     assert_eq!(
         f.ids(&dest, if tasks { "tasks" } else { "memories" }, "0"),
         [1]
     );
+}
+
+#[test]
+fn invalid_embedded_snapshot_does_not_clear_existing_store() {
+    for tasks in [true, false] {
+        rejects_source(
+            |path| {
+                let mut snapshot = NetDbSnapshot {
+                    tasks: None,
+                    memories: None,
+                };
+                let adapter = if tasks {
+                    &mut snapshot.tasks
+                } else {
+                    &mut snapshot.memories
+                };
+                *adapter = Some((vec![255], Some(0)));
+                fs::write(path, snapshot.encode().unwrap()).unwrap();
+            },
+            "snapshot validation",
+        );
+    }
+}
+
+#[test]
+fn restored_records_and_subsequent_writes_survive_repeated_processes() {
+    let f = Fixture::new();
+    let source = f.source();
+    let dest = f.path("destination");
+    success(
+        f.restore(&dest, &source)
+            .args(["--origin", "17"])
+            .output()
+            .unwrap(),
+    );
+    fs::remove_file(source).unwrap();
+    f.task(&dest, "3", "17");
+    assert_eq!(f.ids(&dest, "tasks", "17"), [2, 3]);
+    success(
+        f.command()
+            .args([
+                "tasks", "rename", "2", "--title", "changed", "--origin", "17", "--store",
+            ])
+            .arg(&dest)
+            .output()
+            .unwrap(),
+    );
+    success(
+        f.command()
+            .args(["tasks", "delete", "3", "--origin", "17", "--store"])
+            .arg(&dest)
+            .output()
+            .unwrap(),
+    );
+    let records = success(
+        f.command()
+            .args(["tasks", "ls", "--origin", "17", "--store"])
+            .arg(&dest)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(records.as_array().unwrap().len(), 1);
+    assert_eq!(records[0]["title"], "changed");
+    failure(
+        f.command()
+            .args(["tasks", "ls", "--origin", "18", "--store"])
+            .arg(&dest)
+            .output()
+            .unwrap(),
+        "origin mismatch",
+    );
+    assert_eq!(f.ids(&dest, "tasks", "17"), [2]);
+}
+
+#[test]
+fn checkpoint_input_failure_has_no_restore_success() {
+    let f = Fixture::new();
+    let source = f.source();
+    let dest = f.path("destination");
+    f.task(&dest, "1", "17");
+    // A directory cannot be decoded or replaced as a checkpoint file.
+    fs::create_dir(dest.join("cortex/tasks/cortex.snapshot")).unwrap();
+    let before = inventory(&dest);
+    failure(
+        f.restore(&dest, &source)
+            .args(["--origin", "17", "--force"])
+            .output()
+            .unwrap(),
+        "netdb restore",
+    );
+    assert_eq!(inventory(&dest), before);
+}
+
+#[test]
+fn corrupt_checkpoint_is_not_silently_ignored() {
+    let f = Fixture::new();
+    let source = f.source();
+    let dest = f.path("destination");
+    success(
+        f.restore(&dest, &source)
+            .args(["--origin", "17"])
+            .output()
+            .unwrap(),
+    );
+    fs::write(dest.join("cortex/tasks/cortex.snapshot"), [255]).unwrap();
+    failure(
+        f.command()
+            .args(["tasks", "ls", "--origin", "17", "--store"])
+            .arg(&dest)
+            .output()
+            .unwrap(),
+        "checkpoint",
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn checkpoint_replacement_failure_has_no_success_and_keeps_previous_checkpoint() {
+    let f = Fixture::new();
+    let source = f.source();
+    let dest = f.path("destination");
+    success(
+        f.restore(&dest, &source)
+            .args(["--origin", "17"])
+            .output()
+            .unwrap(),
+    );
+    let checkpoint = dest.join("cortex/tasks/cortex.snapshot");
+    let before = fs::read(&checkpoint).unwrap();
+    let original_permissions = fs::metadata(&checkpoint).unwrap().permissions();
+    let mut readonly = original_permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&checkpoint, readonly).unwrap();
+    let out = f
+        .restore(&dest, &source)
+        .args(["--origin", "17", "--force"])
+        .output()
+        .unwrap();
+    // Restore the attribute even if the assertion below fails, so TempDir
+    // can remove this disposable store. Windows rejects replacing readonly
+    // files; unlike denying reads, this reaches the publication operation.
+    fs::set_permissions(&checkpoint, original_permissions).unwrap();
+    failure(out, "netdb restore");
+    assert_eq!(fs::read(checkpoint).unwrap(), before);
+    assert_eq!(f.ids(&dest, "tasks", "17"), [2]);
 }

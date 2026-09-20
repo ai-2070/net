@@ -209,6 +209,21 @@ impl Redex {
         self
     }
 
+    /// Locate a typed adapter checkpoint only after the normal channel
+    /// authorization and persistent-file configuration checks have passed.
+    #[cfg(all(feature = "cortex", feature = "redex-disk"))]
+    pub(crate) fn cortex_checkpoint_path(
+        &self,
+        name: &ChannelName,
+        config: RedexFileConfig,
+    ) -> Result<PathBuf, RedexError> {
+        self.open_file(name, config)?;
+        let base = self.persistent_dir.as_ref().ok_or_else(|| {
+            RedexError::Channel("persistent checkpoint requires a persistent directory".into())
+        })?;
+        Ok(super::disk::channel_dir(base, name).join("cortex.snapshot"))
+    }
+
     /// Install replication wiring rooted at `mesh`. Constructs a
     /// fresh [`RedexReplicationRouter`] + [`ReplicationMetricsRegistry`]
     /// and registers the router on the mesh for `SUBPROTOCOL_REDEX`

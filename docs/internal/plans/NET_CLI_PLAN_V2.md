@@ -1,6 +1,6 @@
 # Net CLI — current implementation and next bounded work
 
-**Status:** Implementation authorized in the working session. CLI-1 preflight is committed; durable restoration is the next authorized correction, followed by the remaining slices below.
+**Status:** Implementation authorized in the working session. CLI-1 preflight and durable restoration are implemented and locally verified; DOC-0 is next, followed by the remaining slices below. Platform CI and two-computer acceptance remain outstanding.
 **Source baseline:** `d7b749983199012978e69867f3c3694c4df96f69` on `master`, reviewed 2026-09-20.
 **Package / executable:** `net-cli` / `net-mesh`; package version at the baseline is `0.36.0`.
 **Goal:** Enable capability publishers and consumers to expose, discover, and invoke an authorized capability across processes and computers, know where each operation runs, and capture reusable typed contracts. Repair destructive preflight behavior and misleading execution semantics on the way, using existing SDK mechanisms.
@@ -179,6 +179,10 @@ Windows evidence: full default CLI suite **237 passed, 5 failed, 1 existing igno
 **Discovered pre-existing defect:** a valid snapshot restores into the SDK's in-memory adapter state, but `netdb restore` exits without persisting that initial state for the next ordinary open. A separate CLI read returns no restored records. The snapshot fixture successfully restores the expected record through the public SDK in memory, ruling out an empty input fixture. The five active failing controls cover clear, source-inside-destination, profile destination, tasks-only, and memories-only restoration. They must stay active until the defect is fixed.
 
 ### Authorized persistence extension
+
+**Implemented evidence (2026-09-20):** Tasks and memories now publish origin-bound local checkpoints beside their RedEX logs; ordinary opens load the restored state and replay subsequent destination events. Public snapshot encoding and CLI success payloads are unchanged. Nested payload validation happens before clear; persistence/flush failures produce no restore-success output. Keep checkpoint files when copying a restored store; older binaries cannot read this format and must not open it. This remains offline-only and is not an atomic multi-adapter replacement.
+
+Final Windows default CLI sweep: **247 passed, 0 failed, 1 existing ignored** (the unrelated aggregator query fixture), including **22** restore-preflight/persistence tests. The existing NetDB, CortEX tasks, memories, and adapter integration binaries passed **85 tests** with the repository's broad test alias. Controls cover independent process reopen without the source file, subsequent writes/deletion, retained post-snapshot log tail, absent adapters, wrong-origin/corrupt checkpoint rejection, and Windows checkpoint replacement failure. CLI all-target checking, package formatting, changed-core-file formatting, strict combined CLI/core clippy, root default/no-default clippy, and root all-features rustdoc passed. A narrower root rustdoc invocation hit a pre-existing feature-gated RTC link; the prescribed all-features gate passed. Unix-specific witnesses and exact-head CI/full repository pre-push checks remain outstanding.
 
 Implement the smallest coherent persistence/reopen correction using the existing NetDB/CortEX/RedEX mechanisms. CLI, SDK, and core storage changes are allowed where necessary for this defect; unrelated wire, networking, and command families remain outside CLI-1. Preserve the public snapshot encoding and ordinary command output unless a concrete incompatibility is discovered and documented.
 
