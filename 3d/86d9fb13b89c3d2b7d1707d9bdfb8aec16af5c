@@ -1,0 +1,14 @@
+web/src/content/docs/reference/cli.md
+  h_64425bc75e3f3d 65-66,136-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3d86d9fb13b89c3d2b7d1707d9bdfb8aec16af5c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
