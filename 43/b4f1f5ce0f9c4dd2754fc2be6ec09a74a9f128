@@ -1,0 +1,26 @@
+net/crates/net/sdk/src/enrollment.rs
+  s_38828de26a56bb::t_6032d2d8c38643 65-68
+net/crates/net/sdk/tests/enrollment_policy.rs
+  s_38828de26a56bb::t_868515a7d63aa3 1-13,22-37,43-44,49-56,62-67,77-81,104-108,113
+  s_38828de26a56bb::t_14f7c1b28bb8c1 14-21,38-42,45-48,57-61,68-76,82-103,109-112
+net/crates/net/sdk/src/enrollment/policy.rs
+  s_38828de26a56bb::t_ad5d7e8b7798cf 107
+  s_38828de26a56bb::t_6032d2d8c38643 1-73,79-106,108-112
+  s_38828de26a56bb::t_14f7c1b28bb8c1 74-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "43b4f1f5ce0f9c4dd2754fc2be6ec09a74a9f128",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
