@@ -1,0 +1,36 @@
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_3ba4fa5a4fcc7d 12-14
+net/crates/net/cli/tests/fixtures/native_consumer.py
+  s_38828de26a56bb::t_c0b5c17c6ed0d0 1-9,11-32,39-45
+  s_38828de26a56bb::t_f782b78b5f9d1d 10,33-38
+net/crates/net/cli/tests/fixtures/README.md
+  s_38828de26a56bb::t_3ba4fa5a4fcc7d 61-113
+.github/workflows/ci.yml
+  s_38828de26a56bb::t_f782b78b5f9d1d 4914,4924-4925
+  s_38828de26a56bb::t_3ba4fa5a4fcc7d 4920-4922
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_3ba4fa5a4fcc7d 34-37
+net/crates/net/cli/tests/native_contract_workflow.rs
+  s_38828de26a56bb::t_f782b78b5f9d1d 132-134,219-221
+  s_38828de26a56bb::t_5c1512879a89c7 4-9,12-21,24-26,28-31,44-49,53-62,66-79,85-92,104-112,117-118,122-126,136-153,177-179,184-185,187-194,201-205,208-218,234-254,260-269,275-276,279-289
+  s_38828de26a56bb::t_33bf203aaa660b 157-160,180,182
+  s_38828de26a56bb::t_85058684eee080 161-176
+  s_38828de26a56bb::t_33685d09fecba9 222-233
+  s_38828de26a56bb::t_c0b5c17c6ed0d0 1-3,10-11,22-23,27,32-43,50-52,63-65,80-84,93-103,113-116,119-121,127-131,135,154-156,181,183,186,195-200,206-207,255-259,270-274,277-278,290-303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a94b319b5bf14edddff635019cab5ccb096209ec",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
