@@ -8,6 +8,14 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — wrapped-provider startup budget
+
+- `wrap --timeout` shares one budget across configuration, identity loading,
+  attachment and child MCP initialization/discovery/publication. Startup expiry
+  exits 7 without a `wrapped` result and drops the managed direct child.
+- After publication, the provider lifetime and later tool-list refreshes are
+  not bounded by this startup flag. NDJSON lifecycle events remain unchanged.
+
 ## Unreleased — MCP startup budget
 
 - `mcp serve --timeout` bounds configuration, identity loading and mesh

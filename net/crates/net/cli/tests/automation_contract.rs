@@ -427,6 +427,70 @@ fn mcp_startup_expiry_emits_no_protocol_payload() {
 }
 
 #[test]
+fn wrap_attachment_expiry_precedes_child_spawn() {
+    let dir = fixture();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let key = "42".repeat(32);
+    let identity = dir.path().join("operator.toml");
+    for budget in ["0s", "200ms"] {
+        let out = run(
+            dir.path(),
+            &[
+                "wrap",
+                "fixture",
+                "--identity",
+                identity.to_str().unwrap(),
+                "--node-addr",
+                &addr,
+                "--node-id",
+                "9",
+                "--node-pubkey",
+                &key,
+                "--psk-hex",
+                &key,
+                "--bind",
+                "127.0.0.1:0",
+                "--timeout",
+                budget,
+                "--",
+                "nonexistent-child-must-not-spawn",
+            ],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(&key));
+        if budget == "0s" {
+            assert_eq!(
+                socket.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    let out = run(
+        dir.path(),
+        &[
+            "wrap",
+            "fixture",
+            "--inspect-target",
+            "--timeout",
+            "1s",
+            "--",
+            "nonexistent-child-must-not-spawn",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--timeout is not supported"));
+}
+
+#[test]
 fn ice_commit_is_one_complete_json_result_and_dry_run_remains_preview_only() {
     let dir = fixture();
     let identity = dir.path().join("operator.toml");

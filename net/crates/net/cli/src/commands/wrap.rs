@@ -142,8 +142,10 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let profile = resolve_profile(config_path, profile_name).await?;
+    let profile =
+        crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
 
     // The mesh peer to join. `net-mesh wrap` must join a mesh to be reachable.
     let remote = require_remote_attach_with_bind(
@@ -183,11 +185,15 @@ pub async fn run(
                  so an ephemeral key would admit nobody.",
             )
         })?;
-    let identity = load_operator_identity(identity_path).await?;
+    let identity =
+        crate::deadline::run_optional(deadline, load_operator_identity(identity_path)).await?;
 
     // Build a mesh under that identity and join via the peer. `Arc` because
     // the publisher (and each publication) holds the mesh alongside us.
-    let mesh = std::sync::Arc::new(build_attached_mesh(Some(identity), &remote).await?);
+    let mesh = std::sync::Arc::new(
+        crate::deadline::run_optional(deadline, build_attached_mesh(Some(identity), &remote))
+            .await?,
+    );
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args
@@ -257,10 +263,15 @@ pub async fn run(
     }
 
     let publisher = ServerPublisher::new(std::sync::Arc::clone(&mesh));
-    let mut publication = publisher
-        .publish_server(program, prog_args, &envs, config)
-        .await
-        .map_err(|e| sdk(format!("wrap failed: {e}")))?;
+    // Expiry drops the in-progress client (kill_on_drop child) and any local
+    // serve handles. Do not apply this startup budget to refresh or lifetime.
+    let mut publication = crate::deadline::run_optional(deadline, async {
+        publisher
+            .publish_server(program, prog_args, &envs, config)
+            .await
+            .map_err(|e| sdk(format!("wrap failed: {e}")))
+    })
+    .await?;
 
     // Report what was wrapped through the `--output` pipeline. Wrap streams
     // (report + lifecycle events), so it resolves the stream format.
