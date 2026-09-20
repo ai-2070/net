@@ -34,7 +34,8 @@ It runs on loopback on one machine; it is not off-host acceptance evidence.
 The same guide includes native Rust typed calls, live contract capture,
 generated Python consumption over a real-mesh fixture adapter, and offline
 Python/TypeScript regeneration. A separate protected native leg proves org
-admission denial before handler effect and an authorized typed call. It keeps
+admission denial before handler effect and authorized native and generated Python
+calls (through a Rust SDK fixture adapter). It keeps
 org admission, public native tools, and MCP's owner/pin policy distinct.
 
 ```sh

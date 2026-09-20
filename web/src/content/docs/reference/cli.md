@@ -12,7 +12,8 @@ details for a consumer; local pins do not override provider authorization.
 The guide also exercises native typed calls and generated Python consumption,
 then reproduces Python/TypeScript artifacts offline after provider shutdown.
 The contract example uses a public test service; a separate protected native
-leg proves same-org denial-before-effect and an authorized typed call.
+leg proves same-org denial-before-effect and authorized native/generated Python
+calls through a Rust SDK fixture adapter, using an offline contract.
 
 The `net-mesh` binary provides capability hosting/consumption, typed contract generation, local stores, and offline authority tools. `wrap` hosts a stdio MCP server as mesh capabilities; `mcp serve` bridges mesh capabilities to a local MCP client. `daemon` only lists a temporary snapshot: there is no `daemon run` command.
 

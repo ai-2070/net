@@ -133,12 +133,29 @@ a 25-second ceiling, without shortening production timers or invoking handlers.
 A typed request to the exact provider **without** an org proof receives wire
 status `0x0009` (admission denied), and the provider record must remain empty.
 The same caller then uses `mesh.org(credentials).call(...)` exactly once. Its
-typed response matches the one provider record, including all five verified
+typed response matches the first provider record, including all five verified
 `OrgCaller` fields: caller entity, acting org, provider org, provider entity and
 capability. Each RPC has a five-second ceiling; ambiguous calls are never retried.
+
+The harness also runs CLI `typegen generate` on an explicit offline descriptor
+for `protected.echo`. Python/Pydantic v2 is required (install as above; no skip).
+`protected_consumer.py` imports the generated request, response and call helper.
+It rejects malformed input locally, then makes two explicit helper calls through
+a local TCP fixture adapter. The harness forwards the first without an org proof
+and propagates the real provider's admission denial; the record count must stay
+at one. It forwards the second through the Rust SDK `OrgClient`, returning the
+actual typed provider response. Exactly two provider records remain in total
+(native and generated successes), with verified attribution checked for both.
+The generated helper must not retry either call. Python never receives credentials
+and cannot select authorization mode; that sequence belongs to the test harness.
+
+This executes generated Python against a protected service through the Rust SDK
+adapter, **not** the native Python SDK binding. The supplied offline descriptor
+is not private live metadata capture, and the adapter is not a shipped credential
+broker. Discovery and invocation remain protected; no public registration is added.
 
 Both nodes shut down before temporary authority files are removed. This binary
 contains one test so no subsequent adoption can recycle a deleted revocation
 lock inode within the process. This is same-org native admission evidence on
-loopback, not cross-org grant, revocation, generated protected-client, or
+loopback, not cross-org grant, revocation, native Python binding, or
 two-computer acceptance evidence. It adds no CLI RPC command or SDK API.
