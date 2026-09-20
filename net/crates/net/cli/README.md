@@ -33,8 +33,9 @@ and checks the returned value against a provider-side invocation record.
 It runs on loopback on one machine; it is not off-host acceptance evidence.
 The same guide includes native Rust typed calls, live contract capture,
 generated Python consumption over a real-mesh fixture adapter, and offline
-Python/TypeScript regeneration. It distinguishes public native tools from
-MCP's owner/pin authorization policy.
+Python/TypeScript regeneration. A separate protected native leg proves org
+admission denial before handler effect and an authorized typed call. It keeps
+org admission, public native tools, and MCP's owner/pin policy distinct.
 
 ```sh
 # Generate an identity file; this does not grant remote invocation authority.

@@ -4922,7 +4922,8 @@ jobs:
           # authorization + contract witnesses so they cannot silently vanish.
           for t in two_node_mcp_consent_then_authorized_invocation \
                    two_node_mcp_pin_does_not_override_provider_owner_scope \
-                   native_typed_call_and_generated_consumer_reuse_captured_contract_offline; do
+                   native_typed_call_and_generated_consumer_reuse_captured_contract_offline \
+                   two_node_protected_native_denial_then_authorized_typed_call; do
             grep -q "test $t ... ok" /tmp/cli_default.log || {
               echo "::error::$t did not run"; exit 1; }
           done

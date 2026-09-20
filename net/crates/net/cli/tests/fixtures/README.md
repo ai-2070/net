@@ -109,5 +109,36 @@ Offline regeneration proves contract reuse, never offline invocation.
 `serve_tool` service on an isolated, disposable-PSK mesh. Typed validation is
 not caller authorization; it does not demonstrate org grants, private native
 capabilities, or an identity-based native denial. The MCP leg above proves its
-own owner/consent boundary. Protected native authorization remains an explicit
-acceptance item; do not deploy this public echo as a sensitive capability.
+own owner/consent boundary. The separate protected leg below supplies native
+authorization evidence; do not deploy this public echo as a sensitive capability.
+
+## Protected native authorization
+
+From `net/crates/net/`:
+
+```sh
+cargo nextest run -p net-cli --test protected_native_workflow --no-tests=fail --retries 0
+```
+
+The runnable source is `../protected_native_workflow.rs`. It creates two SDK
+nodes with distinct identities and UDP binds, adopts both into one disposable
+organization, and pre-stages the same owner-discovery audience in their secured
+authority files. `install_org_authority` loads those files through the production
+SDK path. The offline dispatcher grant covers exactly `nrpc:protected.echo`,
+not all capabilities. Test-only keys and authority files are never printed.
+
+The provider registers `serve_org(..., OrgAccess::SameOrg, ...)`; discovery stays
+encrypted/private. The harness polls discovery and authenticated peer pins with
+a 25-second ceiling, without shortening production timers or invoking handlers.
+A typed request to the exact provider **without** an org proof receives wire
+status `0x0009` (admission denied), and the provider record must remain empty.
+The same caller then uses `mesh.org(credentials).call(...)` exactly once. Its
+typed response matches the one provider record, including all five verified
+`OrgCaller` fields: caller entity, acting org, provider org, provider entity and
+capability. Each RPC has a five-second ceiling; ambiguous calls are never retried.
+
+Both nodes shut down before temporary authority files are removed. This binary
+contains one test so no subsequent adoption can recycle a deleted revocation
+lock inode within the process. This is same-org native admission evidence on
+loopback, not cross-org grant, revocation, generated protected-client, or
+two-computer acceptance evidence. It adds no CLI RPC command or SDK API.
