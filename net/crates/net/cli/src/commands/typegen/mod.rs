@@ -18,6 +18,7 @@
 //! disk.
 
 mod diff;
+mod live;
 mod python;
 mod schema;
 mod ts;
@@ -230,21 +231,24 @@ async fn run_generate(
             else {
                 return Ok(());
             };
-            crate::deadline::run_optional(deadline, fetch_live_source(&args.tags, &args.tools, ctx))
-                .await?
+            crate::deadline::run_optional(
+                deadline,
+                fetch_live_source(&args.tags, &args.tools, ctx, deadline),
+            )
+            .await?
         }
     };
 
-    // Tools without an inline input schema can't generate input types
-    // (schema exceeded the fold's per-entry budget). Skip with a warning.
+    // Legacy offline snapshots keep their skip behavior. Live acquisition
+    // has already required a usable input schema for every selected tool.
     let mut skipped: Vec<String> = Vec::new();
     let usable: Vec<ToolDescriptor> = descriptors
         .into_iter()
         .filter(|d| {
             if d.input_schema.is_none() {
                 eprintln!(
-                    "warning: tool `{}` has no inline input schema (size > fold budget); \
-                     binding skipped. Re-run after `tool.metadata.fetch` ships.",
+                    "warning: tool `{}` has no input schema in the saved snapshot; \
+                     binding skipped. Capture a new live snapshot to fetch metadata.",
                     d.tool_id
                 );
                 skipped.push(d.tool_id.clone());
@@ -294,6 +298,13 @@ async fn run_generate(
         Language::Python => python::generate(&usable, &meta, &mut skipped)?,
     };
 
+    if args.from_snapshot.is_none() && !skipped.is_empty() {
+        return Err(invalid_args(format!(
+            "live typegen cannot render selected tools: {}; no output was written",
+            skipped.join(", ")
+        )));
+    }
+
     let written = write_generated(&args.out, &files).await?;
 
     let view = GenerateView {
@@ -333,9 +344,11 @@ async fn run_snapshot(
     else {
         return Ok(());
     };
-    let (descriptors, _meta) =
-        crate::deadline::run_optional(deadline, fetch_live_source(&args.tags, &args.tools, ctx))
-            .await?;
+    let (descriptors, _meta) = crate::deadline::run_optional(
+        deadline,
+        fetch_live_source(&args.tags, &args.tools, ctx, deadline),
+    )
+    .await?;
 
     let schema_bytes: u64 = descriptors
         .iter()
@@ -483,16 +496,10 @@ async fn fetch_live_source(
     tags: &[String],
     tools: &[String],
     ctx: CliContext,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
     let mesh = ctx.require_mesh()?;
-
-    let descriptors = discover_with_timeout(
-        || mesh.list_tools(None),
-        tags,
-        tools,
-        Duration::from_secs(5),
-    )
-    .await?;
+    let descriptors = Box::pin(live::acquire(mesh, tags, tools, deadline)).await?;
     // Broad observation may legitimately end empty, but must not imply that
     // the entire mesh has no tools (or that a requested ID was satisfied).
     if descriptors.is_empty() {
@@ -744,7 +751,7 @@ mod tests {
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
     }
 
-    fn desc(tool_id: &str) -> ToolDescriptor {
+    pub(super) fn desc(tool_id: &str) -> ToolDescriptor {
         ToolDescriptor {
             tool_id: tool_id.into(),
             name: tool_id.into(),

@@ -8,6 +8,17 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — provider-bound live typegen metadata
+
+- Missing live input schemas are fetched from the advertising provider;
+  missing output schemas are fetched when it advertises the metadata service.
+  Returned identity/version, tags and inline contracts must match. Output
+  schemas remain optional; snapshot v1 and offline skip behavior are unchanged.
+- Conflicting advertisements fail; identical replicas choose the lowest node
+  ID without fallback. Acquisition shares the explicit remaining timeout, or
+  one 30-second post-attachment limit when omitted. Unusable schemas and fetch
+  failures refuse before publication. Existing unary transport size limits apply.
+
 ## Unreleased — selection-aware live typegen discovery
 
 - Live `typegen generate/snapshot --tool` waits for every requested ID after
@@ -15,8 +26,8 @@ and output shape.
   before writing output. An explicit global timeout can end the wait sooner.
 - Tag-only/unfiltered discovery observes the full five-second window; this
   is not a complete inventory. Offline snapshot filtering is unchanged.
-- Provider-bound schema hydration remains follow-up work; missing inline or
-  unsupported schemas can still be skipped during generation.
+- Provider-bound hydration is covered above; offline incomplete or unsupported
+  schemas can still be skipped during generation.
 
 ## Unreleased — wrapped-provider startup budget
 

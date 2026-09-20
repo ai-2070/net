@@ -38,7 +38,7 @@ net-mesh mcp serve --help
 net-mesh typegen generate --language ts --from-snapshot tools.json --out ./generated
 ```
 
-`wrap` keeps the publisher subprocess alive and is owner-only by default. Consumers need the configured target and appropriate permission; an identity or successful handshake alone is not permission. Live typegen currently uses inline schemas and does not fetch oversized metadata. These examples are entry points, not an accepted cross-computer deployment recipe.
+`wrap` keeps the publisher subprocess alive and is owner-only by default. Consumers need the configured target and appropriate permission; an identity or successful handshake alone is not permission. Live typegen fetches missing schemas from the exact advertising provider, subject to existing unary RPC transport limits, and refuses mismatched or unusable contracts before output. These examples are entry points, not an accepted cross-computer deployment recipe.
 
 ### Temporary-supervisor development commands
 

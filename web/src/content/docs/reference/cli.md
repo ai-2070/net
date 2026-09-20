@@ -166,7 +166,9 @@ The response reports whether cancellation occurred. `cancelled: false` is a succ
 
 ## `net-mesh typegen`
 
-Code generation from live-discovered tool descriptors or a saved snapshot. The current live path uses inline schemas; it does not fetch oversized metadata through `tool.metadata.fetch`. Generation skips missing inline input schemas and unsupported schemas with diagnostics. A successful generation is not proof that every requested tool was captured.
+Code generation from live-discovered tool descriptors or a saved snapshot. Live acquisition fetches missing input schemas from the exact advertising provider via `tool.metadata.fetch`; it also fetches missing output schemas when that provider advertises the metadata service. Output schemas remain optional. Returned ID/version/tags and already-inline schemas must agree with the advertisement. Conflicting selected advertisements fail; identical replicas choose the lowest node ID without fallback or CLI retry. Missing/unusable input or failed hydration rejects the operation before writing output. Offline generation retains its legacy warning-and-skip behavior for incomplete or unsupported snapshots.
+
+The remaining explicit `--timeout` budget covers all metadata fetches, not a new budget per tool. Without that flag, post-attachment acquisition has a single 30-second limit (discovery still at most five seconds); SDK RPC limits also apply. Snapshot v1 is unchanged. This is not arbitrary-size metadata transfer: roughly 6 KB contracts are tested, while a roughly 22 KB response exceeded the current 8 KB packet receive path. Final file publication is outside cancellation and is not crash-atomic.
 
 ### `generate`
 

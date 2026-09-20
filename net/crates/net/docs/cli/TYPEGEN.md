@@ -55,7 +55,7 @@ res = await call_acme_web_search(mesh, AcmeWebSearchRequest(query="net mesh", ma
 - **Live discovery** — pass the remote-attach flags (`--node-addr`,
   `--node-pubkey`, `--node-id`, `--psk-hex`, each defaultable in the
   profile). The CLI joins the mesh, lets the capability fold populate, then
-  reads `list_tools`. Explicit `--tool` IDs must all be observed after
+  reads provider-attributed capability entries. Explicit `--tool` IDs must all be observed after
   filtering within five seconds; unrelated tools cannot end the wait.
   Missing IDs fail with exit 7 before snapshot/generated output is written.
   Without IDs, discovery observes the full five-second window. This is a
@@ -64,6 +64,27 @@ res = await call_acme_web_search(mesh, AcmeWebSearchRequest(query="net mesh", ma
   budget after attachment; it does not extend the discovery window.
 - **Snapshot** — `generate --from-snapshot <file>` regenerates from a pinned
   capture. Offline and deterministic; this is the path CI and tests use.
+
+Live acquisition fetches a missing input schema from the exact advertising
+provider using `tool.metadata.fetch`. If that provider advertises the metadata
+service, a missing output schema also triggers a fetch; an output still absent
+in the full response remains optional. Legacy inline-input tools without that
+service can retain an absent output. Returned tool ID, version, tags and any
+already-inline schemas must agree with the selected advertisement.
+
+Conflicting selected advertisements (including versions) fail before output.
+Identical replicas use the lowest node ID, with no fallback or CLI retry on
+fetch failure. Snapshot v1 stays unchanged: provenance selects the live RPC,
+but provider IDs are not persisted as an offline routing guarantee.
+
+An explicit `--timeout` shares its remaining budget across attachment,
+observation and all metadata fetches. If omitted, acquisition after attachment
+has one 30-second limit; observation still lasts at most five seconds and SDK
+RPC limits still apply. Schema/metadata failure preserves existing output.
+Publication after successful acquisition is not a crash-atomic transaction.
+Metadata uses the existing unary RPC transport: arbitrarily large contracts
+are not supported by this change (a roughly 22 KB response exceeded the current
+8 KB packet receive path in local testing; a roughly 6 KB contract is covered).
 
 ### Filtering
 
@@ -169,12 +190,12 @@ without intending an open object); only an explicit `true` / typed schema
 opens it (TS index signature, Python `ConfigDict(extra="allow")`), and
 `false` closes it.
 
-Out of initial scope — a tool with one of these is **skipped with a
-warning**, not silently mis-generated: external `$ref` URIs, `not`,
+Out of scope: external `$ref` URIs, `not`,
 `if`/`then`/`else`, `dependentSchemas` / `dependentRequired`,
-`unevaluatedProperties`. A tool whose `input_schema` is `None` (schema
-exceeded the fold's per-entry budget) is also skipped until the
-`tool.metadata.fetch` RPC ships. A tool with no `output_schema` still
+`unevaluatedProperties`. Live snapshot/generation rejects unsupported schemas
+or a missing input schema after hydration before writing output. Offline
+generation retains legacy warning-and-skip behavior for incomplete or
+unsupported saved descriptors. A tool with no `output_schema` still
 generates — its response type is `unknown` (TS) / `Any` (Python).
 
 ---
