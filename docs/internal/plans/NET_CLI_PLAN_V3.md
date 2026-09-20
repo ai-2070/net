@@ -465,7 +465,7 @@ IDs, impossible transitions/timestamps and invalid lengths. Decoder errors and
 Debug output must not echo receipt bytes, bearer material, PSKs or proofs. Secret
 file removal is not secure erasure; no such claim is made.
 
-**First persistence witnesses (not yet executed):** second process cannot own the
+**Required persistence witnesses (partial evidence below):** second process cannot own the
 same store; an insecure/symlink/non-regular path refuses; repeated replacement
 retains Unix modes/Windows DACL; missing/corrupt state refuses open; injected
 pre-rename failure preserves old committed state; injected post-rename failure
@@ -475,9 +475,47 @@ two real processes, exact-byte lost-response recovery, expiry and approval races
 wrong subject/intent, crash points and capacity. These must reach production
 transitions, followed by inverse mutations in a disposable review worktree.
 
-**Handoff:** contract/source audit only, no new store implementation or durability
-test result claimed. Next bounded implementation is the protected persistence
-owner/reuse boundary, then the ledger transitions above. Bootstrap feature/release
+**Protected storage implementation (`e1c687379`, 2026-09-20):**
+`src/adapter/net/behavior/enrollment_storage.rs` now owns a fixed opaque snapshot
+and stable lifetime lock, reusing the existing org directory/file validation and
+phased atomic replacement helpers. Creation refuses existing directories; open
+never initializes missing state. Reads/writes have a 64 MiB ceiling, and existing
+insecure or hardlinked files are refused rather than repaired by replacement.
+Post-rename uncertainty fences subsequent reads/writes until close/reopen; reopen
+re-persists the checked snapshot under the lock before returning it. This is a
+workspace-internal byte-storage primitive, not an SDK ledger or credential verifier.
+
+Windows validation: `cargo tfl -E 'test(enrollment_storage) + test(org_authority) + test(org_revocation)' --retries 0`
+passed **80 tests** (5,706 filtered), including six storage tests. Witnesses cover
+same-process and real child-process lock contention, exact-byte reopen, missing
+state, hardlinks, oversized reads, permissive Windows ACL refusal, and injected
+pre-/post-rename outcomes. The child writes a marker so zero test discovery cannot
+masquerade as lock evidence. Default-feature `cargo clippy --lib -- -D warnings`,
+touched-file rustfmt and `git diff --check` passed. Tests were added with the code;
+no pre-implementation RED is claimed. CI now explicitly includes the module in
+Windows security tests; nextest sets its retries to zero.
+
+**Inverse evidence:** in the Orca-managed disposable review checkout at
+`e1c687379`, removing the production `self.uncertain = true` assignment made
+`phase_failures_preserve_or_fence_reads_and_writes` fail at its read-fencing
+assertion (one test discovered, zero retries). The mutation was restored from the
+committed source and verified by an empty Git diff. During restoration verification,
+a NUL-filled review source and a corrupt generated PDB separately prevented
+compilation; neither is test evidence. The primary source/commit remained intact;
+the review source was replaced and only the named rebuildable PDB was removed.
+After recovery, `cargo tfl enrollment_storage --retries 0` passed **6/6** in the
+restored review checkout (5,780 filtered). No inverse changes remain. The candidate
+and this receipt are locally committed, not pushed; exact-head CI is unverified.
+
+Limits: Unix-only assertions have not run locally; exact-head CI, actual power-loss
+testing and schema/corruption/issuer validation remain outstanding. The latter
+belong to the forthcoming SDK ledger: opaque storage cannot reject semantically
+invalid bytes. No SDK wiring, receipt issuance, bootstrap listener or CLI command
+is implemented by this slice. Same-account/privileged filesystem mutation and
+restoring old disk images remain outside this storage boundary.
+
+**Handoff:** next bounded implementation is the versioned, issuer-bound SDK ledger
+and its claim/approval/receipt transitions above. Bootstrap feature/release
 inclusion, final recovery/retention bounds, lifecycle fencing, selective subnet
 semantics and V2 exact-head acceptance remain open; V3-0 is not complete.
 
