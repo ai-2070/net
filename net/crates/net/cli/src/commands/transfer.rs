@@ -97,6 +97,9 @@ pub struct RecvBlobArgs {
 
 #[derive(Args, Debug)]
 pub struct SendBlobArgs {
+    /// Report source/store paths without reading files/stdin or staging bytes.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Source file. Pass `-` to read from stdin.
     pub path: PathBuf,
     /// Stage the bytes into an on-disk store at this directory so a node
@@ -133,6 +136,9 @@ pub struct RecvDirArgs {
 
 #[derive(Args, Debug)]
 pub struct SendDirArgs {
+    /// Report source/store paths without walking the directory or staging bytes.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Source directory.
     pub path: PathBuf,
     /// Stage the manifest + chunks into an on-disk store at this
@@ -185,6 +191,31 @@ pub async fn run(
     profile_name: &str,
     quiet: bool,
 ) -> Result<(), CliError> {
+    let staging = match &cmd {
+        TransferCommand::SendBlob(args) if args.inspect_target => {
+            Some((&args.path, &args.store, args.path.as_os_str() == "-"))
+        }
+        TransferCommand::SendDir(args) if args.inspect_target => {
+            Some((&args.path, &args.store, false))
+        }
+        _ => None,
+    };
+    if let Some((path, store, stdin)) = staging {
+        let profile = resolve_profile(config_path, profile_name).await?;
+        let mut view = crate::target::TargetInspection::local(
+            &profile,
+            if store.is_some() {
+                "persistent_store"
+            } else {
+                "offline"
+            },
+        );
+        view.store = store.clone();
+        view.source = Some(path.clone());
+        view.provenance("store", if store.is_some() { "flag" } else { "unused" });
+        view.provenance("source", if stdin { "stdin" } else { "argument" });
+        return view.emit(output);
+    }
     match cmd {
         TransferCommand::RecvBlob(args) => {
             run_recv_blob(args, output, config_path, profile_name, quiet).await

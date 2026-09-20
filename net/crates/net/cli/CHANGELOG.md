@@ -8,6 +8,16 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — policy, pin and staging inspection
+
+- Forwarding policy and MCP pin commands accept `--inspect-target`, resolving
+  their actual explicit/default store without reading it, creating locks,
+  or changing policy/consent. Profile `netdb` does not redirect these stores.
+- Transfer send-blob/send-dir inspect their source and optional staging store
+  without reading files/stdin or walking directories. Staging is not hosting.
+- Inspection is resolution-only, not policy/content validation or approval.
+  Keychain-backed `forwarding set-value` remains outside this surface.
+
 ## Unreleased — local target inspection and explicit selector validation
 
 - Every dispatched command validates explicit config/profile selections,

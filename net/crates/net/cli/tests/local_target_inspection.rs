@@ -27,6 +27,93 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn policy_pins_and_staging_inspect_without_accessing_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'missing'\n",
+    );
+    let store = dir.path().join("store");
+    let path = store.to_str().unwrap();
+    let commands = [
+        vec!["forwarding", "enable", "--store", path],
+        vec!["forwarding", "disable", "--store", path],
+        vec![
+            "forwarding",
+            "allow",
+            "test",
+            "--header",
+            "Authorization",
+            "--store",
+            path,
+        ],
+        vec!["forwarding", "rm", "test", "--store", path],
+        vec!["forwarding", "audit", "--store", path],
+        vec![
+            "mcp",
+            "pin",
+            "approve",
+            "provider/tool",
+            "--pin-store",
+            path,
+        ],
+        vec!["mcp", "pin", "reject", "provider/tool", "--pin-store", path],
+        vec!["mcp", "pin", "list", "--pin-store", path],
+        vec!["transfer", "send-blob", "missing", "--store", path],
+        vec!["transfer", "send-dir", "missing", "--store", path],
+    ];
+    // First absent, then corrupt: neither inspection may create a lock, load
+    // the policy/pin payload, enumerate content, or alter existing bytes.
+    for existing in [false, true] {
+        if existing {
+            std::fs::write(&store, b"PRIVATE_SENTINEL invalid store").unwrap();
+        }
+        for command in &commands {
+            let mut args = vec!["--config", cfg.to_str().unwrap()];
+            args.extend(command.iter().copied());
+            args.push("--inspect-target");
+            let out = run(&args);
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(view["store"], path);
+            assert_eq!(view["provenance"]["store"], "flag");
+            assert_eq!(view["mode"], "persistent_store");
+            assert_eq!(view["identity"]["state"], "unused");
+            assert_eq!(view["ignored_profile_remote_defaults"], true);
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("PRIVATE_SENTINEL"));
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                if existing { 2 } else { 1 }
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(store).unwrap(),
+        b"PRIVATE_SENTINEL invalid store"
+    );
+    for verb in ["send-blob", "send-dir"] {
+        let out = run(&[
+            "--config",
+            cfg.to_str().unwrap(),
+            "transfer",
+            verb,
+            "-",
+            "--inspect-target",
+        ]);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["mode"], "offline");
+        assert_eq!(view["source"], "-");
+        assert!(view.get("store").is_none());
+    }
+}
+
+#[test]
 fn explicit_selections_fail_before_offline_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
@@ -266,6 +353,65 @@ fn environment_selections_are_validated_and_flags_override_them() {
         .args(["version", "--profile", "default"])
         .assert()
         .success();
+}
+
+#[test]
+fn policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(&cfg, "[default]\nnetdb = 'unrelated-netdb'\n");
+    for (command, flag, name) in [
+        (vec!["forwarding", "enable"], "--store", "forwarding.json"),
+        (
+            vec!["mcp", "pin", "approve", "provider/tool"],
+            "--pin-store",
+            "pins.json",
+        ),
+    ] {
+        let store = dir.path().join(name);
+        let mut args = vec!["--config", cfg.to_str().unwrap()];
+        args.extend(command);
+        args.extend([flag, store.to_str().unwrap()]);
+        let mut inspect = args.clone();
+        inspect.push("--inspect-target");
+        let out = run(&inspect);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(!store.exists());
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["store"], result["store"]);
+        assert!(store.is_file());
+    }
+    let mut defaults = Vec::new();
+    for command in [vec!["forwarding", "audit"], vec!["mcp", "pin", "list"]] {
+        let mut args = vec!["--config", cfg.to_str().unwrap()];
+        args.extend(command);
+        args.push("--inspect-target");
+        let out = run(&args);
+        assert!(out.status.success());
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["provenance"]["store"], "default");
+        defaults.push(view["store"].clone());
+    }
+    assert_ne!(defaults[0], defaults[1]);
+    assert_ne!(defaults[0], "unrelated-netdb");
+    assert_ne!(defaults[1], "unrelated-netdb");
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "forwarding",
+        "set-value",
+        "test",
+        "--inspect-target",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
 }
 
 #[cfg(unix)]

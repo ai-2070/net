@@ -145,7 +145,9 @@ net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./gen
 
 NetDB reports `mode: persistent_store`, the store (`--store` > profile `netdb` > data-directory default), and snapshot input/output paths where applicable. Saved typegen reports `mode: offline` and its input/output paths. Both report unused remote defaults and `identity.state: unused`: they do not consume a signing identity. Inspection reads profile configuration but does not open/create/clear a store or read artifact payloads. Missing input/output paths can therefore be inspected. This is resolution inspection, not restore preflight, content validation or proof that a path is writable. Execution retains its existing validation gates. Offline typegen continues to reject explicit remote target/bind flags.
 
-Inspection is not yet CLI-wide: other offline/persistent commands and standalone `anchor serve` remain outside this surface.
+Forwarding policy (`enable/disable/allow/rm/audit`), MCP pins (`approve/reject/list`), and transfer `send-blob/send-dir` also support `--inspect-target`. Policy/pin inspection reports the existing per-user default or explicit `--store`/`--pin-store`; profile `netdb` does not select these stores. It does not load their contents, acquire mutation locks or change consent. Transfer inspection reports source and optional staging store: persistent-store mode with `--store`, offline mode without it. `send-blob -` reports stdin without reading it; directory inspection does not walk the source. Staging still does not host or publish bytes. Inspection is not argument/content/policy validation or authorization approval.
+
+Inspection is not yet CLI-wide: offline issuance, other temporary-supervisor commands, standalone `anchor serve`, and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

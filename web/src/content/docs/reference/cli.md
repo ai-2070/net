@@ -46,7 +46,11 @@ net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./gen
 
 All NetDB verbs support `--inspect-target`. The result identifies `mode: persistent_store`, the resolved store (`--store` > profile `netdb` > data-directory default), and snapshot source/destination where applicable. Normal dispatch uses the inspected store selection. Saved typegen reports `mode: offline`, source and destination, and rejects explicit remote target/bind flags.
 
-These local operations report unused remote defaults, `identity.state: unused`, null remote target/bind, and `authorization: not_checked`. Inspection reads profile configuration but neither signing identities nor artifact payloads. It does not open, create or clear stores, so nonexistent inputs and outputs can be inspected safely. It is not snapshot/restore preflight, content validation, or a writability guarantee; normal execution retains those checks. Other offline/persistent commands remain follow-up work.
+These local operations report unused remote defaults, `identity.state: unused`, null remote target/bind, and `authorization: not_checked`. Inspection reads profile configuration but neither signing identities nor artifact payloads. It does not open, create or clear stores, so nonexistent inputs and outputs can be inspected safely. It is not snapshot/restore preflight, content validation, or a writability guarantee; normal execution retains those checks.
+
+Forwarding policy (`enable/disable/allow/rm/audit`) and MCP pins (`approve/reject/list`) also support inspection. Store selection remains their own per-user default or explicit `--store`/`--pin-store`, not profile `netdb`. Inspection does not load store contents, create locks or modify policy/consent. Keychain-backed `forwarding set-value` does not support it.
+
+Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Offline issuance, other temporary-supervisor commands and standalone anchor serving remain follow-up work.
 
 ## `net-mesh transfer`
 

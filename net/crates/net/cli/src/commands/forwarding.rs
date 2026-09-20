@@ -48,6 +48,9 @@ pub enum ForwardingCommand {
 
 #[derive(Args, Debug)]
 pub struct StoreArgs {
+    /// Report the policy-store path without opening or changing it.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Forwarding policy store file. Defaults to the per-user store.
     #[arg(long = "store", value_name = "PATH")]
     pub store: Option<PathBuf>,
@@ -109,11 +112,35 @@ pub struct SetValueArgs {
 }
 
 pub async fn run(
-    cmd: ForwardingCommand,
+    mut cmd: ForwardingCommand,
     output: Option<OutputFormat>,
-    _config_path: Option<&Path>,
-    _profile_name: &str,
+    config_path: Option<&Path>,
+    profile_name: &str,
 ) -> Result<(), CliError> {
+    let store = match &mut cmd {
+        ForwardingCommand::Enable(args)
+        | ForwardingCommand::Disable(args)
+        | ForwardingCommand::Audit(args) => Some(args),
+        ForwardingCommand::Allow(args) => Some(&mut args.store),
+        ForwardingCommand::Rm(args) => Some(&mut args.store),
+        ForwardingCommand::SetValue(_) => None,
+    };
+    if let Some(store) = store {
+        let source = if store.store.is_some() {
+            "flag"
+        } else {
+            "default"
+        };
+        let path = resolve_store(store.store.as_deref())?;
+        if store.inspect_target {
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut view = crate::target::TargetInspection::local(&profile, "persistent_store");
+            view.store = Some(path);
+            view.provenance("store", source);
+            return view.emit(output);
+        }
+        store.store = Some(path);
+    }
     match cmd {
         ForwardingCommand::Enable(args) => set_enabled(args, output, true).await,
         ForwardingCommand::Disable(args) => set_enabled(args, output, false).await,

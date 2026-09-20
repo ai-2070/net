@@ -62,6 +62,9 @@ pub enum PinCommand {
 
 #[derive(Args, Debug)]
 pub struct PinIdArgs {
+    /// Report the pin-store path without reading or changing consent state.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The capability id, as `provider/capability` (from a search result).
     pub cap_id: String,
 
@@ -72,6 +75,9 @@ pub struct PinIdArgs {
 
 #[derive(Args, Debug)]
 pub struct PinListArgs {
+    /// Report the pin-store path without reading its contents.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Pin-store file. Defaults to the per-user store `net-mesh mcp serve` reads.
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
@@ -121,7 +127,7 @@ pub async fn run(
         // Explicit inspection exits before protocol startup and, like `pin`,
         // uses the ordinary one-shot output pipeline.
         McpCommand::Serve(args) => run_serve(args, output, config_path, profile_name).await,
-        McpCommand::Pin(cmd) => run_pin(cmd, output).await,
+        McpCommand::Pin(cmd) => run_pin(cmd, output, config_path, profile_name).await,
     }
 }
 
@@ -242,7 +248,28 @@ struct PinRow {
     state: &'static str,
 }
 
-async fn run_pin(cmd: PinCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_pin(
+    mut cmd: PinCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let (store, inspect) = match &mut cmd {
+        PinCommand::Approve(args) | PinCommand::Reject(args) => {
+            (&mut args.pin_store, args.inspect_target)
+        }
+        PinCommand::List(args) => (&mut args.pin_store, args.inspect_target),
+    };
+    let source = if store.is_some() { "flag" } else { "default" };
+    let path = resolve_pin_store(store.as_deref())?;
+    if inspect {
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut view = crate::target::TargetInspection::local(&profile, "persistent_store");
+        view.store = Some(path);
+        view.provenance("store", source);
+        return view.emit(output);
+    }
+    *store = Some(path);
     match cmd {
         PinCommand::Approve(args) => pin_mutate(args, output, "approved").await,
         PinCommand::Reject(args) => pin_mutate(args, output, "rejected").await,
