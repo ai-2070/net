@@ -3140,6 +3140,7 @@ name = "net-cli"
 version = "0.36.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "clap_complete",
  "clap_mangen",
@@ -3152,6 +3153,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
+ "postcard",
  "predicates",
  "serde",
  "serde_json",

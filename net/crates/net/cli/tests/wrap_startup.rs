@@ -27,6 +27,11 @@ async fn exercise(stall: bool) {
     );
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let identity = dir.path().join("operator.toml");
     let generated = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"))
         .env_remove("NET_MESH_CONFIG")

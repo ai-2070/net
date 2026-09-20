@@ -67,6 +67,8 @@ fn unsupported_timeouts_refuse_before_local_effects() {
         ],
         vec!["admin", "cordon", "1", "--dry-run"],
         vec!["audit", "stream", "--local"],
+        vec!["log", "tail", "--local"],
+        vec!["failures", "tail", "--local"],
         vec!["aggregator", "ls", "--local"],
         vec!["aggregator", "ls", "--inspect-target"],
         vec!["mcp", "serve", "--inspect-target"],
