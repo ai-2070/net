@@ -52,6 +52,8 @@ Forwarding policy (`enable/disable/allow/rm/audit`) and MCP pins (`approve/rejec
 
 Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Remaining organization/subnet/bootstrap credential issuance and other temporary-supervisor commands are follow-up work.
 
+`node adopt --inspect-target` reports certificate/floors paths, the explicit/default authority directory, its three filenames and the public node fingerprint. `--identity` uses the normal identity-file gate, but identifies the adoption subject rather than a signer. Inspection checks skew/entity selection without reading certificate/floors payloads, opening authority state or installing ownership. It does not validate certificates, directory permissions or authorization.
+
 ## Inspect identity and announcement artifacts
 
 Identity `generate/show/fingerprint/revoke` supports `--inspect-target`. Generate reports an unavailable identity and the explicit output path, or a `destination_pattern` containing `<generated-operator-id>` when the filename depends on the not-yet-generated identity. The pattern is not a concrete writable destination. Show/fingerprint report the source path without reading the file or computing a subject fingerprint. Revoke reports the actual explicit/default revocation store and a public issuer fingerprint without opening the store or raising floors; inspection does not establish enforcement or propagation.

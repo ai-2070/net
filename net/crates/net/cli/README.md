@@ -153,6 +153,8 @@ Identity `generate/show/fingerprint/revoke` and `cap announce` also support `--i
 
 `cap announce --inspect-target` reads the explicit `--key` through its normal secret-file gate, reports that signer's public fingerprint and the file/stdout destination, then exits without signing or emitting announcement bytes. The profile identity is unused; a conflicting `--node-id` still fails. Inspection is not validation of all announcement policies/tags or publication to a mesh. Normal execution retains its signing and output behavior.
 
+`node adopt --inspect-target` reports the certificate/floors input paths, explicit/default authority directory, three authority filenames and public node fingerprint. With `--identity`, it reads the identity through the normal file gate; the identity is a subject, not a signer. Inspection does not read certificate/floors payloads, open the authority directory or install ownership. Skew and entity selection are checked, but certificate validity, directory permissions and authorization are not.
+
 Inspection is not yet CLI-wide: organization/subnet/bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes

@@ -27,6 +27,115 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn adoption_inspection_never_opens_authority_or_certificate_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let authority = dir.path().join("authority");
+    let cert = dir.path().join("cert.json");
+    let floors = dir.path().join("floors.json");
+    let entity = "0101010101010101010101010101010101010101010101010101010101010101";
+    let args = [
+        "--config",
+        cfg.to_str().unwrap(),
+        "node",
+        "adopt",
+        "--entity",
+        entity,
+        "--cert",
+        cert.to_str().unwrap(),
+        "--floors",
+        floors.to_str().unwrap(),
+        "--authority-dir",
+        authority.to_str().unwrap(),
+        "--inspect-target",
+    ];
+    for existing in [false, true] {
+        if existing {
+            std::fs::create_dir(&authority).unwrap();
+            config(&authority.join("owner-membership.json"), "PRIVATE_SENTINEL");
+            config(&cert, "PRIVATE_SENTINEL invalid certificate");
+            config(&floors, "PRIVATE_SENTINEL invalid floors");
+        }
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["store"], authority.to_str().unwrap());
+        assert_eq!(view["source"], cert.to_str().unwrap());
+        assert_eq!(view["floors_source"], floors.to_str().unwrap());
+        assert_eq!(view["provenance"]["store"], "flag");
+        assert_eq!(view["authorization"], "not_checked");
+        assert_eq!(view["identity"]["state"], "unused");
+        assert_eq!(view["ignored_profile_remote_defaults"], true);
+        assert_eq!(view["files"].as_array().unwrap().len(), 3);
+        assert!(view["subject_fingerprint"].is_string());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(entity));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("PRIVATE_SENTINEL"));
+        assert_eq!(authority.exists(), existing);
+        if existing {
+            assert_eq!(std::fs::read_dir(&authority).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read_to_string(authority.join("owner-membership.json")).unwrap(),
+                "PRIVATE_SENTINEL"
+            );
+        }
+    }
+    let out = run(&args[..args.len() - 1]);
+    assert!(!out.status.success()); // Actual adoption still validates certificate payloads.
+    let mut invalid = args.to_vec();
+    invalid.extend(["--skew-secs", "301"]);
+    assert!(!run(&invalid).status.success());
+    let out = run(&[
+        "node",
+        "adopt",
+        "--cert",
+        cert.to_str().unwrap(),
+        "--entity",
+        entity,
+        "--inspect-target",
+    ]);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["provenance"]["store"], "default");
+    assert!(view["store"].as_str().unwrap().ends_with("authority"));
+    let identity = dir.path().join("node.toml");
+    let identity_args = [
+        "node",
+        "adopt",
+        "--cert",
+        cert.to_str().unwrap(),
+        "--identity",
+        identity.to_str().unwrap(),
+        "--inspect-target",
+    ];
+    assert!(!run(&identity_args).status.success());
+    assert!(
+        run(&["identity", "generate", "--out", identity.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let before = std::fs::read(&identity).unwrap();
+    let out = run(&identity_args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["identity_source"], identity.to_str().unwrap());
+    assert_eq!(view["provenance"]["subject"], "identity_file");
+    assert_eq!(view["identity"]["state"], "unused");
+    assert_eq!(std::fs::read(&identity).unwrap(), before);
+}
+
+#[test]
 fn identity_targets_do_not_generate_read_or_revoke_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");

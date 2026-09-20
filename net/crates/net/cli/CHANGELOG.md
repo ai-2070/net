@@ -8,6 +8,12 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — adoption target inspection
+
+- `node adopt --inspect-target` reports authority and input paths plus the
+  public subject fingerprint without reading certificates/floors or installing
+  ownership. Normal adoption and inspection share authority-path resolution.
+
 ## Unreleased — identity and announcement artifact inspection
 
 - Identity generate/show/fingerprint/revoke accept `--inspect-target` without
