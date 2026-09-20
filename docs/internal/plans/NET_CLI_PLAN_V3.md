@@ -3,7 +3,7 @@
 > **For Hermes:** After V2 acceptance and explicit implementation authorization, use the subagent-driven-development skill for one accepted slice at a time, with independent review. This document authorizes planning, not production edits or protocol publication.
 
 **Status:** Proposed follow-on to [NET_CLI_PLAN_V2.md](NET_CLI_PLAN_V2.md). Do not interleave V3 implementation with the active V2 work.
-**Goal:** An operator sends a join link; a new device joins the intended mesh, optionally its organization and exact subnet, survives restart, and can later be selectively removed with verifiable, honestly scoped enforcement.
+**Goal:** An operator sends a join link; a new device joins the intended mesh, optionally its organization and exact subnet, survives restart, can voluntarily leave, and can be selectively removed by an operator with verifiable, honestly scoped enforcement.
 **Architecture:** Thin Rust/Clap commands over reusable SDK enrollment and authority mechanisms, backed by an explicitly running operator service and durable local state. Enrollment, observation, and removal refer to real identities and real enforcement points; temporary supervisors, inventory records, and credential files never stand in for deployment effects.
 **Tech stack:** Existing `net-cli` / `net-mesh` executable, Tokio, `net-mesh-sdk`, signed organization/subnet credentials, current native transport and optional bootstrap adapters. No new global control plane.
 **Planning source snapshot:** `234c3685a285353d89fd92a540eb33a826c44194`, in `C:/Users/chief/orca/workspaces/net/net-cli`. V2 implementation was actively editing the checkout during inspection. This is a source survey, not runtime acceptance or the eventual V3 implementation baseline.
@@ -33,6 +33,7 @@ V2's deferred transfer holder, generic unary RPC, remote Deck, and crash-safe Ne
 7. An invocation without separately granted execution authority is denied. Apply the explicit existing dispatcher/capability/provider permissions and prove the authorized call reaches the exact provider.
 8. Remove B from one selected subnet. The selected enforcement points refuse B's old credentials, including after reconnect/restart; unaffected device C still works. B's unrelated organization/capability/subnet authority is not silently revoked.
 9. Revoke organization membership separately and prove its own admission consequences. Report remaining transport and independently granted access rather than claiming the device has disappeared from the entire mesh.
+10. On a separately admitted device, voluntarily leave a selected subnet/org/mesh, including while its authority is unreachable. Prove local participation and automatic renewal/rejoin stop across restart, unrelated relations remain intact, and authority notification is reported separately from revocation. Later rejoining requires explicit intent and current authorization.
 
 **Completion is this loop, not a help tree.** A successful link mint followed by manual PSK copying, an inventory deletion with continuing admission, or a generated certificate without live acceptance does not complete V3.
 
@@ -76,6 +77,9 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 | `net-mesh join <join-link>` | Enroll a new device into the stated mesh; persist and apply the selected bundle. Also support protected file/stdin input to avoid shell-history leakage. |
 | `net-mesh org invite <org-ref>` / `org join <join-link>` | Explicit organization membership enrollment, optionally composed with mesh connectivity and subnet attachment. No owner replacement. |
 | `net-mesh subnet invite <subnet-ref>` / `subnet join <join-link>` | Explicit endpoint attachment invitation; standalone join reuses an already-connected identity. |
+| `net-mesh leave <mesh-ref>` | Voluntary local departure from the selected mesh enrollment; disables its automatic attachment/renewal and stops its controlled runtime participation, without deleting device identity or claiming transport-secret revocation. |
+| `net-mesh org leave <org-ref>` | Voluntary local deactivation of that organization enrollment and dependent use; not an owner transfer or issuer-side membership revocation. |
+| `net-mesh subnet leave <subnet-ref>` | Voluntary local withdrawal from that exact qualified subnet; unrelated memberships and authority remain unchanged. |
 | `net-mesh enrollment status` / `enrollment devices` | Own service/enrollment status and issuer inventory, with separately attributed live observations. Not an omniscient mesh roster. |
 | `net-mesh org members <org-ref>` / `subnet members <subnet-ref>` | Authorized issuer inventory plus scoped enforcement-point observations, distinguishing issued from live-admitted and unknown. |
 | `net-mesh org remove <org-ref> <entity-id>` | Revoke the selected membership relation using the actual organization floor/admission mechanism. |
@@ -154,6 +158,25 @@ Default mutation completion may mean durable owner commit, with clearly named pe
 
 **Transport caveat:** Removing membership or subnet access does not take back a shared PSK already known to B. State whether B can still establish transport or access public/unrelated services. Whole-mesh transport expulsion requires its own verified session/admission or key-rotation mechanism; V3 must not claim it from an org/subnet removal.
 
+### 6.3 Voluntary leave: local intent, not forced removal
+
+`leave` is initiated by the participating device's local operator. `remove` is an authority operation against a potentially uncooperative subject. Both use the shared lifecycle/status machinery, but they have different postconditions.
+
+- Resolve the selected enrollment and preview its dependent providers, callers, attachments and renewal tasks. Require the existing V2 confirmation contract for consequential changes; `--yes` bypasses the prompt, not scope validation. Never select all meshes/orgs/subnets by default.
+- Persist a scoped **left/disabled intent** before attempting authority notification. Fence in-flight join/renew/install callbacks so delayed success cannot reactivate it. Startup and renewal paths must honor this state; explicit later join is the only way to restore intent, and it still needs current authorization.
+- Stop new work under the selected relation and deactivate its controlled runtime use, renewal and automatic reattachment. Define a bounded shutdown/drain policy for already-active work; do not replay calls or claim cancellation reverses completed remote effects. Remove affected advertisements/attachments where the runtime owns them.
+- A CLI process cannot stop arbitrary independent SDK processes by editing a profile. Use the actual local runtime/control owner selected at V3-0. If an existing consumer cannot be fenced or acknowledged, report **local configuration disabled; runtime stop unconfirmed** and do not emit complete-left success. An explicitly offline mode may disable next-start use, but must disclose its weaker guarantee.
+- Deactivate only the selected enrollment's credential references. Preserve the device key, unrelated memberships, retained application data, audit receipts and revocation maxima. No secure-erasure claim and no automatic deletion of shared PSKs or credential files used by another relation.
+- Leaving an org does not erase historical ownership or authorize adoption by a different org. Retain the existing single-owner guard; ownership migration remains outside this plan. Leaving a mesh makes dependent use over that connection unavailable without pretending it revoked independent org/subnet credentials.
+- Local departure must work while the authority is offline. Attempt a bounded, identity-authenticated notification when possible and retain a resumable receipt otherwise. Show **left locally; authority notification pending** separately from **authority notified**. No issuer private key is needed to stop one's own participation.
+- Notification is advisory unless the authority explicitly commits a supported self-revocation request. Authenticate the subject and bind the request to exact relation/incarnation; it must never authorize removing another device. Reuse the removal mechanism for any actual revocation, with the same durability/propagation evidence. Do not make self-revocation a prerequisite for local leave.
+- Retries are idempotent. A delayed leave notification or callback for the old enrollment must not deactivate or revoke a newer explicitly accepted enrollment. Where the existing revocation semantics cannot safely distinguish them, refuse stale self-revocation rather than raising a floor against the successor.
+- Status must distinguish `active`, `left locally`, `stop unconfirmed`, `notification pending`, and authority-confirmed revocation without treating those labels as one shared authority state. Rejoin must not clear floors, bypass issuer approval or generate a new identity as an escape hatch.
+
+### Leave acceptance boundary
+
+Successful default leave means the durable local intent is disabled and the controlled live runtime has stopped the selected participation. Remote notification may remain pending and is explicitly reported. It does **not** prove all copies of the credential are unusable elsewhere. A required live-stop timeout is a nonzero partial result with its receipt retained; an authority-notification timeout alone does not undo completed local departure.
+
 ## 7. Ordered implementation slices
 
 Implementers choose coherent factoring and review boundaries. Each code-bearing task starts with a failing witness, adds the smallest correction, runs the focused GREEN and relevant regressions, and records an independent inverse for authority/durability claims. Do not invent passing counts or write production APIs from these proposed names without checking the accepted baseline.
@@ -170,6 +193,7 @@ Tasks:
 4. Specify membership-only enrollment outcome and its consumer path, preserving the existing agent delegation APIs unchanged. Pin only the new typed fields/version boundaries actually necessary.
 5. Specify the minimal selective subnet-removal mechanism and verification set; identify exact SDK/core/wire owners and cross-language compatibility work if wire changes are required.
 6. Map each required outcome to an existing mechanism, missing hook and witness. Record final CLI syntax/defaults and state transitions in this document.
+7. Pin the local lifecycle owner for voluntary leave, its durable intent/fencing and dependent-service stop policy. Identify which consumers acknowledge live stop and which can only honor next-start disablement; do not promise control over arbitrary SDK processes.
 
 **Exit:** No unresolved authority/bootstrap/state-owner decision may be passed to a command wrapper. If a mechanism needs a wider protocol redesign than this bounded lifecycle, stop that slice for an explicit scope decision; do not declare V3 complete or reopen serverless/remote Deck. This is a bounded design gate for named blockers, not a new platform-foundation project.
 
@@ -200,6 +224,20 @@ Tasks:
 5. Exercise partial issuance/install, restart, expiry/renewal and same-identity resume. Verify a standard consumer after restart can use the enrolled profile and requires separately supplied invocation grants.
 
 **Exit:** All requested enrollment shapes complete through CLI processes, with joined status only for stages actually verified. Wrong authority and denied policy fail before handler effects; direct and delegated subnet issuers are tested where offered.
+
+### V3-2A — voluntary leave through the same lifecycle
+
+**Modify:** shared SDK enrollment/persistence/lifecycle modules selected in V3-1/2; CLI `enrollment.rs`, `org.rs`, `subnet.rs`, `config.rs` and relevant runtime adapters.
+**Proposed new test:** `cli/tests/enrollment_leave.rs`. Keep this inside the existing lifecycle work, not a new control-plane project.
+
+Tasks:
+1. Write RED for mesh/org/subnet leave, offline authority, repeated leave and an in-flight renewal completing after departure. Assert preserved device identity and unaffected memberships/data.
+2. Implement durable scoped disabled intent, callback fencing, controlled runtime stop and profile/credential deactivation. Preserve the existing owner guard and revocation floors.
+3. Add explicit-target leave commands, bounded stop/notification behavior and partial receipts. Authenticate any remote self-notification and keep advisory notification separate from revocation.
+4. Prove restart does not renew/rejoin; genuine explicit rejoin uses current authorization; delayed old leave/renew callbacks cannot affect the successor. An unmanaged live consumer must produce stop-unconfirmed, not success.
+5. In a disposable review worktree, bypass disabled-intent checks and allow a late renewal to install: the relevant witnesses must fail. Restore the candidate and run compatibility controls.
+
+**Exit:** Local voluntary departure is usable online/offline and remains in effect across restart, with honest runtime and remote-state reporting. It neither depends on remote approval nor masquerades as issuer-enforced revocation.
 
 ### V3-3 — live inspection without false completeness
 
@@ -235,7 +273,7 @@ Tasks:
 **Proposed new deliverables:** fixtures under `cli/tests/fixtures/enrollment/` and `cli/tests/enrollment_workflow.rs`.
 
 Tasks:
-1. Ship runnable operator/joiner/provider fixtures and public instructions with prerequisites, terminal ownership, join links, separate grants, inspection, removal, restart and cleanup.
+1. Ship runnable operator/joiner/provider fixtures and public instructions with prerequisites, terminal ownership, join links, separate grants, inspection, voluntary leave, operator removal, restart and cleanup. Demonstrate the distinction between offline local departure and remote revocation.
 2. Extend V2's same-runner two-node CLI journey. Add a third identity/participant for the selective-removal positive control; loopback proves multi-node/process behavior, not multiple physical computers.
 3. Exercise native publisher/consumer behavior and the existing MCP route without adding generic RPC hosting. Match accepted calls to provider-side effects and rejected calls to actual gate decisions.
 4. Add platform gates for Unix permissions, Windows secret storage/replacement, process lifetime and default/optional features. Pin new root integration binaries and required authority witnesses; CLI tests remain auto-discovered.
@@ -265,6 +303,9 @@ All rows are required unless explicitly marked feature-conditional; narrow slice
 | E14 | No secrets in debug/error/stdout by default, no real user directories touched in tests, and Unix/Windows persistence checks actually execute on their platforms. |
 | E15 | V2 target/framing/deadline/confirmation/typegen/journey regressions pass; service startup timeout does not kill a successfully started listener. |
 | E16 | Public CLI journey proves a provider-side accepted effect, actual unauthorized gate denial, selective removal, restart and cleanup. Optional bootstrap adapters require their own feature-enabled tests. |
+| E17 | Mesh/org/subnet leave disables the exact relation, stops controlled live use and automatic renewal/rejoin across restart, preserving identity, unrelated authority and data; unmanaged live use is stop-unconfirmed. |
+| E18 | Offline leave completes locally with notification pending; retries are idempotent; notification never implies revocation and cannot target another identity. |
+| E19 | Concurrent join/renew completion cannot undo leave; delayed old leave/notification cannot revoke an explicitly authorized successor; rejoin preserves floors and the single-owner guard. |
 
 For denial witnesses, observe a real authenticated request at the relevant production gate and its refusal, then run an authorized positive control. A timeout or absence of output alone is insufficient. For durability/ordering claims, barriers/fault injection must reach the production transition; sleep-based contention is supplemental. Disable the claimed mechanism in a disposable review worktree and require the named witness to fail.
 
@@ -276,7 +317,7 @@ These are **future implementation gates**, not executed results. Run Rust comman
 cargo check -p net-cli --all-targets
 
 # NEW V3 DELIVERABLES: run after their files have been added.
-cargo nextest run -p net-cli --test enrollment_lifecycle --test org_join --test subnet_join --test enrollment_status --test enrollment_removal --test enrollment_workflow --no-tests=fail --retries 0
+cargo nextest run -p net-cli --test enrollment_lifecycle --test org_join --test subnet_join --test enrollment_leave --test enrollment_status --test enrollment_removal --test enrollment_workflow --no-tests=fail --retries 0
 
 # Existing CLI compatibility coverage, then one complete default sweep.
 cargo nextest run -p net-cli --test org_adopt --test org_grant --test subnet_issuance --test target_resolution --test remote_inspection --no-tests=fail --retries 0
