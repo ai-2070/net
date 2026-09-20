@@ -1,0 +1,28 @@
+web/src/content/docs/reference/cli.md
+  s_38828de26a56bb::t_03361d7ae541d4 7,11-15,97,114,116,123,147,213,252,311
+  s_38828de26a56bb::t_a410ccc71505eb 21-23,27,29-30,33,37,39-40,43,45,49,51-52,55,59,61-62,65,69,71-72,77,79-80,83,87,89-90,93
+  s_38828de26a56bb::t_bea9035bdb0c8d 305-307
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_38828de26a56bb::t_a823ee872d7ffe 145
+  s_38828de26a56bb::t_bea9035bdb0c8d 143,161
+  s_38828de26a56bb::t_2230cdaf50f098 3,165
+  s_38828de26a56bb::t_c1c075cdb1d193 166
+net/crates/net/cli/README.md
+  s_38828de26a56bb::t_5be785411cf12e 5,30,33-41,43,45,47-49,62-63,65,68-69,74-75,77-78,97-99,103,114,134-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5f4b0203a55b3ce1dc445670dbfe91d18bc897d4",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
