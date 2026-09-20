@@ -149,7 +149,11 @@ Forwarding policy (`enable/disable/allow/rm/audit`), MCP pins (`approve/reject/l
 
 Feature-enabled `anchor serve --inspect-target` resolves mesh/HTTPS/RTC/STUN binds, TLS file paths or ACME cache/challenge settings, and the public issuer fingerprint. It reads profile configuration but not PSK/TLS files; it does not start sockets, order certificates or generate an identity. Normal serving consumes the same resolved selections. The standalone anchor keeps its existing ephemeral identity and ignores profile identity/remote/bind defaults; inspection reports that identity as unavailable. Defaults remain mesh `0.0.0.0:0`, HTTPS `0.0.0.0:8443`, RTC on the mesh IP with an ephemeral port, and no second STUN socket. `:0` is a requested ephemeral port, not a bound address; runtime-announced endpoints, TLS validity, authority and reachability are not verified by inspection.
 
-Inspection is not yet CLI-wide: offline issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
+Identity `generate/show/fingerprint/revoke` and `cap announce` also support `--inspect-target`. Generate reports an unavailable identity and either explicit `destination` or a `destination_pattern` containing `<generated-operator-id>`; it does not generate a key merely to guess the runtime filename. Show/fingerprint inspect the source path without reading its contents or calculating its subject fingerprint. Revoke reports the selected floor store and a public issuer fingerprint without opening the store or changing floors; it does not prove revocation has propagated.
+
+`cap announce --inspect-target` reads the explicit `--key` through its normal secret-file gate, reports that signer's public fingerprint and the file/stdout destination, then exits without signing or emitting announcement bytes. The profile identity is unused; a conflicting `--node-id` still fails. Inspection is not validation of all announcement policies/tags or publication to a mesh. Normal execution retains its signing and output behavior.
+
+Inspection is not yet CLI-wide: organization/subnet/bootstrap credential issuance, other temporary-supervisor commands and keychain-backed `forwarding set-value` remain outside this surface.
 
 ## Exit codes
 

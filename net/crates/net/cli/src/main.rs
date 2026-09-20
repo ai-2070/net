@@ -291,7 +291,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let quiet = cli.quiet;
     match cli.command {
         Command::Version => commands::version::run(output).await,
-        Command::Identity(cmd) => commands::identity::run(cmd, output).await,
+        Command::Identity(cmd) => commands::identity::run(cmd, output, config_path, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,

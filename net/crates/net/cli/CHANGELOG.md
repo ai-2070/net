@@ -8,6 +8,18 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — identity and announcement artifact inspection
+
+- Identity generate/show/fingerprint/revoke accept `--inspect-target` without
+  generating keys, reading identity payloads or raising revocation floors.
+  A default generation destination is a runtime filename pattern, not a
+  fabricated identity or path. Explicit destinations and store precedence
+  retain their existing meaning.
+- `cap announce --inspect-target` reports the actual signer fingerprint and
+  file/stdout destination without signing or emitting announcement bytes.
+  The selected key is read through the existing permission/parse gate;
+  conflicting node-ID confirmation fails before inspection as in execution.
+
 ## Unreleased — standalone anchor inspection
 
 - `anchor serve --inspect-target` (`rtc-bootstrap`) resolves listener/RTC/TLS

@@ -50,7 +50,13 @@ These local operations report unused remote defaults, `identity.state: unused`, 
 
 Forwarding policy (`enable/disable/allow/rm/audit`) and MCP pins (`approve/reject/list`) also support inspection. Store selection remains their own per-user default or explicit `--store`/`--pin-store`, not profile `netdb`. Inspection does not load store contents, create locks or modify policy/consent. Keychain-backed `forwarding set-value` does not support it.
 
-Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Offline issuance and other temporary-supervisor commands remain follow-up work.
+Transfer `send-blob/send-dir --inspect-target` reports the source and optional staging store without reading files/stdin, walking directories or creating a store. With `--store` the mode is `persistent_store`; without it, `offline`. For `send-blob -`, source provenance is `stdin`. Staging is not publication or hosting. These inspection paths do not validate mutation arguments or approve authority. Remaining organization/subnet/bootstrap credential issuance and other temporary-supervisor commands are follow-up work.
+
+## Inspect identity and announcement artifacts
+
+Identity `generate/show/fingerprint/revoke` supports `--inspect-target`. Generate reports an unavailable identity and the explicit output path, or a `destination_pattern` containing `<generated-operator-id>` when the filename depends on the not-yet-generated identity. The pattern is not a concrete writable destination. Show/fingerprint report the source path without reading the file or computing a subject fingerprint. Revoke reports the actual explicit/default revocation store and a public issuer fingerprint without opening the store or raising floors; inspection does not establish enforcement or propagation.
+
+`cap announce --inspect-target` loads the explicit signing key through the normal permission/parse gate, reports its public fingerprint and the file/stdout destination, and exits before signing or writing an announcement. It does not use profile identity or remote defaults. An incompatible `--node-id` is refused before either inspection or signing. Other tag/policy validation remains part of execution; target inspection is not publication or authority approval. Ordinary output formats and overwrite/revocation safeguards are unchanged.
 
 ## Inspect standalone anchor serving
 

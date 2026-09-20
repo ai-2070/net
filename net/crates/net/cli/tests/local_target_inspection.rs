@@ -27,6 +27,107 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn identity_targets_do_not_generate_read_or_revoke_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let artifact = dir.path().join("identity.toml");
+    let store = dir.path().join("revocations.json");
+    let issuer = "0101010101010101010101010101010101010101010101010101010101010101";
+    for command in [
+        vec!["identity", "generate", "--out", artifact.to_str().unwrap()],
+        vec!["identity", "show", artifact.to_str().unwrap()],
+        vec!["identity", "fingerprint", artifact.to_str().unwrap()],
+        vec![
+            "identity",
+            "revoke",
+            issuer,
+            "--revocation-store",
+            store.to_str().unwrap(),
+        ],
+    ] {
+        let verb = command[1];
+        let mut args = vec!["--config", cfg.to_str().unwrap()];
+        args.extend(command);
+        args.push("--inspect-target");
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(view["ignored_profile_remote_defaults"], true);
+        assert_eq!(view["authorization"], "not_checked");
+        match verb {
+            "generate" => {
+                assert_eq!(view["destination"], artifact.to_str().unwrap());
+                assert_eq!(view["identity"]["state"], "unavailable");
+            }
+            "show" | "fingerprint" => {
+                assert_eq!(view["source"], artifact.to_str().unwrap());
+                assert_eq!(view["identity"]["state"], "unused");
+            }
+            "revoke" => {
+                assert_eq!(view["store"], store.to_str().unwrap());
+                assert!(view["subject_fingerprint"].as_str().is_some());
+                assert!(!String::from_utf8_lossy(&out.stdout).contains(issuer));
+            }
+            _ => unreachable!(),
+        }
+        assert!(!artifact.exists() && !store.exists());
+    }
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "identity",
+        "generate",
+        "--inspect-target",
+    ]);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(view.get("destination").is_none());
+    assert!(view["destination_pattern"]
+        .as_str()
+        .unwrap()
+        .contains("<generated-operator-id>"));
+    assert_eq!(view["identity"]["state"], "unavailable");
+    assert!(view["identity"]["fingerprint"].is_null());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    config(&artifact, "PRIVATE_SENTINEL corrupt identity");
+    for verb in ["show", "fingerprint"] {
+        let out = run(&[
+            "--config",
+            cfg.to_str().unwrap(),
+            "identity",
+            verb,
+            artifact.to_str().unwrap(),
+            "--inspect-target",
+        ]);
+        assert!(out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("PRIVATE_SENTINEL"));
+    }
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "identity",
+        "generate",
+        "--out",
+        artifact.to_str().unwrap(),
+        "--force",
+        "--inspect-target",
+    ]);
+    assert!(out.status.success());
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"PRIVATE_SENTINEL corrupt identity"
+    );
+}
+
+#[test]
 fn policy_pins_and_staging_inspect_without_accessing_contents() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");
@@ -353,6 +454,95 @@ fn environment_selections_are_validated_and_flags_override_them() {
         .args(["version", "--profile", "default"])
         .assert()
         .success();
+}
+
+#[test]
+fn announcement_inspection_reports_the_real_signer_without_signing_or_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    config(
+        &cfg,
+        "[default]\nnode_addr = 'unused'\nidentity = 'unused-missing'\n",
+    );
+    let key = dir.path().join("identity.toml");
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "identity",
+        "generate",
+        "--out",
+        key.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let before = std::fs::read(&key).unwrap();
+    let fingerprint = run(&["identity", "fingerprint", key.to_str().unwrap()]);
+    assert!(fingerprint.status.success());
+    let fingerprint: Value = serde_json::from_slice(&fingerprint.stdout).unwrap();
+    let dest = dir.path().join("announcement.json");
+    let args = [
+        "--config",
+        cfg.to_str().unwrap(),
+        "cap",
+        "announce",
+        "--key",
+        key.to_str().unwrap(),
+        "--tag",
+        "example.tool",
+        "--out",
+        dest.to_str().unwrap(),
+    ];
+    let mut inspect = args.to_vec();
+    inspect.push("--inspect-target");
+    let out = run(&inspect);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["mode"], "offline");
+    assert_eq!(view["identity"]["state"], "configured");
+    assert_eq!(view["identity"]["fingerprint"], fingerprint["fingerprint"]);
+    assert_eq!(view["destination"], dest.to_str().unwrap());
+    assert_eq!(view["provenance"]["identity"], "flag");
+    let key_file: toml::Value = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(key_file["seed_hex"].as_str().unwrap()));
+    assert_eq!(std::fs::read(&key).unwrap(), before);
+    assert!(!dest.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    let mut stdout_inspect = args[..args.len() - 2].to_vec();
+    stdout_inspect.push("--inspect-target");
+    let out = run(&stdout_inspect);
+    assert!(out.status.success());
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(view["provenance"]["destination"], "stdout");
+    assert!(view.get("destination").is_none());
+    let mut wrong_node = inspect.clone();
+    wrong_node.extend(["--node-id", "0"]);
+    let out = run(&wrong_node);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(!dest.exists());
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.is_file());
+    let announcement =
+        net_sdk::capabilities::CapabilityAnnouncement::from_bytes(&std::fs::read(&dest).unwrap())
+            .unwrap();
+    announcement.verify().unwrap();
+    assert_eq!(
+        hex::encode(announcement.entity_id.as_bytes()),
+        key_file["public_key_hex"].as_str().unwrap()
+    );
+    config(&key, "seed_hex = 'PRIVATE_SENTINEL\n");
+    let out = run(&inspect);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE_SENTINEL"));
 }
 
 #[test]

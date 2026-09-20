@@ -97,6 +97,9 @@ pub struct NodesArgs {
 
 #[derive(Args, Debug)]
 pub struct AnnounceArgs {
+    /// Inspect signer/output selection without signing or emitting an announcement.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// One or more capability tags to carry on the announcement
     /// (e.g. `nrpc:my-service`, `dataforts.blob.overflow`).
     ///
@@ -176,7 +179,7 @@ pub async fn run(
         CapCommand::Show(args) => run_show(args, output, config_path, profile_name).await,
         CapCommand::Query(args) => run_query(args, output, config_path, profile_name).await,
         CapCommand::Nodes(args) => run_nodes(args, output, config_path, profile_name).await,
-        CapCommand::Announce(args) => run_announce(args).await,
+        CapCommand::Announce(args) => run_announce(args, output, config_path, profile_name).await,
     }
 }
 
@@ -332,12 +335,32 @@ fn capability_set_from_tags(tags: &[String]) -> Result<CapabilitySet, CliError> 
     Ok(caps)
 }
 
-async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
+async fn run_announce(
+    args: AnnounceArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
     // 1. Identity. Reuses the same TOML loader the live
     //    `CliContext::build` path uses so an operator can point
     //    `--key` at the same file they already configured for
     //    other write-side subcommands.
     let keypair = load_identity_keypair(&args.key).await?;
+    let node_id = resolve_announcement_node_id(keypair.node_id(), args.node_id.as_deref())?;
+    if args.inspect_target {
+        let profile = resolve_profile(config_path, profile_name).await?;
+        let mut view = crate::target::TargetInspection::local(&profile, "offline");
+        view.configured_identity(keypair.entity_id().as_bytes());
+        view.provenance("identity", "flag");
+        view.source = Some(args.key.clone());
+        view.destination = args.out.clone();
+        view.provenance("source", "flag");
+        view.provenance(
+            "destination",
+            if args.out.is_some() { "flag" } else { "stdout" },
+        );
+        return view.emit(output);
+    }
 
     // 2. Allow-list parsing — fail loudly on any malformed entry
     //    before signing anything. Operators get a typed error per
@@ -376,24 +399,7 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     //    Allow `--node-id` only as an explicit confirmation (must
     //    equal the derived value); a mismatch is an operator error
     //    that would otherwise produce unusable bytes.
-    let derived = keypair.node_id();
-    let node_id = match args.node_id.as_deref() {
-        Some(s) => {
-            let supplied = parse_node_id(s)?;
-            if supplied != derived {
-                return Err(invalid_args(format!(
-                    "--node-id {supplied:#x} does not match the signing key's \
-                     derived node id {derived:#x}; receivers re-derive the \
-                     expected NodeId from the signed entity_id and reject \
-                     announcements with mismatched bindings. Drop the flag \
-                     to use the derived value, or sign with the keypair that \
-                     produces {supplied:#x}."
-                )));
-            }
-            supplied
-        }
-        None => derived,
-    };
+    // Already resolved before the inspection branch, without signing.
 
     // 4. Build the CapabilitySet with the user-supplied tags.
     let caps = capability_set_from_tags(&args.tags)?;
@@ -414,6 +420,23 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     let bytes = ann.to_bytes();
     write_announcement_output(args.out.as_deref(), &bytes).await?;
     Ok(())
+}
+
+fn resolve_announcement_node_id(derived: u64, supplied: Option<&str>) -> Result<u64, CliError> {
+    if let Some(s) = supplied {
+        let supplied = parse_node_id(s)?;
+        if supplied != derived {
+            return Err(invalid_args(format!(
+                "--node-id {supplied:#x} does not match the signing key's \
+                 derived node id {derived:#x}; receivers re-derive the \
+                 expected NodeId from the signed entity_id and reject \
+                 announcements with mismatched bindings. Drop the flag \
+                 to use the derived value, or sign with the keypair that \
+                 produces {supplied:#x}."
+            )));
+        }
+    }
+    Ok(derived)
 }
 
 fn parse_node_ids(values: &[String]) -> Result<Vec<u64>, CliError> {

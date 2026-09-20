@@ -15,6 +15,10 @@ pub(crate) fn has_profile_target(profile: &crate::config::Profile) -> bool {
 #[derive(Serialize)]
 pub(crate) struct TargetInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_pattern: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<std::path::PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<std::path::PathBuf>,
@@ -135,6 +139,8 @@ pub(crate) async fn inspect(
         },
     };
     Ok(TargetInspection {
+        destination_pattern: None,
+        subject_fingerprint: None,
         store: None,
         source: None,
         destination: None,
@@ -181,6 +187,8 @@ impl TargetInspection {
     /// an unrelated profile identity must not be read or generated to inspect.
     pub(crate) fn local(profile: &crate::config::Profile, mode: &'static str) -> Self {
         Self {
+            destination_pattern: None,
+            subject_fingerprint: None,
             store: None,
             source: None,
             destination: None,
@@ -211,6 +219,22 @@ impl TargetInspection {
 
     pub(crate) fn provenance(&mut self, field: &'static str, source: &'static str) {
         self.provenance.insert(field, source);
+    }
+
+    pub(crate) fn unavailable_identity(&mut self, reason: &'static str) {
+        self.identity = InspectionIdentity {
+            state: "unavailable",
+            fingerprint: None,
+            reason: Some(reason),
+        };
+    }
+
+    pub(crate) fn configured_identity(&mut self, public_key: &[u8]) {
+        self.identity = InspectionIdentity {
+            state: "configured",
+            fingerprint: Some(public_fingerprint(public_key)),
+            reason: None,
+        };
     }
 
     pub(crate) fn explicit_mode(&mut self) {
