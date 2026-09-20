@@ -1,0 +1,38 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 1797-1848
+docs/internal/spikes/org-streaming/S0_MAPPING.md
+  h_64425bc75e3f3d 1-202
+net/crates/net/guards/org_api_probe/.gitignore
+  h_64425bc75e3f3d 1-7
+net/crates/net/guards/org_api_probe/Cargo.lock
+  h_64425bc75e3f3d 1-1731
+net/crates/net/guards/org_api_probe/Cargo.toml
+  h_64425bc75e3f3d 1-58
+net/crates/net/guards/org_api_probe/MANIFEST
+  h_64425bc75e3f3d 1-43
+net/crates/net/guards/org_api_probe/src/main.rs
+  h_64425bc75e3f3d 1-450
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  h_64425bc75e3f3d 23-24,26,32-35,57-61,125-128,153-162,177-236,343,402,406-531,762-791
+net/crates/net/sdk/benches/nrpc_unary.rs
+  h_64425bc75e3f3d 21-28,39-40,112-131
+net/crates/net/src/adapter/net/behavior/mod.rs
+  h_64425bc75e3f3d 71-74,80-83
+net/crates/net/src/adapter/net/behavior/org_stream_lifecycle.rs
+  h_64425bc75e3f3d 1-1707
+net/crates/net/src/adapter/net/behavior/org_stream_registry.rs
+  h_64425bc75e3f3d 1-3651
+spikes/org-streaming/S0_BRIEF.md
+  h_64425bc75e3f3d 1-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "23f33bf98667f11aae04b41a21775df3d56b192e",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
