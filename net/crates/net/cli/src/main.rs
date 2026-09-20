@@ -145,31 +145,31 @@ enum Command {
     /// Operator identity authoring + inspection.
     #[command(subcommand)]
     Identity(commands::identity::IdentityCommand),
-    /// Signed admin-chain commits (9 verbs).
+    /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
-    /// Break-glass ICE operator surface (simulate → commit).
+    /// Temporary-supervisor ICE simulation/commit (--local).
     #[command(subcommand)]
     Ice(commands::ice::IceCommand),
-    /// `MeshOsSnapshot` reads (one-shot).
+    /// Temporary-supervisor snapshot reads (--local).
     #[command(subcommand)]
     Snapshot(commands::snapshot::SnapshotCommand),
-    /// Read-only operator-audit queries.
+    /// Temporary-supervisor audit reads/streams (--local).
     #[command(subcommand)]
     Audit(commands::audit::AuditCommand),
-    /// Substrate log stream.
+    /// Temporary-supervisor log stream (--local).
     #[command(subcommand)]
     Log(LogCommand),
-    /// Substrate failure stream.
+    /// Temporary-supervisor failure stream (--local).
     #[command(subcommand)]
     Failures(FailuresCommand),
-    /// Capability advertisement + discovery.
+    /// Temporary capability reads (--local) or offline announcement authoring.
     #[command(subcommand)]
     Cap(commands::cap::CapCommand),
-    /// Peer + NAT-traversal helpers.
+    /// Temporary-supervisor peer listing (--local).
     #[command(subcommand)]
     Peer(PeerCommand),
-    /// Per-daemon listing.
+    /// Temporary-supervisor daemon listing (--local).
     #[command(subcommand)]
     Daemon(DaemonCommand),
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
@@ -186,16 +186,16 @@ enum Command {
     /// (plan §5 Layer 0, Stage 4b).
     #[command(subcommand)]
     Anchor(commands::anchor::AnchorCommand),
-    /// Hierarchical subnet inspection (`show|ls|tree`).
+    /// Temporary topology reads (--local) or offline subnet authority tools.
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
-    /// `SubnetGateway` stats + export-table operator surface.
+    /// Temporary gateway reads (--local); export is unsupported.
     #[command(subcommand)]
     Gateway(commands::gateway::GatewayCommand),
-    /// `ChannelConfigRegistry` inspection (`visibility|ls`).
+    /// Temporary channel registry reads (--local).
     #[command(subcommand)]
     Channel(commands::channel::ChannelCommand),
-    /// `AggregatorDaemon` inspection + remote query.
+    /// Temporary inspection (--local) or explicitly targeted aggregator RPC.
     #[command(subcommand)]
     Aggregator(commands::aggregator::AggregatorCommand),
     /// Blob + directory transfer (recv/send/ls/status/cancel).

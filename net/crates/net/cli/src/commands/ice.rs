@@ -126,6 +126,9 @@ pub struct KillMigrationArgs {
 
 #[derive(Args, Debug)]
 pub struct CommonIceArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     /// Build the envelope + simulate, print the blast radius,
     /// do NOT commit. Exits 0 regardless of operator approval.
     #[arg(long)]
@@ -255,6 +258,7 @@ async fn run_ice<F>(
 where
     F: for<'a> FnOnce(&'a net_sdk::deck::DeckClient) -> net_sdk::deck::IceProposal<'a>,
 {
+    super::scope::require_local(common.scope.local, "ice")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(
         &profile,

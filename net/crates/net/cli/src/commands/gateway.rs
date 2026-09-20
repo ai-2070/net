@@ -47,6 +47,9 @@ pub enum GatewayCommand {
 
 #[derive(Args, Debug)]
 pub struct StatsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -56,6 +59,9 @@ pub struct StatsArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -102,6 +108,7 @@ async fn run_stats(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "gateway stats")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let view = match ctx.deck().gateway_stats() {
@@ -119,6 +126,7 @@ async fn run_exports(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "gateway exports")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();

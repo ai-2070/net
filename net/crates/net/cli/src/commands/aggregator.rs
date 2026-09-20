@@ -100,6 +100,9 @@ pub enum AggregatorCommand {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -109,6 +112,9 @@ pub struct InspectArgs {
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -225,6 +231,7 @@ async fn run_inspect(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "aggregator inspect")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
@@ -335,9 +342,20 @@ async fn run_ls(
     // an operator who supplied attach flags doesn't accidentally
     // read the local registry.
     let want_remote = args.remote || args.attach.node_addr.is_some();
+    if args.scope.local
+        && (want_remote
+            || args.attach.node_pubkey.is_some()
+            || args.attach.remote_node_id.is_some()
+            || args.attach.psk_hex.is_some())
+    {
+        return Err(invalid_args(
+            "--local conflicts with explicit remote target flags",
+        ));
+    }
     if want_remote {
         return run_ls_remote(args, output, &profile).await;
     }
+    super::scope::require_local(args.scope.local, "aggregator ls")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let snapshot = deck.aggregator_registry_snapshot().await;

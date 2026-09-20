@@ -100,6 +100,9 @@ pub struct DropReplicasArgs {
 
 #[derive(Args, Debug)]
 pub struct CommonAdminArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     /// Build the envelope, print it, do NOT commit.
     #[arg(long)]
     pub dry_run: bool,
@@ -263,6 +266,7 @@ where
         return Ok(());
     }
 
+    super::scope::require_local(common.scope.local, "admin")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(
         &profile,

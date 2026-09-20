@@ -8,6 +8,24 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — explicit temporary-supervisor scope
+
+- Admin commits, ICE simulation/commit, audit/log/failure streams, capability
+  reads, peer/daemon listings, subnet topology reads, gateway/channel reads,
+  and local aggregator inspect/list now require `--local`, like snapshot.
+  Without it they exit 2 without a result payload. This is a deliberate
+  script compatibility change: `net-mesh peer ls` becomes
+  `net-mesh peer ls --local` only for intentional development use.
+- Scope: "Starts a temporary supervisor for this command; does not inspect
+  a running node." Successful opt-in emits this notice on stderr even with
+  `--quiet` or logging disabled. Existing JSON result shapes are unchanged.
+  This does not implement remote Deck administration.
+- Admin `--dry-run` remains an offline preview without `--local` or an
+  identity; ICE dry-run still starts a supervisor and requires the opt-in.
+  Offline issuance, persistent stores, and real remote clients are not gated.
+  Gateway export remains unsupported. Local/explicit-remote aggregator
+  selections conflict; profile-only remote list selection is separate work.
+
 ## Unreleased — NetDB restore preflight
 
 - Successful `netdb restore` now persists the restored adapter state for

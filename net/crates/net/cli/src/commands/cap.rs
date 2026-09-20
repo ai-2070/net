@@ -51,6 +51,9 @@ pub enum CapCommand {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     /// Peer node id. Defaults to the local node configured by
     /// `--node`.
     #[arg(long, value_name = "PEER_NODE")]
@@ -65,6 +68,9 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct QueryArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     /// One or more required tags. A node matches when its
     /// advertised capability set contains every tag listed.
     #[arg(long = "tag", required = true, num_args = 1.., value_name = "TAG")]
@@ -79,6 +85,9 @@ pub struct QueryArgs {
 
 #[derive(Args, Debug)]
 pub struct NodesArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -177,6 +186,7 @@ async fn run_show(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "cap show")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
@@ -201,6 +211,7 @@ async fn run_query(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "cap query")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();
@@ -226,6 +237,7 @@ async fn run_nodes(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "cap nodes")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();

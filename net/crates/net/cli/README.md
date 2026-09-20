@@ -42,7 +42,7 @@ net-mesh typegen generate --language ts --from-snapshot tools.json --out ./gener
 
 ### Temporary-supervisor development commands
 
-**Starts a temporary supervisor for this command; does not inspect a running node.** This applies to admin/ICE, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection. `snapshot` already requires explicit `--local`; sibling commands do not yet have that safety gate. Admin `--dry-run` is an offline preview. Gateway export is unsupported.
+**Starts a temporary supervisor for this command; does not inspect a running node.** This applies to admin/ICE, snapshot, audit/log/failures, peer/daemon listings, capability reads, subnet topology reads, gateway/channel reads, and local aggregator inspection. These paths now require explicit `--local`, with a scope notice on stderr even under `--quiet`. Admin `--dry-run` remains an offline preview and needs no opt-in; ICE simulation does require it. Gateway export remains unsupported. Offline issuance and real remote clients do not take this flag.
 
 ```sh
 net-mesh snapshot get --local
@@ -50,8 +50,8 @@ net-mesh snapshot status --local
 ```
 
 Upgrading? [CHANGELOG.md](CHANGELOG.md) records what an operator or a CI
-script has to do differently — 0.35 makes `--local` mandatory on both
-`snapshot` verbs, which will fail scripts that call them.
+script has to do differently. Temporary-supervisor scripts must now add
+`--local` intentionally; this does not turn them into deployment operations.
 
 ## Subcommand surface
 
@@ -91,7 +91,7 @@ Applied to every subcommand; environment-variable fallbacks in brackets:
 - `--profile <name>` `[NET_MESH_PROFILE]` — named profile within the config file.
 - `--insecure-config-permissions` `[NET_MESH_INSECURE_CONFIG_PERMISSIONS]` — read the profile even when it is group/world-accessible or owned by another user.
 - `--output (json|yaml|ndjson|table|text)` — auto-detects `table`/`text` on TTY and `json`/`ndjson` off-TTY.
-- `--quiet` / `-q` — suppress stderr diagnostics.
+- `--quiet` / `-q` — suppress progress/logging; temporary-supervisor scope disclosures remain on stderr.
 - `--verbose` / `-v` — `-v` info, `-vv` debug, `-vvv` trace. `NET_MESH_LOG=` env-filter overrides.
 - `--no-color` `[NO_COLOR]` — disable ANSI in table / text output.
 - `--timeout <dur>` — parsed duration (e.g. `500ms`, `1h30m`; default `30s`), currently not forwarded by dispatch. It is not an enforced universal deadline.

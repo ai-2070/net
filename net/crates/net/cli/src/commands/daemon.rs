@@ -41,6 +41,9 @@ use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -54,6 +57,7 @@ pub async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::require_local(args.scope.local, "daemon ls")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let snapshot = ctx.deck().status();

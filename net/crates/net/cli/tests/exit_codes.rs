@@ -102,7 +102,14 @@ fn code_8_on_ice_confirmation_refused_non_tty() {
     // keeps the test legible.
     Command::cargo_bin("net-mesh")
         .unwrap()
-        .args(["ice", "freeze-cluster", "--ttl", "5m", "--identity"])
+        .args([
+            "ice",
+            "freeze-cluster",
+            "--local",
+            "--ttl",
+            "5m",
+            "--identity",
+        ])
         .arg(&identity)
         .stdin(Stdio::null())
         .assert()

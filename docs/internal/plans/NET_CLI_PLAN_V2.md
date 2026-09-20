@@ -1,6 +1,6 @@
 # Net CLI — current implementation and next bounded work
 
-**Status:** Implementation authorized in the working session. CLI-1 preflight/durable restoration and DOC-0 are implemented and locally verified; CLI-2A is next. Platform CI and the requested two-node CI journey remain outstanding; off-host readiness is not claimed.
+**Status:** Implementation authorized in the working session. CLI-1 preflight/durable restoration, DOC-0, and CLI-2A are implemented and locally verified; CLI-2B is next. Platform CI and the requested two-node CI journey remain outstanding; off-host readiness is not claimed.
 **Source baseline:** `d7b749983199012978e69867f3c3694c4df96f69` on `master`, reviewed 2026-09-20.
 **Package / executable:** `net-cli` / `net-mesh`; package version at the baseline is `0.36.0`.
 **Goal:** Enable capability publishers and consumers to expose, discover, and invoke an authorized capability across processes and computers, know where each operation runs, and capture reusable typed contracts. Repair destructive preflight behavior and misleading execution semantics on the way, using existing SDK mechanisms.
@@ -275,6 +275,10 @@ Verify target discovery and nonzero counts. The CLI has no library target. Typeg
 ## 6. CLI-2 — execution scope and target resolution
 
 ### CLI-2A — explicit fresh-supervisor scope
+
+**Implemented evidence (2026-09-20):** Shared `commands/scope.rs` provides a per-command `--local` opt-in and unsuppressible stderr disclosure. All 36 temporary-supervisor operations are covered, including admin commits and ICE simulations; admin offline previews, offline issuance, persistent stores, and real remote clients remain outside the gate. Snapshot no longer recommends `peer` as a live alternative. Local/explicit-remote aggregator selections conflict, while profile-based selection remains CLI-2B. README, reference, changelog, and generated help descriptions record the migration without changing result payloads.
+
+`tests/temporary_scope.rs` first demonstrated three failing witnesses against the baseline (missing default scope refusal, help disclosure, and opt-in disclosure). Final focused suite: **8 passed**, covering the 36-leaf refusal/help matrix, explicit local reads and signed admin/ICE simulations, streams with logging disabled, offline preview, conflicts, unsupported gateway export, and generated man/completion. The full default CLI regression sweep passed **254 tests**, with **1 existing ignored** aggregator query fixture; the final eighth scope test was added and passed in the subsequent focused run. Existing remote aggregator/transfer and offline typegen/downstream tests remained green. CLI all-target check, strict binary clippy, CLI rustdoc with warnings denied, package formatting, and web checks passed. Exact-head CI, optional-feature coverage, and full repository pre-push checks remain outstanding.
 
 **Outcome:** Fresh-supervisor reads/streams and admin/ICE operations cannot masquerade as live deployment operations.
 
