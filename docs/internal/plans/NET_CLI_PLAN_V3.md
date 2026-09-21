@@ -3,8 +3,8 @@
 > **For Hermes:** After V2 acceptance and explicit implementation authorization, use the subagent-driven-development skill for one accepted slice at a time, with independent review. This document authorizes planning, not production edits or protocol publication.
 
 **Status:** V3 continuation authorized by the user on 2026-09-20. V3-0 source re-survey/design preparation started at `346b4b8bfe74ee8399a5f4191bfc7b86eb7f3a84`; its exit gate is **not passed**. V2's agreed implementation is complete, including generated protected-client coverage, but accepted exact-head CI evidence is still outstanding. The first narrow V3 code slice implements local invitation policy only; no working enrollment service or protocol publication is claimed. See the V3-0 decision record below before implementing wrappers.
-**Goal:** An operator sends a join link; a new device joins the intended mesh, optionally its organization and exact subnet, survives restart, can voluntarily leave, and can be selectively removed by an operator with verifiable, honestly scoped enforcement.
-**Architecture:** Thin Rust/Clap commands over reusable SDK enrollment and authority mechanisms, backed by an explicitly running operator service and durable local state. Enrollment, observation, and removal refer to real identities and real enforcement points; temporary supervisors, inventory records, and credential files never stand in for deployment effects.
+**Goal:** An operator can start and stop a real long-lived Net node from an explicit protected PSK source, send a join link, let a new device join the intended mesh (optionally its organization and exact subnet), survive restart, voluntarily leave, and selectively remove it with verifiable, honestly scoped enforcement.
+**Architecture:** Thin Rust/Clap commands over reusable SDK enrollment, node-lifecycle and authority mechanisms, backed by an explicitly running node/operator service and durable local state. Enrollment, observation, removal, startup and shutdown refer to real identities, processes and enforcement points; temporary supervisors, inventory records, PID files and credential files never stand in for deployment effects.
 **Tech stack:** Existing `net-cli` / `net-mesh` executable, Tokio, `net-mesh-sdk`, signed organization/subnet credentials, current native transport and optional bootstrap adapters. No new global control plane.
 **Planning source snapshot:** `234c3685a285353d89fd92a540eb33a826c44194`, in `C:/Users/chief/orca/workspaces/net/net-cli`. V2 implementation was actively editing the checkout during inspection. This is a source survey, not runtime acceptance or the eventual V3 implementation baseline.
 
@@ -24,7 +24,7 @@ V2's deferred transfer holder, generic unary RPC, remote Deck, and crash-safe Ne
 
 ## 2. The complete operator journey
 
-1. On operator A, select the real identity, authority stores, trust domain, and reachable listener. Start or attach to the explicitly named enrollment service. The listener's lifetime is visible.
+1. On operator A, select the real identity, authority stores, trust domain, reachable listener and protected PSK source. Start or attach to the explicitly named long-lived node, then start or attach to its enrollment service. Both lifetimes are visible and independently stoppable.
 2. Create a short-lived join link for the intended target. Mesh and organization invitations can carry an explicitly authorized subnet attachment scope. A device already on the mesh can receive a standalone subnet link.
 3. On device B, inspect the link locally, confirm the intended roots/scope, generate or load its own persistent identity, and explicitly redeem. Root private keys never leave A.
 4. A validates B's proof of identity, the invitation and current policy, and issues exactly the preauthorized bundle. Creating the invitation is the inviter's authorization: by default there is no second human approval. Only invitations explicitly created with `--require-approval` wait for a subsequent operator decision.
@@ -70,6 +70,9 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 
 | Proposed surface | Meaning and execution owner |
 |---|---|
+| `net-mesh up --psk-from <SOURCE>` | Start one real long-lived node under the selected profile/identity. Foreground by default; `--detach` explicitly transfers ownership to a managed child only after readiness. `<SOURCE>` is a protected `file:`, `stdin`, or configured `kms:` reference, never a literal PSK on argv. |
+| `net-mesh down` | Ask the selected locally managed node instance to drain and stop through authenticated owner-only local control, then verify that exact instance exited. It does not revoke enrollment, delete identity, rotate the PSK, or stop unrelated SDK processes. |
+| `net-mesh node status` | Report the selected managed instance, exact incarnation, readiness, bind/public endpoint, identity fingerprint and control-owner state without exposing the PSK or treating a stale PID/metadata file as liveness. |
 | `net-mesh enrollment serve` | Foreground, operator-owned enrollment/status service using selected durable stores. Explicit bind and readiness; stopping the process stops service. No implicit background daemon or hosted SaaS. |
 | `net-mesh invite create` | Create a mesh invitation through the actual authority owner; optional exact `--subnet` scope. |
 | `net-mesh invite inspect` | Offline, redacted parse/signature/expiry inspection where verifiable; never consumes a nonce or claims current authority. |
@@ -88,6 +91,8 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 Use full cryptographic subject identifiers for mutations, not ambiguous names, truncated fingerprints, or a routing `u64`. Display names are untrusted labels. A shortened display is not a signing/lookup identity.
 
 Local operator commands must operate on the same durable authority state as the running service, through a locked local control path or authenticated bounded SDK service. Choose the minimum existing-compatible path at V3-0. Spawning a fresh `OperatorEnrollment` for every invite while the server owns a different in-memory map is invalid. Remote issuance/removal must never be exposed merely because a caller holds a PSK or membership certificate; keep remote mutation unavailable unless the exact management authority is implemented and tested.
+
+`up` owns an ordinary Net node lifetime, not enrollment authority by implication. `enrollment serve` may attach to that exact managed node through the accepted local owner path, but starting a PSK-authenticated node must not mint invitations, expose management operations, or grant application invocation rights. Conversely, stopping enrollment service must not silently stop a node that the operator started independently.
 
 ## 5. Non-negotiable authority and secret boundaries
 
@@ -128,6 +133,65 @@ Model the minimal durable transitions: preauthorized offer → identity-bound cl
 - File failures leave a recoverable state and no final `joined` result. Profile publication must not point at missing identity/credential files. Avoid clobbering existing ownership, credentials or profiles; conflicting ownership is a refusal, not an implicit migration.
 - Bound outstanding requests, receipts, pending approvals and retained history; fail closed on capacity. Retain replay protection for its required lifetime and require tested cleanup rules across restart.
 - Ordinary renewal must not revive a removed member or expand scope. Re-enrollment after removal is a separate explicit, floor-aware issuance operation; never lower floors or switch identity automatically to make it succeed.
+
+### 5.4 Managed node lifecycle and PSK sources
+
+`net-mesh up --psk-from <SOURCE>` is the explicit local runtime owner missing
+from the current one-shot CLI. It starts a production `MeshNode`, not a temporary
+inspection supervisor. The selected profile/incarnation has one owner-only
+control endpoint and one exclusive lifetime lock. A second `up` for the same
+profile refuses with the live instance identity rather than starting a competing
+node or trusting a PID file.
+
+The initial source contract is deliberately narrow:
+
+- `file:<path>` reads a bounded 32-byte raw or 64-hex PSK from a protected,
+  regular, non-symlink file using the CLI's existing platform permission gates.
+- `stdin` reads the same bounded form without echoing it or placing it in argv,
+  environment, profile output or shell history. Detached startup must transfer
+  the already-read secret to the child over a private inherited pipe and wait
+  for child readiness; it must not rewrite the secret into a temporary file.
+- `kms:<provider>:<opaque-ref>` resolves through an explicitly configured,
+  allow-listed provider adapter using the process/workload identity. It means a
+  retrievable secret-manager value, not a non-exportable signing-key handle and
+  not arbitrary shell execution. Unsupported providers/features fail before
+  node startup. Exact provider adapters and URI grammar must be pinned before
+  implementation; this plan does not create a universal credential vault.
+
+The source yields exactly one PSK value for startup, is validated before binding,
+and is scrubbed after constructing the runtime. Raw `--psk-hex` is not accepted
+by `up`. Existing one-shot compatibility flags/profile fields remain a separate
+legacy surface until an explicit migration is accepted. Diagnostics, target
+inspection, readiness metadata and process listings expose only source kind and
+redacted reference/fingerprint, never the value. A KMS/secret-manager fetch must
+not place cloud credentials in Net configuration; provider-native workload
+identity remains outside Net.
+
+Foreground is the default so containers, service managers and terminals own the
+process honestly. `--detach` is explicit and returns success only after the child
+has acquired the lifetime lock, bound its sockets, installed the selected
+identity/configuration, started its receive/runtime loops, published its protected
+control endpoint and acknowledged readiness. Parent exit, pipe closure, a stale
+metadata file or a spawned PID is not readiness. Startup failure leaves no
+success output and no child that later becomes live unexpectedly.
+
+`net-mesh down` resolves the same profile and exact incarnation through the
+protected local control endpoint, requests bounded drain/shutdown, and waits for
+that instance's acknowledged termination. PID reuse cannot select a process.
+Timeout is a nonzero partial result with the node still reported running or
+unknown; force termination, if later offered, is an explicit separate mode and
+cannot be described as a graceful stop. Repeated `down` is idempotent only for
+the same recorded incarnation. Shutdown removes advertisements owned by that
+runtime where possible, closes streams/listeners and releases the lifetime lock;
+it preserves identity, enrollment, PSK source, stores and audit receipts. It
+does not revoke already issued authority or claim secure erasure.
+
+PSK rotation is outside `down`: changing the referenced value while a node is
+running does not mutate the live trust domain. A restart or future explicit
+rotation ceremony is required, with honest mixed-key behavior. `node status`
+must distinguish `starting`, `ready`, `draining`, `stopped`, `stale metadata`
+and `unknown`, and must verify the live control owner rather than infer health
+from files.
 
 ## 6. Selective removal and propagation
 
@@ -208,6 +272,7 @@ design direction requiring the listed proof, not an implemented mechanism.
 | Native first contact | `sdk/src/mesh_enroll.rs::Rendezvous` contains address, Noise public key and routing ID, but explicitly assumes an out-of-band PSK. `Mesh::join` starts from an already-built mesh. | Product choice resolved: preauthorized, single-use invitations redeemed through an authenticated adapter, without a standing PSK in the link or a second approval by default. Optional `--require-approval` is invitation-bound policy. The concrete transport/control proposal below remains subject to security witnesses and V3-0 exit, not a shipped guarantee. No public/default PSK workaround or secret-bearing mode is selected for V3-1. |
 | Existing browser bootstrap | `sdk/src/bootstrap_credential.rs::BrowserBootstrapCredential` is signed and secret-bearing. SDK HTTP/TLS dependencies and the CLI listener are gated by `rtc-bootstrap`, which also enables WebRTC. | Reuse verification/secret-redaction concepts, not a silent browser-feature dependency. This is not evidence for native secure redemption. Do not enable `rtc-bootstrap` globally to make a new default command appear to work. |
 | Membership-only outcome | `sdk/src/enrollment.rs::JoinOutcome::Admitted` contains a delegation chain; `sdk/src/delegation.rs::derive_device` issues `INVOKE_ACTION | DELEGATE`. `InviteToken` itself has no issuer signature or operation/scope fields. | Preserve existing agent enrollment and `NMI1`/`NMO1` behavior. V3 needs a separately versioned integrity-bound invite and membership-only receipt/bundle, never an empty/fake delegation chain. Proposed receipt binds issuer, full subject, invitation/operation ID, exact requested relations, request-intent digest and committed result; finalize encoding after transport/store decisions. |
+| Managed node lifecycle | The CLI can create short-lived attached clients and temporary supervisors, but has no generic command that owns a persistent production `MeshNode`, proves readiness, or stops that exact runtime. Profiles may contain plaintext `psk_hex`; there is no shared PSK-source abstraction or KMS resolver. | Add explicit `up`/`down`/`node status` over one owner-only lifecycle endpoint and exact incarnation. Pin foreground/detached ownership, readiness, drain and stale-state semantics. Add a bounded `file:`/`stdin`/configured-`kms:` PSK source boundary without turning Net into a credential vault or accepting raw PSKs on `up` argv. |
 | Ordinary consumer / leave | CLI `config.rs` and `context.rs` have no enrollment-intent or renewal lifecycle integration. A saved profile alone cannot fence a running independent SDK process. | Proposed: shared SDK durable intent/receipt owner and an enrollment reference in existing profile resolution; controlled CLI consumers register instance/incarnation with a protected local lifecycle owner. Leave first persists disabled intent, then requires scoped stop acknowledgements. Unmanaged consumers remain stop-unconfirmed. Pin IPC, liveness and fail-closed startup semantics before promising live stop. |
 | Selective subnet removal | `src/adapter/net/subnet/auth.rs::SubnetGrant` has subject, rights and generation; `SubnetRevocationFloor` has scope/epoch/generation but no subject. `control.rs::SubnetFactKind` accepts four strict V1 tags. | No existing per-subject floor can simply be invoked. Proposed root-signed subject floor keyed by qualified scope, topology epoch, full subject and explicitly covered rights, with monotone floor/revision and explicit reissue. Ancestor credential coverage, ATTACH versus independent ROUTE/EXPORT, durable load, active-context invalidation and unsupported-peer refusal remain mandatory design decisions. Do not allocate a new wire tag yet. |
 
@@ -527,6 +592,7 @@ Tasks:
 5. Specify the minimal selective subnet-removal mechanism and verification set; identify exact SDK/core/wire owners and cross-language compatibility work if wire changes are required.
 6. Map each required outcome to an existing mechanism, missing hook and witness. Record final CLI syntax/defaults and state transitions in this document.
 7. Pin the local lifecycle owner for voluntary leave, its durable intent/fencing and dependent-service stop policy. Identify which consumers acknowledge live stop and which can only honor next-start disablement; do not promise control over arbitrary SDK processes.
+8. Pin the generic managed-node owner used by `up`/`down`: identity persistence, profile/incarnation lock, protected control transport, foreground/detached process ownership, readiness handshake, shutdown/drain behavior and PSK-source resolver boundary. Select the initially shipped KMS adapters/features or explicitly mark them feature-conditional; a placeholder `kms:` parser is not a working source.
 
 **Exit:** No unresolved authority/bootstrap/state-owner decision may be passed to a command wrapper. If a mechanism needs a wider protocol redesign than this bounded lifecycle, stop that slice for an explicit scope decision; do not declare V3 complete or reopen serverless/remote Deck. This is a bounded design gate for named blockers, not a new platform-foundation project.
 
@@ -543,6 +609,30 @@ Tasks:
 5. Prove default redemption succeeds without a second approval and optional approval cannot be bypassed. Cover concurrent same/different identity redemption, lost response after commit, operator/device crash points, revoke during claim/approval, corruption and saturation. A second redemption is not an implicit grant reissue.
 
 **Exit:** Two clean participants enroll through a link without manual PSK handling or a second approval in default mode; restart and retry recover the same identity/result. Invalid/mismatched requesters cannot redeem; optional approval cannot be bypassed. Even a valid enrolled device receives no implicit application authority. No org/subnet success is claimed yet.
+
+### V3-1A — managed node up/down and protected PSK sources
+
+**Modify:** CLI `main.rs`, `context.rs`, `config.rs`, `secret.rs`, the selected
+SDK/runtime lifecycle owner and platform-local control implementation.
+**Proposed new files:** `cli/src/commands/lifecycle.rs`,
+`cli/tests/node_lifecycle.rs`. Reuse the V3-1 protected local owner if its
+authority and process-lifetime contract fits; do not create two control daemons.
+
+Tasks:
+1. Write RED subprocess witnesses showing the current CLI cannot start a persistent node, report its verified readiness, or stop that exact instance. Cover duplicate `up`, stale metadata/PID reuse, wrong profile/incarnation, startup failure after spawn, shutdown timeout and a second unrelated node.
+2. Implement `net-mesh up --psk-from <SOURCE>` with foreground default and explicit `--detach`. Persist or load the selected node identity under existing protected-file rules; do not silently create a new identity on every restart. Return success only after the production node is live and the protected control owner acknowledges the exact incarnation.
+3. Implement bounded `file:` and `stdin` sources first, with permission/type/length checks, secret-free diagnostics and in-memory scrubbing. Implement only explicitly selected `kms:` provider adapters behind named features; use workload identity and reject unsupported/malformed references before binding. No shell-command resolver, argv literal, environment-value shortcut or secret-bearing temporary file.
+4. Implement `net-mesh down` and `net-mesh node status` through authenticated owner-only local control. Prove graceful drain/stop, advertisement withdrawal where owned, exact-instance termination and honest partial results. Preserve identity, stores and source configuration; do not claim revocation or PSK rotation.
+5. Cross foreground/detached mode with Unix and Windows process/control semantics, parent crash, child crash, terminal closure, Ctrl-C/service-manager stop, restart and concurrent status/down. Ensure a failed detached readiness handshake cannot leave an unreported live child.
+6. In a disposable review worktree, mutate readiness to answer before `MeshNode` runtime start and mutate `down` to trust PID metadata; the named witnesses must fail. Restore the candidate and run existing remote-attach, temporary-supervisor, wrap and MCP-service compatibility controls.
+
+**Exit:** A fresh profile can start one production node from protected file,
+stdin and every advertised feature-enabled KMS source, prove live readiness, be
+used by an existing capability/provider path, stop through a second CLI process,
+and prove that exact runtime is no longer reachable. Secrets never appear in
+argv, environment, output, metadata or test logs. Duplicate/stale/wrong-instance
+operations fail without affecting another node. Sources not shipped are not
+advertised.
 
 ### V3-2 — organization and subnet-scoped enrollment
 
@@ -639,6 +729,9 @@ All rows are required unless explicitly marked feature-conditional; narrow slice
 | E17 | Mesh/org/subnet leave disables the exact relation, stops controlled live use and automatic renewal/rejoin across restart, preserving identity, unrelated authority and data; unmanaged live use is stop-unconfirmed. |
 | E18 | Offline leave completes locally with notification pending; retries are idempotent; notification never implies revocation and cannot target another identity. |
 | E19 | Concurrent join/renew completion cannot undo leave; delayed old leave/notification cannot revoke an explicitly authorized successor; rejoin preserves floors and the single-owner guard. |
+| E20 | `up` starts one production node for the selected profile and reports ready only after bind, identity/config install and runtime-loop start. Duplicate startup, parent/child failure and stale metadata cannot produce false readiness or an unreported live child. |
+| E21 | `file:` and `stdin` PSK sources, plus each advertised feature-enabled `kms:` adapter, supply the exact runtime secret without argv/environment/output leakage; malformed, insecure, unsupported or unavailable sources fail before bind. Changing a source while live does not silently rotate the node. |
+| E22 | `down` authenticates the exact local incarnation, drains and stops it, and verifies termination while leaving another profile/node untouched. Timeout/unknown/forced termination and already-stopped states remain distinct; shutdown never claims authority revocation or secure erasure. |
 
 For denial witnesses, observe a real authenticated request at the relevant production gate and its refusal, then run an authorized positive control. A timeout or absence of output alone is insufficient. For durability/ordering claims, barriers/fault injection must reach the production transition; sleep-based contention is supplemental. Disable the claimed mechanism in a disposable review worktree and require the named witness to fail.
 
@@ -650,7 +743,7 @@ These are **future implementation gates**, not executed results. Run Rust comman
 cargo check -p net-cli --all-targets
 
 # NEW V3 DELIVERABLES: run after their files have been added.
-cargo nextest run -p net-cli --test enrollment_lifecycle --test org_join --test subnet_join --test enrollment_leave --test enrollment_status --test enrollment_removal --test enrollment_workflow --no-tests=fail --retries 0
+cargo nextest run -p net-cli --test enrollment_lifecycle --test node_lifecycle --test org_join --test subnet_join --test enrollment_leave --test enrollment_status --test enrollment_removal --test enrollment_workflow --no-tests=fail --retries 0
 
 # Existing CLI compatibility coverage, then one complete default sweep.
 cargo nextest run -p net-cli --test org_adopt --test org_grant --test subnet_issuance --test target_resolution --test remote_inspection --no-tests=fail --retries 0
@@ -669,7 +762,7 @@ Every slice handoff names exact HEAD, changes, executed commands/counts, inverse
 
 ## 10. Non-goals and stop line
 
-No new global node registry, central scheduler, remote Deck protocol, generic administrative shell, arbitrary delegation engine, replicated membership consensus, custom revocation anti-entropy system, universal credential vault, compliance workflow, QR/mobile app, browser landing-page product, public invitation directory, serverless capability provider, agent migration, transfer holder, generic streaming CLI, or redesign of nRPC/storage.
+No new global node registry, central scheduler, remote Deck protocol, generic administrative shell, arbitrary delegation engine, replicated membership consensus, custom revocation anti-entropy system, universal credential vault, compliance workflow, QR/mobile app, browser landing-page product, public invitation directory, serverless capability provider, agent migration, transfer holder, generic streaming CLI, or redesign of nRPC/storage. The bounded `kms:` PSK-source adapters are startup integrations with named secret managers, not a general KMS abstraction, arbitrary secret broker or key-lifecycle product.
 
 The narrow service/state/API additions necessary for this enrollment-and-removal loop are in scope after V3-0 acceptance. A generalized framework is not. Preserve native SDK ownership of mechanisms, but do not turn this CLI plan into blanket five-language feature expansion; wire/ABI changes must still update every affected decoder/binding and conformance witness or remain disabled for incompatible peers.
 
@@ -677,4 +770,4 @@ The narrow service/state/API additions necessary for this enrollment-and-removal
 
 ## 11. Planning validation
 
-This creation changes only `NET_CLI_PLAN_V3.md`; V2 and its active implementation files are outside this edit. Validate Markdown structure, relative links, existing source paths, labels for proposed files/commands and whitespace. Record any concurrently observed user changes separately; do not restore, stage or commit them. No implementation, Cargo tests, public docs, commits or pushes are part of creating this plan.
+This planning document is the only intended file changed by plan-only edits; V2 and its active implementation files remain outside them. The managed-node amendment adds proposed `up`/`down`/`node status`, protected PSK-source and lifecycle acceptance contracts only; it does not implement or advertise shipped commands. Validate Markdown structure, relative links, existing source paths, labels for proposed files/commands and whitespace. Record any concurrently observed user changes separately; do not restore, stage or commit them. No implementation, Cargo tests, public docs, commits or pushes are part of editing this plan.
