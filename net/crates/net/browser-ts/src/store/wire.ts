@@ -802,13 +802,25 @@ export function decimalValue(value: Decimal): bigint {
  * evidence is already gone — so an action input of `{n: NaN}` encoded
  * happily as `{"n":null}` and sent a value the caller never wrote.
  *
- * These are ordinary `number`s at the type level; no cast or exotic
+ * It also TRANSFORMS some values and THROWS on others, all before any
+ * scan of the serialized text could see anything: a `toJSON` method
+ * replaces its object wholesale (a `Date` ships as a string), a
+ * `Map`/`Set` ships as `{}` with its entries gone, an own symbol key
+ * is never serialized at all, and a cycle or a `BigInt` raises a bare
+ * `TypeError` out of the serializer itself.
+ *
+ * These are ordinary values at the type level; no cast or exotic
  * object is needed to produce them. So the source values are checked
  * **before** serialization, and an inadmissible one is a refusal
- * rather than a substitution. `null` itself stays admissible: an
- * intentional null is data.
+ * rather than a substitution or an escape. `null` itself stays
+ * admissible: an intentional null is data.
  */
-export function inadmissibleValue(value: JsonValue | undefined, path: string): string | null {
+export function inadmissibleValue(value: unknown, path: string): string | null {
+  return admissibleValue(value, path, new Set<object>());
+}
+
+/** {@link inadmissibleValue}, with the ancestor chain for cycle detection. */
+function admissibleValue(value: unknown, path: string, ancestors: Set<object>): string | null {
   if (value === null) return null;
   switch (typeof value) {
     case 'boolean':
@@ -818,18 +830,45 @@ export function inadmissibleValue(value: JsonValue | undefined, path: string): s
       // The one the brief names (§1.12): every number is finite.
       return Number.isFinite(value) ? null : `non-finite-number:${path}`;
     case 'object': {
-      if (Array.isArray(value)) {
-        for (let i = 0; i < value.length; i += 1) {
-          const bad = inadmissibleValue(value[i] as JsonValue, `${path}[${i}]`);
+      const object = value as object;
+      // A cycle serializes as a bare `TypeError` — refused here, before
+      // the serializer can throw it. Sibling SHARING is fine (the value
+      // is duplicated, not transformed), so only ancestors count.
+      if (ancestors.has(object)) return `circular:${path}`;
+      // `toJSON` replaces the value wholesale during serialization —
+      // `Date` ships as a string and an application object can ship
+      // anything at all — so what would leave is not what was checked.
+      if ('toJSON' in object) return `to-json-transform:${path}`;
+      // `Map`/`Set` and their weak forms serialize as `{}`: the
+      // entries vanish.
+      if (
+        object instanceof Map ||
+        object instanceof Set ||
+        object instanceof WeakMap ||
+        object instanceof WeakSet
+      ) {
+        return `map-or-set:${path}`;
+      }
+      // An own symbol key is never serialized, whatever its
+      // enumerability: the data vanishes without a trace.
+      if (Object.getOwnPropertySymbols(object).length > 0) return `symbol-key:${path}`;
+      ancestors.add(object);
+      try {
+        if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i += 1) {
+            const bad = admissibleValue(value[i], `${path}[${i}]`, ancestors);
+            if (bad !== null) return bad;
+          }
+          return null;
+        }
+        for (const [key, nested] of Object.entries(value as JsonObject)) {
+          const bad = admissibleValue(nested, `${path}.${key}`, ancestors);
           if (bad !== null) return bad;
         }
         return null;
+      } finally {
+        ancestors.delete(object);
       }
-      for (const [key, nested] of Object.entries(value as JsonObject)) {
-        const bad = inadmissibleValue(nested, `${path}.${key}`);
-        if (bad !== null) return bad;
-      }
-      return null;
     }
     default:
       // `undefined`, function, symbol, bigint: each is either dropped,

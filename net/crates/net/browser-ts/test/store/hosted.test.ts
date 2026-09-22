@@ -23,8 +23,7 @@ import {
   type TransportFrame,
   type TransportStream,
 } from '../../src/store/host.js';
-import { joinStore } from '../../src/store/join.js';
-import { MAX_OUTSTANDING, REQUEST_DEADLINE_MS } from '../../src/store/join.js';
+import { joinStore, MAX_OUTSTANDING, REQUEST_DEADLINE_MS, TRANSITION_DEADLINE_MS } from '../../src/store/join.js';
 import type { Cancel } from '../../src/store/types.js';
 import { StoreError } from '../../src/store/errors.js';
 import { MAX_JOIN_REASKS } from '../../src/store/replica.js';
@@ -131,6 +130,8 @@ function mesh() {
   /** Nodes whose next OPEN is held, and the streams they closed. */
   const holdingOpen = new Set<string>();
   const heldOpens: { node: string; settle: () => void }[] = [];
+  /** Nodes whose next OPEN rejects, as a transient failure does. */
+  const failingOpen = new Set<string>();
   const closes = new Map<string, number>();
   const held: { node: string; settle: (fail: boolean) => void }[] = [];
   /** Drop the Nth frame a node sends, once. */
@@ -172,6 +173,13 @@ function mesh() {
     return {
       nodeIdHex: () => self,
       openStream: options => {
+        // A transient open failure: the promise REJECTS (a synchronous
+        // throw never reaches the store's in-flight bookkeeping, and
+        // the cached-rejection defect under test lives exactly there).
+        if (failingOpen.has(self)) {
+          failingOpen.delete(self);
+          return Promise.reject(new Error('session: no session with the peer (transient)'));
+        }
         // The double enforces what the WASM option reader enforces,
         // and it did not before — which is exactly why the in-process
         // suite was green while the real join was rejected before a
@@ -378,6 +386,10 @@ function mesh() {
     /** Hold this node's next OPEN, unresolved. */
     holdNextOpen: (node: string) => {
       holdingOpen.add(node);
+    },
+    /** Make this node's next OPEN reject once, transiently. */
+    failNextOpen: (node: string) => {
+      failingOpen.add(node);
     },
     settleHeldOpens: () => {
       const pending = heldOpens.splice(0, heldOpens.length);
@@ -2492,5 +2504,462 @@ describe('the host’s own surface', () => {
     const { host } = wired();
 
     expect(host.authority).toBe(HOST_NODE);
+  });
+});
+
+describe('#5 — no frame leaves for state the transaction may discard', () => {
+  // The public `host.setState` is `owner.commit`, and both ladders
+  // (`act` and `in`) run application code on the request's behalf: the
+  // PARSE and the handler. All four must join the transaction — so a
+  // throw discards the write AND its emission, and a commit ships
+  // exactly one frame with the committed world. Routing a write
+  // beside the transaction shipped a staged-world delta no rollback
+  // ever retracted, and the path then answered `action-rejected` /
+  // `in-rejected` for a change that had already left the building.
+  interface Note {
+    readonly marks: number;
+  }
+  type GoActions = { go: { input: Record<string, never>; output: Record<string, never> } };
+  type NoteInputs = { mark: { readonly at: number } };
+
+  function writer(writeFrom: 'parse' | 'handler') {
+    const net = mesh();
+    const time = timeline();
+    const seam: { write: ((next: Note) => void) | null; throws: boolean; notified: number } = {
+      write: null,
+      throws: false,
+      notified: 0,
+    };
+
+    const notes = defineStore<Note, GoActions, NoteInputs>({
+      id: 'notes',
+      version: 1,
+      state: value => {
+        const marks =
+          value !== null && typeof value === 'object' && 'marks' in value ? value.marks : 0;
+        return { marks: Number(marks ?? 0) };
+      },
+      empty: () => ({ marks: 0 }),
+      actions: {
+        go: {
+          // The action's input PARSE: application code on the
+          // request's behalf.
+          input: value => {
+            if (writeFrom === 'parse') seam.write?.({ marks: 77 });
+            return value as Record<string, never>;
+          },
+          output: value => value as Record<string, never>,
+        },
+      },
+      inputs: {
+        mark: value => {
+          if (writeFrom === 'parse') seam.write?.({ marks: 77 });
+          return { at: 1 };
+        },
+      },
+    });
+
+    const host = hostStore<Note, GoActions, NoteInputs>({
+      definition: notes,
+      transport: net.node(HOST_NODE),
+      initialState: { marks: 0 },
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: {
+        go: () => {
+          if (writeFrom === 'handler') seam.write?.({ marks: 88 });
+          if (seam.throws) throw new Error('the handler refused');
+          return {};
+        },
+      },
+      inputs: {
+        mark: () => {
+          if (writeFrom === 'handler') seam.write?.({ marks: 88 });
+          if (seam.throws) throw new Error('the handler refused');
+        },
+      },
+      now: time.now,
+      newHandle: () => '1'.repeat(32),
+      newIncarnation: () => 'abcdef0123456789',
+      canProject: () => true,
+      schedule: time.schedule,
+    });
+    seam.write = next => host.setState(next);
+    // One notification per applied transaction: the revision count a
+    // subscriber can see.
+    host.subscribe(() => {
+      seam.notified += 1;
+    });
+
+    const joined = joinStore<Note, GoActions, NoteInputs>({
+      definition: notes,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'ada',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    return { net, host, joined, seam };
+  }
+
+  for (const path of ['in', 'act'] as const) {
+    for (const writeFrom of ['parse', 'handler'] as const) {
+      const where = `${path} ${writeFrom}`;
+
+      it(`discards a \`host.setState\` from the ${where} when the handler throws — no frame leaves`, async () => {
+        const { net, host, joined, seam } = writer(writeFrom);
+        await joined.ready();
+        const before = host.getState();
+        const installed = net.kinds(CALLER_NODE).length;
+        seam.throws = true;
+
+        if (path === 'in') joined.input('mark', { at: 1 });
+        else void joined.act('go', {}).catch(() => undefined);
+        await flush(20);
+
+        // Nothing carrying state leaves — on the input path, which
+        // has no reply, LITERALLY no frame at all — and the document
+        // and revision are exactly as before.
+        expect(net.deltas(CALLER_NODE)).toHaveLength(0);
+        expect(net.kinds(CALLER_NODE)).toHaveLength(installed + (path === 'act' ? 1 : 0));
+        expect(host.getState()).toEqual(before);
+        expect(seam.notified).toBe(0);
+      });
+
+      it(`ships exactly one frame with the committed world when the ${where} write commits`, async () => {
+        const { net, host, joined, seam } = writer(writeFrom);
+        await joined.ready();
+        const committed = writeFrom === 'parse' ? { marks: 77 } : { marks: 88 };
+        seam.throws = false;
+
+        if (path === 'in') joined.input('mark', { at: 1 });
+        else await joined.act('go', {});
+        await flush(20);
+
+        // ONE frame carries the world — the write joined the
+        // transaction and committed with it — and it carries the
+        // committed document. Routing the write beside the
+        // transaction shipped its own delta first and the end-of-path
+        // one after: two frames, the first naming a base the replica
+        // could not match.
+        expect(net.deltas(CALLER_NODE)).toHaveLength(1);
+        expect(host.getState()).toEqual(committed);
+        expect(seam.notified).toBe(1);
+        expect(joined.getState()).toEqual(committed);
+      });
+    }
+  }
+});
+
+describe('#15 — every public-surface encode refusal is `StoreError`', () => {
+  // `encodeMessage` refuses an unrepresentable `aud` (more than 32
+  // labels, rung 6) with a bare `RangeError`, which every
+  // `error.code` branch in application code misses. The aud-carrying
+  // public surfaces wrap it exactly like `act` and `input` do:
+  // `StoreError('invalid-data')` with the encoder's refusal as `cause`.
+  const oversized = Array.from({ length: 33 }, (_, i) => `label-${String(i)}`);
+
+  it('rejects an unencodable audience at construction, typed', () => {
+    const net = mesh();
+    let thrown: unknown;
+    try {
+      joinStore<Ship, Actions, Inputs>({
+        definition: ship,
+        transport: net.node(CALLER_NODE),
+        host: HOST_NODE,
+        audience: oversized,
+        key: 'ada',
+        maxEventBytes: MAX_EVENT_BYTES,
+        now: () => 0,
+        schedule: () => () => undefined,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+    expect((thrown as StoreError).cause).toBeInstanceOf(RangeError);
+  });
+
+  it('rejects an unencodable audience at `setAudience`, typed', async () => {
+    const { joined } = wired();
+    await joined.ready();
+
+    const thrown = await joined.setAudience(oversized).catch((error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+    expect((thrown as StoreError).cause).toBeInstanceOf(RangeError);
+  });
+
+  it('rejects an unencodable audience at `reconnect`, typed', async () => {
+    const { joined } = wired();
+    await joined.ready();
+    // The refused `setAudience` leaves the unrepresentable audience as
+    // the caller's DESIRED one, which `reconnect` then states.
+    await joined.setAudience(oversized).catch(() => undefined);
+
+    const thrown = await joined.reconnect().catch((error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+    expect((thrown as StoreError).cause).toBeInstanceOf(RangeError);
+  });
+});
+
+describe('#6 — every transition hold is bounded', () => {
+  // A host that answers every `join`/`resync`/`aud` with a fresh
+  // manifest whose assembly never completes: the small `man` survives
+  // and the multi-KB chunks do not. `#abandon → #resync → man` then
+  // restarts the 10 s assembly clock for ever, and each stuck call
+  // holds one of 64 `MAX_OUTSTANDING` slots plus its promise. The per
+  // call deadline (`TRANSITION_DEADLINE_MS`) is the fence; the clock
+  // here is the injected one, advanced by hand.
+  function stranded() {
+    const net = mesh();
+    const time = timeline();
+    let qs = 0;
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'ada',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      newQ: () => {
+        qs += 1;
+        return qs.toString(16).padStart(16, '0');
+      },
+      schedule: time.schedule,
+    });
+    const answered = new Set<string>();
+    let generation = 0;
+    /** Answer every unanswered transition request with a manifest whose chunks never arrive. */
+    const answer = () => {
+      for (const entry of [...net.delivered]) {
+        if (entry.to !== HOST_NODE) continue;
+        const message = JSON.parse(new TextDecoder().decode(entry.bytes)) as {
+          k: string;
+          q?: string;
+        };
+        if (message.q === undefined || answered.has(message.q)) continue;
+        if (message.k !== 'join' && message.k !== 'aud' && message.k !== 'resync' && message.k !== 'resume') {
+          continue;
+        }
+        answered.add(message.q);
+        generation += 1;
+        net.inject(
+          CALLER_NODE,
+          HOST_NODE,
+          encodeMessage({
+            k: 'man',
+            q: message.q as Hex,
+            h: 'a'.repeat(32) as Hex,
+            inc: 'abcdef0123456789' as Hex,
+            g: String(generation),
+            r: '1',
+            n: 2,
+            bytes: '4096',
+          }),
+        );
+      }
+    };
+    return { net, time, joined, answer };
+  }
+
+  /** Advance the injected clock in sweep cadence, re-answering as the ladder re-asks. */
+  async function runTheLoop(
+    time: { advance: (ms: number) => void },
+    answer: () => void,
+  ): Promise<void> {
+    for (let step = 0; step < 7; step += 1) {
+      time.advance(REQUEST_DEADLINE_MS);
+      await flush(20);
+      answer();
+    }
+  }
+
+  const actFrames = (net: { kinds: (to: string) => string[] }) =>
+    net.kinds(HOST_NODE).filter(kind => kind === 'act');
+
+  it('reaches a fence at the call’s own deadline and frees its `MAX_OUTSTANDING` slot', async () => {
+    const { net, time, joined, answer } = stranded();
+    await flush(20);
+    answer(); // the join's manifest: the handle is learned
+    await flush(20);
+
+    const stuck = joined.setAudience(['deck']);
+    const settled = { value: false };
+    stuck.then(
+      () => {
+        settled.value = true;
+      },
+      () => {
+        settled.value = true;
+      },
+    );
+    await flush(20);
+    answer(); // the `aud`'s manifest: answered, never installing
+    await flush(20);
+
+    for (let step = 0; step < 5; step += 1) {
+      time.advance(REQUEST_DEADLINE_MS);
+      await flush(20);
+      answer();
+    }
+    time.advance(REQUEST_DEADLINE_MS / 2); // t = 55 s: inside the bound
+    await flush(20);
+
+    // Crowd the rest of the budget with unanswered `act` holds —
+    // whose own 10 s clock expires at t = 65 s — so the transition's
+    // slot is the one being measured. While the hold lives the budget
+    // is FULL: `act` is refused `capacity`.
+    for (let i = 0; i < MAX_OUTSTANDING - 1; i += 1) {
+      void joined.act('fire', { power: 1 }).catch(() => undefined);
+    }
+    await flush(20);
+    const crowded = await joined.act('fire', { power: 1 }).catch((error: unknown) => error);
+    expect(crowded).toMatchObject({ code: 'capacity' });
+
+    await runTheLoop(time, answer);
+
+    // Past the bound the call is DONE — asserted before awaiting its
+    // rejection, so a boundless hold fails here rather than hanging —
+    // typed as an unknown outcome, and its slot is gone while the
+    // crowd's are still held: an `act` is accepted again (parked on
+    // its own reply, rather than refused out of the budget).
+    expect(settled.value).toBe(true);
+    await expect(stuck).rejects.toMatchObject({ code: 'indeterminate' });
+    const outcome = await Promise.race([
+      joined.act('fire', { power: 1 }).then(
+        () => 'answered',
+        (error: StoreError) => error.code,
+      ),
+      flush(20).then(() => 'parked'),
+    ]);
+    expect(outcome).toBe('parked');
+    void joined.close();
+  });
+
+  it('64 such holds cannot turn `act` into `capacity`', async () => {
+    const { net, time, joined, answer } = stranded();
+    await flush(20);
+    answer();
+    await flush(20);
+
+    for (let i = 0; i < MAX_OUTSTANDING; i += 1) {
+      void joined.setAudience([`label-${String(i)}`]).catch(() => undefined);
+    }
+    await flush(20);
+    answer();
+    await flush(20);
+
+    // Accepted while THE64 HOLDS ARE HELD — no deadline or ladder has
+    // cleared anything yet: the request parks on its own reply rather
+    // than being refused out of the budget. Without the supersession
+    // release and the per-call bound these holds own every
+    // `MAX_OUTSTANDING` slot and `act` answers `capacity` until an
+    // unrelated installation, `fail()` or `close()`.
+    const early = await Promise.race([
+      joined.act('fire', { power: 1 }).then(
+        () => 'answered',
+        (error: StoreError) => error.code,
+      ),
+      flush(20).then(() => 'parked'),
+    ]);
+    expect(early).toBe('parked');
+
+    await runTheLoop(time, answer);
+
+    // …and still, past the bound.
+    const late = await Promise.race([
+      joined.act('fire', { power: 1 }).then(
+        () => 'answered',
+        (error: StoreError) => error.code,
+      ),
+      flush(20).then(() => 'parked'),
+    ]);
+    expect(late).toBe('parked');
+    void joined.close();
+  });
+
+  it('keeps `act`’s own request deadline intact', async () => {
+    // The transition bound must not have become the request clock:
+    // an unanswered `act` is `indeterminate` at 10 s, exactly as
+    // before — and its correlation holds its slot until then.
+    const { net, time, joined, answer } = stranded();
+    await flush(20);
+    answer(); // the join's manifest: the handle is learned
+    await flush(20);
+
+    const acted = joined.act('fire', { power: 1 }).catch((error: unknown) => error);
+    await flush(20);
+    expect(actFrames(net)).toHaveLength(1);
+
+    time.advance(REQUEST_DEADLINE_MS);
+    await expect(acted).resolves.toMatchObject({ code: 'indeterminate' });
+    void joined.close();
+  });
+});
+
+describe('#17 — a superseded transition rejects its callers', () => {
+  it('resolves the superseding `setAudience` at ITS installation and rejects the superseded one', async () => {
+    const { joined } = wired();
+    await joined.ready();
+
+    const superseded = joined.setAudience(['deck']);
+    const superseding = joined.setAudience(['crew', 'secrets']);
+
+    // The superseded transition can never install — its generation is
+    // fenced the moment the newer request takes the slot — so its
+    // caller is rejected. Resolving it over the SUPERSEDING
+    // installation reports success for someone else's install.
+    await expect(superseded).rejects.toMatchObject({ code: 'aborted' });
+    await expect(superseding).resolves.toBeUndefined();
+    expect(joined.getState().secrets).toEqual({ plan: 7 });
+    await joined.close();
+  });
+});
+
+describe('#27 — a transient `openStream` failure is a retry, not a cached verdict', () => {
+  it('serves the peer again after a failed first open', async () => {
+    const { net, host, joined } = wired();
+    void joined;
+    // The host's first reply-stream open fails transiently: the
+    // join's manifest never reaches the caller.
+    net.failNextOpen(HOST_NODE);
+    await flush(20);
+    expect(host.counters()['send-failed']).toBeGreaterThan(0);
+
+    // A fresh open serves the next commit's delta. Caching the
+    // rejection as this peer's fate wedges its service for the
+    // lifetime of the store, with every future commit's frames
+    // counted `send-failed`.
+    host.setState({ ...FULL, hull: 6 });
+    await flush(20);
+    expect(net.deltas(CALLER_NODE)).toHaveLength(1);
+  });
+
+  it('shares one in-flight open across concurrent emissions — no stampede', async () => {
+    const { net, host, joined } = wired();
+    void joined;
+    net.holdNextOpen(HOST_NODE);
+    await flush(20);
+    // Two more emissions for the same peer, before the held open
+    // settles: one open must serve all of them. A double open per
+    // peer orphans the loser and fences the derived id on the real
+    // leaf.
+    host.setState({ ...FULL, hull: 1 });
+    host.setState({ ...FULL, hull: 2 });
+    await flush(20);
+
+    expect(net.settleHeldOpens()).toBe(1);
+    await flush(20);
+    expect(net.opensOf(HOST_NODE)).toBe(1);
+    expect(net.deltas(CALLER_NODE)).toHaveLength(2);
   });
 });

@@ -18,7 +18,6 @@
  */
 
 import { StoreError } from './errors.js';
-import type { JsonValue } from './json.js';
 import { inadmissibleValue, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_CHUNKS, utf8Length } from './wire.js';
 
 /**
@@ -117,21 +116,43 @@ export function chunkSnapshot(state: unknown, chunkBytes: number): Chunked {
   if (chunkBytes < 1) {
     throw new StoreError('capacity', `a chunk budget of ${chunkBytes} B cannot carry anything`);
   }
-  const json = JSON.stringify(state);
+  // The admissible-value scan, over the SOURCE values like every
+  // other value-bearing payload — and BEFORE serialization, because
+  // `JSON.stringify` is lossy, silent and throwing: `NaN`/`Infinity`
+  // become `null`, an `undefined`-valued own key disappears, a
+  // `toJSON`/`Map`/symbol-keyed value is transformed or emptied, and
+  // a cycle or a `BigInt` raises a bare `TypeError` out of the
+  // serializer. Running the scan on the wrong side of `stringify`
+  // either saw transformed evidence or never ran at all — and the
+  // delta-overflow fallback is exactly this path.
+  try {
+    const bad = inadmissibleValue(state, 'state');
+    if (bad !== null) {
+      throw new StoreError('invalid-data', `the projected state is not JSON: ${bad}`);
+    }
+  } catch (error) {
+    if (error instanceof StoreError) throw error;
+    // The scan itself can throw — a hostile getter — and an escape
+    // here is `invalid-data` like every other refusal on this path.
+    throw new StoreError('invalid-data', `the projected state is not JSON: ${String(error)}`, {
+      cause: error,
+    });
+  }
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(state);
+  } catch (error) {
+    // Everything named above is refused by the scan first, so what
+    // escapes here is `stringify` throwing on something the scan
+    // cannot see (a getter that throws mid-serialization). Still
+    // invalid data, never a bare `TypeError`.
+    throw new StoreError('invalid-data', 'the projected state is not JSON', { cause: error });
+  }
   if (json === undefined) {
     // `JSON.stringify` returns undefined for a function or a symbol.
     // Serializing that as the string "undefined" would ship a snapshot
     // the replica cannot parse.
     throw new StoreError('invalid-data', 'the projected state is not JSON');
-  }
-  // The admissible-value scan, over the SNAPSHOT document like every
-  // other value-bearing payload. `JSON.stringify` is lossy and silent:
-  // `NaN`/`Infinity` become `null` and an `undefined`-valued own key
-  // disappears — the manifest would ship a document the owner never
-  // held, and the delta-overflow fallback is exactly this path.
-  const bad = inadmissibleValue(state as JsonValue, 'state');
-  if (bad !== null) {
-    throw new StoreError('invalid-data', `the projected state is not admissible JSON: ${bad}`);
   }
   const bytes = new TextEncoder().encode(json);
   if (bytes.length > MAX_SNAPSHOT_BYTES) {

@@ -758,3 +758,67 @@ describe('a cancellation during an installation is not overwritten', () => {
     expect(pair.core.getState()).toEqual({ tick: 0 });
   });
 });
+
+describe('the delta feed re-authorizes before shipping (#27)', () => {
+  // Regression witnesses for the re-authorization fence in
+  // `propagate`, which shipped without coverage — including the key
+  // security case. The delta feed IS the read delivered fresh: a
+  // policy revocation has to stop it, not only the next projection.
+  // `join`, `aud`/`resume` and `resync` are all gated and the
+  // `resync` refusal deliberately keeps the handle warm — which is
+  // exactly why the feed cannot rely on the grant having been checked
+  // once at admission. Removing the fence makes the rows below fail by
+  // DELIVERING a delta to the revoked peer and keeping its handle.
+
+  const B = '00000000000000bb';
+
+  const kindOf = (frame: string) => {
+    const decoded = decodeMessage(frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    return decoded.ok ? decoded.message.k : 'refused';
+  };
+
+  it('ships no delta to a revoked peer and forgets its handle', () => {
+    let permit = true;
+    const store = owner({ authorize: request => (request.type === 'read' ? permit : true) });
+    const h = handleOf(store.receive(joinFrame(), PEER).out);
+    expect(store.handleCount).toBe(1);
+
+    // Positive control: while the policy permits, the feed ships the
+    // change — so "no delta" below is the fence, not a broken feed.
+    const allowed = store.commit({ tick: 2 });
+    expect(allowed.out.map(frame => kindOf(frame.frame))).toContain('delta');
+
+    permit = false;
+    const revoked = store.commit({ tick: 3 });
+
+    // Nothing is shipped for state the policy now forbids. The handle
+    // goes with the refusal — `closed`, the wire's legal unsolicited
+    // notice — because leaving it alive would let `alive` renew the
+    // lease of a peer the policy forbids.
+    expect(revoked.out.map(frame => kindOf(frame.frame))).not.toContain('delta');
+    expect(revoked.out.map(frame => kindOf(frame.frame))).toEqual(['no']);
+    expect(store.handle(h)).toBeUndefined();
+    expect(store.handleCount).toBe(0);
+  });
+
+  it('keeps shipping to the peers the policy still permits', () => {
+    let permitA = true;
+    const store = owner({
+      authorize: request =>
+        request.type !== 'read' || request.peer !== PEER || permitA,
+    });
+    const hA = handleOf(store.receive(joinFrame(), PEER).out);
+    handleOf(store.receive(joinFrame(), B).out);
+
+    permitA = false;
+    const committed = store.commit({ tick: 2 });
+
+    const byPeer = new Map(committed.out.map(out => [out.peer, kindOf(out.frame)]));
+    // The fence is per peer: A is closed and forgotten, B's delta
+    // ships in the same commit.
+    expect(byPeer.get(PEER)).toBe('no');
+    expect(byPeer.get(B)).toBe('delta');
+    expect(store.handle(hA)).toBeUndefined();
+    expect(store.handleCount).toBe(1);
+  });
+});

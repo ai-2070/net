@@ -102,6 +102,17 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
     return this.#revision;
   }
 
+  /**
+   * Whether a synchronous transaction is open on this store.
+   *
+   * The owner's public `commit` reads this to DEFER its delta
+   * emission to the transaction's commit: no frame may leave for
+   * state the transaction may still discard (#5).
+   */
+  get inTransaction(): boolean {
+    return this.#transaction !== null && this.#transaction.active;
+  }
+
   subscribe(
     listener: (state: ReadonlyState<S>, previous: ReadonlyState<S>) => void,
   ): Cancel;

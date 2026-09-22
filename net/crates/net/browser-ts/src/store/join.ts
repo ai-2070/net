@@ -44,6 +44,23 @@ export const ALIVE_INTERVAL_MS = 20_000;
 export const REQUEST_DEADLINE_MS = 10_000;
 
 /**
+ * How long one TRANSITION call waits for its installation before it
+ * is a typed timeout (§2).
+ *
+ * A transition's answer is its INSTALLATION, never the request
+ * clock's — a snapshot still transferring at 10 s is a success in
+ * progress — but that exemption needs a fence of its own: an owner
+ * that answers every `resync`/`join` with a fresh `man` whose
+ * assembly never completes restarts the 10 s assembly deadline each
+ * time, and the `#abandon → #resync → man` loop would hold the call
+ * (and its `MAX_OUTSTANDING` slot) for ever. So every call carries
+ * this named wall-clock bound from its own start. A timed-out call
+ * removes only that waiter (`cancelWaiter`), and the slot goes with
+ * its last caller.
+ */
+export const TRANSITION_DEADLINE_MS = 60_000;
+
+/**
  * How often the replica's own clock is driven.
  *
  * The assembly deadline is 10 s (`assembly.ts`), so a second is fine
@@ -112,6 +129,28 @@ interface Outstanding {
    * successes.
    */
   readonly transition: boolean;
+}
+
+/** One caller of the transition in flight, with its own deadline (#6). */
+interface TransitionCall {
+  readonly resolve: () => void;
+  readonly reject: (error: StoreError) => void;
+  /** Wall clock: this call's own bound, from its own start. */
+  readonly deadlineAt: number;
+}
+
+/**
+ * The transition in flight (`join`/`aud`/`resume`) and its callers.
+ *
+ * One at a time: a newer transition supersedes the one before it, and
+ * an installation settles exactly the callers of the transition that
+ * produced it (#17) — never a superseded `setAudience` over its
+ * successor's install.
+ */
+interface Transition {
+  /** Its `MAX_OUTSTANDING` slot's `q`, when it holds one. */
+  readonly q: Hex | null;
+  readonly calls: Set<TransitionCall>;
 }
 
 const encoder = new TextEncoder();
@@ -183,6 +222,8 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   let upstream: TransportStream | null = null;
   let opening: Promise<TransportStream> | null = null;
   const readyWaiters: { resolve: () => void; reject: (error: StoreError) => void }[] = [];
+  /** The transition in flight and its callers (§2). */
+  let transition: Transition | null = null;
 
   async function stream(): Promise<TransportStream> {
     if (upstream !== null) return upstream;
@@ -304,6 +345,9 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         ? error
         : new StoreError('indeterminate', `the transport could not carry a store frame: ${String(error)}`);
     for (const waiter of readyWaiters.splice(0, readyWaiters.length)) waiter.reject(reason);
+    // The transition's callers too: a slot-less one (the construction
+    // join) has no `outstanding` entry to reject it from below.
+    settleTransitions(reason);
     for (const [q, waiter] of [...outstanding]) {
       outstanding.delete(q);
       waiter.reject(reason);
@@ -346,18 +390,64 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   }
 
   /**
-   * Settle every transition correlation: the installation resolved
-   * them, or `error` is the typed answer that ended them. `act`
+   * Settle the transition in flight: the installation resolved its
+   * callers, or `error` is the typed answer that ended them. `act`
    * correlations are untouched — an installation is no answer to a
    * request that has its own `res`/`ok`/`no` coming.
    */
   function settleTransitions(error: StoreError | null): void {
-    for (const [q, waiter] of [...outstanding]) {
-      if (!waiter.transition) continue;
-      outstanding.delete(q);
-      if (error === null) waiter.resolve(undefined);
-      else waiter.reject(error);
+    const current = transition;
+    if (current === null) return;
+    transition = null;
+    if (current.q !== null) outstanding.delete(current.q);
+    for (const call of [...current.calls]) {
+      current.calls.delete(call);
+      if (error === null) call.resolve();
+      else call.reject(error);
     }
+  }
+
+  /**
+   * Take the transition slot — and SUPERSEDE the transition in
+   * flight (§1.7b). The superseded one can never install (its
+   * generation is fenced at the replica), so its callers are rejected
+   * now, never resolved over this transition's installation (#17),
+   * and its `MAX_OUTSTANDING` slot goes with them (#6).
+   */
+  function openTransition(q: Hex | null): StoreError | null {
+    settleTransitions(
+      new StoreError('aborted', 'a newer transition superseded this one before it installed'),
+    );
+    transition = { q, calls: new Set() };
+    if (q === null) return null;
+    if (outstanding.size >= MAX_OUTSTANDING) {
+      return new StoreError('capacity', 'too many requests are already outstanding');
+    }
+    outstanding.set(q, {
+      resolve: () => settleTransitions(null),
+      reject: (error: StoreError) => settleTransitions(error),
+      at: now(),
+      transition: true,
+    });
+    return null;
+  }
+
+  /**
+   * Register one caller of the transition in flight — BEFORE its
+   * request goes out, or an installation that lands immediately finds
+   * nothing to settle — with its own deadline (#6).
+   */
+  function awaitTransition(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const call: TransitionCall = {
+        resolve,
+        reject,
+        deadlineAt: now() + TRANSITION_DEADLINE_MS,
+      };
+      const current = transition ?? { q: null, calls: new Set<TransitionCall>() };
+      transition = current;
+      current.calls.add(call);
+    });
   }
 
   const unsubscribe = options.transport.onEvent((event: TransportFrame) => {
@@ -415,13 +505,30 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   const stopDeadlines = schedule(() => {
     if (closed) return;
     const at = now();
+    // A transition CALL is settled by its installation or its typed
+    // refusal — and bounded by its own wall clock (#6): the re-ask
+    // ladder recovers the SILENCE case, but an owner answering every
+    // ask with a manifest whose assembly never completes would hold
+    // the call (and its `MAX_OUTSTANDING` slot) for ever. A timed-out
+    // call removes only that waiter, and the slot goes with its last
+    // caller.
+    const current = transition;
+    if (current !== null) {
+      for (const call of [...current.calls]) {
+        if (at < call.deadlineAt) continue;
+        current.calls.delete(call);
+        replica.cancelWaiter();
+        call.reject(
+          new StoreError('indeterminate', 'the transition did not install before its deadline'),
+        );
+      }
+      if (current.q !== null && current.calls.size === 0) settleTransitions(null);
+    }
     for (const [q, waiter] of [...outstanding]) {
-      // A transition is settled by its installation or its typed
-      // refusal — and timed out by the replica's own re-ask ladder,
-      // which recovers where the clock cannot. The request clock is
-      // for `act`, where an unanswered request's outcome is UNKNOWN:
-      // a snapshot still transferring here is a success in progress,
-      // and rejecting it reported failure for a success.
+      // The request clock is for `act`, where an unanswered request's
+      // outcome is UNKNOWN: a snapshot still transferring here is a
+      // success in progress, and rejecting it reported failure for a
+      // success.
       if (waiter.transition) continue;
       if (at - waiter.at < REQUEST_DEADLINE_MS) continue;
       outstanding.delete(q);
@@ -457,9 +564,23 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     settleReady(core.getStatus().error ?? null);
   }, TICK_INTERVAL_MS);
 
-  dispatch(framesOf([replica.join()]));
+  // A join carries the audience, and `encodeMessage` refuses an
+  // unrepresentable one with a bare `RangeError` — which every
+  // `error.code` branch in application code misses. Invalid data
+  // throws `StoreError` (#15), exactly like `act` and `input`.
+  let first: Request;
+  try {
+    first = replica.join();
+  } catch (error) {
+    throw new StoreError('invalid-data', 'the join request cannot be encoded', { cause: error });
+  }
+  // The join is a transition whose answer is its installation (§2):
+  // registered so a later equal-pending call can attach to it and be
+  // settled — or superseded — with it.
+  openTransition(null);
+  dispatch(framesOf([first]));
 
-  function correlate<T>(q: Hex, transition = false): Promise<T> {
+  function correlate<T>(q: Hex): Promise<T> {
     if (outstanding.size >= MAX_OUTSTANDING) {
       return Promise.reject(new StoreError('capacity', 'too many requests are already outstanding'));
     }
@@ -470,7 +591,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         },
         reject,
         at: now(),
-        transition,
+        transition: false,
       });
     });
   }
@@ -570,35 +691,58 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     },
     setAudience: async names => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
-      const requests = replica.setAudience(names);
+      let requests: readonly Request[];
+      try {
+        requests = replica.setAudience(names);
+      } catch (error) {
+        // `encodeMessage` refuses an unrepresentable `aud` with a
+        // bare `RangeError` — which every `error.code` branch in
+        // application code misses. Invalid data throws `StoreError`
+        // (#15), exactly like `act` and `input`.
+        throw new StoreError('invalid-data', 'the audience cannot be encoded', { cause: error });
+      }
+      const slot = requests[0];
+      if (slot !== undefined) {
+        // A NEW transition: it takes the slot and supersedes the one
+        // in flight (#17/#6). An equal pending request takes the
+        // other branch and awaits THAT transition (§2: "an equal
+        // pending request awaits that transition").
+        const capacity = openTransition(slot.q);
+        if (capacity !== null) throw capacity;
+      }
       // The transition completes on the INSTALLATION, not on an
       // acknowledgement: the manifest that answers it carries the same
       // `q`, and the replica publishes when the last chunk lands. The
-      // waiter is registered BEFORE the request goes out, or an
+      // caller is registered BEFORE the request goes out, or an
       // installation that lands immediately finds nothing to settle.
-      const installed = new Promise<void>((resolve, reject) => {
-        readyWaiters.push({ resolve, reject });
-      });
-      const slot = requests[0];
-      if (slot === undefined) {
-        // An equal transition is already in flight: this caller joined
-        // it as another waiter and awaits THAT transition (§2: "an
-        // equal pending request awaits that transition"). Returning
-        // here resolved over the `empty()` view the transition had
-        // just cleared, with the install still on the wire.
-        await installed;
-        return;
-      }
-      const answered = correlate<unknown>(slot.q, true).then(() => undefined);
-      await send(framesOf(requests));
-      await Promise.race([answered, installed]);
+      const installed = awaitTransition();
+      // A send below can throw first; its caller's rejection must not
+      // leave `installed` to reject unobserved on a later turn.
+      installed.catch(() => undefined);
+      if (slot !== undefined) await send(framesOf(requests));
+      await installed;
     },
     reconnect: async () => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
       // The old stream belongs to the lost session.
       upstream = null;
       opening = null;
-      await send(framesOf(replica.reconnect()));
+      let requests: readonly Request[];
+      try {
+        requests = replica.reconnect();
+      } catch (error) {
+        // The `aud`-carrying encode refuses an unrepresentable desired
+        // audience with a bare `RangeError`. Invalid data throws
+        // `StoreError` (#15), exactly like `act` and `input`.
+        throw new StoreError('invalid-data', 'the reconnect request cannot be encoded', {
+          cause: error,
+        });
+      }
+      // The resume takes the slot (§1.7b): a transition still in
+      // flight can never install now, so its callers are rejected
+      // with it (#17) rather than resolved over the resume's install.
+      if (requests[0] !== undefined) openTransition(null);
+      await send(framesOf(requests));
     },
     close: async () => {
       if (closed) return;
@@ -619,6 +763,12 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         }
       }
       unsubscribe();
+      // The transition's callers first: a slot-less one (the
+      // construction join) has no `outstanding` entry to reject it
+      // from below.
+      settleTransitions(
+        new StoreError('aborted', 'the store handle closed before this request was answered'),
+      );
       for (const waiter of outstanding.values()) {
         waiter.reject(new StoreError('aborted', 'the store handle closed before this request was answered'));
       }

@@ -165,8 +165,17 @@ describe('MeshSession', () => {
     await session.announce(['cap:one']);
     expect(fake.announced).toEqual([['cap:one']]);
     await session.signal('00000000deadbeef', '0000000000000003', 'offer', new Uint8Array([1]));
+    // …and one whose u64 is NOT f64-representable
+    // ('0123456789abcdef' = 81985529216486895: `as f64 as u64` rounds
+    // it to …896, re-spelling the dialog `…abcdf0`): a spelling that
+    // would visibly round through a `Number` → re-pad hop, asserted
+    // verbatim through the proxy all the way to the leaf. (The
+    // review's suggested `0011223344556677` is itself f64-exact —
+    // 4822678189205111 < 2^53 — and proves nothing.)
+    await session.signal('00000000deadbeef', '0123456789abcdef', 'offer', new Uint8Array([2]));
     expect(fake.signalled).toEqual([
       { peerHex: '00000000deadbeef', dialog: '0000000000000003', kind: 'offer' },
+      { peerHex: '00000000deadbeef', dialog: '0123456789abcdef', kind: 'offer' },
     ]);
 
     const descriptors = await session.query('cap:one');

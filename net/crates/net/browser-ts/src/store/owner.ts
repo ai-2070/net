@@ -250,11 +250,22 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     return this.handles.get(h);
   }
 
-  /** Replace the authoritative state, as `setState` does. */
+  /**
+   * Replace the authoritative state, as `setState` does.
+   *
+   * Inside an open transaction the write JOINS it (`applySnapshot`
+   * stages) and the delta emission is DEFERRED to that transaction's
+   * commit (#5): `decide`/`input` diff the committed before/after at
+   * the transaction's end and ship exactly one delta, and a rollback
+   * ships nothing at all. Emitting here would put a staged-world
+   * delta on the wire that no rollback retracts.
+   */
   commit(next: S): Dispatched {
+    const inTransaction = this.core.inTransaction;
     const previous = this.core.getState() as S;
-    this.revisionBeforeCommit = this.core.revision;
+    if (!inTransaction) this.revisionBeforeCommit = this.core.revision;
     this.core.applySnapshot(next);
+    if (inTransaction) return this.accept([]);
     const current = this.core.getState() as S;
     if (Object.is(previous, current)) {
       // An equivalent commit is not a change (§4): no revision moved,
@@ -661,17 +672,26 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     this.revisionBeforeCommit = this.core.revision;
     let outcome: Outcome;
     try {
-      const input = spec.input(message.in);
       const handler = this.deps.actions[message.name as keyof A];
       // Everything that can REFUSE this action happens inside the
-      // transaction, because a throw inside it discards the staged
-      // writes and a throw after it does not. Validating the output
-      // afterwards let a handler whose result the definition refuses
-      // commit its writes and ship a delta, answering
-      // `action-rejected` for a change that had already happened —
-      // and the same for a result too large to send, which left the
-      // caller with a document it could not be told about.
+      // transaction — the input parse INCLUDED, because it is
+      // application code and a write it makes through the public
+      // `host.setState` must join the transaction like the handler's
+      // own: discarded on a throw, shipped once at the commit (#5).
+      // A parse run beside the transaction published its write and an
+      // emission of its own, and the rollback then answered
+      // `action-rejected` for a change that had already shipped.
+      //
+      // The output is validated here for the same reason: a throw
+      // inside the transaction discards the staged writes and a throw
+      // after it does not. Validating the output afterwards let a
+      // handler whose result the definition refuses commit its writes
+      // and ship a delta, answering `action-rejected` for a change
+      // that had already happened — and the same for a result too
+      // large to send, which left the caller with a document it could
+      // not be told about.
       const produced = this.core.transact(context => {
+        const input = spec.input(message.in);
         const out = spec.output(handler(input, context)) as JsonObject;
         const frame = encodeMessage({
           k: 'res',
@@ -731,10 +751,16 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     const before = this.core.getState() as S;
     this.revisionBeforeCommit = this.core.revision;
     try {
-      const parse = this.deps.definition.inputs[name as keyof I];
-      const input = parse(message.in);
-      const handler = this.deps.inputs[name as keyof I];
-      this.core.transact(context => handler(input, context), peer);
+      // The parse runs INSIDE the transaction, exactly as the action
+      // ladder does (#5): it is application code, and a write it makes
+      // through the public `host.setState` joins the transaction —
+      // discarded with the handler's own writes on a throw, shipped
+      // once in the change this path reports at the end.
+      this.core.transact(context => {
+        const parse = this.deps.definition.inputs[name as keyof I];
+        const handler = this.deps.inputs[name as keyof I];
+        handler(parse(message.in), context);
+      }, peer);
     } catch {
       return this.refuse('in-rejected');
     }

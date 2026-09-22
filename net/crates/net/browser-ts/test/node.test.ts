@@ -287,12 +287,27 @@ describe('BrowserNode', () => {
     // trip through `as f64 as u64` rounds ~511 of every 512 minted
     // ids into a dialog that names no attempt.
     await node.signal('beefcafe00000002', '0000000000000004', 'offer', new Uint8Array([1, 2]));
+    // …and one whose u64 is NOT f64-representable
+    // ('0123456789abcdef' = 81985529216486895: `as f64 as u64` rounds
+    // it to …896, re-spelling the dialog `…abcdf0`). The fixture
+    // above re-encodes identically through any `Number` → re-pad hop,
+    // so the verbatim property is only proven end to end on a
+    // spelling that would visibly round. (The review's suggested
+    // `0011223344556677` is itself f64-exact — 4822678189205111 <
+    // 2^53 — and proves nothing.)
+    await node.signal('beefcafe00000002', '0123456789abcdef', 'offer', new Uint8Array([3]));
     expect(inner.signals).toEqual([
       {
         peerHex: 'beefcafe00000002',
         dialog: '0000000000000004',
         kind: 'offer',
         payload: new Uint8Array([1, 2]),
+      },
+      {
+        peerHex: 'beefcafe00000002',
+        dialog: '0123456789abcdef',
+        kind: 'offer',
+        payload: new Uint8Array([3]),
       },
     ]);
   });
