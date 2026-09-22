@@ -1736,11 +1736,11 @@ jobs:
 
           # ORG_SCOPED_STREAMING_PLAN Stage 1 — protected server-streaming
           # openings (binary tests/org_rpc_streaming.rs). Floor = the count
-          # the binary reports at the pinned head (24 after slice 1.4: 15 +
-          # the eight plan-named 1.4 witnesses + Main's node-shutdown carve
-          # witness). Raised with each slice that lands witnesses; REQUIRED
-          # names extended in the same commit as the witnesses.
-          run_binary org_rpc_streaming 24 \
+          # the binary reports at the pinned head (27 after slice 1.5: 24 +
+          # the three bridge/routing witnesses). Raised with each slice that
+          # lands witnesses; REQUIRED names extended in the same commit as
+          # the witnesses.
+          run_binary org_rpc_streaming 27 \
             stream_opening_admits_same_org \
             stream_opening_admits_cross_org \
             unary_context_proof_is_binding_invalid_on_stream_registration \
@@ -1764,7 +1764,10 @@ jobs:
             active_call_id_reuse_after_replay_window_is_refused \
             raise_between_reserve_and_install_denies_with_zero_effects \
             queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire \
-            node_shutdown_retires_live_protected_streams || exit 1
+            node_shutdown_retires_live_protected_streams \
+            forbidden_stream_opening_causes_zero_handler_effects \
+            streaming_denial_is_not_fanned_out_to_the_reply_roster \
+            provider_policy_veto_denies_before_effects || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
