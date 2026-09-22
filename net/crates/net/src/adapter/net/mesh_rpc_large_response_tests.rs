@@ -112,6 +112,7 @@ async fn send_first_fragment(server: &MeshNode, caller: &MeshNode, call_id: u64)
 enum End {
     Deadline,
     Drop,
+    DropDuringPublish,
     Cancel,
     SessionEviction,
     SessionRetirement,
@@ -133,6 +134,66 @@ async fn partial_call_cleanup(end: End) {
             }),
         )
         .unwrap();
+    if matches!(end, End::DropDuringPublish) {
+        // Drop the call future INSIDE its request-publish await — the gap
+        // between `register_large` and the `UnaryCallGuard` — with fragment
+        // state already attached. The same `(1, 22_007) -> (0, 0)`
+        // leak-vs-release transition the other ends assert proves the
+        // pre-publish cleanup; without the guard installed before the
+        // publish, the entry and its 22 007 budget bytes strand forever.
+        let request_stream = MeshNode::publish_stream_id(&ChannelId::new(
+            ChannelName::new("partial.requests").unwrap(),
+        ));
+        let arrived = caller.arm_publish_park(request_stream);
+        let call = {
+            let caller = caller.clone();
+            let server_id = server.node_id();
+            tokio::spawn(async move {
+                caller
+                    .call(server_id, "partial", Bytes::new(), CallOptions::default())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("call must park inside its publish await");
+        let pending = caller.rpc_client_pending_arc();
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 0),
+            "the pending entry is registered before the publish runs"
+        );
+        let ids = pending.unary_call_ids_for_test();
+        assert_eq!(ids.len(), 1, "exactly the parked call is pending");
+        let call_id = ids[0];
+        send_first_fragment(&server, &caller, call_id).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pending.retained_for_test().1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first fragment must reach real reply dispatcher");
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 22_007),
+            "fragment state hangs off the still-pending call"
+        );
+        assert!(!call.is_finished(), "the call is parked mid-publish");
+        caller.disarm_publish_park();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            pending.retained_for_test(),
+            (0, 0),
+            "drop during publish must release the pending entry and all fragment storage"
+        );
+        release.notify_one();
+        caller.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+        assert_eq!(pending.retained_for_test(), (0, 0));
+        return;
+    }
     let token = caller.reserve_cancel_token();
     let call = {
         let caller = caller.clone();
@@ -195,6 +256,7 @@ async fn partial_call_cleanup(end: End) {
                 Err(RpcError::Cancelled)
             ));
         }
+        End::DropDuringPublish => unreachable!("handled above"),
         End::SessionEviction | End::SessionRetirement | End::Shutdown => {
             // Deterministic session-table eviction: exercise the live call's
             // retirement watcher without relying on heartbeat timing.
@@ -243,6 +305,10 @@ async fn partial_response_deadline_releases_real_call_storage() {
 #[tokio::test]
 async fn partial_response_dropped_future_releases_real_call_storage() {
     partial_call_cleanup(End::Drop).await;
+}
+#[tokio::test]
+async fn partial_response_drop_during_publish_releases_real_call_storage() {
+    partial_call_cleanup(End::DropDuringPublish).await;
 }
 #[tokio::test]
 async fn partial_response_cancel_token_releases_real_call_storage() {

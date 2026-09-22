@@ -11606,6 +11606,14 @@ pub struct MeshNode {
     /// Eight node-wide logical response pumps, with no fragment queue.
     #[cfg(feature = "cortex")]
     rpc_large_response_slots: Arc<tokio::sync::Semaphore>,
+    /// Test-only publish park (review finding 1): when armed for a
+    /// `stream_id`, `publish_to_peer` signals `arrived` and parks forever,
+    /// so a test can deterministically drop a call future INSIDE its
+    /// request-publish await — the gap between `RpcClientPending::
+    /// register_large` and the `UnaryCallGuard` cleanup. Production builds
+    /// carry no field and no check (`#[cfg(test)]`).
+    #[cfg(test)]
+    publish_park: parking_lot::Mutex<Option<(u64, Arc<tokio::sync::Notify>)>>,
     /// Independent fetch_add counter used by `RoutingPolicy::
     /// RoundRobin` and `Random` to pick the next target node.
     /// Sequential is correct here — the cursor is local-only and
@@ -14079,6 +14087,8 @@ impl MeshNode {
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             #[cfg(feature = "cortex")]
             rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            #[cfg(test)]
+            publish_park: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -32597,6 +32607,22 @@ impl MeshNode {
         self.rpc_large_response_slots.clone()
     }
 
+    /// Test seam for the drop-during-publish case: park `publish_to_peer`
+    /// for `stream_id` and hand back the arrival signal to await on.
+    #[cfg(test)]
+    pub(crate) fn arm_publish_park(&self, stream_id: u64) -> Arc<tokio::sync::Notify> {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        *self.publish_park.lock() = Some((stream_id, Arc::clone(&arrived)));
+        arrived
+    }
+
+    /// Release the publish park so later publishes — including the
+    /// `UnaryCallGuard` Drop's CANCEL — flow again.
+    #[cfg(test)]
+    pub(crate) fn disarm_publish_park(&self) {
+        *self.publish_park.lock() = None;
+    }
+
     /// Per-Mesh shared `RpcClientPending` — accessor for the
     /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
     /// RESPONSE events live here.
@@ -41703,6 +41729,18 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> Result<(), AdapterError> {
+        // Test-only park point (see `arm_publish_park`): this await is the
+        // gap the `register_large` cleanup guard must survive.
+        #[cfg(test)]
+        {
+            let parked = self.publish_park.lock().clone();
+            if let Some((park_stream, arrived)) = parked {
+                if park_stream == stream_id {
+                    arrived.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
         match self
             .try_publish_to_peer(peer_node_id, channel_hash, stream_id, reliable, events)
             .await

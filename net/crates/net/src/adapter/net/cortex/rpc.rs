@@ -4126,12 +4126,39 @@ pub struct RpcClientPending {
     fragment_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// Cap on entries inspected per [`RpcClientPending::sweep_stranded_unary`].
+/// Registration is per-call work, so the scan must stay O(1)-ish even for a
+/// pathological map; repeated registrations walk the whole map over time.
+const STRANDED_UNARY_SWEEP_MAX: usize = 64;
+
 impl RpcClientPending {
     /// Construct an empty pending-call store.
     pub fn new() -> Self {
         Self {
             senders: dashmap::DashMap::new(),
             fragment_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Bounded sweep for stranded unary entries: a `Unary` entry whose
+    /// receiver is gone can never complete a call, yet — with
+    /// `session: Some(..)` — still grows fragment assembly charged to the
+    /// node-global budget. Removing it releases both the entry and any
+    /// assembly reservation, so no single missed cleanup path can exhaust
+    /// `fragment_bytes` for the node's lifetime (review finding 1).
+    /// At most [`STRANDED_UNARY_SWEEP_MAX`] entries are inspected per call.
+    fn sweep_stranded_unary(&self, max: usize) {
+        let stranded: Vec<u64> = self
+            .senders
+            .iter()
+            .take(max)
+            .filter_map(|entry| match entry.value() {
+                (_, PendingEntry::Unary { tx, .. }) if tx.is_closed() => Some(*entry.key()),
+                _ => None,
+            })
+            .collect();
+        for call_id in stranded {
+            self.senders.remove(&call_id);
         }
     }
 
@@ -4177,6 +4204,10 @@ impl RpcClientPending {
         target: u64,
         session: u64,
     ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
+        // Heal-before-grow: free any entry whose receiver is gone BEFORE
+        // this call can need the fragment budget its late fragments would
+        // otherwise hold.
+        self.sweep_stranded_unary(STRANDED_UNARY_SWEEP_MAX);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.senders.insert(
             call_id,
@@ -4295,6 +4326,20 @@ impl RpcClientPending {
             self.senders.len(),
             self.fragment_bytes.load(Ordering::Acquire),
         )
+    }
+
+    /// Test-only observation of the unary call ids currently registered —
+    /// lets a test address a call whose REQUEST was never published (so no
+    /// handler ever reported its id).
+    #[cfg(test)]
+    pub(crate) fn unary_call_ids_for_test(&self) -> Vec<u64> {
+        self.senders
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                (_, PendingEntry::Unary { .. }) => Some(*entry.key()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Deliver `resp` to the waiter for `call_id`, if any.
@@ -7192,6 +7237,51 @@ mod tests {
         let inner = result.expect("must complete within 1s");
         assert!(inner.is_err(), "re-register must close prior receiver");
         assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// A pending entry whose receiver is gone can never complete, yet a
+    /// fragment-owning one keeps charging the node-global reassembly
+    /// budget until something removes it. `register_large` sweeps exactly
+    /// such entries (review finding 1, closure (b)): no single missed
+    /// cleanup path can exhaust `fragment_bytes` for the node's lifetime.
+    #[tokio::test]
+    async fn client_pending_sweep_releases_stranded_unary_storage() {
+        let pending = RpcClientPending::new();
+        let rx = pending.register_large(0x5EED, 0x42, 7);
+        let mut first = None;
+        super::large_response::emit(
+            RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from(vec![b'x'; 22_000]),
+            },
+            true,
+            |piece| {
+                if first.is_none() {
+                    first = Some(piece);
+                }
+            },
+        );
+        pending.deliver_session(0x5EED, 0x42, 7, first.unwrap());
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 22_007),
+            "fragment state hangs off the live entry"
+        );
+        // The cleanup path was missed: the receiver is gone and the entry
+        // strands with its reservation.
+        drop(rx);
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 22_007),
+            "the stranded entry holds its reservation until swept"
+        );
+        let _next = pending.register_large(0xBEEF, 0x42, 7);
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 0),
+            "the next registration sweeps the stranded entry and releases its budget"
+        );
     }
 
     /// S-4 part 2 regression: a RESPONSE whose wire `from_node`

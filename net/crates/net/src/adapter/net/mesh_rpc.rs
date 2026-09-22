@@ -6030,6 +6030,28 @@ impl MeshNode {
                 })?;
         let rx = pending.register_large(call_id, target_node_id, expected_session);
 
+        // Install the RAII cleanup IMMEDIATELY after registration and
+        // BEFORE the publish await below (review finding 1): a future
+        // dropped inside `publish_to_peer(...).await` — hedge loser,
+        // `select!`-cancelled call, aborted `JoinHandle` — must still
+        // retire the entry. A drop in that gap used to strand
+        // `PendingEntry::Unary { session: Some(..) }` for the node's
+        // lifetime, letting late fragments charge the node-global
+        // reassembly budget with no release path. Drop fires CANCEL
+        // while `completed` is false; for a request that never finished
+        // publishing that CANCEL may name an id the server never saw —
+        // a server-side no-op, strictly safer than leaking.
+        remember_cancel_publish_runtime();
+        let mut guard = UnaryCallGuard {
+            pending: Arc::clone(&pending),
+            mesh: Arc::clone(self),
+            target_node_id,
+            request_channel: route.request_channel.clone(),
+            self_origin,
+            call_id,
+            completed: false,
+        };
+
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
@@ -6063,7 +6085,10 @@ impl MeshNode {
             )
             .await
         {
-            pending.cancel(call_id);
+            // The REQUEST never completed its publish, so a wire CANCEL
+            // has nothing to cancel: mark the guard so Drop retires the
+            // pending entry only.
+            guard.completed = true;
             // Distinguish "I don't know how to reach this peer"
             // from a generic transport blip: when the publish path
             // surfaces a no-session error, that's NoRoute (the
@@ -6091,28 +6116,13 @@ impl MeshNode {
             return Err(err);
         }
 
-        // From here on, the REQUEST is in flight on the server.
-        // Wrap the rest of the call in an RAII guard whose Drop
-        // fires CANCEL if `guard.completed` isn't set — covering:
-        //  - the call future being dropped mid-flight (e.g. hedge
-        //    loser, select!-cancelled future, caller awaiting a
-        //    `JoinHandle` that gets cancelled).
-        //  - the timeout path (we leave `completed=false` so Drop
-        //    handles CANCEL emission; no need for a separate
-        //    `send_rpc_cancel` call).
-        //  - the cancel_token path (same: leave completed=false,
-        //    Drop emits CANCEL).
-        // See `remember_cancel_publish_runtime`.
-        remember_cancel_publish_runtime();
-        let mut guard = UnaryCallGuard {
-            pending: Arc::clone(&pending),
-            mesh: Arc::clone(self),
-            target_node_id,
-            request_channel: route.request_channel.clone(),
-            self_origin,
-            call_id,
-            completed: false,
-        };
+        // From here on, the REQUEST is in flight on the server. The
+        // `UnaryCallGuard` installed right after `register_large` covers
+        // every remaining exit: the timeout and cancel_token paths leave
+        // `completed = false` so Drop emits CANCEL (no separate
+        // `send_rpc_cancel` call needed), and a dropped call future
+        // (hedge loser, `select!`-cancel, aborted `JoinHandle`) cleans up
+        // from Drop exactly as the resolved paths do.
 
         // Substrate cancel-token plumbing (v3 / C-S1). When the
         // caller set `opts.cancel_token`, register a Notify against
