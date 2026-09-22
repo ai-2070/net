@@ -4459,3 +4459,448 @@ async fn opening_body_budget_refusal_completes_the_record() {
     );
     assert_eq!(registry.active_node(), 0, "no active-call quota charged");
 }
+
+// ===========================================================================
+// Slice 2.3 — duplex response flow control (C8, Q3's approved PUBLIC +
+// PROTECTED honouring): the `flow_control` map + `STREAM_GRANT` arm "as
+// SS", the caller's `nrpc-stream-window-initial` header honoured.
+// ===========================================================================
+
+/// Slice 2.3 — `duplex_response_window_blocks_until_grant` (C8's regression
+/// witness, PROTECTED and PUBLIC legs). A duplex caller's opted-in
+/// `nrpc-stream-window-initial` response window is HONORED on both folds:
+/// with zero initial credit the response pump PARKS — the queued echo
+/// publishes NOTHING through the bounded darkness window — and a
+/// `STREAM_GRANT` on the exact session releases it so the remaining output
+/// (echo + terminal) completes. (A public caller that sets a window and
+/// never grants now STALLS instead of receiving unbounded.)
+#[tokio::test]
+async fn duplex_response_window_blocks_until_grant() {
+    use net::adapter::net::cortex::rpc::{HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_END};
+
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x98u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x30);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-c8");
+    let caller_origin = caller.origin_hash();
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+
+    // ---- the PROTECTED leg (owner-scoped, real admission) ----
+    let prot_seen: Arc<parking_lot::Mutex<Vec<Bytes>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let prot_entries = Arc::new(AtomicUsize::new(0));
+    let prot_finished = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            s14::SERVICE,
+            Arc::new(s2::EchoDX {
+                seen: Arc::clone(&prot_seen),
+                entries: prot_entries.clone(),
+                finished: Arc::clone(&prot_finished),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        46,
+        caller_origin,
+        &s2::dx_opening(s14::SERVICE, Some(0), b"C8-protected-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the zero-credit protected opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || prot_seen.lock().len() == 1).await,
+        "the opening body reached the protected handler",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 46, &s13::chunk_payload(46, b"", true)),
+        )),
+        "the bridge accepted the protected END (before the grant probes)",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "protected zero credit publishes nothing before a grant",
+    )
+    .await;
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    let key = (caller.node_id(), session_id, caller_origin, 46u64);
+    assert_eq!(
+        fold.lock().flow_control_permits(key),
+        Some(0),
+        "the protected response window parks the pump at zero credit",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 46, 1),
+        )),
+        "the bridge accepted the protected STREAM_GRANT",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 2).await,
+        "the grant releases the blocked protected output — echo + terminal complete",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            s15::response_of(&seen[0]).body.as_ref(),
+            b"C8-protected-1".as_slice(),
+            "the protected echo carries the delivered body",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        2,
+        "protected: exactly the echo and ONE terminal",
+    );
+    assert_eq!(prot_finished.load(Ordering::SeqCst), 1, "one protected run");
+
+    // ---- the PUBLIC leg (`serve_rpc_duplex`, no proof) ----
+    let pub_seen: Arc<parking_lot::Mutex<Vec<Bytes>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let pub_entries = Arc::new(AtomicUsize::new(0));
+    let pub_finished = Arc::new(AtomicUsize::new(0));
+    let pub_serve = server
+        .serve_rpc_duplex(
+            "svc-pub",
+            Arc::new(s2::EchoDX {
+                seen: Arc::clone(&pub_seen),
+                entries: pub_entries.clone(),
+                finished: Arc::clone(&pub_finished),
+            }),
+        )
+        .expect("serve public duplex");
+    let pub_reply = ChannelName::new(&format!("svc-pub.replies.{caller_origin:016x}")).unwrap();
+    let (pub_disp, pub_seen_frames) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(pub_reply.hash(), pub_disp)
+        .is_some());
+    let pub_req = s2::dx_opening("svc-pub", Some(0), b"C8-public-3");
+    assert!(
+        pub_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::request_frame(caller_origin, 47, &pub_req),
+        )),
+        "the bridge accepted the zero-credit public opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || pub_seen.lock().len() == 1).await,
+        "the opening body reached the public handler",
+    );
+    assert!(
+        pub_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 47, &s13::chunk_payload(47, b"", true)),
+        )),
+        "the bridge accepted the public END (before the grant probes)",
+    );
+    s15::assert_stays_empty(
+        &pub_seen_frames,
+        Duration::from_millis(200),
+        "public zero credit publishes nothing before a grant (C8)",
+    )
+    .await;
+    let pub_fold = pub_serve
+        .duplex_fold_for_test()
+        .expect("the public duplex fold handle");
+    let pub_key = (caller.node_id(), session_id, caller_origin, 47u64);
+    assert_eq!(
+        pub_fold.lock().flow_control_permits(pub_key),
+        Some(0),
+        "the PUBLIC response window is installed and parks the pump at zero credit (C8)",
+    );
+    assert!(
+        pub_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 47, 1),
+        )),
+        "the bridge accepted the public STREAM_GRANT",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || pub_seen_frames.lock().len()
+            >= 2)
+        .await,
+        "the grant releases the blocked public output — echo + terminal complete",
+    );
+    {
+        let seen = pub_seen_frames.lock();
+        assert_eq!(
+            s15::response_of(&seen[0]).body.as_ref(),
+            b"C8-public-3".as_slice(),
+            "the public echo carries the delivered body",
+        );
+        let terminal = s15::response_of(&seen[seen.len() - 1]);
+        assert_eq!(
+            (terminal.status, terminal.headers, terminal.body.as_ref()),
+            (
+                RpcStatus::Ok,
+                vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec()
+                )],
+                b"".as_slice(),
+            ),
+            "the public terminal's exact wire content is Ok + `nrpc-streaming: end`",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        pub_seen_frames.lock().len(),
+        2,
+        "public: exactly the echo and ONE terminal",
+    );
+    assert_eq!(pub_finished.load(Ordering::SeqCst), 1, "one public run");
+}
+
+/// Slice 2.3 — `cross_direction_grant_is_ignored`. Response-direction
+/// credit is released ONLY by its own grant kind, for its own shape: an
+/// inbound `DISPATCH_RPC_REQUEST_GRANT` (the server → caller UPLOAD-grant
+/// kind — the WRONG DIRECTION for a response window) never releases the
+/// response credit (the window stays at its initial zero — named), while
+/// the `STREAM_GRANT` kind does (positive control); and a `STREAM_GRANT`
+/// at a client-streaming call (whose shape has no response pump to credit)
+/// is a no-op — the call's single response completes when the handler
+/// returns, grant or not (the shape half).
+#[tokio::test]
+async fn cross_direction_grant_is_ignored() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x99u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x31);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-cross");
+    let caller_origin = caller.origin_hash();
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+
+    // ---- the direction half: a zero-credit DX response window ----
+    let seen_bodies: Arc<parking_lot::Mutex<Vec<Bytes>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let entries = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            "svc-dx",
+            Arc::new(s2::EchoDX {
+                seen: Arc::clone(&seen_bodies),
+                entries: entries.clone(),
+                finished: Arc::clone(&finished),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+    let reply_channel = ChannelName::new(&format!("svc-dx.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let intent = fixture::owner_delegated_intent(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        "svc-dx",
+    );
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        48,
+        caller_origin,
+        &s2::dx_opening("svc-dx", Some(0), b"cross-warm-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the zero-credit duplex opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || seen_bodies.lock().len() == 1).await,
+        "the opening body reached the duplex handler",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 48, &s13::chunk_payload(48, b"", true)),
+        )),
+        "the bridge accepted the duplex END (before the grant probes)",
+    );
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    let key = (caller.node_id(), session_id, caller_origin, 48u64);
+    assert_eq!(
+        fold.lock().flow_control_permits(key),
+        Some(0),
+        "the response window starts at zero credit",
+    );
+
+    // WRONG-DIRECTION grant: the upload-grant KIND on the exact session and
+    // call — it must never release the RESPONSE credit.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s2::request_grant_frame(caller_origin, 48, 5),
+        )),
+        "the bridge accepted the cross-direction REQUEST_GRANT",
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fold.lock().flow_control_permits(key),
+        Some(0),
+        "a cross-direction REQUEST_GRANT does not release response credit",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "the cross-direction grant published nothing",
+    )
+    .await;
+
+    // Positive control: the RIGHT kind releases.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 48, 1),
+        )),
+        "the bridge accepted the STREAM_GRANT",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 2).await,
+        "the STREAM_GRANT kind releases the response credit",
+    );
+
+    // ---- the shape half: a STREAM_GRANT at a CLIENT-STREAMING call (no
+    // response pump to credit) is a no-op — the single response completes
+    // when the handler returns, grant or not. ----
+    let cs_entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_b.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let cs_serve = server
+        .serve_rpc_owner_scoped_client_stream(
+            "svc-cs",
+            Arc::new(s2::AggregateCS {
+                entries: cs_entries.clone(),
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped client-streaming");
+    let cs_reply = ChannelName::new(&format!("svc-cs.replies.{caller_origin:016x}")).unwrap();
+    let (cs_disp, cs_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(cs_reply.hash(), cs_disp)
+        .is_some());
+    let cs_intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), "svc-cs");
+    let cs_frame = s2::mint_opening(
+        &cs_intent,
+        RpcCallShape::ClientStreaming,
+        binding,
+        49,
+        caller_origin,
+        &s2::cs_opening("svc-cs", b"cs-shape-1"),
+    );
+    assert!(
+        cs_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            cs_frame
+        )),
+        "the bridge accepted the client-streaming opening",
+    );
+    // The shape-wrong STREAM_GRANT arrives before the END.
+    assert!(
+        cs_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 49, 5),
+        )),
+        "the bridge accepted the shape-wrong STREAM_GRANT",
+    );
+    assert!(
+        cs_serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 49, &s13::chunk_payload(49, b"", true)),
+        )),
+        "the bridge accepted the END",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || cs_seen.lock().len() == 1).await,
+        "the client-streaming single response completes — a shape-wrong \
+         STREAM_GRANT is a no-op, grant or not",
+    );
+    assert_eq!(
+        s15::response_of(&cs_seen.lock()[0]).body.as_ref(),
+        b"cs-shape-1".as_slice(),
+        "the single response carries the aggregate",
+    );
+}

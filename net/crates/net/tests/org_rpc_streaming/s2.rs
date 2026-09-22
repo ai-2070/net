@@ -20,15 +20,28 @@ use net::adapter::net::behavior::org::OrgId;
 use net::adapter::net::behavior::org_call::RpcCallShape;
 use net::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 use net::adapter::net::cortex::rpc::{
-    RequestStream, RpcClientStreamingHandler, RpcDuplexHandler, RpcHandlerError, RpcRequestPayload,
-    RpcResponsePayload, RpcResponseSink, RpcStatus, RpcStreamingContext,
-    FLAG_RPC_CLIENT_STREAMING_REQUEST, FLAG_RPC_STREAMING_RESPONSE,
-    HEADER_NRPC_STREAM_WINDOW_INITIAL,
+    encode_request_grant, encode_rpc_route, RequestStream, RpcClientStreamingHandler,
+    RpcDuplexHandler, RpcHandlerError, RpcRequestPayload, RpcResponsePayload, RpcResponseSink,
+    RpcStatus, RpcStreamingContext, DISPATCH_RPC_REQUEST_GRANT, FLAG_RPC_CLIENT_STREAMING_REQUEST,
+    FLAG_RPC_STREAMING_RESPONSE, HEADER_NRPC_STREAM_WINDOW_INITIAL,
 };
+use net::adapter::net::cortex::EventMeta;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{test_sign_admission_proof, OrgProofIntent};
 
 use super::s13;
+
+/// A `DISPATCH_RPC_REQUEST_GRANT` frame — the server → caller UPLOAD-grant
+/// KIND (the wrong direction for a response window): the cross-direction
+/// probe's grant (Stage 2 slice 2.3).
+pub(crate) fn request_grant_frame(origin: u64, call_id: u64, credits: u32) -> Bytes {
+    let meta = EventMeta::new(DISPATCH_RPC_REQUEST_GRANT, 0, origin, call_id, 0);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&meta.to_bytes());
+    encode_rpc_route(&mut buf, 0);
+    buf.extend_from_slice(&encode_request_grant(call_id, credits));
+    Bytes::from(buf)
+}
 
 /// A client-streaming opening payload (CS flags — `ClientStreaming` is
 /// `(true, false)` under `RpcCallShape::from_streaming_flags`).

@@ -7923,6 +7923,20 @@ impl RpcDuplexFold {
                     byte_charge: None,
                     gate: None,
                 };
+                // C8 (Stage 2 slice 2.3, Q3's approved public change): the
+                // caller's opted-in response window
+                // (`nrpc-stream-window-initial`) is HONORED on the public
+                // path exactly as on the protected one — `Some(sem)` means
+                // the pump must `acquire().await` one permit per chunk
+                // before emitting, and a `STREAM_GRANT` refills it; absent
+                // entry = unbounded credit (back-compat). A public caller
+                // that sets a window and never grants now STALLS instead of
+                // receiving unbounded.
+                let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
+                    let sem = Arc::new(tokio::sync::Semaphore::new(n as usize));
+                    self.flow_control.lock().insert(key, sem.clone());
+                    sem
+                });
 
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
                     extract_trace_context(&payload.headers)
@@ -7949,11 +7963,23 @@ impl RpcDuplexFold {
                 let metrics = self.metrics.clone();
 
                 // Pump: drains resp_rx, emits per-chunk RESPONSE
-                // events with `nrpc-streaming: continue`.
+                // events with `nrpc-streaming: continue`. C8 (Stage 2
+                // slice 2.3): one flow-control credit per chunk when the
+                // caller opted in (the SS pump's acquire clause).
                 let pump_emit = emit.clone();
                 let pump_metrics = metrics.clone();
+                let pump_flow = flow_sem.clone();
                 let pump = tokio::spawn(async move {
                     while let Some(chunk) = resp_rx.recv().await {
+                        if let Some(sem) = pump_flow.as_ref() {
+                            match sem.clone().acquire_owned().await {
+                                Ok(permit) => permit.forget(),
+                                // Semaphore closed by retirement: stop
+                                // publishing (the SS pump's `Err(_) =>
+                                // break` clause).
+                                Err(_) => break,
+                            }
+                        }
                         if let Some(m) = pump_metrics.as_ref() {
                             m.streaming_chunks_emitted_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8184,6 +8210,9 @@ impl RpcDuplexFold {
                     token.cancel();
                 }
                 self.senders.lock().remove(&key);
+                // C8 (Stage 2 slice 2.3): drop the response-window entry
+                // too (the SS fold's CANCEL clause).
+                self.flow_control.lock().remove(&key);
             }
             _ => {}
         }
