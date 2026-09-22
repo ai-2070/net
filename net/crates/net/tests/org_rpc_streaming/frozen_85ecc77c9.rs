@@ -30,6 +30,12 @@ pub mod old_org_admission;
 pub mod old_org_call;
 #[path = "frozen_85ecc77c9/old_serve.rs"]
 #[rustfmt::skip]
+// Verbatim `85ecc77c9` source: its `std::sync::Mutex::lock` calls are part of
+// the frozen extraction this witness exists to pin (sha256 in each file's
+// doc). Migrating them to `parking_lot` would falsify the frozen-decoder
+// evidence, so the repo-wide disallowed-methods ban is lifted for this module
+// only — the vendored file itself stays byte-identical.
+#[allow(clippy::disallowed_methods)]
 pub mod old_serve;
 
 pub use old_serve::{frozen_opening, FrozenProvider, FrozenYield, UnaryAdmission};

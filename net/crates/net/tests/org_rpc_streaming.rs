@@ -68,6 +68,11 @@ fn mint_stream_opening(
 
 /// The provider-side context for a server-streaming opening (registered
 /// shape SS; SS payload flags; the receiving session's binding).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper assembling the full AdmissionContext; a params struct would only \
+              rename the arguments and hide which verified facts the caller must supply"
+)]
 fn stream_ctx<'a>(
     mode: OrgAdmission,
     caller: &'a net::adapter::net::identity::EntityId,
@@ -772,8 +777,7 @@ async fn requested_deadline_over_cap_is_refused_with_zero_effects() {
             &lifetime,
             None,
         )
-        .err()
-        .expect("an explicit deadline over the provider cap must be refused");
+        .expect_err("an explicit deadline over the provider cap must be refused");
     assert!(
         matches!(refused, AdmissionDenied::DeadlineExceedsPolicy),
         "an explicit deadline over the provider cap is refused with DeadlineExceedsPolicy, got {refused:?}",

@@ -2125,10 +2125,16 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     let node = build_node().await;
     node.install_org_revocation_store(store.clone())
         .expect("install");
+    // Rewritten 2026-09-22 (named, plan §2.3): installation registers
+    // exactly TWO subscribers — the node's own raise callback and the
+    // protected-call registry's second `subscribe_floors_raised` feed.
+    // The teardown property below is unchanged and now guards strictly
+    // more: BOTH subscriptions must be gone after the drop.
     assert_eq!(
         store.subscriber_count(),
-        1,
-        "installation registers exactly one node subscriber"
+        2,
+        "installation registers exactly two subscribers (plan §2.3): the \
+         node's own raise callback and the protected-call registry's"
     );
 
     // Drop the node (the test holds the only strong Arc, and an
@@ -2138,7 +2144,9 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     assert_eq!(
         store.subscriber_count(),
         0,
-        "a dropped node must unsubscribe — else the core/callback leaks"
+        "a dropped node must unsubscribe BOTH subscriptions — its own \
+         raise callback and the protected-call registry's (§2.3) — else \
+         the core/callback leaks"
     );
 
     // The store still works after the node is gone (a raise simply
@@ -2212,7 +2220,15 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     let node = build_node().await;
     node.install_org_revocation_store(store.clone())
         .expect("install");
-    assert_eq!(store.subscriber_count(), 1);
+    // Rewritten 2026-09-22 (named, plan §2.3): the install registers the
+    // node's own raise callback plus the protected-call registry's second
+    // feed. The inertness property below is unchanged and is now asserted
+    // over every snapshotted callback, not just one.
+    assert_eq!(
+        store.subscriber_count(),
+        2,
+        "§2.3: the node's callback plus the protected-call registry's"
+    );
 
     // Project ownership under the installed store (cert generation 4).
     let publisher = EntityKeypair::generate();
@@ -2229,15 +2245,21 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     ann.sign(&publisher);
     node.test_inject_capability_announcement(ann);
 
-    // Hold the fold and SNAPSHOT the node's raise callback, both BEFORE
-    // teardown — exactly what `notify` captures.
+    // Hold the fold and SNAPSHOT the live raise callbacks (the node's own
+    // and the registry's §2.3 feed), both BEFORE teardown — exactly what
+    // `notify` captures.
     let fold = node.capability_fold().clone();
     assert_eq!(
         owner_org_for(&fold, publisher_node_id),
         Some(org().org_id())
     );
     let snapshot = store.snapshot_subscribers_for_test();
-    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "the snapshot captures both live callbacks — inertness is asserted \
+         below over every one of them"
+    );
 
     // Tear the node down: MeshNode::drop invalidates the owner token
     // BEFORE unsubscribing, so the count returns to baseline…

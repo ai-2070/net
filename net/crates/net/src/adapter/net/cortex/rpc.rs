@@ -3200,7 +3200,7 @@ impl StreamCallRecord {
 /// (once wired) the revocation callback, session sweep and node
 /// shutdown (§2.2) — the production mirror of the model's
 /// `RetireSignal`. First reason wins, matching
-/// [`StreamCallRecord::retire`].
+/// `StreamCallRecord::retire`.
 #[derive(Debug, Default)]
 pub struct StreamRetireSignal {
     notify: Notify,
@@ -5869,7 +5869,7 @@ impl RpcServerStreamingFold {
     }
 
     /// The registration-owned live PROTECTED calls (§2.2). The serve
-    /// seam clones this into its [`ServeHandle`] so handle drop retires
+    /// seam clones this into its `ServeHandle` so handle drop retires
     /// exactly these records (Q3).
     pub fn protected_owners(&self) -> ProtectedStreamOwners {
         self.protected_calls.clone()
@@ -5901,7 +5901,7 @@ impl RpcServerStreamingFold {
     /// deadline, an explicit request over `max_live` is REFUSED (never
     /// clamped), and credential validity clamps with the `Deadline` vs
     /// `Credential` bound recorded. Every refusal is one typed
-    /// [`AdmissionDenied`](crate::adapter::net::behavior::org_admission::AdmissionDenied)
+    /// [`AdmissionDenied`]
     /// the bridge routes through the unchanged `emit_admission_denial`
     /// — the fold emits NOTHING on refusal, so a denied opening has
     /// exactly one bounded denial and zero handler effects (no handler,
@@ -11833,7 +11833,7 @@ mod tests {
         .encode_into(&mut small);
         apply_request_chunk_to_senders(2, 3, Bytes::from(small), &meta, &senders, "unit");
         {
-            let mut rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime");
             rt.block_on(async {
@@ -11882,7 +11882,7 @@ mod tests {
         .encode_into(&mut small2);
         apply_request_chunk_to_senders(2, 3, Bytes::from(small2), &meta, &senders, "unit");
         {
-            let mut rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime");
             rt.block_on(async {

@@ -1105,7 +1105,7 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
 /// the handler NEVER runs. A non-REQUEST frame (a CANCEL for an already-admitted
 /// call) passes to the fold unchanged — no re-admission.
 /// §3's admission transaction (slice 1.4) — the SHARED helper the unary
-/// protected bridge ([`admit_and_dispatch_protected`]) consumes now and
+/// protected bridge (`admit_and_dispatch_protected`) consumes now and
 /// `admit_and_dispatch_protected_stream` (slice 1.5) consumes next (the
 /// F-S1.3-7 shared-helper preference). One exact-incarnation transaction
 /// around the shape-aware verifier, replay/policy ordering UNCHANGED
@@ -4627,7 +4627,7 @@ impl MeshNode {
     /// `nrpc:<service>` tag is never broadcast in the clear (OA3-4b1 emission
     /// rules, shared with [`Self::serve_rpc_owner_scoped`]), whose streaming
     /// openings run the E1.2 org-admission gate
-    /// ([`verify_org_admission`]: crate::adapter::net::behavior::org_admission::verify_org_admission)
+    /// (`verify_org_admission` at `behavior::org_admission`)
     /// under [`OrgAdmission::OwnerDelegated`] with the captured
     /// `provider_policy` as the final application veto. REQUIRES an installed
     /// node authority (else [`ServeError::ProtectedAuthorityRequired`]).
