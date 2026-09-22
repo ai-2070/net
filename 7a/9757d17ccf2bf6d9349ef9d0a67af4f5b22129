@@ -1,0 +1,23 @@
+net/crates/net/cli/tests/automation_contract.rs
+  s_38828de26a56bb::t_d48c57c4036f79 40-57,457-468,490-491,494-497,522-523,526-529
+net/crates/net/cli/tests/remote_inspection.rs
+  s_38828de26a56bb::t_b0bfc0cf10d4eb 154-170,190-192,264-265,271-274
+net/crates/net/cli/tests/wrap_listen.rs
+  s_38828de26a56bb::t_52db5b67eec5da 14,24-26,30-46,50-51,60,85-86,97-100,107-108,148-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7a9757d17ccf2bf6d9349ef9d0a67af4f5b22129",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
