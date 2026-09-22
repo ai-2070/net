@@ -1,0 +1,23 @@
+net/crates/net/sdk/src/enrollment.rs
+  s_3f3d4c91f992be::t_b12bb687de40b7 69
+net/crates/net/sdk/tests/enrollment_invite.rs
+  s_3f3d4c91f992be::t_b12bb687de40b7 11,45-46,48,107,112-116,288
+net/crates/net/sdk/src/enrollment/invite.rs
+  s_3f3d4c91f992be::t_b12bb687de40b7 2,36-40,408-410,413,418-422,424-425,427,433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5ee86fb8c51df832b1d86c6cb6350333a4d7f1e7",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
