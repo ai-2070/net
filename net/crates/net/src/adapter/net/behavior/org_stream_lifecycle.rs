@@ -704,6 +704,13 @@ pub struct SinkClosed;
 /// `handler` is the user future; `queued` is the pump's inbound queue
 /// (the handler's sink side is the matching `Sender`); `deadline` is the
 /// already-resolved §2.1 end.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the §2.2 ctl parameter pushed this one over the arg-count lint; the model names \
+              every supervisor-owned piece one-for-one (handler, pump queue, gate, semaphores, \
+              retire signal, deadline, emission counter, control path) and a params struct \
+              would only rename the arguments and hide that mapping"
+)]
 pub async fn run_supervisor(
     state: Arc<parking_lot::Mutex<CallLifecycle>>,
     handler: impl Future<Output = HandlerResult> + Send,
