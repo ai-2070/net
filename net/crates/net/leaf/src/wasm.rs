@@ -5125,16 +5125,24 @@ mod id_parse_witnesses {
     /// contract covers every id argument here.
     #[wasm_bindgen_test]
     fn five_node_id_spellings_read_one_way_through_both_id_readers() {
-        let peer = parse_peer_id(SPELLINGS[0]).ok().expect("the 16 hex digits parse");
+        let peer = parse_peer_id(SPELLINGS[0])
+            .ok()
+            .expect("the 16 hex digits parse");
         assert_eq!(
             peer,
-            parse_peer_id(SPELLINGS[1]).ok().expect("the 0x form parses to the same id")
+            parse_peer_id(SPELLINGS[1])
+                .ok()
+                .expect("the 0x form parses to the same id")
         );
         assert_eq!(peer, 0x0036_6d40_3ce1_9dac);
-        let dialog = parse_dialog_id(SPELLINGS[0]).ok().expect("the 16 hex digits parse");
+        let dialog = parse_dialog_id(SPELLINGS[0])
+            .ok()
+            .expect("the 16 hex digits parse");
         assert_eq!(
             dialog,
-            parse_dialog_id(SPELLINGS[1]).ok().expect("the 0x form parses to the same id")
+            parse_dialog_id(SPELLINGS[1])
+                .ok()
+                .expect("the 0x form parses to the same id")
         );
 
         for spelling in &SPELLINGS[2..] {
@@ -5166,18 +5174,18 @@ mod id_parse_witnesses {
     #[wasm_bindgen_test]
     fn a_malformed_id_returns_the_named_refusal_and_never_a_panic() {
         for bait in [
-            "",                                                     // empty
-            " ",                                                    // blank
-            "0x",                                                   // lone prefix
-            "0X",                                                   // lone prefix, upper
-            "0123456789abcde",                                      // one short
-            "0123456789abcdefg",                                    // one overlong
-            "0123456789abcdef0123456789abcdef",                     // twice overlong
-            "0123456789abcdeZ",                                     // 16 bytes, one non-hex
-            "\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}",     // 8 chars = 16 BYTES
-            "0x\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}",   // prefixed non-ASCII
-            "00366d403ce19da\u{e4}",                                // 16 bytes with a 2-byte tail
-            " 0x9 ",                                                // padded short hex
+            "",                                                   // empty
+            " ",                                                  // blank
+            "0x",                                                 // lone prefix
+            "0X",                                                 // lone prefix, upper
+            "0123456789abcde",                                    // one short
+            "0123456789abcdefg",                                  // one overlong
+            "0123456789abcdef0123456789abcdef",                   // twice overlong
+            "0123456789abcdeZ",                                   // 16 bytes, one non-hex
+            "\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}",   // 8 chars = 16 BYTES
+            "0x\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}", // prefixed non-ASCII
+            "00366d403ce19da\u{e4}",                              // 16 bytes with a 2-byte tail
+            " 0x9 ",                                              // padded short hex
         ] {
             let peer_refusal = message(
                 parse_peer_id(bait)
