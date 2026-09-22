@@ -97,9 +97,10 @@ in the code and was not driven. These are never blurred. Confidence is stated pe
 | 49 | A refused provisional stream allocation strands that stream id — the next frame parks behind a sequence that never comes (surfaced during the repair pass) | Medium | anchor | Open |
 | 50 | Gate 4 keys on the ADJACENT sender, not the announcement's ORIGIN — a provisional peer's announcement relayed by an admitted third party is ingested (surfaced during the repair pass; owner adjudication) | Medium | anchor | Open |
 | 51 | A send half that gives up in two waves reports its death twice — duplicate reset, retire and count (surfaced during verification) | Medium | leaf | Closed |
-| 52 | The browser node-id-spelling witness fails at the engine-marshaling layer on both engines — `"index out of bounds"` (Firefox) and silent `false` (Chromium) (surfaced at the merge gate; pre-existing, outside the repair's files) | Medium | tests | Open |
+| 52 | The browser node-id-spelling witness failed at the engine-marshaling layer on both engines — root cause: a stale JS-number dialog literal in the harness page panics wasm-bindgen's string marshaling before any parser runs (surfaced at the merge gate) | Medium | tests | Closed |
 | 53 | The Windows security step ran under pwsh with bash syntax — it failed before executing a single test (surfaced at the merge gate) | Medium | ci | Closed |
-| 54 | Two leader-supersession witnesses fail in the wasm runner — a superseded session's proxied send succeeds where it must refuse, and a stood-down leader still reads Leader (surfaced at the merge gate; in the repair's own leader-lifecycle area, masked until the fmt fix unmasked the step) | High | leaf | Open |
+| 54 | Two leader-supersession witnesses failed in the wasm runner — root cause: `stand_down` recycled the failed-promotion recovery, re-attaching the supersession away and re-taking the lock (surfaced at the merge gate) | High | leaf | Closed |
+| 55 | Three wasm-lib witnesses fail on this host's runner — invariant under every fix of this pass (control-proven); candidates: engine ICE-classification divergence (`failed` vs `iceTimeout`) or harness timing (surfaced during the #54 round) | Medium | leaf | Open |
 
 ### Claims of the repair pass, contradicted
 
@@ -848,6 +849,27 @@ write refused too), and a leader whose recorded generation moved reports
 `Follower` after stand-down — both green in the wasm runner, with the
 stand_down credit restated for whichever semantics is adjudicated.
 
+**#55 — Three wasm-lib witnesses fail on this host's runner.**
+`net/crates/net/leaf/src/wasm_witnesses.rs:1815`, `:706`, `:1571`
+(`an_unnamed_open_resolves_to_the_anchor_not_peer_zero`,
+`an_expired_attempts_deadline_settlement_cannot_charge_its_successor`,
+`a_promotion_whose_attempt_was_superseded_is_credited_to_nobody`).
+Source-established + executed locally (surfaced during the #54 round when the
+local wasm runner was first enabled; 20 passed / 3 failed of 23). **Invariant
+under every fix of this pass** — a full-revert control of the #54 fix's entire
+behavioral surface yields the byte-identical 3-name red set, the names are
+symbol-disjoint from both fix lanes' diffs, and one failure's shape is an ICE
+failure-classification mismatch (`left: "failed" / right: "iceTimeout"`).
+Candidates: engine-classification divergence (headless Chromium 141 on Windows
+vs CI's Linux Chromium) or harness timing. CI's wasm step has never reached the
+lib run on this branch (it died earlier in the step chain at `wasm_leader` until
+this pass fixed that), so their Linux status is unknown. *Impact boundary:* the
+invariance is control-proven; the engine-vs-defect classification is not settled
+on this host. *Required:* classify the three on CI's engines — if they pass
+there, record them as Windows-runner divergence with a skipped-with-reason
+marker or a widened classification assertion that names both engine outcomes; if
+they fail there too, they are regressions needing their own repair round.
+
 ---
 
 ## Preserved credits
@@ -907,10 +929,19 @@ watch it pass.
   `u64_field` decode); `parse_dialog_id` exact; the `cast_precision_loss` allow and both
   rounding casts deleted; TS side carries zero `number` transits and the fakes enforce
   the boundary kind.
-- **`stand_down` re-attach (67c32d25c)** — `resume_as_follower` is the single recovery
-  for both `fall_back_to_follower` and `stand_down`, `attach_as_follower` the sole
-  client setter, `await_promotion` re-queued: no zombie tab (Rust and TS sides both
-  verified; the TS layer holds no role-derived state to go stale).
+- **`stand_down` re-attach (67c32d25c) — restated after #54.** The zombie-tab
+  property is preserved and witnessed (the client-less `NotLeader`-forever strand is
+  gone; the TS layer holds no role-derived state to go stale). Its supersession
+  semantics were wrong and are fixed in #54: the rework recycled the
+  FAILED-PROMOTION recovery (`resume_as_follower`) as the supersession recovery,
+  which re-attached the fence away and re-took the lock. The credited shape is now:
+  a stood-down tab re-attaches as a functioning follower and queues its acquisition
+  ONCE IT HAS MET the successor it would replace — the blocking lock request is the
+  close-or-crash detector. Deliberately not preserved: self-promotion after a
+  supersession-into-silence (the pinned contract of
+  `a_leader_revalidates_its_generation_against_the_store_and_stands_down`), and the
+  successor-loss re-promotion leg remains unwitnessed — an owner may pin it with a
+  new witness plus a CI roster floor move.
 - **Effect-ordering repairs (67c32d25c)** — `accept_answer`'s fence verified against
   entry-time connection resolution; per-item fenced Answer application with pushback
   restore (the peer's verified Answer included); the settle-bool Reject/deadline
@@ -1135,6 +1166,55 @@ head. **Merge recommendation: hold** until `#54` is adjudicated and fixed in the
 wasm lane (it is production supersession semantics), with `#52` and the two
 owner-adjudication items (`#46`, `#50`) tracked alongside; the review's original
 findings `#1`–`#51` are fixed and witnessed in this tree.
+
+**The `#52`/`#54` round.** Both were root-caused and fixed with the local wasm
+runner first enabling true red/green cycles in the browser-executed suites (the
+host recipe: chromedriver 141.0.7390.37 against ms-playwright chromium-1194, plus
+`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner`,
+`WASM_BINDGEN_TEST_TIMEOUT=120` (CI's env — the 20s default kills the driver
+mid-suite) and a `webdriver.json` browser pin, which is a LOCAL-ONLY artifact and
+is not committed).
+
+- **#54 — fixed** (`fix(leaf): a superseded session refuses typed and a stood-down
+  leader stays down`): `stand_down` had recycled `resume_as_follower` — the
+  FAILED-PROMOTION recovery — as its supersession recovery, so `attach_as_follower`
+  installed a `ProxyClient` whose gate adopted the successor's generation (the
+  fenced session then SERVED through its successor — `Ok(Text("[]"))` where a typed
+  refusal belongs) and the unconditional `await_promotion` re-queue re-took the
+  lock `stand_down`'s own doc says it must not reclaim (role read `Leader` after
+  its recorded generation moved). The fix introduces a `Supersession` marker
+  refused at the single `Lifecycle::request` funnel (cleared only by
+  `take_leadership` of a NEW generation) and queues the acquisition when the tab
+  first MEETS its successor. Leader-session only; both witnesses untouched and
+  green (29/29 in the wasm runner, inverse probes red-then-green per site, the
+  zombie-tab witnesses preserved). The `stand_down` credit above is restated
+  accordingly.
+- **#52 — fixed** (`fix(browser): carry signal ids as 16-hex strings and refuse
+  non-strings by name`): the uniform failure was the DIALOG argument, not the
+  spellings — `page/leaf5.js:1829` passed the bare JS number `0` (the stale f64-seam
+  call shape) and wasm-bindgen's string marshaling died (`assert!(old_size > 0)`
+  via NaN lengths) before any parser ran, which also explains the engine asymmetry
+  (the panic text surfaces per-engine: Firefox's `index out of bounds` is this
+  panic family's prefix — reproduced by putting a slicing panic through the same
+  mapping — while Chromium's silent `(false, "")` is the panic escaping the page's
+  catch arm). Fixed at four layers: the harness call now spells the reserved
+  no-attempt sentinel as 16 hex zeros (page-wide sweep found exactly one stale
+  shape); the TS bindings refuse non-string ids BY NAME (never coerce);
+  `parse_peer_id`/`parse_dialog_id` are pinned panic-free by a 12-shape panic-bait
+  witness plus the reserved-zero and non-f64-rounding bit pins; and the refusal
+  text originates at the binding so it reaches both engines identically. The
+  stage6 end-to-end witness's call shape is reviewed statically (the run.sh matrix
+  is Linux-only) and is CI-verified-only.
+
+**#55 — open, recorded.** The three wasm-lib reds surfaced when the local runner
+was first enabled; they are invariant under this pass's fixes (control-proven) and
+await classification on CI's engines (the CI step has never reached the wasm-lib
+run on this branch — it died earlier in the chain until this pass fixed that).
+
+Post-round verification (executed, this host): browser-ts `tsc` clean + **726/726**;
+leaf host **337/337**; `wasm_leader` **29/29** (both `#54` witnesses named green);
+`wasm_leaf` **16/16**; the wasm lib **20/23** with exactly the `#55` trio red and
+all three `id_parse_witnesses` green.
 
 ---
 
