@@ -2345,7 +2345,7 @@ these 3, exit 0 (executed).
 | 7 cross-org | `cross_org_completed_stream_drains_correlated_items_with_end_terminal` | integration, `serve_rpc_granted_streaming` + the granted/other-org intent (`fixture::cross_org_intent`) | the same observations under the cross-org authority intent shape | A2b + A2c (its own copies of both assertions) |
 | 3 | `node_budget_refusal_rolls_back_call_and_caller_reservations` | in-source sibling of `byte_reservation_rolls_back_in_order_and_releases_exactly_once` | a node-level refusal AFTER two successful level increments (call + caller); BOTH counters rolled back to exact values (400/400) and the node total unmoved | A3 |
 | 4 | `late_retire_against_a_reused_key_is_a_no_op_for_the_successor` | in-source unit (production `ProtectedCallRegistry`) | the S0 model's `late_operations_with_a_stale_incarnation_cannot_touch_the_successor` shape: the first record is retired and its supervisor-side single removal is driven directly (`complete`) — the key is reused IMMEDIATELY (NO `record_count()` wait or poll anywhere) while the first incarnation's cleanup-owner handles stay armed across the reuse; every late op carrying the stale incarnation (retire/complete/release/commit) is inert; the successor survives end to end (unsettled, un-signalled, own retire+complete exactly once) | A4 |
-| 5 | `response_after_session_replacement_reaches_only_the_live_session` | integration, real re-handshake + real wire endpoint | a response emitted strictly AFTER a session replacement reaches the LIVE session's endpoint while the REPLACED session's endpoint receives NOTHING — receiver-side attribution asserted on BOTH endpoints (`RpcInboundEvent::session_id`) | A5 — see F-S1R-1 |
+| 5 | `response_after_session_replacement_reaches_only_the_live_session` | integration, real re-handshake + real wire endpoint | **AMENDED CLOSURE WORDING (Main's S1R ruling, sharpened (a); amended, not weakened):** the EMIT-SESSION SELECTION the test drives — a response emitted after a session replacement is carried by, delivered on, and attributed to the session LIVE at emission — read receiver-side at the ingress attribution (`RpcInboundEvent::session_id`, the R2 carrying-incarnation stamp): the LIVE session's endpoint receives it while the REPLACED session's endpoint receives NOTHING — receiver-side attribution asserted on BOTH endpoints | A5' (receipt 7 — discriminating, red at the witness's own named assertion). The brief's A5 stays green by construction — F-S1R-1 |
 | 6 | `item_permit_transfer_consumes_once_across_the_handoff` | in-source unit (production `ItemPermit`) | the S0 model's `cancel_dequeue_handoff_consumes_one_permit` semantics at the production permit: source consumed, target owns (handoff is not memory reclamation — bytes stay charged), exactly ONE release across the pair, another call's live bytes stay charged throughout | A3b |
 | 8 | (documentation) | `frozen_85ecc77c9/old_serve.rs` + `frozen_85ecc77c9.rs` module docs | the denial-shape block's re-indentation is NAMED (whitespace-insensitive provenance statement + trimmed-hash evidence; vendored bodies untouched — their extraction sha256s remain the record) | no runtime inverse (R-Row8 below) |
 
@@ -2355,7 +2355,7 @@ integration_nrpc_streaming, integration_nrpc_client_streaming,
 integration_nrpc_duplex, nrpc_registration_order, integration_nrpc_protected,
 org_admission_wire, subnet_org_boundary) 89/89 — **121/121, exit 0**.
 
-### 3.3 The six receipts (raw)
+### 3.3 The six Appendix receipts (raw) + receipt 7 (R-A5′)
 
 Baselines: `cortex/rpc.rs`
 `35b003e55f5f75fe25350312ae5107bc3a11ed189b82f4d119a9ee5ddb8c0c92`;
@@ -2521,6 +2521,53 @@ equality recorded in the frozen module's doc
 sides after reversing the one named prefix retarget; `cmp` clean). The
 vendored bodies are untouched; their extraction sha256s remain the record.
 
+**Receipt 7 — R-A5′ (row 5; the lane's own discriminating inverse at the
+amended closure's observable seam).** Mutation (`mesh_rpc.rs` `dispatch_packet`,
+the three `RpcInboundEvent` attribution stamps — the R2 carrying-incarnation
+point the witness reads; the `StreamLifetime` site at `:30758` is a different
+concern and deliberately left untouched):
+
+```diff
+                         disp(crate::adapter::net::cortex::RpcInboundEvent {
+                             // R2: the incarnation that carried this
+                             // request, not whatever is installed
+                             // when the bridge drains it.
+-                            session_id: session.session_id(),
++                            session_id: 0, // A5' MUTATION
+                             channel_hash: canonical,
+```
+
+(x3 — the `Snapshot::Single` site at `mesh.rs:30512` and the two
+`Snapshot::Many` sites at `:30537`/`:30549`.) Framing: the ingress delivers
+the frame under NO session attribution instead of the AEAD-verified carrying
+incarnation — the observable-attribution form of "delivered to the wrong
+endpoint instead of the live session's". The packet ruling's literal example
+("select/deliver to the stale or cached session instead of the live one") has
+NO retained stale session to select at any seam (source-established, executed
+inspection of `install_peer_locked`'s displaced branch: the displaced
+`NetSession` is consumed and dropped, `session_id_to_node`'s stale entry is
+removed, `peers` holds exactly one session per peer; and the wire-claimed
+`NetHeader.session_id` is verified EQUAL to the carrying session's id at the
+ingress resolution, so stamping the claim is observationally identical) —
+the attribution flip above is the discriminating mutation available at the
+observed seam.
+
+Run: `cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=response_after_session_replacement_reaches_only_the_live_session)'`
+— exit 100 (1 run, 1 failed) — red at the WITNESS'S OWN named assertion:
+
+```
+tests/org_rpc_streaming.rs:3256:9: assertion `left == right` failed:
+  the LIVE session's endpoint receives the post-replacement response
+  left: 0
+ right: 17873330928486580960
+```
+
+Restore: `git checkout -- net/crates/net/src/adapter/net/mesh.rs`; sha256
+`a55818907d0bfe52f5e1ec285fe7f6216e451c58c7366fc79038c662c7ca98fd` ==
+pre-mutation baseline (and == the packet's own `mesh.rs` baseline — the file
+is byte-identical to `e25ac28bf`'s). Restored green: same `-E` run, 1/1.
+
 ### 3.4 Findings (stated, not decided)
 
 1. **F-S1R-1 — Row 5's named closure is unsatisfiable against A5 as written
@@ -2564,16 +2611,53 @@ vendored bodies are untouched; their extraction sha256s remain the record.
    terminal is left as an observation for Main (a possible follow-up
    property: a post-replacement terminal that cannot be silently dropped).
 3. **F-S1R-3 — the HOLD packet's `a1c518dd…` trimmed hash is not
-   reproducible with standard tooling (record coherence; P3).** Executed:
-   `b2sum`/`b2sum -l 256`/`sha256sum`/`sha512sum`/`sha384sum`/`sha1sum`/
-   `md5sum` over the whitespace-trimmed five-line window (several newline/
-   trim framings) produced no `a1c518dd…` value. The frozen doc therefore
-   records a REPRODUCIBLE procedure and value instead: whitespace-trimmed
-   window, the one named prefix retarget reversed → byte-identical (`cmp`),
-   sha256 `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7`
-   on both sides (the raw extraction's `fa275454…` reproduces exactly). The
-   re-indentation itself is confirmed and now named (the raw windows differ
-   exactly in leading whitespace plus the named prefix).
+   reproducible with standard tooling (record coherence; P3).** The two
+   procedures, side by side, for review-2.1 adjudication on evidence:
+
+   **Packet procedure (S1_REVIEW_PACKET §4 F-8 / §9):** the claim is
+   "the five lines are re-indented (trimmed hashes match `a1c518dd…`;
+   raw windows differ)". The packet states NO trim convention and NO
+   digest algorithm for `a1c518dd…` — only the value.
+
+   **This lane's reproduction attempts (all executed; window = `git show
+   85ecc77c9:net/crates/net/src/adapter/net/mesh_rpc.rs | sed -n
+   '872,876p'` — its raw sha256 `fa275454…` reproduces the packet's
+   recorded extraction hash exactly, so the window and its line endings
+   are certainly the packet's):**
+
+   | framing of the five lines | digest | value |
+   |---|---|---|
+   | each line trimmed both sides (`sed 's/^[[:space:]]*//;s/[[:space:]]*$//'`) | sha256 | `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7` |
+   | " | sha512 | `00b91cbcbd685257e64e350e86d839cb47246058351c80ba1c791ae81b1301acc62d32ca95fa127b01044f0fd8caec707876ef321812493ffd2b9ae1d84a28ce` |
+   | " | sha1 | `530fd949fc604abe25bf4ee18702009748872e7c` |
+   | " | md5 | `d6ff091901c5dd64bf4e440449a565cf` |
+   | " | blake2b-512 (`b2sum`) | `6cb82e9d88e51f7b77e6da2d7cb1464ac9ca0f15cacd24addb493c5314c2a2b380da4e0f54d4d9922b2357b5cea5f7fff27a504b5ea20625c70017f419f34010` |
+   | " | blake2b-256 (`b2sum -l 256`) | `a6fe6bcd3afd1ff7429ffbfdf12b85879095b8d1516a389441f858ea797ba396` |
+   | all whitespace removed (`sed 's/[[:space:]]//g'`) | sha256 | `38c8e808de561f8c95ede1f4863c7edf4baacb03529ab34e6f49fe562c5744b0` |
+   | " | blake2b-512 | `d3fc3c3fc7e7853448890d8358148fc2…` (32-char prefix observed) |
+   | leading-whitespace-only trim | sha256 | `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7` |
+
+   None begins `a1c518dd`. (Also attempted without a match: a
+   newline-joined variant; `b3sum` is not installed on this host.)
+
+   **This lane's procedure (the one recorded in the frozen module doc):**
+   step 1: `git show 85ecc77c9:net/crates/net/src/adapter/net/mesh_rpc.rs |
+   sed -n '872,876p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'` → sha256
+   `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7`;
+   step 2: `sed -n '208,212p' tests/org_rpc_streaming/frozen_85ecc77c9/old_serve.rs
+   | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed
+   's/net::adapter/crate::adapter/'` (the one NAMED prefix retarget
+   reversed) → sha256
+   `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7`;
+   step 3: `cmp` of the two streams → clean (byte-identical). Without
+   reversing the named retarget, the vendored five trimmed lines hash to
+   sha256 `bfb3bb90a4d6954b2a2dcf60188005dd7c69e2edde6b600088c58ed41cfd52ba`
+   — the expected single-content delta.
+
+   Both procedures agree the re-indentation is whitespace-only modulo the
+   one named prefix; they differ only in the digest/trim convention behind
+   the cited hash value. Reviewer adjudication requested on which value the
+   record should carry.
 4. **Row-4 interpretation note (stated).** The closure phrase "reuses
    `(caller, call_id)` while the old record's async cleanup is still armed
    (do NOT wait for `record_count() == 0`)" is realized as the S0 model's

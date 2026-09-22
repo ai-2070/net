@@ -3153,9 +3153,17 @@ async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() 
 /// handler's explicit post-replacement send; protected calls retire at the
 /// replacement boundary and their terminal races the peer transition).
 ///
-/// Red witness demanded by the row: the S1_R brief Appendix inverse **A5**
-/// (the streaming emitter's `receiving_session_id` forced to `0` at
-/// `mesh_rpc.rs`). The receipt outcome for this witness is recorded in
+/// AMENDED CLOSURE WORDING (Main's S1R ruling, sharpened (a)): the property
+/// is the EMIT-SESSION SELECTION this test drives — the response is carried
+/// by, delivered on, and attributed to the session LIVE at emission — read
+/// receiver-side at the ingress attribution (`RpcInboundEvent::session_id`,
+/// the R2 carrying-incarnation stamp). Discriminating inverse: **A5'**
+/// (`S1_REPORT.md` §3 receipt 7 — the ingress attribution stamps `0` instead
+/// of the carrying incarnation) reddens "the LIVE session's endpoint
+/// receives the post-replacement response" below. The brief's Appendix
+/// inverse **A5** (the streaming emitter's `receiving_session_id` forced to
+/// `0` at `mesh_rpc.rs`) stays GREEN here by construction (its value is
+/// consumed only under `feature = "webrtc"`) — finding F-S1R-1, recorded in
 /// `docs/internal/spikes/org-streaming/S1_REPORT.md` §3.
 #[tokio::test]
 async fn response_after_session_replacement_reaches_only_the_live_session() {
