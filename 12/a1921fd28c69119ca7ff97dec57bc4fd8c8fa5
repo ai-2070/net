@@ -1,0 +1,16 @@
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  h_64425bc75e3f3d 91-93,99-108,111-113,600-626
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  h_64425bc75e3f3d 90-92,98-107,110-112,652-678
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "12a1921fd28c69119ca7ff97dec57bc4fd8c8fa5",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
