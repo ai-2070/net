@@ -222,6 +222,7 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
     // the anchor's dispatch (the session is real) and is refused
     // before any dialog state exists, because forwarding it or
     // acting on it are both participation.
+    let before_promoted = anchor.rtc_stats().admission_promoted();
     let before_deliver = anchor.rtc_stats().admission_refused_deliver()
         + anchor.rtc_stats().admission_refused_forward();
     let _ = client
@@ -233,13 +234,39 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
             },
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after = anchor.rtc_stats().admission_refused_deliver()
-        + anchor.rtc_stats().admission_refused_forward();
+    // The refusal has to actually HAPPEN. These counters are monotone, so
+    // `after >= before` held even when the Offer was acted on and nothing
+    // was refused at all — a comparison that cannot fail is not a check.
     assert!(
-        after >= before_deliver,
+        wait_for(
+            || {
+                anchor.rtc_stats().admission_refused_deliver()
+                    + anchor.rtc_stats().admission_refused_forward()
+                    > before_deliver
+            },
+            Duration::from_secs(10)
+        )
+        .await,
+        "gate 5: a provisional peer's `0x0D02` signalling must be refused at the gate"
+    );
+
+    // Counting a refusal is not the same as not participating. The
+    // regression this leg exists for is the Offer reaching the engine and
+    // allocating an ICE agent (R1: "KYRA_SIGNAL ice_allocations=1"), which
+    // satisfies any counter-only assertion while doing exactly what the
+    // gate exists to prevent — so the absence is asserted as well, and it
+    // covers legs (a)-(d) too: each of them may count its refusal, and
+    // none may act.
+    assert_eq!(
+        anchor.rtc_stats().ice_pending(),
+        0,
         "a provisional peer's signalling must never be acted on as an ordinary \
-         dialog"
+         dialog: no dialog state, no ICE agent"
+    );
+    assert_eq!(
+        anchor.rtc_stats().admission_promoted(),
+        before_promoted,
+        "and no leg of this witness may promote the session it refused"
     );
 }
 
