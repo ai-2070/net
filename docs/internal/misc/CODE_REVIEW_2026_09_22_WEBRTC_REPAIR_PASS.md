@@ -1291,6 +1291,15 @@ drops, then the future is polled — the `offer_peer` pattern. Verified at
 host lib 256/256, wasm lib 23/23 (including the fallback's own witness and
 the parse trio). The merge is the owner's to make.
 
+**CI, final:** run `35778394485` at `17f7325db` — `success`, 58/58 jobs,
+including the Leaf chain's wasm test runner and the Browser matrix. (The
+Browser matrix's one red at `ec514cbef` — `stage5_two_tabs_share_one_identity_without_eviction`
+reporting `same identity=false` — was the same `RefCell`-across-await hazard
+in live form: the real `signal()` fetch yields back into page callbacks that
+borrow `inner`, so the held `Ref` panicked on re-entrancy and tab b's answer
+path died mid-flight. The borrow-hoist fixed the witness and the lint
+together.)
+
 ---
 
 ## Open owner questions
