@@ -1740,7 +1740,7 @@ jobs:
           # preserved verbatim + 11 CS/DX + duplex-flow + half-close
           # witnesses). Raised with each slice that lands witnesses;
           # REQUIRED names extended in the same commit as the witnesses.
-          run_binary org_rpc_streaming 41 \
+          run_binary org_rpc_streaming 42 \
             stream_opening_admits_same_org \
             stream_opening_admits_cross_org \
             unary_context_proof_is_binding_invalid_on_stream_registration \
@@ -1781,7 +1781,8 @@ jobs:
             pre_admission_chunks_are_never_delivered \
             retire_unblocks_both_directions \
             upload_end_then_remaining_output_completes \
-            wrong_session_grant_does_not_release_credit || exit 1
+            wrong_session_grant_does_not_release_credit \
+            early_handler_return_refuses_late_input_without_resource_exhausted || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
