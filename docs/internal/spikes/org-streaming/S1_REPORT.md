@@ -2941,8 +2941,20 @@ deleted.)
    files) reflowed S1_R-era witness/unit whitespace inside
    `src/adapter/net/cortex/rpc.rs` and `tests/org_rpc_streaming.rs` — the
    `cargo fmt -p net-mesh -- --check` gate cannot pass with those hunks
-   unformatted. The reflow-only hunks are `git diff -w`-empty (no semantic
-   change) and ride the S2.1 commit.
+   unformatted. The reflow-only hunks have NO semantic change and ride
+   the S2.1 commit — proven by NORMALISATION (whitespace-stripped body
+   digests), not by `git diff -w` emptiness (line re-wraps survive `-w`
+   as line-count changes; S2_R Row 3 / F-S2R-3 corrects the earlier METHOD
+   claim): the three re-wrapped S1_R witnesses are whitespace-identical at
+   `87f89c8da` and `017e7148a` —
+   `completed_stream_drains_queued_items_in_order_with_content_and_end_terminal`
+   (`edaf83163c8fab877fafe5c1cee89a7dd2e486e4675fe069e69c9b5ea5c5b83a`),
+   `cross_org_completed_stream_drains_correlated_items_with_end_terminal`
+   (`d4f69c897960bf32dd0544e9acd3e6036b9f8eb123e204d866519d96c14df3b9`),
+   `response_after_session_replacement_reaches_only_the_live_session`
+   (`0ff9d805480e2660a972ca00c8fde8bbf3bcc40736de2b1babb7801d34f80fee`)
+   — and the 30-roster is preserved semantically byte-for-byte (the S2
+   review's executed normalisation, `S2_REVIEW_PACKET.md` §3).
 
 **Receipt-baseline shas (post-format, the committed trees):**
 `cortex/rpc.rs` `961d9529cc16254253e2496c67fac79582bd58607a7d1121131d3670807a4fd0`;
@@ -3420,7 +3432,13 @@ layers); same sha == baseline. Restored green: exit 0, 1/1.
    landed at 2.2 because its own witnesses bind them
    (`end_cannot_cancel_another_stream_or_reopen_terminal_half`); this
    slice adds the §2.2 queue-owner row's `poll_next` retire-awareness and
-   binds the full §2.6 table with its named pair.
+   binds what its named pair actually observes — END closes input once and
+   retire closes both halves (`upload_end_then_remaining_output_completes`,
+   `retire_unblocks_both_directions`) — NOT the full §2.6 table (S2_R
+   Row 1 / F-S2R-1's record-quality correction): the handler-return
+   late-input disposition (§2.6's input-`Closed` rule and the chunk-path
+   record gate) was UNWITNESSED until §5's
+   `early_handler_return_refuses_late_input_without_resource_exhausted`.
 
 **What never ran at 4.4 (complete):** the §4.1 list unchanged (the fmt
 gate IS executed — exit 0).
@@ -3561,6 +3579,166 @@ late-input disposition witness), F-S2R-2 (the post-transfer
 `ConfirmedOpening`-shape scope guard — the ONE authorized production
 change: the plan §3 step-5 mandate) and F-S2R-3 (the proof-method
 wording). Nothing else changes. The S2R code commit is `c17572f03`.
+
+### 5.1 What landed (executed)
+
+**Row 1 — F-S2R-1 (witness gap: the §2.6 late-input disposition).**
+Closure property (packet §7, verbatim): "a named witness in which a
+PROTECTED client-streaming or duplex handler returns EARLY (before the
+caller's END) with its input half still `Open`, a request chunk then
+arrives for the call, and the observed outcome is: the chunk is
+refused/discarded — never delivered, never retained — no `ResourceExhausted`
+is latched, and the handler's own result remains the terminal (exact wire
+content asserted) with the record completing exactly once — reddening
+under (a) the input-Closed-on-return rule removed (`handler_returned`)
+and (b) the chunk-path record gate removed." (Plus its belt discipline:
+"the sender-map removal at `complete()` must not be able to satisfy this
+witness alone.")
+
+MET by `early_handler_return_refuses_late_input_without_resource_exhausted`
+(`tests/org_rpc_streaming.rs:5278`): a PROTECTED duplex handler
+(`s2::EarlyReturnDX`) returns EARLY — before the caller's END (none is
+ever sent) with its input half still `Open` at return — carrying its
+TYPED error `Application(0x007E, "ER-early-9")`; the zero-credit response
+window parks the pump holding its one queued echo, so the call stays LIVE
+(its §2.4 single removal has not run) while the late request chunk
+`ER-LATE-7` arrives. Observed (executed, green): the chunk is
+refused/discarded — the handler's delivered aggregate is exactly
+`[ER-req-1]` (the late chunk is nowhere) and the endpoint stays silent
+through the 200 ms darkness window (never delivered, never retained); no
+`ResourceExhausted` is latched (THE named assertion — the parked record
+reads `(is_live, terminal) == (true, None)`); the handler's own result is
+the terminal's exact wire content (`Application(0x007E)`, no headers,
+`ER-early-9`) after the queued echo publishes first; and the record
+completes exactly once (`removals(&key, 1) == 1`, `record_count() == 0`,
+`active_node() == 0`, both fold maps empty, "exactly one terminal, ever"
+over a 250 ms re-check). Belt discipline held: at the injection moment
+`sender_keys()` still contains the call's key — the §2.4 single removal
+has not run and cannot be what refuses the chunk. Both PAIR mutations
+redden at the named no-latch assertion (§5.2, R-S2R-1a/1b). Determinism
+(executed reasoning + run shape): the chunk is injected only after the
+handler's own return signal, and on the `#[tokio::test]` current-thread
+runtime the supervisor's `handler_returned` runs in the same task poll
+that completes the handler future — the injection is strictly
+post-return, with no sleep-based coincidence.
+
+**Row 2 — F-S2R-2 (fix class: the post-transfer scope guard).** Closure
+property (packet §7, verbatim): "the CS and DX `apply_inbound_admitted`
+post-transfer windows are covered by a `ConfirmedOpening`-shape scope
+guard such that ANY exit after `registry.confirm` (a delivery refusal, a
+scheduling/installation failure, or a panic) settles the record's
+release-once `complete` and every map entry — demonstrated by a witness in
+the shape of §6.5's probe (a post-transfer installation failure) asserting
+`record_count() == 0` and an empty `in_flight_keys()`, failing (orphan)
+without the guard and passing with it; the F-S2.2-5 witness stays green
+throughout."
+
+MET by `ConfirmedStreamOpening` (`cortex/rpc.rs`) in BOTH seams — the
+unary `ConfirmedOpening` precedent (its own doc: "this scope guard stands
+in for it so no `Running` record is ever orphaned"), completed to the §2.4
+single removal point: armed at `registry.confirm`, its Drop runs
+`StreamCallRegistration::complete` (the release-once `complete` + every
+map entry — in-flight/sender/flow/window), and the `tokio::spawn`
+transfer defuses it (the supervisor's own registration remains the single
+removal point exactly as before). The inline F-S2.2-5 settlement is
+FOLDED into the guard (ONE settlement mechanism — the brief's "your call"
+option) and its fail-pre-fix property survives VERBATIM: §5.2's
+R-S2.2c-v2 reds at `tests/org_rpc_streaming.rs:4455:5` byte-identically
+to R-S2.2c's receipt quote. Demonstrated by
+`post_transfer_scope_guard_never_orphans_a_running_record` (the in-source
+probe-witness, the lib filter's 221st test): the reviewer's §6.5 probe
+made permanent — a synthetic installation failure at the SAME window
+point (right after the opening-body block) on BOTH seams, through a
+one-shot `#[cfg(test)]` thread-local injection seam (test builds only;
+production compiles neither the flag nor its checks — the S2R guard is
+the ONLY production change in this round). Asserted: `record_count() == 0`
+(the named orphan assertion), `in_flight_keys()` empty, exactly one
+removal (`removals(&key, incarnation) == 1` — the probe mints its own
+lease so the incarnation is known exactly), and (the DX leg) the
+flow-window entry settled. Fails without the guard — §5.2's R-S2R-2 reds
+with `record_count` left 1 (the reviewer's outcome verbatim) — and passes
+with it on both seams; the F-S2.2-5 witness is green throughout.
+
+**Row 3 — F-S2R-3 (record quality: the proof-method wording).** Closure
+property (packet §7, verbatim): "state the normalisation proof
+(whitespace-stripped body digests) instead of the `-w` emptiness claim,
+or restore the original wrapping. No code impact." MET in §4's F-S2.1-4
+entry (the parenthetical replaced with the reviewer's executed
+normalisation digests) — documentation only; NO runtime inverse (§5.2).
+
+**Record-quality note closed with Row 1.** §4's F-S2.4-2 overclaim is
+scoped to what its pair actually binds (packet §7: the "binds the full
+§2.6 table" claim overstates).
+
+**Estate at the S2R tree (executed, `--retries 0 --no-tests=fail`, warm
+aliases, from `net/crates/net/`):** `org_rpc_streaming` **42/42** (was
+41); preserved + public regression controls **134/134** (10 binaries);
+cross-lang + gate **32/32** (4 binaries); the in-source three-module
+filter **221/221** (was 220 — + the probe); Stage 0 models **76/76**
+(untouched); `cargo fmt -p net-mesh -- --check` exit 0. Roster from
+source: the 42 `#[test]`/`#[tokio::test]` fns of
+`tests/org_rpc_streaming.rs` == 42 executed; the five helper modules
+carry 0 test attributes. The 41 preserved names are UNCHANGED (the
+file's edits are append-only past the pristine 5256 lines, plus the new
+witness's own in-place restructure); the ONE added name is the Row-1
+witness. **For Main's same-commit CI floor re-pin — `run_binary
+org_rpc_streaming 41 → 42` — the full name list (source order):**
+
+```
+ 1. stream_opening_admits_same_org
+ 2. stream_opening_admits_cross_org
+ 3. unary_context_proof_is_binding_invalid_on_stream_registration
+ 4. stream_proof_on_unary_registration_is_not_supported
+ 5. frozen_old_provider_refuses_stream_proof_with_not_supported
+ 6. replayed_opening_on_new_session_is_session_binding_mismatch
+ 7. late_chunk_from_replaced_session_is_dropped
+ 8. omitted_deadline_gets_default_and_expires_idle
+ 9. requested_deadline_over_cap_is_refused_with_zero_effects
+10. requested_deadline_within_cap_is_honoured
+11. pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal
+12. serve_handle_drop_retires_live_stream_and_sibling_survives
+13. credential_clamp_expiry_is_admission_denied_not_timeout
+14. public_ss_nonzero_deadline_expires_with_typed_timeout
+15. public_client_stream_deadline_expiry_is_typed_timeout
+16. floor_raise_retires_blocked_stream_before_publish_returns
+17. sibling_stream_of_other_org_sends_next_item_after_publication
+18. poisoned_store_retires_all_protected_streams
+19. store_replacement_retires_all_and_resubscribes
+20. session_replacement_retires_old_call
+21. active_call_id_reuse_after_replay_window_is_refused
+22. raise_between_reserve_and_install_denies_with_zero_effects
+23. queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire
+24. node_shutdown_retires_live_protected_streams
+25. forbidden_stream_opening_causes_zero_handler_effects
+26. streaming_denial_is_not_fanned_out_to_the_reply_roster
+27. provider_policy_veto_denies_before_effects
+28. completed_stream_drains_queued_items_in_order_with_content_and_end_terminal
+29. cross_org_completed_stream_drains_correlated_items_with_end_terminal
+30. response_after_session_replacement_reaches_only_the_live_session
+31. client_stream_opening_binds_first_chunk
+32. client_stream_aggregate_with_valid_proof
+33. duplex_exchange_with_valid_proof
+34. pre_admission_chunks_are_never_delivered
+35. end_cannot_cancel_another_stream_or_reopen_terminal_half
+36. wrong_session_grant_does_not_release_credit
+37. opening_body_budget_refusal_completes_the_record
+38. duplex_response_window_blocks_until_grant
+39. cross_direction_grant_is_ignored
+40. upload_end_then_remaining_output_completes
+41. retire_unblocks_both_directions
+42. early_handler_return_refuses_late_input_without_resource_exhausted
+```
+
+**What never ran at 5 (complete):** the clippy battery, rustdoc runs and
+`cargo check --workspace --all-targets` (Main's stage-end list);
+`cargo fmt --all -- --check` (the per-crate gate IS executed, exit 0);
+`cargo tl` / `cargo t` full suites (the named filters above are the
+executed scope); the wire suite; the benches; the `webrtc` feature graph;
+Linux/macOS and `#[cfg(unix)]` legs (Windows host only); CI itself
+(branch unpushed — the floor re-pin is Main's); the browser/SDK/facade
+and bindings surfaces (Stage 3+ by contract); anything in the F-S1R-2
+rider territory (owner-declined, out of scope — never demanded here).
+Owner-pending: NONE.
 
 ### 5.2 Inverse receipts (executed, raw)
 
