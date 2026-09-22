@@ -1,0 +1,38 @@
+net/crates/net/cli/Cargo.toml
+  s_3f3d4c91f992be::t_20847748d22085 45-46
+net/crates/net/sdk/src/enrollment.rs
+  s_3f3d4c91f992be::t_54c0bfadb76e22 72-75
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_3f3d4c91f992be::t_52fb07054ce33d 66,189,192-196,205-207,211-213,216,220-226,229,247-255,257-269,272-287,320-321
+  s_3f3d4c91f992be::t_20847748d22085 99-102,106-109,114,118-119,123-127,842,866-879,910
+  s_3f3d4c91f992be::t_e32436a18b5416 256
+  s_3f3d4c91f992be::t_41e11bbe79a5c3 1142-1175
+net/crates/net/cli/src/commands/enrollment.rs
+  s_3f3d4c91f992be::t_51bc5a3ba0d29e 179-181,184,186,190
+  s_3f3d4c91f992be::t_94928dc1af48cf 24,42-46,48,52,58,62-75,89-92,94,98-152,154-158,162-178,182-183,185,187-189,191-192,202,220-246,250-251,257-277,279,283-291,293,296,301,307,310,312-385,393-395,401-402,404-406,411-412,418-424,426,428-430,435,445-447,456,459,491-502,509,528,732-735,820-823,946
+  s_3f3d4c91f992be::t_e32436a18b5416 23,194-196,280-281,909-945
+net/crates/net/cli/tests/enrollment_lifecycle.rs
+  s_3f3d4c91f992be::t_51bc5a3ba0d29e 171-172,175-177
+  s_3f3d4c91f992be::t_f903d19cc35006 338-343
+  s_3f3d4c91f992be::t_e32436a18b5416 112-120,231,235,237,239,241,246,250,263-264,268,283-337,344-345
+  s_3f3d4c91f992be::t_7e3c021d091f22 346-347
+net/crates/net/sdk/src/enrollment/portmap.rs
+  s_3f3d4c91f992be::t_54c0bfadb76e22 62-65,142,157-161,169-171,179
+  s_3f3d4c91f992be::t_7d2c5ca3f7daa5 1-61,66-141,143-156,162-168,172-178,180-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "765d112997963c6c5ba9958dbd3a23dc513941e8",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
