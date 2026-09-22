@@ -67,8 +67,13 @@ The checks run in a fixed order, and the order is the security argument:
 ```text
 1. mode is org-protected           (Public routes elsewhere)
 2. exactly one admission header    (0 or >1 → deny)
-3. proof decodes                   (malformed → deny)
-4. call is unary                   (streaming → distinct deny)
+3. proof decodes                   (malformed → deny; a streaming
+                                    registration requires the FULL
+                                    streaming proof value)
+4. shape is coherent               (unary registration + streaming flags →
+                                    NotSupported; streaming registration +
+                                    flags ≠ registered shape, or proof kind
+                                    ≠ shape → Denied)
 5. TOFU member binding             (proof caller == channel peer)
 6. mode checks                     (owner / cross-org shape)
 7. dispatcher grant checks         (acts-for org, capability)
@@ -137,6 +142,17 @@ Across Rust, Node, Python, Go and C the surface is two calls:
 mesh.org(credentials).call(..)                                   // caller
 mesh.serve_org(service, OrgAccess::{SameOrg, Granted}, handler)  // provider
 ```
+
+Protected server-streaming landed at the core seam (slice 1.5): a provider
+serves an owner-scoped or granted server-streaming handler through
+`serve_rpc_owner_scoped_streaming(service, handler, provider_policy)` /
+`serve_rpc_granted_streaming(service, handler, provider_policy)`, whose
+openings run the same admission order above with the streaming proof and the
+session fence, and whose responses route `DirectOnly` to the authenticated
+caller (never the reply channel's roster). The caller side mints the streaming
+proof through `call_streaming(.., CallOptions { org_proof_intent, .. })`; the
+language-idiomatic `call_streaming`/`serve_org_streaming` verbs ride the SDK
+release train.
 
 Errors use a frozen `org:<domain>:<kind>` vocabulary so a denial means the same
 thing in every binding. CLI provisioning is `net org keygen` / `issue-cert` /

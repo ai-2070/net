@@ -5944,16 +5944,6 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcStream, RpcError> {
-        // Org admission is unary-only (E1.8): a proof intent on a streaming call
-        // shape is a caller error, never a silently-ignored security intent.
-        if opts.org_proof_intent.is_some() {
-            return Err(RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
-                          protected service"
-                    .to_string(),
-            });
-        }
         // `stream_window_initial = Some(0)` would deadlock the
         // RESPONSE direction by default: server's pump awaits one
         // credit per chunk, the caller's auto-grant only fires on
@@ -6009,13 +5999,87 @@ impl MeshNode {
         // Append caller-supplied request headers (Phase 9b — same
         // semantics as the unary `call` path).
         headers.extend(opts.request_headers.iter().cloned());
-        let req = RpcRequestPayload {
+        let mut req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
             flags,
             headers,
             body: payload.clone(),
         };
+        // C11 (slice 1.6): `call_streaming` accepts an `org_proof_intent` and
+        // mints a STREAMING call proof (kind = server-streaming) bound to the
+        // exact session this call rides (§1.3). The shared mint helper is the
+        // unary `call`'s verbatim block below — pinned-entity binding,
+        // exactly-one-header discipline, the finalized wire bounds and the
+        // one-packet measurement — with the shape and the receiving session's
+        // Noise handshake hash threaded through. A streaming mint without a
+        // binding (a hand-built session) fails LOCAL, fail-closed.
+        if let Some(intent) = opts.org_proof_intent.as_ref() {
+            // Publishing an A-bound proof to provider B would DISCLOSE the
+            // credential to the wrong peer (the unary block's verbatim
+            // clause)…
+            match self.peer_entity_id(target_node_id) {
+                Some(pinned) if pinned == intent.provider => {}
+                Some(_) => {
+                    return Err(RpcError::Codec {
+                        direction: CodecDirection::Encode,
+                        message: format!(
+                            "org admission: proof provider does not match the pinned entity \
+                             of target {target_node_id:#x}"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(RpcError::Codec {
+                        direction: CodecDirection::Encode,
+                        message: format!(
+                            "org admission: target {target_node_id:#x} has no pinned entity \
+                             to bind the proof to"
+                        ),
+                    });
+                }
+            }
+            // Exactly ONE proof header may ride, and only the builder sets it.
+            if req
+                .headers
+                .iter()
+                .any(|(name, _)| name == ORG_ADMISSION_HEADER)
+            {
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: "org admission: request already carries a net-org-admission header"
+                        .to_string(),
+                });
+            }
+            // §1.3: the streaming proof binds the RECEIVING session's full
+            // Noise handshake hash — the exact session this call rides.
+            let session_binding = self.peer_session_binding(target_node_id);
+            let header = sign_admission_proof(
+                intent,
+                call_id,
+                &req,
+                RpcCallShape::ServerStreaming,
+                session_binding,
+            )?;
+            req.headers.push(header);
+            req.validate_wire_bounds().map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: format!("org admission: finalized request exceeds wire bounds: {e}"),
+            })?;
+            // The unary block's verbatim one-packet clause.
+            let finalized = request_wire_size(&req);
+            if finalized > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE {
+                let budget = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
+                return Err(RpcError::Codec {
+                    direction: CodecDirection::Encode,
+                    message: format!(
+                        "org admission: the finalized request is {finalized} bytes with the \
+                         signed admission proof on it, over the {budget}-byte per-packet \
+                         budget; a frame that large is never delivered, so it is refused here"
+                    ),
+                });
+            }
+        }
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
@@ -9766,37 +9830,125 @@ mod roster_fallback_tests {
         );
     }
 
-    /// Kyra #47 tail (caller/API): a proof intent is REFUSED on every streaming
-    /// call shape (org admission is unary-only, E1.8 — never silently ignored),
-    /// and an intent whose capability does not match the invoked service fails
-    /// LOCALLY (before it can reach a provider as a CapabilityMismatch denial).
+    /// The 1.6 inversion of `org_proof_intent_rejected_on_streaming_and_capability_mismatch`:
+    /// `call_streaming` now ACCEPTS an `org_proof_intent` and MINTS a full
+    /// streaming call proof — observed at the provider's request dispatcher
+    /// as the decoded `net-org-admission` header: kind = server-streaming and
+    /// `session_binding` = the exact live session's Noise handshake hash
+    /// (§1.3). The capability-mismatch half is KEPT verbatim (an intent whose
+    /// capability does not match the invoked service still fails LOCALLY,
+    /// before it can reach a provider as a `CapabilityMismatch` denial); the
+    /// client-streaming / duplex / service-routed refusal legs are KEPT too
+    /// (their widening is a later stage's — C11 names all of them; only
+    /// `call_streaming` flips here, and `call_service_streaming` keeps
+    /// refusing because capability-index routing cannot pin a provider
+    /// entity).
     #[tokio::test]
-    async fn org_proof_intent_rejected_on_streaming_and_capability_mismatch() {
+    async fn call_streaming_mints_a_stream_proof() {
         use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_call::{
+            OrgStreamCallProof, STREAM_CALL_KIND_SERVER_STREAMING,
+        };
         const TARGET: u64 = 0xDEAD_BEEF;
-        let server = build_server().await;
+
+        // ---- the inverted positive: a real session (1.1a carries its
+        // binding) + an intent ⇒ a full streaming proof on the wire. ----
+        let caller = build_server().await;
+        let provider_node = build_server().await;
+        let provider_entity = provider_node.entity_id().clone();
         let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
-        let provider = crate::adapter::net::identity::EntityId::from_bytes([0x99u8; 32]);
+        // Direct handshake so BOTH sides hold the session's binding.
+        let caller_id = caller.node_id();
+        let p_pub = *provider_node.public_key();
+        let p_addr = provider_node.local_addr();
+        let p_clone = Arc::clone(&provider_node);
+        let accept = tokio::spawn(async move { p_clone.accept(caller_id).await });
+        caller
+            .connect(p_addr, &p_pub, provider_node.node_id())
+            .await
+            .expect("connect");
+        accept
+            .await
+            .expect("accept task")
+            .expect("accept handshake");
+        caller.start();
+        provider_node.start();
+        let binding = caller
+            .peer_session_binding(provider_node.node_id())
+            .expect("the live session carries its binding (1.1a)");
+        caller.test_pin_peer_entity(provider_node.node_id(), provider_entity.clone());
+
+        // The provider's request channel, with a capture dispatcher standing
+        // in for a serve (the mint is the property — no admission is run).
+        // No channel-config registry is installed on a default node: the
+        // defaults are permissive, so the request and reply channels need no
+        // `install_rpc_service_defaults` preamble.
+        let req_channel = ChannelName::new("svc.requests").expect("channel name");
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<RpcInboundEvent>();
+        let capture: RpcInboundDispatcher = Arc::new(move |ev| {
+            let _ = cap_tx.send(ev);
+        });
+        assert!(
+            provider_node
+                .register_rpc_inbound(ChannelId::new(req_channel.clone()).hash(), capture)
+                .is_some(),
+            "the provider captures its request channel",
+        );
+
+        let intent =
+            owner_delegated_intent(EntityKeypair::generate(), &org_b, provider_entity.clone());
+        let _stream = caller
+            .call_streaming(
+                provider_node.node_id(),
+                "svc",
+                Bytes::from_static(b"body"),
+                CallOptions {
+                    org_proof_intent: Some(intent),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call_streaming accepts the intent and mints");
+        let ev = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+            .await
+            .expect("the minted REQUEST reaches the provider")
+            .expect("capture channel open");
+        let req = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+            .expect("the REQUEST payload decodes");
+        let proof_bytes = req
+            .headers
+            .iter()
+            .find(|(name, _)| name == ORG_ADMISSION_HEADER)
+            .map(|(_, value)| value.clone())
+            .expect("the minted proof rides as the single admission header");
+        let proof = OrgStreamCallProof::decode(&proof_bytes)
+            .expect("the minted bytes are a FULL streaming proof (strict decode)");
+        assert_eq!(
+            proof.kind, STREAM_CALL_KIND_SERVER_STREAMING,
+            "the minted proof's kind is server-streaming",
+        );
+        assert_eq!(
+            proof.session_binding, binding,
+            "the minted proof binds the exact live session's Noise handshake hash (§1.3)",
+        );
+
+        // ---- the kept half: local refusals unchanged. ----
+        let server = build_server().await;
         // Pin the target to the proof's bound provider so the unary
         // capability-mismatch path is reached (provider binding is checked
         // first, before the capability match).
-        server.test_pin_peer_entity(TARGET, provider.clone());
+        server.test_pin_peer_entity(TARGET, provider_entity.clone());
         let intent_opts = || CallOptions {
             org_proof_intent: Some(owner_delegated_intent(
                 EntityKeypair::generate(),
                 &org_b,
-                provider.clone(),
+                provider_entity.clone(),
             )),
             ..Default::default()
         };
 
-        // Streaming shapes refuse a proof intent up front.
-        assert!(matches!(
-            server
-                .call_streaming(TARGET, "svc", Bytes::new(), intent_opts())
-                .await,
-            Err(RpcError::Codec { .. })
-        ));
+        // Client-streaming / duplex still refuse a proof intent up front
+        // (their protected admission is a later stage).
         assert!(matches!(
             server
                 .call_client_stream(TARGET, "svc", intent_opts())
@@ -9809,8 +9961,8 @@ mod roster_fallback_tests {
         ));
         // Service-routed streaming rejects the intent at the TOP, before
         // discovery: with NO service advertised, empty discovery would yield
-        // `NoRoute` — a `Codec` proves the unary-only guard fired first and
-        // routing state was never touched.
+        // `NoRoute` — a `Codec` proves the guard fired first and routing
+        // state was never touched.
         assert!(matches!(
             server
                 .call_service_streaming("svc", Bytes::new(), intent_opts())

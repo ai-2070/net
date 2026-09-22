@@ -944,6 +944,86 @@ mod tests {
         )
     }
 
+    /// [`cross_org_proof_for_call`]'s streaming twin: a FULL
+    /// `OrgStreamCallProof` — the streaming decoder's exact value, kind +
+    /// session binding included — for the same cross-org shape and `REQ`
+    /// digest (the 1.6 split/rework builders).
+    fn cross_org_stream_proof_at(
+        call_id: u64,
+        session_binding: [u8; 32],
+        expiry_ns: u64,
+    ) -> OrgStreamCallProof {
+        let caller = caller();
+        let membership =
+            OrgMembershipCert::try_issue(&org_a(), caller.entity_id().clone(), 1, 3600)
+                .expect("cert");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org_a(),
+            caller.entity_id().clone(),
+            DispatcherScope::Exact(cap()),
+            3600,
+        )
+        .expect("dispatcher");
+        let (grant, _) = OrgCapabilityGrant::try_issue(
+            &org_b(),
+            org_a().org_id(),
+            cap(),
+            GrantRights::INVOKE,
+            GrantTargetScope::ExactNode(provider()),
+            3600,
+        )
+        .expect("grant");
+        OrgStreamCallProof::sign_for_stream_call(
+            &caller,
+            membership,
+            dispatcher,
+            Some(grant),
+            org_a().org_id(),
+            org_b().org_id(),
+            provider(),
+            call_id,
+            cap(),
+            expiry_ns,
+            REQ,
+            crate::adapter::net::behavior::org_call::STREAM_CALL_KIND_SERVER_STREAMING,
+            session_binding,
+        )
+    }
+
+    /// A live [`cross_org_stream_proof_at`] (expiry 20 s out).
+    fn cross_org_stream_proof(call_id: u64, session_binding: [u8; 32]) -> OrgStreamCallProof {
+        let expiry = (crate::adapter::net::behavior::org::current_timestamp() + 20) * 1_000_000_000;
+        cross_org_stream_proof_at(call_id, session_binding, expiry)
+    }
+
+    /// The streaming-registered twin of [`cross_org_ctx`] (§1.5 step 4's
+    /// COHERENT shape): registered and flags-derived shape both
+    /// server-streaming, the receiving session carrying `session_binding`.
+    /// The identity references are BORROWED from the caller's locals (the
+    /// surrounding `cross_org_ctx` helpers' `Box::leak` idiom is pre-existing
+    /// and deliberately not extended).
+    fn cross_org_stream_ctx<'a>(
+        floors: &'a OrgRevocationState,
+        authenticated_caller: &'a crate::adapter::net::identity::EntityId,
+        provider: &'a crate::adapter::net::identity::EntityId,
+        session_binding: [u8; 32],
+    ) -> AdmissionContext<'a> {
+        AdmissionContext {
+            mode: OrgAdmission::CrossOrgGranted,
+            authenticated_caller,
+            provider,
+            provider_owner_org: org_b().org_id(),
+            invoked_capability: cap(),
+            call_id: CALL_ID,
+            request_digest: REQ,
+            shape: RpcCallShape::ServerStreaming,
+            registered_shape: RpcCallShape::ServerStreaming,
+            session_binding: Some(session_binding),
+            floors,
+            skew_secs: 0,
+        }
+    }
+
     /// Build a valid owner-delegated proof (caller ∈ B = my owner,
     /// dispatcher B→caller, NO capability grant).
     fn owner_delegated_proof() -> OrgCallProof {
@@ -1082,8 +1162,11 @@ mod tests {
         );
     }
 
+    /// Malformed proof bytes refuse `MalformedProof` and are never mistaken
+    /// for a shape refusal (the 1.6 split of
+    /// `malformed_and_streaming_are_distinct` — the malformed-proof refusal).
     #[test]
-    fn malformed_and_streaming_are_distinct() {
+    fn malformed_proof_is_refused() {
         let floors = empty_floors();
         let ctx = cross_org_ctx(&floors);
         let replay = AdmissionReplayGuard::with_defaults();
@@ -1098,13 +1181,55 @@ mod tests {
             ),
             Err(AdmissionDenied::MalformedProof)
         );
+    }
 
+    /// The SURVIVING unary denial invariant (§1.5 step 4a — the typed
+    /// old-provider refusal, preserved; the 1.6 split's second part): a
+    /// unary registration receiving streaming flags is
+    /// `StreamingUnsupported`, never a generic denial and never an
+    /// admission.
+    #[test]
+    fn unary_registration_streaming_flags_are_streaming_unsupported() {
+        let floors = empty_floors();
         let mut streaming = cross_org_ctx(&floors);
         streaming.shape = RpcCallShape::ServerStreaming;
+        let replay = AdmissionReplayGuard::with_defaults();
         assert_eq!(
             admit(&streaming, &cross_org_proof(), &replay),
             Err(AdmissionDenied::StreamingUnsupported)
         );
+    }
+
+    /// The new supported-shape positive (§1.5 — the 1.6 split's third part):
+    /// a streaming registration with coherent flags ADMITS a full streaming
+    /// proof whose `kind` matches the shape and whose `session_binding`
+    /// matches the receiving session — the exact shape step 4 refuses
+    /// everything else for.
+    #[test]
+    fn streaming_registration_admits_the_supported_shape() {
+        let floors = empty_floors();
+        let binding = [0x5Au8; 32];
+        let caller_entity = caller().entity_id().clone();
+        let provider_entity = provider();
+        let ctx = cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        let replay = AdmissionReplayGuard::with_defaults();
+        let bytes = cross_org_stream_proof(CALL_ID, binding)
+            .encode()
+            .expect("encode");
+        let out = verify_org_admission(
+            &ctx,
+            &[&bytes],
+            &replay,
+            ClockSample::now(),
+            || true,
+            |_| true,
+        );
+        let admitted = out.expect("the coherent streaming shape admits");
+        assert_eq!(admitted.caller, caller_entity);
+        assert_eq!(admitted.acting_org, org_a().org_id());
+        assert_eq!(admitted.provider_org, org_b().org_id());
+        assert_eq!(admitted.provider, provider_entity);
+        assert_eq!(admitted.capability, cap());
     }
 
     #[test]
@@ -1558,27 +1683,80 @@ mod tests {
         assert_eq!(replay.len(), 1);
     }
 
-    /// The recheck runs LATE — a proof that fails an EARLIER check
-    /// (here: streaming) is rejected on its own merits and never
-    /// reaches the §9.5 hook (so `AuthorityChanged` cannot mask a
-    /// more specific denial).
+    /// §9.5's ordering (the 1.6 rewrite for the new step-4 shape check; the
+    /// ordering property is KEPT): the shape and credential checks run
+    /// BEFORE the stability recheck (`AuthorityChanged` never masks a more
+    /// specific denial), and the recheck runs BEFORE the replay insert (a
+    /// stale view consumes no `(caller, call_id)` slot).
     #[test]
     fn stability_recheck_runs_after_credential_checks() {
         let floors = empty_floors();
-        let mut ctx = cross_org_ctx(&floors);
-        ctx.shape = RpcCallShape::ServerStreaming;
+        let binding = [0x5Au8; 32];
+        let caller_entity = caller().entity_id().clone();
+        let provider_entity = provider();
+        let bytes = cross_org_stream_proof(CALL_ID, binding)
+            .encode()
+            .expect("encode");
+
+        // (i) A step-4 shape refusal preempts the recheck entirely: the
+        //     flags-derived shape disagrees with the registered shape even
+        //     though the view is unstable.
+        let mut incoherent =
+            cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        incoherent.shape = RpcCallShape::Duplex;
         let replay = AdmissionReplayGuard::with_defaults();
-        let bytes = cross_org_proof().encode().expect("encode");
-        // Even with an unstable view, the streaming rejection wins.
-        let out = verify_org_admission(
-            &ctx,
-            &[&bytes],
-            &replay,
-            ClockSample::now(),
-            || false,
-            |_| true,
+        assert_eq!(
+            verify_org_admission(
+                &incoherent,
+                &[&bytes],
+                &replay,
+                ClockSample::now(),
+                || false,
+                |_| true
+            ),
+            Err(AdmissionDenied::ShapeMismatch),
+            "step 4 runs BEFORE the recheck — a shape refusal wins over an unstable view",
         );
-        assert_eq!(out, Err(AdmissionDenied::StreamingUnsupported));
+
+        // (ii) A credential failure preempts the recheck too: an expired
+        //      proof is refused as `ProofExpired` (the credential checks
+        //      run BEFORE the recheck), not `AuthorityChanged`.
+        let ctx = cross_org_stream_ctx(&floors, &caller_entity, &provider_entity, binding);
+        let expired = cross_org_stream_proof_at(CALL_ID, binding, 1);
+        let expired_bytes = expired.encode().expect("encode");
+        assert_eq!(
+            verify_org_admission(
+                &ctx,
+                &[&expired_bytes],
+                &replay,
+                ClockSample::now(),
+                || false,
+                |_| true
+            ),
+            Err(AdmissionDenied::ProofExpired),
+            "the credential checks run before the recheck",
+        );
+
+        // (iii) With everything valid the recheck fires at its exact place
+        //       (after credentials, before the replay insert) and consumes
+        //       NO slot.
+        assert_eq!(
+            verify_org_admission(
+                &ctx,
+                &[&bytes],
+                &replay,
+                ClockSample::now(),
+                || false,
+                |_| true
+            ),
+            Err(AdmissionDenied::AuthorityChanged),
+            "an unstable view denies at the recheck once every check before it passed",
+        );
+        assert_eq!(
+            replay.len(),
+            0,
+            "a stale decision consumes no (caller, call_id) replay slot",
+        );
     }
 
     #[test]
@@ -1642,6 +1820,13 @@ mod tests {
             AdmissionDenied::MultipleHeaders,
             AdmissionDenied::MalformedProof,
             AdmissionDenied::StreamingUnsupported,
+            AdmissionDenied::ShapeMismatch,
+            AdmissionDenied::SessionBindingMismatch,
+            AdmissionDenied::DeadlineExceedsPolicy,
+            AdmissionDenied::ActiveCallOwned,
+            AdmissionDenied::ActiveStreamCapacity,
+            AdmissionDenied::Revoked,
+            AdmissionDenied::ResourceExhausted,
             AdmissionDenied::MemberBindingMismatch,
             AdmissionDenied::ActingOrgMismatch,
             AdmissionDenied::UnexpectedCapabilityGrant,
@@ -1664,6 +1849,8 @@ mod tests {
             AdmissionDenied::CallIdCollision,
             AdmissionDenied::ReplayCapacity,
             AdmissionDenied::PerCallerReplayCapacity,
+            AdmissionDenied::PerOrganizationReplayCapacity,
+            AdmissionDenied::ExternalPoolReplayCapacity,
             AdmissionDenied::ProviderPolicyRejected,
         ];
         for &d in ALL {
@@ -1674,7 +1861,7 @@ mod tests {
                 "coarse reason for {d:?} must round-trip through its wire byte",
             );
         }
-        // Bucket anchors.
+        // Bucket anchors (extended to the C4 variants in the1.6 pass).
         assert_eq!(
             AdmissionDenied::StreamingUnsupported.coarse(),
             CoarseAdmissionReason::NotSupported,
@@ -1684,6 +1871,10 @@ mod tests {
             AdmissionDenied::AuthorityChanged,
             AdmissionDenied::ReplayCapacity,
             AdmissionDenied::PerCallerReplayCapacity,
+            AdmissionDenied::PerOrganizationReplayCapacity,
+            AdmissionDenied::ExternalPoolReplayCapacity,
+            AdmissionDenied::ActiveStreamCapacity,
+            AdmissionDenied::ResourceExhausted,
         ] {
             assert_eq!(unavailable.coarse(), CoarseAdmissionReason::Unavailable);
         }
@@ -1692,6 +1883,14 @@ mod tests {
             AdmissionDenied::Replay,
             AdmissionDenied::ProviderPolicyRejected,
             AdmissionDenied::MembershipRevoked,
+            AdmissionDenied::ShapeMismatch,
+            AdmissionDenied::SessionBindingMismatch,
+            AdmissionDenied::DeadlineExceedsPolicy,
+            AdmissionDenied::ActiveCallOwned,
+            // Main's ruling (plan §4.3, `cddb063a3`): a revocation refusal
+            // shares the frozen `Denied` coarse byte — midstream retirement
+            // arrives as `Err(AdmissionDenied(Denied))`.
+            AdmissionDenied::Revoked,
         ] {
             assert_eq!(denied.coarse(), CoarseAdmissionReason::Denied);
         }
