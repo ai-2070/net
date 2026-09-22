@@ -1,0 +1,14 @@
+net/crates/net/cli/src/context.rs
+  h_64425bc75e3f3d 499
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7c71f9c99f0fde75740998dc5b4719e55a02a900",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
