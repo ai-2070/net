@@ -897,11 +897,74 @@ public docs (`cli/README.md`, web reference) and Unix execution. The default
 bind is `0.0.0.0:0`, so the mesh port changes per restart until an operator
 pins `--bind`; enrollment will need a stable one.
 
-**Next:** `up --enroll` (issuer identity + ledger store, refusing without them)
-hosting `EnrollmentService` + `MembershipIssuer` over the node's own PSK and
-contact; `invite create/revoke/status` as control operations; then `join` over
-`DeviceJoin`. Lifecycle fencing, selective subnet semantics and V2 exact-head
-acceptance remain open.
+**`up --enroll`, `enrollment init`, `invite …` (2026-09-23, `03c47f75b`):**
+`cli/src/commands/enrollment.rs` (+ `lifecycle.rs`), witnesses
+`cli/tests/enrollment_lifecycle.rs` and a control-channel unit test.
+
+- **Scope assumption:** the operator node is publicly reachable (public IP,
+  port forward or VPS); joiners may be behind NAT because every joiner
+  connection is outbound. Both-sides-behind-NAT (relay / hole punching) is not
+  in this slice and needs its own scope decision.
+- **`enrollment init --issuer-identity <PATH> [--ledger DIR]`** creates an empty
+  ledger (default `<state-dir>/ledger`) bound to that issuer; never replaces one.
+- **`up --enroll`** requires `--public-addr <host:port>`, `--issuer-identity`,
+  a fixed `--bind` port and an existing ledger; optional `--domain-name`
+  (default: profile name). All inputs are validated before any node state is
+  created; the issuer is loaded and the ledger's exclusive lock taken before
+  the mesh binds (another issuer's ledger → exit 2). After the mesh starts it
+  binds the PSK-free Noise enrollment listener on TCP at the **same port
+  number** as the mesh's UDP socket (one number to forward), resolves
+  `--public-addr` for the bundle's `MeshContact`, and serves
+  `MembershipIssuer` bundles carrying this node's PSK. Readiness and
+  `node status` include a non-secret enrollment block (public endpoint, listen
+  address, enrollment key, issuer and fingerprint, domain). `down` stops the
+  listener with the node.
+- **`invite create [--require-approval] [--ttl D] [--for ENTITY] [--out PATH]`**
+  is a control operation: the node signs, records in its ledger, and returns the
+  `netmesh-join_` token, offer id, expiry, approval mode and bearer flag; a
+  bearer warning goes to stderr. `--out` writes the token to a new owner-only
+  file (existing path refused) and omits it from stdout.
+- **`invite status [OFFER]`, `invite revoke OFFER`, `invite approve|deny OFFER
+  --subject ENTITY`** are control operations; approve/deny act only on the
+  pending claim whose full subject the operator names. With no running
+  enrolling node they exit 6; a node without `--enroll` refuses them.
+- **`invite inspect <TOKEN|->`** is offline: signature, issuer and
+  fingerprint, endpoint, enrollment key, domain, trust-domain id, relations,
+  approval, created/expiry, bearer or intended subject. Never prints the token.
+- **Control channel** now encrypts messages (keyed-BLAKE3 keystream, MAC over
+  ciphertext, direction and sequence bound) because tokens cross it.
+
+Validation (Windows): `enrollment_lifecycle` **5/5** — each refusal case lacks
+exactly one input and asserts its reason (missing public address, ephemeral
+port, missing issuer, missing ledger, unusable address) with no node state;
+foreign-issuer ledger refused; second init refused; invite commands exit 6
+without a node. Journey: init → `up --enroll` → `invite create` → stdin
+`invite inspect` (endpoint, fingerprint, 24 h, bearer) → a clean SDK device
+redeems the token and **attaches to the running node's mesh with the delivered
+PSK** → `invite status` shows issued to that subject → a second device is
+refused (conflict) → a revoked token issues nothing. Require-approval: pending,
+wrong-subject approve refused, correct approve → install → attach. `--out`
+file, no overwrite, ledger offers persist across down/restart. A node without
+`--enroll` refuses invite operations. Unit: control frames never contain the
+plaintext; wrong sequence fails. Full `net-cli` **332/332**; SDK enrollment
+binaries **48/48**; clippy/rustfmt clean. **Inverses** (restored
+byte-identically): allowing an ephemeral port, approving any subject, `--out`
+overwriting, answering invite operations without `--enroll`, removing the
+keystream — each failed its witness. The ephemeral-port inverse first passed
+because its case also lacked a ledger; the refusal test was rebuilt so each case
+lacks exactly one input, and one-shot commands are bounded at 20 s so a refusal
+that regresses into a live node fails fast.
+
+Not witnessed on one host: that the bundle contact uses the public address
+rather than the bind address (identical on loopback); multi-host/NAT behavior;
+Unix execution. `invite create` opening the ledger directly is structurally
+excluded (the node holds the ledger lock) but has no dedicated inverse.
+
+**Next:** the device-side `net-mesh join <TOKEN|->` over `DeviceJoin` (show the
+inspection summary and require confirmation or `--yes`, persist before
+redeeming, install, then prove live attach), and `up` running as a joined node
+from that installed bundle. Lifecycle fencing, selective subnet semantics and
+V2 exact-head acceptance remain open.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
