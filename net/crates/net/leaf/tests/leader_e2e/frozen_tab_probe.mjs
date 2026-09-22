@@ -189,15 +189,35 @@ try {
     window.currentGeneration(),
   );
 
-  // 5. And once the successor has acted, the resumed tab's
-  //    generation is below the one in storage NOW — which is the
-  //    fence. Compared against a fresh storage read rather than the
-  //    successor's increment result, which is above every prior
-  //    reading by construction.
+  // 5. The successor has acted — in its own right and in its own
+  //    step: the read-increment-write the new leader performs. The
+  //    fence row below performs NO write at all, so the store move it
+  //    measures is an independent writer's act, observed post-hoc —
+  //    not a delta the fence row caused and then read back one line
+  //    later, where the compared values agree by construction and
+  //    the row can never report anything else.
   findings.successorGeneration = await follower.evaluate(() => window.nextGeneration());
+
+  // 6. The fence — asserted strictly as what it measures: the
+  //    tab-side bookkeeping the generation fence rests on, that the
+  //    resumed tab's cached generation LAGS the counter in storage.
+  //    Both sides are read fresh after the successor's move, and
+  //    neither is the successor's increment result (which is above
+  //    every prior reading by construction). It can fail on
+  //    staleness: a resumed tab whose belief tracked the store — a
+  //    vault that re-read the counter on resume — reads equal here
+  //    and this row reports false, refuting the staleness claim.
   findings.generationInStorageNow = await follower.evaluate(() => window.currentGeneration());
+  findings.resumedTabBelievesNow = await leader.evaluate(() => window.myGeneration);
   findings.resumedTabIsStale =
-    findings.resumedLeaderBelievesGeneration < findings.generationInStorageNow;
+    findings.resumedTabBelievesNow < findings.generationInStorageNow;
+  // The control, the same predicate applied to the tab that produced
+  // the move: false, because a writer is current with what it just
+  // wrote. This pair is what makes `resumedTabIsStale` a staleness
+  // reading rather than a tautology — the predicate demonstrably
+  // does report false for a tab that is not stale.
+  findings.successorTabIsStale =
+    findings.successorGeneration < findings.generationInStorageNow;
 
   findings.verdict = !findings.leaderFreezeVerified
     ? 'INCONCLUSIVE on this engine: the freeze never took effect'

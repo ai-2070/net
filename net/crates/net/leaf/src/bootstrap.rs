@@ -33,13 +33,13 @@
 //! the browser matrix.
 
 use base64::Engine as _;
-use zeroize::Zeroize;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use web_sys::{RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcPeerConnectionIceEvent};
+use zeroize::Zeroize;
 
 use crate::control_plane::NodeId;
 use crate::enroll::Invite;
@@ -384,7 +384,12 @@ pub fn parse_node_id(raw: &str) -> Option<NodeId> {
 /// first `map_err`/debug-log message that formats this struct must
 /// not hand it to a log line anyone with the page can read. Same
 /// treatment, same reason, as `OfferRequest`/`OfferResponse` and
-/// [`Credential`].
+/// [`Credential`] — and that treatment covers `sdp` too: the anchor's
+/// SDP answer carries `a=ice-ufrag`/`a=ice-pwd`, the dialog's STUN
+/// short-term credentials, and a holder can forge binding requests
+/// that pass this dialog's MESSAGE-INTEGRITY. So, exactly as both
+/// named siblings do, the body is never printed — only its LENGTH,
+/// which is what a diagnosis needs.
 #[derive(Clone)]
 pub struct OfferAccepted {
     /// The attempt token, presented as the trickle socket's
@@ -402,7 +407,7 @@ impl core::fmt::Debug for OfferAccepted {
         f.debug_struct("OfferAccepted")
             .field("attempt_token", &"<redacted>")
             .field("dialog", &self.dialog)
-            .field("sdp", &self.sdp)
+            .field("sdp_bytes", &self.sdp.len())
             .finish()
     }
 }
@@ -1021,15 +1026,50 @@ mod tests {
         // The attempt token is a per-dialog bearer: holding it lets
         // anyone inject `type:"candidate"` frames into this leaf's
         // ICE.
-        let accepted =
-            OfferAccepted::from_json(r#"{"attempt_token":"deadbeef","dialog":7,"sdp":"v=0"}"#)
-                .expect("parses");
+        //
+        // And the SDP body is one too: the answer carries the
+        // dialog's STUN short-term credentials in `a=ice-ufrag`/
+        // `a=ice-pwd`, and a holder can forge binding requests that
+        // pass this dialog's MESSAGE-INTEGRITY — the same ICE-hijack
+        // surface `attempt_token` names. Neither the body nor its
+        // credentials may appear in the output; only its length,
+        // exactly as the `sdp_bytes` of `OfferRequest`/`OfferResponse`.
+        let accepted = OfferAccepted::from_json(
+            r#"{"attempt_token":"deadbeef","dialog":7,"sdp":"v=0\r\na=ice-ufrag:UFRAG42\r\na=ice-pwd:PWDSUPERSECRET\r\n"}"#,
+        )
+        .expect("parses");
         let text = format!("{accepted:?}");
         assert!(
             !text.contains("deadbeef"),
             "the redacting OfferAccepted Debug leaked the attempt token: {text}"
         );
-        assert!(text.contains("dialog"), "non-secret fields stay visible: {text}");
+        for leak in [
+            // The body itself…
+            "v=0",
+            accepted.sdp.as_str(),
+            // …and both spellings of its ICE credentials: the
+            // attribute lines and the bare secrets a Debug impl that
+            // redacted by attribute name would still print values of.
+            "ice-ufrag",
+            "ice-pwd",
+            "UFRAG42",
+            "PWDSUPERSECRET",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "the redacting OfferAccepted Debug leaked the SDP body or its ICE \
+                 credentials: {text}"
+            );
+        }
+        assert!(
+            text.contains("dialog"),
+            "non-secret fields stay visible: {text}"
+        );
+        assert!(
+            text.contains("sdp_bytes"),
+            "and the diagnosis half stays too: the SDP's length is printed like both \
+             named siblings print it: {text}"
+        );
     }
 
     /// The correction, as a truth table. This is the property the

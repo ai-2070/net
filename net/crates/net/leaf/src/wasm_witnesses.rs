@@ -70,6 +70,17 @@ struct Pair {
     /// What the peer's channel delivered, waiting for
     /// [`Pair::pump_peer`].
     peer_inbox: Rc<RefCell<VecDeque<(NodeId, Bytes)>>>,
+    /// This leaf's own inbound sink — the very closure its transport
+    /// delivers through — so a witness can make a datagram arrive at
+    /// a chosen moment, including while the node's cell is held.
+    inbound: crate::rtc::InboundSink,
+    /// How many datagrams have reached this leaf's sink.
+    ///
+    /// Arrival is observable AT the sink and nowhere later: the sink
+    /// delivers opportunistically (production's shape), so a
+    /// free-cell arrival is already drained through the node by the
+    /// time a later turn could look at `inbox`.
+    arrived: Rc<Cell<u64>>,
     /// How many offers the peer has made, so each one is numbered
     /// with a dialog of its own.
     minted: Cell<u64>,
@@ -134,15 +145,40 @@ fn pair() -> Pair {
     // inbound closure has to reach its node the way the bindgen
     // surface's own sink does — through a `Weak`, and queueing
     // rather than re-entering a borrow the pump may hold.
+    //
+    // **This sink is production's shape, exactly** (the `connect`
+    // path's inbound sink): the datagram is queued UNCONDITIONALLY —
+    // outside `try_borrow_mut`, so an arrival while the pump already
+    // holds the node's cell is left for the pump that is running
+    // rather than discarded with the borrow — and then delivered
+    // opportunistically, with the listeners dispatched outside any
+    // borrow. The fixture sink this replaces pushed INSIDE
+    // `try_borrow_mut`, which models the PRE-fix drop-on-conflict:
+    // it would mask the very regression the production shape
+    // prevents. `arrived` counts at the sink because that is the one
+    // moment arrival is observable.
     let reaches: Rc<RefCell<Weak<RefCell<Inner>>>> = Rc::new(RefCell::new(Weak::new()));
     let sink = Rc::clone(&reaches);
-    let transport = RtcLeafTransport::new(Rc::new(move |from, bytes| {
-        if let Some(inner) = sink.borrow().upgrade() {
-            if let Ok(guard) = inner.try_borrow_mut() {
-                guard.inbox.borrow_mut().push_back((from, bytes));
-            }
+    let inbox = Rc::new(RefCell::new(VecDeque::new()));
+    let sink_inbox = Rc::clone(&inbox);
+    let arrived = Rc::new(Cell::new(0u64));
+    let sink_arrived = Rc::clone(&arrived);
+    let transport_sink: crate::rtc::InboundSink = Rc::new(move |from, bytes| {
+        let Some(inner) = sink.borrow().upgrade() else {
+            return;
+        };
+        sink_arrived.set(sink_arrived.get() + 1);
+        // Queued first — outside the borrowed cell — then delivered.
+        sink_inbox.borrow_mut().push_back((from, bytes));
+        if let Ok(mut guard) = inner.try_borrow_mut() {
+            guard.deliver();
         }
-    }));
+        // Outside the borrow, deliberately: a `stream_data` listener
+        // is where an application answers, and the answer is a
+        // synchronous `send` back into this same cell.
+        dispatch_events(&inner);
+    });
+    let transport = RtcLeafTransport::new(Rc::clone(&transport_sink));
     let peer_inbox: Rc<RefCell<VecDeque<(NodeId, Bytes)>>> = Rc::new(RefCell::new(VecDeque::new()));
     let peer_sink = Rc::clone(&peer_inbox);
     let peer_transport = RtcLeafTransport::new(Rc::new(move |from, bytes| {
@@ -173,7 +209,7 @@ fn pair() -> Pair {
         // never made would be the inverse of the defect the
         // partition assertion is for.
         bootstrap_settled: true,
-        inbox: Rc::new(RefCell::new(VecDeque::new())),
+        inbox,
         outbox: Vec::new(),
         dispatching: false,
         listeners: Vec::new(),
@@ -195,6 +231,8 @@ fn pair() -> Pair {
         peer_id,
         peer_transport,
         peer_inbox,
+        inbound: transport_sink,
+        arrived,
         minted: Cell::new(0),
     }
 }
@@ -281,15 +319,19 @@ impl Pair {
     }
 
     /// Wait until the channel has actually delivered something to
-    /// this leaf's inbox.
+    /// this leaf's sink.
     ///
     /// A DataChannel message arrives on a later turn of the event
     /// loop, so a pump that runs first observes nothing and a
-    /// witness built on it would assert about a packet that had
-    /// not landed.
+    /// witness built on it would assert about a packet that had not
+    /// landed. Counted at the sink ([`Pair::arrived`]) rather than
+    /// read off `inbox`: the sink delivers opportunistically —
+    /// production's shape — so a free-cell arrival has already been
+    /// drained through the node by the time a later turn could look.
     async fn await_arrival(&self) {
+        let seen = self.arrived.get();
         for _ in 0..80 {
-            if !self.leaf.inner.borrow().inbox.borrow().is_empty() {
+            if self.arrived.get() > seen {
                 return;
             }
             gloo_timer_sleep(TICK_MS).await.ok();
@@ -597,7 +639,11 @@ async fn a_stale_dialog_is_refused_before_it_services_the_replacement() {
             .peers
             .get(&p.peer_id)
             .expect("the replacement attempt is live");
-        (dialog.local.len(), dialog.inbox.len(), dialog.deferred.len())
+        (
+            dialog.local.len(),
+            dialog.inbox.len(),
+            dialog.deferred.len(),
+        )
     };
     let before = queued();
     assert!(
@@ -1407,6 +1453,21 @@ async fn a_verified_establishment_is_credited_to_the_attempt_that_admitted_it() 
 /// attempt that no longer exists. The successor must not be handed
 /// a `direct` term it never negotiated, and the retired
 /// establishment must install nothing.
+///
+/// **Declared exception (the staging, not the claim).** This race
+/// used to be staged by polling for the proof to sit in `inbox`
+/// "undelivered" — a premise only a queue-only fixture sink could
+/// hold. The fixture sink now delivers opportunistically, which is
+/// production's exact shape and whose regression that fixture would
+/// otherwise mask, so an arrival on a free cell is processed at
+/// arrival and the old staging could no longer hold its premise.
+/// The race is now staged through the sink's REAL deferral instead:
+/// the proof — the peer's own signed output, unmodified — arrives
+/// while this leaf's node cell is held, which is precisely the
+/// window production's sink defers over, and the supersession lands
+/// before the first pump that could consume it (`peer_accept_offer`
+/// supersedes in its first critical section and pumps only in its
+/// tail). Every oracle below is unchanged.
 #[wasm_bindgen_test]
 async fn a_promotion_whose_attempt_was_superseded_is_credited_to_nobody() {
     let p = pair();
@@ -1416,31 +1477,57 @@ async fn a_promotion_whose_attempt_was_superseded_is_credited_to_nobody() {
     p.peer_initiates_direct_handshake();
     p.await_arrival().await;
 
-    // One pump admits message 1 and sends message 2; one peer pump
-    // completes the peer's handshake and puts its PROOF on the
-    // channel, where this leaf's sink queues it — undelivered,
-    // because nothing has pumped this side since.
+    // The arrival admits message 1 and sends message 2 back over the
+    // open channel; the pump below is belt and braces.
     with_node(&p.leaf.inner, |guard| guard.pump());
     assert_eq!(
         p.leaf.inner.borrow().admissions.get(&p.peer_id).copied(),
         Some(p.attempt(d1)),
         "the admission is owned by the attempt whose channel carried it"
     );
-    // The proof is a real packet on a real channel, so it lands on
-    // a later turn of the event loop — and nothing pumps THIS side
-    // while it does, which is what makes the supersession below a
-    // race the proof loses rather than a sequence a test staged.
-    let mut in_flight = false;
+    // The peer completes ITS handshake over the message 2 that really
+    // crossed the channel, and its signed proof is taken from the
+    // peer's own outbox — unmodified production output — so the
+    // arrival moment is this test's to choose.
+    let mut proof: Vec<Bytes> = Vec::new();
     for _ in 0..80 {
-        p.pump_peer();
-        if !p.leaf.inner.borrow().inbox.borrow().is_empty() {
-            in_flight = true;
+        if let Some((from, bytes)) = p.peer_inbox.borrow_mut().pop_front() {
+            let inbound = p.peer.borrow_mut().classify_datagram(from, bytes);
+            match inbound {
+                Inbound::Handshake { from, packet, .. } => {
+                    p.peer
+                        .borrow_mut()
+                        .complete_handshake(from, &packet)
+                        .expect("the peer completes the handshake it began");
+                }
+                _ => panic!("the leaf's message 2 must arrive as a handshake packet"),
+            }
+            let mut peer = p.peer.borrow_mut();
+            peer.tick(clock::now());
+            proof = peer
+                .take_outbound()
+                .into_iter()
+                .map(|out| out.packet)
+                .collect();
             break;
         }
         gloo_timer_sleep(TICK_MS).await.ok();
     }
     assert!(
-        in_flight,
+        !proof.is_empty(),
+        "the peer must have produced its signed proof for this to be the race it claims"
+    );
+    // The proof ARRIVES while this leaf's node cell is held — the
+    // exact mid-pump window the production sink defers over — so it
+    // is queued and unconsumed when the supersession below lands.
+    {
+        let _held = p.leaf.inner.borrow_mut();
+        for packet in proof {
+            (p.inbound)(p.peer_id, packet);
+        }
+    }
+    assert!(
+        !p.leaf.inner.borrow().inbox.borrow().is_empty(),
         "the peer's proof must be in flight for this to be the race it claims"
     );
 
@@ -1513,14 +1600,53 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
         .into_bytes()
     };
 
+    // The third claimed fate — the drop is WARNED rather than silent —
+    // asserted on the drops' OWN text, recorded through a shim over
+    // `console.warn`: the channel BOTH overflow drops actually warn
+    // through (each drop site warns with `web_sys::console::warn_1`,
+    // not `console_error`). The shim is armed immediately around each
+    // queue's overflow deliveries and restored at once, so every
+    // recorded line is attributable to the overflow itself: an
+    // unrelated complaint anywhere in the leg cannot stand in for the
+    // warn, and removing either warn at its drop site turns its
+    // assertion below red.
+    let console =
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("console")).expect("console");
+    let original_warn =
+        js_sys::Reflect::get(&console, &JsValue::from_str("warn")).expect("console.warn");
+    let warned: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let record = warned.clone();
+    let shim = Closure::wrap(Box::new(move |arg: JsValue| {
+        record
+            .borrow_mut()
+            .push(arg.as_string().unwrap_or_default());
+    }) as Box<dyn FnMut(JsValue)>);
+
     // The pending-offer queue: no live attempt to file them on.
     let p = pair();
     p.install_session();
     let dialog: DialogId = 0x0BEE_0000_0000_0002;
     p.deliver(dialog, SignalKind::Offer, b"v=0\r\n".to_vec());
+    js_sys::Reflect::set(
+        &console,
+        &JsValue::from_str("warn"),
+        shim.as_ref().unchecked_ref::<js_sys::Function>(),
+    )
+    .expect("arm the console shim around the overflow deliveries");
     for n in 0..over {
         p.deliver(dialog, SignalKind::Candidate, line(n));
     }
+    js_sys::Reflect::set(&console, &JsValue::from_str("warn"), &original_warn)
+        .expect("restore console.warn");
+    assert!(
+        warned
+            .borrow()
+            .iter()
+            .any(|text| text.contains("the rest are dropped")),
+        "the pending-offer overflow must be warned with the drop site's own text, \
+         not dropped silently; console.warn lines recorded: {:?}",
+        warned.borrow()
+    );
     // The whole kept sequence, not one position plus a cardinality:
     // a queue that evicted the oldest on overflow (keeping the newest
     // N) satisfied both of the old assertions and kept exactly the
@@ -1538,30 +1664,17 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
          what the interval this exists for is about"
     );
 
-    // The third claimed fate — the drop is WARNED rather than silent —
-    // counted through a shim over `console.error`, the module's one
-    // console path (`console_error`), for the duration of the
-    // overflow below, and restored afterwards.
-    let console = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("console"))
-        .expect("console");
-    let original_error =
-        js_sys::Reflect::get(&console, &JsValue::from_str("error")).expect("console.error");
-    let warned = Rc::new(Cell::new(0usize));
-    let counting = warned.clone();
-    let shim = Closure::wrap(Box::new(move |_args: JsValue| {
-        counting.set(counting.get() + 1);
-    }) as Box<dyn FnMut(JsValue)>);
-    js_sys::Reflect::set(
-        &console,
-        &JsValue::from_str("error"),
-        shim.as_ref().unchecked_ref::<js_sys::Function>(),
-    )
-    .expect("install the console shim");
-
     // The live attempt's queue: held for want of a remote description.
     let q = pair();
     q.install_session();
     let d = q.offer(20_000).await;
+    warned.borrow_mut().clear();
+    js_sys::Reflect::set(
+        &console,
+        &JsValue::from_str("warn"),
+        shim.as_ref().unchecked_ref::<js_sys::Function>(),
+    )
+    .expect("arm the console shim around the overflow deliveries");
     for n in 0..over {
         q.deliver(d, SignalKind::Candidate, line(n));
     }
@@ -1570,6 +1683,17 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
         .service_peer(q.attempt(d))
         .await
         .unwrap_or_else(|_| panic!("the attempt is live"));
+    js_sys::Reflect::set(&console, &JsValue::from_str("warn"), &original_warn)
+        .expect("restore console.warn");
+    assert!(
+        warned
+            .borrow()
+            .iter()
+            .any(|text| text.contains("trickled candidate(s) dropped")),
+        "the live-attempt overflow must be warned with the drop site's own text, \
+         not dropped silently; console.warn lines recorded: {:?}",
+        warned.borrow()
+    );
     assert_eq!(reading.applied, 0, "no remote description, nothing applied");
     assert_eq!(
         q.leaf
@@ -1582,15 +1706,7 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
         "the attempt holds at most the bound, keeps the earliest arrivals in \
          arrival order, and the excess is dropped rather than queued"
     );
-    js_sys::Reflect::set(&console, &JsValue::from_str("error"), &original_error)
-        .expect("restore console.error");
     drop(shim);
-    assert!(
-        warned.get() >= 1,
-        "the overflow drop must be warned rather than silent; console complaints \
-         counted: {}",
-        warned.get()
-    );
     p.leaf.close();
     q.leaf.close();
 }
@@ -1884,5 +2000,318 @@ fn repeated_stream_open_and_close_leaves_the_listener_count_flat() {
     stream.close();
     assert_eq!(p.leaf.listener_count(), baseline);
 
+    p.leaf.close();
+}
+
+// ────── transport-loss fencing, the message-1 probe, inbound deferral ──────
+
+/// A predecessor channel's late loss report cannot drop the
+/// successor's session — and the same report still drops the session
+/// when it names the channel that installed it (positive control).
+///
+/// #9. `channel_installations` used to be a single per-peer slot
+/// paired with reports that carried only a peer id, so the harvest
+/// fenced against whichever incarnation was installed LAST: a
+/// predecessor channel's ICE `disconnected` → `failed` report still
+/// queued after a successor channel's handshake installed popped the
+/// SUCCESSOR's number and dropped the working session. The report
+/// now carries the reporting channel's identity
+/// ([`crate::rtc::IceLoss`]) and the drop is fenced on it.
+///
+/// Both cycles below are real: a real offer answered on a real
+/// connection, a real DataChannel opened, the peer's real message 1
+/// answered and its real signed establishment proof promoted — twice
+/// for one peer, which is the re-attempt shape. The predecessor's
+/// report is parked BEFORE the successor's install and drained
+/// AFTER, which is exactly the window the defect needed.
+#[wasm_bindgen_test]
+async fn a_predecessor_channels_late_loss_report_cannot_drop_the_successors_session() {
+    let p = pair();
+    p.install_session();
+
+    // Cycle one: the predecessor channel installs the pair's first
+    // direct session.
+    let d1 = p.answer_a_real_offer().await;
+    let predecessor_channel = p
+        .transport()
+        .channel_id(p.peer_id)
+        .expect("the predecessor link exists");
+    p.open_answer(d1).await;
+    p.peer_initiates_direct_handshake();
+    for _ in 0..40 {
+        with_node(&p.leaf.inner, |guard| guard.pump());
+        p.pump_peer();
+        if p.terminal().is_some() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        p.terminal(),
+        Some((IceTerm::Direct, "open")),
+        "the predecessor channel really installs the first direct session"
+    );
+    let predecessor_install = p
+        .leaf
+        .inner
+        .borrow()
+        .node
+        .session_incarnation(p.peer_id)
+        .expect("the predecessor's session is installed");
+
+    // The predecessor's ICE gives up and its watcher files the loss
+    // report — PARKED, because the drain runs later. This is the
+    // trigger that exists (a `disconnected` → `failed` transition),
+    // not the "late close" older comments named: `closed` is not a
+    // loss and files nothing.
+    p.transport()
+        .report_ice_loss(p.peer_id, predecessor_channel);
+
+    // Cycle two: the successor channel — a fresh connection replacing
+    // the predecessor's link, a real channel, and the peer's real
+    // message 1 again — installs the session that replaces the
+    // predecessor's.
+    let d2 = p.answer_a_real_offer().await;
+    assert_ne!(d1, d2);
+    let successor_channel = p
+        .transport()
+        .channel_id(p.peer_id)
+        .expect("the successor link exists");
+    assert_ne!(
+        successor_channel, predecessor_channel,
+        "the re-attempt really produced a second channel for the same peer"
+    );
+    p.open_answer(d2).await;
+    p.peer_initiates_direct_handshake();
+    for _ in 0..40 {
+        with_node(&p.leaf.inner, |guard| guard.pump());
+        p.pump_peer();
+        if p.terminal().is_some() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        p.terminal(),
+        Some((IceTerm::Direct, "open")),
+        "the successor channel installs the second direct session"
+    );
+    let successor_install = p
+        .leaf
+        .inner
+        .borrow()
+        .node
+        .session_incarnation(p.peer_id)
+        .expect("the successor's session is installed");
+    assert_ne!(
+        successor_install, predecessor_install,
+        "and it is a different establishment than the predecessor's"
+    );
+
+    // Deliver the PARKED predecessor report. THE claim: the working
+    // successor session survives it.
+    with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+    assert!(
+        p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "a predecessor channel's late loss report must not drop the successor's session"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.session_incarnation(p.peer_id),
+        Some(successor_install),
+        "and the successor's establishment is exactly the one still installed"
+    );
+
+    // Positive control: the same report, naming the CURRENT channel —
+    // the one whose handshake installed the session — still drops it.
+    // Without this the fence could be a `return` and the assertion
+    // above would stay green.
+    p.transport().report_ice_loss(p.peer_id, successor_channel);
+    with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+    assert!(
+        !p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "a loss report from the channel that installed the session still drops it"
+    );
+    p.leaf.close();
+}
+
+/// A racing message 1 cannot destroy a parked admission's keys — the
+/// parked admission still verifies its establishment proof and the
+/// pair installs.
+///
+/// #18. The message-1/message-2 discriminator used
+/// `LeafNode::accept_handshake` as its probe, whose success path
+/// INSERTS `provisional[peer]` — destroying the admission already
+/// parked there — even when the probe's own finding is then thrown
+/// away and the packet refused. The re-attempt shape reaches that
+/// state exactly: an unproven admission parked for the peer, this
+/// leaf's own initiation in flight, and a further message 1 from the
+/// peer. The probe now runs pure (`PendingHandshake::respond` parks
+/// nothing) and the node's admission runs only on the branch that
+/// ADMITS the packet, so a refused message 1 leaves `provisional`
+/// exactly as it found it.
+///
+/// The racing message 1 is built with a standalone
+/// [`PendingHandshake`] — real Noise output the responder really
+/// answers — so the PEER node keeps the pending handshake the parked
+/// admission's proof leg needs. The proof, its verification and the
+/// install below are the same real exchange every witness here runs.
+#[wasm_bindgen_test]
+async fn a_racing_message_1_cannot_destroy_a_parked_admission() {
+    let p = pair();
+    p.install_session();
+    let d = p.offer(20_000).await;
+    let attempt = p.attempt(d);
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    let peer_noise = *p.peer.borrow().identity().noise().public_key();
+    p.open_channel(d).await;
+
+    // The peer's message 1 parks an admission — keys and nothing
+    // else, awaiting the signed proof.
+    let msg1 = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 1)
+        .expect("the peer's message 1");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &msg1, false);
+    });
+    let parked = p
+        .leaf
+        .inner
+        .borrow()
+        .node
+        .provisional_attempt(p.peer_id)
+        .expect("message 1 parks keys, and only a verified proof promotes them");
+    assert_eq!(
+        p.leaf.inner.borrow().admissions.get(&p.peer_id).copied(),
+        Some(attempt),
+        "the admission is owned by the attempt whose channel carried it"
+    );
+
+    // This leaf's own initiation in flight — the discriminator's
+    // precondition, and half of the re-attempt shape.
+    let slot = with_node(&p.leaf.inner, |guard| guard.transport.next_slot());
+    with_node(&p.leaf.inner, |guard| {
+        guard
+            .node
+            .begin_handshake(p.peer_id, &PSK, &peer_noise, slot)
+            .expect("this leaf's own initiation");
+    });
+    assert!(p.leaf.inner.borrow().node.is_handshaking(p.peer_id));
+
+    // The racing message 1: a further message 1 from the peer while
+    // the parked admission is still unproven. Standalone Noise, so
+    // the peer node's own pending (the parked admission's) is
+    // untouched.
+    let (_scratch, racing) = crate::session::PendingHandshake::initiate(
+        &PSK,
+        &our_noise,
+        p.peer_id,
+        p.us,
+        crate::session::rtc_addr(0, 1),
+    )
+    .expect("a real message 1 from the peer");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &racing, false);
+    });
+
+    // THE claim: `provisional` is exactly as it was found — same
+    // admission, same negotiated keys, nothing clobbered and nothing
+    // superseded by a packet that was refused.
+    assert_eq!(
+        p.leaf.inner.borrow().node.provisional_attempt(p.peer_id),
+        Some(parked),
+        "a racing message 1 must leave the parked admission exactly as it found it"
+    );
+
+    // And the parked admission still verifies its establishment
+    // proof — the peer completes ITS handshake over the message 2
+    // that really crossed the channel and signs the proof over it —
+    // and the pair installs: THE parked establishment, consumed by
+    // its promotion.
+    for _ in 0..40 {
+        with_node(&p.leaf.inner, |guard| guard.pump());
+        p.pump_peer();
+        if p.terminal().is_some() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        p.terminal(),
+        Some((IceTerm::Direct, "open")),
+        "the parked admission's proof promotes and the pair installs"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.session_incarnation(p.peer_id),
+        Some(parked),
+        "and what installs IS the parked establishment — the same keys the \
+         racing message 1 tried to destroy"
+    );
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_none(),
+        "the admission is consumed by its promotion, not left for a second one"
+    );
+    p.leaf.close();
+}
+
+/// A datagram that arrives while the node cell is held is DELIVERED
+/// afterwards — not lost with the borrow.
+///
+/// #33. Production's inbound sink queues UNCONDITIONALLY — outside
+/// `try_borrow_mut` — and delivers opportunistically, so an arrival
+/// during a held borrow is deferred to the pump that is running. The
+/// fixture sink this module's `pair()` builds now mirrors that shape;
+/// before it did, it pushed INSIDE `try_borrow_mut` and modelled the
+/// pre-fix drop-on-conflict, and no witness could fail on the
+/// regression. This is that witness: the peer's real message 1 — a
+/// routed handshake packet the node really classifies and really
+/// admits — arrives through the sink while `Inner`'s cell is held,
+/// and the pump that follows must find it.
+///
+/// It fails under the old fixture shape by construction: the old sink
+/// discarded the datagram on the borrow conflict, so the admission
+/// below never appears.
+#[wasm_bindgen_test]
+fn a_datagram_that_arrives_while_the_node_cell_is_held_is_delivered_afterwards() {
+    let p = pair();
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    let msg1 = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 1)
+        .expect("the peer's message 1");
+    // Wrapped for the relayed path — the §9 step 2 shape, which needs
+    // no channel and no attempt to be admissible — and delivered as
+    // the relay's channel delivers it.
+    p.peer.borrow_mut().set_peer_relay(p.us, ANCHOR);
+    let out = p.peer.borrow().route_outbound(p.us, msg1);
+
+    // The arrival, with the node cell held — the exact re-entrancy
+    // the sink must survive rather than drop.
+    {
+        let _held = p.leaf.inner.borrow_mut();
+        (p.inbound)(ANCHOR, out.packet);
+    }
+
+    // Delivered afterwards, not lost: the pump that follows finds the
+    // datagram and the node does what any admitted message 1 makes it
+    // do — park the provisional establishment.
+    with_node(&p.leaf.inner, |guard| guard.pump());
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_some(),
+        "a datagram that arrived while the node cell was held must be delivered \
+ afterwards, not dropped with the borrow"
+    );
     p.leaf.close();
 }

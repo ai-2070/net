@@ -402,6 +402,26 @@ struct Subscription {
     retained: Option<Closure<dyn FnMut(JsValue)>>,
 }
 
+/// The transport-loss path's fence record: the session one open
+/// DataChannel's handshake installed, and the identity of that
+/// channel ([`crate::rtc::IceLoss`]).
+///
+/// Both halves are load-bearing. The incarnation is what
+/// [`crate::node::LeafNode::drop_session_if_incarnation`] checks, so
+/// a drop can never name a session that replaced the one the channel
+/// carried. The channel identity is what makes a report actionable at
+/// all: across a re-attempt a peer's PREDECESSOR channel files its
+/// own death after the successor's handshake installed, and only the
+/// reporting channel's identity distinguishes that report from the
+/// successor's own dying words — a peer id cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstalledChannel {
+    /// The channel whose handshake installed the session.
+    channel: u64,
+    /// The session incarnation that handshake installed.
+    incarnation: u64,
+}
+
 /// The shared interior. One per node; the transport's inbound
 /// closure holds a `Weak` to it, so a closed node's callbacks cannot
 /// resurrect it.
@@ -460,18 +480,22 @@ struct Inner {
     /// by [`Inner::on_handshake`] and consumed by [`Inner::pump`]
     /// when `take_verified_admissions` reports the proof verified.
     admissions: HashMap<NodeId, Attempt>,
-    /// The session incarnation each open DataChannel's handshake
-    /// installed, keyed by peer.
+    /// The session each open DataChannel's handshake installed, and
+    /// the identity of the channel it installed it over, keyed by
+    /// peer.
     ///
     /// The transport-loss path's fence. When the channel a session
     /// came up over dies, that session goes with it
     /// ([`crate::node::LeafNode::drop_session_if_incarnation`]) — but
-    /// only THAT session: a predecessor channel's late close must not
-    /// remove a successor's entry, and a peer id cannot express the
-    /// difference. Snapshotted at the install
+    /// only THAT session: a predecessor channel's late
+    /// `disconnected` → `failed` report must not remove a successor's
+    /// entry, and a peer id cannot express the difference. What can
+    /// is the REPORTING channel's identity, carried by every report
+    /// ([`crate::rtc::IceLoss`]) and matched against this record's
+    /// `channel` half. Snapshotted at the install
     /// ([`Inner::direct_installed`]), consumed at the loss
-    /// ([`Inner::harvest_ice_failures`]).
-    channel_installations: HashMap<NodeId, u64>,
+    /// ([`Inner::harvest_ice_failures`]). See [`InstalledChannel`].
+    channel_installations: HashMap<NodeId, InstalledChannel>,
     /// The number the next routed establishment is identified by.
     next_routed: u64,
     /// Local candidates gathered for the **bootstrap** dialog,
@@ -697,11 +721,23 @@ impl Inner {
             // shape** — both are Net handshake packets wrapping one
             // Noise message of the same pattern — so the boundary
             // discriminates by ATTEMPTING, and the safe direction
-            // first: `accept_handshake` touches no state unless the
-            // packet really is a message 1 (it validates before it
-            // parks anything), so its refusal means "not a message 1"
-            // and the packet falls through to the message-2 case
-            // below, untouched.
+            // first: `PendingHandshake::respond` runs the whole
+            // responder computation and parks NOTHING — its return
+            // value is the scratch slot — so its refusal means "not a
+            // message 1", the packet falls through to the message-2
+            // case below untouched, and its success has changed no
+            // state either.
+            //
+            // `LeafNode::accept_handshake` is NOT usable as that
+            // probe: its success path inserts `provisional[peer]`,
+            // and the `HashMap::insert` destroys whatever admission
+            // is already parked there — the negotiated keys of an
+            // establishment whose proof is still on its way. So the
+            // probe runs pure, and the node's own admission runs only
+            // on the ONE branch that admits the packet (below), where
+            // replacing a parked admission would be the documented
+            // second-message-1 supersession rather than the wreckage
+            // of a packet that ends up refused.
             //
             // The discriminator used to be "do I have a handshake in
             // flight", which cannot tell the two apart: a peer's
@@ -717,35 +753,67 @@ impl Inner {
             // behalf.
             if from != self.anchor {
                 let slot = self.transport.next_slot();
-                if let Ok(msg2) = self.node.accept_handshake(from, &self.psk, packet, slot) {
-                    // It IS a message 1, racing our own initiation.
-                    // Both cannot proceed: two completed NKpsk0
-                    // handshakes cross-install — each side keeps the
-                    // one it initiated and neither can open the
-                    // other's packets — so exactly one initiator is
-                    // elected, and the rule (`the lower node id keeps
-                    // the initiator role`) computes the same winner
-                    // on both sides. The loser's OPERATION is not
-                    // lost: it abandons its own pending and answers,
-                    // and the winner's establishment lands on the
-                    // loser's attempt through the ordinary admission
-                    // attribution.
-                    if self.node.node_id() < from {
-                        // Ours keeps the initiator role: the peer's
-                        // message 1 takes case 3's disposition and
-                        // our pending is left exactly as it was.
-                        self.node.retire_provisional(from);
-                        console_error(&format!(
-                            "net-mesh-leaf: refusing a message 1 from {from:#x}: this \
-                             leaf's own initiation holds the pair's initiator role"
-                        ));
+                // Whether this branch would refuse a message 1 — and
+                // a refused packet may touch nothing, `provisional`
+                // least of all. Two refusals live here: ours keeping
+                // the initiator role (below), and a provisional
+                // admission already parked for the peer (the
+                // re-attempt shape: a further message 1 racing a
+                // parked establishment must not destroy its keys —
+                // the peer is working toward a proof over them).
+                let refuses_message_1 =
+                    self.node.node_id() < from || self.node.provisional_attempt(from).is_some();
+                if refuses_message_1 {
+                    if crate::session::PendingHandshake::respond(
+                        &self.psk,
+                        self.node.identity().noise(),
+                        from,
+                        self.node.node_id(),
+                        crate::session::rtc_addr(slot, 1),
+                        packet,
+                    )
+                    .is_ok()
+                    {
+                        // It IS a message 1, and this branch refuses
+                        // it — case 3's disposition. Our pending is
+                        // left exactly as it was, and so is
+                        // `provisional`: the probe parked nothing, so
+                        // there is nothing to undo and nothing was
+                        // destroyed on the way in.
+                        if self.node.provisional_attempt(from).is_some() {
+                            console_error(&format!(
+                                "net-mesh-leaf: refusing a message 1 from {from:#x}: a \
+                                 provisional admission already owns this peer's \
+                                 establishment window"
+                            ));
+                        } else {
+                            console_error(&format!(
+                                "net-mesh-leaf: refusing a message 1 from {from:#x}: this \
+                                 leaf's own initiation holds the pair's initiator role"
+                            ));
+                        }
                         return;
                     }
-                    // The peer's initiation wins, so ours is
-                    // abandoned — deliberately, as the election's
-                    // loser, not as the side effect of a packet that
-                    // was never for it — and their message 1 is
-                    // answered as case 2 answers any.
+                    // Not a message 1: the message-2 case below owns
+                    // it, untouched.
+                } else if let Ok(msg2) = self.node.accept_handshake(from, &self.psk, packet, slot) {
+                    // It IS a message 1, racing our own initiation,
+                    // and the peer's initiation wins — no admission
+                    // is parked (the arm above) and ours is the lower
+                    // priority. Both cannot proceed: two completed
+                    // NKpsk0 handshakes cross-install — each side
+                    // keeps the one it initiated and neither can open
+                    // the other's packets — so exactly one initiator
+                    // is elected, and the rule (`the lower node id
+                    // keeps the initiator role`) computes the same
+                    // winner on both sides. The loser's OPERATION is
+                    // not lost: it abandons its own pending and
+                    // answers, and the winner's establishment lands
+                    // on the loser's attempt through the ordinary
+                    // admission attribution. `accept_handshake` runs
+                    // exactly here — the one branch that ADMITS the
+                    // packet — and its supersession is the admission,
+                    // not the probe's side effect.
                     self.handshakes.remove(&from);
                     self.node.release_handshake(from);
                     self.answer_message_1(from, relayed, msg2);
@@ -891,13 +959,27 @@ impl Inner {
     fn direct_installed(&mut self, attempt: Attempt) {
         let peer = attempt.peer;
         self.node.clear_peer_relay(peer);
-        // The incarnation this channel's handshake just installed —
-        // the one establishment the channel CARRIED. When the channel
-        // dies, the transport-loss path drops exactly that session
-        // and no other: a predecessor channel's late close fenced
-        // against this number is a no-op on the successor's session.
-        if let Some(incarnation) = self.node.session_incarnation(peer) {
-            self.channel_installations.insert(peer, incarnation);
+        // What this channel's handshake just installed — the one
+        // establishment the channel CARRIED — recorded WITH this
+        // channel's own identity. When a channel dies, the
+        // transport-loss path drops exactly its session and no other.
+        // The channel half is what makes that true across a
+        // re-attempt: the predecessor channel's ICE
+        // `disconnected` → `failed` report still queued after this
+        // successor install names the predecessor's channel and
+        // therefore cannot touch the entry below (see
+        // [`InstalledChannel`]).
+        if let (Some(channel), Some(incarnation)) = (
+            self.transport.channel_id(peer),
+            self.node.session_incarnation(peer),
+        ) {
+            self.channel_installations.insert(
+                peer,
+                InstalledChannel {
+                    channel,
+                    incarnation,
+                },
+            );
         }
         // **The role this leaf installed the pair in, registered in
         // BOTH directions.** The offerer owns the repair (§9 step 4
@@ -994,25 +1076,48 @@ impl Inner {
     /// Both file into `retry_triggers` and neither decides anything,
     /// which is what makes the owner single.
     fn harvest_ice_failures(&mut self) {
-        for peer in self.transport.take_ice_failures() {
+        for (peer, channel) in self.transport.take_ice_failures() {
             // **The transport-loss path: the session goes with its
             // channel.** A DataChannel that dies leaves the session
             // installed and unrelayed — `take_outbound` keeps queueing
             // to a dead transport and in-flight calls burn their full
             // deadline instead of failing `SessionLost` the moment
             // the session carrying them went away. The drop is fenced
-            // by the incarnation THAT channel's handshake installed
-            // ([`Inner::channel_installations`]), so a predecessor
-            // channel's late close cannot remove a successor's entry.
+            // on BOTH halves of what THAT channel's handshake
+            // installed ([`Inner::channel_installations`]): the
+            // reporting channel's own identity, and the incarnation
+            // it installed. The identity is the half that matters
+            // across a re-attempt — the trigger that exists is not
+            // "a predecessor channel's late close" (`closed` is not a
+            // loss and files nothing) but the predecessor channel's
+            // late ICE `disconnected` → `failed` transition, and such
+            // a report still queued after a successor's install names
+            // the predecessor's channel and must not remove the
+            // successor's entry. A report that matches no entry is no
+            // loss this table knows; the entry it failed to match is
+            // left in place for the channel it actually belongs to.
             //
             // This drain is the module's only transport-loss
             // detector: the DataChannel installs no `onclose`
             // handler, and the ICE `disconnected` → `failed` watcher
             // is what reports a link that is gone.
-            if let Some(installed) = self.channel_installations.remove(&peer) {
-                self.node
-                    .drop_session_if_incarnation(peer, installed, "the DataChannel closed");
+            let matched = self
+                .channel_installations
+                .get(&peer)
+                .filter(|installed| installed.channel == channel)
+                .copied();
+            if let Some(installed) = matched {
+                self.channel_installations.remove(&peer);
+                self.node.drop_session_if_incarnation(
+                    peer,
+                    installed.incarnation,
+                    "the DataChannel closed",
+                );
             }
+            // The re-attempt trigger files regardless of the fence:
+            // a dying link is a fact about the pair, and whether this
+            // leaf OWNS the repair is the policy's question
+            // ([`crate::retry`]), not this fence's.
             self.retry_triggers
                 .borrow_mut()
                 .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
@@ -2378,9 +2483,7 @@ impl LeafNode {
         let (control, envelope) = {
             let guard = self.inner.borrow();
             guard.admit().map_err(js)?;
-            let envelope = guard
-                .node
-                .sign_signal(peer, dialog, kind, payload.to_vec());
+            let envelope = guard.node.sign_signal(peer, dialog, kind, payload.to_vec());
             (guard.control.clone(), envelope)
         };
         control.signal(envelope).await.map_err(js)
@@ -3022,8 +3125,7 @@ impl LeafNode {
         let (answers, rest): (Vec<_>, Vec<_>) = incoming
             .into_iter()
             .partition(|(kind, _)| matches!(kind, SignalKind::Answer));
-        let mut queue: VecDeque<(SignalKind, Vec<u8>)> =
-            answers.into_iter().chain(rest).collect();
+        let mut queue: VecDeque<(SignalKind, Vec<u8>)> = answers.into_iter().chain(rest).collect();
         while failure.is_none() {
             let Some((kind, payload)) = queue.pop_front() else {
                 break;
@@ -3110,8 +3212,7 @@ impl LeafNode {
                     // Reject changes nothing; the reading reports the
                     // state that actually won.
                     let settled = with_node(&self.inner, |guard| {
-                        if guard.active(attempt)
-                            && guard.settle(attempt, IceTerm::Failed, "failed")
+                        if guard.active(attempt) && guard.settle(attempt, IceTerm::Failed, "failed")
                         {
                             guard.peers.remove(&peer);
                             true
