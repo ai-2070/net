@@ -11,7 +11,7 @@
 
 use super::{
     org_authority,
-    org_revocation::{open_regular_nofollow, write_atomic_phased, WritePhase},
+    org_revocation::{write_atomic_phased, WritePhase},
 };
 use std::{
     fs::File,
@@ -182,8 +182,36 @@ fn secure_dir(dir: &Path) -> Result<(), StorageError> {
     org_authority::ensure_secure_authority_dir(dir).map_err(|_| StorageError::Security)
 }
 
+/// Open `path` read-only under the crate's shared planted-inode policy
+/// (`org_revocation::open_regular_policy` — no-follow, `O_NONBLOCK`, type
+/// check on the OPENED descriptor), then the owner and permission checks
+/// below. A planted non-regular inode is a [`StorageError::Security`]
+/// refusal on every platform — never a hang and never an `Io` the caller
+/// could mistake for missing state (review finding 6).
 fn checked_file(path: &Path) -> Result<File, StorageError> {
-    let file = open_regular_nofollow(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    let file = match super::org_revocation::open_regular_policy(path, &mut opts) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            // The policy refuses planted inodes (symlink/FIFO/directory):
+            // fail closed as `Security`, matching every other planted
+            // inode shape in this module.
+            return Err(StorageError::Security);
+        }
+        Err(e) => {
+            // The open itself failed before any check could run (Windows
+            // refuses to open a directory at all). A non-regular inode is
+            // still a policy refusal; anything else stays a plain IO
+            // failure. Fail-closed either way.
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                if !meta.is_file() {
+                    return Err(StorageError::Security);
+                }
+            }
+            return Err(StorageError::Io(e));
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -338,6 +366,115 @@ mod tests {
             .set_len(MAX_SNAPSHOT_BYTES as u64 + 1)
             .unwrap();
         assert!(matches!(owner.read(), Err(StorageError::TooLarge)));
+    }
+
+    #[test]
+    fn planted_directory_is_refused() {
+        // A directory where a file inode belongs is refused as `Security`
+        // — the same fail-closed class as the hardlink, symlink and
+        // permissive-mode refusals — by the type check on the OPENED
+        // descriptor (or its classification when the open itself refuses,
+        // as on Windows). Runnable on every platform, unlike the FIFO
+        // case below, so it carries the refusal-class claim locally.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("ledger");
+        let mut owner = EnrollmentStorage::create(&dir, b"secret").unwrap();
+        // Positive control: healthy state works, so the refusals below
+        // are the planted inode and not a broken setup.
+        assert_eq!(owner.read().unwrap(), b"secret");
+        let snapshot = dir.join(SNAPSHOT);
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        let res = owner.read();
+        assert!(
+            matches!(res, Err(StorageError::Security)),
+            "planted snapshot directory must be refused as Security, got {res:?}"
+        );
+        let res = owner.replace(b"next");
+        assert!(
+            matches!(res, Err(StorageError::Security)),
+            "replace must refuse a planted snapshot directory as Security, got {res:?}"
+        );
+        drop(owner);
+        let lock = dir.join(LOCK);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let err = EnrollmentStorage::open(&dir).err();
+        assert!(
+            matches!(err, Some(StorageError::Security)),
+            "planted lock directory must be refused as Security, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_lock_and_snapshot_are_refused() {
+        // Review finding 6: the planted FIFO is the one tampering shape
+        // that used to become a process hang instead of a refusal —
+        // `open(2)` on a FIFO without `O_NONBLOCK` parks until a writer
+        // appears. Each operation runs under a watchdog so the inverse
+        // (blocking open) fails with the hang NAMED instead of wedging
+        // the harness. `mkfifo -m 0600` keeps the inode owned, private
+        // and single-link, so the type check is the only refusal path
+        // that can fire. Never executed on non-Unix hosts; CI-only.
+        fn refusing<T: Send + 'static>(what: &str, op: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(op());
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(v) => v,
+                Err(_) => {
+                    panic!("{what} parked instead of refusing: planted FIFO blocked the open")
+                }
+            }
+        }
+        fn mkfifo(path: &Path) {
+            let ok = std::process::Command::new("mkfifo")
+                .args(["-m", "0600"])
+                .arg(path)
+                .status()
+                .expect("mkfifo must run on the unix witness host");
+            assert!(
+                ok.success(),
+                "mkfifo must plant a real FIFO for this witness"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("ledger");
+        let owner = EnrollmentStorage::create(&dir, b"secret").unwrap();
+        assert_eq!(owner.read().unwrap(), b"secret");
+        let snapshot = dir.join(SNAPSHOT);
+        std::fs::remove_file(&snapshot).unwrap();
+        mkfifo(&snapshot);
+        let (mut owner, res) = refusing("read() with a FIFO snapshot", move || {
+            let res = owner.read();
+            (owner, res)
+        });
+        assert!(
+            matches!(res, Err(StorageError::Security)),
+            "planted FIFO snapshot must be refused as Security, got {res:?}"
+        );
+        let (owner, res) = refusing("replace() with a FIFO snapshot", move || {
+            let res = owner.replace(b"next");
+            (owner, res)
+        });
+        assert!(
+            matches!(res, Err(StorageError::Security)),
+            "replace must refuse a planted FIFO snapshot as Security, got {res:?}"
+        );
+        drop(owner);
+        let lock = dir.join(LOCK);
+        std::fs::remove_file(&lock).unwrap();
+        mkfifo(&lock);
+        let res = refusing("open() with a FIFO lock", move || {
+            EnrollmentStorage::open(&dir).map(|_| ()).err()
+        });
+        assert!(
+            matches!(res, Some(StorageError::Security)),
+            "planted FIFO lock must be refused as Security, got {res:?}"
+        );
     }
 
     #[cfg(windows)]

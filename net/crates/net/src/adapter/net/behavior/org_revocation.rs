@@ -2557,14 +2557,58 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<std::fs::File, OrgRevocatio
     Ok(lock)
 }
 
+/// The lock/regular-inode open policy (review-9; extracted for review
+/// finding 6): no-follow (a planted symlink cannot redirect the inode),
+/// `O_NONBLOCK` (a planted FIFO fails or returns instead of blocking
+/// the open forever; inert for regular files), and a type check on the
+/// OPENED descriptor. ONE implementation shared by [`open_lock_file`]
+/// and the enrollment storage's checked handles, so the policy cannot
+/// drift between consumers. The caller owns the ACCESS MODE through
+/// `opts` — read vs write+create is usage, not policy.
+pub(crate) fn open_regular_policy(
+    path: &Path,
+    opts: &mut std::fs::OpenOptions,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix has no O_NOFOLLOW: same symlink precheck as
+        // `open_regular_nofollow` (plus the opened-handle type
+        // check below).
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing symlink: inodes must be regular files",
+                ));
+            }
+        }
+    }
+    let f = opts.open(path)?;
+    // Type check on the opened descriptor — immune to a swap
+    // between check and use.
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing non-regular file: inodes must be regular files",
+        ));
+    }
+    Ok(f)
+}
+
 /// Open-and-lock a lock inode (`.lock` sidecar, ceremony lock)
-/// under the full regular-file policy (review-9): no-follow (a
-/// planted symlink cannot redirect the lock inode), `O_NONBLOCK`
-/// (a planted FIFO fails or returns instead of blocking the open
-/// forever), and a type check on the OPENED descriptor — advisory
-/// locking a non-regular inode is not a lock on anything this
-/// module owns. `O_NONBLOCK` is inert for regular files and does
-/// not affect the (deliberately blocking) advisory lock call.
+/// under the full regular-file policy ([`open_regular_policy`]):
+/// no-follow (a planted symlink cannot redirect the lock inode),
+/// `O_NONBLOCK` (a planted FIFO fails or returns instead of
+/// blocking the open forever), and a type check on the OPENED
+/// descriptor — advisory locking a non-regular inode is not a lock
+/// on anything this module owns. `O_NONBLOCK` is inert for regular
+/// files and does not affect the (deliberately blocking) advisory
+/// lock call.
 ///
 /// `pub(crate)`: the adoption ceremony lock
 /// (`org_authority::lock_ceremony`) applies the same policy.
@@ -2574,32 +2618,9 @@ pub(crate) fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File>
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         opts.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        // Non-Unix has no O_NOFOLLOW: same symlink precheck as
-        // `open_regular_nofollow` (plus the opened-handle type
-        // check below).
-        if let Ok(meta) = std::fs::symlink_metadata(lock_path) {
-            if meta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "refusing symlink: lock files must be regular files",
-                ));
-            }
-        }
-    }
-    let f = opts.open(lock_path)?;
-    // Type check on the opened descriptor — immune to a swap
-    // between check and use.
-    if !f.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing non-regular file: lock files must be regular files",
-        ));
-    }
+    let f = open_regular_policy(lock_path, &mut opts)?;
     f.lock()?;
     Ok(f)
 }
