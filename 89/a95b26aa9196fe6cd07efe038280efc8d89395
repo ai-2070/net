@@ -1,0 +1,16 @@
+net/crates/net/src/adapter/net/behavior/org_stream_lifecycle.rs
+  h_64425bc75e3f3d 286-307,312-314,478,491,511-534,536-537,568-570,635,661-670,672,675,681-689,716,827,832-847,853,890-892,922-925,946,950-955,958-966,971-975,1020,1029-1038,1362-1365,1367-1375,1419-1420,1436-1438,1447-1448,1477,1499,1522,1532,1556,1568,1592,1605,1620,1625-1627,1641,1657,1661-1665,1669,1680,1702,1741-1926,1998-2002,2010-2016
+net/crates/net/src/adapter/net/behavior/org_stream_registry.rs
+  h_64425bc75e3f3d 1632-1637,1639,2083,2103-2106,2303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "89a95b26aa9196fe6cd07efe038280efc8d89395",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
