@@ -1518,6 +1518,7 @@ jobs:
           --test nrpc_service_equality
           --test nrpc_streaming_gate
           --test org_admission_gate
+          --test org_rpc_streaming
           --test queue_group_dispatch
           --test aggregator_fold_query
           --test aggregator_registry_rpc
@@ -1710,8 +1711,9 @@ jobs:
 
           # Literal `--test` flags for the pin guard, which scrapes this file.
           cargo nextest list --color never --features "$FEATURES" \
-            --test sensing_org_exact_seam --test sensing_org_exact_guards >/dev/null \
-            || { echo "::error::the OA-5 binaries do not even list"; exit 1; }
+            --test sensing_org_exact_seam --test sensing_org_exact_guards \
+            --test org_rpc_streaming >/dev/null \
+            || { echo "::error::the pinned binaries do not even list"; exit 1; }
 
           run_binary sensing_org_exact_seam 8 \
             discovery_transport_observations_projection_and_admission_compose \
@@ -1731,6 +1733,19 @@ jobs:
           run_binary sensing_org_three_node 2 \
             relay_reauthors_org_provider_under_its_own_membership \
             a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown || exit 1
+
+          # ORG_SCOPED_STREAMING_PLAN Stage 1 — protected server-streaming
+          # openings (binary tests/org_rpc_streaming.rs). Floor = the count
+          # the binary reports at the pinned head (6 after slice 1.2); raised
+          # with each slice that lands witnesses (1.4 adds 8, 1.5 adds 3),
+          # REQUIRED names extended in the same commit as the witnesses.
+          run_binary org_rpc_streaming 6 \
+            stream_opening_admits_same_org \
+            stream_opening_admits_cross_org \
+            unary_context_proof_is_binding_invalid_on_stream_registration \
+            stream_proof_on_unary_registration_is_not_supported \
+            frozen_old_provider_refuses_stream_proof_with_not_supported \
+            replayed_opening_on_new_session_is_session_binding_mismatch || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
