@@ -56,7 +56,7 @@
 use super::admission_clock::ClockSample;
 use super::org::OrgId;
 use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome, ReplayPrincipal};
-use super::org_call::{OrgCallProof, MAX_ORG_CALL_PROOF_BYTES};
+use super::org_call::{OrgCallProof, OrgStreamCallProof, RpcCallShape, MAX_ORG_CALL_PROOF_BYTES};
 use super::org_grant::CapabilityAuthorityId;
 use super::org_revocation::OrgRevocationState;
 use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
@@ -82,7 +82,14 @@ pub enum OrgAdmission {
 /// (0x0009) while preserving the reason for audit — a caller bug
 /// (e.g. [`Self::CallIdCollision`]) must read differently from an
 /// attack (e.g. [`Self::Replay`] or [`Self::BindingInvalid`]).
+///
+/// `#[non_exhaustive]` (C4/Q7): new variants are a named source
+/// break for downstream exhaustive `match`es, never a silent
+/// reclassification. The [`Self::coarse`] mapping stays exhaustive
+/// IN-CRATE (compile-forced), so a new variant can never escape the
+/// caller-facing `{Denied, NotSupported, Unavailable}` byte set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdmissionDenied {
     /// The engine was invoked for a non-org-protected mode
     /// ([`OrgAdmission::PublicAuthenticated`]) — a caller logic
@@ -98,8 +105,38 @@ pub enum AdmissionDenied {
     /// A streaming (non-unary) call — org admission covers unary
     /// only in v1 (Locked #9); rejected with THIS distinct reason
     /// rather than admitted under a binding that covers only the
-    /// initial payload.
+    /// initial payload. Preserved as the UNARY-REGISTRATION refusal
+    /// (§1.5 step 4): a unary registration never admits streaming
+    /// flags.
     StreamingUnsupported,
+    /// The call's shape is incoherent with its proof or its
+    /// registration (§1.5 step 4): streaming flags on a streaming
+    /// registration of a DIFFERENT shape, or `proof.kind` naming a
+    /// different shape than the flags (C4, coarse `Denied`).
+    ShapeMismatch,
+    /// The opening proof's `session_binding` does not equal the Noise
+    /// handshake hash of the RECEIVING session (§1.3) — a replayed or
+    /// transplanted opening, or a session carrying no binding at all
+    /// (hand-built test sessions can never admit a protected stream).
+    SessionBindingMismatch,
+    /// The explicitly requested deadline exceeds the provider's
+    /// maximum protected lifetime (§2.1 bound 2: refused, never
+    /// clamped; C4, coarse `Denied`).
+    DeadlineExceedsPolicy,
+    /// The `(caller, call_id)` key is already live in the protected
+    /// call registry (§3 `reserve`): one admitted handler owns the
+    /// stream (C4, coarse `Denied`).
+    ActiveCallOwned,
+    /// The node/caller/org active-stream budget is exhausted at
+    /// `reserve` (§3; C4, coarse `Unavailable` — a later retry may
+    /// succeed).
+    ActiveStreamCapacity,
+    /// The call's credentials were revoked mid-call (§2.3/§2.4
+    /// retirement terminal; C4, coarse `Denied`).
+    Revoked,
+    /// A per-call/per-caller/per-node byte budget refused an item and
+    /// retired the call (§2.7; C4, coarse `Unavailable`).
+    ResourceExhausted,
     /// The proof's caller does not match the TOFU-authenticated
     /// channel peer — a relayed or transplanted proof.
     MemberBindingMismatch,
@@ -265,7 +302,9 @@ impl AdmissionDenied {
             | D::ReplayCapacity
             | D::PerCallerReplayCapacity
             | D::PerOrganizationReplayCapacity
-            | D::ExternalPoolReplayCapacity => C::Unavailable,
+            | D::ExternalPoolReplayCapacity
+            | D::ActiveStreamCapacity
+            | D::ResourceExhausted => C::Unavailable,
             // The call shape is unsupported on a protected unary service.
             D::StreamingUnsupported => C::NotSupported,
             // Everything else is a denial on the merits.
@@ -273,6 +312,11 @@ impl AdmissionDenied {
             | D::MissingHeader
             | D::MultipleHeaders
             | D::MalformedProof
+            | D::ShapeMismatch
+            | D::SessionBindingMismatch
+            | D::DeadlineExceedsPolicy
+            | D::ActiveCallOwned
+            | D::Revoked
             | D::MemberBindingMismatch
             | D::ActingOrgMismatch
             | D::UnexpectedCapabilityGrant
@@ -316,6 +360,12 @@ pub struct Admitted {
 /// The provider's own facts for one admission decision. Everything
 /// here is the provider's knowledge — never the caller's claims and
 /// never fold state.
+///
+/// `#[non_exhaustive]` + [`Self::new`] (C3/Q7): the `is_unary →
+/// shape` replacement is a named source break, and external literal
+/// construction goes with it — the stable constructor is the
+/// migration path. There is deliberately NO second derivable
+/// `is_unary`-style field beside [`Self::shape`].
 pub struct AdmissionContext<'a> {
     /// The registered admission mode for the invoked capability.
     pub mode: OrgAdmission,
@@ -336,12 +386,64 @@ pub struct AdmissionContext<'a> {
     /// blake3 of the canonical request with the admission header
     /// removed (computed at the cortex layer).
     pub request_digest: [u8; 32],
-    /// `true` iff this is a unary call; streaming is rejected.
-    pub is_unary: bool,
+    /// The SHAPE TERM (C3): the call's shape as derived from
+    /// (registration shape, payload flags) at the gate — the exact
+    /// replacement for the old flags-derived `is_unary`.
+    pub shape: RpcCallShape,
+    /// The shape the invoked REGISTRATION serves (§1.5 step 4's
+    /// "registration shape"): [`RpcCallShape::Unary`] for a unary
+    /// serve seam, the matching streaming shape for a streaming one.
+    pub registered_shape: RpcCallShape,
+    /// The Noise handshake hash of the RECEIVING session (§1.3),
+    /// resolved from `RpcInboundEvent.session_id`; `None` for a
+    /// hand-built/test session, which can never admit a protected
+    /// STREAM (unary wire semantics are unchanged and do not read
+    /// this).
+    pub session_binding: Option<[u8; 32]>,
     /// The provider's current revocation floor view.
     pub floors: &'a OrgRevocationState,
     /// Clock-skew tolerance for every wall-clock check.
     pub skew_secs: u64,
+}
+
+impl<'a> AdmissionContext<'a> {
+    /// The stable external constructor (C3). `client_streaming` /
+    /// `streaming_response` are the two nRPC streaming-flag bits of the
+    /// REQUEST payload, resolved to plain bools at the cortex layer;
+    /// [`Self::shape`] is derived from (the registration shape, those
+    /// payload flags) here, and [`Self::registered_shape`] is carried
+    /// for the §1.5 step-4 coherence checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mode: OrgAdmission,
+        authenticated_caller: &'a EntityId,
+        provider: &'a EntityId,
+        provider_owner_org: OrgId,
+        invoked_capability: CapabilityAuthorityId,
+        call_id: u64,
+        request_digest: [u8; 32],
+        registered_shape: RpcCallShape,
+        client_streaming: bool,
+        streaming_response: bool,
+        session_binding: Option<[u8; 32]>,
+        floors: &'a OrgRevocationState,
+        skew_secs: u64,
+    ) -> Self {
+        Self {
+            mode,
+            authenticated_caller,
+            provider,
+            provider_owner_org,
+            invoked_capability,
+            call_id,
+            request_digest,
+            shape: RpcCallShape::from_streaming_flags(client_streaming, streaming_response),
+            registered_shape,
+            session_binding,
+            floors,
+            skew_secs,
+        }
+    }
 }
 
 /// Verify one admission proof against `ctx` in the §2.4 order.
@@ -395,26 +497,82 @@ pub fn verify_org_admission(
         return Err(AdmissionDenied::MalformedProof);
     }
 
-    // 3. Decode the proof.
-    let proof = OrgCallProof::decode(header).map_err(|_| AdmissionDenied::MalformedProof)?;
+    // 3. Decode the proof — under the REGISTERED shape's decoder (§1.4).
+    //    A unary registration keeps the frozen prefix-tolerant decode
+    //    (unary wire semantics byte-for-byte unchanged); a streaming
+    //    registration requires the FULL streaming value — strict
+    //    full-consumption, so unknown kinds, truncated suffixes and
+    //    trailing bytes all refuse `MalformedProof`.
+    enum DecodedProof {
+        Unary(OrgCallProof),
+        Stream(OrgStreamCallProof),
+    }
+    let proof = match ctx.registered_shape {
+        RpcCallShape::Unary => DecodedProof::Unary(
+            OrgCallProof::decode(header).map_err(|_| AdmissionDenied::MalformedProof)?,
+        ),
+        RpcCallShape::ServerStreaming | RpcCallShape::ClientStreaming | RpcCallShape::Duplex => {
+            DecodedProof::Stream(
+                OrgStreamCallProof::decode(header).map_err(|_| AdmissionDenied::MalformedProof)?,
+            )
+        }
+    };
+    let (membership, dispatcher, cap_grant, expires_ns, call_binding_sig) = match &proof {
+        DecodedProof::Unary(p) => (
+            &p.caller_membership,
+            &p.dispatcher_grant,
+            &p.capability_grant,
+            p.proof_expires_at_unix_ns,
+            &p.call_binding_sig,
+        ),
+        DecodedProof::Stream(p) => (
+            &p.caller_membership,
+            &p.dispatcher_grant,
+            &p.capability_grant,
+            p.proof_expires_at_unix_ns,
+            &p.call_binding_sig,
+        ),
+    };
 
-    // 4. Unary only (Locked #9). A distinct reason so a caller can
-    //    tell "not supported" from "rejected".
-    if !ctx.is_unary {
-        return Err(AdmissionDenied::StreamingUnsupported);
+    // 4. Shape coherence (§1.5, replacing the old unary-only check).
+    //    (a) unary registration + streaming flags ⇒ `StreamingUnsupported`
+    //        (the preserved, typed "not supported" refusal);
+    //    (b) streaming registration + flags ≠ registered shape ⇒
+    //        `ShapeMismatch` (new, `Denied`);
+    //    (c) streaming registration + `proof.kind ≠ shape` ⇒
+    //        `ShapeMismatch`.
+    match ctx.registered_shape {
+        RpcCallShape::Unary => {
+            if ctx.shape != RpcCallShape::Unary {
+                return Err(AdmissionDenied::StreamingUnsupported);
+            }
+        }
+        RpcCallShape::ServerStreaming | RpcCallShape::ClientStreaming | RpcCallShape::Duplex => {
+            if ctx.shape != ctx.registered_shape {
+                return Err(AdmissionDenied::ShapeMismatch);
+            }
+            match &proof {
+                DecodedProof::Stream(p)
+                    if RpcCallShape::from_stream_kind(p.kind) == Some(ctx.shape) => {}
+                DecodedProof::Stream(_) => return Err(AdmissionDenied::ShapeMismatch),
+                DecodedProof::Unary(_) => {
+                    unreachable!("streaming registrations decode the streaming proof")
+                }
+            }
+        }
     }
 
     // 5. TOFU member binding: the proof's caller must be who is
     //    actually on the channel — a captured proof replayed by a
     //    different peer fails here before any signature work.
-    if &proof.caller_membership.member != ctx.authenticated_caller {
+    if &membership.member != ctx.authenticated_caller {
         return Err(AdmissionDenied::MemberBindingMismatch);
     }
 
     // The acting org is named by the membership; the dispatcher
     // grant must agree.
-    let acting_org = proof.caller_membership.org_id;
-    if proof.dispatcher_grant.org_id != acting_org {
+    let acting_org = membership.org_id;
+    if dispatcher.org_id != acting_org {
         return Err(AdmissionDenied::ActingOrgMismatch);
     }
 
@@ -426,13 +584,12 @@ pub fn verify_org_admission(
             if acting_org != ctx.provider_owner_org {
                 return Err(AdmissionDenied::GranteeMismatch);
             }
-            if proof.capability_grant.is_some() {
+            if cap_grant.is_some() {
                 return Err(AdmissionDenied::UnexpectedCapabilityGrant);
             }
         }
         OrgAdmission::CrossOrgGranted => {
-            let grant = proof
-                .capability_grant
+            let grant = cap_grant
                 .as_ref()
                 .ok_or(AdmissionDenied::MissingCapabilityGrant)?;
             // The grant is authority ONLY if my owner issued it…
@@ -464,10 +621,8 @@ pub fn verify_org_admission(
 
     // 7. Dispatcher grant scope: it must empower THIS caller to act
     //    for the acting org over the invoked capability.
-    if proof.dispatcher_grant.dispatcher != *ctx.authenticated_caller
-        || !proof
-            .dispatcher_grant
-            .covers_capability(&ctx.invoked_capability)
+    if dispatcher.dispatcher != *ctx.authenticated_caller
+        || !dispatcher.covers_capability(&ctx.invoked_capability)
     {
         return Err(AdmissionDenied::DispatcherGrantScope);
     }
@@ -480,8 +635,7 @@ pub fn verify_org_admission(
     //    wall-clock jump mid-admission cannot make one check disagree
     //    with another or with the replay retention below.
     let now_secs = clock.wall_secs();
-    proof
-        .caller_membership
+    membership
         .is_valid_at_with_skew(now_secs, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::MembershipInvalid)?;
     // §14 — BOUNDARY, stated because it is invisible at this call site.
@@ -511,39 +665,71 @@ pub fn verify_org_admission(
     // operational surface, not a check. Until then `provider_policy` is the
     // documented mechanism, and this is the §D1 limitation made concrete at
     // the exact line where a reader would otherwise assume coverage.
-    let floor = ctx
-        .floors
-        .floor_for(&acting_org, &proof.caller_membership.member);
-    if proof.caller_membership.generation < floor {
+    let floor = ctx.floors.floor_for(&acting_org, &membership.member);
+    if membership.generation < floor {
         return Err(AdmissionDenied::MembershipRevoked);
     }
-    proof
-        .dispatcher_grant
+    dispatcher
         .is_valid_at_with_skew(now_secs, ctx.skew_secs)
         .map_err(|_| AdmissionDenied::DispatcherGrantInvalid)?;
-    if let Some(grant) = &proof.capability_grant {
+    if let Some(grant) = &cap_grant {
         grant
             .is_valid_at_with_skew(now_secs, ctx.skew_secs)
             .map_err(|_| AdmissionDenied::CapabilityGrantInvalid)?;
     }
-    proof
-        .check_expiry_at(clock.wall_ns, ctx.skew_secs)
-        .map_err(|_| AdmissionDenied::ProofExpired)?;
+    match &proof {
+        DecodedProof::Unary(p) => p.check_expiry_at(clock.wall_ns, ctx.skew_secs),
+        DecodedProof::Stream(p) => p.check_expiry_at(clock.wall_ns, ctx.skew_secs),
+    }
+    .map_err(|_| AdmissionDenied::ProofExpired)?;
 
     // 9. Call binding: the caller ENTITY signed THIS exact call.
     //    The provider supplies its own owner org, identity,
     //    call_id, the invoked capability, and the request digest —
     //    a proof minted for another call/callee/capability fails.
-    let binding = proof.binding_for_verify(
-        ctx.provider_owner_org,
-        ctx.provider.clone(),
-        ctx.call_id,
-        ctx.invoked_capability,
-        ctx.request_digest,
-    );
-    binding
-        .verify(&proof.call_binding_sig)
-        .map_err(|_| AdmissionDenied::BindingInvalid)?;
+    //    Unary verifies the 11-field `"net-org-call-v1"` transcript
+    //    (byte-for-byte unchanged); streaming verifies the 13-field
+    //    `"net-org-stream-call-v1"` transcript (§1.2), so a
+    //    unary-domain signature can never authorize a streaming
+    //    opening and vice versa.
+    match &proof {
+        DecodedProof::Unary(p) => {
+            let binding = p.binding_for_verify(
+                ctx.provider_owner_org,
+                ctx.provider.clone(),
+                ctx.call_id,
+                ctx.invoked_capability,
+                ctx.request_digest,
+            );
+            binding
+                .verify(call_binding_sig)
+                .map_err(|_| AdmissionDenied::BindingInvalid)?;
+        }
+        DecodedProof::Stream(p) => {
+            let binding = p.binding_for_stream_verify(
+                ctx.provider_owner_org,
+                ctx.provider.clone(),
+                ctx.call_id,
+                ctx.invoked_capability,
+                ctx.request_digest,
+            );
+            binding
+                .verify(call_binding_sig)
+                .map_err(|_| AdmissionDenied::BindingInvalid)?;
+            // 9b. Session binding (§1.3): the opening is admitted only
+            //     on the ONE session its proof binds — the RECEIVING
+            //     session's full Noise handshake hash must equal
+            //     `proof.session_binding`. A hand-built session (`None`)
+            //     can never admit a protected stream; a captured opening
+            //     replayed on any later session fails here, BEFORE the
+            //     replay insert (so the typed reason is
+            //     `SessionBindingMismatch`, not `Replay`).
+            match ctx.session_binding {
+                Some(resolved) if resolved == p.session_binding => {}
+                _ => return Err(AdmissionDenied::SessionBindingMismatch),
+            }
+        }
+    }
 
     // 9.5. Stability linearization (E1.4, verdict §6). Steps 1–9
     //      verified the proof against a floor snapshot + authority
@@ -608,9 +794,9 @@ pub fn verify_org_admission(
     //     cost is bounded: entries live at most 5 minutes past expiry
     //     rather than `ctx.skew_secs`, and the per-caller ceiling
     //     already bounds how many a caller can hold.
-    let binding_digest: [u8; 32] = blake3::hash(&proof.call_binding_sig).into();
+    let binding_digest: [u8; 32] = blake3::hash(call_binding_sig).into();
     let skew_ns = MAX_TOKEN_CLOCK_SKEW_SECS.saturating_mul(1_000_000_000);
-    let retain_until_wall_ns = proof.proof_expires_at_unix_ns.saturating_add(skew_ns);
+    let retain_until_wall_ns = expires_ns.saturating_add(skew_ns);
     let expires_at = clock.monotonic_deadline_for(retain_until_wall_ns);
     // §5 — the quota principal. `acting_org` here is the VERIFIED one: it was
     // taken from the org-signed membership certificate at step 5 and
@@ -647,13 +833,25 @@ pub fn verify_org_admission(
 
     // 11. Provider-local policy LAST (Locked #6): the application
     //     veto. Fold state / decrypted announcements are never
-    //     consulted here — the closure gets only the verified proof.
-    if !provider_policy(&proof) {
+    //     consulted here — the closure gets only the verified proof
+    //     (for a streaming call, its five unary prefix fields as an
+    //     `OrgCallProof` view: `OrgProviderPolicy` keeps its unary
+    //     signature; `kind`/`session_binding` are shape/session
+    //     facts, not credentials).
+    let policy_view;
+    let policy_proof: &OrgCallProof = match &proof {
+        DecodedProof::Unary(p) => p,
+        DecodedProof::Stream(p) => {
+            policy_view = p.unary_prefix();
+            &policy_view
+        }
+    };
+    if !provider_policy(policy_proof) {
         return Err(AdmissionDenied::ProviderPolicyRejected);
     }
 
     Ok(Admitted {
-        caller: proof.caller_membership.member.clone(),
+        caller: membership.member.clone(),
         acting_org,
         provider_org: ctx.provider_owner_org,
         provider: ctx.provider.clone(),
@@ -785,7 +983,9 @@ mod tests {
             invoked_capability: cap(),
             call_id: CALL_ID,
             request_digest: REQ,
-            is_unary: true,
+            shape: RpcCallShape::Unary,
+            registered_shape: RpcCallShape::Unary,
+            session_binding: None,
             floors,
             skew_secs: 0,
         }
@@ -800,7 +1000,9 @@ mod tests {
             invoked_capability: cap(),
             call_id: CALL_ID,
             request_digest: REQ,
-            is_unary: true,
+            shape: RpcCallShape::Unary,
+            registered_shape: RpcCallShape::Unary,
+            session_binding: None,
             floors,
             skew_secs: 0,
         }
@@ -898,7 +1100,7 @@ mod tests {
         );
 
         let mut streaming = cross_org_ctx(&floors);
-        streaming.is_unary = false;
+        streaming.shape = RpcCallShape::ServerStreaming;
         assert_eq!(
             admit(&streaming, &cross_org_proof(), &replay),
             Err(AdmissionDenied::StreamingUnsupported)
@@ -1364,7 +1566,7 @@ mod tests {
     fn stability_recheck_runs_after_credential_checks() {
         let floors = empty_floors();
         let mut ctx = cross_org_ctx(&floors);
-        ctx.is_unary = false;
+        ctx.shape = RpcCallShape::ServerStreaming;
         let replay = AdmissionReplayGuard::with_defaults();
         let bytes = cross_org_proof().encode().expect("encode");
         // Even with an unstable view, the streaming rejection wins.

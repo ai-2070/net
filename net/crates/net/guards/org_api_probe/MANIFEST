@@ -36,6 +36,7 @@ net::adapter::net::cortex::rpc::RpcCancellationToken
 net::adapter::net::cortex::rpc::TraceContext
 net::adapter::net::behavior::org_admission::AdmissionContext
 net::adapter::net::behavior::org_admission::AdmissionDenied
+net::adapter::net::behavior::org_call::RpcCallShape
 net::adapter::net::behavior::org_admission::OrgAdmission
 net::adapter::net::behavior::org_revocation::OrgRevocationState
 net::adapter::net::identity::EntityId

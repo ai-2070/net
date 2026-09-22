@@ -228,6 +228,18 @@ fn pin_admission_denied(denied: AdmissionDenied) -> &'static str {
         AdmissionDenied::PerOrganizationReplayCapacity => "per_organization_replay_capacity",
         AdmissionDenied::ExternalPoolReplayCapacity => "external_pool_replay_capacity",
         AdmissionDenied::ProviderPolicyRejected => "provider_policy_rejected",
+        // C4's seven Stage 1 variants (realized in slice 1.2).
+        AdmissionDenied::ShapeMismatch => "shape_mismatch",
+        AdmissionDenied::SessionBindingMismatch => "session_binding_mismatch",
+        AdmissionDenied::DeadlineExceedsPolicy => "deadline_exceeds_policy",
+        AdmissionDenied::ActiveCallOwned => "active_call_owned",
+        AdmissionDenied::ActiveStreamCapacity => "active_stream_capacity",
+        AdmissionDenied::Revoked => "revoked",
+        AdmissionDenied::ResourceExhausted => "resource_exhausted",
+        // `#[non_exhaustive]` (C4/Q7) — a future variant is not a compile
+        // break downstream any more; this arm is the acknowledged cost of the
+        // approved break, and its string is the pinned fallback.
+        _ => "future_variant",
     }
 }
 
@@ -357,28 +369,33 @@ fn pin_rpc_streaming_context() -> RpcStreamingContext {
     context
 }
 
-/// **Ledger C3.** `AdmissionContext { .. }` by struct literal, including the
-/// `is_unary: bool` field Q7 authorized replacing with `shape: RpcCallShape`
-/// (`src/adapter/net/behavior/org_admission.rs:319-345`). The ledger calls
-/// this type externally constructible; this function is the executable proof
-/// of that claim at head.
+/// **Ledger C3 (realized in Stage 1 slice 1.2).** The `AdmissionContext { .. }`
+/// literal — including the `is_unary: bool` field — stopped compiling when Q7
+/// landed: `is_unary` became `shape: RpcCallShape` and the struct became
+/// `#[non_exhaustive]`. This is the named break's migration path, UPDATED not
+/// deleted: the stable constructor (the only external construction the break
+/// leaves), with the shape term the constructor derives from (registration
+/// shape, payload flags).
 fn pin_admission_context<'a>(
     authenticated_caller: &'a EntityId,
     provider: &'a EntityId,
     floors: &'a OrgRevocationState,
 ) -> AdmissionContext<'a> {
-    AdmissionContext {
-        mode: OrgAdmission::OwnerDelegated,
+    AdmissionContext::new(
+        OrgAdmission::OwnerDelegated,
         authenticated_caller,
         provider,
-        provider_owner_org: OrgId::from_bytes([7u8; 32]),
-        invoked_capability: CapabilityAuthorityId::for_tag("nrpc:probe.org.unary"),
-        call_id: 1,
-        request_digest: [0u8; 32],
-        is_unary: true,
+        OrgId::from_bytes([7u8; 32]),
+        CapabilityAuthorityId::for_tag("nrpc:probe.org.unary"),
+        1,
+        [0u8; 32],
+        net::adapter::net::behavior::org_call::RpcCallShape::Unary,
+        false,
+        false,
+        None,
         floors,
-        skew_secs: 30,
-    }
+        30,
+    )
 }
 
 /// `OrgAdmission`, matched exhaustively: the canonical mode enum behind
@@ -438,11 +455,11 @@ fn main() {
     println!(
         "org+streaming API probe: 3 ledger literals constructed \
          (CallOptions.stream_window_initial={:?}, RpcStreamingContext.call_id={}, \
-         AdmissionContext.is_unary={}), {} exhaustive matches ({}), \
+         AdmissionContext.shape={:?}), {} exhaustive matches ({}), \
          {} signatures pinned without running a node",
         options.stream_window_initial,
         context.call_id,
-        admission.is_unary,
+        admission.shape,
         matched.len(),
         handler_error,
         unrun.len(),

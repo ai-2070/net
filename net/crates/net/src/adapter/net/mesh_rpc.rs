@@ -53,7 +53,9 @@ use crate::error::AdapterError;
 
 use super::behavior::org::{OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
-use super::behavior::org_call::{OrgCallProof, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER};
+use super::behavior::org_call::{
+    OrgCallProof, OrgStreamCallProof, RpcCallShape, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER,
+};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
 use super::mesh::{MeshNode, PeerPublishOutcome, ReplySubscription};
 use super::org_admission_gate::{
@@ -1121,10 +1123,14 @@ async fn admit_and_dispatch_protected(
         .filter(|(n, _)| n == crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER)
         .map(|(_, v)| v.as_slice())
         .collect();
-    // Unary only (E1.8): a streaming flag on a protected REQUEST is a distinct
-    // "not supported" denial, never admitted under a unary binding.
-    let is_unary =
-        payload.flags & (FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE) == 0;
+    // Shape term (C3, §1.5 step 4): derived from (registration shape,
+    // payload flags). This seam serves UNARY registrations, and a
+    // streaming flag on one is a distinct "not supported" denial, never
+    // admitted under a unary binding (E1.8 preserved).
+    let shape = crate::adapter::net::behavior::org_call::RpcCallShape::from_streaming_flags(
+        payload.flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0,
+        payload.flags & FLAG_RPC_STREAMING_RESPONSE != 0,
+    );
 
     // Provider self-verify (E1.3) against ONE clock sample.
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
@@ -1182,7 +1188,11 @@ async fn admit_and_dispatch_protected(
         invoked_capability,
         call_id,
         request_digest,
-        is_unary,
+        shape,
+        registered_shape: crate::adapter::net::behavior::org_call::RpcCallShape::Unary,
+        // Unary wire semantics are unchanged: the unary proof carries no
+        // session binding and none is checked (§1.3 is streaming-only).
+        session_binding: None,
         floors: facts.floors.as_ref(),
         skew_secs: facts.skew_secs,
     };
@@ -5773,7 +5783,7 @@ impl MeshNode {
             // validate the FINAL bounds — 32 supplied headers + the proof header
             // would otherwise be 33 > MAX_RPC_HEADERS and panic (debug) /
             // truncate (release) at `encode_into`.
-            let header = sign_admission_proof(intent, call_id, &req)?;
+            let header = sign_admission_proof(intent, call_id, &req, RpcCallShape::Unary, None)?;
             req.headers.push(header);
             req.validate_wire_bounds().map_err(|e| RpcError::Codec {
                 direction: CodecDirection::Encode,
@@ -6526,15 +6536,27 @@ const REPLY_SUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_m
 /// broader stack won't be functional anyway; the pool cursor is
 /// left exhausted so the next mint retries the refill. `0` is
 /// reserved as a sentinel and never returned.
-/// Mint the `net-org-admission` proof header for a protected unary call (E2.1):
-/// sign an [`OrgCallProof`] binding THIS `call_id` and the finalized `req` (via
-/// the shared [`org_request_digest`], which strips any admission header, so the
-/// caller signing and the provider verifying derive the SAME digest) under the
-/// caller's [`OrgProofIntent`]. Returns the single header the caller appends.
+/// Mint the `net-org-admission` proof header for a protected call (E2.1,
+/// `ORG_SCOPED_STREAMING_PLAN.md` contract 2) — the mint helper SHARED by
+/// the unary [`MeshNode::call`] and the protected streaming caller: sign
+/// the call binding over THIS `call_id` and the finalized `req` (via the
+/// shared [`org_request_digest`], which strips any admission header, so the
+/// caller signing and the provider verifying derive the SAME digest) under
+/// the caller's [`OrgProofIntent`].
+///
+/// `call_shape` selects the proof: [`RpcCallShape::Unary`] mints the
+/// unchanged [`OrgCallProof`]; a streaming shape mints an
+/// [`OrgStreamCallProof`] whose `kind` is the shape's wire kind and whose
+/// `session_binding` MUST be the Noise handshake hash of the exact session
+/// the call rides (§1.3 — a streaming proof without one is a caller
+/// construction error, refused locally). Returns the single header the
+/// caller appends.
 fn sign_admission_proof(
     intent: &OrgProofIntent,
     call_id: u64,
     req: &RpcRequestPayload,
+    call_shape: RpcCallShape,
+    session_binding: Option<[u8; 32]>,
 ) -> Result<(String, Vec<u8>), RpcError> {
     // The intent's capability must match the invoked service (`nrpc:<service>`),
     // else the provider would deny `CapabilityMismatch` — fail the caller locally
@@ -6581,24 +6603,73 @@ fn sign_admission_proof(
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let expiry = now_ns.saturating_add(ttl_secs.saturating_mul(1_000_000_000));
-    let proof = OrgCallProof::sign_for_call(
-        &intent.caller,
-        intent.membership.clone(),
-        intent.dispatcher.clone(),
-        intent.capability_grant.clone(),
-        intent.acting_org,
-        intent.provider_owner_org,
-        intent.provider.clone(),
-        call_id,
-        intent.capability,
-        expiry,
-        digest,
-    );
-    let bytes = proof.encode().map_err(|e| RpcError::Codec {
-        direction: CodecDirection::Encode,
-        message: format!("org admission: proof encode failed: {e}"),
-    })?;
+    let bytes = match call_shape {
+        RpcCallShape::Unary => {
+            let proof = OrgCallProof::sign_for_call(
+                &intent.caller,
+                intent.membership.clone(),
+                intent.dispatcher.clone(),
+                intent.capability_grant.clone(),
+                intent.acting_org,
+                intent.provider_owner_org,
+                intent.provider.clone(),
+                call_id,
+                intent.capability,
+                expiry,
+                digest,
+            );
+            proof.encode().map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: format!("org admission: proof encode failed: {e}"),
+            })?
+        }
+        RpcCallShape::ServerStreaming | RpcCallShape::ClientStreaming | RpcCallShape::Duplex => {
+            let kind = call_shape.stream_kind().ok_or_else(|| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: format!("org admission: call shape {call_shape:?} has no streaming kind"),
+            })?;
+            let session_binding = session_binding.ok_or_else(|| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: "org admission: a streaming proof must bind the Noise handshake hash \
+                              of the exact session it rides (§1.3)"
+                    .to_string(),
+            })?;
+            let proof = OrgStreamCallProof::sign_for_stream_call(
+                &intent.caller,
+                intent.membership.clone(),
+                intent.dispatcher.clone(),
+                intent.capability_grant.clone(),
+                intent.acting_org,
+                intent.provider_owner_org,
+                intent.provider.clone(),
+                call_id,
+                intent.capability,
+                expiry,
+                digest,
+                kind,
+                session_binding,
+            );
+            proof.encode().map_err(|e| RpcError::Codec {
+                direction: CodecDirection::Encode,
+                message: format!("org admission: proof encode failed: {e}"),
+            })?
+        }
+    };
     Ok((ORG_ADMISSION_HEADER.to_string(), bytes))
+}
+
+/// Test/fixtures seam over the shared mint helper, so integration
+/// witnesses feed the provider "the new caller's bytes" — literally the
+/// caller-side mint output, not a hand-rolled proof.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn test_sign_admission_proof(
+    intent: &OrgProofIntent,
+    call_id: u64,
+    req: &RpcRequestPayload,
+    call_shape: RpcCallShape,
+    session_binding: Option<[u8; 32]>,
+) -> Result<(String, Vec<u8>), RpcError> {
+    sign_admission_proof(intent, call_id, req, call_shape, session_binding)
 }
 
 fn mint_random_call_id() -> u64 {
@@ -8326,7 +8397,8 @@ mod roster_fallback_tests {
             body: Bytes::from_static(b"ping"),
         };
         // Sign ONE proof (call_id 1) — the exact bytes are replayed later.
-        let header1 = sign_admission_proof(&intent, 1, &base).expect("sign");
+        let header1 =
+            sign_admission_proof(&intent, 1, &base, RpcCallShape::Unary, None).expect("sign");
         let make = |header: &(String, Vec<u8>), call_id: u64, channel_hash: ChannelHash| {
             let mut req = base.clone();
             req.headers.push(header.clone());
@@ -8375,7 +8447,8 @@ mod roster_fallback_tests {
             .expect("serve #2");
         let ch2 = serve2.channel_hash;
         assert!(server.deliver_rpc_inbound_for_test(ch2, make(&header1, 1, ch2))); // replay
-        let header2 = sign_admission_proof(&intent, 2, &base).expect("sign fresh");
+        let header2 =
+            sign_admission_proof(&intent, 2, &base, RpcCallShape::Unary, None).expect("sign fresh");
         assert!(server.deliver_rpc_inbound_for_test(ch2, make(&header2, 2, ch2))); // fresh
         assert!(
             wait_until_at_least(|| admits2.load(Ordering::SeqCst) as u64, 1).await,
@@ -8514,7 +8587,8 @@ mod roster_fallback_tests {
         // recorded before B is probed.
         let intent_a = intent_for("a");
         let req_a = req_for("a");
-        let header_a7 = sign_admission_proof(&intent_a, 7, &req_a).expect("sign a7");
+        let header_a7 =
+            sign_admission_proof(&intent_a, 7, &req_a, RpcCallShape::Unary, None).expect("sign a7");
         assert!(server.deliver_rpc_inbound_for_test(ch_a, make(&req_a, &header_a7, 7, ch_a)));
         assert!(
             wait_until_at_least(|| admits_a.load(Ordering::SeqCst) as u64, 1).await,
@@ -8527,8 +8601,10 @@ mod roster_fallback_tests {
         // already processed, so `admits_b == 1` proves the reuse was denied.
         let intent_b = intent_for("b");
         let req_b = req_for("b");
-        let header_b7 = sign_admission_proof(&intent_b, 7, &req_b).expect("sign b7");
-        let header_b8 = sign_admission_proof(&intent_b, 8, &req_b).expect("sign b8");
+        let header_b7 =
+            sign_admission_proof(&intent_b, 7, &req_b, RpcCallShape::Unary, None).expect("sign b7");
+        let header_b8 =
+            sign_admission_proof(&intent_b, 8, &req_b, RpcCallShape::Unary, None).expect("sign b8");
         assert!(server.deliver_rpc_inbound_for_test(ch_b, make(&req_b, &header_b7, 7, ch_b)));
         assert!(server.deliver_rpc_inbound_for_test(ch_b, make(&req_b, &header_b8, 8, ch_b)));
         assert!(
@@ -8998,14 +9074,27 @@ mod roster_fallback_tests {
         };
         // 0 → rejected: only "live" inside the provider's skew tolerance.
         assert!(matches!(
-            sign_admission_proof(&intent_with(0), 1, &base),
+            sign_admission_proof(&intent_with(0), 1, &base, RpcCallShape::Unary, None),
             Err(RpcError::Codec { .. })
         ));
         // Exactly the shared ceiling → admitted.
-        assert!(sign_admission_proof(&intent_with(MAX_ORG_PROOF_TTL_SECS), 2, &base).is_ok());
+        assert!(sign_admission_proof(
+            &intent_with(MAX_ORG_PROOF_TTL_SECS),
+            2,
+            &base,
+            RpcCallShape::Unary,
+            None
+        )
+        .is_ok());
         // One past the ceiling → rejected, NOT clamped to the ceiling.
         assert!(matches!(
-            sign_admission_proof(&intent_with(MAX_ORG_PROOF_TTL_SECS + 1), 3, &base),
+            sign_admission_proof(
+                &intent_with(MAX_ORG_PROOF_TTL_SECS + 1),
+                3,
+                &base,
+                RpcCallShape::Unary,
+                None
+            ),
             Err(RpcError::Codec { .. })
         ));
     }
@@ -9753,8 +9842,10 @@ mod roster_fallback_tests {
             body: Bytes::from_static(b"ping"),
         };
         // The exact header `call` would mint + append.
-        req.headers
-            .push(sign_admission_proof(&intent, call_id, &req).expect("sign proof"));
+        req.headers.push(
+            sign_admission_proof(&intent, call_id, &req, RpcCallShape::Unary, None)
+                .expect("sign proof"),
+        );
 
         let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
             .to_bytes()
@@ -9881,8 +9972,10 @@ mod roster_fallback_tests {
             headers: vec![],
             body: Bytes::from_static(b"ping"),
         };
-        req.headers
-            .push(sign_admission_proof(&intent, call_id, &req).expect("sign proof"));
+        req.headers.push(
+            sign_admission_proof(&intent, call_id, &req, RpcCallShape::Unary, None)
+                .expect("sign proof"),
+        );
         let mut frame = EventMeta::new(DISPATCH_RPC_REQUEST, 0, caller_origin, call_id, 0)
             .to_bytes()
             .to_vec();
@@ -11099,8 +11192,10 @@ mod roster_fallback_tests {
                 headers: vec![],
                 body: Bytes::from_static(b"ping"),
             };
-            req.headers
-                .push(sign_admission_proof(&intent, call_id, &req).expect("sign"));
+            req.headers.push(
+                sign_admission_proof(&intent, call_id, &req, RpcCallShape::Unary, None)
+                    .expect("sign"),
+            );
             let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, frame_origin, call_id, 0)
                 .to_bytes()
                 .to_vec();
