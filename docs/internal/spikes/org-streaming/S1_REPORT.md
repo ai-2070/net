@@ -75,6 +75,23 @@ source-established label and its receipt per the brief's evidence rules.
   for the node's own static X25519 key (`peer_static_x25519` is peers-only),
   so a public-API handshake witness would require a new API and still would
   not cover the routed F1 sites.
+- **2026-09-22, coordinator spot-check incident (self-inflicted, disclosed).**
+  An attempted independent reproduction of `S1Session`'s R-1.1a receipt
+  mutated `mesh.rs` **in the shared tree while `S1Core` was building it**. The
+  mutation's `replace_all` caught only the AcceptRotation arm (the Vacant
+  arm's block differs in whitespace), leaving a dangling `handshake_hash` at
+  `mesh.rs:28689` and breaking the lib-test build (E0425) for the sibling
+  lane — which correctly held per its no-touch directive and disclosed the
+  break. Response: `git restore` to committed pristine
+  (`MESH_RESTORED_PRISTINE_AT_HEAD`, `git diff --quiet` clean — the only
+  uncommitted `mesh.rs` changes were the coordinator's), and full disclosure
+  to `S1Core` as a coordinator-caused phantom, not a code defect. The
+  attempted spot-check is **invalidated** — a compile error is never a red —
+  so R-1.1a stands on the lane's raw receipt plus review round 2's
+  independent re-execution in the reviewer's isolated worktree. **Process
+  rule adopted:** coordinator production-site mutations run only in an
+  isolated worktree or between lanes, never while a sibling builds the shared
+  tree.
 - **2026-09-22, S1.1 coordinator spot-check (executed).** Receipt R-a
   reproduced independently: the prescribed widening inverse at
   `wire/src/crypto.rs:437` → red at `wire/src/session.rs:3443:9`
