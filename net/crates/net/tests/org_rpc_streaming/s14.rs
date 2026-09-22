@@ -207,7 +207,11 @@ pub(crate) fn admit_ss(
         Some(1),
     )?;
     match outcome {
-        ProtectedOpeningOutcome::Admitted { admitted, lease } => Ok((frame, admitted, lease)),
+        ProtectedOpeningOutcome::Admitted {
+            admitted,
+            lease,
+            credential_ends_ns: _,
+        } => Ok((frame, admitted, lease)),
     }
 }
 

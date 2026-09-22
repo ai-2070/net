@@ -15,6 +15,8 @@ mod frozen_85ecc77c9;
 mod s13;
 #[path = "org_rpc_streaming/s14.rs"]
 mod s14;
+#[path = "org_rpc_streaming/s15.rs"]
+mod s15;
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -2341,4 +2343,482 @@ async fn node_shutdown_retires_live_protected_streams() {
     );
     drop(fold_a);
     drop(fold_b);
+}
+
+// ============================================================================
+// Slice 1.5 — bridge wiring + routing (contract 5). These witnesses drive the
+// REAL serve bridge (`ServeHandle::inject_inbound_for_test` = the dispatcher's
+// exact hand-off), so §3 admission and the fold drive run in one bridge
+// iteration, and observe every response at REAL wire endpoints (the NC2
+// probe idiom from `nrpc_streaming_gate.rs:268-305`).
+// ============================================================================
+
+use net::adapter::net::behavior::org_grant::{GrantRights, GrantTargetScope, OrgCapabilityGrant};
+use net::adapter::net::{ChannelName, ChannelPublisher, PublishConfig};
+use std::sync::atomic::Ordering;
+
+/// A FORBIDDEN stream opening causes ZERO handler effects. A handler
+/// counter alone is not proof (the plan): observe handler entry, sink
+/// sends, grant mutations (the wire grant/terminal channels) AND the fold
+/// call-key maps (`in_flight_keys` / `sender_keys`).
+#[tokio::test]
+async fn forbidden_stream_opening_causes_zero_handler_effects() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x71u8; 32])).await;
+    let caller = s15::caller_keypair(0x24);
+    let caller = fixture::build_node_with(caller).await;
+    let bystander = fixture::build_node_with(EntityKeypair::from_bytes([0x73u8; 32])).await;
+    s15::connect_three(&caller, &server, &bystander).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s15-w1");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_streaming(
+            "svc",
+            Arc::new(s15::CountingSS {
+                entries: entries.clone(),
+                sends: sends.clone(),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped streaming");
+
+    // Wire observation channels: the caller's own reply channel carries
+    // every frame the provider emits for the call (the output-emission and
+    // grant-mutation channels); a roster subscriber (the bystander) proves
+    // nothing leaks beyond the authenticated peer.
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let (bystander_disp, bystander_seen) = s15::recorder();
+    assert!(bystander
+        .register_rpc_inbound(reply_channel.hash(), bystander_disp)
+        .is_some());
+    bystander
+        .subscribe_channel(server.node_id(), reply_channel.clone())
+        .await
+        .expect("bystander subscribes to the caller's reply channel");
+    let _pub = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
+
+    // FORBIDDEN: a structurally perfect owner-delegated proof carrying a
+    // CROSS-ORG capability grant — §1.5's mode checks forbid the SHAPE at an
+    // OwnerDelegated registration ("an unexpected one is malformed",
+    // `AdmissionDenied::UnexpectedCapabilityGrant`) with the signature and
+    // every credential valid.
+    let caller_kp = s15::caller_keypair(0x24);
+    let mut intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), "svc");
+    let cap = CapabilityAuthorityId::for_tag("nrpc:svc");
+    let (grant, _audience) = OrgCapabilityGrant::try_issue(
+        &org_b,
+        org_b.org_id(),
+        cap,
+        GrantRights::INVOKE,
+        GrantTargetScope::ExactNode(server.entity_id().clone()),
+        3600,
+    )
+    .expect("capability grant");
+    intent.capability_grant = Some(grant);
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let (frame, _req) = s14::mint_ss_opening(&intent, binding, 42, caller_origin, None, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the frame",
+    );
+
+    // Exactly ONE wire frame: the typed denial (0x0009 + the single coarse
+    // `Denied` byte). No chunk, no grant, no other terminal — the forbidden
+    // opening produced NO output emission and NO grant mutation.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the caller is told exactly one denial",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[0], 0),
+        "the single frame is AdmissionDenied + the coarse Denied byte",
+    );
+    fixture::assert_handler_stays_dark(&entries, "the forbidden opening's handler stayed dark")
+        .await;
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "the handler's SINK SENDS stayed at zero (output emission observed separately)",
+    );
+    // …and the frame count did not move during the darkness window.
+    assert_eq!(
+        caller_seen.lock().len(),
+        1,
+        "the denial is the ONLY frame — no chunks, no grants, no extra terminals",
+    );
+    s15::assert_stays_empty(
+        &bystander_seen,
+        Duration::from_millis(200),
+        "the roster subscriber for the caller's reply channel",
+    )
+    .await;
+
+    // The fold call-key maps: no in-flight token, no flow/grant semaphore
+    // (`grant mutations` at the fold), no protected record — and the §3
+    // reservation rolled back.
+    let fold = serve
+        .streaming_fold_for_test()
+        .expect("the streaming fold handle");
+    let key = (caller.node_id(), session_id, caller_origin, 42u64);
+    {
+        let fold = fold.lock();
+        assert!(
+            fold.in_flight_keys().is_empty(),
+            "in_flight_keys(): a forbidden opening creates no in-flight state",
+        );
+        assert_eq!(
+            fold.flow_control_permits(key),
+            None,
+            "no flow/grant semaphore is ever installed for a forbidden opening",
+        );
+    }
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "the §3 reservation rolled back — no registry record survives",
+    );
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
+
+    // The input-delivery maps (`sender_keys` — the CS/DX folds' `senders`)
+    // for the SAME opening shape: the CS and duplex bridges refuse it at
+    // their shape check, cleanly before any call state (their protected
+    // forms do not exist at this stage — E1.8).
+    let cs_entries = Arc::new(AtomicUsize::new(0));
+    let dx_entries = Arc::new(AtomicUsize::new(0));
+    let cs = server
+        .serve_rpc_client_stream(
+            "svc-cs",
+            Arc::new(s15::CountingCS {
+                entries: cs_entries.clone(),
+            }),
+        )
+        .expect("serve client-streaming");
+    let dx = server
+        .serve_rpc_duplex(
+            "svc-dx",
+            Arc::new(s15::CountingDX {
+                entries: dx_entries.clone(),
+            }),
+        )
+        .expect("serve duplex");
+    for (handle, svc, call_id) in [(&cs, "svc-cs", 43u64), (&dx, "svc-dx", 44u64)] {
+        let frame = s15::plain_ss_opening(svc, call_id, caller_origin, b"open");
+        assert!(
+            handle.inject_inbound_for_test(s13::inbound(
+                session_id,
+                caller.node_id(),
+                caller_origin,
+                frame
+            )),
+            "{svc}: the bridge accepted the frame",
+        );
+    }
+    fixture::assert_handler_stays_dark(&cs_entries, "the CS handler stayed dark").await;
+    fixture::assert_handler_stays_dark(&dx_entries, "the duplex handler stayed dark").await;
+    let cs_fold = cs.request_fold_for_test().expect("the CS fold handle");
+    {
+        let cs_fold = cs_fold.lock();
+        assert!(
+            cs_fold.in_flight_keys().is_empty(),
+            "CS in_flight_keys(): the forbidden opening creates no input-delivery state",
+        );
+        assert!(
+            cs_fold.sender_keys().is_empty(),
+            "CS sender_keys(): the forbidden opening creates no request sender",
+        );
+    }
+    let dx_fold = dx.duplex_fold_for_test().expect("the duplex fold handle");
+    {
+        let dx_fold = dx_fold.lock();
+        assert!(
+            dx_fold.in_flight_keys().is_empty(),
+            "duplex in_flight_keys(): the forbidden opening creates no input-delivery state",
+        );
+        assert!(
+            dx_fold.sender_keys().is_empty(),
+            "duplex sender_keys(): the forbidden opening creates no request sender",
+        );
+    }
+}
+
+/// The streaming NC2 witness that did not exist: a PROTECTED
+/// server-streaming denial is unicast ONLY to the authenticated session
+/// peer — never fanned out to the claimed origin's reply-channel roster
+/// where a same-origin bystander (or a forged-origin victim) listens. The
+/// bystander probe from `nrpc_streaming_gate.rs:268-305`, adapted to
+/// `serve_rpc_owner_scoped_streaming`.
+#[tokio::test]
+async fn streaming_denial_is_not_fanned_out_to_the_reply_roster() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x72u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x25)).await;
+    let bystander = fixture::build_node_with(EntityKeypair::from_bytes([0x74u8; 32])).await;
+    s15::connect_three(&caller, &server, &bystander).await;
+    let (_org_b, _auth, _dir) = s14::install_authority_owned(&server, "s15-w2");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_streaming(
+            "svc",
+            Arc::new(s15::CountingSS {
+                entries: entries.clone(),
+                sends: sends.clone(),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped streaming");
+
+    // The probe's shape: the bystander subscribes to the CALLER's reply
+    // channel and records anything delivered on it.
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let (bystander_disp, bystander_seen) = s15::recorder();
+    assert!(bystander
+        .register_rpc_inbound(reply_channel.hash(), bystander_disp)
+        .is_some());
+    bystander
+        .subscribe_channel(server.node_id(), reply_channel.clone())
+        .await
+        .expect("bystander subscribes to the caller's reply channel");
+    let _pub = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
+
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+
+    // Leg (a) — the probe's exact shape: a denied opening on the caller's
+    // REAL session (no org credential presented). The caller is told
+    // exactly once; the bystander sees NOTHING.
+    let frame = s15::plain_ss_opening("svc", 42, caller_origin, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the frame",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "a denied streaming caller must be told, not left hanging (§T7)",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[0], 0),
+        "the streaming denial is AdmissionDenied + the coarse Denied byte",
+    );
+    s15::assert_stays_empty(
+        &bystander_seen,
+        Duration::from_secs(1),
+        "the bystander for a denial on the caller's live session",
+    )
+    .await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        1,
+        "the denial is exactly one frame, delivered only to the authenticated peer",
+    );
+
+    // Leg (b) — the NC2 REFLECTION trigger: the same no-proof opening
+    // claiming the caller's origin but arriving from an UNROUTABLE peer
+    // (no session, no entity pin). Its denial has no authenticated
+    // destination: `DirectOnly` DROPS it — it must never be roster-fanned
+    // onto the claimed origin's reply channel where the bystander sits.
+    // (This is the reachable trigger `response_route_fallback`'s doc names:
+    // `PeerPublishOutcome::NoSession` at send time. Flipping `DirectOnly`
+    // to `RosterOnStaleDirect` at the production site makes the bystander
+    // RECEIVE the terminal — the required inverse red.)
+    let ghost = 0xDEAD_BEEF_BAAD_F00Du64;
+    let frame = s15::plain_ss_opening("svc", 43, caller_origin, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(0, ghost, caller_origin, frame)),
+        "the bridge accepted the frame",
+    );
+    s15::assert_stays_empty(
+        &bystander_seen,
+        Duration::from_secs(1),
+        "the bystander for a denial whose direct route is gone",
+    )
+    .await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        1,
+        "the unroutable denial reached NOBODY's roster (dropped, not reflected)",
+    );
+
+    // Zero handler effects on both legs.
+    fixture::assert_handler_stays_dark(&entries, "both denials kept the handler dark").await;
+    assert_eq!(sends.load(Ordering::SeqCst), 0, "zero sink sends");
+    let registry = s14::registry_of(&server);
+    assert_eq!(registry.record_count(), 0, "no registry record survives");
+}
+
+/// Q4 + the §3 step-10/11 order: a VALID proof the provider policy VETOES
+/// denies before effects (zero items, zero handler entry) — and the replay
+/// slot stays CONSUMED: the identical re-submission is refused at the replay
+/// insert (step 10, BEFORE the policy at step 11) without reaching the
+/// policy again.
+#[tokio::test]
+async fn provider_policy_veto_denies_before_effects() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x75u8; 32])).await;
+    let caller = fixture::build_node_with(s15::caller_keypair(0x26)).await;
+    let bystander = fixture::build_node_with(EntityKeypair::from_bytes([0x76u8; 32])).await;
+    s15::connect_three(&caller, &server, &bystander).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s15-w3");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let policy_calls_for_policy = Arc::clone(&policy_calls);
+    let serve = server
+        .serve_rpc_owner_scoped_streaming(
+            "svc",
+            Arc::new(s15::CountingSS {
+                entries: entries.clone(),
+                sends: sends.clone(),
+            }),
+            Arc::new(move |_| {
+                policy_calls_for_policy.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        )
+        .expect("serve owner-scoped streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let (bystander_disp, bystander_seen) = s15::recorder();
+    assert!(bystander
+        .register_rpc_inbound(reply_channel.hash(), bystander_disp)
+        .is_some());
+    bystander
+        .subscribe_channel(server.node_id(), reply_channel.clone())
+        .await
+        .expect("bystander subscribes to the caller's reply channel");
+    let _pub = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
+
+    // A VALID owner-delegated proof: every credential, the binding and the
+    // session fence pass — only the provider-local application veto (step
+    // 11, LAST) refuses it.
+    let intent = fixture::owner_delegated_intent(
+        s15::caller_keypair(0x26),
+        &org_b,
+        server.entity_id().clone(),
+        "svc",
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let (frame, _req) = s14::mint_ss_opening(&intent, binding, 42, caller_origin, None, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame.clone()
+        )),
+        "the bridge accepted the frame",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the vetoed caller is told",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[0], 0),
+        "the veto is AdmissionDenied + the coarse Denied byte",
+    );
+    assert_eq!(
+        policy_calls.load(Ordering::SeqCst),
+        1,
+        "the provider policy saw the VERIFIED proof exactly once (it runs last)",
+    );
+    fixture::assert_handler_stays_dark(&entries, "the vetoed opening's handler stayed dark").await;
+    assert_eq!(sends.load(Ordering::SeqCst), 0, "zero items");
+    s15::assert_stays_empty(
+        &bystander_seen,
+        Duration::from_millis(200),
+        "the roster subscriber for the vetoed call",
+    )
+    .await;
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "Q4: the active reservation is RELEASED on veto",
+    );
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
+
+    // Q4: "release the active reservation on veto but RETAIN the replay
+    // record" — the IDENTICAL re-submission (same call id, same signed
+    // bytes) is refused at the replay insert (step 10) BEFORE the policy
+    // (step 11): the vetoed proof is not repeatedly reusable, and the
+    // policy is never consulted again for it.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the re-submission",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 2).await,
+        "the re-submission is denied too",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[1], 0),
+        "the re-submission denial is the same coarse Denied byte",
+    );
+    assert_eq!(
+        policy_calls.load(Ordering::SeqCst),
+        1,
+        "the replay slot stayed CONSUMED — the vetoed proof never reaches the policy again \
+         (step 10's insert precedes step 11's veto)",
+    );
+    fixture::assert_handler_stays_dark(&entries, "the re-submitted opening's handler stayed dark")
+        .await;
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "zero items on re-submission"
+    );
+    assert_eq!(
+        caller_seen.lock().len(),
+        2,
+        "exactly one denial per attempt — zero items either way",
+    );
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "the re-submission's reservation rolled back as well",
+    );
 }

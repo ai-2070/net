@@ -441,6 +441,22 @@ pub struct ServeHandle {
     /// observe key/record shape deterministically.
     #[cfg(any(test, feature = "fixtures"))]
     test_streaming_fold: Option<Arc<Mutex<RpcServerStreamingFold>>>,
+    /// Test-only handle to this bridge's client-streaming fold, so a
+    /// witness can observe its `in_flight_keys` / `sender_keys`
+    /// (input-delivery) maps for a driven frame. `None` on the folds
+    /// that do not drive one.
+    #[cfg(any(test, feature = "fixtures"))]
+    test_request_fold: Option<Arc<Mutex<RpcStreamingRequestFold>>>,
+    /// Test-only handle to this bridge's duplex fold (same rationale as
+    /// `test_request_fold`).
+    #[cfg(any(test, feature = "fixtures"))]
+    test_duplex_fold: Option<Arc<Mutex<RpcDuplexFold>>>,
+    /// Test-only second handle on the bridge's exact hand-off point (the
+    /// dispatcher's bounded mpsc), so a witness can drive the REAL bridge
+    /// loop — preflight/admission/fold drive, in the bridge's own
+    /// iteration order — without a live caller transport.
+    #[cfg(any(test, feature = "fixtures"))]
+    test_inbound: Option<mpsc::Sender<RpcInboundEvent>>,
     /// Test-only handle to this bridge's authenticated response-route cache
     /// (the per-serve `origin_node_cache`), so a witness can DETERMINISTICALLY
     /// assert that a rejected frame (origin mismatch / relayed) left no cached
@@ -507,6 +523,34 @@ impl ServeHandle {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn streaming_fold_for_test(&self) -> Option<Arc<Mutex<RpcServerStreamingFold>>> {
         self.test_streaming_fold.clone()
+    }
+
+    /// Test-only: this bridge's client-streaming fold, when the
+    /// registration drives one (observe `in_flight_keys` / `sender_keys`).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn request_fold_for_test(&self) -> Option<Arc<Mutex<RpcStreamingRequestFold>>> {
+        self.test_request_fold.clone()
+    }
+
+    /// Test-only: this bridge's duplex fold, when the registration
+    /// drives one (observe `in_flight_keys` / `sender_keys`).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn duplex_fold_for_test(&self) -> Option<Arc<Mutex<RpcDuplexFold>>> {
+        self.test_duplex_fold.clone()
+    }
+
+    /// Test-only: hand one inbound event to THIS bridge's dispatcher —
+    /// the exact production hand-off (the bounded mpsc the bridge loop
+    /// drains), so preflight, admission and the fold drive run in their
+    /// production order and synchronously within one bridge iteration.
+    /// Returns `false` when the bridge's receiver is gone or at
+    /// capacity (the dispatcher's own `try_send` semantics).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn inject_inbound_for_test(&self, ev: RpcInboundEvent) -> bool {
+        self.test_inbound
+            .as_ref()
+            .map(|tx| tx.try_send(ev).is_ok())
+            .unwrap_or(false)
     }
 }
 
@@ -604,9 +648,15 @@ fn cache_authenticated_response_destination(
         // sessions sharing one entity/origin route each response to the
         // node that issued THAT call, rather than clobbering each other.
         if let Some(m) = meta {
+            // The value pairs the AEAD-verified target node with the
+            // RECEIVING session incarnation (`RpcInboundEvent.session_id`)
+            // the request arrived on — the exact `(node, session, call)`
+            // reservation R2-A names. Protected emitters carry that real
+            // `session_id` in their `RpcResponseJob` (contract 5, NC2)
+            // instead of the pre-1.5 `0`.
             cache.insert(
                 (inbound.from_node, inbound.origin_hash, m.seq_or_ts),
-                inbound.from_node,
+                (inbound.from_node, inbound.session_id),
             );
         }
     }
@@ -1086,6 +1136,16 @@ pub enum ProtectedOpeningOutcome {
         admitted: crate::adapter::net::behavior::org_admission::Admitted,
         /// The installed lease (the fold's transfer target).
         lease: crate::adapter::net::cortex::rpc::ProtectedCallLease,
+        /// §2.1's clamp inputs: every applicable validity end in unix
+        /// NANoseconds — the proof's membership / dispatcher / (optional)
+        /// capability-grant `not_after` values plus the installed provider
+        /// authority's owner-cert end ("include the provider's required
+        /// authority validity, not only caller credentials"), each a
+        /// checked seconds→nanoseconds normalization (`None` = no
+        /// additional bound). The streaming fold's
+        /// [`StreamCallLifetime`](crate::adapter::net::cortex::rpc::StreamCallLifetime)
+        /// clamps the resolved deadline with these.
+        credential_ends_ns: Vec<Option<u64>>,
     },
     /// Review-7 RED negative-control seam ONLY (its `#[cfg(test)]` caller
     /// is compiled out of production): dispatched WITHOUT the
@@ -1260,17 +1320,48 @@ pub fn admit_protected_opening(
     // §3 step 4 — INSTALL under the registry lock with the §2.3
     // requalification. The member generation comes from the decoded
     // proof's membership certificate (the floor comparison term).
-    let member_generation = match registered_shape {
+    let (member_generation, mut deadline_inputs) = match registered_shape {
         RpcCallShape::Unary => crate::adapter::net::behavior::org_call::OrgCallProof::decode(
             admission_headers.first().copied().unwrap_or(&[]),
         )
-        .map(|proof| proof.caller_membership.generation),
+        .map(|proof| {
+            (
+                proof.caller_membership.generation,
+                vec![
+                    Some(proof.caller_membership.not_after),
+                    Some(proof.dispatcher_grant.not_after),
+                    proof.capability_grant.as_ref().map(|g| g.not_after),
+                ],
+            )
+        }),
         _ => crate::adapter::net::behavior::org_call::OrgStreamCallProof::decode(
             admission_headers.first().copied().unwrap_or(&[]),
         )
-        .map(|proof| proof.caller_membership.generation),
+        .map(|proof| {
+            (
+                proof.caller_membership.generation,
+                vec![
+                    Some(proof.caller_membership.not_after),
+                    Some(proof.dispatcher_grant.not_after),
+                    proof.capability_grant.as_ref().map(|g| g.not_after),
+                ],
+            )
+        }),
     }
     .map_err(|_| AdmissionDenied::MalformedProof)?;
+    // §2.1 ("include the provider's required authority validity, not only
+    // caller credentials"): the installed owner cert's end joins the
+    // caller's credential ends as a clamp term.
+    if let Some(authority) = mesh.node_authority() {
+        deadline_inputs.push(Some(authority.config.owner_cert.not_after));
+    }
+    // §2.1 — normalize credential timestamps to the deadline's
+    // nanosecond unit with CHECKED conversion (an unrepresentable end
+    // contributes no bound rather than a wrapped one).
+    let credential_ends_ns: Vec<Option<u64>> = deadline_inputs
+        .into_iter()
+        .map(|end| end.and_then(|secs| secs.checked_mul(1_000_000_000)))
+        .collect();
     let lease = registry.install(
         &mut reservation,
         fold::VerifiedCallFacts {
@@ -1284,7 +1375,11 @@ pub fn admit_protected_opening(
         },
         clock.wall_ns,
     )?;
-    Ok(ProtectedOpeningOutcome::Admitted { admitted, lease })
+    Ok(ProtectedOpeningOutcome::Admitted {
+        admitted,
+        lease,
+        credential_ends_ns,
+    })
 }
 
 /// §3's exact-incarnation admission/retirement transaction around the
@@ -1418,7 +1513,11 @@ async fn admit_and_dispatch_protected(
         session_generation,
     );
     match opening {
-        Ok(ProtectedOpeningOutcome::Admitted { admitted, lease }) => {
+        Ok(ProtectedOpeningOutcome::Admitted {
+            admitted,
+            lease,
+            credential_ends_ns: _,
+        }) => {
             // Cache the authenticated response route (as the public accept path
             // does), then hand the fold the admitted REQUEST — the handler runs
             // with `RpcContext::org_admission = Some(admitted)` and the raw proof
@@ -1483,6 +1582,240 @@ async fn admit_and_dispatch_protected(
             // registration. That is provider-side state movement, not
             // malformed caller behavior, and charging it would let the
             // provider's own churn exhaust an honest caller's budget.
+            if !matches!(
+                denied,
+                crate::adapter::net::behavior::org_admission::AdmissionDenied::AuthorityChanged
+            ) {
+                mesh.admission_rate_limiter()
+                    .on_failure(from_node, clock.monotonic);
+            }
+            tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
+            emit_admission_denial(
+                mesh,
+                resp_tx,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                denied.coarse(),
+            );
+        }
+    }
+}
+
+/// §3's exact-incarnation admission/retirement transaction at the streaming
+/// bridge's fold-drive seam (contract 5, slice 1.5) — the streaming sibling of
+/// [`admit_and_dispatch_protected`], consuming the SAME shared helper
+/// ([`admit_protected_opening`]): reserve (before decode, before any signature
+/// work) → decode/digest → provider self-verify → `verify_org_admission` with
+/// its UNCHANGED step order (the §9.5 stability recheck, the replay insert at
+/// step 10, the provider policy at step 11) → rollback-on-`Err` (the
+/// reservation guard; the Q4 policy-veto guard slot stays consumed) → install
+/// under the registry lock with the §2.3 requalification. Admission runs
+/// SYNCHRONOUSLY in the same bridge iteration as the fold drive: an admitted
+/// opening reaches `apply_inbound_admitted` — the §3 step-5 ownership
+/// TRANSFER — before this bridge dequeues the next frame.
+///
+/// Refusals are exactly one bounded denial through the UNCHANGED
+/// [`emit_admission_denial`] (`DirectOnly`, NC2 — never fanned out to the
+/// claimed origin's roster), and the fold emits nothing on refusal: a
+/// forbidden opening has zero handler effects (no handler, no in-flight entry,
+/// no sender, no flow semaphore, no grant emission).
+#[allow(clippy::too_many_arguments)]
+async fn admit_and_dispatch_protected_stream(
+    mesh: &Arc<MeshNode>,
+    cache: &RpcOriginNodeCache,
+    inbound: &RpcInboundEvent,
+    service: &str,
+    tag: &str,
+    metrics: &ServiceMetricsAtomic,
+    reg: &crate::adapter::net::org_admission_gate::RegisteredRpcService,
+    replay: &crate::adapter::net::behavior::org_admission_replay::AdmissionReplayGuard,
+    registered_shape: crate::adapter::net::behavior::org_call::RpcCallShape,
+    fold: &Arc<Mutex<RpcServerStreamingFold>>,
+    // §7 — the bounded response drainer (the streaming impl's, §8a): denials
+    // are ENQUEUED here rather than published inline, exactly as unary.
+    resp_tx: &mpsc::Sender<RpcResponseJob>,
+) {
+    use crate::adapter::net::behavior::org_admission::CoarseAdmissionReason;
+
+    let Some(meta) = bridge_origin_check(inbound, service, tag, metrics) else {
+        return;
+    };
+    let from_node = inbound.from_node;
+    let claimed_origin = meta.origin_hash;
+    let call_id = meta.seq_or_ts;
+
+    // Only the initial REQUEST is admitted; a CANCEL (or any control frame)
+    // for an already-admitted call reaches the fold WITHOUT re-admission —
+    // the fold keys it on the authenticated session peer + call id.
+    if meta.dispatch != DISPATCH_RPC_REQUEST {
+        if let Err(e) = fold.lock().apply_inbound(inbound) {
+            tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
+        }
+        return;
+    }
+
+    // E0.3 (the unary bridge's verbatim clause): resolve the DIRECT-session
+    // caller AND bind the authenticated session entity's origin to the
+    // wire-claimed origin. Loopback, an unpinned peer, and a pinned peer
+    // whose origin != the claimed origin are all refused.
+    let caller = match mesh.resolve_direct_caller(from_node, claimed_origin) {
+        Ok(caller) => caller,
+        Err(_) => {
+            emit_admission_denial(
+                mesh,
+                resp_tx,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                CoarseAdmissionReason::Denied,
+            );
+            return;
+        }
+    };
+
+    // E1.2: the PROVIDER must itself hold the capability (`has_local_capability`
+    // — the caller's authorization is the org proof, never the announcement
+    // allow-list).
+    if !crate::adapter::net::behavior::fold::capability_bridge::has_local_capability(
+        mesh.capability_fold(),
+        mesh.node_id(),
+        tag,
+    ) {
+        emit_admission_denial(
+            mesh,
+            resp_tx,
+            service,
+            claimed_origin,
+            call_id,
+            from_node,
+            CoarseAdmissionReason::Denied,
+        );
+        return;
+    }
+
+    // §32 — length guard (the unary bridge's verbatim clause).
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET {
+        return;
+    }
+
+    // §3 (slices 1.4 + 1.5) — ONE exact-incarnation admission transaction
+    // around the shape-aware verifier. §1.3: the streaming proof binds the
+    // RECEIVING session's full Noise handshake hash — resolved here and
+    // required to equal `proof.session_binding` at step 9b (a hand-built
+    // session with `None` can never admit a protected stream).
+    let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+    let session = crate::adapter::net::cortex::rpc::SessionIdentity {
+        peer: from_node,
+        session_id: inbound.session_id,
+        establishment: mesh.peer_session_binding(from_node),
+    };
+    let session_binding = mesh.peer_session_binding(from_node);
+    // `SessionCurrentness`'s live generation is not reachable from this
+    // module (finding F-S1.4-2): `Some(0)` records "a live, non-exhausted
+    // generation", keeping the seam's `u64::MAX` refusal armed for the
+    // callers that can resolve it.
+    let session_generation = Some(0);
+    let opening = admit_protected_opening(
+        mesh,
+        inbound,
+        call_id,
+        &caller,
+        tag,
+        reg,
+        replay,
+        clock,
+        registered_shape,
+        session_binding,
+        session,
+        session_generation,
+    );
+    match opening {
+        Ok(ProtectedOpeningOutcome::Admitted {
+            admitted,
+            lease,
+            credential_ends_ns,
+        }) => {
+            // Cache the authenticated response route (as the public accept
+            // path does — the cached pair carries the record's receiving
+            // `session_id` for the protected emitters), then hand the fold
+            // the admitted REQUEST: the handler runs with
+            // `RpcStreamingContext::org_admission = Some(..)` and the raw
+            // proof header stripped (E1.6), under the §2.2 supervisor.
+            cache_authenticated_response_destination(mesh, cache, inbound);
+            // §2.1 — the admission's ONE `ClockSample` (freshness and
+            // deadline translation read the same instant), the verified
+            // credential ends (caller credentials + the provider authority
+            // validity), and the Q1 defaults (`300 s` / `3600 s`). The
+            // provider-configurable knob Q1 names is startup configuration;
+            // a per-registration lifetime policy would be API-addition
+            // territory (stated in the report, not added).
+            let lifetime = crate::adapter::net::cortex::rpc::StreamCallLifetime {
+                policy: crate::adapter::net::cortex::rpc::StreamLifetimePolicy::q1_defaults(),
+                credential_ends_ns: &credential_ends_ns,
+                clock,
+            };
+            if let Err(denied) =
+                fold.lock()
+                    .apply_inbound_admitted(inbound, admitted, &lifetime, Some(lease))
+            {
+                tracing::warn!(
+                    service = service,
+                    reason = ?denied,
+                    "rpc serve_rpc_streaming: fold refused the admitted opening",
+                );
+                // §3 step 5: the bridge owns exactly one bounded opening
+                // refusal when routable (the fold emitted nothing).
+                emit_admission_denial(
+                    mesh,
+                    resp_tx,
+                    service,
+                    claimed_origin,
+                    call_id,
+                    from_node,
+                    denied.coarse(),
+                );
+            }
+        }
+        #[cfg(test)]
+        Ok(ProtectedOpeningOutcome::EngineBypassed { admitted }) => {
+            cache_authenticated_response_destination(mesh, cache, inbound);
+            let lifetime = crate::adapter::net::cortex::rpc::StreamCallLifetime {
+                policy: crate::adapter::net::cortex::rpc::StreamLifetimePolicy::q1_defaults(),
+                credential_ends_ns: &[],
+                clock,
+            };
+            if let Err(e) = fold
+                .lock()
+                .apply_inbound_admitted(inbound, admitted, &lifetime, None)
+            {
+                tracing::warn!(reason = ?e, "rpc serve_rpc_streaming: fold apply error");
+            }
+        }
+        Err(OpeningRefusal::Throttled) => {
+            tracing::warn!(
+                service = service,
+                from_node = format!("{:#x}", from_node),
+                "nrpc: org admission throttled — peer exhausted its failed-admission budget",
+            );
+            metrics
+                .capability_denied_total
+                .fetch_add(1, Ordering::Relaxed);
+            emit_admission_denial(
+                mesh,
+                resp_tx,
+                service,
+                claimed_origin,
+                call_id,
+                from_node,
+                CoarseAdmissionReason::Unavailable,
+            );
+        }
+        Err(OpeningRefusal::Denied(denied)) => {
+            // §6 — charge the failure (the unary bridge's verbatim
+            // disposition, incl. the D7 `AuthorityChanged` exception).
             if !matches!(
                 denied,
                 crate::adapter::net::behavior::org_admission::AdmissionDenied::AuthorityChanged
@@ -2989,10 +3322,10 @@ fn build_request_grant_emitter(
 /// is a DROPPED response and a caller timeout, because those registrations
 /// are [`ResponseRouteFallback::DirectOnly`] and must never roster-fan an
 /// org-confidential body onto a permissive reply channel (see
-/// [`UnaryAdmission::response_route_fallback`]). Eviction is therefore
+/// [`ProtectedAdmission::response_route_fallback`]). Eviction is therefore
 /// never a *confidentiality* event in either mode, but it is not free for
 /// protected services — size this cap against their concurrency.
-type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64, u64), u64>>;
+type RpcOriginNodeCache = Arc<BoundedLru<(u64, u64, u64), (u64, u64)>>;
 
 /// Capacity bound for the per-`serve_rpc` caller-keyed caches
 /// ([`RpcOriginNodeCache`] and the §8b reply-channel cache). Sized for the
@@ -3581,7 +3914,7 @@ impl MeshNode {
         service: &str,
         handler: Arc<H>,
     ) -> Result<ServeHandle, ServeError> {
-        self.serve_rpc_unary_impl(service, handler, UnaryAdmission::Public)
+        self.serve_rpc_unary_impl(service, handler, ProtectedAdmission::Public)
     }
 
     /// Register a PROTECTED unary RPC handler (E1.1/E1.2). Every call must carry
@@ -3617,7 +3950,7 @@ impl MeshNode {
         self.serve_rpc_unary_impl(
             service,
             handler,
-            UnaryAdmission::Protected {
+            ProtectedAdmission::Protected {
                 admission,
                 provider_policy,
             },
@@ -3676,7 +4009,7 @@ impl MeshNode {
         self.serve_rpc_unary_impl(
             service,
             handler,
-            UnaryAdmission::SubnetExported {
+            ProtectedAdmission::SubnetExported {
                 admission,
                 export,
                 provider_policy,
@@ -3708,7 +4041,7 @@ impl MeshNode {
         self.serve_rpc_unary_impl(
             service,
             handler,
-            UnaryAdmission::ProtectedRedWitnessDisabled {
+            ProtectedAdmission::ProtectedRedWitnessDisabled {
                 admission,
                 provider_policy,
             },
@@ -3737,7 +4070,7 @@ impl MeshNode {
         self.serve_rpc_unary_impl(
             service,
             handler,
-            UnaryAdmission::OwnerScoped { provider_policy },
+            ProtectedAdmission::OwnerScoped { provider_policy },
         )
     }
 
@@ -3768,7 +4101,7 @@ impl MeshNode {
         self.serve_rpc_unary_impl(
             service,
             handler,
-            UnaryAdmission::Granted { provider_policy },
+            ProtectedAdmission::Granted { provider_policy },
         )
     }
 
@@ -3780,7 +4113,7 @@ impl MeshNode {
         self: &Arc<Self>,
         service: &str,
         handler: Arc<H>,
-        mode: UnaryAdmission,
+        mode: ProtectedAdmission,
     ) -> Result<ServeHandle, ServeError> {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
@@ -3805,7 +4138,7 @@ impl MeshNode {
 
         // Captured before `mode` is consumed below. An org-protected
         // registration NEVER roster-fans its responses — see
-        // [`UnaryAdmission::response_route_fallback`].
+        // [`ProtectedAdmission::response_route_fallback`].
         let response_fallback = mode.response_route_fallback();
 
         // Bridge: a tokio mpsc the inbound dispatcher pushes into.
@@ -3861,8 +4194,9 @@ impl MeshNode {
         let resp_tx_for_denials = resp_tx.clone();
         let emit: RpcResponseEmitter =
             Arc::new(move |from_node, session_id, caller_origin, call_id, resp| {
-                let target_hint =
-                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                let target_hint = origin_node_cache_for_emit
+                    .get((from_node, caller_origin, call_id))
+                    .map(|(node, _session)| node);
                 // Resolve the reply channel from cache (Arc bump on hit; one
                 // `format!` + `ChannelName::new` the first time we see a caller).
                 let cached = match reply_channel_cache.get(caller_origin) {
@@ -3985,10 +4319,10 @@ impl MeshNode {
         // unknown-policy fallback). Public is a trivial allow-all; protected
         // carries the org-protected mode + explicit policy.
         let reg = Arc::new(match mode {
-            UnaryAdmission::Public => {
+            ProtectedAdmission::Public => {
                 RegisteredRpcService::public(registration_id, Arc::from(service))
             }
-            UnaryAdmission::Protected {
+            ProtectedAdmission::Protected {
                 admission,
                 provider_policy,
             } => match RegisteredRpcService::protected(
@@ -4012,20 +4346,22 @@ impl MeshNode {
             // OA3-4b1: owner-scoped — internal private capability of this node's
             // own org. `OwnerScoped` visibility (encrypted-only emission) +
             // `OwnerDelegated` invocation authority.
-            UnaryAdmission::OwnerScoped { provider_policy } => RegisteredRpcService::owner_scoped(
-                registration_id,
-                Arc::from(service),
-                provider_policy,
-            ),
+            ProtectedAdmission::OwnerScoped { provider_policy } => {
+                RegisteredRpcService::owner_scoped(
+                    registration_id,
+                    Arc::from(service),
+                    provider_policy,
+                )
+            }
             // OA3-4b2: granted-audience — cross-org private capability.
             // `GrantedAudience` visibility (encrypted-only emission) +
             // `CrossOrgGranted` invocation authority.
-            UnaryAdmission::Granted { provider_policy } => {
+            ProtectedAdmission::Granted { provider_policy } => {
                 RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
             }
             // D7: subnet-exported — an org-protected registration bound to
             // one exact declared crossing, captured immutably.
-            UnaryAdmission::SubnetExported {
+            ProtectedAdmission::SubnetExported {
                 admission,
                 export,
                 provider_policy,
@@ -4048,7 +4384,7 @@ impl MeshNode {
             // ONLY the org-admission engine. Same shape validation as a normal
             // protected registration; the disabled flag is the sole difference.
             #[cfg(test)]
-            UnaryAdmission::ProtectedRedWitnessDisabled {
+            ProtectedAdmission::ProtectedRedWitnessDisabled {
                 admission,
                 provider_policy,
             } => match RegisteredRpcService::protected(
@@ -4252,6 +4588,12 @@ impl MeshNode {
             protected_streams: None,
             #[cfg(any(test, feature = "fixtures"))]
             test_streaming_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_request_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_duplex_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_inbound: None,
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4271,6 +4613,89 @@ impl MeshNode {
         self: &Arc<Self>,
         service: &str,
         handler: Arc<H>,
+    ) -> Result<ServeHandle, ServeError> {
+        self.serve_rpc_streaming_impl(
+            service,
+            handler,
+            RpcCallShape::ServerStreaming,
+            ProtectedAdmission::Public,
+        )
+    }
+
+    /// Register an OWNER-SCOPED server-streaming RPC handler (contract 5,
+    /// slice 1.5): an internal private capability of this node's OWN org whose
+    /// `nrpc:<service>` tag is never broadcast in the clear (OA3-4b1 emission
+    /// rules, shared with [`Self::serve_rpc_owner_scoped`]), whose streaming
+    /// openings run the E1.2 org-admission gate
+    /// ([`verify_org_admission`]: crate::adapter::net::behavior::org_admission::verify_org_admission)
+    /// under [`OrgAdmission::OwnerDelegated`] with the captured
+    /// `provider_policy` as the final application veto. REQUIRES an installed
+    /// node authority (else [`ServeError::ProtectedAuthorityRequired`]).
+    /// Denied openings receive [`RpcStatus::AdmissionDenied`] (0x0009 + a
+    /// coarse reason byte) routed `DirectOnly` to the authenticated session
+    /// peer (NC2); the handler runs only on an admitted opening and reads the
+    /// four-party attribution via
+    /// [`RpcContext::org_admission`](crate::adapter::net::cortex::RpcContext).
+    pub fn serve_rpc_owner_scoped_streaming<H: RpcStreamingHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_streaming_impl(
+            service,
+            handler,
+            RpcCallShape::ServerStreaming,
+            ProtectedAdmission::OwnerScoped { provider_policy },
+        )
+    }
+
+    /// Register a GRANTED-AUDIENCE server-streaming RPC handler (contract 5,
+    /// slice 1.5): a cross-org private capability emitted only as an encrypted
+    /// grant-audience `ScopedCapabilityAnnouncement` (OA3-4b2), whose openings
+    /// run the E1.2 org-admission gate under
+    /// [`OrgAdmission::CrossOrgGranted`] with the captured `provider_policy` as
+    /// the final application veto. REQUIRES an installed node authority.
+    /// Registering BEFORE a matching grant is installed is fail-closed (the
+    /// service is dispatchable but undiscoverable until a provider grant wakes
+    /// a coherent reannouncement), exactly as [`Self::serve_rpc_granted`].
+    pub fn serve_rpc_granted_streaming<H: RpcStreamingHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        self.serve_rpc_streaming_impl(
+            service,
+            handler,
+            RpcCallShape::ServerStreaming,
+            ProtectedAdmission::Granted { provider_policy },
+        )
+    }
+
+    /// Shared server-streaming serve implementation for the public
+    /// [`Self::serve_rpc_streaming`] and the protected
+    /// [`Self::serve_rpc_owner_scoped_streaming`] /
+    /// [`Self::serve_rpc_granted_streaming`] wrappers — the streaming sibling
+    /// of [`Self::serve_rpc_unary_impl`] (contract 5). `shape` is the
+    /// REGISTRATION shape §1.5's step-4 coherence checks compare against
+    /// (server-streaming today). The bridge branches on the captured
+    /// [`RegisteredRpcService`]'s admission mode: public runs the shared
+    /// `bridge_preflight` + fold drive; protected runs the E1.2 org-admission
+    /// gate (`admit_and_dispatch_protected_stream`, §3's exact-incarnation
+    /// transaction) in the same bridge iteration as the fold drive.
+    fn serve_rpc_streaming_impl<H: RpcStreamingHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        shape: RpcCallShape,
+        mode: ProtectedAdmission,
     ) -> Result<ServeHandle, ServeError> {
         let request_channel = ChannelName::new(&format!("{service}.requests"))
             .map_err(|e| ServeError::InvalidServiceName(e.to_string()))?;
@@ -4294,9 +4719,39 @@ impl MeshNode {
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
+        // Captured before `mode` is consumed below. A protected streaming
+        // registration NEVER roster-fans its responses (contract 5, NC2) —
+        // see [`ProtectedAdmission::response_route_fallback`].
+        let response_fallback = mode.response_route_fallback();
+
+        // §8a response drainer (the unary hot path's seam, extended to the
+        // protected streaming registration in slice 1.5). It carries the
+        // registration's DENIALS (via the unchanged `emit_admission_denial`)
+        // and the protected stream TERMINALS — the bounded `RpcResponseJob`
+        // drainer / route layer where `Sent` / `Refused` / `Unreachable`
+        // become separately distinguishable (§2.8; the disposition recorded
+        // on the call record stays `Queued` = "the control path took the
+        // job", per the enum's documented boundary). Chunks publish inline
+        // through the emit closure as before: the pump awaits each publish,
+        // which keeps per-call wire ordering and releases each item's §2.7
+        // byte permit at the actual publish (never at a queue handoff).
+        let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
+        // §7 — a second handle for the protected admission's DENIAL path, so
+        // a denial is enqueued on the same bounded drainer as any other
+        // response instead of being published inline (the §7 head-of-line
+        // argument applies to the streaming bridge exactly as to unary).
+        let resp_tx_for_denials = resp_tx.clone();
+        // Protected registrations hand their terminals to the drainer; public
+        // ones keep the pre-1.5 inline publish (public behavior unchanged).
+        let terminal_jobs_for_emit: Option<mpsc::Sender<RpcResponseJob>> =
+            (response_fallback == ResponseRouteFallback::DirectOnly).then(|| resp_tx.clone());
+
         // T1.2 cache: bridge populates from inbound.from_node, emit
         // closure consults to skip roster fan-out. See the unary
-        // serve_rpc above for the full rationale.
+        // serve_rpc above for the full rationale. The cached value pairs
+        // the AEAD-verified target node with the RECEIVING session
+        // incarnation — "the record's real `session_id`" (contract 5) the
+        // protected emitters carry in their `RpcResponseJob`.
         let origin_node_cache: RpcOriginNodeCache = Arc::new(BoundedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
@@ -4309,14 +4764,28 @@ impl MeshNode {
             Arc::new(move |from_node, caller_origin, call_id, resp| {
                 let mesh = Arc::clone(&mesh_for_emit);
                 let service = service_for_emit.clone();
-                let target_hint =
-                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                let cached = origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                // The record's real receiving incarnation (R2-A); `0` only
+                // when the bounded route cache already evicted the entry
+                // (the documented DirectOnly drop trigger below).
+                let receiving_session_id = cached.map(|(_node, session)| session).unwrap_or(0);
+                // NC2: a protected response names its authenticated session
+                // peer EXPLICITLY — never a cache/origin resolution — while a
+                // public response keeps the AV-5 cached hint.
+                let target_hint = match response_fallback {
+                    ResponseRouteFallback::DirectOnly => Some(from_node),
+                    ResponseRouteFallback::RosterOnStaleDirect => {
+                        cached.map(|(node, _session)| node)
+                    }
+                };
                 // AV-4 item 4: a streaming call fires many RESPONSE frames;
                 // retire its cached route only on the terminal frame (the
                 // direct hint for THIS frame was already captured above).
-                if streaming_response_is_terminal(&resp) {
+                let terminal = streaming_response_is_terminal(&resp);
+                if terminal {
                     origin_node_cache_for_emit.remove((from_node, caller_origin, call_id));
                 }
+                let terminal_jobs = terminal_jobs_for_emit.clone();
                 Box::pin(async move {
                     let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                     let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -4346,17 +4815,53 @@ impl MeshNode {
                     let reply_channel_id = ChannelId::new(reply_channel.clone());
                     let reply_channel_hash = reply_channel_id.hash();
                     let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
+                    // §2.8 / contract 5: a PROTECTED terminal rides the
+                    // bounded `RpcResponseJob` drainer (the seam that makes
+                    // `Sent` / `Refused` / `Unreachable` separately
+                    // distinguishable) with the record's REAL `session_id`
+                    // and the `DirectOnly` route. The handoff is the model's
+                    // control-path `try_send` (non-blocking — the supervisor
+                    // already recorded `Queued` and completed ownership); a
+                    // full drainer is the explicit bounded failure
+                    // disposition: the terminal is REFUSED here and the peer
+                    // observes interruption or its own deadline — never a
+                    // synthetic success.
+                    if terminal {
+                        if let Some(jobs) = terminal_jobs.as_ref() {
+                            let job = RpcResponseJob {
+                                caller_origin,
+                                call_id,
+                                session_id: receiving_session_id,
+                                target_hint,
+                                reply_channel,
+                                reply_channel_hash,
+                                reply_stream_id,
+                                payload: Bytes::from(buf),
+                            };
+                            if jobs.try_send(job).is_err() {
+                                tracing::warn!(
+                                    caller_origin = format!("{:#x}", caller_origin),
+                                    call_id,
+                                    session_id = receiving_session_id,
+                                    "rpc serve_rpc_streaming: response drainer refused the \
+                                     protected terminal; the peer observes interruption or its \
+                                     deadline (§2.8)"
+                                );
+                            }
+                            return;
+                        }
+                    }
                     if let Err(e) = publish_response_to_caller(
                         &mesh,
                         caller_origin,
                         call_id,
-                        0,
+                        receiving_session_id,
                         target_hint,
                         &reply_channel,
                         reply_channel_hash,
                         reply_stream_id,
                         Bytes::from(buf),
-                        ResponseRouteFallback::RosterOnStaleDirect,
+                        response_fallback,
                     )
                     .await
                     {
@@ -4367,6 +4872,46 @@ impl MeshNode {
                     }
                 })
             });
+
+        // The drainer task (see the §8a note above). Exits when `resp_tx`
+        // (held by the emit closure and the bridge's denial path) is gone.
+        let response_drain_mesh = Arc::clone(self);
+        let response_drain = tokio::spawn(async move {
+            while let Some(job) = resp_rx.recv().await {
+                match publish_response_to_caller(
+                    &response_drain_mesh,
+                    job.caller_origin,
+                    job.call_id,
+                    job.session_id,
+                    job.target_hint,
+                    &job.reply_channel,
+                    job.reply_channel_hash,
+                    job.reply_stream_id,
+                    job.payload,
+                    response_fallback,
+                )
+                .await
+                {
+                    // `Sent` at the transport seam (still not endpoint
+                    // receipt). `publish_response_to_caller`'s `Ok` also
+                    // covers the `Unreachable` DirectOnly drop, which the
+                    // route layer logs distinctly ("peer session gone at
+                    // send time; dropping"); a `SendFailed` is never
+                    // roster-retried and is logged here as `Refused`.
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            caller_origin = format!("{:#x}", job.caller_origin),
+                            call_id = job.call_id,
+                            session_id = job.session_id,
+                            "rpc serve_rpc_streaming: terminal publish failed at the transport \
+                             seam (not retried on the roster)"
+                        );
+                    }
+                }
+            }
+        });
 
         // Attach per-service metrics so the spawned handler tasks
         // + pump task bump server-side counters (including the
@@ -4390,6 +4935,12 @@ impl MeshNode {
         let protected_streams = fold.lock().protected_owners();
         #[cfg(any(test, feature = "fixtures"))]
         let test_streaming_fold = Arc::clone(&fold);
+        // Test-only second handle on the bridge's exact hand-off point
+        // (the dispatcher's mpsc), so a witness can drive the REAL bridge
+        // loop — admission synchronous in the same iteration as the fold
+        // drive — without a live caller transport.
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_inbound_tx = tx.clone();
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -4409,15 +4960,92 @@ impl MeshNode {
         let Some(registration_id) = self.register_rpc_inbound(channel_hash, dispatcher) else {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
-        self.rpc_local_services_arc().insert(
-            service.to_string(),
-            registration_id,
-            CapabilityVisibility::Public,
-        );
+        let visibility = mode.visibility();
+        self.rpc_local_services_arc()
+            .insert(service.to_string(), registration_id, visibility);
         self.index_self_with_local_services();
+
+        // E1.1: the immutable registration the bridge captures — the exact
+        // `serve_rpc_unary_impl` construction (one truth for admission mode +
+        // provider policy), so the streaming bridge branches on the same
+        // `RegisteredRpcService` fact the unary bridge does.
+        let reg = Arc::new(match mode {
+            ProtectedAdmission::Public => {
+                RegisteredRpcService::public(registration_id, Arc::from(service))
+            }
+            ProtectedAdmission::Protected {
+                admission,
+                provider_policy,
+            } => match RegisteredRpcService::protected(
+                registration_id,
+                Arc::from(service),
+                admission,
+                provider_policy,
+            ) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
+            ProtectedAdmission::OwnerScoped { provider_policy } => {
+                RegisteredRpcService::owner_scoped(
+                    registration_id,
+                    Arc::from(service),
+                    provider_policy,
+                )
+            }
+            ProtectedAdmission::Granted { provider_policy } => {
+                RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
+            }
+            ProtectedAdmission::SubnetExported {
+                admission,
+                export,
+                provider_policy,
+            } => match RegisteredRpcService::subnet_exported(
+                registration_id,
+                Arc::from(service),
+                admission,
+                export,
+                provider_policy,
+            ) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
+            #[cfg(test)]
+            ProtectedAdmission::ProtectedRedWitnessDisabled {
+                admission,
+                provider_policy,
+            } => match RegisteredRpcService::protected(
+                registration_id,
+                Arc::from(service),
+                admission,
+                provider_policy,
+            ) {
+                Ok(reg) => reg.with_red_witness_disabled(),
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
+        });
+        // E1.5: the NODE-owned admission replay guard, shared across every
+        // protected registration on this node (same seam as unary).
+        let admission_replay = self.rpc_admission_replay_arc();
         let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let mesh_for_bridge = Arc::clone(self);
         let service_for_bridge = service.to_string();
+        let reg_for_bridge = Arc::clone(&reg);
+        let replay_for_bridge = Arc::clone(&admission_replay);
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             while let Some(inbound) = rx.recv().await {
@@ -4429,43 +5057,72 @@ impl MeshNode {
                 if !mesh_for_bridge.rtc_admission_allows_rpc(&inbound, &service_for_bridge) {
                     continue;
                 }
-                // The shared callee preflight (see the unary bridge).
-                match bridge_preflight(
-                    &mesh_for_bridge,
-                    &origin_node_cache_for_bridge,
-                    &inbound,
-                    &service_for_bridge,
-                    &tag,
-                    &metrics_for_bridge,
-                ) {
-                    BridgePreflight::Proceed(frame) => {
-                        // AV-1 item 1: authenticated-peer-bound fold drive, on
-                        // the preflight's stripped frame (E1.6 / §8).
-                        if let Err(e) = fold.lock().apply_inbound(&frame) {
-                            tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
+                match reg_for_bridge.admission() {
+                    OrgAdmission::PublicAuthenticated => {
+                        // The shared callee preflight (see the unary bridge).
+                        match bridge_preflight(
+                            &mesh_for_bridge,
+                            &origin_node_cache_for_bridge,
+                            &inbound,
+                            &service_for_bridge,
+                            &tag,
+                            &metrics_for_bridge,
+                        ) {
+                            BridgePreflight::Proceed(frame) => {
+                                // AV-1 item 1: authenticated-peer-bound fold drive, on
+                                // the preflight's stripped frame (E1.6 / §8).
+                                if let Err(e) = fold.lock().apply_inbound(&frame) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "rpc serve_rpc_streaming: fold apply error"
+                                    );
+                                }
+                            }
+                            BridgePreflight::Drop => continue,
+                            BridgePreflight::Deny {
+                                claimed_origin,
+                                call_id,
+                                from_node,
+                            } => {
+                                metrics_for_bridge
+                                    .capability_denied_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // A non-`Ok` status closes the caller's stream
+                                // regardless of streaming headers; NC2 delivers it
+                                // only to the authenticated session peer.
+                                emit_capability_denial(
+                                    &mesh_for_bridge,
+                                    &service_for_bridge,
+                                    claimed_origin,
+                                    call_id,
+                                    from_node,
+                                )
+                                .await;
+                                continue;
+                            }
                         }
                     }
-                    BridgePreflight::Drop => continue,
-                    BridgePreflight::Deny {
-                        claimed_origin,
-                        call_id,
-                        from_node,
-                    } => {
-                        metrics_for_bridge
-                            .capability_denied_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // A non-`Ok` status closes the caller's stream
-                        // regardless of streaming headers; NC2 delivers it
-                        // only to the authenticated session peer.
-                        emit_capability_denial(
+                    OrgAdmission::OwnerDelegated | OrgAdmission::CrossOrgGranted => {
+                        // E1.2 + contract 5 (slice 1.5): the org-admission
+                        // gate at the fold-drive seam — §3's exact-incarnation
+                        // transaction runs synchronously in THIS bridge
+                        // iteration, and an admitted opening reaches
+                        // `apply_inbound_admitted` in the same iteration (the
+                        // fold drive every `Proceed` frame used to get).
+                        admit_and_dispatch_protected_stream(
                             &mesh_for_bridge,
+                            &origin_node_cache_for_bridge,
+                            &inbound,
                             &service_for_bridge,
-                            claimed_origin,
-                            call_id,
-                            from_node,
+                            &tag,
+                            &metrics_for_bridge,
+                            &reg_for_bridge,
+                            &replay_for_bridge,
+                            shape,
+                            &fold,
+                            &resp_tx_for_denials,
                         )
                         .await;
-                        continue;
                     }
                 }
             }
@@ -4475,13 +5132,17 @@ impl MeshNode {
             registration_id,
             service: service.to_string(),
             _bridge: bridge,
-            // Streaming/duplex variants still spawn per emit (§8a covers the
-            // unary hot path); no drainer.
-            _response_drain: None,
+            _response_drain: Some(response_drain),
             mesh: Arc::clone(self),
             protected_streams: Some(protected_streams),
             #[cfg(any(test, feature = "fixtures"))]
             test_streaming_fold: Some(test_streaming_fold),
+            #[cfg(any(test, feature = "fixtures"))]
+            test_request_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_duplex_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_inbound: Some(test_inbound_tx),
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4546,8 +5207,9 @@ impl MeshNode {
                 let _ = session_id;
                 let mesh = Arc::clone(&emit_resp_mesh);
                 let service = emit_resp_service.clone();
-                let target_hint =
-                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                let target_hint = origin_node_cache_for_emit
+                    .get((from_node, caller_origin, call_id))
+                    .map(|(node, _session)| node);
                 tokio::spawn(async move {
                     let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                     let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -4623,6 +5285,12 @@ impl MeshNode {
                 .with_grant_emitter(emit_grant)
                 .with_metrics(metrics_handle),
         ));
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_request_fold = Arc::clone(&fold);
+        // Test-only second handle on this bridge's dispatcher hand-off
+        // (see `ServeHandle::inject_inbound_for_test`).
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_inbound_tx = tx.clone();
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -4726,6 +5394,12 @@ impl MeshNode {
             protected_streams: None,
             #[cfg(any(test, feature = "fixtures"))]
             test_streaming_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_request_fold: Some(test_request_fold),
+            #[cfg(any(test, feature = "fixtures"))]
+            test_duplex_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_inbound: Some(test_inbound_tx),
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4912,8 +5586,9 @@ impl MeshNode {
             Arc::new(move |from_node, caller_origin, call_id, resp| {
                 let mesh = Arc::clone(&emit_resp_mesh);
                 let service = emit_resp_service.clone();
-                let target_hint =
-                    origin_node_cache_for_emit.get((from_node, caller_origin, call_id));
+                let target_hint = origin_node_cache_for_emit
+                    .get((from_node, caller_origin, call_id))
+                    .map(|(node, _session)| node);
                 // AV-4 item 4: retire the cached route only on the duplex
                 // call's terminal RESPONSE frame (the direct hint for THIS
                 // frame was already captured above).
@@ -4989,6 +5664,12 @@ impl MeshNode {
                 .with_grant_emitter(emit_grant)
                 .with_metrics(metrics_handle),
         ));
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_duplex_fold = Arc::clone(&fold);
+        // Test-only second handle on this bridge's dispatcher hand-off
+        // (see `ServeHandle::inject_inbound_for_test`).
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_inbound_tx = tx.clone();
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -5087,6 +5768,12 @@ impl MeshNode {
             protected_streams: None,
             #[cfg(any(test, feature = "fixtures"))]
             test_streaming_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_request_fold: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_duplex_fold: Some(test_duplex_fold),
+            #[cfg(any(test, feature = "fixtures"))]
+            test_inbound: Some(test_inbound_tx),
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -7056,10 +7743,13 @@ pub struct PublicOwnedProvider {
     pub owner_org: crate::adapter::net::behavior::org::OrgId,
 }
 
-/// The admission shape for a unary serve registration (E1.1), threaded from the
-/// public `serve_rpc` / protected `serve_rpc_protected` wrappers into the shared
-/// `serve_rpc_unary_impl`. Streaming / duplex have no protected form (E1.8).
-enum UnaryAdmission {
+/// The admission shape for a serve registration (E1.1), threaded from the
+/// public/protected serve wrappers into the shared [`Self::serve_rpc_unary_impl`]
+/// and [`Self::serve_rpc_streaming_impl`]. E1.8, updated for slice 1.5:
+/// server-streaming HAS a protected form (`serve_rpc_owner_scoped_streaming` /
+/// `serve_rpc_granted_streaming`, contract 5); client-streaming and duplex still
+/// have none (their protected admission is a later stage).
+enum ProtectedAdmission {
     /// Legacy v0.4 public: `PublicAuthenticated` + a trivial allow-all policy.
     Public,
     /// Org-protected: an org admission mode + the explicit provider policy.
@@ -7097,7 +7787,7 @@ enum UnaryAdmission {
     },
 }
 
-impl UnaryAdmission {
+impl ProtectedAdmission {
     /// The announcement visibility this registration mode carries — the
     /// discriminator the local-service registry stores so emission can exclude
     /// owner-scoped / granted `nrpc:` tags from the plaintext broadcast
@@ -8279,7 +8969,7 @@ mod roster_fallback_tests {
         );
         assert_eq!(
             serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 4)),
-            Some(DIRECT_NODE),
+            Some((DIRECT_NODE, 0)),
             "an accepted authenticated direct frame DOES cache its response route",
         );
 
@@ -8447,7 +9137,7 @@ mod roster_fallback_tests {
         );
         assert_eq!(
             serve.origin_node_cache.get((DIRECT_NODE, direct_origin, 3)),
-            Some(DIRECT_NODE),
+            Some((DIRECT_NODE, 0)),
             "an accepted authenticated direct frame DOES cache its response route",
         );
 
@@ -9451,7 +10141,7 @@ mod roster_fallback_tests {
         // reconnected under a new NodeId is still reachable via its signed
         // roster subscription, and a public response body is not confidential.
         assert_eq!(
-            UnaryAdmission::Public.response_route_fallback(),
+            ProtectedAdmission::Public.response_route_fallback(),
             ResponseRouteFallback::RosterOnStaleDirect,
             "public services keep the AV-5 roster fallback",
         );
@@ -9460,33 +10150,33 @@ mod roster_fallback_tests {
         for (label, mode) in [
             (
                 "Protected/OwnerDelegated",
-                UnaryAdmission::Protected {
+                ProtectedAdmission::Protected {
                     admission: OrgAdmission::OwnerDelegated,
                     provider_policy: policy.clone(),
                 },
             ),
             (
                 "Protected/CrossOrgGranted",
-                UnaryAdmission::Protected {
+                ProtectedAdmission::Protected {
                     admission: OrgAdmission::CrossOrgGranted,
                     provider_policy: policy.clone(),
                 },
             ),
             (
                 "OwnerScoped",
-                UnaryAdmission::OwnerScoped {
+                ProtectedAdmission::OwnerScoped {
                     provider_policy: policy.clone(),
                 },
             ),
             (
                 "Granted",
-                UnaryAdmission::Granted {
+                ProtectedAdmission::Granted {
                     provider_policy: policy.clone(),
                 },
             ),
             (
                 "ProtectedRedWitnessDisabled",
-                UnaryAdmission::ProtectedRedWitnessDisabled {
+                ProtectedAdmission::ProtectedRedWitnessDisabled {
                     admission: OrgAdmission::OwnerDelegated,
                     provider_policy: policy.clone(),
                 },
