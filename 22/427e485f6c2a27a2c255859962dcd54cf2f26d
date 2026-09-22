@@ -1,0 +1,14 @@
+docs/internal/spikes/org-streaming/S0_REPORT.md
+  h_64425bc75e3f3d 344-367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "22427e485f6c2a27a2c255859962dcd54cf2f26d",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
