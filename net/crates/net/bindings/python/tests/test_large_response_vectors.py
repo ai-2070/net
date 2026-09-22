@@ -14,6 +14,9 @@ def test_shared_unary_response_fragment_layout():
     response = fixture["response"]
     encoded = struct.pack("<HBI", response["status"], 0, response["body_length"])
     encoded += bytes([response["body_byte"]]) * response["body_length"]
+    prefix = bytes.fromhex(fixture["encoded_prefix_hex"])
+    assert encoded[:len(prefix)].hex() == fixture["encoded_prefix_hex"], \
+        "response byte layout drifted: encoded prefix != fixture encoded_prefix_hex"
     assert len(encoded) == fixture["encoded_response_bytes"]
     chunk = fixture["chunk_bytes"]
     assert len(fixture["fragments"]) == (len(encoded) + chunk - 1) // chunk

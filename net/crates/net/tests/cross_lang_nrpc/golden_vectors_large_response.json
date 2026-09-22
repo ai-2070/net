@@ -12,6 +12,7 @@
     "body_length": 22000
   },
   "encoded_response_bytes": 22007,
+  "encoded_prefix_hex": "000000f0550000",
   "fragments": [
     {
       "index": 0,

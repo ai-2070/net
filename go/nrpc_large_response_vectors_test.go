@@ -22,6 +22,7 @@ func TestLargeResponseWireVector(t *testing.T) {
 		Maximum      int    `json:"max_response_bytes"`
 		MaxFragments int    `json:"max_fragments"`
 		Length       int    `json:"encoded_response_bytes"`
+		Prefix       string `json:"encoded_prefix_hex"`
 		Response     struct {
 			Status uint16 `json:"status"`
 			Byte   byte   `json:"body_byte"`
@@ -44,6 +45,13 @@ func TestLargeResponseWireVector(t *testing.T) {
 	binary.LittleEndian.PutUint32(encoded[3:], uint32(fixture.Response.Length))
 	for i := 7; i < len(encoded); i++ {
 		encoded[i] = fixture.Response.Byte
+	}
+	prefix, err := hex.DecodeString(fixture.Prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefix) > len(encoded) || hex.EncodeToString(encoded[:len(prefix)]) != fixture.Prefix {
+		t.Fatal("response byte layout drifted: encoded prefix != fixture encoded_prefix_hex")
 	}
 	if len(encoded) != fixture.Length || len(fixture.Fragments) != (len(encoded)+fixture.Chunk-1)/fixture.Chunk {
 		t.Fatal("encoded length mismatch")

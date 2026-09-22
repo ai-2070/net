@@ -14,6 +14,10 @@ it('pins the shared unary response fragment layout', () => {
   encoded.writeUInt16LE(fixture.response.status, 0)
   encoded.writeUInt8(0, 2)
   encoded.writeUInt32LE(fixture.response.body_length, 3)
+  const prefix = Buffer.from(fixture.encoded_prefix_hex, 'hex')
+  expect(encoded.subarray(0, prefix.length).toString('hex'),
+    'response byte layout drifted: encoded prefix != fixture encoded_prefix_hex')
+    .toBe(fixture.encoded_prefix_hex)
   expect(encoded.length).toBe(fixture.encoded_response_bytes)
   expect(fixture.fragments.length).toBe(Math.ceil(encoded.length / fixture.chunk_bytes))
   const assembled: Buffer[] = []

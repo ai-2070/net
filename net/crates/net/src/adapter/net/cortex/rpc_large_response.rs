@@ -225,6 +225,13 @@ mod tests {
             ]),
         };
         assert_eq!(fixture["encoded_response_bytes"], response.encoded_len());
+        let encoded = response.encode();
+        let prefix = hex::decode(fixture["encoded_prefix_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            &encoded[..prefix.len()],
+            &prefix[..],
+            "response byte layout drifted: encoded prefix != fixture encoded_prefix_hex"
+        );
         let pieces = fragments(response);
         let expected = fixture["fragments"].as_array().unwrap();
         assert_eq!(pieces.len(), expected.len());

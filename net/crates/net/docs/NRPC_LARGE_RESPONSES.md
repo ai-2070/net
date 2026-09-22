@@ -61,7 +61,10 @@ replace the caller's deadline or promise remote success. Real-network/platform
 acceptance remains separate from local two-node and fault-injection witnesses.
 
 The shared fixture at `tests/cross_lang_nrpc/golden_vectors_large_response.json`
-pins the byte layout in Rust, Node/TypeScript, Python and Go tests. The latter
-three are independent layout checks, not mesh interoperability tests. Native
-bindings share the Rust implementation; these tests do not add independent
-fragment transport support to pure-language clients.
+pins the encoded response's prefix bytes as `encoded_prefix_hex` (status `u16`,
+header count `u8`, body length `u32`, little-endian), plus the fragment envelope
+values and the chunking, asserted byte-for-byte in Rust, Node/TypeScript, Python
+and Go tests. The latter three are independent layout checks, not mesh
+interoperability tests. Native bindings share the Rust implementation; these
+tests do not add independent fragment transport support to pure-language
+clients.
