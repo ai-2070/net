@@ -3551,3 +3551,170 @@ pin). Owner-pending boundary: the F-S1R-2 rider was DECLINED mid-stage
 (§4's header); no closure here requires it — the §2.8
 session-replacement terminal-drop limitation stands as documented in
 `S1_REVIEW_PACKET_2.md` §3.1.
+
+## 5. Repair round (S2_R)
+
+The S2 review's ACCEPT (`S2_REVIEW_PACKET.md` @`017e7148a`) stands; this
+round closes its three non-blocking findings per the PINNED REPAIR BRIEF
+`spikes/org-streaming/S2_R_BRIEF.md` @`4bf24aad7` — F-S2R-1 (the §2.6
+late-input disposition witness), F-S2R-2 (the post-transfer
+`ConfirmedOpening`-shape scope guard — the ONE authorized production
+change: the plan §3 step-5 mandate) and F-S2R-3 (the proof-method
+wording). Nothing else changes. The S2R code commit is `c17572f03`.
+
+### 5.2 Inverse receipts (executed, raw)
+
+Restore-equality baselines at `c17572f03` (the S2R code commit):
+
+```
+b6b161cd355fe9c350cd41e65577831103a81381272af57cf90d0d2cb1a525f3  src/adapter/net/cortex/rpc.rs
+54b533d48d151d8f663d97aa51d569e89939465460fe06b5dfedede69af5bb3c  tests/org_rpc_streaming.rs
+```
+
+Every mutation ran in the session tree at the PRODUCTION site; every
+cycle ended sha-proven byte-identical to these and with a green leg. All
+runs `--retries 0 --no-tests=fail` on the warm aliases (`cargo tf` /
+`tfl`, `net/crates/net/.cargo/config.toml`), from `net/crates/net/`.
+Thread ids are run-specific; panic numbering is pristine-at-`c17572f03`
+with each mutation's line delta stated (a compile error is never a red).
+
+**R-S2R-1a — Row 1's PAIR (a): the `handler_returned` input-`Closed`-on-return
+rule removed (`cortex/rpc.rs`, delta −2 to that file, 0 to the test file):**
+
+```diff
+         self.output = StreamCallOutput::Draining(result);
+-        if self.input == StreamCallInput::Open {
+-            self.input = StreamCallInput::Closed;
+-        }
++        // R-S2R-1a MUTATION: the input-Closed-on-return rule is removed
+         true
+```
+
+Run: `cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=early_handler_return_refuses_late_input_without_resource_exhausted)'`
+— **exit 100**. Verbatim:
+
+```
+thread 'early_handler_return_refuses_late_input_without_resource_exhausted' (153720) panicked at tests\org_rpc_streaming.rs:5379:5:
+assertion `left == right` failed: no `ResourceExhausted` is latched — a late request chunk after an early handler return is refused/discarded without replacing the handler's result
+  left: None
+ right: Some((true, None))
+```
+
+The named no-latch assertion is the red and the forbidden outcome is
+exactly the brief's: without the rule the late chunk reaches delivery,
+its failure at the dropped receiver latches `ResourceExhausted`, and the
+retirement replaces the handler's result (the forced path's single
+removal erases the record — hence `left: None`). Restore:
+`git checkout --`; sha256 `b6b161cd…` == baseline. Restored green: exit
+0, 1/1.
+
+**R-S2R-1b — Row 1's PAIR (b): the chunk-path record gate neutralized
+(`apply_request_chunk_to_senders`; delta −5 to `cortex/rpc.rs`):**
+
+```diff
+-    if let Some(record) = sender.record.as_ref() {
+-        let rec = record.lock();
+-        if rec.terminal.is_some() || rec.input != StreamCallInput::Open {
+-            return;
+-        }
+-    }
++    // R-S2R-1b MUTATION: the chunk-path record gate is neutralized
+```
+
+Same command — **exit 100**. Verbatim (the same named assertion, the
+same forbidden outcome):
+
+```
+thread 'early_handler_return_refuses_late_input_without_resource_exhausted' (194296) panicked at tests\org_rpc_streaming.rs:5379:5:
+assertion `left == right` failed: no `ResourceExhausted` is latched — a late request chunk after an early handler return is refused/discarded without replacing the handler's result
+  left: None
+ right: Some((true, None))
+```
+
+Restore + green 1/1 as above.
+
+**R-S2R-2 — Row 2's probe receipt: the guard removed (its settlement
+neutralized at `ConfirmedStreamOpening`'s Drop; `cortex/rpc.rs`, line-neutral
+— the probe's own numbering unaffected):**
+
+```diff
+     fn drop(&mut self) {
+         if self.armed {
+-            self.registration.complete();
++            // R-S2R-2 MUTATION: the guard's settlement is removed
+         }
+     }
+```
+
+Run: `cargo tfl --retries 0 -E
+'test(=adapter::net::cortex::rpc::tests::post_transfer_scope_guard_never_orphans_a_running_record)'`
+— **exit 100**. Verbatim:
+
+```
+thread 'adapter::net::cortex::rpc::tests::post_transfer_scope_guard_never_orphans_a_running_record' (161100) panicked at src\adapter\net\cortex\rpc.rs:13400:9:
+assertion `left == right` failed: a post-transfer installation failure must not orphan the Running record (the ConfirmedOpening scope-guard precedent)
+  left: 1
+ right: 0
+```
+
+The orphan: `record_count` left 1 — the reviewer's §6.5 probe outcome,
+verbatim. Under the same mutation the F-S2.2-5 witness also fails
+(belt-first, `tests/org_rpc_streaming.rs:4443:9` "the refused opening
+leaves no in-flight state" — exit 100), the whole settlement being the
+guard now. Restore + green BOTH (the probe 1/1 AND
+`opening_body_budget_refusal_completes_the_record` 1/1 — "the F-S2.2-5
+witness stays green throughout", packet §7).
+
+**R-S2.2c-v2 — R-S2.2c's fail-pre-fix property, PRESERVED (the registry's
+release-once `complete` removed from `StreamCallRegistration::complete` —
+its fix line's post-fold home; `cortex/rpc.rs`, delta −3):**
+
+```diff
+         self.protected.remove(&self.key);
+         if let Some(senders) = self.senders.as_ref() {
+             senders.lock().remove(&self.key);
+         }
+-        if let Some(call_ref) = self.registry.as_ref() {
+-            call_ref
+-                .registry
+-                .complete(&call_ref.key, call_ref.incarnation);
+-        }
++        // R-S2.2c-v2 MUTATION: the registry's release-once `complete` is removed
++        let _ = &self.registry;
+```
+
+Run: `cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=opening_body_budget_refusal_completes_the_record)'` — **exit 100**.
+Verbatim:
+
+```
+thread 'opening_body_budget_refusal_completes_the_record' (145816) panicked at tests\org_rpc_streaming.rs:4455:5:
+assertion `left == right` failed: the pre-supervisor refusal completes the record's single removal
+  left: 1
+ right: 0
+```
+
+BYTE-IDENTICAL to R-S2.2c's receipt quote (§4.2) — with the F-S2.2-5
+settlement folded into the guard the witness remains a genuine
+fail-pre-fix regression witness (its named assertion, its exact
+observation). Restore + green 1/1.
+
+**Row 3 (F-S2R-3): NO runtime inverse — documentation only.** The §4
+wording fix and this record carry no executable behavior to invert;
+stated as such per the brief.
+
+**Disclosure — one superseded cycle and one pre-push amend.** The FIRST
+R-S2R-1a attempt red at the witness's `.expect("the record is alive …")`
+belt (the latch's forced path erases the record map entry before a
+recorded terminal can be read) — a real red but NOT at the named
+assertion. The named observation was restructured to map-form
+(`owners.get(&key).map(|call| (call.is_live(), call.terminal())) ==
+Some((true, None))` — no `expect`, no green observation changed), the
+code commit was AMENDED pre-push to carry it (`d1f072bda` →
+`c17572f03`), and EVERY cycle recorded above re-ran after the
+restructure. The first attempt's output is superseded, not cited
+anywhere. Four weakenings on every recorded cycle: **NONE** — no
+precondition fixed, no window widened, no assertion relaxed, no witness
+deleted (both witnesses are additions; the restructure strengthened red
+placement only).
