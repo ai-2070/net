@@ -2959,7 +2959,11 @@ impl LeafNode {
             }
         };
         if let Some(envelope) = for_control {
-            if let Err(error) = self.inner.borrow().control.signal(envelope).await {
+            // The borrow must not span the await: a `Ref` held across
+            // a yield is re-enterable from the callbacks this future
+            // polls. The handle is a cheap `Rc` clone.
+            let control = self.inner.borrow().control.clone();
+            if let Err(error) = control.signal(envelope).await {
                 web_sys::console::warn_1(
                     &format!("net-mesh-leaf: signalling envelope dropped: {error}").into(),
                 );
