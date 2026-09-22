@@ -1,0 +1,20 @@
+net/crates/net/cli/CHANGELOG.md
+  h_64425bc75e3f3d 11-22
+net/crates/net/cli/src/commands/wrap.rs
+  h_64425bc75e3f3d 437-452
+net/crates/net/cli/src/context.rs
+  h_64425bc75e3f3d 398,445-450,469,479-516
+net/crates/net/cli/tests/exit_codes.rs
+  h_64425bc75e3f3d 118-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "807e11b74f7fb24c5167cad5f9c73322db4fc293",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
