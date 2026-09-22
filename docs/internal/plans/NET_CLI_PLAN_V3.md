@@ -960,6 +960,83 @@ rather than the bind address (identical on loopback); multi-host/NAT behavior;
 Unix execution. `invite create` opening the ledger directly is structurally
 excluded (the node holds the ledger lock) but has no dedicated inverse.
 
+#### Primary use case and reachability requirement (user, 2026-09-23)
+
+**Use case.** Anyone, with minimal configuration, connects a *local* device
+(sensor, robotic arm, camera, home appliance) to an AI agent in the cloud:
+the device side runs `invite`, the token is pasted into a chat, and the agent
+runs `join` through a tool. The **inviter is the device behind a home NAT**;
+the **joiner is the cloud agent**. The slices above assumed the reverse (a
+publicly reachable inviter), so a device behind NAT without a manual port
+forward cannot currently be joined.
+
+**Requirement (user decision):**
+
+1. **Direct first, relay fallback.** The token carries a direct path when one is
+   viable and a relay path as fallback; `join` tries direct first and falls
+   back automatically.
+2. **No manual router configuration** is required for the supported journey.
+3. **Relay availability is never a prerequisite** for an otherwise viable
+   direct connection: with no relay configured or reachable, a viable direct
+   path still enrolls and attaches.
+4. **Evidence required:** (a) prove direct operation *without application
+   forwarding* — the joiner's enrollment session and mesh session reach the
+   device's own sockets through the NAT, with no relay or forwarding node in
+   the path (and ideally none in the topology); then (b) force direct-path
+   failure and prove automatic relay fallback — the same journey completes
+   through the relay without operator action, and the evidence identifies the
+   relayed path.
+
+**Direct path (no manual router configuration).** The SDK already provides
+opportunistic UPnP-IGD / NAT-PMP / PCP port mapping (`port-mapping` feature:
+install, 30-minute renewal, revoke on shutdown) that pins the mesh's reflex
+override to the mapped external address. V3 work:
+
+- `up --enroll` requests mappings for the mesh UDP port **and** the enrollment
+  TCP port (same number when the router allows) and signs the mapped external
+  `host:port` into tokens. `--public-addr` becomes an optional override; a
+  concrete routable bind address is also used directly. With no mapping, no
+  override and no routable bind, the token carries no direct path.
+- The bundle's contact reuses the address that reached enrollment (same port
+  number for TCP and UDP), so the node need not know its address for bundles.
+- Auto-provisioning for minimal config is proposed but **not yet accepted**:
+  first `up --enroll` would create the issuer identity (or reuse the node
+  identity), the ledger and a persisted port. This changes the earlier rule that
+  `--enroll` refuses without an issuer identity and ledger store and needs an
+  explicit decision.
+
+**Relay fallback.** Design constraints discovered so far (to verify before
+freezing): a Net relay today is an ordinary mesh node that forwards routed
+handshakes/data to peers it holds sessions with, i.e. it sits inside the trust
+domain and holds its PSK; sessions through it stay end-to-end Noise-encrypted.
+Enrollment is PSK-free TCP and cannot ride that mesh path, so the fallback also
+needs a relayable enrollment path (the relay splicing the device's outbound
+registration to the joiner's inbound enrollment stream, with the NK session
+end-to-end), plus the device keeping an outbound registration with the relay.
+The token would carry direct and relay locators under the same issuer
+signature.
+
+**Open decisions before relay work:** (1) who runs the relay — project-provided
+default, user-provided (e.g. their VPS or the agent's cloud side), or both with
+a configurable default (a project-run default is a scope change from the
+no-hosted-service non-goal); (2) whether the relay may be a trust-domain member
+holding the PSK, or must be a blind forwarder that never holds it (the latter
+needs relay work below the mesh session layer); (3) acceptance of the
+auto-provisioning change above.
+
+**Evidence plan.** Loopback cannot prove either path. Extend `natsim` (Linux
+network namespaces with real nftables NAT, CI-only) with a port-mapping gateway
+(e.g. `miniupnpd` with NAT-PMP/PCP/UPnP in the device's gateway namespace):
+- direct row: device behind that gateway, agent on the WAN, **no relay node in
+  the topology**; `up --enroll` maps ports without manual configuration, the
+  agent redeems and attaches, and the evidence shows the peer address is the
+  gateway's mapped address and the route is direct;
+- fallback row: the same topology plus a relay, with mapping made to fail
+  (daemon off, or mapping refused); the journey completes through the relay and
+  the evidence shows the relayed path; and a row with the relay down but mapping
+  working, proving the relay is not a prerequisite.
+These cannot run on the Windows development machine; they gate in CI.
+
 **Next:** the device-side `net-mesh join <TOKEN|->` over `DeviceJoin` (show the
 inspection summary and require confirmation or `--yes`, persist before
 redeeming, install, then prove live attach), and `up` running as a joined node
