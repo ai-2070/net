@@ -17,7 +17,9 @@ Three entry points, proposed at the existing `@net-mesh/browser` root:
 - `joinStore(...)`: obtain a subscribed local replica from an explicit owner.
 
 A store instance is identified by **(authority identity, definition id,
-version, application key)**. The key can name a ship, room or region. There
+version, store name)**. The store name can name a ship, room or region; the
+`key` a joiner presents is its own opaque join token — two callers of one
+store carry different ones — and only the owner's policy reads it. There
 is no global world authority, global registry or mandatory anchor data hop.
 A browser can host one ship and join another store. A store owner is the
 application endpoint, not an extra relay inserted between two endpoints.
@@ -132,7 +134,7 @@ interface HostedStoreHandle<S extends object> extends StoreReader<S> {
 declare function hostStore<S extends object, A extends ActionSpec, I extends InputSpec>(options: {
   transport: MeshSession;
   definition: StoreDefinition<S, A, I>;
-  key: string;
+  store?: string;
   initialState: S;
   maxEventBytes: number;
   authorize: (request: AccessRequest<A, I>) => boolean;
@@ -147,6 +149,7 @@ declare function joinStore<S extends object, A extends ActionSpec, I extends Inp
   transport: MeshSession;
   definition: StoreDefinition<S, A, I>;
   host: string;
+  store?: string;
   key: string;
   audience: readonly string[];
   maxEventBytes: number;
@@ -271,7 +274,7 @@ const ship = defineStore<ShipState, ShipActions, ShipInputs>({
 ```typescript
 async function startShip(session: MeshSession, crew: ReadonlySet<string>, captain: string) {
   return hostStore({
-    transport: session, definition: ship, key: 'black-petrel',
+    transport: session, definition: ship, store: 'black-petrel',
     maxEventBytes: 8108,
     initialState: { ship: { heading: 0, sail: 0, shots: 0 } },
     authorize(request) {
@@ -321,11 +324,12 @@ scene or deep-merge surprise.
 async function boardShip(
   session: MeshSession,
   authority: string,
+  invite: string,
   renderHeading: (n: number | null) => void,
 ) {
   const store = joinStore({
     transport: session, definition: ship, host: authority,
-    key: 'black-petrel', audience: ['crew'], maxEventBytes: 8108,
+    store: 'black-petrel', key: invite, audience: ['crew'], maxEventBytes: 8108,
   });
 
   // `null` reaches the renderer as "no visible ship" — the selector never
@@ -401,7 +405,7 @@ waiters. No aborted promise can later resolve from a snapshot callback.
   that subscription and clears its local projection; it cannot erase data a
   previously authorized user has already copied.
 - Only the configured owner can emit accepted replica state. Another peer
-  advertising the same definition/key cannot take it over. Include owner,
+  advertising the same definition/store cannot take it over. Include owner,
   store incarnation, schema version, subscription generation and revision in
   validation. Transport session replacement does not itself authorize a new
   application owner or reset a live store's action ledger.
