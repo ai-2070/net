@@ -33,6 +33,7 @@
 //! the browser matrix.
 
 use base64::Engine as _;
+use zeroize::Zeroize;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -113,6 +114,25 @@ impl core::fmt::Debug for Credential {
     }
 }
 
+/// Zeroize the three live secrets on drop (M50): the trust domain's
+/// PSK, the whole bearer string, and the invite nonce the enrollment
+/// request echoes as proof-of-invite.
+///
+/// Same honest caveat as `IdentitySecrets`' `Drop`: `zeroize` is a
+/// volatile write and a compiler fence, so these bytes are gone from
+/// *this* allocation. On wasm that is all there is — the browser
+/// never returns linear memory to the OS, so a secret left in freed
+/// wasm memory stays readable for the page's remaining life. This
+/// says nothing about copies the JavaScript heap made before wasm
+/// ever saw the bytes.
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.psk.zeroize();
+        self.encoded.zeroize();
+        self.invite.nonce.zeroize();
+    }
+}
+
 impl Credential {
     /// Decode the `net-bootstrap:` string.
     ///
@@ -168,10 +188,10 @@ impl Credential {
         if at != bytes.len() {
             return Err(malformed("trailing bytes"));
         }
-        if !bootstrap_url.starts_with("https://") && !bootstrap_url.starts_with("http://localhost")
-        {
+        if !bootstrap_url.starts_with("https://") && !is_loopback_bootstrap_url(&bootstrap_url) {
             return Err(malformed(
-                "the bootstrap URL must be https:// (or http://localhost for a harness)",
+                "the bootstrap URL must be https:// (or http:// on a loopback host — \
+                 localhost, 127.0.0.1 or [::1] — for a harness)",
             ));
         }
         Ok(Self {
@@ -199,6 +219,80 @@ impl Credential {
         }
         Ok(())
     }
+}
+
+/// The one cleartext exception: `http://` on a **loopback host**, for
+/// a harness. The URL is parsed and the HOST matched (M15).
+///
+/// The prefix shape this replaces — `url.starts_with("http://localhost")`
+/// — named a URL prefix while claiming to name a host:
+/// `http://localhost.attacker.example/rtc` and
+/// `http://localhost@evil.example/` both passed it (in the second,
+/// `localhost` is merely userinfo), and the leaf then POSTed the
+/// whole bearer credential — PSK, invite nonce, issuer signature —
+/// over cleartext HTTP to the attacker's host. A hostname checked as
+/// a string prefix is the same defect class as a hostname prefix
+/// check in TLS validation. `Credential::decode` verifies no issuer
+/// signature (the anchor does that), so this check is the only thing
+/// between a phished credential string and a cleartext bearer POST.
+///
+/// The parsing deliberately mirrors what a browser does with the
+/// authority:
+///
+/// - the authority ends at `/`, `?`, `#` — **and `\`**, which the
+///   WHATWG URL parser every browser runs folds into `/`. Without
+///   that delimiter `http://evil\@localhost/` would read as host
+///   `localhost` here while the browser connects to `evil`;
+/// - userinfo runs to the LAST `@`, exactly as a browser splits it,
+///   so `http://localhost@evil.example/` names host `evil.example`;
+/// - the host must be `localhost`, `127.0.0.1` or `[::1]` — the
+///   literal `[::1]` only, so a bracketed spelling of another
+///   address, or an unbracketed IPv6, is refused rather than guessed
+///   at.
+///
+/// **Port policy: any well-formed port, or none.** An absent port is
+/// the scheme default (80); a named port must be decimal digits
+/// within `u16`. The port cannot widen the exception — every port on
+/// a loopback host is one trust domain, because the cleartext never
+/// leaves the machine — so `http://localhost:8080/rtc` and
+/// `http://localhost` are both admitted while
+/// `http://localhost:8080@evil.example/` is not (its host is
+/// `evil.example`).
+fn is_loopback_bootstrap_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = if host.starts_with('[') {
+        let Some(end) = host.find(']') else {
+            return false;
+        };
+        let tail = &host[end + 1..];
+        let port = if tail.is_empty() {
+            None
+        } else {
+            let Some(port) = tail.strip_prefix(':') else {
+                return false;
+            };
+            Some(port)
+        };
+        (&host[..=end], port)
+    } else {
+        match host.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host, None),
+        }
+    };
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+    }
+    matches!(host, "[::1]") || host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
 }
 
 /// What `GET /rtc/anchor` publishes.
@@ -283,15 +377,34 @@ pub fn parse_node_id(raw: &str) -> Option<NodeId> {
 }
 
 /// What `POST /rtc/offer` answers.
-#[derive(Debug, Clone)]
+///
+/// Redacting `Debug` (M48): `attempt_token` is a per-dialog bearer —
+/// the trickle socket's WebSocket subprotocol — and anyone holding it
+/// can inject `type:"candidate"` frames into this leaf's ICE. The
+/// first `map_err`/debug-log message that formats this struct must
+/// not hand it to a log line anyone with the page can read. Same
+/// treatment, same reason, as `OfferRequest`/`OfferResponse` and
+/// [`Credential`].
+#[derive(Clone)]
 pub struct OfferAccepted {
     /// The attempt token, presented as the trickle socket's
     /// WebSocket subprotocol.
     pub attempt_token: String,
-    /// The dialog this attempt runs under.
+    /// The dialog this attempt runs under. Never 0 — see
+    /// [`Self::from_json`].
     pub dialog: u64,
     /// The anchor's SDP answer.
     pub sdp: String,
+}
+
+impl core::fmt::Debug for OfferAccepted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OfferAccepted")
+            .field("attempt_token", &"<redacted>")
+            .field("dialog", &self.dialog)
+            .field("sdp", &self.sdp)
+            .finish()
+    }
 }
 
 impl OfferAccepted {
@@ -310,6 +423,17 @@ impl OfferAccepted {
             .get("dialog")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| malformed("offer response carries no dialog"))?;
+        if dialog == 0 {
+            // 0 is the driver's nothing-to-hand-back sentinel (`if
+            // dialog != 0 { end_attempt(dialog) }`). A listener that
+            // numbered its first dialog 0 would otherwise be accepted
+            // here and never ended: the trickle socket stays open and
+            // the anchor holds the attempt to its own deadline.
+            return Err(malformed(
+                "offer response carries dialog 0, which is reserved as the \
+                 no-attempt sentinel",
+            ));
+        }
         Ok(Self {
             attempt_token: field("attempt_token")?,
             dialog,
@@ -331,13 +455,19 @@ pub async fn stun_probe_failed(rtc_addr: &str) -> bool {
         // No probe means no evidence, which means no `UdpBlocked`.
         return false;
     };
-    let (connection, saw_srflx) = probe;
     let deadline = gloo_timer_sleep(STUN_PROBE_MS);
     // A rejected timer promise cannot happen; either way the
     // deadline has elapsed by the time we are here.
     let _ = deadline.await;
-    connection.close();
-    !saw_srflx.get()
+    probe.connection.close();
+    // Detach before dropping, so a queued ICE event cannot reach a
+    // dropped `Closure`. With the connection closed and the handler
+    // cleared, the probe's callback drops here with the handle that
+    // owned it — nothing is leaked and nothing outlives the probe.
+    probe.connection.set_onicecandidate(None);
+    let failed = !probe.saw_srflx.get();
+    drop(probe.on_icecandidate);
+    failed
 }
 
 /// The corrected classification.
@@ -521,8 +651,19 @@ impl EndpointKey {
 
 /// A throwaway peer connection whose only ICE server is `rtc_addr`,
 /// with a flag that flips when a `srflx` candidate appears.
+///
+/// The ICE callback is owned here — not `forget`ten — so it drops
+/// with the probe handle (L107). The caller must detach it from the
+/// connection before the handle drops.
 #[cfg(target_arch = "wasm32")]
-fn build_probe(rtc_addr: &str) -> Result<(RtcPeerConnection, std::rc::Rc<core::cell::Cell<bool>>)> {
+struct StunProbe {
+    connection: RtcPeerConnection,
+    saw_srflx: std::rc::Rc<core::cell::Cell<bool>>,
+    on_icecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     let servers = js_sys::Array::new();
     let server = js_sys::Object::new();
     let urls = js_sys::Array::new();
@@ -546,9 +687,6 @@ fn build_probe(rtc_addr: &str) -> Result<(RtcPeerConnection, std::rc::Rc<core::c
         }
     }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
     connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));
-    // The callback must outlive this function; the connection is
-    // closed by the caller, at which point both are dropped.
-    closure.forget();
 
     // A channel is what makes the browser gather at all.
     let init = RtcDataChannelInit::new();
@@ -572,7 +710,11 @@ fn build_probe(rtc_addr: &str) -> Result<(RtcPeerConnection, std::rc::Rc<core::c
             }
         }
     });
-    Ok((connection, saw_srflx))
+    Ok(StunProbe {
+        connection,
+        saw_srflx,
+        on_icecandidate: closure,
+    })
 }
 
 /// `setTimeout` as a future. No `tokio`, no `gloo` dependency — the
@@ -686,6 +828,60 @@ mod tests {
         .is_ok());
     }
 
+    /// M15: the plain-http exception matches the URL's HOST, not the
+    /// URL's first bytes. A prefix match here routes the whole bearer
+    /// over cleartext to an attacker host.
+    #[test]
+    fn the_plain_http_exception_matches_the_host_not_the_url_prefix() {
+        for admitted in [
+            "http://localhost",
+            "http://localhost:8080/rtc",
+            "http://LOCALHOST:8080/rtc",
+            "http://127.0.0.1:8080/rtc",
+            "http://[::1]:8080/rtc",
+            "https://anchor.example/rtc",
+        ] {
+            assert!(
+                Credential::decode(&credential_string(admitted, 2_000_000_000)).is_ok(),
+                "{admitted} must be admitted"
+            );
+        }
+        for refused in [
+            // The two shapes the prefix match admitted: a host that
+            // merely begins with the name, and `localhost` as
+            // userinfo of an attacker's host.
+            "http://localhost.attacker.example/rtc",
+            "http://localhost@evil.example/",
+            "http://localhost:8080@evil.example/",
+            // The WHATWG parser every browser runs folds `\` into
+            // `/`: a browser reads this as host `evil`, path
+            // `/@localhost` — a prefix check that split on `@` alone
+            // would read host `localhost` and hand it the bearer.
+            "http://evil\\@localhost/",
+            // Percent-encoding and case do not conjure a host match.
+            "http://localhost%2eevil.example/",
+            "http://LOCALHOST.evil.example/",
+            "http://127.0.0.1.evil.example/",
+            "http://[::1].evil.example/",
+            // Port policy: named ports are decimal digits within
+            // u16, and a malformed port is refused, not ignored.
+            "http://localhost:99999/",
+            "http://localhost:/",
+            "http://localhost:8080.evil.example/",
+            // Only the literal `[::1]`, not another spelling of some
+            // v6 address inside brackets.
+            "http://[0:0:0:0:0:0:0:1]:8080/",
+            // Not a URL shape this check trusts at all.
+            "http:/localhost/",
+            "HTTP://LOCALHOST:8080/",
+        ] {
+            assert!(
+                Credential::decode(&credential_string(refused, 2_000_000_000)).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
     #[test]
     fn an_expired_psk_is_refused_at_validation_not_at_parse() {
         let credential =
@@ -776,6 +972,64 @@ mod tests {
                 "a missing field must be refused, not defaulted: {missing}"
             );
         }
+    }
+
+    /// M49: dialog 0 is the driver's no-attempt sentinel and must not
+    /// be parseable — a listener numbering its first dialog 0 would
+    /// otherwise get `end_attempt` silently skipped on every cancel,
+    /// abandon and close.
+    #[test]
+    fn an_offer_response_refuses_the_reserved_dialog_zero() {
+        let body = r#"{"attempt_token":"t","dialog":0,"sdp":"x"}"#;
+        assert!(
+            OfferAccepted::from_json(body).is_err(),
+            "dialog 0 must be refused at parse, not carried into `if dialog != 0` sentinels"
+        );
+    }
+
+    /// M16/M48: a bearer secret has no business in a log line. The
+    /// redacting `Debug`s must keep every secret out — in **both**
+    /// spellings a `Debug` impl would print it (a derived `[u8; N]`
+    /// renders decimal, a redaction-by-hex regression renders hex) —
+    /// while still showing the fields nobody is hiding.
+    #[test]
+    fn a_formatted_credential_or_offer_prints_no_bearer_secret() {
+        let encoded = credential_string("https://anchor.example/rtc", 2_000_000_000);
+        let credential = Credential::decode(&encoded).expect("decodes");
+        let text = format!("{credential:?}");
+        // Positive control: it is a formatter, not a deletion.
+        for visible in ["bootstrap_url", "anchor.example", "psk_expires_at", "root"] {
+            assert!(text.contains(visible), "{visible} missing from {text}");
+        }
+        for secret in [
+            // The derived-Debug spelling, which is exactly what the
+            // old impls printed for `invite` and `psk`.
+            format!("{:?}", credential.psk),
+            format!("{:?}", credential.invite.nonce),
+            // …and the hex spelling.
+            crate::identity::hex_lower(&credential.psk),
+            crate::identity::hex_lower(&credential.invite.nonce),
+            // The whole bearer string.
+            encoded.clone(),
+        ] {
+            assert!(
+                !text.contains(secret.as_str()),
+                "the redacting Credential Debug leaked a bearer secret: {text}"
+            );
+        }
+
+        // The attempt token is a per-dialog bearer: holding it lets
+        // anyone inject `type:"candidate"` frames into this leaf's
+        // ICE.
+        let accepted =
+            OfferAccepted::from_json(r#"{"attempt_token":"deadbeef","dialog":7,"sdp":"v=0"}"#)
+                .expect("parses");
+        let text = format!("{accepted:?}");
+        assert!(
+            !text.contains("deadbeef"),
+            "the redacting OfferAccepted Debug leaked the attempt token: {text}"
+        );
+        assert!(text.contains("dialog"), "non-secret fields stay visible: {text}");
     }
 
     /// The correction, as a truth table. This is the property the
