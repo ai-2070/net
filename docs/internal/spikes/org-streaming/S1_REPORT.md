@@ -3400,3 +3400,130 @@ layers); same sha == baseline. Restored green: exit 0, 1/1.
 
 **What never ran at 4.4 (complete):** the §4.1 list unchanged (the fmt
 gate IS executed — exit 0).
+
+### 4.5 Row 5 — the CS/DX intent-refusal pins invert (S2.5) + stage close
+
+**Landed (executed):** `1dcbf2545` — `S2.5: the CS/DX mint pins invert (row
+5's replacement witness)` (1 file: `mesh_rpc.rs`) on base `89b498aa0`.
+`mesh_rpc.rs` receipt baseline for this slice:
+`59a4c6a9a7cd085136486308cfe1a6dd7aca886c936464a5f1af872adbb1aa89`.
+
+**What landed (source-established):** F-S1.6-2's inversion COMPLETES
+(delete-and-replace — F-S2.1-1's second half):
+`client_stream_and_duplex_mint_their_stream_proofs` mirrors 1.6's
+`call_streaming_mints_a_stream_proof` EXACTLY. Positive halves: the LAZY
+mints' output observed at the provider's request dispatcher — full
+strict-decoded `OrgStreamCallProof` (the strict decoder's refusal of
+truncated/trailing/unknown-kind values is the 1.2 pin's), kind =
+client-streaming (2) / duplex (3), `session_binding` = the exact live
+session's Noise handshake hash (§1.3), each minted over the FINALIZED
+initial REQUEST at the first `send` (contract 2). Kept halves (verbatim
+mirror): the capability-mismatch leg (`call_client_stream`/`call_duplex`
+against a DIFFERENT service fail LOCAL with `RpcError::Codec`) and the
+service-routed refusal leg (`call_service_streaming` rejects the intent
+at the TOP, before discovery).
+
+**Unit totals before/after by module (row 5's requirement; executed):**
+
+| Module / binary | before Stage 2 | after Stage 2 | delta |
+|---|---|---|---|
+| `behavior::org_admission::` tests | 21 | 21 | count-unchanged |
+| `adapter::net::mesh_rpc` filter (39 in `mesh_rpc.rs` + 13 in `mesh_rpc_metrics.rs`) | 52 | 53 | +1 (row 5's mirror; S2.1's pin surgery was a named in-place rewrite, 1 in / 1 out) |
+| `adapter::net::cortex::rpc` in-source tests | 91 | 91 | count-unchanged (Stage 2 adds no in-source units) |
+| `org_stream` (the Stage 0 models) | 76 | 76 | UNTOUCHED and green |
+| `org_rpc_streaming` integration binary | 30 | 41 | +11 (one named witness per dispatched2.1–2.4 property + the F-S2.2-5 regression) |
+
+**Inverse receipt R-S2.5 (executed, raw; the mirror of 1.6's R2).**
+Production site: `mesh_rpc.rs` `attach_signed_admission`'s mint call — the
+mint shape flipped to `Unary`:
+
+```diff
+-    let header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
++    let header = sign_admission_proof(intent, call_id, req, RpcCallShape::Unary, session_binding)?; // R-S2.5 MUTATION: the mint shape is Unary
+```
+
+Run (exact): `cargo tfl --retries 0
+adapter::net::mesh_rpc::roster_fallback_tests::client_stream_and_duplex_mint_their_stream_proofs`
+— **exit 100**. Verbatim:
+
+```
+thread 'adapter::net::mesh_rpc::roster_fallback_tests::client_stream_and_duplex_mint_their_stream_proofs' (189364) panicked at src\adapter\net\mesh_rpc.rs:10764:14:
+the minted bytes are a FULL streaming proof (strict decode): InvalidFormat
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The strict streaming decoder refuses the unary-format value (the 1.6 R2
+outcome shape exactly) — the witness discriminates "mints a STREAM proof"
+for both kinds. Restore: edit-reversed; sha256
+`59a4c6a9a7cd085136486308cfe1a6dd7aca886c936464a5f1af872adbb1aa89`
+== baseline. Restored green (same run): exit 0, 1/1. (Four weakenings:
+NONE.)
+
+**Stage 2 close — green at the exact head (executed, exit-captured):**
+
+- `cargo fmt -p net-mesh -- --check` → exit 0.
+- `cargo tf --retries 0 --test org_rpc_streaming` → **41 run / 41
+  passed / 0 skipped**, exit 0. Roster FROM SOURCE (41 `#[test]` /
+  `#[tokio::test]` fns in `tests/org_rpc_streaming.rs`; the four helper
+  fns carry no test attribute; the helper modules carry none) == 41
+  executed. The 30-roster of §3.2 is preserved VERBATIM (byte-untouched
+  bodies); the 11 new names:
+  `client_stream_opening_binds_first_chunk`,
+  `client_stream_aggregate_with_valid_proof`,
+  `duplex_exchange_with_valid_proof`,
+  `pre_admission_chunks_are_never_delivered`,
+  `end_cannot_cancel_another_stream_or_reopen_terminal_half`,
+  `wrong_session_grant_does_not_release_credit`,
+  `opening_body_budget_refusal_completes_the_record`,
+  `duplex_response_window_blocks_until_grant`,
+  `cross_direction_grant_is_ignored`,
+  `upload_end_then_remaining_output_completes`,
+  `retire_unblocks_both_directions`.
+  **CI floor re-pin for Main (never edited here): `org_rpc_streaming`
+  30 → 41; the full name list is §3.2's 30 verbatim + the 11 above.**
+- In-source units (exit-captured, each its own run):
+  `adapter::net::behavior::org_admission::` → **21 / 21**, exit 0;
+  `adapter::net::mesh_rpc` → **53 / 53**, exit 0 (the in-source bridge
+  trio preserved: `client_stream_bridge_rejects_before_fold_end_to_end`,
+  `duplex_bridge_rejects_before_fold_end_to_end`,
+  `reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads`,
+  plus `call_streaming_mints_a_stream_proof` with its kept halves and the
+  row-5 mirror);
+  `adapter::net::cortex::rpc` → **91 / 91**, exit 0;
+  `org_stream` → **76 / 76**, exit 0. The three-module filter = **220**
+  (was 219).
+- Preserved + public regression control, ONE invocation (10 binaries):
+  **134 run / 134 passed / 0 skipped**, exit 0 —
+  `nrpc_streaming_gate` (incl. the preserved trio
+  `client_streaming_denies_unauthorized_caller`,
+  `duplex_denies_unauthorized_caller`,
+  `denial_is_not_fanned_out_to_the_reply_roster`),
+  `integration_nrpc_streaming`, `integration_nrpc_client_streaming`,
+  `integration_nrpc_duplex`, `nrpc_registration_order`,
+  `integration_nrpc_protected`, `org_admission_wire`,
+  `subnet_org_boundary`, `org_ownership`, `cross_lang_wire`.
+- The remaining cross_lang-named controls + `org_admission_gate`, ONE
+  invocation (4 binaries): **32 / 32**, exit 0 —
+  `cross_lang_capability_fixtures`, `integration_nrpc_cross_lang`,
+  `integration_nrpc_cross_lang_streaming`, `org_admission_gate`.
+- Stage 0 models UNTOUCHED (executed: `git log 87f89c8da..HEAD --
+  org_stream_{lifecycle,registry}.rs` is EMPTY) and green (76/76).
+- Ten inverse receipt cycles (R-S2.1, R-S2.2a/b/c, R-S2.3a/b,
+  R-S2.4a/b/c-v2, R-S2.5) — each red at its own named assertion (a
+  compile error never counted as a red), each sha-proven restored, each
+  closed with a green re-run. Plus one disclosed GREEN observation
+  (F-S2.4-1's single-layer cycle — not the property's inverse).
+
+**What never ran at 4.5 (complete):** `cargo fmt --all -- --check` (the
+evidence rule is per-crate only — the per-crate gate IS executed, exit
+0); the clippy battery (4 invocations), the rustdoc lines and `cargo
+check --workspace --all-targets` (Main's stage-end list, §2.5's
+precedent); `cargo tl` / `cargo t` full suites (the named filters above
+are the executed scope); the benches; the `webrtc` feature graph;
+Linux/macOS and `#[cfg(unix)]` legs (Windows host only); the browser /
+SDK / facade surfaces (Stage 3+ by contract); CI itself (branch unpushed;
+nobody pushes but Main — the floor re-pin rides with Main's same-commit
+pin). Owner-pending boundary: the F-S1R-2 rider was DECLINED mid-stage
+(§4's header); no closure here requires it — the §2.8
+session-replacement terminal-drop limitation stands as documented in
+`S1_REVIEW_PACKET_2.md` §3.1.
