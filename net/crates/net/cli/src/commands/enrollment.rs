@@ -907,6 +907,231 @@ pub async fn run_invite(
     }
 }
 
+// ---- CLI: join ------------------------------------------------------------------
+
+/// `net-mesh join` arguments.
+#[derive(Args, Debug)]
+pub struct JoinArgs {
+    /// The join token, or `-` to read it from stdin (keeps it out of shell
+    /// history; `--yes` is then required because stdin cannot also answer the
+    /// confirmation prompt).
+    pub token: String,
+    /// State directory for this device's join and its later `net-mesh up`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Skip the interactive confirmation (scripts and agent tool use).
+    #[arg(long)]
+    pub yes: bool,
+    /// Bound on the redemption session and on the live attach check.
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = crate::humantime::parse_duration)]
+    pub wait: Duration,
+}
+
+pub(crate) const JOIN_SUBDIR: &str = "join";
+
+/// Build a mesh as `identity` with `psk` and attach it to `contact` via the
+/// routed handshake. The local socket binds loopback for a loopback contact and
+/// the wildcard otherwise (outbound only).
+pub(crate) async fn attach_mesh(
+    identity: Identity,
+    psk: &Psk,
+    contact: &MeshContact,
+    bind: Option<SocketAddr>,
+    wait: Duration,
+) -> Result<net_sdk::Mesh, String> {
+    let bind = bind.unwrap_or_else(|| {
+        if contact.addr.ip().is_loopback() {
+            SocketAddr::new(contact.addr.ip(), 0)
+        } else if contact.addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        }
+    });
+    let mesh = net_sdk::MeshBuilder::new(&bind.to_string(), psk.expose_bytes())
+        .map_err(|e| e.to_string())?
+        .identity(identity)
+        .build()
+        .await
+        .map_err(|e| e.to_string())?;
+    mesh.start();
+    let attached = tokio::time::timeout(
+        wait,
+        mesh.connect_via(
+            &contact.addr.to_string(),
+            &contact.noise_pubkey,
+            contact.node_id,
+        ),
+    )
+    .await;
+    match attached {
+        Ok(Ok(())) => Ok(mesh),
+        Ok(Err(e)) => {
+            let _ = mesh.shutdown().await;
+            Err(e.to_string())
+        }
+        Err(_) => {
+            let _ = mesh.shutdown().await;
+            Err("timed out".to_string())
+        }
+    }
+}
+
+/// Redeem a join token: confirm the issuer, persist identity and intent,
+/// redeem, verify and install the bundle, then prove live admission separately.
+pub async fn run_join(
+    args: JoinArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError, JoinStatus};
+    use net_sdk::enrollment::redeem::RedeemError;
+
+    let state = state_dir(args.state_dir, profile_name)?;
+    let from_stdin = args.token == "-";
+    let token = if from_stdin {
+        let mut buf = String::new();
+        use tokio::io::AsyncReadExt as _;
+        tokio::io::stdin()
+            .take(4096)
+            .read_to_string(&mut buf)
+            .await
+            .map_err(|e| generic(format!("read token from stdin: {e}")))?;
+        crate::secret::ScrubbedString::new(buf)
+    } else {
+        crate::secret::ScrubbedString::new(args.token)
+    };
+    let invite = MembershipInvite::decode(token.as_str())
+        .map_err(|e| invalid_args(format!("not a valid join token: {e}")))?;
+    let policy = invite.policy();
+    if now_unix() >= policy.expires_at() {
+        return Err(invalid_args(
+            "this join token has expired; ask for a new one",
+        ));
+    }
+
+    // Show what is being trusted before anything is written or sent.
+    eprintln!(
+        "Joining trust domain '{}' (id {}) run by issuer {}\n  enrollment address: {}\n  token: {}, expires at unix {}",
+        invite.trust_domain_name(),
+        invite.trust_domain(),
+        invite.issuer_fingerprint(),
+        invite.endpoint().as_str(),
+        if invite.is_bearer() {
+            "bearer (the first redeemer joins)"
+        } else {
+            "bound to one device"
+        },
+        policy.expires_at(),
+    );
+    let tty = {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal() && !from_stdin
+    };
+    let yes = args.yes;
+    tokio::task::spawn_blocking(move || {
+        super::ice::check_confirm_gate(tty, yes, || {
+            use std::io::{BufRead as _, Write as _};
+            let mut err = std::io::stderr();
+            write!(
+                err,
+                "Confirm the issuer fingerprint is the one you expect. Type YES to join: "
+            )
+            .and_then(|()| err.flush())
+            .map_err(|e| generic(format!("prompt: {e}")))?;
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| generic(format!("prompt: {e}")))?;
+            Ok(line.trim() == "YES")
+        })
+    })
+    .await
+    .map_err(|e| generic(format!("confirmation task failed: {e}")))??;
+
+    std::fs::create_dir_all(&state)
+        .map_err(|e| generic(format!("create state directory {}: {e}", state.display())))?;
+    let dir = state.join(JOIN_SUBDIR);
+    let storage_err = |e: DeviceJoinError| match e {
+        DeviceJoinError::Storage(
+            net::adapter::net::behavior::enrollment_storage::StorageError::Busy,
+        ) => generic(format!(
+            "join state {} is in use (is `net-mesh up` running with it?)",
+            dir.display()
+        )),
+        other => generic(format!("join state {}: {other}", dir.display())),
+    };
+    let mut join = if dir.exists() {
+        let join = DeviceJoin::open(&dir).map_err(storage_err)?;
+        if join.invite().digest() != invite.digest() {
+            return Err(invalid_args(format!(
+                "{} already holds a join from a different token; use another --state-dir",
+                state.display()
+            )));
+        }
+        join
+    } else {
+        DeviceJoin::begin(&dir, &invite, Identity::generate()).map_err(storage_err)?
+    };
+    let device = hex::encode(join.identity().entity_id().as_bytes());
+    let fmt = OutputFormat::resolve_oneshot(output);
+    let status = join.redeem(args.wait).await.map_err(|e| match e {
+        DeviceJoinError::Redeem(RedeemError::Refused(r)) => {
+            generic(format!("the issuer refused this join: {r}"))
+        }
+        DeviceJoinError::Redeem(
+            RedeemError::Io(_) | RedeemError::Timeout | RedeemError::Handshake,
+        ) => connection_failure(format!(
+            "could not complete enrollment with {}: {e}",
+            invite.endpoint().as_str()
+        )),
+        other => generic(format!("join failed: {other}")),
+    })?;
+    if status == JoinStatus::PendingApproval {
+        return emit_value(
+            fmt,
+            &json!({
+                "state": "pending_approval",
+                "device": device,
+                "detail": "the operator must approve this device; run the same join again afterwards",
+            }),
+        )
+        .map_err(|e| generic(format!("write result: {e}")));
+    }
+    let Some(bundle) = join.bundle() else {
+        return Err(generic("join reported installed without a bundle"));
+    };
+    let contact = bundle.contact().clone();
+    let trust_domain = bundle.psk().trust_domain().to_string();
+    // Installation is credential state; live admission is observed separately.
+    match attach_mesh(join.identity().clone(), bundle.psk(), &contact, None, args.wait).await {
+        Ok(mesh) => {
+            let _ = mesh.shutdown().await;
+        }
+        Err(e) => {
+            return Err(connection_failure(format!(
+                "credentials are installed, but the live attach to {} failed: {e}; `net-mesh up` retries it",
+                contact.addr
+            )))
+        }
+    }
+    emit_value(
+        fmt,
+        &json!({
+            "state": "joined",
+            "device": device,
+            "issuer_fingerprint": invite.issuer_fingerprint(),
+            "domain_name": invite.trust_domain_name(),
+            "trust_domain": trust_domain,
+            "contact": contact.addr.to_string(),
+            "installed": true,
+            "attached": true,
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

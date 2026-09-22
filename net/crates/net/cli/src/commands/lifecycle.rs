@@ -70,6 +70,7 @@ const MAX_CONTROL_FRAME: usize = 16 * 1024;
 const CONTROL_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_MAX_SESSIONS: usize = 8;
 const MESH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const JOIN_ATTACH_WAIT: Duration = Duration::from_secs(10);
 
 /// `net-mesh up` arguments.
 #[derive(Args, Debug)]
@@ -622,6 +623,20 @@ struct NodeReport {
     started_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enrollment: Option<super::enrollment::EnrollmentReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    joined: Option<JoinedReport>,
+}
+
+/// A node started from an installed join: whose mesh it joined and whether the
+/// live attach to that issuer's node succeeded.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct JoinedReport {
+    issuer_fingerprint: String,
+    domain_name: String,
+    contact: String,
+    attached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 struct ControlState {
@@ -831,6 +846,7 @@ pub async fn run_up(
         .or_else(|| profile.bind.clone())
         .unwrap_or_else(|| "0.0.0.0:0".to_string());
     let bind = crate::context::parse_bind_literal(&bind_raw)?;
+    let explicit_identity = args.identity.is_some();
     let identity_path = args.identity.or_else(|| profile.identity.clone());
     let fmt = OutputFormat::resolve_stream(output);
     let enroll_plan = if args.enroll {
@@ -846,6 +862,22 @@ pub async fn run_up(
     } else {
         None
     };
+    // A state directory holding a join runs as that joined device: its own
+    // enrolled identity and delivered PSK, nothing that would contradict them.
+    let join_dir = state.join(super::enrollment::JOIN_SUBDIR);
+    let has_join = join_dir.exists();
+    if has_join {
+        if args.enroll {
+            return Err(invalid_args(
+                "this node joined another operator's mesh; --enroll would hand that mesh's PSK to others",
+            ));
+        }
+        if args.psk_from.is_some() || explicit_identity {
+            return Err(invalid_args(
+                "this node runs from its installed join; --psk-from and --identity do not apply",
+            ));
+        }
+    }
     // A supplied PSK is read and validated before any filesystem effect, so a
     // refused source leaves no state behind.
     let supplied = match &source {
@@ -863,6 +895,24 @@ pub async fn run_up(
         .await
         .map_err(|e| generic(format!("node state task failed: {e}")))??;
     let lifetime_lock = hold_lifetime_lock(&dir)?;
+    let joined = if has_join {
+        use net_sdk::enrollment::device::{DeviceJoin, DeviceJoinError};
+        let join = DeviceJoin::open(&join_dir).map_err(|e| match e {
+            DeviceJoinError::Storage(StorageError::Busy) => generic(format!(
+                "join state {} is in use by another process",
+                join_dir.display()
+            )),
+            other => generic(format!("join state {}: {other}", join_dir.display())),
+        })?;
+        if join.bundle().is_none() {
+            return Err(invalid_args(
+                "the join in this state directory is still pending approval; run `net-mesh join` again once approved",
+            ));
+        }
+        Some(join)
+    } else {
+        None
+    };
     // Enrollment is provisioned (fixed port, issuer, ledger lock) before any bind.
     let port_mapping = enroll_plan.as_ref().is_some_and(|p| p.port_mapping());
     let (bind, enroll_owner) = match enroll_plan {
@@ -879,7 +929,11 @@ pub async fn run_up(
         None => (bind, None),
     };
 
-    let mut psk = match supplied {
+    let joined_psk = joined
+        .as_ref()
+        .and_then(|j| j.bundle())
+        .map(|b| *b.psk().expose_bytes());
+    let mut psk = match supplied.or(joined_psk) {
         Some(psk) => psk,
         None => match secrets.psk {
             Some(psk) => psk,
@@ -896,9 +950,10 @@ pub async fn run_up(
     };
     let psk_value = Psk::new(psk);
     let trust_domain = psk_value.trust_domain().to_string();
-    let identity = match &identity_path {
-        Some(path) => crate::context::load_operator_identity(path).await?,
-        None => Identity::from_seed(secrets.seed),
+    let identity = match (&joined, &identity_path) {
+        (Some(join), _) => join.identity().clone(),
+        (None, Some(path)) => crate::context::load_operator_identity(path).await?,
+        (None, None) => Identity::from_seed(secrets.seed),
     };
     drop(secrets);
 
@@ -915,6 +970,29 @@ pub async fn run_up(
 
     let enrollment = match enroll_owner {
         Some(owner) => Some(owner.start(&mesh, psk_value).await?),
+        None => None,
+    };
+    let joined_report = match joined.as_ref().and_then(|j| j.bundle().map(|b| (j, b))) {
+        Some((join, bundle)) => {
+            let c = bundle.contact();
+            let attached = tokio::time::timeout(
+                JOIN_ATTACH_WAIT,
+                mesh.connect_via(&c.addr.to_string(), &c.noise_pubkey, c.node_id),
+            )
+            .await;
+            let detail = match attached {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("attach failed: {e}")),
+                Err(_) => Some("attach timed out".to_string()),
+            };
+            Some(JoinedReport {
+                issuer_fingerprint: join.invite().issuer_fingerprint(),
+                domain_name: join.invite().trust_domain_name().to_string(),
+                contact: c.addr.to_string(),
+                attached: detail.is_none(),
+                detail,
+            })
+        }
         None => None,
     };
 
@@ -934,10 +1012,15 @@ pub async fn run_up(
         entity_id: hex::encode(identity.entity_id().as_bytes()),
         public_key: hex::encode(mesh.public_key()),
         bind: mesh.local_addr().to_string(),
-        psk_source: source.kind().to_string(),
+        psk_source: if joined.is_some() {
+            "joined".to_string()
+        } else {
+            source.kind().to_string()
+        },
         trust_domain,
         started_at: now_unix(),
         enrollment: enrollment.as_ref().map(|e| e.report()),
+        joined: joined_report,
     };
     let control = ControlFile {
         version: 1,
@@ -992,6 +1075,7 @@ pub async fn run_up(
     }
     let stopped = tokio::time::timeout(MESH_SHUTDOWN_TIMEOUT, mesh.shutdown()).await;
     let _ = std::fs::remove_file(&control_path);
+    drop(joined);
     drop(lifetime_lock);
     drop(storage);
     match stopped {

@@ -378,7 +378,11 @@ async fn confirm_and_commit(
 /// has cheap unit-test coverage that doesn't pay the substrate
 /// boot cost the integration test does. Returns `Err` with
 /// `ConfirmationRefused` when the gate rejects.
-fn check_confirm_gate<P>(stdin_is_tty: bool, yes_flag: bool, prompt: P) -> Result<(), CliError>
+pub(crate) fn check_confirm_gate<P>(
+    stdin_is_tty: bool,
+    yes_flag: bool,
+    prompt: P,
+) -> Result<(), CliError>
 where
     P: FnOnce() -> Result<bool, CliError>,
 {
