@@ -18,6 +18,25 @@
 //! discriminates exactly what its name and its failure message name
 //! — stream, origin and channel — and nothing else. No name, helper,
 //! assertion or message changed.
+//!
+//! One further exception, `36cb4c0d6`, which supersedes that closing
+//! claim for one probe. The body of
+//! `kyra_fragment_group_cannot_change_stream_or_provenance` (its
+//! :120-181) is no longer the reviewer's: the `PieceMeta` literals
+//! became a `meta` closure (same `subprotocol_id`/`reliable` values
+//! the paragraph above records), a `second_piece_refused` helper now
+//! drives **one dimension at a time** — stream, origin and channel
+//! refused separately, each with its own message ("one group
+//! assembled bytes across different streams/origins/channels") — and
+//! a completion control assembles one consistent group. The rewrite
+//! exists because co-varying all three dimensions let a group key
+//! binding any ONE of them stay green while the other two went
+//! unbound; the probe now discriminates strictly more than it did at
+//! landing. The probe's name is unchanged, every other probe and
+//! helper in this file is still Kyra's verbatim, and the probes
+//! remain the reviewer's otherwise — but "no name, helper, assertion
+//! or message changed" is true only up to `36cb4c0d6`, and this file
+//! is not verbatim below this header.
 use net_leaf::rpc_wire::{EventMeta, RpcStatus, DISPATCH_RPC_RESPONSE};
 use net_leaf::stream::LEAF_STREAM_DISCRIMINATOR;
 use net_leaf::{Channel, LeafEvent, LeafIdentity, LeafNode, Reliability};

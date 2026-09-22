@@ -6,6 +6,22 @@
 //! establishment-proof plumbing in `pair()`, applied exactly as
 //! `76c2ca8cc` applied it to the four earlier reviewer suites: no
 //! probe name, assertion or message is changed.
+//!
+//! One further change, `36cb4c0d6`, which supersedes that closing
+//! claim: the `registered_rpc` branch of `rpc_carrier_collision`
+//! (this file's :261-289), driven by
+//! `kyra_rpc_carrier_cannot_silently_shadow_admitted_stream`, is no
+//! longer the reviewer's body. The refusal is now pinned three ways
+//! — the typed registration conflict (`LeafError::Session(_)`, "the
+//! refusal must be the typed registration conflict"), the empty
+//! outbound queue ("the conflict refuses at registration: nothing is
+//! queued for a refused open"), and a follow-up open on an unclaimed
+//! carrier that must still admit ("the refusal must be the carrier
+//! conflict, not a corrupted stream table"), so the failure STAGE is
+//! the collision rather than a broken table. No probe name changed
+//! and every other body in this file is still Kyra's verbatim — but
+//! "no probe name, assertion or message is changed" is true only up
+//! to `36cb4c0d6`.
 use net_leaf::{LeafEvent, LeafIdentity, LeafNode, Reliability, StreamHandle};
 fn pair() -> (LeafNode, LeafNode) {
     let mut a = LeafNode::new(LeafIdentity::generate().unwrap(), 100);

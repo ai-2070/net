@@ -26,6 +26,45 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Every `.rs` file under `src/`, recursively, as `(name, source)`.
+///
+/// The name is the path relative to `src/`, `/`-separated. The walks
+/// below scan ALL of the crate's source: a flat `read_dir` of `src/`
+/// leaves every file in a subdirectory outside the guard, and a
+/// guard with holes is where the thing being guarded moves.
+fn source_tree() -> Vec<(String, String)> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", dir.display()))
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 file name")
+                .to_string();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                walk(&path, &rel, out);
+            } else if name.ends_with(".rs") {
+                out.push((
+                    rel,
+                    std::fs::read_to_string(&path).expect("module is readable"),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&manifest_dir().join("src"), "", &mut out);
+    out
+}
+
 fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -101,17 +140,27 @@ fn the_leaf_depends_on_the_wire_crate_and_nothing_native() {
     // missed: `rt = { package = "tokio" }` contains no `tokio =` at
     // all, so the quoted crate name and the dotted dependency-table
     // spellings are denied alongside the bare key (spaced and
-    // unspaced).
+    // unspaced) — and in BOTH TOML quote styles, since a literal
+    // string (`rt = { package = 'tokio' }`) matched only the
+    // double-quoted spelling.
     let code: String = manifest
         .lines()
         .map(|line| line.split('#').next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n");
-    for forbidden in ["net-mesh", "net-mesh-sdk", "tokio", "ring", "str0m", "parking_lot"] {
+    for forbidden in [
+        "net-mesh",
+        "net-mesh-sdk",
+        "tokio",
+        "ring",
+        "str0m",
+        "parking_lot",
+    ] {
         for spelling in [
             format!("{forbidden} ="),
             format!("{forbidden}="),
             format!("\"{forbidden}\""),
+            format!("'{forbidden}'"),
             format!("[dependencies.{forbidden}]"),
             format!("[dependencies.{forbidden}."),
         ] {
@@ -140,7 +189,6 @@ fn the_leaf_depends_on_the_wire_crate_and_nothing_native() {
 /// would prove nothing about being anchorless.
 #[test]
 fn web_sys_is_confined_to_the_transport_and_the_bindgen_surface() {
-    let src = manifest_dir().join("src");
     // Every entry here is a module that CANNOT be written without
     // the browser, and the list is kept at exactly that. It has
     // been tightened twice: `mock_control_plane.rs` came off it
@@ -185,17 +233,8 @@ fn web_sys_is_confined_to_the_transport_and_the_bindgen_surface() {
         "leader_session.rs",
     ];
     let mut checked = 0;
-    for entry in std::fs::read_dir(&src).expect("src is readable") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        let body = code_only(&read(&path).expect("module is readable"));
+    for (name, body) in &source_tree() {
+        let body = code_only(body);
         checked += 1;
         if allowed.contains(&name.as_str()) {
             continue;
@@ -219,18 +258,8 @@ fn web_sys_is_confined_to_the_transport_and_the_bindgen_surface() {
 /// catch the sites it happens to execute — this catches every site.
 #[test]
 fn nothing_reads_the_clock_outside_the_seam() {
-    let src = manifest_dir().join("src");
-    for entry in std::fs::read_dir(&src).expect("src is readable") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        let body = code_only(&read(&path).expect("module is readable"));
+    for (name, body) in &source_tree() {
+        let body = code_only(body);
         for forbidden in ["Instant::now()", "SystemTime::now()"] {
             assert!(
                 !body.contains(forbidden),
