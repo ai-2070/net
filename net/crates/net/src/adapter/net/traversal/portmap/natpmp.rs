@@ -84,7 +84,7 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::net::UdpSocket;
 
-use super::{PortMapperClient, PortMapping, PortMappingError, Protocol};
+use super::{MapTransport, PortMapperClient, PortMapping, PortMappingError, Protocol};
 
 /// NAT-PMP uses UDP port 5351 on the gateway (RFC 6886 §1.2).
 pub const NATPMP_PORT: u16 = 5351;
@@ -96,6 +96,8 @@ pub const NATPMP_VERSION: u8 = 0;
 pub const OP_EXTERNAL_ADDRESS: u8 = 0;
 /// Opcode 1: UDP port-map request / response.
 pub const OP_MAP_UDP: u8 = 1;
+/// Opcode 2: TCP port-map request / response (RFC 6886 §3.3).
+pub const OP_MAP_TCP: u8 = 2;
 /// Response opcode offset — the server adds 128 to the request
 /// opcode (0 → 128, 1 → 129) to distinguish response from
 /// re-transmitted request.
@@ -201,6 +203,16 @@ pub enum NatPmpRequest {
         /// "remove this mapping."
         lifetime: u32,
     },
+    /// Request a TCP port mapping. Same fields and semantics as
+    /// [`NatPmpRequest::MapUdp`], on opcode [`OP_MAP_TCP`].
+    MapTcp {
+        /// The internal (LAN-side) TCP port we're asking to map.
+        internal_port: u16,
+        /// Preferred external port; the gateway may choose another.
+        external_port_hint: u16,
+        /// Requested lease length in seconds. `0` removes the mapping.
+        lifetime: u32,
+    },
 }
 
 /// Decoded NAT-PMP response. Returned from [`decode_response`].
@@ -232,6 +244,70 @@ pub enum NatPmpResponse {
         /// requested lifetime; some gateways cap it lower.
         lifetime: u32,
     },
+    /// Response to a `MapTcp` request. Same fields as `MapUdp`.
+    MapTcp {
+        /// Result code from the router.
+        result: ResultCode,
+        /// Router's uptime in seconds.
+        epoch_seconds: u32,
+        /// Echoed internal port from the request.
+        internal_port: u16,
+        /// The external port the gateway actually allocated.
+        mapped_port: u16,
+        /// Granted lifetime in seconds.
+        lifetime: u32,
+    },
+}
+
+impl NatPmpRequest {
+    /// A map request for `transport`.
+    pub fn map(
+        transport: MapTransport,
+        internal_port: u16,
+        external_port_hint: u16,
+        lifetime: u32,
+    ) -> Self {
+        match transport {
+            MapTransport::Udp => Self::MapUdp {
+                internal_port,
+                external_port_hint,
+                lifetime,
+            },
+            MapTransport::Tcp => Self::MapTcp {
+                internal_port,
+                external_port_hint,
+                lifetime,
+            },
+        }
+    }
+}
+
+impl NatPmpResponse {
+    /// `(result, mapped_port, lifetime)` when this is a map response for
+    /// exactly `transport`; `None` for any other opcode.
+    fn map_for(&self, transport: MapTransport) -> Option<(ResultCode, u16, u32)> {
+        match (transport, self) {
+            (
+                MapTransport::Udp,
+                Self::MapUdp {
+                    result,
+                    mapped_port,
+                    lifetime,
+                    ..
+                },
+            )
+            | (
+                MapTransport::Tcp,
+                Self::MapTcp {
+                    result,
+                    mapped_port,
+                    lifetime,
+                    ..
+                },
+            ) => Some((*result, *mapped_port, *lifetime)),
+            _ => None,
+        }
+    }
 }
 
 /// Encode a request. Output length is exactly
@@ -252,6 +328,21 @@ pub fn encode_request(req: &NatPmpRequest) -> Bytes {
             let mut buf = BytesMut::with_capacity(MAP_REQUEST_LEN);
             buf.put_u8(NATPMP_VERSION);
             buf.put_u8(OP_MAP_UDP);
+            buf.put_u16(0); // reserved
+            buf.put_u16(*internal_port);
+            buf.put_u16(*external_port_hint);
+            buf.put_u32(*lifetime);
+            debug_assert_eq!(buf.len(), MAP_REQUEST_LEN);
+            buf.freeze()
+        }
+        NatPmpRequest::MapTcp {
+            internal_port,
+            external_port_hint,
+            lifetime,
+        } => {
+            let mut buf = BytesMut::with_capacity(MAP_REQUEST_LEN);
+            buf.put_u8(NATPMP_VERSION);
+            buf.put_u8(OP_MAP_TCP);
             buf.put_u16(0); // reserved
             buf.put_u16(*internal_port);
             buf.put_u16(*external_port_hint);
@@ -293,19 +384,29 @@ pub fn decode_response(data: &[u8]) -> Option<NatPmpResponse> {
                 external_ip,
             })
         }
-        OP_MAP_UDP => {
+        OP_MAP_UDP | OP_MAP_TCP => {
             if data.len() < MAP_RESPONSE_LEN {
                 return None;
             }
             let internal_port = u16::from_be_bytes([data[8], data[9]]);
             let mapped_port = u16::from_be_bytes([data[10], data[11]]);
             let lifetime = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
-            Some(NatPmpResponse::MapUdp {
-                result,
-                epoch_seconds,
-                internal_port,
-                mapped_port,
-                lifetime,
+            Some(if op == OP_MAP_UDP {
+                NatPmpResponse::MapUdp {
+                    result,
+                    epoch_seconds,
+                    internal_port,
+                    mapped_port,
+                    lifetime,
+                }
+            } else {
+                NatPmpResponse::MapTcp {
+                    result,
+                    epoch_seconds,
+                    internal_port,
+                    mapped_port,
+                    lifetime,
+                }
             })
         }
         _ => None,
@@ -342,6 +443,8 @@ pub struct NatPmpMapper {
     /// filter is the whole point of the spoof-rejection test).
     target_port: u16,
     cached_external: Mutex<Option<Ipv4Addr>>,
+    /// Transport this mapper installs, renews and removes. UDP by default.
+    transport: MapTransport,
 }
 
 impl NatPmpMapper {
@@ -352,7 +455,19 @@ impl NatPmpMapper {
             gateway,
             target_port: NATPMP_PORT,
             cached_external: Mutex::new(None),
+            transport: MapTransport::Udp,
         }
+    }
+
+    /// Bind this mapper to `transport` (UDP by default).
+    pub fn with_transport(mut self, transport: MapTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// The transport this mapper maps.
+    pub fn transport(&self) -> MapTransport {
+        self.transport
     }
 
     /// Test-only constructor that lets the caller pin the
@@ -365,6 +480,7 @@ impl NatPmpMapper {
             gateway,
             target_port,
             cached_external: Mutex::new(None),
+            transport: MapTransport::Udp,
         }
     }
 
@@ -474,21 +590,14 @@ impl PortMapperClient for NatPmpMapper {
             ));
         }
         let lifetime = ttl.as_secs().min(u32::MAX as u64) as u32;
-        let req = NatPmpRequest::MapUdp {
-            internal_port,
-            external_port_hint: internal_port,
-            lifetime,
-        };
+        let req = NatPmpRequest::map(self.transport, internal_port, internal_port, lifetime);
         let bytes = self.round_trip(encode_request(&req)).await?;
         let resp = decode_response(&bytes)
             .ok_or_else(|| PortMappingError::Transport("malformed NAT-PMP response".into()))?;
-        match resp {
-            NatPmpResponse::MapUdp {
-                result: ResultCode::Success,
-                mapped_port,
-                lifetime: granted,
-                ..
-            } => {
+        // Only a map response for this mapper's own transport counts; a UDP
+        // answer to a TCP request (or the reverse) is not our mapping.
+        match resp.map_for(self.transport) {
+            Some((ResultCode::Success, mapped_port, granted)) => {
                 // External IP comes from the cached probe response.
                 // If probe wasn't run (or returned an error that
                 // left the cache empty), we refuse to produce a
@@ -521,8 +630,8 @@ impl PortMapperClient for NatPmpMapper {
                     protocol: Protocol::NatPmp,
                 })
             }
-            NatPmpResponse::MapUdp { result, .. } => Err(result.to_error()),
-            _ => Err(PortMappingError::Transport(
+            Some((result, _, _)) => Err(result.to_error()),
+            None => Err(PortMappingError::Transport(
                 "unexpected NAT-PMP response opcode".into(),
             )),
         }
@@ -548,11 +657,7 @@ impl PortMapperClient for NatPmpMapper {
         // the failure verbatim.
         const REMOVE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
 
-        let req = NatPmpRequest::MapUdp {
-            internal_port: mapping.internal_port,
-            external_port_hint: 0,
-            lifetime: 0,
-        };
+        let req = NatPmpRequest::map(self.transport, mapping.internal_port, 0, 0);
         let sock = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
@@ -1342,6 +1447,89 @@ mod tests {
         // And the cache is still empty — a refused install
         // must not somehow populate the cache as a side effect.
         assert!(mapper.cached_external().is_none());
+        gw.abort();
+    }
+
+    fn encode_map_success_op(op: u8, internal: u16, mapped: u16, lifetime: u32) -> Vec<u8> {
+        let mut buf = encode_map_success(internal, mapped, lifetime);
+        buf[1] = op + RESPONSE_OP_OFFSET;
+        buf
+    }
+
+    #[test]
+    fn tcp_map_requests_use_opcode_2_and_decode_only_as_tcp() {
+        let tcp = encode_request(&NatPmpRequest::map(MapTransport::Tcp, 7443, 7443, 3600));
+        assert_eq!(tcp.len(), MAP_REQUEST_LEN);
+        assert_eq!(tcp[1], OP_MAP_TCP);
+        let udp = encode_request(&NatPmpRequest::map(MapTransport::Udp, 7443, 7443, 3600));
+        assert_eq!(udp[1], OP_MAP_UDP);
+        assert_eq!(tcp[2..], udp[2..], "same body, different opcode");
+
+        let resp = decode_response(&encode_map_success_op(OP_MAP_TCP, 7443, 7444, 3600)).unwrap();
+        assert!(matches!(
+            resp,
+            NatPmpResponse::MapTcp {
+                mapped_port: 7444,
+                ..
+            }
+        ));
+        assert_eq!(
+            resp.map_for(MapTransport::Tcp),
+            Some((ResultCode::Success, 7444, 3600))
+        );
+        assert_eq!(resp.map_for(MapTransport::Udp), None);
+        let udp_resp = decode_response(&encode_map_success(7443, 7443, 3600)).unwrap();
+        assert_eq!(udp_resp.map_for(MapTransport::Tcp), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_mapper_installs_a_tcp_mapping_and_refuses_a_udp_answer() {
+        let external = Ipv4Addr::new(198, 51, 100, 7);
+        let (port, gw) = spawn_mock_gateway(move |req| match req {
+            r if r == [NATPMP_VERSION, OP_EXTERNAL_ADDRESS] => {
+                Some(encode_external_success(external))
+            }
+            r if r.len() == MAP_REQUEST_LEN && r[1] == OP_MAP_TCP => {
+                let internal = u16::from_be_bytes([r[4], r[5]]);
+                Some(encode_map_success_op(OP_MAP_TCP, internal, internal, 3600))
+            }
+            _ => None,
+        })
+        .await;
+        let mapper =
+            NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, port).with_transport(MapTransport::Tcp);
+        assert_eq!(mapper.transport(), MapTransport::Tcp);
+        mapper.probe().await.unwrap();
+        let mapping = mapper
+            .install(7443, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(
+            mapping.external,
+            SocketAddr::new(IpAddr::V4(external), 7443)
+        );
+        gw.abort();
+
+        // A gateway that answers the TCP request with a UDP-opcode mapping
+        // has not mapped TCP: never report it as our mapping.
+        let (port, gw) = spawn_mock_gateway(move |req| match req {
+            r if r == [NATPMP_VERSION, OP_EXTERNAL_ADDRESS] => {
+                Some(encode_external_success(external))
+            }
+            r if r.len() == MAP_REQUEST_LEN && r[1] == OP_MAP_TCP => {
+                let internal = u16::from_be_bytes([r[4], r[5]]);
+                Some(encode_map_success(internal, internal, 3600))
+            }
+            _ => None,
+        })
+        .await;
+        let mapper =
+            NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, port).with_transport(MapTransport::Tcp);
+        mapper.probe().await.unwrap();
+        assert!(matches!(
+            mapper.install(7443, Duration::from_secs(3600)).await,
+            Err(PortMappingError::Transport(_))
+        ));
         gw.abort();
     }
 }
