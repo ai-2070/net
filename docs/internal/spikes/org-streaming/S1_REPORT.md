@@ -803,3 +803,410 @@ contract-conformant (F2 ruling, §0) — not a finding here.
   end).
 - Windows workstation only: `#[cfg(unix)]` legs never compile here; no
   Linux/macOS execution.
+
+### 2.2 Slice 1.3 — fold ownership + lifetime
+
+**Landed (executed):** `b4fc7933f` — `S1.3: own streaming folds' call keys
+and supervise protected streams` (5 files, +2648/−313) on
+`LZL0/org-streaming`; this record rides in the following `S1.3:` commit.
+Base `e0b76e05e` (S1Session's `S1.1`/`S1.1a`, the 1.2 landing + record,
+and Main's `S1 CI pin` commit). All green claims below are at
+`b4fc7933f`'s exact tree.
+
+**What landed** (source-established; executed via the runs below):
+
+- `cortex/rpc.rs` —
+  - **C5:** `StreamCallKey = (from_node, receiving_session_id, origin,
+    call_id)` unified across the server folds — `InFlightCalls`,
+    `RequestChunkSenders` and `FlowControlMap` all keyed on it (the
+    unary-only `UnaryInFlightCalls` alias folded in; one key shape now
+    that the keys match), `self.session_id` set from the event in every
+    `apply_inbound` (public + protected), and
+    `apply_request_chunk_to_senders` takes the receiving incarnation.
+    The test accessors (`in_flight_keys`/`sender_keys`/
+    `flow_control_permits`) return the four-part keys and are
+    `fixtures`-visible. A late chunk / CANCEL / GRANT from a replaced
+    session with the same `(node, origin, call_id)` misses the map.
+  - **The SS REQUEST arm's flag check** (contract 4, unified with the
+    CS/DX discipline): flags whose derived shape is not exactly
+    server-streaming (`FLAG_RPC_STREAMING_RESPONSE` set,
+    `FLAG_RPC_CLIENT_STREAMING_REQUEST` clear) are refused cleanly
+    before any call state exists.
+  - **C1/Q2 named break:** `RpcStreamingContext` gains `org_admission:
+    Option<Admitted>`, becomes `#[non_exhaustive]`, and gets the stable
+    `new()` constructor (creates NO admitted facts — admission facts
+    originate at the verifier); both fold construction sites migrated.
+  - **§2.1 production implementation** (mirror of the Stage 0
+    `org_stream_lifecycle` model, which stays `#[cfg(test)]`):
+    `StreamLifetimePolicy` (`q1_defaults()` = 300 s / 3600 s + startup
+    `validate`), `ResolvedStreamDeadline`/`StreamDeadlineBound`,
+    `StreamDeadlineRefusal`, `resolve_stream_deadline` (the default is
+    reached ONLY through the omitted-deadline arm and never caps an
+    explicit request; an explicit end over `now + max_live` is REFUSED;
+    credential validity clamps with `<=` so an exact tie reports
+    `Credential`; an already-elapsed end is refused), and
+    `StreamCallLifetime { policy, credential_ends_ns, clock }` — the
+    admission's ONE `ClockSample`, with `monotonic_deadline_for`
+    translating the resolved wall end into the record's monotonic
+    deadline.
+  - **§2.2/§2.6 production implementation:** `StreamCallRecord`
+    (independent halves; server-streaming starts `input = Ended`;
+    `handler_returned` → `Draining(result)` and never terminal;
+    `pump_exited` → `Completed(result)` vs `PumpFailed`; `retire`
+    first-writer-wins; `record_emission` one-shot), `StreamRetireSignal`
+    (register-before-recheck), `StreamProducerGate` (§2.2's
+    producer-finished gate), `ProtectedStreamCall` (the
+    supervisor-owned record handle: resolved deadline + bound,
+    terminal, emission, retire), `ProtectedStreamOwners` (the
+    registration's live protected set + `retire_all`),
+    `StreamCallRegistration` (the §2.4 single removal point),
+    `stream_terminal_payload` (reason → wire: `Completed(Ok)` → `Ok` +
+    `nrpc-streaming: end` verbatim; `Completed(Err)` → the handler's own
+    status/body; `Cancelled`/`ServeHandleDropped` → `Cancelled`;
+    `SessionReplaced` → `Cancelled`; `Timeout` → `Timeout` (C7);
+    `CredentialExpired`/`Revoked`/`AuthorityUnavailable` →
+    `AdmissionDenied` + coarse `Denied` byte `[0]`; `ResourceExhausted`
+    → `AdmissionDenied` + `[2]`; `PumpFailed` → `Internal`) — and
+    `run_stream_call_supervisor`: the persistent `biased` `select!` over
+    {retire, `sleep_until(resolved)`, handler, pump join} that STAYS in
+    the loop after the handler returns (producer finished is not
+    terminal); on retirement: first-writer `retire`, the handler's
+    cancellation token signalled, the flow semaphore `close()`d, the
+    pump `abort()`ed and **awaited**, then exactly one terminal AFTER
+    pump stop (queued-data policy: only `Completed(_)` drains — every
+    retirement discards with the aborted receiver). §2.8's
+    `StreamTerminalDisposition` is recorded exactly once on the
+    `Terminal` (see F-S1.3-5 for the `Queued` mapping at this layer).
+  - **Contract 4's fold seam** — `apply_inbound_admitted(frame,
+    admitted, lifetime) -> Result<Arc<ProtectedStreamCall>,
+    AdmissionDenied>` on the SS fold (at 1.3 the `lease` slot carries
+    the `Admitted` facts; the registry's exact-incarnation lease is
+    1.4's and the four-part key does the session fencing). Refusals are
+    typed and land BEFORE any handler effect — non-REQUEST →
+    `NotOrgProtected`; a live-key duplicate → `ActiveCallOwned` before
+    the payload decode (§3); malformed → `MalformedProof`; flags ≠ SS →
+    `ShapeMismatch`; the §2.1 deadline refusal → `DeadlineExceedsPolicy`
+    (the specific `StreamDeadlineRefusal` is logged). The fold emits
+    NOTHING on refusal — the bridge owes exactly one bounded denial
+    through the unchanged `emit_admission_denial` (slice 1.5). On
+    admission the raw `net-org-admission` header is stripped (E1.6) and
+    the supervisor is spawned owning handler, pump, semaphore and the
+    one terminal.
+  - **Public SS keeps Q3's shared repairs only:** a NONZERO
+    `deadline_ns` is enforced (C6) with a `Timeout` terminal (C7) via
+    the same bounded call shape; `deadline_ns == 0` still means no
+    deadline; the documented CANCEL-wins terminal override is preserved;
+    no retire signal / producer gate (public lossy-sink and
+    outstanding-call behavior unchanged). The CANCEL arm routes
+    PROTECTED records through the supervisor (single removal point — a
+    re-REQUEST cannot race the retired call's cleanup) and keeps the
+    legacy map cleanup for public. The GRANT arm classifies through the
+    record (§2.6: credit survives `Draining`, stops at terminal/`Ended`).
+  - **CS/DX shared repairs:** C5 keying + `session_id` (the DX fold gains
+    the field; the CS fold's dormant field is now set) and C7 — a
+    deadline expiry's terminal is typed `Timeout` (see F-S1.3-1: the
+    pre-change source emitted `Cancelled`, not `Internal`, because the
+    deadline's own `cancel_for_deadline.cancel()` fed the CANCEL-wins
+    override). A caller CANCEL that fired before the deadline still
+    wins (the preserved public semantic).
+  - In-source fold witnesses migrated mechanically (four-part key
+    literals; the AV-1 server-streaming fixture's opening flags brought
+    under the new flag check); names and assertions unchanged.
+- `mesh_rpc.rs` — `ServeHandle` gains `protected_streams:
+  Option<ProtectedStreamOwners>`: the SS registration wires
+  `fold.protected_owners()` and `Drop` retires exactly those records
+  with `ServeHandleDropped` (whose emitted terminal is `Cancelled`, per
+  §2.2's queued-data table). Q3/C9 scope: protected-only on handle drop
+  — PUBLIC calls are not in the set and keep their documented
+  outstanding-call behavior; §2.2's async-cleanup boundary is honored
+  (signals fire synchronously; cleanup completes after). CS/DX handles
+  carry `None` (their protected admitted seam is Stage 2's — no org
+  admission on CS/DX at 1.3). A `fixtures`-gated
+  `ServeHandle::streaming_fold_for_test()` (the `origin_node_cache`
+  precedent) lets a witness drive the fold's admitted seam through a
+  REAL registration.
+- `guards/org_api_probe` (the C1 named break, landed in the SAME commit
+  as the break): `pin_rpc_streaming_context`'s struct literal STOPPED
+  compiling and is UPDATED — not deleted — to the stable constructor
+  plus a no-admitted-facts assertion; the report line adjusted ("3
+  ledger surfaces constructed … org_admission.is_none()=true" — probe
+  run output captured). Every other pin untouched. Executed green:
+  `cargo metadata --locked`, `cargo check --locked` (its own lockfile),
+  and a probe run.
+
+**Witnesses and counts (executed):** `cargo t --retries 0 --test
+org_rpc_streaming` → `Summary 15 tests run: 15 passed, 0 skipped`, exit
+0 — `late_chunk_from_replaced_session_is_dropped`,
+`omitted_deadline_gets_default_and_expires_idle`,
+`requested_deadline_over_cap_is_refused_with_zero_effects`,
+`requested_deadline_within_cap_is_honoured`,
+`pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal`,
+`serve_handle_drop_retires_live_stream_and_sibling_survives` (the six
+NAMED witnesses), plus `credential_clamp_expiry_is_admission_denied_not_timeout`
+(§2.1 bound 3 + the tie rule),
+`public_ss_nonzero_deadline_expires_with_typed_timeout` (C6),
+`public_client_stream_deadline_expiry_is_typed_timeout` (C7) — and the
+1.2 six still green: `stream_opening_admits_same_org`,
+`stream_opening_admits_cross_org`,
+`unary_context_proof_is_binding_invalid_on_stream_registration`,
+`stream_proof_on_unary_registration_is_not_supported`,
+`frozen_old_provider_refuses_stream_proof_with_not_supported`,
+`replayed_opening_on_new_session_is_session_binding_mismatch`.
+Floor becomes 6+N = **15** (N = 3).
+
+Regression surface (executed): the preserved + control batch — one
+invocation, `cargo t --retries 0 --test nrpc_streaming_gate --test
+integration_nrpc_streaming --test integration_nrpc_client_streaming
+--test integration_nrpc_duplex --test nrpc_registration_order --test
+integration_nrpc_protected --test org_admission_wire --test
+subnet_org_boundary` → **89 run / 89 passed / 0 skipped** (the preserved
+trio `client_streaming_denies_unauthorized_caller`,
+`duplex_denies_unauthorized_caller`,
+`denial_is_not_fanned_out_to_the_reply_roster` ran inside
+`nrpc_streaming_gate`). In-source, one invocation
+(`cargo tfl adapter::net::cortex::rpc adapter::net::mesh_rpc
+org_stream`) → **214 run / 214 passed / 5620 skipped** — the edited
+AV-1/fold unit witnesses; the preserved bridge trio
+(`client_stream_bridge_rejects_before_fold_end_to_end`,
+`duplex_bridge_rejects_before_fold_end_to_end`,
+`reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads`
+at `mesh_rpc.rs`'s test mod); and the Stage 0 models
+(`org_stream_lifecycle` / `org_stream_registry`) green and untouched.
+
+Also executed: `cargo check --lib` (the `t`/integration feature graph)
+clean; scoped `rustfmt --edition 2021 --config skip_children=true` on my
+five files, `--check` clean (F-S1.2-7's precedent); the three verbatim
+vendored frozen files' provenance hashes UNCHANGED
+(`d5faa9fe82f76db3…`, `0ab7e915e835533c…`, `9c5963e8b14d003a…`);
+probe `cargo metadata --locked` + `cargo check --locked` + run (above).
+
+**CI pin data for Main (never edited here):** binary
+`org_rpc_streaming`, floor **15**, REQUIRED names exactly:
+`stream_opening_admits_same_org`,
+`stream_opening_admits_cross_org`,
+`unary_context_proof_is_binding_invalid_on_stream_registration`,
+`stream_proof_on_unary_registration_is_not_supported`,
+`frozen_old_provider_refuses_stream_proof_with_not_supported`,
+`replayed_opening_on_new_session_is_session_binding_mismatch`,
+`late_chunk_from_replaced_session_is_dropped`,
+`omitted_deadline_gets_default_and_expires_idle`,
+`requested_deadline_over_cap_is_refused_with_zero_effects`,
+`requested_deadline_within_cap_is_honoured`,
+`pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal`,
+`serve_handle_drop_retires_live_stream_and_sibling_survives`,
+`credential_clamp_expiry_is_admission_denied_not_timeout`,
+`public_ss_nonzero_deadline_expires_with_typed_timeout`,
+`public_client_stream_deadline_expiry_is_typed_timeout`
+(suggested filter-set: the same fifteen space-separated).
+
+**Inverse receipts (executed, raw).** Each mutation is a bounded diff at
+the PRODUCTION site (R1/R5 are the brief's two named inverses; R2/R3/R4/R6
+invert the other four named properties at their production sites). The
+command is `cargo t --retries 0 --test org_rpc_streaming` from
+`net/crates/net/` (`echo EXIT=$?` captured); restores are cp-back and
+sha256-proven byte-identical on both sides (`cortex/rpc.rs`
+`77d0b338bd5a572e…`, `mesh_rpc.rs` `50fc387fdcd4cac0…`), and each
+closes with a green 15/15 run.
+
+- **R1 — the named keying inverse: restore the pre-C5 session-less key**
+  (`self.session_id = ev.session_id;` removed at the three streaming
+  folds' `apply_inbound`, `cortex/rpc.rs`). **Exit 100.** Verbatim red:
+  `late_chunk_from_replaced_session_is_dropped`
+  (`tests/org_rpc_streaming.rs:600`) — `assertion `left == right`
+  failed: the handler must see ONLY the live incarnation's chunks — the
+  replaced session's late chunk must be dropped, not admitted into the
+  stream / left: [[111,112,101,110],[108,97,116,101],[108,105,118,101]]
+  (open, **late**, live) / right:
+  [[111,112,101,110],[108,105,118,101]] (open, live)`;
+  `Summary 15 tests run: 14 passed, 1 failed`. Restore `77d0b338…` ==
+  baseline. Green leg: 15/15. The prescribed outcome: under the
+  session-less key the replaced session's frame **is admitted** into
+  the stream.
+- **R2 — the omitted deadline no longer receives the provider default**
+  (`resolve_stream_deadline`'s `None` arm fills `max_live`,
+  `cortex/rpc.rs`). **Exit 100.** Verbatim red:
+  `omitted_deadline_gets_default_and_expires_idle`
+  (`tests/org_rpc_streaming.rs:679`) — `assertion `left == right`
+  failed: omitted ⇒ exactly the Q1 300 s provider default / left:
+  1790060688158400500 / right: 1790057388158400500` (Δ = 3 300 s =
+  3600 − 300). `Summary … 14 passed, 1 failed`. Restore + green 15/15.
+- **R3 — over-cap is clamped instead of refused** (`resolve_stream_deadline`'s cap check → `end.min(cap)`,
+  `cortex/rpc.rs`). **Exit 100.** Verbatim red:
+  `requested_deadline_over_cap_is_refused_with_zero_effects`
+  (`tests/org_rpc_streaming.rs:769`) — `panicked …: an explicit
+  deadline over the provider cap must be refused` (the refusal
+  expectation: the opening is now ADMITTED). `Summary … 14 passed, 1
+  failed`. Restore + green 15/15.
+- **R4 — the one-`min` clamp bug** (`Some(end)` arm → `end.min(now +
+  default_live)`, `cortex/rpc.rs`). **Exit 100.** Verbatim red:
+  `requested_deadline_within_cap_is_honoured`
+  (`tests/org_rpc_streaming.rs:817`) — `assertion `left == right`
+  failed: the requested 900 s end is honoured verbatim / left:
+  1790057626258090700 / right: 1790058226258090700` (Δ = 600 s =
+  900 − 300 — the explicit request was silently clamped to the
+  default). Collateral red:
+  `credential_clamp_expiry_is_admission_denied_not_timeout`.
+  `Summary … 13 passed, 2 failed`. Restore + green 15/15.
+- **R5 — the named lifetime inverse: wrap ONLY the handler in the
+  timeout** (`run_stream_call_supervisor`: the call-wide `sleep_until`
+  arm parked and the handler future wrapped in
+  `tokio::time::timeout(remaining, …)`, `cortex/rpc.rs`). **Exit 100.**
+  Verbatim red:
+  `pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal`
+  (`tests/org_rpc_streaming.rs:884`) — `panicked …: the parked pump
+  must be retired at the deadline with a Timeout terminal`, raised
+  after the witness's 30 s bound elapsed (`FAIL [30.088s]`): the parked
+  pump is never retired and the call runs past its bound (surfaced as
+  the witness's bounded red; under an unbounded wait the nextest
+  terminate-after would name it — the hang is the prescribed symptom).
+  Collateral reds: `credential_clamp_expiry_is_admission_denied_not_timeout`,
+  `omitted_deadline_gets_default_and_expires_idle`,
+  `public_ss_nonzero_deadline_expires_with_typed_timeout` (every
+  whole-call deadline lost its retirement).
+  `Summary … 11 passed, 4 failed`. Restore + green 15/15.
+- **R6 — `ServeHandle::drop` without retire** (the `retire_all` call
+  removed from the Drop body, `mesh_rpc.rs`). **Exit 100.** Verbatim
+  red: `serve_handle_drop_retires_live_stream_and_sibling_survives`
+  (`tests/org_rpc_streaming.rs:996`) — `panicked …: the dropped
+  registration's stream must retire with ServeHandleDropped`, raised
+  after the 30 s bound. `Summary … 14 passed, 1 failed`. Restore
+  `50fc387f…` == baseline. Green leg: 15/15.
+
+**Findings (state, not decide):**
+
+1. **F-S1.3-1 — the C7 row's premise mischaracterizes the source
+   (executed + source-established).** The plan's Context says CS/DX
+   "expiry emits `RpcStatus::Internal`, not `Timeout`". Against the
+   source at `e0b76e05e` that is wrong: the deadline guards fire
+   `cancel_for_deadline.cancel()` on the SHARED cancellation token
+   (`cortex/rpc.rs:3405`, `:3418` CS; `:3858`, `:3871` DX), and the
+   terminal selection's CANCEL-wins override (`let terminal = if
+   cancel_probe.is_cancelled()`, `:3440` CS / `:3894` DX) then wins — a
+   deadline expiry emitted `RpcStatus::Cancelled` with the "server
+   observed CANCEL during … handler execution" body; the constructed
+   `Internal("… deadline_ns exceeded")` outcome was shadowed. C7's
+   RULING ("→ `Timeout`") is unambiguous and is implemented as ruled:
+   the expiry is recorded before the deadline's own cancel signal and
+   the terminal selection orders `Timeout` first, while a caller CANCEL
+   that preceded the deadline keeps its documented override. Per the
+   brief's rule the wrong premise is reported with citations, not coded
+   around. Witnesses:
+   `public_client_stream_deadline_expiry_is_typed_timeout` +
+   `public_ss_nonzero_deadline_expires_with_typed_timeout`.
+2. **F-S1.3-2 — node-shutdown retirement is unreachable from the files
+   this slice owns (source-established).** Q3/C9 require node shutdown
+   to retire all node-owned calls/tasks (public + protected). The
+   shutdown paths are `Adapter::shutdown`
+   (`src/adapter/net/mesh.rs:48891`) and `Drop for MeshNode`
+   (`mesh.rs:49060`) — both inside `src/adapter/net/mesh.rs`, on this
+   slice's MUST-NOT-TOUCH list ("never, even for compilation fixes").
+   The signals that could carry the hook (`tasks`, `shutdown`,
+   `shutdown_notify`, `mesh.rs:13018-13022`) are private fields of
+   `MeshNode`, and `mod mesh` is private
+   (`src/adapter/net/mod.rs:60`), so `mesh_rpc.rs`/`cortex/rpc.rs`
+   cannot observe shutdown (only the polled `is_shutdown()` flag is
+   `pub`). Landed and reachable here: `ServeHandle::drop`'s
+   protected-only retirement + `ProtectedStreamOwners::retire_all` as
+   the single entry point a shutdown hook would call. The remaining
+   wiring is one call from the shutdown path — unowned here. None of
+   the six named witnesses covers shutdown (none is prescribed), so
+   this is UNWITNESSED as well as unwired. Stated, not decided.
+3. **F-S1.3-3 — the `DeadlineRefusal` identity collapses at the
+   `AdmissionDenied` mapping (state).** §2.1 names
+   `AdmissionDenied::DeadlineExceedsPolicy` only for the over-cap
+   refusal; the model keeps `DeadlineRefusal::{ExceedsPolicy,
+   AlreadyElapsed, Overflow}` distinct and no C4 variant covers the
+   latter two. Implemented mapping: all three → `DeadlineExceedsPolicy`
+   (coarse `Denied` either way), with the distinct
+   `StreamDeadlineRefusal` preserved at the seam and logged at the
+   refusal. A distinct wire reason would be a C4-extension ruling —
+   none exists.
+4. **F-S1.3-4 — `SessionReplaced`'s wire status is not spelled by the
+   plan (state).** §2.2's queued-data table gives its disposition
+   ("terminal attempted `DirectOnly`, dropped if the session is gone")
+   but no `RpcStatus`; §4.3 names only `AdmissionDenied(Denied)` /
+   `Timeout` / `Cancelled` for midstream outcomes. Implemented as
+   `RpcStatus::Cancelled` ("peer session replaced" body), beside
+   `ServeHandleDropped` whose `Cancelled` IS specified. No witness
+   here — session-replacement retirement is slice 1.4's `retire_session`.
+5. **F-S1.3-5 — the terminal handoff must be non-blocking (executed
+   observation + source).** With the terminal emit awaited inside the
+   supervisor, ownership completion became hostage to transport: on a
+   live node the `serve_rpc_streaming` emit closure's
+   `publish_response_to_caller(…).await` did not complete (no peer),
+   the supervisor never reached scope end, and the handler future was
+   not dropped within the observation bound (first run of
+   `serve_handle_drop_retires_live_stream_and_sibling_survives`, a 10 s
+   bounded red at the drop-flag assertion). §2.2 ("Bound all
+   library-controlled waits … rather than hang") and §2.8 ("a `try_send`
+   attempt is **not** peer receipt") resolve it exactly as the model
+   does — `ctl.try_send` + record + return: the supervisor now hands
+   the terminal to the response-emitter seam non-blocking (spawn) and
+   records `StreamTerminalDisposition::Queued`. `Sent`/`Refused`/
+   `Unreachable` become separately distinguishable at slice 1.5's
+   bounded `RpcResponseJob` drainer / route layer (documented on the
+   enum). Wire order is preserved: the pump is joined before the
+   handoff, so the terminal starts strictly after the last chunk emit.
+6. **F-S1.3-6 — a retire that wins before the supervisor's first poll
+   never enters the handler (executed observation).** The `biased`
+   `select!` takes an already-ready retire arm on its first poll, so
+   the handler future is never polled and its body never exists
+   (including its drop-guards) — "zero handler effects" holds even
+   earlier than §3 step 5's wording. The witnesses that observe
+   handler-drop therefore wait for handler entry first; noted for
+   1.4/1.5's witness design (a "handler stayed dark" observation is
+   stronger than "handler did not drop").
+7. **F-S1.3-7 — interpretation note: where the protected SS records are
+   fed (state).** The assignment's "wire the protected SS records'
+   supervisor spawn at the serve seam (~4078-4290) feeding
+   `apply_inbound_admitted`" is implemented as the fold seam plus its
+   serve-side wiring (the `ServeHandle` ownership set and the
+   fixtures-gated fold handle); the actual FEED of admitted records is
+   `admit_and_dispatch_protected_stream` at the `Proceed` seam — the
+   plan names THAT as slice 1.5's target (`mesh_rpc.rs:4242-4247`).
+   At 1.3 the seam is exercised by the unit-witness idiom (fold-level
+   driving through REAL `ServeHandle` registrations in
+   `serve_handle_drop_retires_live_stream_and_sibling_survives`).
+8. **F-S1.3-8 — the model's byte-permit semaphore and the sink
+   refusal-latch land with 1.4 (state).** §2.2's table closes "byte-
+   permit semaphore (2.7)" beside the flow semaphore and §2.7's
+   response direction wants a refused protected item to latch
+   `ResourceExhausted`; the brief assigns §2.7 byte accounting to slice
+   1.4 ("byte accounting per §2.7 at both enqueue boundaries"). The 1.3
+   supervisor closes the semaphores the call owns (the flow-control
+   credit one) and the protected sink carries §2.2's producer-finished
+   gate only.
+
+**What never ran here (complete):**
+
+- `cargo fmt -p <crate> -- --check`, the four clippy invocations, the
+  five rustdoc lines and `cargo check --workspace --all-targets` —
+  Main's stage-end list (mid-flight rule). My five files were converged
+  with scoped `rustfmt --check`/apply (clean) and the lib compiled
+  clean on the integration feature graph, but the gate commands
+  themselves never executed here.
+- `cargo tl` / `cargo t` full suites; `tests/cross_lang_*`; the wire
+  suite; the browser/SDK surfaces; the 1.1/1.1a wire and handshake
+  witnesses (S1Session's — re-run at stage end).
+- CI itself (branch unpushed; nobody pushes but Main).
+- Node-shutdown retirement (F-S1.3-2 — not wired at its only call
+  sites and therefore not witnessed; the `ServeHandle::drop` half is
+  landed and witnessed).
+- Authenticated ENDPOINT receipt of the terminal frames. The
+  fold-level witnesses capture at the response-emitter seam (the §2.8
+  "network receipt is a separate observation" boundary); live endpoint
+  receipt belongs to slice 1.5's bridge witnesses.
+  `serve_handle_drop_retires_live_stream_and_sibling_survives` drives
+  real registrations on a live node but observes the records' handles
+  and fold maps, not network delivery.
+- CS/DX PROTECTED admission (Stage 2 by contract) and
+  `call_streaming`'s `org_proof_intent` widening (slice 1.6's named
+  inversion per F-S1.2-5 — `mesh_rpc.rs:5052`'s refusal untouched and
+  still green under
+  `org_proof_intent_rejected_on_streaming_and_capability_mismatch`).
+- The `Revoked`/`AuthorityUnavailable`/`ResourceExhausted` terminal
+  wire mappings (`stream_terminal_payload`) — constructed per §2.2/
+  §2.7/§4.3 but their retirement triggers are slice 1.4's
+  revocation/byte-accounting work; no witness reaches them here.
+- Windows workstation only: `#[cfg(unix)]` legs never compile here; no
+  Linux/macOS execution.
