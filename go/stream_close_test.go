@@ -101,11 +101,34 @@ func TestSessionSupersededSentinelMatchesTheHeaderCode(t *testing.T) {
 		t.Fatalf("ErrSessionSuperseded = %q, want %q", got, want)
 	}
 	// Terminal, not retryable: `SendWithRetry` / `SendBlocking`
-	// absorb only ErrBackpressure, so the sentinel must not be
-	// reachable through that absorption.
-	if errors.Is(ErrBackpressure, ErrSessionSuperseded) {
-		t.Fatal("ErrSessionSuperseded must not be absorbed by the backpressure retry path")
+	// absorb exactly one sentinel — ErrBackpressure. The previous
+	// probe compared the two sentinels with each other
+	// (`errors.Is(ErrBackpressure, ErrSessionSuperseded)`): two
+	// distinct constants, false by construction, so the leg could
+	// never fire. Probed through the wrapper instead, on a real
+	// stream whose send cannot succeed and cannot be backpressure.
+	a, b, cleanup := meshHandshakePair(t)
+	defer cleanup()
+	peer := b.NodeID()
+	stream, err := a.OpenStream(peer, 0x1170, StreamConfig{Reliability: "reliable"})
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
 	}
+	stream.Close()
+	got := stream.SendWithRetry([][]byte{[]byte("x")}, 3)
+	if got == nil {
+		t.Fatal("a closed stream's retry send must fail")
+	}
+	if errors.Is(got, ErrBackpressure) {
+		t.Fatalf("the retry wrappers absorb only ErrBackpressure; a closed stream's %v must not ride that absorption", got)
+	}
+	// DEFERRED: the sharper claim — that a genuinely superseded
+	// handle's -117 send is not folded into that same retry loop —
+	// needs a real displaced session, and the Go binding generates
+	// each node's identity internally. The displacement
+	// `tests/rtc_repairs.rs::a_displaced_sessions_handle_cannot_address_its_successor`
+	// drives (a second same-identity incarnation) cannot be built
+	// from the exported Go surface.
 }
 
 // headerConstant reads one NET_* enum constant out of `go/net.h` —
