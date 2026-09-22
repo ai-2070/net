@@ -2939,3 +2939,230 @@ precedent); `cargo tl` / `cargo t` full suites; `tests/cross_lang_*`; the
 wire suite; the browser/SDK/facade surfaces (later stages by contract); the
 benches; the `webrtc` feature graph; Linux/macOS and `#[cfg(unix)]` legs
 (Windows host only); CI itself (branch unpushed; nobody pushes but Main).
+
+### 4.2 Slice 2.2 — CS/DX admission at the `Proceed` seam
+
+**Landed (executed):** `4db0f8a5f` — `S2.2: admit protected client-streaming
+and duplex at the Proceed seam` (4 files). Base `f68fc453f`. The commit was
+AMENDED once (pre-push) to carry the F-S2.2-5 fix + its regression witness
+(found while writing this record). All green claims below are executed at
+`4db0f8a5f`'s exact tree; all receipts run against the frozen formatted
+code (post-rustfmt shas in §4.1's baseline block are superseded by:
+`cortex/rpc.rs`
+`22b0ce9029d96bf676d29e28c71f4260c9698152910bd0b470e9e36105e99638`;
+`tests/org_rpc_streaming.rs`
+`989dc2c77b16033bb458fce7b94977ecabd80eb3c1ce93605822f361d196d8f7`;
+`mesh_rpc.rs` unchanged from §4.1's
+`d71463e5dd0174a80993888661902180b8c73e7802c35f345788a71970e627a8`;
+`org_admission_gate.rs` unchanged
+`69b81aae4532ef73dc2b3364eb3a3ad15680b5c3cb088d630181368040601537`).
+
+**What landed (source-established):**
+
+- **One admission seam for every streaming shape.** `ProtectedStreamFold`
+  (the SS/CS/DX folds' shared `apply_inbound` / `apply_inbound_admitted`
+  shape) generalizes `admit_and_dispatch_protected_stream`; the four
+  `serve_rpc_{owner_scoped,granted}_{client_stream,duplex}` seams land
+  beside the SS twins (node authority required, `RegisteredRpcService`
+  construction + the node-owned replay guard identical to the unary
+  bridge), and each CS/DX bridge now branches on the registration's
+  admission mode exactly as the unary/SS bridges (public = `bridge_preflight`
+  + Gate-3 + fold drive, byte-unchanged; protected = the §3 transaction in
+  the same bridge iteration as the fold drive).
+- **NC2/§2.8 on the CS/DX emissions.** Protected emissions name the
+  authenticated session peer explicitly (`DirectOnly`, `Some(from_node)`)
+  and carry the record's REAL receiving incarnation (the route cache's
+  `(node, receiving session_id)` pair — R2-A); denials and the protected
+  terminal (a CS call's single response IS its terminal; a DX call's `end`
+  frame) ride the §8a `RpcResponseJob` drainer (§2.8's `Sent` / `Refused` /
+  `Unreachable` disposition seam); `ServeHandle::drop` retires the
+  registration's protected set (Q3/C9) and every CS/DX handle now carries
+  `protected_streams: Some(..)`.
+- **The §2.6/§2.2 machinery on the CS/DX folds.** `apply_inbound_admitted`
+  mirrors the SS seam verbatim (§2.1 resolution before any handler effect,
+  `DeadlineExceedsPolicy` refusal, the E1.6 strip, §3 step-5's ownership
+  TRANSFER via `registry.confirm`); `StreamCallRecord::new_client_streaming`
+  / `new_duplex` (both halves `Open`) + `end_input` (END closes input ONCE,
+  idempotent, never touching output); `run_client_stream_call` (§2.2's
+  bounded supervision for the single-response shape — its bounded emission
+  IS the drain-complete event: `handler_returned` ⇒ `Draining` + input
+  `Closed`, then `pump_exited` ⇒ `Completed(result)`, the handler's own
+  payload emitted verbatim) and `SupervisedHandler::Duplex` (one supervisor
+  body owning handler/pump/semaphore/terminal for SS + DX); protected
+  CANCEL retires through the supervisor (first-writer-wins terminal, the
+  registration's single removal covers `in_flight` / `flow_control` /
+  `senders` / the protected set / the registry record).
+- **Shape + direction gating before delivery/credit.** `cs_request_flags_ok`
+  / `dx_request_flags_ok` refuse `ShapeMismatch` at admission; the
+  request-chunk path is 4-tuple (`from_node`, receiving incarnation,
+  origin, call_id) keyed and record-gated (terminal or non-`Open` input ⇒
+  dropped, no delivery, no credit); `deliver_protected_body` performs the
+  §2.7 byte accounting + the §2.3 check-and-commit as ONE ownership
+  operation (the opening body reserves like any chunk — §2.7 "refuse the
+  call, never truncate it", `ResourceExhausted` ⇒ wire `Unavailable`); the
+  DX fold gains the `flow_control` map + `STREAM_GRANT` arm (the record's
+  `credit_grantable` gate: credit survives the handler's return for the
+  drain and stops at terminal/ended-output; the cross-direction grant kind
+  `DISPATCH_RPC_REQUEST_GRANT` never reaches the arm).
+- **F-S2.2-5's fix** (below): a pre-supervisor opening-body refusal settles
+  the record's release-once `complete` in the fold.
+
+**Witnesses + counts (executed):** `org_rpc_streaming` binary **31 → 37**.
+The five dispatched witnesses plus the F-S2.2-5 regression:
+
+| Witness | Asserted observation | Named inverse |
+|---|---|---|
+| `client_stream_aggregate_with_valid_proof` | a VALID owner-delegated kind-2 opening + one continuation chunk + END aggregate into the call's ONE response (content-joined in order) at the authenticated receiving endpoint, with the four-party attribution observed on `RpcStreamingContext::org_admission` and the proof header stripped (E1.6) — and it stays one response ever (§2.6's single-response rule) | — |
+| `duplex_exchange_with_valid_proof` | the CROSS-ORG shape (`serve_rpc_granted_duplex` + the B→A grant intent): echoed bodies IN ORDER, a content-labelled TAIL after input EOF (independent halves), then EXACTLY ONE terminal with the exact wire content (status `Ok` + `nrpc-streaming: end`) | — |
+| `pre_admission_chunks_are_never_delivered` | chunks + an END for a call with NO admitted opening are never delivered (handler dark, empty `in_flight_keys()`/`sender_keys()`, endpoint silent through the bounded darkness window); when the real opening arrives the aggregate is EXACTLY the post-admission bodies | — |
+| `end_cannot_cancel_another_stream_or_reopen_terminal_half` | two live CS calls: B's END closes ONLY B's input half (`input_half() == Ended`) while A's stays `Open` and A keeps receiving; a SECOND END never reopens B's half (still `Ended`, no sender reappears) and a late B chunk is discarded; both calls' remaining output completes exactly once (body-content asserted) | — |
+| `wrong_session_grant_does_not_release_credit` | a zero-credit protected DX window under 4-tuple keys: a WRONG-session `STREAM_GRANT` never releases credit (named) AND a wrong-session REQUEST_CHUNK is never delivered (named — the brief's prescribed inverse's target); the exact session's grant releases and the exchange completes (positive control both ways) | R-S2.2a (the brief's: chunks keyed 3-tuple) + R-S2.2b |
+| `opening_body_budget_refusal_completes_the_record` (F-S2.2-5 regression) | an opening body over the per-call byte budget is refused `ResourceExhausted` (0x0009 + coarse `Unavailable`) with ZERO delivery and the §3 record COMPLETED (`record_count` 0, `active_node` 0) | R-S2.2c (the fix removed — the PRE-FIX leak reproduces) |
+
+Green at `4db0f8a5f` (executed, exit-captured): `cargo fmt -p net-mesh --
+--check` → exit 0; `cargo tf --retries 0 --test org_rpc_streaming` →
+**37 run / 37 passed / 0 skipped**, exit 0; the three-module in-source
+filter → **219 / 219**, exit 0 (Stage 2 adds no in-source units here —
+count-continuous with §3's 219).
+
+**Inverse receipts (executed, raw; the frozen formatted tree).** Each
+cycle: bounded diff at the PRODUCTION site → the witness's named assertion
+red (a compile error is never a red) → edit-reversed restore, sha256-proven
+== baseline → restored green (same `-E` run). Exact command shape: `cargo
+tf --retries 0 --test org_rpc_streaming -E 'test(=<witness>)'`, from
+`net/crates/net/`.
+
+**R-S2.2a — the brief's prescribed inverse: request chunks delivered on
+`(node, origin, call_id)` only (3-tuple).** The sender map's insert keys
+drop the receiving-incarnation term and the chunk-path lookup drops it too
+(the faithful "3-tuple keying" scheme — 3 bounded hunks in
+`cortex/rpc.rs`):
+
+```diff
+-    let key = (from_node, session_id, meta.origin_hash, meta.seq_or_ts);
++    let key = (from_node, 0, meta.origin_hash, meta.seq_or_ts); // R-S2.2a MUTATION: 3-tuple chunk key
+     let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
+```
+```diff
+-                key,
++                (key.0, 0, key.2, key.3), // R-S2.2a MUTATION: 3-tuple chunk key
+                 RequestChunkSender {
+                     tx,
+                     charge: call_ref.clone(),
+```
+(×2 — the CS and DX admitted seams)
+
+**exit 100.** Verbatim:
+
+```
+thread 'wrong_session_grant_does_not_release_credit' (187368) panicked at tests\org_rpc_streaming.rs:4277:5:
+assertion `left == right` failed: a wrong-session REQUEST_CHUNK is never delivered — the opening body is all the handler ever sees
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The prescribed outcome exactly: the wrong-session chunk WAS delivered
+(`left: 2`) and the witness reds at its own named assertion. Restore:
+edit-reversed; sha256
+`22b0ce9029d96bf676d29e28c71f4260c9698152910bd0b470e9e36105e99638` ==
+baseline. Restored green: exit 0, 1/1.
+
+**R-S2.2b — the grant-credit lookup ignores its key** (the wrong-session
+grant's own inverse; `cortex/rpc.rs`, both arms' shared line):
+
+```diff
+-if let Some(sem) = self.flow_control.lock().get(&key).cloned() {
++if let Some(sem) = self.flow_control.lock().values().next().cloned() { // R-S2.2b MUTATION: lookup ignores the key
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'wrong_session_grant_does_not_release_credit' (186036) panicked at tests\org_rpc_streaming.rs:4283:5:
+assertion `left == right` failed: a wrong-session STREAM_GRANT does not release credit
+  left: Some(4)
+ right: Some(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The wrong-session grant released credit (`Some(4)` = 5 granted − 1 consumed
+by the parked pump's queued echo). Restore: edit-reversed; same sha ==
+baseline. Restored green: exit 0, 1/1.
+
+**R-S2.2c — F-S2.2-5's fix removed (the pre-fix shape; `cortex/rpc.rs`,
+the CS seam):**
+
+```diff
+                         self.in_flight.lock().remove(&key);
+-                        charge.registry.complete(&charge.key, charge.incarnation);
++                        // R-S2.2c MUTATION: the fix removed (pre-fix shape)
+                         return Err(AdmissionDenied::ResourceExhausted);
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'opening_body_budget_refusal_completes_the_record' (184388) panicked at tests\org_rpc_streaming.rs:4455:5:
+assertion `left == right` failed: the pre-supervisor refusal completes the record's single removal
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The pre-fix leak reproduces exactly (`record_count` stuck at 1 — the
+terminal record owning its key forever). Restore: edit-reversed; same sha
+== baseline. Restored green: exit 0, 1/1. (Four weakenings on all three:
+NONE — each witness is its diff's own inverse and reddens at its named
+assertion.)
+
+**Findings (stated, not decided):**
+
+1. **F-S2.2-1 — the 2.2/2.3 production split on the DX response
+   flow-control (stated).** The plan's rows overlap on this region (2.3's
+   named `cortex/rpc.rs` targets are a SUBSET of 2.2's). The `flow_control`
+   map + `STREAM_GRANT` arm + the protected window install land here —
+   2.2's "GRANT checked … before credit" gate needs the credit to gate
+   (`wrong_session_grant_does_not_release_credit` observes it through
+   `flow_control_permits`) — while the PUBLIC window honouring (C8's
+   approved public change: install at the public arm + the public pump's
+   per-chunk acquire) lands at 2.3 with its named witnesses.
+2. **F-S2.2-2 — `wrong_session_grant_does_not_release_credit` carries BOTH
+   wrong-session probes (interpretation).** The brief's name covers the
+   grant half while its prescribed inverse ("deliver chunks on `(node,
+   origin, call_id)` only") targets CHUNK delivery; the witness pins both
+   named assertions (chunk non-delivery first — R-S2.2a's red target; grant
+   non-release second — R-S2.2b's).
+3. **F-S2.2-3 — the CS/DX emitters carry the cache-derived receiving
+   incarnation uniformly (stated).** The protected path requires the
+   record's real `session_id` (NC2/contract 5); the closures mirror the SS
+   emitter exactly, including passing the cache-derived value on the public
+   inline path (previously hardcoded `0`). F-S1R-1 established that value's
+   only consumers are `webrtc`-gated code and tracing fields — no
+   sanctioned-graph observable change.
+4. **F-S2.2-4 — `SupervisedHandler` realizes the §2.2 supervisor across the
+   pumping shapes (seam shape).** One supervisor body owns the §2.2 table's
+   pieces for SS + DX (the handler future via an owned async block — the
+   `async_trait` self-borrow); client-streaming runs
+   `run_client_stream_call` per §2.2's own carve-out ("a single-response
+   emitter, not an SS/DX pump").
+5. **F-S2.2-5 — a pre-supervisor opening-body refusal needed the fold as
+   cleanup owner (found + FIXED with regression witness + receipt).**
+   `apply_inbound_admitted` transfers ownership (§3 step-5) BEFORE the
+   opening body's §2.7 delivery; a budget refusal there postdates the
+   transfer but predates the supervisor, so the release-once `complete`
+   had no owner — the terminal registry record kept its key forever
+   (`record_count` stuck at 1, `ActiveCallOwned` for any successor).
+   Fixed in the CS and DX seams (the unary `ConfirmedOpening` scope-guard
+   precedent); `opening_body_budget_refusal_completes_the_record` is the
+   reproduction (fails pre-fix under R-S2.2c, passes post-fix).
+
+**What never ran at 4.2 (complete):** the same list as §4.1's (the fmt
+gate IS executed here — exit 0; `cargo fmt --all`, clippy, rustdoc,
+`--workspace --all-targets` remain Main's stage-end list), plus: the full
+preserved + public-regression-control batch (§4.5's stage-end run), the
+Stage 0 model suite as such (inside the 219), and every later-stage
+surface. Two earlier receipt cycles (an R-S2.2a/b pair) were lost to a
+same-file parallel-mutation race and are NOT cited anywhere — they were
+superseded by the sequential re-runs recorded above (the race's outputs
+are discarded, not merged).
