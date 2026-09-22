@@ -2587,13 +2587,23 @@ is byte-identical to `e25ac28bf`'s). Restored green: same `-E` run, 1/1.
    "deliberately absent because it is the one feature with a C toolchain
    dependency"). No receiver-side attribution surface — wire, emit seam, or
    fold key — reads that value in any sanctioned graph, so "reddening under
-   A5" cannot be realized there. The witness LANDED as the row's
-   receiver-side-attribution pin (the executed property: post-replacement
-   response reaches the live session's endpoint, the replaced endpoint
-   receives nothing). **Stated for Main's ruling, not decided here:**
-   whether the witness stands on its own property value, or the closure
-   wording is revised to name an observable seam (e.g. the webrtc
-   enrollment-targeting behavior the value actually feeds).
+   A5" cannot be realized there.
+   **RESOLVED BY MAIN'S S1R RULING (sharpened (a)) — decided by the owner,
+   recorded here:** the discovery is credited (the packet's
+   reddening-under-A5 was unsatisfiable BY CONSTRUCTION in the executable
+   graphs — the green is a property of the feature graph, not of the
+   witness); witness discipline is absolute, so the witness STANDS on its
+   receiver-side-attribution property (the fence's actual protective effect:
+   post-replacement response reaches the live session's endpoint, the
+   replaced endpoint receives nothing) with the closure wording AMENDED
+   (not weakened) to name the observable seam — the EMIT-SESSION SELECTION
+   the test drives, read at the ingress attribution
+   (`RpcInboundEvent::session_id`) — and it is QUALIFIED by its own
+   discriminating inverse: receipt 7 (R-A5′, §3.3) reds it at its own named
+   assertion ("the LIVE session's endpoint receives the post-replacement
+   response") and is sha-restored green. Four weakenings: NONE applied to
+   the witness. (Correction note: `3620fed0b`'s message states this
+   resolution; its body edit missed its anchor and landed in this commit.)
 2. **F-S1R-2 — a displaced PROTECTED call's `SessionReplaced` terminal is
    not a reliable wire observation (executed observation; mechanism
    [INFERENCE]).** During Row-5 construction (executed iterations at this
