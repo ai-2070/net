@@ -55,6 +55,22 @@ struct MemoriesSnapshotPayload {
     inner: Vec<u8>,
 }
 
+/// Which store the `(state_bytes, last_seq)` pair passed to
+/// [`MemoriesAdapter::open_snapshot`] describes — the identity
+/// discriminator for replay, never sequence arithmetic.
+#[derive(Clone, Copy)]
+enum StateProvenance {
+    /// The pair came from THIS store's own checkpoint file
+    /// (`checkpoint::load`, whose version/origin check is the
+    /// identity gate). `last_seq` is a position in THIS log and
+    /// covers its prefix.
+    OwnCheckpoint,
+    /// The pair is a caller-supplied snapshot of ANOTHER store
+    /// (`open_from_snapshot`). `last_seq` is a position in the SOURCE
+    /// store's log and claims no coverage here.
+    ForeignSnapshot,
+}
+
 /// Typed wrapper around `CortexAdapter<MemoriesState>` that exposes
 /// domain-level operations (`store`, `retag`, `pin`, `unpin`,
 /// `delete`) and hides the `EventMeta` + postcard plumbing.
@@ -157,7 +173,7 @@ impl MemoriesAdapter {
                 redex_config,
                 &checkpoint.state,
                 checkpoint.last_seq,
-                false,
+                StateProvenance::OwnCheckpoint,
             )
             .await;
         }
@@ -398,7 +414,12 @@ impl MemoriesAdapter {
         Ok((bytes, last_seq))
     }
 
-    /// Open the memories adapter from a snapshot.
+    /// Open the memories adapter from another store's snapshot.
+    ///
+    /// `last_seq` describes the SOURCE store's log and claims no
+    /// coverage of this one: every event of THIS log folds onto the
+    /// restored state (the documented restore semantic: "a fold, not
+    /// a replace"). The `Some(u64::MAX)` sentinel is still refused.
     ///
     /// See [`Self::open`] for why this is `async`.
     pub async fn open_from_snapshot(
@@ -434,7 +455,7 @@ impl MemoriesAdapter {
             redex_config,
             state_bytes,
             last_seq,
-            true,
+            StateProvenance::ForeignSnapshot,
         )
         .await
     }
@@ -445,23 +466,39 @@ impl MemoriesAdapter {
         redex_config: RedexFileConfig,
         state_bytes: &[u8],
         last_seq: Option<u64>,
-        persist: bool,
+        provenance: StateProvenance,
     ) -> Result<Self, CortexAdapterError> {
         let payload = Self::decode_snapshot(state_bytes, last_seq)?;
         let name = ChannelName::new(MEMORIES_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
 
-        let last_seq = if persist {
+        // Force-restore merge fix: `last_seq` is a position in the
+        // log of the store the pair came from. An `OwnCheckpoint`
+        // pair comes from THIS store's own checkpoint file
+        // (identity-gated by `checkpoint::load`'s version/origin
+        // check), so its position covers this log's prefix and
+        // replay may skip it. A `ForeignSnapshot` pair is ANOTHER
+        // store's snapshot: its position covers NOTHING here, so
+        // every destination frame must fold onto the incoming state
+        // (the documented restore semantic: "a fold, not a replace")
+        // and the published checkpoint claims no coverage (`store`'s
+        // clamp maps `None` to `None`, keeping later appends
+        // replayable).
+        let resume = match provenance {
+            StateProvenance::OwnCheckpoint => last_seq,
+            StateProvenance::ForeignSnapshot => None,
+        };
+        let last_seq = if matches!(provenance, StateProvenance::ForeignSnapshot) {
             super::super::checkpoint::store(
                 redex,
                 &name,
                 &redex_config,
                 origin_hash,
                 state_bytes,
-                last_seq,
+                resume,
             )?
         } else {
-            last_seq
+            resume
         };
 
         // Pre-load the snapshot's persisted counter into the
@@ -546,6 +583,54 @@ impl std::fmt::Debug for MemoriesAdapter {
 mod tests {
     use super::*;
     use crate::adapter::net::redex::Redex;
+
+    /// Cross-store fold witness (memories side — the mirror of the
+    /// tasks merge `force_without_clear_preserves_merge_semantics`
+    /// covers at the CLI level; that fixture's snapshot is tasks-only,
+    /// so it cannot observe the memories restore path). Restoring
+    /// ANOTHER store's snapshot must FOLD: the destination's own
+    /// records survive AND the snapshot's arrive ("this is a fold, not
+    /// a replace"). Inverse: `StateProvenance::ForeignSnapshot`'s
+    /// resume reverted to `last_seq` skips the destination's prefix
+    /// frames and drops its records (state = the snapshot's only).
+    #[tokio::test]
+    async fn cross_store_restore_folds_destination_memories_onto_snapshot_state() {
+        const ORIGIN: u64 = 0xC0FF_EE00_D00D_F00D;
+
+        // Source store: the foreign snapshot holds memory 4.
+        let source = Redex::new();
+        let src = MemoriesAdapter::open(&source, ORIGIN).await.unwrap();
+        let seq = src.store(4, "from-snapshot", vec![], "src", 400).unwrap();
+        src.wait_for_seq(seq).await.unwrap();
+        let (bytes, last_seq) = src.snapshot().unwrap();
+        src.close().unwrap();
+
+        // Destination store: its own log holds memory 3.
+        let dest = Redex::new();
+        let dst = MemoriesAdapter::open(&dest, ORIGIN).await.unwrap();
+        let seq = dst.store(3, "destination", vec![], "dst", 300).unwrap();
+        dst.wait_for_seq(seq).await.unwrap();
+        dst.close().unwrap();
+
+        // Cross-store restore: every destination frame folds onto the
+        // incoming state.
+        let restored = MemoriesAdapter::open_from_snapshot(&dest, ORIGIN, &bytes, last_seq)
+            .await
+            .unwrap();
+        let state = restored.state();
+        let guard = state.read();
+        assert!(
+            guard.find_unique(3).is_some(),
+            "the destination's memory 3 must survive the cross-store restore \
+             (this is a fold, not a replace)"
+        );
+        assert!(
+            guard.find_unique(4).is_some(),
+            "the snapshot's memory 4 must arrive"
+        );
+        drop(guard);
+        restored.close().unwrap();
+    }
 
     /// Mirror of the TasksAdapter WrongOrigin test — same guard,
     /// same contract, same dashboards counter. See the matching
