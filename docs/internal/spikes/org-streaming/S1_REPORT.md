@@ -131,6 +131,27 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, S2R repair round verified (executed).** All three
+  S2Review ACCEPT findings closed at `1d26bc4ba` (commits `c17572f03` code,
+  `1432c6c03` receipts, `1d26bc4ba` record). Row 2's guard landed as the
+  `ConfirmedStreamOpening` Drop-guard (the unary `ConfirmedOpening`
+  precedent) in BOTH `apply_inbound_admitted` CS/DX seams — armed at
+  `registry.confirm`, Drop runs the release-once `complete` + every map
+  entry, defused at the spawn transfer — with the inline F-S2.2-5
+  settlement FOLDED into it (one mechanism) and R-S2.2c's fail-pre-fix
+  property preserved byte-identically (R-S2.2c-v2). Coordinator spot-check
+  SCR1 reproduced the Row-2 probe receipt: the guard's settlement removed →
+  `post_transfer_scope_guard_never_orphans_a_running_record` red (the orphan
+  manifests), `git checkout`-restored clean. Row 1's REQUIRED PAIR both red
+  at the same named no-latch assertion (`:5379:5`); Row 2's probe red at
+  the reviewer's §6.5 orphan outcome verbatim (`left: 1 / right: 0`); four
+  weakenings NONE; one superseded first cycle (red at an `.expect` belt →
+  assertion restructured to map-form → every cycle re-ran post-amend)
+  disclosed. Row 3's wording fixed with the normalisation digests (F-S2.4-2
+  scoped). Estate at head: `org_rpc_streaming` 42/42 (CI floor 42),
+  in-source 221/221, preserved+controls 134/134, cross-lang 32/32, Stage 0
+  models untouched 76/76. The owner-declined rider untouched. Stage 2 is
+  fully closed; Stage 3 proceeds.
 - **2026-09-22, Stage 2 verified (executed).** Landed over ten commits
   (`16cd67e85`…`98df0bb0b`, S2.1–S2.5 pairs; §4). Coordinator spot-checks
   reproduced two Stage-2 receipts with the full cycle: SC3 — R-S2.2c (the
