@@ -1698,3 +1698,318 @@ shutdown carve — `15+N+1`), REQUIRED names exactly the twenty-four:
   `expect` exists to catch).
 - Windows workstation only: `#[cfg(unix)]` legs never compile here; no
   Linux/macOS execution.
+
+### 2.4 Slice 1.5 — bridge wiring + routing
+
+**Landed (executed):** `444a4aab9` — `S1.5: wire protected streaming
+admission into the serve bridges` (4 files, +1483/−91) on
+`LZL0/org-streaming`; this record rides in the following `S1.5:` commit.
+Base `8ad588171` (the S1 CI pin after 1.4). All green claims below are at
+`444a4aab9`'s exact tree (the scoped rustfmt pass is whitespace-only and
+landed inside it; the receipt cycles ran on the pre-format tree — the
+1.1a/1.4 precedent — with post-format shas recorded below).
+
+**What landed** (source-established; executed via the runs below):
+
+- `mesh_rpc.rs` — contract 5 in full:
+  - **`admit_and_dispatch_protected_stream`** at the streaming bridge's
+    fold-drive seam (the brief's `BridgePreflight::Proceed(frame)` seam),
+    consuming 1.4's `admit_protected_opening` +
+    `apply_inbound_admitted` unchanged: reserve (before decode/signature
+    work) → decode/digest → provider self-verify → `verify_org_admission`
+    with its UNCHANGED step order (the §9.5 recheck, the replay insert at
+    step 10, the provider policy at step 11) → rollback-on-`Err` (the
+    reservation guard; the Q4 veto slot stays consumed) → install with the
+    §2.3 requalification → the fold seam's ownership TRANSFER. Admission
+    is synchronous in the SAME bridge iteration as the fold drive (the
+    unary bridge's exact `match reg.admission()` shape: public →
+    `bridge_preflight` + `apply_inbound`; protected → the §3 transaction).
+    §1.3: `session_binding = mesh.peer_session_binding(from_node)` (the
+    receiving session's full Noise handshake hash; `None` fail-closed at
+    step 9b). Every refusal is exactly one bounded denial through the
+    byte-unchanged `emit_admission_denial` (`DirectOnly`, NC2); the fold
+    emits nothing on refusal.
+  - **`serve_rpc_owner_scoped_streaming` / `serve_rpc_granted_streaming`**
+    `(service, Arc<H>, OrgProviderPolicy)` — both land in
+    **`serve_rpc_streaming_impl(shape, admission)`** beside
+    `serve_rpc_unary_impl` (the public `serve_rpc_streaming` wrapper's
+    signature is unchanged — `net_sdk` and `guards/org_api_probe`
+    unaffected; executed green below). The seams require an installed node
+    authority (`ProtectedAuthorityRequired`) and construct the same
+    `RegisteredRpcService` shapes the unary seams do (owner-scoped =
+    `OwnerDelegated` + `OwnerScoped` visibility; granted =
+    `CrossOrgGranted` + `GrantedAudience`).
+  - **`UnaryAdmission` → `ProtectedAdmission`** (C10) with the E1.8 doc
+    line rewritten: server-streaming HAS a protected form now (contract
+    5); client-streaming and duplex still have none. Its
+    `response_route_fallback` / `visibility` are semantically untouched
+    (every protected mode stays `DirectOnly`).
+  - **Protected emitters (NC2):** the SS emit closure routes `DirectOnly`
+    naming the authenticated session peer explicitly (`Some(from_node)`)
+    and carries the record's REAL `session_id` in `RpcResponseJob` —
+    the receiving incarnation captured at admission (R2-A: "the
+    incarnation that received the request"), now stored as the route
+    cache's `(target node, receiving session_id)` pair. PROTECTED
+    terminals ride the §8a `RpcResponseJob` drainer the streaming impl now
+    owns — the F-S1.3-5 deferral: `Sent` / `Refused` / `Unreachable` are
+    separately distinguishable at the drainer/route layer (structured
+    logs; `Refused` is the §2.8 bounded failure disposition — the peer
+    observes interruption or its deadline, never synthetic success).
+    Chunks publish inline (the pump's per-chunk await keeps wire order and
+    releases each §2.7 byte permit at the actual publish). Public emitters
+    keep the AV-5 `RosterOnStaleDirect` inline path, byte-compatible.
+  - **§2.1 inputs:** `ProtectedOpeningOutcome::Admitted` carries
+    `credential_ends_ns` — the membership / dispatcher / (optional)
+    capability-grant `not_after` values plus the installed owner cert's
+    end ("include the provider's required authority validity"), each a
+    checked seconds→ns normalization — feeding
+    `StreamCallLifetime { policy: q1_defaults(), .. }` (300 s / 3600 s)
+    at the fold seam.
+  - **ServeHandle fixtures seams** (`#[cfg(any(test, feature =
+    "fixtures"))]`, the `origin_node_cache`/`streaming_fold_for_test`
+    precedent): `inject_inbound_for_test` (the bridge dispatcher's exact
+    bounded-mpsc hand-off — preflight, §3 admission and fold drive run in
+    production order in one bridge iteration) and
+    `request_fold_for_test` / `duplex_fold_for_test` (the input-delivery
+    map observation below).
+- `tests/org_rpc_streaming.rs` + `tests/org_rpc_streaming/s15.rs` (new) —
+  the three witnesses below (driving REAL registrations + REAL wire
+  endpoints: the NC2 probe idiom from `nrpc_streaming_gate.rs:268-305`);
+  `s14.rs` adapted mechanically (the outcome destructure).
+
+**Witnesses and counts (executed):** `cargo t --retries 0 --test
+org_rpc_streaming` → `Summary 27 tests run: 27 passed, 0 skipped`,
+**exit 0** — the twenty-four prior witnesses still green plus the three
+named:
+
+| # | Witness | Property proved |
+|---|---|---|
+| (a) | `forbidden_stream_opening_causes_zero_handler_effects` | a structurally perfect but MODE-forbidden opening (an unexpected cross-org capability grant at an OwnerDelegated registration — §1.5/step 6) causes ZERO effects: handler entry and SINK SENDS stay 0 through the bounded darkness window, the wire carries EXACTLY the one coarse denial (no chunk, no grant, no other terminal), the roster subscriber sees nothing, `in_flight_keys()` is empty, no flow/grant semaphore is installed, and the §3 reservation rolled back (registry `record_count`/`active_node` 0). The plan's `sender_keys` channel is observed too: the same opening shape at real client-streaming and duplex registrations leaves `in_flight_keys()` AND `sender_keys()` empty (their folds refuse the shape before any call state) |
+| (b) | `streaming_denial_is_not_fanned_out_to_the_reply_roster` | the streaming NC2 witness (the `nrpc_streaming_gate.rs:268-305` bystander probe against `serve_rpc_owner_scoped_streaming`): leg (a) — a denied opening on the caller's REAL session is told to the caller EXACTLY once (0x0009 + the coarse `Denied` byte `[0]`; §T7's "the caller must be told") and the bystander subscribed to the caller's reply-channel roster sees NOTHING across a 1 s window; leg (b) — the NC2 reflection trigger (the same no-proof opening claiming the caller's origin from an UNROUTABLE peer: the denial's direct route is gone — the `NoSession` trigger `response_route_fallback`'s doc names) is DROPPED by `DirectOnly`, never roster-fanned onto the claimed origin's channel |
+| (c) | `provider_policy_veto_denies_before_effects` | Q4 + the §3 step-10/11 order: a fully VALID owner-delegated proof the provider policy vetoes denies before effects (zero items, zero handler entry across the darkness window, the roster silent) AND the active reservation is RELEASED while the replay slot stays CONSUMED — the byte-identical re-submission is refused at the replay insert (step 10, before the policy at step 11) without re-running the policy (`policy_calls` stays exactly 1) and with zero effects again |
+
+Green at this head (executed):
+
+- Preserved + public-streaming-regression + `subnet_org_boundary` batch,
+  ONE invocation (`cargo t --retries 0 --test nrpc_streaming_gate --test
+  integration_nrpc_streaming --test integration_nrpc_client_streaming
+  --test integration_nrpc_duplex --test nrpc_registration_order --test
+  integration_nrpc_protected --test org_admission_wire --test
+  subnet_org_boundary`) → **89 run / 89 passed / 0 skipped**, exit 0. The
+  preserved trio (`client_streaming_denies_unauthorized_caller`,
+  `duplex_denies_unauthorized_caller`,
+  `denial_is_not_fanned_out_to_the_reply_roster`) ran inside
+  `nrpc_streaming_gate` (the roster's last PASS names the third).
+- In-source units, ONE invocation (`CARGO_INCREMENTAL=0 cargo tfl
+  adapter::net::cortex::rpc adapter::net::mesh_rpc org_stream`) →
+  **216 run / 216 passed / 5620 skipped** — count-continuous with 1.4's
+  216 (this slice adds NO in-source units): the preserved in-source bridge
+  trio (`client_stream_bridge_rejects_before_fold_end_to_end`,
+  `duplex_bridge_rejects_before_fold_end_to_end`,
+  `reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads`)
+  inside `adapter::net::mesh_rpc`, and the Stage 0 models
+  (`org_stream_lifecycle` / `org_stream_registry`) green and byte-untouched.
+- The admission unit pins (`cargo tfl behavior::org_admission::`) →
+  **19 run / 19 passed / 5817 skipped** (incl. the 1.6 pin-region units
+  `malformed_and_streaming_are_distinct`,
+  `stability_recheck_runs_after_credential_checks`,
+  `every_denial_maps_to_a_defined_coarse_reason` — green and unmodified).
+- Post-format green at the exact commit tree: `cargo t --retries 0 --test
+  org_rpc_streaming` → **27/27**, exit 0.
+- Frozen provenance hashes UNCHANGED: `d5faa9fe82f76db3…`
+  (old_org_admission.rs), `0ab7e915e835533c…` (old_org_call.rs),
+  `9c5963e8b14d003a…` (old_serve.rs).
+- Scoped rustfmt (`rustfmt --edition 2021 --config skip_children=true`)
+  on the four touched files; `--check` clean. Post-format shas:
+  `mesh_rpc.rs` `15fa31b9fe11bf5e…` (pre-format receipt baseline
+  `06cd466bc423f3b7…`), `tests/org_rpc_streaming.rs`
+  `1152cf264405663b…`, `s14.rs` `708bb1142657af83…`, `s15.rs`
+  `0b741589fb6c5fda…`. `behavior/org_admission.rs` restored
+  byte-identical at `33892cead2e82dde…` (receipt INV-C's baseline).
+
+**Inverse receipts (executed, raw).** Each mutation is a bounded diff at
+the PRODUCTION site; commands run from `net/crates/net/`; restores are
+edits-reversed + sha256-proven byte-identical to the pre-format
+baselines (`mesh_rpc.rs` `06cd466bc423f3b7…`, `org_admission.rs`
+`33892cead2e82dde…`), each closing with a green `cargo t --retries 0
+--test org_rpc_streaming` → `27 tests run: 27 passed`, exit 0.
+
+**INV-A — the prescribed inverse (REQUIRED): `DirectOnly` flipped to
+`RosterOnStaleDirect`.** Bounded diff at `mesh_rpc.rs`
+`ProtectedAdmission::response_route_fallback`'s protected arm (the
+`:7836` literal). Command: `cargo t --retries 0 --test
+org_rpc_streaming -E
+'test(=streaming_denial_is_not_fanned_out_to_the_reply_roster)'`.
+**Exit 100.** Verbatim failure:
+
+```
+thread 'streaming_denial_is_not_fanned_out_to_the_reply_roster' (160944) panicked at tests\org_rpc_streaming\s15.rs:202:9:
+assertion `left == right` failed: the bystander for a denial whose direct route is gone: 1 frame(s) reached the roster subscriber — a protected response was fanned out
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Summary [   1.218s] 1 test run: 0 passed, 1 failed, 26 skipped
+```
+
+The prescribed outcome exactly: the bystander (a same-origin roster
+subscriber of the claimed origin's reply channel) RECEIVES the terminal
+the moment the fallback flips. Restore: diff reversed;
+`06cd466bc423f3b7…` == baseline. Restored green: 27/27, exit 0.
+
+**INV-B — the forbidden opening dispatched despite its refusal.**
+Bounded diff at `mesh_rpc.rs` `admit_and_dispatch_protected_stream`'s
+`Err(OpeningRefusal::Denied(_))` arm (`let _ =
+fold.lock().apply_inbound(inbound);` — the worst-case admission failure:
+"denies to the caller but still executes the handler"). Command:
+`cargo t --retries 0 --test org_rpc_streaming -E
+'test(=forbidden_stream_opening_causes_zero_handler_effects)'`.
+**Exit 100.** Verbatim failure:
+
+```
+thread 'forbidden_stream_opening_causes_zero_handler_effects' (170024) panicked at tests\org_rpc_streaming.rs:2455:5:
+the caller is told exactly one denial
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Summary [  10.171s] 1 test run: 0 passed, 1 failed, 26 skipped
+```
+
+Analysis (stated per the rules): the mutation's handler effects surface
+on the WIRE first (the denial plus the handler's two chunks and its
+terminal), so the witness trips at its first effects observation — the
+"exactly one denial frame" property — before reaching
+`assert_handler_stays_dark`. The witness catches its own inverse at the
+first place effects become observable; four weakenings: **none applies**
+(the diff IS the property's own inverse and the witness reddens; nothing
+was weakened). Restore: diff reversed; `06cd466bc423f3b7…` == baseline.
+Restored green: 27/27.
+
+**INV-C — steps 10/11 swapped (the Q4/ordering inverse).** Bounded diff
+at `org_admission.rs` `verify_org_admission`: the provider-policy veto
+moved BEFORE the replay insert (two hunks — the policy block relocated
+above `let binding_digest`, its step-11 tail removed). Command:
+`cargo t --retries 0 --test org_rpc_streaming -E
+'test(=provider_policy_veto_denies_before_effects)'`. **Exit 100.**
+Verbatim failure:
+
+```
+thread 'provider_policy_veto_denies_before_effects' (168920) panicked at tests\org_rpc_streaming.rs:2812:5:
+assertion `left == right` failed: the replay slot stayed CONSUMED — the vetoed proof never reaches the policy again (step 10's insert precedes step 11's veto)
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The property's own inverse: with the veto ahead of the insert, the
+vetoed proof consumes no slot and REACHES THE POLICY AGAIN on
+re-submission (`policy_calls` 2 vs the pinned 1). Restore: both hunks
+reversed; `33892cead2e82dde…` == baseline. Restored green: 27/27.
+
+No witness stayed green under its own inverse.
+
+**Findings** (state, not decide):
+
+1. **F-S1.5-1 — the `Proceed(frame)` seam is realized as the unary
+   bridge's admission-mode branch (interpretation, source-established).**
+   The brief says "admission at the `Proceed(frame)` seam before
+   `fold.lock().apply_inbound(&frame)`"; the protected path cannot run
+   `bridge_preflight` (its `may_admit` allow-list is the PUBLIC gate —
+   "the caller's authorization is the org proof, never the announcement
+   allow-list") and cannot land on `apply_inbound` (admitted openings
+   must take `apply_inbound_admitted`). Implemented as the unary
+   bridge's exact structure: `match reg.admission()` with the protected
+   arm running `admit_and_dispatch_protected_stream` at the same
+   loop position — admission synchronous in the same bridge iteration
+   that used to fold-drive the frame. The brief's base-commit line
+   numbers (`mesh_rpc.rs:4242-4247`) name that fold-drive site.
+2. **F-S1.5-2 — `sender_keys` is not a server-streaming map
+   (source-established).** `RpcServerStreamingFold`'s per-call maps are
+   `in_flight` / `flow_control` / `protected_calls`; the
+   `RequestChunkSenders` map behind `sender_keys()` lives on the
+   client-streaming and duplex folds (there is no SS request-chunk
+   direction). The plan's "`in_flight_keys()`/`sender_keys()`"
+   observation is realized across the fold family: witness (a) observes
+   `in_flight_keys()` + `flow_control_permits` on the protected SS fold
+   AND `in_flight_keys()`/`sender_keys()` on REAL client-streaming and
+   duplex registrations fed the same forbidden opening shape (via the
+   new fixtures fold handles). Every named map is observed empty.
+3. **F-S1.5-3 — the record's real `session_id` is cache-carried
+   (source-established).** `cache_authenticated_response_destination`
+   stores `(AEAD-verified target node, receiving session_id)` — the
+   value is exactly the `SessionIdentity.session_id` the §3 record binds
+   ("the incarnation that received the request", R2-A). An exact
+   registry query (`session_for(key)`) is not reachable from
+   `mesh_rpc.rs` — the registry record's fields are private to
+   `cortex/rpc.rs` (F-S1.4-2's same API-addition boundary, ruling
+   territory). On a bounded route-cache eviction the job carries `0` and
+   `DirectOnly` drops it — the eviction trigger
+   `response_route_fallback`'s doc already names.
+4. **F-S1.5-4 — the lifetime policy at the bridge is `q1_defaults()`
+   (source-established).** Q1's "provider-configurable initial defaults
+   that must be validated at startup" has no per-registration or
+   per-node configuration surface at this stage; adding one is
+   API-addition territory. The `300 s` / `3600 s` defaults are wired
+   through `StreamCallLifetime` and the §2.1 resolution (1.3's
+   machinery) enforces them.
+5. **F-S1.5-5 — the `Sent`/`Refused`/`Unreachable` dispositions live at
+   the drainer/route layer, not on the call record (source-established
+   + executed).** F-S1.3-5's deferral is realized at the bounded
+   `RpcResponseJob` drainer (protected terminals) with structured logs
+   per disposition (`Refused` = the §2.8 bounded failure disposition
+   when the drainer is full). The call record's one-shot emission stays
+   `Queued` — its documented boundary ("the control path took the job").
+   Recording the transport disposition INTO `StreamCallRecord` would
+   need a `cortex/rpc.rs` seam (untouchable here) and a second
+   `record_emission` write past its one-shot guard — ruling territory.
+6. **F-S1.5-6 — `emit_admission_denial` is byte-unchanged
+   (source-established).** The protected terminal jobs reuse
+   `RpcResponseJob`'s EXISTING `session_id` field, so no struct change
+   was needed and the denial path — routing, job literal, coarse-byte
+   body — is exactly the 1.4 code. (Denial jobs keep `session_id: 0`:
+   "a denial answers no reservation", unchanged and correct.)
+7. **F-S1.5-7 — `ProtectedOpeningOutcome::Admitted` gained
+   `credential_ends_ns` (seam shape).** The §2.1 clamp inputs (the
+   proof's credential ends + the installed owner cert's end, checked
+   seconds→ns) ride the outcome out of the shared helper's existing
+   proof decode. The unary bridge ignores them (unary records keep
+   `deadline: None`, F-S1.4-4 — unary behavior unchanged) and `s14`'s
+   destructure adapted mechanically.
+8. **F-S1.5-8 — `call_streaming`'s `org_proof_intent` widening is NOT
+   here (ordering note).** The named1.6 inversion
+   (`call_streaming_mints_a_stream_proof`) owns it (F-S1.2-5). The 1.5
+   witnesses therefore drive their minted openings through the bridge's
+   exact hand-off seam with the REAL caller-side mint output
+   (`test_sign_admission_proof` — the witnesses feed the provider
+   literally the caller's bytes) and observe every response at real wire
+   endpoints.
+
+**CI pin data for Main (never edited here):** binary
+`org_rpc_streaming`, floor **27** (24 prior + 3 named), REQUIRED names
+exactly the twenty-seven (the twenty-four of §2.3 plus):
+
+`forbidden_stream_opening_causes_zero_handler_effects`,
+`streaming_denial_is_not_fanned_out_to_the_reply_roster`,
+`provider_policy_veto_denies_before_effects`.
+
+(suggested filter-set: the same twenty-seven space-separated.)
+
+**What never ran here (complete):**
+
+- `cargo fmt -p <crate> -- --check`, the four clippy invocations, the
+  five rustdoc lines and `cargo check --workspace --all-targets` —
+  Main's stage-end list (mid-flight rule). My four files were converged
+  with scoped `rustfmt` + `--check` (clean) but the gate command itself
+  never executed here.
+- `cargo tl` / `cargo t` full suites, `tests/cross_lang_*`, the wire
+  suite, the browser/SDK surfaces — stage-end (Main's) or other lanes'.
+- The 1.1/1.1a wire and handshake witnesses (S1Session's — re-run at
+  stage end).
+- CI itself (branch unpushed; nobody pushes but Main).
+- A live end-to-end `call_streaming` carrying an org proof over the
+  transport: `call_streaming` still refuses `org_proof_intent` until
+  slice 1.6's named inversion (`call_streaming_mints_a_stream_proof`,
+  F-S1.2-5/F-S1.5-8). The 1.5 witnesses' openings ride the bridge's
+  exact dispatcher hand-off with the real caller-side mint output; every
+  response they assert on rides the real transport to real endpoints.
+- CS/DX PROTECTED admission (Stage 2 by contract) and a per-node/
+  per-registration lifetime-policy knob (F-S1.5-4).
+- Windows workstation only: `#[cfg(unix)]` legs never compile here; no
+  Linux/macOS execution.
