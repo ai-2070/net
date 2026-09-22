@@ -38,7 +38,7 @@
 
 import { StoreError } from './errors.js';
 import type { JsonObject, JsonValue } from './json.js';
-import type { Decimal, Hex } from './wire.js';
+import { utf8Length, type Decimal, type Hex } from './wire.js';
 import type { StoreErrorCode } from './errors.js';
 
 /** Outcomes retained per handle (§2). */
@@ -271,8 +271,11 @@ export class HandleLedger {
 }
 
 function entryBytes(binding: RequestBinding, outcome: Outcome): number {
-  const payload = outcome.kind === 'result' ? JSON.stringify(outcome.out).length : outcome.code.length;
-  return binding.value.length + payload;
+  // UTF-8 BYTES, the unit `LEDGER_MAX_BYTES` bounds (the idiom
+  // `canonicalBytes` shows): `.length` counts UTF-16 code units and
+  // under-enforced the cap exactly for unicode-heavy inputs.
+  const payload = outcome.kind === 'result' ? JSON.stringify(outcome.out) : outcome.code;
+  return utf8Length(binding.value) + utf8Length(payload);
 }
 
 /**

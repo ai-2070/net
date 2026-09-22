@@ -236,9 +236,21 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
    * An equivalent snapshot is a no-op — same root reference, no
    * notifications — which is what stops a periodic resynchronization
    * from looking like a world change to every selector.
+   *
+   * Inside a handler it JOINS the open transaction, exactly as
+   * `applyOwnerUpdate` does: the owner's public `setState` reaches
+   * here through `commit`, and committing beside the transaction
+   * published a handler's world while `transact` then reported
+   * `action-rejected` for it — or, on the committing path, silently
+   * reverted the nested write after subscribers had seen it.
    */
   applySnapshot(raw: unknown): void {
     this.#refuseWhenClosed();
+    const open = this.#transaction;
+    if (open !== null && open.active) {
+      open.staged = this.#validate(raw);
+      return;
+    }
     this.#commit(this.#validate(raw));
   }
 

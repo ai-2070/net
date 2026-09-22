@@ -103,6 +103,15 @@ interface Outstanding {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: StoreError) => void;
   readonly at: number;
+  /**
+   * A transition's correlation (`join`/`aud`/`resume` slot), whose
+   * answer is the INSTALLATION. Settled by `settleTransitions`, never
+   * by the request clock: a snapshot still transferring at the 10 s
+   * deadline is a success in progress, not an unknown outcome — and
+   * holding the slot to the clock starved `MAX_OUTSTANDING` on
+   * successes.
+   */
+  readonly transition: boolean;
 }
 
 const encoder = new TextEncoder();
@@ -311,6 +320,11 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
 
   function settleReady(refusal: StoreError | null): void {
     if (replica.state === 'ready') {
+      // The INSTALLATION is a transition's answer (§2), so its
+      // correlation settles here: holding it to the request deadline
+      // both kept an `outstanding` slot for 10 s after a success and
+      // rejected a still-installing transition as `indeterminate`.
+      settleTransitions(null);
       for (const waiter of readyWaiters.splice(0, readyWaiters.length)) waiter.resolve();
       return;
     }
@@ -327,7 +341,23 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         replica.state === 'closed' ? 'owner-lost' : 'aborted',
         `the store handle is ${replica.state}`,
       );
+    settleTransitions(error);
     for (const waiter of readyWaiters.splice(0, readyWaiters.length)) waiter.reject(error);
+  }
+
+  /**
+   * Settle every transition correlation: the installation resolved
+   * them, or `error` is the typed answer that ended them. `act`
+   * correlations are untouched — an installation is no answer to a
+   * request that has its own `res`/`ok`/`no` coming.
+   */
+  function settleTransitions(error: StoreError | null): void {
+    for (const [q, waiter] of [...outstanding]) {
+      if (!waiter.transition) continue;
+      outstanding.delete(q);
+      if (error === null) waiter.resolve(undefined);
+      else waiter.reject(error);
+    }
   }
 
   const unsubscribe = options.transport.onEvent((event: TransportFrame) => {
@@ -386,6 +416,13 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     if (closed) return;
     const at = now();
     for (const [q, waiter] of [...outstanding]) {
+      // A transition is settled by its installation or its typed
+      // refusal — and timed out by the replica's own re-ask ladder,
+      // which recovers where the clock cannot. The request clock is
+      // for `act`, where an unanswered request's outcome is UNKNOWN:
+      // a snapshot still transferring here is a success in progress,
+      // and rejecting it reported failure for a success.
+      if (waiter.transition) continue;
       if (at - waiter.at < REQUEST_DEADLINE_MS) continue;
       outstanding.delete(q);
       // Submitted and unanswered: the outcome is unknown, and saying
@@ -422,7 +459,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
 
   dispatch(framesOf([replica.join()]));
 
-  function correlate<T>(q: Hex): Promise<T> {
+  function correlate<T>(q: Hex, transition = false): Promise<T> {
     if (outstanding.size >= MAX_OUTSTANDING) {
       return Promise.reject(new StoreError('capacity', 'too many requests are already outstanding'));
     }
@@ -433,6 +470,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         },
         reject,
         at: now(),
+        transition,
       });
     });
   }
@@ -479,14 +517,25 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       if (h === null) throw new StoreError('not-ready', 'no handle yet: the join has not been answered');
       sequence += 1n;
       const q = (options.newQ ?? (() => randomHex(8) as Hex))();
-      const frame = encodeMessage({
-        k: 'act',
-        q,
-        h,
-        s: sequence.toString(),
-        name,
-        in: input as never,
-      });
+      let frame: string;
+      try {
+        frame = encodeMessage({
+          k: 'act',
+          q,
+          h,
+          s: sequence.toString(),
+          name,
+          in: input as never,
+        });
+      } catch (error) {
+        // `encodeMessage` refuses source values JSON would silently
+        // destroy (`NaN` as `null`, a dropped `undefined` key) with a
+        // bare `RangeError` — which every `error.code` branch in
+        // application code misses. Invalid data throws `StoreError`.
+        throw new StoreError('invalid-data', `the input for '${name}' cannot be encoded`, {
+          cause: error,
+        });
+      }
       const answered = correlate<unknown>(q);
       // The frame goes out AFTER the correlation is registered, or a
       // reply that arrives immediately has nothing to resolve.
@@ -501,36 +550,48 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       // hand back and loss is not an error.
       const next = (inputSequences.get(name) ?? 0n) + 1n;
       inputSequences.set(name, next);
-      const frame = encodeMessage({
-        k: 'in',
-        h,
-        s: next.toString(),
-        name,
-        in: value as never,
-      });
+      let frame: string;
+      try {
+        frame = encodeMessage({
+          k: 'in',
+          h,
+          s: next.toString(),
+          name,
+          in: value as never,
+        });
+      } catch (error) {
+        // Same contract as `act`: invalid data throws `StoreError`.
+        throw new StoreError('invalid-data', `the input for '${name}' cannot be encoded`, {
+          cause: error,
+        });
+      }
       dispatch([frame]);
       return { type: next === 1n ? 'queued' : 'replaced' };
     },
     setAudience: async names => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
       const requests = replica.setAudience(names);
-      const slot = requests[0];
-      if (slot === undefined) {
-        // An equal transition is already in flight: this caller joins
-        // it as another waiter rather than opening a second one.
-        return;
-      }
-      const answered = correlate<unknown>(slot.q).then(() => undefined);
-      await send(framesOf(requests));
       // The transition completes on the INSTALLATION, not on an
       // acknowledgement: the manifest that answers it carries the same
-      // `q`, and the replica publishes when the last chunk lands.
-      await Promise.race([
-        answered,
-        new Promise<void>(resolve => {
-          readyWaiters.push({ resolve, reject: () => undefined });
-        }),
-      ]);
+      // `q`, and the replica publishes when the last chunk lands. The
+      // waiter is registered BEFORE the request goes out, or an
+      // installation that lands immediately finds nothing to settle.
+      const installed = new Promise<void>((resolve, reject) => {
+        readyWaiters.push({ resolve, reject });
+      });
+      const slot = requests[0];
+      if (slot === undefined) {
+        // An equal transition is already in flight: this caller joined
+        // it as another waiter and awaits THAT transition (§2: "an
+        // equal pending request awaits that transition"). Returning
+        // here resolved over the `empty()` view the transition had
+        // just cleared, with the install still on the wire.
+        await installed;
+        return;
+      }
+      const answered = correlate<unknown>(slot.q, true).then(() => undefined);
+      await send(framesOf(requests));
+      await Promise.race([answered, installed]);
     },
     reconnect: async () => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');

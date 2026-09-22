@@ -239,8 +239,15 @@ export interface LeafWasmNode {
   /**
    * Sign and send a `0x0D02` signalling envelope to `peer` through the
    * control plane — no session with `peer` needed.
+   *
+   * `dialog_hex` is the attempt's id, 16 lowercase hex digits — the
+   * same spelling {@link LeafWasmNode.peer_offer} resolves to and the
+   * `*_in` forms take. A number would not do: `DialogId` is a `u64`
+   * minted from the full CSPRNG range, and one carried through a JS
+   * number comes back rounded (`as f64 as u64`), so ~511 of every 512
+   * minted dialogs would name no attempt at all.
    */
-  signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void>;
+  signal(peer_hex: string, dialog_hex: string, kind: string, payload: Uint8Array): Promise<void>;
   /**
    * Offer a direct browser ↔ browser connection to `peer` (plan §9
    * steps 2–3). Resolves to the dialog id, 16 lowercase hex digits.

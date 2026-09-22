@@ -164,8 +164,10 @@ describe('MeshSession', () => {
     expect(fake.published).toEqual([{ channel: 'chan', payload: new Uint8Array([7]) }]);
     await session.announce(['cap:one']);
     expect(fake.announced).toEqual([['cap:one']]);
-    await session.signal('00000000deadbeef', 3, 'offer', new Uint8Array([1]));
-    expect(fake.signalled).toEqual([{ peerHex: '00000000deadbeef', dialog: 3, kind: 'offer' }]);
+    await session.signal('00000000deadbeef', '0000000000000003', 'offer', new Uint8Array([1]));
+    expect(fake.signalled).toEqual([
+      { peerHex: '00000000deadbeef', dialog: '0000000000000003', kind: 'offer' },
+    ]);
 
     const descriptors = await session.query('cap:one');
     expect(descriptors).toHaveLength(1);

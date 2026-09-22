@@ -115,7 +115,7 @@ export class FakeSession implements LeafWasmSession {
   readonly peerHandshakes: Array<{ peer: string; dialog: string }> = [];
   readonly published: { channel: string; payload: Uint8Array }[] = [];
   readonly announced: string[][] = [];
-  readonly signalled: { peerHex: string; dialog: number; kind: string }[] = [];
+  readonly signalled: { peerHex: string; dialog: string; kind: string }[] = [];
   readonly streams: FakeProxyStream[] = [];
   enrollCalls = 0;
   closed = false;
@@ -248,7 +248,7 @@ export class FakeSession implements LeafWasmSession {
     return this.behaviour.enrolled ?? true;
   }
 
-  async signal(peer_hex: string, dialog: number, kind: string, _payload: Uint8Array): Promise<void> {
+  async signal(peer_hex: string, dialog: string, kind: string, _payload: Uint8Array): Promise<void> {
     this.signalled.push({ peerHex: peer_hex, dialog, kind });
   }
 

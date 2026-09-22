@@ -287,8 +287,8 @@ export class MeshSession {
    * Sign and send a `0x0D02` signalling envelope — the
    * session-independent path, so no session with `peer` is needed.
    */
-  async signal(peerHex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
-    await this.guard(() => this.inner.signal(peerHex, dialog, kind, payload));
+  async signal(peerHex: string, dialogHex: string, kind: string, payload: Uint8Array): Promise<void> {
+    await this.guard(() => this.inner.signal(peerHex, dialogHex, kind, payload));
   }
 
   /**

@@ -150,7 +150,7 @@ export class FakeNode implements LeafWasmNode {
   readonly announced: string[][] = [];
   readonly calls: Array<{ service: string; payload: Uint8Array; timeoutMs?: number }> = [];
   readonly streams: FakeStream[] = [];
-  readonly signals: Array<{ peerHex: string; dialog: number; kind: string; payload: Uint8Array }> = [];
+  readonly signals: Array<{ peerHex: string; dialog: string; kind: string; payload: Uint8Array }> = [];
   readonly peerOffers: string[] = [];
   readonly peerAccepts: string[] = [];
   readonly peerCandidates: string[] = [];
@@ -231,7 +231,7 @@ export class FakeNode implements LeafWasmNode {
     return this.behaviour.originHashHex ?? '00000000000000bb';
   }
 
-  async signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
+  async signal(peer_hex: string, dialog: string, kind: string, payload: Uint8Array): Promise<void> {
     if (this.behaviour.signalError !== undefined) throw this.behaviour.signalError;
     this.signals.push({ peerHex: peer_hex, dialog, kind, payload });
   }

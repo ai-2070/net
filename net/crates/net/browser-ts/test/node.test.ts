@@ -282,9 +282,18 @@ describe('BrowserNode', () => {
   it('sends a session-independent signalling envelope', async () => {
     const inner = new FakeNode();
     const node = await connected(inner);
-    await node.signal('beefcafe00000002', 4, 'offer', new Uint8Array([1, 2]));
+    // The dialog is the 16-hex spelling, passed through verbatim: a
+    // numeric dialog is a `u64` through a JS number, and one round
+    // trip through `as f64 as u64` rounds ~511 of every 512 minted
+    // ids into a dialog that names no attempt.
+    await node.signal('beefcafe00000002', '0000000000000004', 'offer', new Uint8Array([1, 2]));
     expect(inner.signals).toEqual([
-      { peerHex: 'beefcafe00000002', dialog: 4, kind: 'offer', payload: new Uint8Array([1, 2]) },
+      {
+        peerHex: 'beefcafe00000002',
+        dialog: '0000000000000004',
+        kind: 'offer',
+        payload: new Uint8Array([1, 2]),
+      },
     ]);
   });
 

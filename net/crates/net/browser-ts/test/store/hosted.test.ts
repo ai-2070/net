@@ -24,7 +24,7 @@ import {
   type TransportStream,
 } from '../../src/store/host.js';
 import { joinStore } from '../../src/store/join.js';
-import { MAX_OUTSTANDING } from '../../src/store/join.js';
+import { MAX_OUTSTANDING, REQUEST_DEADLINE_MS } from '../../src/store/join.js';
 import type { Cancel } from '../../src/store/types.js';
 import { StoreError } from '../../src/store/errors.js';
 import { MAX_JOIN_REASKS } from '../../src/store/replica.js';
@@ -1296,6 +1296,100 @@ describe('audience and recovery over the transport', () => {
   });
 });
 
+describe('an equal pending audience request awaits the transition', () => {
+  it('resolves at installation, not over the cleared view', async () => {
+    // Two rapid `setAudience` calls share one wire transition. The
+    // second joins it as a local waiter, and §2 is explicit: "an equal
+    // pending request awaits that transition". Resolving it at t0 gave
+    // the caller the `empty()` world the request had just cleared,
+    // with the install still on the wire.
+    const { joined } = wired();
+    await joined.ready();
+
+    const first = joined.setAudience(['secrets']);
+    const second = joined.setAudience(['secrets']).then(() => {
+      // Read at RESOLUTION: the projection is installed, not `empty()`.
+      expect(joined.getState().secrets).toEqual({ plan: 7 });
+      expect(joined.getState().crew).toEqual({});
+    });
+    await second;
+    await first;
+  });
+});
+
+describe('an audience transition settles at installation', () => {
+  it('is not reported failed by the request deadline while still installing', async () => {
+    // The `aud` correlation is answered by the INSTALLATION, not by a
+    // `res`/`ok`/`no`. Settling it only at the 10 s request deadline
+    // reported `indeterminate` for a transition that then installed —
+    // failure for a success.
+    const { joined, net, time } = wired();
+    await joined.ready();
+
+    // The request never leaves: the transition stays installing while
+    // the request deadline sweeps past it.
+    net.holdNextSend(CALLER_NODE);
+    const changing = joined.setAudience(['secrets']);
+    await flush(12);
+    time.advance(REQUEST_DEADLINE_MS);
+    // The store's own ladder re-asks under the deadline; the late
+    // frame and its answer are counted, never confused for the live
+    // slot. Either way the transition completes on an installation.
+    net.settleHeld(false);
+    await flush(12);
+
+    await expect(changing).resolves.toBeUndefined();
+    expect(joined.getState().secrets).toEqual({ plan: 7 });
+  });
+
+  it('releases its outstanding slot at installation, not at the deadline', async () => {
+    // Each transition installed successfully, yet its correlation
+    // survived installation and held one of `MAX_OUTSTANDING` slots
+    // until the 10 s sweep — so 64 successes starved the 65th request
+    // into a `capacity` refusal.
+    const { joined } = wired();
+    await joined.ready();
+
+    for (let i = 0; i < MAX_OUTSTANDING; i += 1) {
+      await joined.setAudience([i % 2 === 0 ? 'secrets' : 'crew']);
+    }
+
+    await expect(joined.setAudience(['secrets'])).resolves.toBeUndefined();
+    // …and ordinary requests are not starved either.
+    await expect(joined.act('fire', { power: 0 })).resolves.toEqual({ shot: 10 });
+  });
+});
+
+describe('an unencodable input is a StoreError', () => {
+  it('rejects `act` with `invalid-data` and its cause, not a bare RangeError', async () => {
+    // `encodeMessage` refuses a value JSON would silently destroy
+    // (`NaN` becomes `null`). Outside a wrap that is a bare
+    // `RangeError`, and every `error.code` branch in application code
+    // misses it — against "Invalid data still throws `StoreError`".
+    const { joined } = wired();
+    await joined.ready();
+
+    let thrown: unknown;
+    try {
+      await joined.act('fire', { power: Number.NaN } as never);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+    expect((thrown as StoreError).cause).toBeInstanceOf(RangeError);
+
+    let inputThrown: unknown;
+    try {
+      joined.input('helm', { heading: Number.NaN });
+    } catch (error) {
+      inputThrown = error;
+    }
+    expect(inputThrown).toBeInstanceOf(StoreError);
+    expect((inputThrown as StoreError).code).toBe('invalid-data');
+  });
+});
+
 describe('a snapshot that loses a chunk recovers by itself', () => {
   it('abandons the stalled assembly, asks again, and installs', async () => {
     // The shape a real browser produced: ONE dropped datagram and a
@@ -2262,8 +2356,15 @@ describe('the host’s own surface', () => {
     expect(net.kinds(HOST_NODE).length).toBeGreaterThan(framesBefore);
     // One code for unknown, expired, fenced and mis-bound alike.
     expect(refused).toBe('closed');
+    // Nothing was ADOPTED: the successor never issued that handle, and
+    // the write it carried was never applied. This is the claim.
     expect(successor.getState().hull).toBe(10);
-    expect(successor.counts().handles).toBe(0);
+    // What the successor holds now, it minted itself. `closed` is handle
+    // death, so a live replica asks again rather than sitting on a handle
+    // the owner has refused — an issuance, which is not the adoption this
+    // witness is about. Exactly one: the stale handle was not carried
+    // over, and the rejoin did not leak a second.
+    expect(successor.counts().handles).toBe(1);
     await successor.close();
     await joined.close();
   });

@@ -18,7 +18,8 @@
  */
 
 import { StoreError } from './errors.js';
-import { MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_CHUNKS, utf8Length } from './wire.js';
+import type { JsonValue } from './json.js';
+import { inadmissibleValue, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_CHUNKS, utf8Length } from './wire.js';
 
 /**
  * Room left for everything in a `snap` that is not `d`.
@@ -80,6 +81,18 @@ export function assertChunkingFits(maxEventBytes: number): number {
       `a ${maxEventBytes} B event leaves ${chunkBytes} B per chunk, below the ${MIN_CHUNK_BYTES} B floor`,
     );
   }
+  // The product, not just the floor: chunks that meet MIN_CHUNK_BYTES
+  // can still be unable to carry MAX_SNAPSHOT_BYTES within
+  // MAX_SNAPSHOT_CHUNKS, and the store would start and then discover
+  // that on its first large projection — the exact opposite of the
+  // promise above.
+  if (chunkBytes * MAX_SNAPSHOT_CHUNKS < MAX_SNAPSHOT_BYTES) {
+    throw new StoreError(
+      'capacity',
+      `a ${maxEventBytes} B event leaves ${chunkBytes} B per chunk: ${MAX_SNAPSHOT_CHUNKS} of them cover ` +
+        `${chunkBytes * MAX_SNAPSHOT_CHUNKS} B, below the ${MAX_SNAPSHOT_BYTES} B snapshot bound`,
+    );
+  }
   return chunkBytes;
 }
 
@@ -111,6 +124,15 @@ export function chunkSnapshot(state: unknown, chunkBytes: number): Chunked {
     // the replica cannot parse.
     throw new StoreError('invalid-data', 'the projected state is not JSON');
   }
+  // The admissible-value scan, over the SNAPSHOT document like every
+  // other value-bearing payload. `JSON.stringify` is lossy and silent:
+  // `NaN`/`Infinity` become `null` and an `undefined`-valued own key
+  // disappears — the manifest would ship a document the owner never
+  // held, and the delta-overflow fallback is exactly this path.
+  const bad = inadmissibleValue(state as JsonValue, 'state');
+  if (bad !== null) {
+    throw new StoreError('invalid-data', `the projected state is not admissible JSON: ${bad}`);
+  }
   const bytes = new TextEncoder().encode(json);
   if (bytes.length > MAX_SNAPSHOT_BYTES) {
     throw new StoreError(
@@ -138,16 +160,37 @@ export function chunkSnapshot(state: unknown, chunkBytes: number): Chunked {
   return { bytes: bytes.length, n: pieces.length, pieces };
 }
 
+/**
+ * Chars per bulk conversion step.
+ *
+ * `btoa`/`atob` traffic in binary strings, and building one a byte at
+ * a time is a call per byte over up to a megabyte — against "never
+ * avoidably allocate, copy, or compute". Conversion runs in bounded
+ * pieces; 0x8000 stays under every engine's argument-count bound.
+ */
+const CONVERSION_CHARS = 0x8000;
+
 /** Canonical base64: standard alphabet, padded, no line breaks. */
 export function base64(bytes: Uint8Array): string {
   let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
+  for (let offset = 0; offset < bytes.length; offset += CONVERSION_CHARS) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + CONVERSION_CHARS));
+  }
   return btoa(binary);
 }
 
-/** The inverse of {@link base64}, refusing anything non-canonical. */
+/**
+ * The inverse of {@link base64}.
+ *
+ * Canonicality is the CALLER's gate: `isCanonicalBase64` runs in the
+ * wire decoder and again in `Assembly.accept`. This only decodes —
+ * `atob` accepts non-canonical spellings, so a direct caller MUST run
+ * that check first.
+ */
 export function fromBase64(text: string): Uint8Array {
   const binary = atob(text);
+  // Straight into the destination: there is no bulk binary-string →
+  // bytes primitive to chunk here, and no intermediate is built.
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
   return out;

@@ -216,6 +216,68 @@ describe('C — an application callback that throws', () => {
 
     expect(() => store.receive(joinFrame(), PEER)).not.toThrow();
   });
+
+  it('refuses a handle typed when a commit can no longer project for it', () => {
+    // The `propagate` side of the same application failure: the
+    // projection worked at join and dies at a later commit, with
+    // `empty()` broken too. Silence left the replica at its old
+    // revision reporting `ready, stale: false`.
+    let broken = false;
+    const store = owner({
+      definition: definition({ empty: failingEmpty() }),
+      project: state => {
+        if (broken) throw new Error('projection explodes');
+        return state;
+      },
+    });
+
+    // A caller holding a live view of that handle, through the real
+    // replica.
+    const replicaDefinition = definition();
+    const replicaCore = new StoreCore<Doc, Record<string, never>, Record<string, never>>({
+      definition: replicaDefinition,
+      initialState: { tick: 0 },
+    });
+    let replicaQs = 0;
+    const replica = new StoreReplica<Doc, Record<string, never>, Record<string, never>>({
+      definition: replicaDefinition,
+      core: replicaCore,
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: () => 0,
+      newQ: () => (++replicaQs).toString(16).padStart(16, '0') as Hex,
+      audience: ['crew'],
+      store: 'test-store',
+      key: 'k',
+    });
+    const toReplica = (frames: readonly { readonly frame: string }[]) =>
+      frames.flatMap(frame => replica.receive(frame.frame).out);
+    const joined = store.receive(replica.join().frame, PEER);
+    const h = handleOf(joined.out);
+    toReplica(joined.out);
+    expect(replica.state).toBe('ready');
+    expect(store.handleCount).toBe(1);
+
+    broken = true;
+    const committed = store.commit({ tick: 2 });
+
+    // The caller is TOLD — `closed`, the only unsolicited refusal the
+    // wire admits — and the handle goes with it.
+    expect(committed.out).toHaveLength(1);
+    const decoded = decodeMessage(committed.out[0]!.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+    expect(decoded.ok && decoded.message.k).toBe('no');
+    expect(decoded.ok && decoded.message.k === 'no' && decoded.message.code).toBe('closed');
+    expect(decoded.ok && decoded.message.k === 'no' && decoded.message.h).toBe(h);
+    expect(store.handleCount).toBe(0);
+
+    // And the ladder lands the TYPED refusal at the caller: the notice
+    // provokes a rejoin, and the join — a request path that CAN carry
+    // a refusal — answers `capacity` correlated.
+    const rejoined = toReplica(committed.out);
+    expect(rejoined.map(request => request.kind)).toEqual(['join']);
+    toReplica(store.receive(rejoined[0]!.frame, PEER).out);
+    expect(replica.state).toBe('fenced');
+    expect(replicaCore.getStatus().error?.code).toBe('capacity');
+  });
 });
 
 describe('C — a solicited `resync` is a read', () => {

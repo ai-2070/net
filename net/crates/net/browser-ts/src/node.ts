@@ -456,10 +456,16 @@ export class BrowserNode {
   /**
    * Sign and send a `0x0D02` signalling envelope to `peer` — the
    * session-independent path, so no session with `peer` is needed.
+   *
+   * `dialogHex` is the attempt's id, 16 lowercase hex digits — the
+   * same value {@link BrowserNode.offerPeer} resolves to. Never a
+   * number: a `u64` dialog through a JS number comes back rounded,
+   * and an envelope signed for a dialog that names no attempt kills
+   * the attempt at its ICE deadline.
    */
-  async signal(peerHex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
+  async signal(peerHex: string, dialogHex: string, kind: string, payload: Uint8Array): Promise<void> {
     try {
-      await this.inner.signal(peerHex, dialog, kind, payload);
+      await this.inner.signal(peerHex, dialogHex, kind, payload);
     } catch (error) {
       throw fromWasmError(error);
     }

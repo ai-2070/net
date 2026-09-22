@@ -808,7 +808,7 @@ export function decimalValue(value: Decimal): bigint {
  * rather than a substitution. `null` itself stays admissible: an
  * intentional null is data.
  */
-function inadmissibleValue(value: JsonValue | undefined, path: string): string | null {
+export function inadmissibleValue(value: JsonValue | undefined, path: string): string | null {
   if (value === null) return null;
   switch (typeof value) {
     case 'boolean':

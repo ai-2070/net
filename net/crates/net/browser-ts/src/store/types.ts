@@ -3,7 +3,13 @@
  *
  * These are the declarations from
  * `docs/internal/plans/BROWSER_GAME_STORE_API_DESIGN.md` §2, moved into
- * the package so they are compiled rather than merely written down.
+ * the package so they are compiled rather than merely written down — but
+ * compiled is all that binds them: the shipped handles are
+ * `HostedStoreHandle` (`host.ts`) and `JoinedStoreHandle` (`join.ts`), and
+ * `OperationOptions`, `StoreLimits`, `HostedStore` and `JoinedStore` below
+ * have no implementor (`HostedStoreHandle.setState(next)` full-replaces;
+ * `joinStore` returns `JoinedStoreHandle` synchronously with
+ * `act(name, input)` / `input(name, value)`, no options).
  *
  * Two of them encode a review disposition and must not be "simplified":
  *

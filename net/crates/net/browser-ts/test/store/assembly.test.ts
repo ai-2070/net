@@ -33,7 +33,7 @@ import {
   SNAP_ENVELOPE_RESERVE,
 } from '../../src/store/chunker.js';
 import { StoreError } from '../../src/store/errors.js';
-import { decodeMessage, encodeMessage, MAX_SNAPSHOT_CHUNKS } from '../../src/store/wire.js';
+import { decodeMessage, encodeMessage, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_CHUNKS } from '../../src/store/wire.js';
 
 const H = 'a'.repeat(32);
 const INC = 'f'.repeat(16);
@@ -162,6 +162,34 @@ describe('the budget is derived from the transport, not assumed', () => {
     expect(() => assertChunkingFits(0)).toThrow(/no usable event size/);
   });
 
+  it('refuses a chunk size that cannot tile the snapshot bound', () => {
+    // The per-chunk floor alone admitted a transport whose chunks
+    // cannot cover `MAX_SNAPSHOT_BYTES` within `MAX_SNAPSHOT_CHUNKS`:
+    // the store started and then failed on its first large projection.
+    // The guard's own promise is "Refuse to start rather than discover
+    // the numbers later".
+    const floor = Math.ceil(MAX_SNAPSHOT_BYTES / MAX_SNAPSHOT_CHUNKS);
+
+    // 5675 B of event: 4110 B per chunk — above MIN_CHUNK_BYTES, but
+    // 4110 × 255 cannot cover a 1 MiB snapshot.
+    let thrown: unknown;
+    try {
+      assertChunkingFits(5675);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('capacity');
+    // Same shape deep inside the window: the floor passes, the product
+    // does not.
+    expect(() => assertChunkingFits(3000)).toThrow(StoreError);
+
+    // Positive control at the boundary: exactly enough per chunk
+    // starts, and reports the size it derived.
+    expect(assertChunkingFits(5676)).toBe(floor);
+    expect(floor).toBeGreaterThan(MIN_CHUNK_BYTES);
+  });
+
   it('keeps every frame inside the cap at the derived size', () => {
     // The reserve is a bound, so a full chunk plus the largest
     // plausible envelope still fits. `carry` asserts this per frame.
@@ -240,6 +268,42 @@ describe('the chunker refuses rather than truncates', () => {
 
   it('refuses a state that is not JSON', () => {
     expect(() => chunkSnapshot(() => 1, 1024)).toThrow(/not JSON/);
+  });
+
+  it('refuses a snapshot JSON would silently destroy', () => {
+    // `JSON.stringify` renders `NaN`/`Infinity` as `null` and drops an
+    // `undefined`-valued own key — the manifest would ship a document
+    // the owner never held, and the delta-overflow fallback is exactly
+    // this path. The scan that refuses this for `act`/`in`/`res`/
+    // `delta` payloads covers the snapshot document too.
+    const chunk = chunkBytesFor(MAX_EVENT_BYTES);
+    for (const bad of [
+      { n: Number.NaN },
+      { n: Number.POSITIVE_INFINITY },
+      { n: Number.NEGATIVE_INFINITY },
+    ]) {
+      let thrown: unknown;
+      try {
+        chunkSnapshot(bad, chunk);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(StoreError);
+      expect((thrown as StoreError).code).toBe('invalid-data');
+    }
+
+    // The dropped-key half of the same silent loss.
+    let thrown: unknown;
+    try {
+      chunkSnapshot({ u: undefined }, chunk);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+
+    // Positive control: an intentional null is data and still ships.
+    expect(chunkSnapshot({ n: null }, chunk).n).toBe(1);
   });
 });
 
