@@ -364,7 +364,10 @@ impl RxStream {
         // The concession is the sequences no released record covers,
         // counted in one arithmetic step: subtracting the record
         // COUNT over-counted the gap by `sum(span - 1)`.
-        counters.drop_n(DropReason::FireAndForgetGap, conceded.saturating_sub(covered));
+        counters.drop_n(
+            DropReason::FireAndForgetGap,
+            conceded.saturating_sub(covered),
+        );
         let mut out = released;
         out.extend(self.drain());
         out
@@ -678,7 +681,10 @@ mod tests {
     /// The same record with an explicit span — a reassembled group
     /// consumes the sequences its fragments arrived on.
     fn span_rec(seq: u64, span: u64, tag: u8) -> StreamRecord {
-        StreamRecord { span, ..rec(seq, tag) }
+        StreamRecord {
+            span,
+            ..rec(seq, tag)
+        }
     }
 
     /// The boundary handoff, where a held record's span STRADDLES the

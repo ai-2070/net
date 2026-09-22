@@ -1693,7 +1693,9 @@ fn stand_down(shared: &Rc<Shared>, successor: u64) {
     // closed. A permanent zombie, in exactly the frozen-tab scenario
     // `guard_lease` stands this tab down for.
     if let Err(error) = resume_as_follower(shared, ours) {
-        report(&format!("re-attaching as a follower after stand-down: {error}"));
+        report(&format!(
+            "re-attaching as a follower after stand-down: {error}"
+        ));
     }
 }
 

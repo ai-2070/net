@@ -1272,10 +1272,11 @@ async fn closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its
         .await
         .expect("the promoted tab holds a stream of its own before the handoff");
     assert!(
-        leader_log.borrow().performed.iter().any(|request| matches!(
-            request,
-            LeaderRequest::StreamOpen { .. }
-        )),
+        leader_log
+            .borrow()
+            .performed
+            .iter()
+            .any(|request| matches!(request, LeaderRequest::StreamOpen { .. })),
         "the premise: the stream open really happened"
     );
 
@@ -1472,10 +1473,7 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
     let channel = web_sys::BroadcastChannel::new(&scope).expect("channel");
     let before = log.borrow().performed.len();
     channel
-        .post_message(&JsValue::from_str(&post(
-            successor.generation(),
-            "control",
-        )))
+        .post_message(&JsValue::from_str(&post(successor.generation(), "control")))
         .expect("post");
     settle().await;
     settle().await;

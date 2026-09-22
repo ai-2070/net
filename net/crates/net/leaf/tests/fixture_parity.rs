@@ -97,12 +97,11 @@ fn every_package_vector_mirrors_its_repository_original() {
         "src/test_vectors/ and the ALL registry disagree — a vector added but \
          unregistered is invisible to the parity above"
     );
-    let mut repository: Vec<String> = json_names(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/cross_lang_wire"),
-    )
-    .into_iter()
-    .filter(|name| !REPOSITORY_ONLY.contains(&name.as_str()))
-    .collect();
+    let mut repository: Vec<String> =
+        json_names(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/cross_lang_wire"))
+            .into_iter()
+            .filter(|name| !REPOSITORY_ONLY.contains(&name.as_str()))
+            .collect();
     repository.sort();
     if !repository.is_empty() {
         assert_eq!(
