@@ -1,0 +1,32 @@
+net/crates/net/sdk/tests/enrollment_join.rs
+  s_3f3d4c91f992be::t_436cac5bd26f8e 20
+  s_3f3d4c91f992be::t_e2e4826d0c49b6 453-456
+  s_3f3d4c91f992be::t_3f70cb54367b5b 262-283
+  s_3f3d4c91f992be::t_1c2c37f8b09d72 284-350
+  s_3f3d4c91f992be::t_36900abfe5c7dd 1-19,21-261,351-452,457
+net/crates/net/sdk/src/enrollment/bundle.rs
+  s_3f3d4c91f992be::t_a0899612833b76 1-384
+net/crates/net/sdk/src/enrollment/invite.rs
+  s_3f3d4c91f992be::t_225e12d75af95d 141,147
+net/crates/net/sdk/src/enrollment/device.rs
+  s_3f3d4c91f992be::t_436cac5bd26f8e 214-217
+  s_3f3d4c91f992be::t_60278e6782d300 1-213,218-234
+net/crates/net/sdk/src/enrollment.rs
+  s_3f3d4c91f992be::t_225e12d75af95d 78-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e70c0c41d653bb43fb64227b3cd8c0b56943123",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
