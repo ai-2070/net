@@ -138,13 +138,13 @@ fn check_relations(relations: &[Relation]) -> Result<(), InviteError> {
     Ok(())
 }
 
-fn put_relations(out: &mut Vec<u8>, relations: &[Relation]) {
+pub(super) fn put_relations(out: &mut Vec<u8>, relations: &[Relation]) {
     // Bounded by MAX_RELATIONS.
     out.push(relations.len() as u8);
     out.extend(relations.iter().map(|r| r.tag()));
 }
 
-fn take_relations(r: &mut Reader<'_>) -> Result<Vec<Relation>, InviteError> {
+pub(super) fn take_relations(r: &mut Reader<'_>) -> Result<Vec<Relation>, InviteError> {
     let n = r
         .take_arr::<1>()
         .ok_or(InviteError::Malformed("truncated"))?[0] as usize;

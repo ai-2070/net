@@ -75,6 +75,12 @@ pub mod redeem;
 // Enrollment redemption listener over the shared ledger.
 pub mod service;
 
+// Membership-only bundle (signed receipt + PSK + contact) and its issuer.
+pub mod bundle;
+
+// Device-side durable join: persist, redeem, verify, install.
+pub mod device;
+
 // Durable, issuer-bound invitation ledger for the same V3 path; not a verifier.
 // (Outer `///` docs here would resolve the module's intra-doc links in this scope.)
 pub mod store;
