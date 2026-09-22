@@ -3166,3 +3166,98 @@ surface. Two earlier receipt cycles (an R-S2.2a/b pair) were lost to a
 same-file parallel-mutation race and are NOT cited anywhere — they were
 superseded by the sequential re-runs recorded above (the race's outputs
 are discarded, not merged).
+
+### 4.3 Slice 2.3 — duplex response flow control (C8)
+
+**Landed (executed):** `S2.3: honor the duplex response window on the
+public fold (C8)` (3 files) on base `5e1b079c0`. All receipts run against
+the frozen formatted tree; `cortex/rpc.rs` receipt baseline for this
+slice: `70b59a13884054675a2aeefd8f30803fe15be232497c9a18454fa9d0a81a70d7`.
+
+**What landed (source-established):** the C8 public-half completion (the
+protected machinery landed at 2.2, F-S2.2-1): the public duplex REQUEST
+arm installs the opted-in `nrpc-stream-window-initial` response
+semaphore into the `flow_control` map and the public pump pays one credit
+per chunk before emitting (the SS pump's acquire clause, including its
+closed-semaphore `break`); the public CANCEL arm drops the window entry
+(the SS clause). `DISPATCH_RPC_STREAM_GRANT` remains the ONLY credit
+source — the cross-direction `DISPATCH_RPC_REQUEST_GRANT` kind
+(server → caller upload grants) never reaches the arm.
+
+**Witnesses + counts (executed):** `org_rpc_streaming` binary **37 → 39**.
+
+| Witness | Asserted observation | Named inverse |
+|---|---|---|
+| `duplex_response_window_blocks_until_grant` | C8's regression witness, PROTECTED and PUBLIC legs: with zero initial credit the response pump PARKS (the queued echo publishes NOTHING through the bounded darkness window on both folds; `flow_control_permits == Some(0)`), and a `STREAM_GRANT` on the exact session releases it — the echo and then ONE terminal (exact wire content asserted on the public leg) complete | R-S2.3a ("remove the grant arm → the initial block occurs but never releases") + R-S2.3b ("bypass the semaphore → the pre-grant blocking assertion fails") |
+| `cross_direction_grant_is_ignored` | the direction half: an inbound `REQUEST_GRANT` (the upload kind — the wrong direction for a response window) never releases response credit (window stays `Some(0)`, endpoint silent) while the `STREAM_GRANT` kind does (positive control); the shape half: a `STREAM_GRANT` at a client-streaming call (no response pump to credit) is a no-op — its single response completes grant or not | — |
+
+Green (executed, exit-captured): `cargo fmt -p net-mesh -- --check` →
+exit 0; `cargo tf --retries 0 --test org_rpc_streaming` → **39 run / 39
+passed / 0 skipped**, exit 0.
+
+**Inverse receipts (executed, raw).** Exact command shape: `cargo tf
+--retries 0 --test org_rpc_streaming -E 'test(=duplex_response_window_blocks_until_grant)'`.
+
+**R-S2.3a — the grant arm removed (`cortex/rpc.rs`, the DX fold's
+`DISPATCH_RPC_STREAM_GRANT` arm):**
+
+```diff
+             DISPATCH_RPC_STREAM_GRANT => {
++                return Ok(()); // R-S2.3a MUTATION: the grant arm is removed
+                 // Response-direction credit (Stage 2 slices 2.2/2.3, C8):
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'duplex_response_window_blocks_until_grant' (188144) panicked at tests\org_rpc_streaming.rs:4576:5:
+the grant releases the blocked protected output — echo + terminal complete
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The prescribed outcome exactly: the block occurred and NEVER released.
+Restore: edit-reversed; sha256
+`70b59a13884054675a2aeefd8f30803fe15be232497c9a18454fa9d0a81a70d7`
+== baseline. Restored green: exit 0, 1/1.
+
+**R-S2.3b — bypass the semaphore (`cortex/rpc.rs`, the public pump's
+credit):**
+
+```diff
+-                let pump_flow = flow_sem.clone();
++                let pump_flow: Option<Arc<tokio::sync::Semaphore>> = None; // R-S2.3b MUTATION: bypass the semaphore
+```
+
+**exit 100.** Verbatim (the red lands in the shared darkness helper
+`s15.rs:202:9`, carrying the witness's named observation string):
+
+```
+thread 'duplex_response_window_blocks_until_grant' (189740) panicked at tests\org_rpc_streaming\s15.rs:202:9:
+assertion `left == right` failed: public zero credit publishes nothing before a grant (C8): 1 frame(s) reached the roster subscriber — a protected response was fanned out
+  left: 1
+ right: 0
+```
+
+The prescribed outcome exactly: with the semaphore bypassed the
+PRE-GRANT blocking assertion fails (the echo published without credit).
+Restore: edit-reversed; same sha == baseline. Restored green: exit 0,
+1/1. (Four weakenings on both: NONE.)
+
+**Findings (stated, not decided):**
+
+1. **F-S2.3-1 — the public credit-parked pump after CANCEL matches the SS
+   public fold's existing shape (stated).** The public CANCEL arm removes
+   the map entry (SS parity) but does not `close()` a removed semaphore —
+   a public pump already parked on credit with a queued chunk under a
+   never-granted window stays parked (the SS public fold has the same
+   shape since Stage 1; §2.2's closed-semaphore wake is named as
+   protected-supervisor behavior). PROTECTED records are unaffected (the
+   supervisor closes the semaphore at retire). Not changed here: fixing
+   the public SS/DX shape is public-behavior territory beyond C5–C8.
+
+**What never ran at 4.3 (complete):** the §4.1 list unchanged (the fmt
+gate IS executed — exit 0). Two witness-construction iterations preceded
+the recorded state (missing upload ENDs in the new witnesses — test-side
+construction, caught by the witnesses' own timeouts, fixed before any
+receipt ran; and one fuzzy-edit corruption of the DX seam's `impl` header
+— repaired, compile-caught, never committed).
