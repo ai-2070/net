@@ -11,6 +11,8 @@
 mod fixture;
 #[path = "org_rpc_streaming/frozen_85ecc77c9.rs"]
 mod frozen_85ecc77c9;
+#[path = "org_rpc_streaming/s13.rs"]
+mod s13;
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -518,5 +520,730 @@ fn replayed_opening_on_new_session_is_session_binding_mismatch() {
         ),
         Err(AdmissionDenied::SessionBindingMismatch),
         "a replayed opening on a new session must surface SessionBindingMismatch, not Replay",
+    );
+}
+
+// ============================================================================
+// Slice 1.3 — fold ownership + lifetime (contract 4, §2.1/§2.2/§2.6/§2.8,
+// ledger C5–C9). The six NAMED witnesses of the 1.3 acceptance list plus
+// three regression witnesses for the observable Q3 changes (C6, C7) and the
+// §2.1 credential clamp. Unit-witness idiom: the folds are driven directly
+// (or through a REAL `ServeHandle`) and every effect is observed at the
+// fold's maps, the protected records' handles, and the emitter seam.
+// ============================================================================
+
+use net::adapter::net::cortex::rpc::{
+    RpcServerStreamingFold, RpcStreamingRequestFold, StreamDeadlineBound, StreamLifetimePolicy,
+    StreamTerminalReason,
+};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+/// C5 — a late chunk from a REPLACED session (same node, same wire
+/// origin, same call id) misses the map entirely: the stream sees
+/// nothing, and only the live incarnation's chunks reach the handler.
+/// The 4-tuple key shape is observed at `sender_keys()`/`in_flight_keys()`.
+#[tokio::test]
+async fn late_chunk_from_replaced_session_is_dropped() {
+    const NODE: u64 = 0xA;
+    const SESSION_A: u64 = 0x51;
+    const SESSION_B: u64 = 0x52; // the REPLACED session
+    const ORIGIN: u64 = 0x1111;
+    const CALL: u64 = 42;
+
+    let collected = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (emit, captured) = s13::capturing_emitter();
+    let mut fold = RpcStreamingRequestFold::new(
+        Arc::new(s13::CollectBodies {
+            collected: Arc::clone(&collected),
+        }),
+        emit,
+    );
+
+    // The call opens on session A.
+    let open = s13::cs_request("svc", 0, b"open");
+    fold.apply_inbound(&s13::inbound(
+        SESSION_A,
+        NODE,
+        ORIGIN,
+        s13::request_frame(ORIGIN, CALL, &open),
+    ))
+    .unwrap();
+
+    // A LATE chunk from the REPLACED session B — same (node, origin,
+    // call). It must miss the map: no delivery, no state change.
+    let late = s13::chunk_payload(CALL, b"late", false);
+    fold.apply_inbound(&s13::inbound(
+        SESSION_B,
+        NODE,
+        ORIGIN,
+        s13::chunk_frame(ORIGIN, CALL, &late),
+    ))
+    .unwrap();
+
+    // The live session's own final chunk + END.
+    let live = s13::chunk_payload(CALL, b"live", true);
+    fold.apply_inbound(&s13::inbound(
+        SESSION_A,
+        NODE,
+        ORIGIN,
+        s13::chunk_frame(ORIGIN, CALL, &live),
+    ))
+    .unwrap();
+
+    // THE frame-admission observation: the handler's stream holds ONLY
+    // the live incarnation's bodies.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || { collected.lock().len() >= 2 }).await,
+        "the live call must complete within the bound",
+    );
+    assert_eq!(
+        collected
+            .lock()
+            .iter()
+            .map(|b| b.to_vec())
+            .collect::<Vec<_>>(),
+        vec![b"open".to_vec(), b"live".to_vec()],
+        "the handler must see ONLY the live incarnation's chunks — the replaced \
+         session's late chunk must be dropped, not admitted into the stream",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || !captured.lock().is_empty()).await,
+        "the call's terminal must land within the bound",
+    );
+    {
+        let frames = captured.lock().clone();
+        assert_eq!(frames.len(), 1, "exactly one terminal response");
+        assert_eq!(
+            frames[0].body.as_ref(),
+            b"openlive".as_slice(),
+            "the terminal body joins only the live incarnation's chunks",
+        );
+    }
+    assert!(fold.in_flight_keys().is_empty());
+    assert!(fold.sender_keys().is_empty());
+
+    // C5's key SHAPE, observed on a fresh live call: the maps are keyed
+    // by the four-part `(from_node, session_id, origin, call_id)`.
+    let open2 = s13::cs_request("svc", 0, b"open");
+    fold.apply_inbound(&s13::inbound(
+        SESSION_A,
+        NODE,
+        ORIGIN,
+        s13::request_frame(ORIGIN, CALL + 1, &open2),
+    ))
+    .unwrap();
+    let live_key: s13::CallKey = (NODE, SESSION_A, ORIGIN, CALL + 1);
+    assert_eq!(
+        fold.sender_keys(),
+        vec![live_key],
+        "C5: the upload sender is keyed by (from_node, session_id, origin, call_id)",
+    );
+    assert!(fold.in_flight_keys().contains(&live_key));
+    fold.apply_inbound(&s13::inbound(
+        SESSION_A,
+        NODE,
+        ORIGIN,
+        s13::cancel_frame(ORIGIN, CALL + 1),
+    ))
+    .unwrap();
+}
+
+/// §2.1 bound 1 — an OMITTED deadline is filled by the provider default
+/// (Q1: 300 s, exact), and an idle protected stream EXPIRES at that
+/// deadline with a typed `Timeout` terminal (the default never caps an
+/// explicit request — see its sibling witness).
+#[tokio::test]
+async fn omitted_deadline_gets_default_and_expires_idle() {
+    // Part 1 — the Q1 default fills an omitted deadline, exactly.
+    let (emit, _captured) = s13::capturing_async_emitter();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let open = s13::ss_request("svc", 0, b"open"); // deadline_ns == 0 ⇒ omitted
+    let call = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("an omitted deadline is filled by the default, never refused");
+    assert_eq!(
+        call.deadline_end_ns(),
+        clock.wall_ns + 300 * s13::SEC,
+        "omitted ⇒ exactly the Q1 300 s provider default",
+    );
+    assert_eq!(call.deadline_bound(), StreamDeadlineBound::Deadline);
+    call.retire(StreamTerminalReason::Cancelled); // clean up the parked record
+
+    // Part 2 — an idle protected stream expires at its (tiny) default
+    // deadline with one `Timeout` terminal, and the handler future is
+    // dropped. Fresh handler state: the flags below belong to THIS
+    // record only.
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let lifetime = s13::lifetime(s13::tiny_policy(), &[], ClockSample::now());
+    let open = s13::ss_request("svc", 0, b"open");
+    let call = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admits");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            started.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await,
+        "the handler must be entered before expiry is observed",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            matches!(call.terminal(), Some(StreamTerminalReason::Timeout))
+        })
+        .await,
+        "an idle call must expire at the resolved default with a Timeout terminal",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            call.emission().is_some() && captured.lock().len() == 1
+        })
+        .await,
+        "the terminal is handed off exactly once, after pump stop",
+    );
+    let frames = captured.lock().clone();
+    assert_eq!(frames.len(), 1, "exactly one terminal frame");
+    assert_eq!(frames[0].status, RpcStatus::Timeout);
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            dropped.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await,
+        "retirement dropped the handler future",
+    );
+    assert!(fold.in_flight_keys().is_empty());
+}
+
+/// §2.1 bound 2 — an EXPLICIT deadline over `max_live` (Q1: 3600 s) is
+/// REFUSED, never clamped, with the typed `DeadlineExceedsPolicy`, and
+/// with ZERO effects: no handler, no in-flight entry, no protected
+/// record, no emitted frame.
+#[tokio::test]
+async fn requested_deadline_over_cap_is_refused_with_zero_effects() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::CountingStream {
+            calls: Arc::clone(&calls),
+        }),
+        emit,
+    );
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let requested_end = clock.wall_ns + 7200 * s13::SEC; // over the 3600 s cap
+    let open = s13::ss_request("svc", requested_end, b"open");
+    let refused = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .err()
+        .expect("an explicit deadline over the provider cap must be refused");
+    assert!(
+        matches!(refused, AdmissionDenied::DeadlineExceedsPolicy),
+        "an explicit deadline over the provider cap is refused with DeadlineExceedsPolicy, got {refused:?}",
+    );
+    // Zero effects — the plan's strong reading: handler entry AND fold
+    // state AND emission.
+    assert!(
+        fold.in_flight_keys().is_empty(),
+        "a refused opening registers no call",
+    );
+    assert!(
+        fold.protected_owners().is_empty(),
+        "a refused opening owns no record",
+    );
+    assert!(
+        captured.lock().is_empty(),
+        "the fold emits nothing on refusal (the bridge owes exactly one bounded denial)",
+    );
+    fixture::assert_handler_stays_dark(&calls, "an over-cap deadline refusal").await;
+}
+
+/// §2.1 bound 1 (complement) — an explicit deadline WITHIN the cap is
+/// honoured VERBATIM: a 900 s request stays 900 s and is never silently
+/// clamped to the 300 s default.
+#[tokio::test]
+async fn requested_deadline_within_cap_is_honoured() {
+    let (emit, _captured) = s13::capturing_async_emitter();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let requested_end = clock.wall_ns + 900 * s13::SEC; // within the 3600 s cap
+    let open = s13::ss_request("svc", requested_end, b"open");
+    let call = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("a within-cap explicit deadline must be admitted");
+    assert_eq!(
+        call.deadline_end_ns(),
+        requested_end,
+        "the requested 900 s end is honoured verbatim",
+    );
+    assert_ne!(
+        call.deadline_end_ns(),
+        clock.wall_ns + 300 * s13::SEC,
+        "the provider default must NEVER cap an explicit request",
+    );
+    assert_eq!(call.deadline_bound(), StreamDeadlineBound::Deadline);
+    call.retire(StreamTerminalReason::Cancelled); // clean up the parked record
+}
+
+/// §2.2 — a pump parked on a zero-credit semaphore is retired at the
+/// deadline: producer finished is NOT terminal while the drain is
+/// blocked, the semaphore is closed and the pump aborted + joined, the
+/// queued chunks are discarded, and EXACTLY ONE terminal (`Timeout`)
+/// lands after pump stop.
+#[tokio::test]
+async fn pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal() {
+    let returned = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::EmitAndReturn {
+            chunks: vec![b"a", b"b"],
+            returned: Arc::clone(&returned),
+        }),
+        emit,
+    );
+    // A 1.5 s default: room to observe "not terminal after the handler
+    // returned", short enough to expire well within the wait bounds.
+    let policy = StreamLifetimePolicy {
+        default_live_ns: 1500 * 1_000_000,
+        max_live_ns: 30 * s13::SEC,
+    };
+    let lifetime = s13::lifetime(policy, &[], ClockSample::now());
+    // Zero initial credit: the pump parks in `acquire` on the first chunk.
+    let open = s13::ss_request_windowed("svc", 0, 0);
+    let call = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admits");
+
+    // The handler finished and queued both chunks under zero credit.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || returned
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler must run and return",
+    );
+    assert!(
+        call.is_live(),
+        "producer finished is NOT terminal (§2.2) — the credit-blocked drain is owned, not abandoned",
+    );
+    assert_eq!(
+        captured.lock().len(),
+        0,
+        "zero credit ⇒ nothing was published",
+    );
+
+    // The deadline retires the call (§2.2's order) and the terminal is
+    // typed `Timeout` — one terminal, after pump stop, queue discarded.
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            matches!(call.terminal(), Some(StreamTerminalReason::Timeout))
+        })
+        .await,
+        "the parked pump must be retired at the deadline with a Timeout terminal",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            call.emission().is_some() && captured.lock().len() == 1
+        })
+        .await,
+        "the terminal is handed off exactly once, after pump stop",
+    );
+    {
+        let frames = captured.lock().clone();
+        assert_eq!(
+            frames.len(),
+            1,
+            "exactly one terminal frame — the queued chunks are discarded on Timeout",
+        );
+        assert_eq!(frames[0].status, RpcStatus::Timeout);
+    }
+    assert!(fold.in_flight_keys().is_empty(), "ownership released");
+    // …and it stays exactly one terminal.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(captured.lock().len(), 1, "exactly one terminal, ever",);
+}
+
+/// Q3/C9 — dropping a `ServeHandle` retires that registration's live
+/// PROTECTED streams (`ServeHandleDropped`), while a SIBLING
+/// registration's stream survives and completes normally.
+#[tokio::test]
+async fn serve_handle_drop_retires_live_stream_and_sibling_survives() {
+    let node = fixture::build_node_with(EntityKeypair::from_bytes([0x61u8; 32])).await;
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let dropped_a = Arc::new(AtomicBool::new(false));
+    let dropped_b = Arc::new(AtomicBool::new(false));
+    let ran_a = Arc::new(AtomicUsize::new(0));
+    let ran_b = Arc::new(AtomicUsize::new(0));
+
+    let handle_a = node
+        .serve_rpc_streaming(
+            "svc.a",
+            Arc::new(s13::ParkUntilReleased {
+                release: Arc::clone(&release_a),
+                dropped: Arc::clone(&dropped_a),
+                ran: Arc::clone(&ran_a),
+            }),
+        )
+        .expect("register svc.a");
+    let handle_b = node
+        .serve_rpc_streaming(
+            "svc.b",
+            Arc::new(s13::ParkUntilReleased {
+                release: Arc::clone(&release_b),
+                dropped: Arc::clone(&dropped_b),
+                ran: Arc::clone(&ran_b),
+            }),
+        )
+        .expect("register svc.b");
+    let fold_a = handle_a
+        .streaming_fold_for_test()
+        .expect("the SS fold is reachable through the handle");
+    let fold_b = handle_b.streaming_fold_for_test().unwrap();
+
+    // Two live protected records, one per registration.
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], ClockSample::now());
+    let open_a = s13::ss_request("svc.a", 0, b"open");
+    let call_a = fold_a
+        .lock()
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open_a)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admitted a");
+    let open_b = s13::ss_request("svc.b", 0, b"open");
+    let call_b = fold_b
+        .lock()
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open_b)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admitted b");
+    assert!(call_a.is_live() && call_b.is_live());
+    assert_eq!(
+        fold_a.lock().in_flight_keys(),
+        vec![(0xA, 0x51, 0x1111, 42)]
+    );
+    assert_eq!(
+        fold_b.lock().in_flight_keys(),
+        vec![(0xA, 0x51, 0x1111, 43)]
+    );
+    // Both handler futures must be POLLED before the drop: a retire that
+    // wins before the supervisor's first poll never enters the handler
+    // at all (§3 — zero handler effects), which would make the drop
+    // flags below vacuous.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            ran_a.load(std::sync::atomic::Ordering::SeqCst) == 1
+                && ran_b.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await,
+        "both handlers must be entered before the drop",
+    );
+
+    // Drop ONE ServeHandle: only ITS registration's protected records
+    // retire (Q3: protected-only on handle drop).
+    drop(handle_a);
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            matches!(
+                call_a.terminal(),
+                Some(StreamTerminalReason::ServeHandleDropped)
+            )
+        })
+        .await,
+        "the dropped registration's stream must retire with ServeHandleDropped",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            fold_a.lock().in_flight_keys().is_empty()
+        })
+        .await,
+        "the retired call's state is reclaimed",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            dropped_a.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await,
+        "retirement dropped the handler future",
+    );
+
+    // The SIBLING is untouched and completes normally afterwards.
+    assert!(
+        call_b.is_live(),
+        "the sibling's stream must survive the drop"
+    );
+    assert_eq!(
+        fold_b.lock().in_flight_keys(),
+        vec![(0xA, 0x51, 0x1111, 43)]
+    );
+    assert_eq!(ran_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+    release_b.notify_one();
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            matches!(call_b.terminal(), Some(StreamTerminalReason::Completed(_)))
+        })
+        .await,
+        "the sibling completes normally",
+    );
+    drop(handle_b);
+}
+
+/// §2.1 bound 3 — credential validity CLAMPS an otherwise-legal request
+/// and the expiry terminal is an authority lapse
+/// (`AdmissionDenied(Denied)`), never a plain `Timeout`; an exact tie
+/// goes to the credential bound.
+#[tokio::test]
+async fn credential_clamp_expiry_is_admission_denied_not_timeout() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let clock = ClockSample::now();
+    let policy = StreamLifetimePolicy {
+        default_live_ns: 400 * 1_000_000,
+        max_live_ns: 30 * s13::SEC,
+    };
+    // Requested 20 s, credential validity ends at +600 ms: the clamp wins.
+    let credential_end = clock.wall_ns + 600 * 1_000_000;
+    let ends = [Some(credential_end)];
+    let lifetime = s13::lifetime(policy, &ends, clock);
+    let open = s13::ss_request("svc", clock.wall_ns + 20 * s13::SEC, b"open");
+    let call = fold
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admits (the clamp is not a refusal)");
+    assert_eq!(
+        call.deadline_end_ns(),
+        credential_end,
+        "credential validity clamps"
+    );
+    assert_eq!(call.deadline_bound(), StreamDeadlineBound::Credential);
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            matches!(
+                call.terminal(),
+                Some(StreamTerminalReason::CredentialExpired)
+            )
+        })
+        .await,
+        "the clamp's expiry is an authority lapse, not a timeout",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || captured.lock().len() == 1).await,
+        "exactly one terminal frame",
+    );
+    let frames = captured.lock().clone();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0].status,
+        RpcStatus::AdmissionDenied,
+        "credential expiry emits AdmissionDenied(Denied), never Timeout",
+    );
+    assert_eq!(
+        frames[0].body.as_ref(),
+        [0u8].as_slice(),
+        "the frozen coarse byte set: 0 = Denied",
+    );
+
+    // The exact tie goes to the credential bound (§2.1: at that instant
+    // the authority is gone; a plain timeout would understate it).
+    let (emit2, _captured2) = s13::capturing_async_emitter();
+    let mut fold2 = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit2,
+    );
+    let clock = ClockSample::now();
+    let requested_end = clock.wall_ns + 20 * s13::SEC;
+    let tie = [Some(requested_end)];
+    let lifetime = s13::lifetime(policy, &tie, clock);
+    let open = s13::ss_request("svc", requested_end, b"open");
+    let call2 = fold2
+        .apply_inbound_admitted(
+            &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open)),
+            s13::synthetic_admitted(),
+            &lifetime,
+        )
+        .expect("admits");
+    assert_eq!(
+        call2.deadline_bound(),
+        StreamDeadlineBound::Credential,
+        "an exact tie reports credential expiry, not timeout",
+    );
+    call2.retire(StreamTerminalReason::Cancelled); // clean up
+}
+
+/// C6 + C7 (Q3 shared repairs, public SS) — a PUBLIC server-streaming
+/// call with a NONZERO `deadline_ns` is now enforced: the handler is
+/// stopped at the deadline and the terminal is typed `Timeout`
+/// (`deadline_ns == 0` keeps meaning "no deadline" — pinned by the
+/// unchanged estate).
+#[tokio::test]
+async fn public_ss_nonzero_deadline_expires_with_typed_timeout() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let open = s13::ss_request("svc", wall_now + 400 * 1_000_000, b"open");
+    fold.apply_inbound(&s13::inbound(
+        0x51,
+        0xA,
+        0x1111,
+        s13::request_frame(0x1111, 42, &open),
+    ))
+    .unwrap();
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            started.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await,
+        "the handler must be entered before expiry is observed",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            captured
+                .lock()
+                .first()
+                .is_some_and(|f| f.status == RpcStatus::Timeout)
+        })
+        .await,
+        "a public SS handler that ignores its expired deadline must stop with a Timeout terminal",
+    );
+    let frames = captured.lock().clone();
+    assert_eq!(frames.len(), 1, "exactly one terminal");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            dropped.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await,
+        "the handler future was stopped at the deadline",
+    );
+    assert!(fold.in_flight_keys().is_empty());
+}
+
+/// C7 (Q3 shared repair, public client-streaming) — a deadline expiry's
+/// terminal is typed `Timeout` (the pre-C7 source classified it through
+/// the CANCEL-wins override).
+#[tokio::test]
+async fn public_client_stream_deadline_expiry_is_typed_timeout() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let (emit, captured) = s13::capturing_emitter();
+    let mut fold = RpcStreamingRequestFold::new(
+        Arc::new(s13::CsParkForever {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        }),
+        emit,
+    );
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let open = s13::cs_request("svc", wall_now + 400 * 1_000_000, b"open");
+    fold.apply_inbound(&s13::inbound(
+        0x51,
+        0xA,
+        0x1111,
+        s13::request_frame(0x1111, 42, &open),
+    ))
+    .unwrap();
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            started.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await,
+        "the handler must be entered before expiry is observed",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || {
+            captured
+                .lock()
+                .first()
+                .is_some_and(|f| f.status == RpcStatus::Timeout)
+        })
+        .await,
+        "a client-streaming deadline expiry must be typed Timeout, not Internal/Cancelled",
+    );
+    let frames = captured.lock().clone();
+    assert_eq!(frames.len(), 1, "exactly one terminal");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            dropped.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await,
+        "the handler future was stopped at the deadline",
     );
 }

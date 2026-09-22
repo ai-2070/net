@@ -1671,25 +1671,29 @@ pub type RpcAsyncResponseEmitter = Arc<
         + 'static,
 >;
 
-/// `(from_node, caller_origin, call_id)` → cancellation token for an
-/// in-flight call. `from_node` (AV-1 item 1) is the AEAD-authenticated
-/// last-hop session peer, so a control frame that copies another peer's
-/// origin + call_id lands under a distinct, absent key and cannot
-/// cancel or otherwise mutate the victim's call. Shared across all four
-/// server folds.
-type InFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64), RpcCancellationToken>>>;
-
-/// The unary server fold's in-flight map, keyed
-/// `(from_node, receiving_session_id, caller_origin, call_id)`
-/// (R2-A).
+/// The per-call identity every server fold keys its state on:
+/// `(from_node, receiving_session_id, caller_origin, call_id)` (R2-A,
+/// C5).
 ///
-/// The receiving incarnation is part of the key: a peer that
-/// reconnects and reuses a call id is making a **new** call, and
-/// the old parked handler's entry must not make it look like a
-/// duplicate of a call belonging to a session that no longer
-/// exists. (The streaming folds keep the three-part key; their
-/// own ownership work is separate.)
-type UnaryInFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64, u64), RpcCancellationToken>>>;
+/// `from_node` (AV-1 item 1) is the AEAD-authenticated last-hop session
+/// peer, so a control frame that copies another peer's origin + call_id
+/// lands under a distinct, absent key and cannot cancel or otherwise
+/// mutate the victim's call. The **receiving incarnation** is part of
+/// the key as well: a peer that reconnects and reuses a call id is
+/// making a **new** call, and the old parked handler's entry must not
+/// make it look like a duplicate of a call belonging to a session that
+/// no longer exists. C5 widened the streaming folds' three-part key to
+/// this same four-part identity — a late chunk / CANCEL / GRANT from a
+/// *replaced* session carrying the same `(from_node, origin, call_id)`
+/// misses the map entirely (session fencing), for public and protected
+/// calls alike (Owner Q3).
+type StreamCallKey = (u64, u64, u64, u64);
+
+/// `(from_node, receiving_session_id, caller_origin, call_id)` →
+/// cancellation token for an in-flight call. Shared across all four
+/// server folds (C5: one key shape after the streaming folds gained
+/// `session_id`).
+type InFlightCalls = Arc<Mutex<HashMap<StreamCallKey, RpcCancellationToken>>>;
 
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
@@ -1709,17 +1713,18 @@ pub struct RpcServerFold {
     /// handed to the emitter with the response. `0` on
     /// test/loopback paths, like `from_node`.
     session_id: u64,
-    /// (from_node, caller_origin, call_id) → cancellation token for
-    /// the in-flight handler. `from_node` is the AEAD-authenticated
-    /// last-hop session peer (AV-1 item 1): binding it into the key
-    /// means a peer that copies another peer's origin + call_id onto
-    /// a forged CANCEL looks up a distinct, absent key and no-ops
-    /// rather than cancelling the victim's call. Inserted on REQUEST,
-    /// removed by either the spawned handler task on completion or by
-    /// the fold on CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned
+    /// (from_node, receiving_session_id, caller_origin, call_id) →
+    /// cancellation token for the in-flight handler. `from_node` is the
+    /// AEAD-authenticated last-hop session peer (AV-1 item 1): binding
+    /// it into the key means a peer that copies another peer's origin +
+    /// call_id onto a forged CANCEL looks up a distinct, absent key and
+    /// no-ops rather than cancelling the victim's call. The receiving
+    /// incarnation is in the key for the same reason (R2-A). Inserted on
+    /// REQUEST, removed by either the spawned handler task on completion
+    /// or by the fold on CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned
     /// tasks can remove their own entries without going back through
     /// the fold.
-    in_flight: UnaryInFlightCalls,
+    in_flight: InFlightCalls,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -2192,6 +2197,13 @@ pub struct RpcResponseSink {
     /// `streaming_chunks_dropped_total` counter. `None` for unit-
     /// test folds that construct without metrics.
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+    /// §2.2's producer-finished gate (protected calls only). Once the
+    /// handler returns, sends are refused even from a clone the handler
+    /// retained or handed to a detached task, so the drain completes on
+    /// the already-admitted items instead of waiting out a stale
+    /// producer. `None` on public calls: their deliberately lossy sink
+    /// contract is unchanged (Q3).
+    gate: Option<Arc<StreamProducerGate>>,
 }
 
 impl RpcResponseSink {
@@ -2201,6 +2213,9 @@ impl RpcResponseSink {
     /// metrics are wired) `streaming_chunks_dropped_total` is
     /// incremented for the service.
     pub fn send(&self, body: impl Into<bytes::Bytes>) {
+        if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
+            return;
+        }
         if self.inner.try_send(body.into()).is_err() {
             if let Some(m) = self.metrics.as_ref() {
                 m.streaming_chunks_dropped_total
@@ -2226,6 +2241,9 @@ impl RpcResponseSink {
     /// instead of a drop); keep [`Self::send`] for streams where
     /// dropping under backpressure is acceptable.
     pub async fn send_wait(&self, body: impl Into<bytes::Bytes>) -> Result<(), RpcSinkClosed> {
+        if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
+            return Err(RpcSinkClosed);
+        }
         self.inner
             .send(body.into())
             .await
@@ -2284,6 +2302,13 @@ pub const STREAMING_REQUEST_PUMP_CAPACITY: usize = 1024;
 /// the eager payload).
 ///
 /// Bidi streaming plan (Phase B).
+///
+/// **Ledger C1 (Q2, realized in Stage 1 slice 1.3):** `#[non_exhaustive]`
+/// and carrying `org_admission`, mirroring [`RpcContext`]. External
+/// struct-literal construction is a named source break; the stable
+/// [`Self::new`] constructor (which creates **no** admitted org facts —
+/// admission facts originate at the verifier) is the migration path.
+#[non_exhaustive]
 pub struct RpcStreamingContext {
     /// Caller's `origin_hash`, from the inbound packet header. Same
     /// source, and the same caveat, as [`RpcContext::caller_origin`]:
@@ -2295,9 +2320,14 @@ pub struct RpcStreamingContext {
     /// CANCEL / REQUEST_GRANT for this call.
     pub call_id: u64,
     /// Absolute deadline (unix nanos) from the initial REQUEST.
-    /// `0` means no deadline; the fold does NOT auto-cancel on
-    /// deadline (handlers self-supervise via tokio timers, same
-    /// contract as the unary fold).
+    /// `0` means no deadline on PUBLIC calls (unchanged). For an
+    /// admitted PROTECTED call the fold always holds a finite
+    /// effective deadline (§2.1: the provider default fills an
+    /// omitted one), the record's supervisor enforces it, and expiry
+    /// surfaces as a typed `Timeout` / `AdmissionDenied(Denied)`
+    /// terminal. Public `deadline_ns != 0` is now enforced too (C6):
+    /// the fold stops the handler at the deadline and emits
+    /// `RpcStatus::Timeout` (C7).
     pub deadline_ns: u64,
     /// Per-chunk metadata headers from the initial REQUEST.
     /// Per-REQUEST_CHUNK headers are NOT surfaced at the substrate
@@ -2316,6 +2346,41 @@ pub struct RpcStreamingContext {
     /// W3C Trace Context propagated from the caller's initial
     /// REQUEST. Same semantics as [`RpcContext::trace_context`].
     pub trace_context: Option<TraceContext>,
+    /// OA-2 org-admission attribution (C1/Q2). `Some(Admitted)` for a
+    /// call that passed the PROTECTED-service admission gate — the
+    /// four-party verified identity. The raw `net-org-admission` proof
+    /// header is STRIPPED from `headers` before the handler sees it, so
+    /// application code receives verified attribution, never raw
+    /// credential material. `None` for public calls, and always `None`
+    /// from [`Self::new`] — admission facts originate at the verifier.
+    pub org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
+}
+
+impl RpcStreamingContext {
+    /// The stable constructor (C1/Q2's migration path). Creates **no**
+    /// admitted org facts: `org_admission` is always `None` here, so a
+    /// fixture or public call can build a context without fabricating
+    /// verified attribution. Admission facts originate at the verifier
+    /// and are placed on the context by the protected fold's admitted
+    /// entry point.
+    pub fn new(
+        caller_origin: u64,
+        call_id: u64,
+        deadline_ns: u64,
+        headers: Vec<RpcHeader>,
+        cancellation: RpcCancellationToken,
+        trace_context: Option<TraceContext>,
+    ) -> Self {
+        Self {
+            caller_origin,
+            call_id,
+            deadline_ns,
+            headers,
+            cancellation,
+            trace_context,
+            org_admission: None,
+        }
+    }
 }
 
 /// Callback the fold invokes to publish a [`DISPATCH_RPC_REQUEST_GRANT`]
@@ -2516,15 +2581,954 @@ pub trait RpcStreamingHandler: Send + Sync + 'static {
 }
 
 /// Per-call flow-control map type. Keyed on
-/// `(caller_origin_hash, call_id)`; value is a tokio
-/// `Semaphore` shared between the pump task (which awaits
-/// permits) and the fold's `apply()` method handling
-/// STREAM_GRANT events (which add permits).
-// Keyed on `(from_node, caller_origin, call_id)` (AV-1 item 1): the
-// authenticated last-hop session peer is part of the key so a peer
-// cannot refill another peer's flow-control window by copying its
-// origin + call_id onto a forged STREAM_GRANT.
-type FlowControlMap = Arc<Mutex<HashMap<(u64, u64, u64), Arc<tokio::sync::Semaphore>>>>;
+/// `(from_node, receiving_session_id, caller_origin_hash, call_id)`
+/// (AV-1 item 1, C5); value is a tokio `Semaphore` shared between the
+/// pump task (which awaits permits) and the fold's `apply()` method
+/// handling STREAM_GRANT events (which add permits). The authenticated
+/// last-hop session peer AND the receiving incarnation are part of the
+/// key so a peer cannot refill another peer's flow-control window by
+/// copying its origin + call_id onto a forged STREAM_GRANT — and a
+/// grant from a replaced session cannot credit the successor.
+type FlowControlMap = Arc<Mutex<HashMap<StreamCallKey, Arc<tokio::sync::Semaphore>>>>;
+
+// ============================================================================
+// §2.1 / §2.2 / §2.6 — protected streaming call lifetime and bounded
+// supervision (Stage 1 slice 1.3).
+//
+// The executable contract is the Stage 0 model in
+// `behavior/org_stream_lifecycle.rs` (`resolve_deadline`,
+// `LifetimePolicy`, `CallLifecycle`, `run_supervisor`, `ProducerGate`,
+// `sink_send`, `TerminalReason`, `TerminalDisposition`). That model is
+// `#[cfg(test)]` and STAYS there as the adversarially-scheduled witness
+// of these semantics; this block is its production implementation,
+// wired into `RpcServerStreamingFold` for PROTECTED records. Where the
+// two must agree, the model is the specification and comments here cite
+// its sections.
+// ============================================================================
+
+/// Provider lifetime policy (Owner Q1 defaults: 300 s / 3600 s). Wall-
+/// clock nanosecond durations, so it composes with
+/// [`ClockSample::wall_ns`](crate::adapter::net::behavior::admission_clock::ClockSample::wall_ns)
+/// without a second unit conversion at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLifetimePolicy {
+    /// Used ONLY when the caller supplied no deadline (§2.1 bound 1).
+    pub default_live_ns: u64,
+    /// Ceiling on an explicitly requested deadline. Exceeding it REFUSES
+    /// the opening (§2.1 bound 2: refused, never clamped).
+    pub max_live_ns: u64,
+}
+
+impl StreamLifetimePolicy {
+    /// The Q1 initial defaults: 300 s default, 3600 s maximum.
+    pub const fn q1_defaults() -> Self {
+        Self {
+            default_live_ns: 300 * 1_000_000_000,
+            max_live_ns: 3_600 * 1_000_000_000,
+        }
+    }
+
+    /// Startup validation (Q1): both positive, and the default can never
+    /// trip the cap (a configuration bug would otherwise refuse every
+    /// call that omitted a deadline).
+    pub fn validate(&self) -> Result<(), StreamPolicyError> {
+        if self.default_live_ns == 0 || self.max_live_ns == 0 {
+            return Err(StreamPolicyError::NotPositive);
+        }
+        if self.default_live_ns > self.max_live_ns {
+            return Err(StreamPolicyError::DefaultOverMax);
+        }
+        Ok(())
+    }
+}
+
+/// Why a [`StreamLifetimePolicy`] is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPolicyError {
+    /// A zero duration: no call could ever run.
+    NotPositive,
+    /// `default_live > max_live`: the default itself would be refused.
+    DefaultOverMax,
+}
+
+/// Which bound produced the effective end (§2.1) — it selects the
+/// terminal reason, so it is not a diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDeadlineBound {
+    /// The caller's deadline, or the provider default for an omitted
+    /// one. Expiry is an ordinary [`StreamTerminalReason::Timeout`].
+    Deadline,
+    /// Credential validity cut the call short (§2.1 bound 3). Expiry is
+    /// an authority lapse, not a timeout: `AdmissionDenied(Denied)`.
+    Credential,
+}
+
+/// The single monotonic-translatable end of a protected call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedStreamDeadline {
+    /// Absolute wall-clock end, unix nanoseconds.
+    pub end_ns: u64,
+    /// Which of the three bounds won.
+    pub bound: StreamDeadlineBound,
+}
+
+impl ResolvedStreamDeadline {
+    /// The terminal this deadline produces when it fires (§2.1):
+    /// `Timeout` vs `CredentialExpired` — the two are never conflated.
+    pub fn expiry_reason(&self) -> StreamTerminalReason {
+        match self.bound {
+            StreamDeadlineBound::Deadline => StreamTerminalReason::Timeout,
+            StreamDeadlineBound::Credential => StreamTerminalReason::CredentialExpired,
+        }
+    }
+}
+
+/// Why an opening is refused before any handler effect (§2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDeadlineRefusal {
+    /// An explicit caller deadline beyond `max_live`. Refused, never
+    /// clamped: the caller asked for something the provider does not
+    /// offer and must learn that, not silently get five minutes.
+    ExceedsPolicy,
+    /// The effective end is already in the past (an explicit past
+    /// deadline, or a credential clamp that lands behind `now`).
+    AlreadyElapsed,
+    /// Checked arithmetic overflowed (a pre-epoch or absurd clock).
+    Overflow,
+}
+
+/// §2.1's effective deadline — three distinct bounds, never one `min`:
+///
+/// 1. `requested` is `None` when the caller omitted a deadline
+///    (`deadline_ns == 0` on the wire); the provider default is reached
+///    ONLY through that arm, so it can never cap an explicit request.
+/// 2. An explicit request over `now + max_live` is REFUSED, never
+///    clamped.
+/// 3. Credential validity CLAMPS and records that it clamped; on an
+///    exact tie credential expiry wins (at that instant the authority is
+///    gone, and a plain timeout would understate it).
+///
+/// `credential_ends_ns` carries every applicable validity end in
+/// nanoseconds — caller membership, dispatcher grant, the optional
+/// capability grant, AND the provider's own authority validity; `None`
+/// entries contribute no bound.
+pub fn resolve_stream_deadline(
+    now_ns: u64,
+    requested: Option<u64>,
+    credential_ends_ns: &[Option<u64>],
+    policy: &StreamLifetimePolicy,
+) -> Result<ResolvedStreamDeadline, StreamDeadlineRefusal> {
+    let (requested_end, mut bound) = match requested {
+        Some(end) => {
+            let cap = now_ns
+                .checked_add(policy.max_live_ns)
+                .ok_or(StreamDeadlineRefusal::Overflow)?;
+            if end > cap {
+                return Err(StreamDeadlineRefusal::ExceedsPolicy);
+            }
+            (end, StreamDeadlineBound::Deadline)
+        }
+        None => (
+            now_ns
+                .checked_add(policy.default_live_ns)
+                .ok_or(StreamDeadlineRefusal::Overflow)?,
+            StreamDeadlineBound::Deadline,
+        ),
+    };
+
+    let mut end_ns = requested_end;
+    for candidate in credential_ends_ns.iter().flatten() {
+        if *candidate <= end_ns {
+            end_ns = *candidate;
+            bound = StreamDeadlineBound::Credential;
+        }
+    }
+
+    if end_ns <= now_ns {
+        return Err(StreamDeadlineRefusal::AlreadyElapsed);
+    }
+    Ok(ResolvedStreamDeadline { end_ns, bound })
+}
+
+/// The lifetime inputs one protected opening resolves its §2.1 deadline
+/// against — the provider policy (Q1 defaults unless configured
+/// otherwise), every applicable credential validity end, and the ONE
+/// clock sample of the admission
+/// ([`ClockSample`](crate::adapter::net::behavior::admission_clock::ClockSample),
+/// per E0.4: freshness and deadline translation read the same instant).
+pub struct StreamCallLifetime<'a> {
+    /// The provider's lifetime policy.
+    pub policy: StreamLifetimePolicy,
+    /// Every applicable validity end in unix nanoseconds; `None`
+    /// entries contribute no bound (see [`resolve_stream_deadline`]).
+    pub credential_ends_ns: &'a [Option<u64>],
+    /// The admission's paired clock sample.
+    pub clock: crate::adapter::net::behavior::admission_clock::ClockSample,
+}
+
+/// What the handler returned (§2.6). Preserved verbatim so an error can
+/// never be reported as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamHandlerResult {
+    /// Clean return.
+    Ok,
+    /// Typed failure: the exact terminal status + body the handler's
+    /// error maps to (`Application(code)` / `Internal`), preserved
+    /// through the drain.
+    Err(RpcStatus, String),
+}
+
+/// The input (caller → provider) half of a call (§2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCallInput {
+    /// Accepting request chunks.
+    Open,
+    /// The caller sent END. Legitimate remaining output is unaffected.
+    Ended,
+    /// The *consumer* is gone (the handler returned). Further chunks are
+    /// refused and discarded.
+    Closed,
+}
+
+/// The output (provider → caller) half (§2.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamCallOutput {
+    /// The handler may still produce.
+    Open,
+    /// The handler returned and its result is held here while the pump
+    /// drains already-queued items. **Not terminal** — producer finished
+    /// is not terminal.
+    Draining(StreamHandlerResult),
+    /// The pump has stopped; nothing further can be published.
+    Ended,
+}
+
+/// The single terminal disposition of a call (§2.6). First writer wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamTerminalReason {
+    /// The handler finished and the pump drained. Carries the handler's
+    /// own result: an `Err` handler yields `Completed(Err(..))`, never
+    /// `Ok`.
+    Completed(StreamHandlerResult),
+    /// Caller CANCEL, or the caller handle dropped.
+    Cancelled,
+    /// The effective deadline fired under
+    /// [`StreamDeadlineBound::Deadline`].
+    Timeout,
+    /// The effective deadline fired under
+    /// [`StreamDeadlineBound::Credential`] — authority lapsed rather
+    /// than time running out.
+    CredentialExpired,
+    /// A revocation floor rose past this call's member generation.
+    Revoked,
+    /// The authority or revocation store moved, was removed, or is
+    /// poisoned: fail closed.
+    AuthorityUnavailable,
+    /// An admitted item could neither be reserved nor delivered. The
+    /// call dies; it never completes `Ok` having silently dropped
+    /// input.
+    ResourceExhausted,
+    /// The peer's session was replaced or the peer disconnected.
+    SessionReplaced,
+    /// The registration's `ServeHandle` dropped, or the node shut down.
+    ServeHandleDropped,
+    /// The pump stopped without the handler returning — a typed failure,
+    /// never successful completion.
+    PumpFailed,
+}
+
+impl StreamTerminalReason {
+    /// Whether already-queued response items are published before the
+    /// terminal (§2.2's queued-data table). Only a genuine completion
+    /// drains; every retirement discards.
+    pub fn drains_queued_output(&self) -> bool {
+        matches!(self, StreamTerminalReason::Completed(_))
+    }
+}
+
+/// What the control path actually did with the terminal (§2.8). The
+/// records are distinct because an attempted send is **not** peer
+/// receipt. At this layer the control path is the response-emitter
+/// seam; `Queued`/`Refused`/`Unreachable` distinctions inside the
+/// bounded response drainer and the route layer become separately
+/// observable at the `RpcResponseJob` seam (slice 1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamTerminalDisposition {
+    /// The control queue accepted the terminal. Not peer receipt.
+    Queued,
+    /// The transport seam accepted the terminal job (recorded at the
+    /// send seam — the emit future completed). Still not endpoint
+    /// receipt, which is attributed at the peer.
+    Sent,
+    /// The session or route is gone. The peer will observe interruption
+    /// or its own deadline.
+    Unreachable,
+    /// The control queue refused the terminal. Recorded as interruption;
+    /// ownership is still released.
+    Refused,
+}
+
+/// The committed terminal plus its one-shot emission record (§2.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamTerminal {
+    /// The selected outcome. First writer wins.
+    reason: StreamTerminalReason,
+    /// The control-path disposition, recorded exactly once by the
+    /// supervisor after the pump stopped.
+    emission: Option<StreamTerminalDisposition>,
+}
+
+/// One call's lifecycle state (§2.6) — the production mirror of the
+/// model's `CallLifecycle`. The input half starts `Ended` for
+/// server-streaming (the model's `CallLifecycle::new`: the single
+/// request arrived with the opening) and carries the §2.6 rules so the
+/// client-streaming/duplex records of Stage 2 extend the same machine.
+#[derive(Debug)]
+struct StreamCallRecord {
+    input: StreamCallInput,
+    output: StreamCallOutput,
+    terminal: Option<StreamTerminal>,
+}
+
+impl StreamCallRecord {
+    fn new_server_streaming() -> Self {
+        Self {
+            input: StreamCallInput::Ended,
+            output: StreamCallOutput::Open,
+            terminal: None,
+        }
+    }
+
+    /// Frames while terminal are dropped, no credit, no delivery (§2.6).
+    /// Credit survives the handler's return — it is what lets a drain
+    /// finish — and stops once the output half has ended.
+    fn credit_grantable(&self) -> bool {
+        self.terminal.is_none()
+            && matches!(
+                self.output,
+                StreamCallOutput::Open | StreamCallOutput::Draining(_)
+            )
+    }
+
+    /// The handler returned (§2.6): output enters `Draining` with the
+    /// result preserved, and an open input half becomes `Closed` — its
+    /// consumer is gone. Returns `false` once terminal or already
+    /// draining.
+    fn handler_returned(&mut self, result: StreamHandlerResult) -> bool {
+        if self.terminal.is_some() || !matches!(self.output, StreamCallOutput::Open) {
+            return false;
+        }
+        self.output = StreamCallOutput::Draining(result);
+        if self.input == StreamCallInput::Open {
+            self.input = StreamCallInput::Closed;
+        }
+        true
+    }
+
+    /// The pump stopped (§2.6). While `Draining` this commits
+    /// `Completed(result)`; while still `Open` the producer died under
+    /// the handler — a typed failure, never a success. Returns the
+    /// committed reason exactly once.
+    fn pump_exited(&mut self) -> Option<StreamTerminalReason> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        let reason = match std::mem::replace(&mut self.output, StreamCallOutput::Ended) {
+            StreamCallOutput::Draining(result) => StreamTerminalReason::Completed(result),
+            StreamCallOutput::Open => StreamTerminalReason::PumpFailed,
+            StreamCallOutput::Ended => return None,
+        };
+        self.terminal = Some(StreamTerminal {
+            reason: reason.clone(),
+            emission: None,
+        });
+        Some(reason)
+    }
+
+    /// Retire from ANY state, including `Draining`. First writer wins;
+    /// later END, handler return or pump exit are no-ops (§2.6).
+    fn retire(&mut self, reason: StreamTerminalReason) -> bool {
+        if self.terminal.is_some() {
+            return false;
+        }
+        self.terminal = Some(StreamTerminal {
+            reason,
+            emission: None,
+        });
+        true
+    }
+
+    /// Record the terminal's control-path disposition (§2.8). Returns
+    /// `true` exactly once, for the supervisor that owns the emission.
+    fn record_emission(&mut self, disposition: StreamTerminalDisposition) -> bool {
+        match self.terminal.as_mut() {
+            Some(terminal) if terminal.emission.is_none() => {
+                terminal.emission = Some(disposition);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn terminal_reason(&self) -> Option<StreamTerminalReason> {
+        self.terminal.as_ref().map(|t| t.reason.clone())
+    }
+
+    fn emission(&self) -> Option<StreamTerminalDisposition> {
+        self.terminal.as_ref().and_then(|t| t.emission)
+    }
+}
+
+/// Retirement signal shared by the CANCEL arm, `ServeHandle::drop`, and
+/// (once wired) the revocation callback, session sweep and node
+/// shutdown (§2.2) — the production mirror of the model's
+/// `RetireSignal`. First reason wins, matching
+/// [`StreamCallRecord::retire`].
+#[derive(Debug, Default)]
+pub struct StreamRetireSignal {
+    notify: Notify,
+    reason: Mutex<Option<StreamTerminalReason>>,
+}
+
+impl StreamRetireSignal {
+    /// A fresh, unsignalled handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal retirement. First reason wins; every signal is idempotent
+    /// afterwards.
+    pub fn fire(&self, reason: StreamTerminalReason) {
+        let mut slot = self.reason.lock();
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+        drop(slot);
+        self.notify.notify_waiters();
+    }
+
+    fn taken(&self) -> Option<StreamTerminalReason> {
+        self.reason.lock().clone()
+    }
+
+    /// Wait for a retirement signal (register-before-recheck, so a
+    /// `fire` between the check and the await cannot be missed).
+    async fn wait(&self) -> StreamTerminalReason {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(reason) = self.taken() {
+                return reason;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The producer-finished gate (§2.2) — the production mirror of the
+/// model's `ProducerGate`. Once the handler returns, the call's sink is
+/// logically closed: new sends are refused even from a clone the handler
+/// retained or handed to a detached task, and the pump drains only what
+/// was already admitted. Without it a retained clone keeps the queue
+/// open and the drain never completes.
+#[derive(Debug, Default)]
+pub struct StreamProducerGate {
+    finished: AtomicBool,
+    woken: Notify,
+}
+
+impl StreamProducerGate {
+    /// A gate that is still admitting.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the producer half is closed.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    /// Close the producer half and wake a pump parked on `recv`.
+    pub fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+        self.woken.notify_waiters();
+    }
+}
+
+/// One PROTECTED streaming call's supervisor-owned state — the §2.2
+/// ownership handle. Retirement reaches the supervisor through
+/// [`Self::retire`] even before its task has been scheduled; the
+/// lifecycle record answers the observation questions a witness (or the
+/// 1.4 registry transfer) needs.
+#[derive(Debug)]
+pub struct ProtectedStreamCall {
+    record: Arc<Mutex<StreamCallRecord>>,
+    retire: Arc<StreamRetireSignal>,
+    deadline: ResolvedStreamDeadline,
+}
+
+impl ProtectedStreamCall {
+    /// The resolved §2.1 effective end (wall-clock unix ns).
+    pub fn deadline_end_ns(&self) -> u64 {
+        self.deadline.end_ns
+    }
+
+    /// Which bound produced [`Self::deadline_end_ns`] — it selects the
+    /// expiry terminal (`Timeout` vs `CredentialExpired`).
+    pub fn deadline_bound(&self) -> StreamDeadlineBound {
+        self.deadline.bound
+    }
+
+    /// Whether the call still owns live work (not terminal).
+    pub fn is_live(&self) -> bool {
+        self.record.lock().terminal.is_none()
+    }
+
+    /// The committed terminal, once one exists.
+    pub fn terminal(&self) -> Option<StreamTerminalReason> {
+        self.record.lock().terminal_reason()
+    }
+
+    /// The control-path disposition recorded for the terminal (§2.8),
+    /// exactly once.
+    pub fn emission(&self) -> Option<StreamTerminalDisposition> {
+        self.record.lock().emission()
+    }
+
+    /// Retire this exact call (§2.2/§2.4). Idempotent: the first reason
+    /// wins at the supervisor.
+    pub fn retire(&self, reason: StreamTerminalReason) {
+        self.retire.fire(reason);
+    }
+}
+
+/// The registration-owned set of live PROTECTED stream calls (§2.2's
+/// "every record of the registration"). `ServeHandle::drop` fires
+/// `ServeHandleDropped` on every record here (Q3: protected-only on
+/// handle drop — PUBLIC calls never enter this set and keep their
+/// documented outstanding-call behavior); node shutdown is meant to
+/// fire it node-wide (see the 1.3 report — the shutdown hook is not
+/// reachable from `mesh_rpc.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct ProtectedStreamOwners {
+    calls: Arc<Mutex<HashMap<StreamCallKey, Arc<ProtectedStreamCall>>>>,
+}
+
+impl ProtectedStreamOwners {
+    /// Empty ownership for one registration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retire every live record with `reason` (the supervisor selects
+    /// each terminal; already-terminal records ignore the signal). All
+    /// retirement is asynchronous by nature — §2.2: "async cleanup is
+    /// not guaranteed to finish before the synchronous revocation
+    /// callback returns". Returns how many signals were fired.
+    pub fn retire_all(&self, reason: StreamTerminalReason) -> usize {
+        let calls: Vec<Arc<ProtectedStreamCall>> = self.calls.lock().values().cloned().collect();
+        let count = calls.len();
+        for call in calls {
+            call.retire(reason.clone());
+        }
+        count
+    }
+
+    fn insert(&self, key: StreamCallKey, call: Arc<ProtectedStreamCall>) {
+        self.calls.lock().insert(key, call);
+    }
+
+    fn remove(&self, key: &StreamCallKey) {
+        self.calls.lock().remove(key);
+    }
+
+    /// The live record for `key`, if any.
+    pub fn get(&self, key: &StreamCallKey) -> Option<Arc<ProtectedStreamCall>> {
+        self.calls.lock().get(key).cloned()
+    }
+
+    /// How many records this registration currently tracks.
+    pub fn len(&self) -> usize {
+        self.calls.lock().len()
+    }
+
+    /// Whether this registration tracks no records.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Test-only: the tracked key set.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn keys(&self) -> Vec<StreamCallKey> {
+        self.calls.lock().keys().copied().collect()
+    }
+}
+
+/// The fold-owned per-call state the supervisor removes at completion —
+/// the 1.3 form of §2.4's single removal point (the exact-incarnation
+/// registry of contract 3 lands in slice 1.4; the four-part key does the
+/// session fencing here).
+struct StreamCallRegistration {
+    key: StreamCallKey,
+    in_flight: InFlightCalls,
+    flow_control: FlowControlMap,
+    protected: ProtectedStreamOwners,
+}
+
+impl StreamCallRegistration {
+    fn complete(&self) {
+        self.in_flight.lock().remove(&self.key);
+        self.flow_control.lock().remove(&self.key);
+        self.protected.remove(&self.key);
+    }
+}
+
+/// Whether a REQUEST's flags claim exactly the server-streaming shape
+/// (contract 4's SS flag check, unified with the CS/DX arms): the
+/// streaming-response flag set and the client-streaming flag clear —
+/// i.e. [`RpcCallShape::from_streaming_flags`](crate::adapter::net::behavior::org_call::RpcCallShape::from_streaming_flags)
+/// derives `ServerStreaming` from them.
+fn ss_request_flags_ok(flags: u16) -> bool {
+    flags & FLAG_RPC_STREAMING_RESPONSE != 0 && flags & FLAG_RPC_CLIENT_STREAMING_REQUEST == 0
+}
+
+/// The terminal frame one selected reason emits (§2.2's queued-data
+/// table + §2.1's `Timeout` vs `CredentialExpired` split + §2.8's "no
+/// synthetic success"). `Completed` carries the handler's own result
+/// verbatim; every retirement maps onto the frozen wire vocabulary —
+/// `Timeout` (C7), `Cancelled` (incl. `ServeHandleDropped` /
+/// `SessionReplaced`, per §2.2's table), `AdmissionDenied` + coarse
+/// byte (`CredentialExpired` / `Revoked` / `AuthorityUnavailable` →
+/// `Denied`, `ResourceExhausted` → `Unavailable`), `Internal` for a
+/// failed pump.
+fn stream_terminal_payload(reason: &StreamTerminalReason) -> RpcResponsePayload {
+    match reason {
+        StreamTerminalReason::Completed(StreamHandlerResult::Ok) => RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![(
+                HEADER_NRPC_STREAMING.to_string(),
+                HEADER_NRPC_STREAMING_END.to_vec(),
+            )],
+            body: Bytes::new(),
+        },
+        StreamTerminalReason::Completed(StreamHandlerResult::Err(status, message)) => {
+            RpcResponsePayload {
+                status: *status,
+                headers: vec![],
+                body: Bytes::from(message.clone()),
+            }
+        }
+        StreamTerminalReason::Cancelled | StreamTerminalReason::ServeHandleDropped => {
+            RpcResponsePayload {
+                status: RpcStatus::Cancelled,
+                headers: vec![],
+                body: Bytes::from_static(
+                    b"server observed CANCEL during streaming handler execution",
+                ),
+            }
+        }
+        StreamTerminalReason::SessionReplaced => RpcResponsePayload {
+            status: RpcStatus::Cancelled,
+            headers: vec![],
+            body: Bytes::from_static(b"peer session replaced"),
+        },
+        StreamTerminalReason::Timeout => RpcResponsePayload {
+            status: RpcStatus::Timeout,
+            headers: vec![],
+            body: Bytes::from_static(b"stream deadline_ns exceeded"),
+        },
+        StreamTerminalReason::CredentialExpired => RpcResponsePayload {
+            status: RpcStatus::AdmissionDenied,
+            headers: vec![],
+            body: Bytes::from_static(&[0]), // coarse `Denied` — authority lapsed
+        },
+        StreamTerminalReason::Revoked | StreamTerminalReason::AuthorityUnavailable => {
+            RpcResponsePayload {
+                status: RpcStatus::AdmissionDenied,
+                headers: vec![],
+                body: Bytes::from_static(&[0]), // coarse `Denied`
+            }
+        }
+        StreamTerminalReason::ResourceExhausted => RpcResponsePayload {
+            status: RpcStatus::AdmissionDenied,
+            headers: vec![],
+            body: Bytes::from_static(&[2]), // coarse `Unavailable`
+        },
+        StreamTerminalReason::PumpFailed => RpcResponsePayload {
+            status: RpcStatus::Internal,
+            headers: vec![],
+            body: Bytes::from_static(b"response pump failed"),
+        },
+    }
+}
+
+/// Run one server-streaming call to a bounded terminal (§2.2) — the
+/// production shape of the model's `run_supervisor`. The supervisor owns
+/// the handler, the response pump's `JoinHandle`, the flow semaphore and
+/// the single terminal emission, and stays in its `select!` after the
+/// handler returns: **producer finished is not terminal**. It exits only
+/// when the pump has stopped — because it drained, or because retirement
+/// closed its semaphore / aborted it. Retirement therefore bounds a
+/// drain the caller never credits; the drain never bounds retirement.
+///
+/// The §2.2 retirement order is exact: signal the handler's cancellation
+/// token, close the flow semaphore (unparking a pump stalled on credit),
+/// `abort()` + `await` the pump so no chunk can be published after the
+/// terminal, select the terminal (first writer wins), and emit exactly
+/// one terminal AFTER the pump stopped. Queued-data policy (§2.2's
+/// table): only `Completed(_)` drains, every retirement discards the
+/// remaining queue with the aborted receiver.
+///
+/// `deadline` is `(monotonic end, expiry reason)` — `Timeout` for a
+/// §2.1 `Deadline` bound, `CredentialExpired` for the `Credential`
+/// clamp. `retire`/`gate` are `Some` for PROTECTED records (the §2.2
+/// supervisor contract) and `None` for public calls, whose documented
+/// behavior is preserved apart from the shared Q3 repairs (C6 nonzero
+/// `deadline_ns` enforcement, C7 `Timeout` classification — the latter
+/// rides `cancel_wins == false` + the `Timeout` reason). `cancel_wins`
+/// keeps the PUBLIC fold's documented CANCEL-wins terminal override;
+/// protected records follow §2.6's first-writer-wins instead.
+///
+/// (The model's byte-permit semaphore lands with slice 1.4's §2.7 byte
+/// accounting; this supervisor closes the semaphores the call owns.)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the §2.2 supervisor-owned pieces are named one-for-one (record, handler, \
+              context, metrics, flow semaphore, producer gate, retire signal, deadline, \
+              cancel policy, emitter, call identity, registration) and a params struct \
+              would only rename them and hide the model mapping"
+)]
+async fn run_stream_call_supervisor(
+    record: Arc<Mutex<StreamCallRecord>>,
+    handler: Arc<dyn RpcStreamingHandler>,
+    ctx: RpcContext,
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+    flow_sem: Option<Arc<tokio::sync::Semaphore>>,
+    gate: Option<Arc<StreamProducerGate>>,
+    retire: Option<Arc<StreamRetireSignal>>,
+    deadline: Option<(tokio::time::Instant, StreamTerminalReason)>,
+    cancel_wins: bool,
+    emit: RpcAsyncResponseEmitter,
+    identity: (u64, u64, u64),
+    registration: StreamCallRegistration,
+) {
+    let (from_node, caller_origin, call_id) = identity;
+
+    if let Some(m) = metrics.as_ref() {
+        m.handler_invocations_total.fetch_add(1, Ordering::Relaxed);
+        m.handler_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+    let handler_started = std::time::Instant::now();
+    let cancel_token = ctx.cancellation.clone();
+
+    // The sink + pump pair (§2.2). Bounded at
+    // STREAMING_PUMP_CAPACITY. The pump pays one flow-control credit
+    // per chunk when the caller opted in; a CLOSED semaphore (retirement)
+    // unparks it (`Err(_) => break`).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
+    let sink = RpcResponseSink {
+        inner: tx,
+        metrics: metrics.clone(),
+        gate: gate.clone(),
+    };
+    let pump_emit = emit.clone();
+    let pump_metrics = metrics.clone();
+    let pump_flow = flow_sem.clone();
+    let pump_gate = gate.clone();
+    let pump_task = tokio::spawn(async move {
+        loop {
+            // After the producer half closes (protected only), drain
+            // what is already admitted and stop — never wait for another
+            // send the gate has just made impossible.
+            let next = match pump_gate.as_ref() {
+                Some(g) if g.is_finished() => rx.try_recv().ok(),
+                Some(g) => tokio::select! {
+                    item = rx.recv() => item,
+                    () = g.woken.notified() => continue,
+                },
+                None => rx.recv().await,
+            };
+            let Some(chunk) = next else { break };
+            if let Some(sem) = pump_flow.as_ref() {
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    // Semaphore closed by retirement: stop publishing.
+                    Err(_) => break,
+                };
+                permit.forget();
+            }
+            if let Some(m) = pump_metrics.as_ref() {
+                m.streaming_chunks_emitted_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let resp = RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
+                )],
+                body: chunk,
+            };
+            // Await per-chunk publish so chunks for one call_id reach
+            // the network in send order.
+            pump_emit(from_node, caller_origin, call_id, resp).await;
+        }
+    });
+    tokio::pin!(pump_task);
+
+    // The handler future, panics caught so a misbehaving handler can't
+    // take down the runtime — same shape as the unary fold.
+    let mut handler_fut = std::pin::pin!(futures::FutureExt::catch_unwind(
+        std::panic::AssertUnwindSafe(handler.call(ctx, sink))
+    ));
+    let mut handler_done = false;
+    let mut handler_panicked = false;
+    let mut pump_done = false;
+    let mut pump_failed = false;
+
+    let sleep = async {
+        match deadline {
+            Some((at, reason)) => {
+                tokio::time::sleep_until(at).await;
+                reason
+            }
+            // No deadline arm (public `deadline_ns == 0`): park forever
+            // rather than fire immediately.
+            None => std::future::pending().await,
+        }
+    };
+    let mut sleep = std::pin::pin!(sleep);
+
+    // The persistent select! (§2.2): handler / pump / sleep_until /
+    // retire — and it STAYS in the loop after the handler returns.
+    let forced: Option<StreamTerminalReason> = loop {
+        if pump_done {
+            break None;
+        }
+        tokio::select! {
+            biased;
+
+            reason = async { match retire.as_ref() { Some(r) => r.wait().await, None => std::future::pending().await } } => {
+                break Some(reason)
+            }
+
+            reason = &mut sleep => break Some(reason),
+
+            result = &mut handler_fut, if !handler_done => {
+                handler_done = true;
+                let result = match result {
+                    Ok(Ok(())) => StreamHandlerResult::Ok,
+                    Ok(Err(RpcHandlerError::Application { code, message })) => {
+                        StreamHandlerResult::Err(RpcStatus::Application(code), message)
+                    }
+                    Ok(Err(RpcHandlerError::Internal(message))) => {
+                        StreamHandlerResult::Err(RpcStatus::Internal, message)
+                    }
+                    Err(panic) => {
+                        handler_panicked = true;
+                        let panic_msg = panic
+                            .downcast_ref::<&'static str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic>".into());
+                        tracing::error!(
+                            caller_origin = format!("{:#x}", caller_origin),
+                            call_id,
+                            panic = %panic_msg,
+                            "rpc streaming server handler panicked",
+                        );
+                        StreamHandlerResult::Err(
+                            RpcStatus::Internal,
+                            format!("handler panicked: {panic_msg}"),
+                        )
+                    }
+                };
+                // Producer finished: Draining, NOT terminal. The gate
+                // closes the sink so a retained clone cannot extend the
+                // drain, while grants stay creditable and expiry stays
+                // armed (§2.2 / §2.6).
+                record.lock().handler_returned(result);
+                if let Some(g) = gate.as_ref() {
+                    g.finish();
+                }
+            }
+
+            joined = &mut pump_task, if !pump_done => {
+                pump_done = true;
+                pump_failed = joined.is_err();
+            }
+        }
+    };
+
+    if let Some(m) = metrics.as_ref() {
+        m.handler_in_flight.fetch_sub(1, Ordering::Relaxed);
+        m.record_handler_duration(handler_started.elapsed());
+        if handler_panicked {
+            m.handler_panics_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // The PUBLIC fold's documented CANCEL-wins terminal override samples
+    // the token BEFORE this teardown signals it (below) — only a cancel
+    // that fired during handler execution wins, never the supervisor's
+    // own retirement signal (Q3 preserved this public behavior; C5–C8
+    // are the approved public changes).
+    let cancelled_by_caller = cancel_wins && cancel_token.is_cancelled();
+
+    // Retirement path (§2.2's order): signal the handler's cancellation,
+    // close the semaphore so a parked pump errors out, then abort AND
+    // join it — the join is what establishes "no chunk is published
+    // after the terminal", not the abort call. The owned handler future
+    // drops at scope end.
+    if let Some(reason) = forced {
+        record.lock().retire(reason);
+        cancel_token.cancel();
+        if let Some(sem) = flow_sem.as_ref() {
+            sem.close();
+        }
+        if !pump_done {
+            pump_task.as_mut().abort();
+            let _ = pump_task.as_mut().await;
+        }
+    } else if pump_failed {
+        record.lock().retire(StreamTerminalReason::PumpFailed);
+    } else {
+        // Clean pump exit: the state machine decides whether that is a
+        // completion (Draining) or a producer that died under the
+        // handler (PumpFailed).
+        record.lock().pump_exited();
+    }
+
+    let reason = record
+        .lock()
+        .terminal_reason()
+        .unwrap_or(StreamTerminalReason::PumpFailed);
+    let reason = if cancelled_by_caller {
+        StreamTerminalReason::Cancelled
+    } else {
+        reason
+    };
+
+    // Single removal point (§2.4's `complete`): the in-flight token,
+    // the flow semaphore and the protected record leave together, so a
+    // stale GRANT/CANCEL after this point misses every map.
+    registration.complete();
+
+    // §2.8 — exactly one terminal, AFTER pump stop, handed to the
+    // response-emitter seam. The handoff is non-blocking — the model's
+    // control-path `try_send`, not an unbounded transport wait ("bound
+    // all library-controlled waits… rather than hang"; "network receipt
+    // is a separate observation"): `Queued` records that the control
+    // path TOOK the job — not peer receipt — and ownership completes
+    // here whether or not the transport can deliver. The `Sent` /
+    // `Refused` / `Unreachable` dispositions become distinguishable at
+    // the bounded `RpcResponseJob` drainer / route layer (slice 1.5's
+    // seam). Pump stop already ordered this behind every chunk emit.
+    let terminal = stream_terminal_payload(&reason);
+    tokio::spawn(emit(from_node, caller_origin, call_id, terminal));
+    record
+        .lock()
+        .record_emission(StreamTerminalDisposition::Queued);
+}
 
 /// Server-side fold for streaming RPC. Parallel to `RpcServerFold`
 /// but multi-fire emit: each handler invocation may produce many
@@ -2535,19 +3539,28 @@ type FlowControlMap = Arc<Mutex<HashMap<(u64, u64, u64), Arc<tokio::sync::Semaph
 /// via captured `Arc<Mutex<S>>`. The fold's own state (in-flight
 /// cancellation tokens) lives on `&mut self`.
 pub struct RpcServerStreamingFold {
+    /// R2-A/C5: the receiving incarnation of the frame currently being
+    /// applied, set by `apply_inbound*` from the event. Part of every
+    /// per-call key below; `0` on test/loopback paths, like `from_node`.
+    session_id: u64,
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
-    /// (from_node, caller_origin, call_id) → cancellation token —
-    /// authenticated-peer-scoped so a forged CANCEL can't cancel
-    /// another peer's stream (AV-1 item 1).
+    /// (from_node, receiving_session_id, caller_origin, call_id) →
+    /// cancellation token — session-fenced so a forged CANCEL can't
+    /// cancel another peer's stream (AV-1 item 1) and a late frame from
+    /// a replaced session misses the map entirely (C5).
     in_flight: InFlightCalls,
     /// Per-call flow-control semaphore (when the caller opted in).
     /// `Some(sem)` means "pump must `acquire().await` one permit
     /// per chunk before emitting; STREAM_GRANT events
-    /// `add_permits(n)`". Absence of an entry for a `(origin,
-    /// call_id)` key means unbounded credit (no flow control —
-    /// pump emits as fast as the publish path can take chunks).
+    /// `add_permits(n)`". Absence of an entry for a key means
+    /// unbounded credit (no flow control — pump emits as fast as the
+    /// publish path can take chunks).
     flow_control: FlowControlMap,
+    /// The registration's live PROTECTED calls (§2.2). Public calls
+    /// never enter this set; `ServeHandle::drop` retires exactly these
+    /// (Q3). Empty until the protected admitted entry point is fed.
+    protected_calls: ProtectedStreamOwners,
     /// Optional per-service metrics handle. Same shape as
     /// `RpcServerFold::metrics`; the streaming fold ALSO bumps
     /// `streaming_chunks_emitted_total` from the pump task on
@@ -2567,10 +3580,12 @@ impl RpcServerStreamingFold {
     /// (or be eclipsed by the terminal frame and lost entirely).
     pub fn new(handler: Arc<dyn RpcStreamingHandler>, emit: RpcAsyncResponseEmitter) -> Self {
         Self {
+            session_id: 0,
             handler,
             emit,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             flow_control: Arc::new(Mutex::new(HashMap::new())),
+            protected_calls: ProtectedStreamOwners::new(),
             metrics: None,
         }
     }
@@ -2588,33 +3603,194 @@ impl RpcServerStreamingFold {
         self
     }
 
-    /// Test-only: snapshot of the in-flight call set.
-    #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
+    /// Test-only: snapshot of the in-flight call set (four-part keys —
+    /// `(from_node, session_id, origin, call_id)`).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn in_flight_keys(&self) -> Vec<StreamCallKey> {
         self.in_flight.lock().keys().copied().collect()
     }
 
-    /// Test-only: available flow-control permits for a call key
-    /// `(from_node, origin, call_id)`, or `None` if no per-call
-    /// semaphore is installed. Lets the AV-1 STREAM_GRANT-hijack
-    /// witness prove a forged grant from a foreign session does not
-    /// refill the victim's window.
-    #[cfg(test)]
-    pub fn flow_control_permits(&self, key: (u64, u64, u64)) -> Option<usize> {
+    /// Test-only: available flow-control permits for a call key, or
+    /// `None` if no per-call semaphore is installed. Lets the AV-1
+    /// STREAM_GRANT-hijack witness prove a forged grant from a foreign
+    /// session does not refill the victim's window.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn flow_control_permits(&self, key: StreamCallKey) -> Option<usize> {
         self.flow_control
             .lock()
             .get(&key)
             .map(|s| s.available_permits())
+    }
+
+    /// The registration-owned live PROTECTED calls (§2.2). The serve
+    /// seam clones this into its [`ServeHandle`] so handle drop retires
+    /// exactly these records (Q3).
+    pub fn protected_owners(&self) -> ProtectedStreamOwners {
+        self.protected_calls.clone()
     }
 }
 
 impl RpcServerStreamingFold {
     /// Production-path entry point. Keys per-call state (in-flight
     /// token + flow-control semaphore) by `(from_node,
-    /// claimed_origin, call_id)` so a forged CANCEL / STREAM_GRANT
-    /// from another peer misses the map and no-ops (AV-1 item 1).
+    /// receiving_session_id, claimed_origin, call_id)` so a forged
+    /// CANCEL / STREAM_GRANT from another peer misses the map and
+    /// no-ops (AV-1 item 1) — and a late frame from a *replaced*
+    /// session carrying the same `(from_node, origin, call_id)` misses
+    /// it too (C5, public + protected).
     pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.session_id = ev.session_id;
         self.apply_frame(ev.from_node, &ev.payload)
+    }
+
+    /// Fold seam of frozen contract 4 — `apply_inbound_admitted(frame,
+    /// lease)`. At slice 1.3 the `lease` slot carries the
+    /// [`Admitted`](crate::adapter::net::behavior::org_admission::Admitted)
+    /// facts: the exact-incarnation `AdmissionLease` of contract 3 lands
+    /// with slice 1.4's registry, and the four-part key does the session
+    /// fencing here.
+    ///
+    /// The PROTECTED opening path. §2.1's deadline resolution runs
+    /// BEFORE any handler effect: the default fills only an omitted
+    /// deadline, an explicit request over `max_live` is REFUSED (never
+    /// clamped), and credential validity clamps with the `Deadline` vs
+    /// `Credential` bound recorded. Every refusal is one typed
+    /// [`AdmissionDenied`](crate::adapter::net::behavior::org_admission::AdmissionDenied)
+    /// the bridge routes through the unchanged `emit_admission_denial`
+    /// — the fold emits NOTHING on refusal, so a denied opening has
+    /// exactly one bounded denial and zero handler effects (no handler,
+    /// no in-flight entry, no sender, no semaphore). On admission the
+    /// raw `net-org-admission` proof header is stripped (E1.6) and the
+    /// §2.2 supervisor is spawned owning the handler, the pump, the
+    /// flow semaphore and the one terminal.
+    ///
+    /// A non-`DISPATCH_RPC_REQUEST` frame is a caller-logic error here
+    /// (control frames for an admitted call ride [`Self::apply_inbound`]
+    /// without re-admission) and is refused as
+    /// `AdmissionDenied::NotOrgProtected`.
+    pub fn apply_inbound_admitted(
+        &mut self,
+        ev: &RpcInboundEvent,
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+        lifetime: &StreamCallLifetime<'_>,
+    ) -> Result<
+        Arc<ProtectedStreamCall>,
+        crate::adapter::net::behavior::org_admission::AdmissionDenied,
+    > {
+        use crate::adapter::net::behavior::org_admission::AdmissionDenied;
+
+        self.session_id = ev.session_id;
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        if meta.dispatch != DISPATCH_RPC_REQUEST {
+            return Err(AdmissionDenied::NotOrgProtected);
+        }
+        let key = (
+            ev.from_node,
+            self.session_id,
+            meta.origin_hash,
+            meta.seq_or_ts,
+        );
+        // §3: a duplicate while the key is live is refused as
+        // `ActiveCallOwned` BEFORE the payload decode.
+        if self.in_flight.lock().contains_key(&key) {
+            return Err(AdmissionDenied::ActiveCallOwned);
+        }
+        if ev.payload.len() < RPC_FRAME_BODY_OFFSET {
+            return Err(AdmissionDenied::MalformedProof);
+        }
+        let Ok(mut payload) = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+        else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        // The SS REQUEST flag check (contract 4): flags whose derived
+        // shape is not server-streaming are `ShapeMismatch`, never
+        // admitted.
+        if !ss_request_flags_ok(payload.flags) {
+            return Err(AdmissionDenied::ShapeMismatch);
+        }
+        // §2.1 — resolve before any handler effect. `deadline_ns == 0`
+        // is an OMITTED deadline (the provider default fills it); any
+        // nonzero value is an explicit request and is never capped by
+        // the default. Over `max_live` ⇒ refused, never clamped.
+        let requested = (payload.deadline_ns != 0).then_some(payload.deadline_ns);
+        let resolved = resolve_stream_deadline(
+            lifetime.clock.wall_ns,
+            requested,
+            lifetime.credential_ends_ns,
+            &lifetime.policy,
+        )
+        .map_err(|refusal| {
+            tracing::warn!(
+                caller_origin = format!("{:#x}", meta.origin_hash),
+                call_id = meta.seq_or_ts,
+                ?refusal,
+                "rpc streaming server fold: protected opening refused before handler effects",
+            );
+            AdmissionDenied::DeadlineExceedsPolicy
+        })?;
+        // E1.6: verified attribution in, raw credential material out.
+        payload.headers.retain(|(name, _)| {
+            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+        });
+
+        let cancellation = RpcCancellationToken::new();
+        self.in_flight.lock().insert(key, cancellation.clone());
+        let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
+            let sem = Arc::new(tokio::sync::Semaphore::new(n as usize));
+            self.flow_control.lock().insert(key, sem.clone());
+            sem
+        });
+        let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+            extract_trace_context(&payload.headers)
+        } else {
+            None
+        };
+        let ctx = RpcContext {
+            caller_origin: meta.origin_hash,
+            session_peer: ev.from_node,
+            call_id: meta.seq_or_ts,
+            payload,
+            cancellation,
+            trace_context,
+            org_admission: Some(admitted),
+        };
+        let call = Arc::new(ProtectedStreamCall {
+            record: Arc::new(Mutex::new(StreamCallRecord::new_server_streaming())),
+            retire: Arc::new(StreamRetireSignal::new()),
+            deadline: resolved,
+        });
+        self.protected_calls.insert(key, call.clone());
+        // The deadline's monotonic end derives from the admission's ONE
+        // clock sample (`monotonic_deadline_for`), so a wall-clock jump
+        // cannot move it.
+        let at =
+            tokio::time::Instant::from_std(lifetime.clock.monotonic_deadline_for(resolved.end_ns));
+        tokio::spawn(run_stream_call_supervisor(
+            Arc::clone(&call.record),
+            self.handler.clone(),
+            ctx,
+            self.metrics.clone(),
+            flow_sem,
+            Some(Arc::new(StreamProducerGate::new())),
+            Some(Arc::clone(&call.retire)),
+            Some((at, resolved.expiry_reason())),
+            false,
+            self.emit.clone(),
+            (ev.from_node, meta.origin_hash, meta.seq_or_ts),
+            StreamCallRegistration {
+                key,
+                in_flight: self.in_flight.clone(),
+                flow_control: self.flow_control.clone(),
+                protected: self.protected_calls.clone(),
+            },
+        ));
+        Ok(call)
     }
 
     /// Core frame application shared by [`Self::apply_inbound`] (real
@@ -2631,7 +3807,7 @@ impl RpcServerStreamingFold {
             );
             return Ok(());
         };
-        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, self.session_id, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
                 let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
@@ -2665,6 +3841,38 @@ impl RpcServerStreamingFold {
                         return Ok(());
                     }
                 };
+                // Caller-bug guard (contract 4 — unifying with the
+                // CS/DX folds' flag checks): a server-streaming REQUEST
+                // must carry flags whose derived shape is exactly
+                // server-streaming (`FLAG_RPC_STREAMING_RESPONSE` set,
+                // `FLAG_RPC_CLIENT_STREAMING_REQUEST` clear). Anything
+                // else is refused cleanly before any call state exists.
+                if !ss_request_flags_ok(payload.flags) {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        flags = format!("{:#06x}", payload.flags),
+                        "rpc streaming server fold: REQUEST flags are not server-streaming",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![(
+                            HEADER_NRPC_STREAMING.to_string(),
+                            HEADER_NRPC_STREAMING_END.to_vec(),
+                        )],
+                        body: Bytes::from_static(
+                            b"REQUEST on a server-streaming service must set FLAG_RPC_STREAMING_RESPONSE \
+                              and must not set FLAG_RPC_CLIENT_STREAMING_REQUEST",
+                        ),
+                    };
+                    let emit = self.emit.clone();
+                    let caller_origin = meta.origin_hash;
+                    let call_id = meta.seq_or_ts;
+                    tokio::spawn(async move {
+                        emit(from_node, caller_origin, call_id, resp).await;
+                    });
+                    return Ok(());
+                }
                 // Refuse a duplicate REQUEST with the same
                 // `(origin_hash, call_id)`. Without this, a retry
                 // that arrives while the first attempt's pump is
@@ -2708,7 +3916,8 @@ impl RpcServerStreamingFold {
                     }
                 }
                 // Cancellation token + in-flight bookkeeping —
-                // identical to the unary fold's pattern.
+                // identical to the unary fold's pattern (C5: the key
+                // carries the receiving incarnation).
                 let cancellation = RpcCancellationToken::new();
                 self.in_flight.lock().insert(key, cancellation.clone());
                 // Flow-control opt-in: parse the
@@ -2724,8 +3933,6 @@ impl RpcServerStreamingFold {
                 });
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
-                let in_flight = self.in_flight.clone();
-                let flow_control = self.flow_control.clone();
                 let caller_origin = meta.origin_hash;
                 let call_id = meta.seq_or_ts;
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
@@ -2734,189 +3941,77 @@ impl RpcServerStreamingFold {
                     None
                 };
                 let metrics = self.metrics.clone();
-                // See unary fold for rationale — clone the
-                // cancellation handle so the spawned task can probe
-                // it after the handler returns and override the
-                // terminal frame with `RpcStatus::Cancelled`.
-                let cancel_probe = cancellation.clone();
-                tokio::spawn(async move {
-                    if let Some(m) = metrics.as_ref() {
-                        m.handler_invocations_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        m.handler_in_flight
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let handler_started = std::time::Instant::now();
-                    let ctx = RpcContext {
-                        caller_origin,
-                        session_peer: from_node,
-                        call_id,
-                        payload,
-                        cancellation,
-                        trace_context,
-                        // Streaming is never protected (E1.8) — always public.
-                        org_admission: None,
-                    };
-                    // Build the sink + receive end. Spawn a
-                    // pump that forwards each chunk to the emit
-                    // closure. The handler's `sink.send(...)`
-                    // calls show up here as items on the receiver.
-                    // **Bounded** at STREAMING_PUMP_CAPACITY: a
-                    // runaway handler that produces chunks faster
-                    // than the publish path can drain stops
-                    // blocking the runtime past this many queued
-                    // chunks; additional chunks are dropped and
-                    // counted via streaming_chunks_dropped_total.
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
-                    let sink = RpcResponseSink {
-                        inner: tx,
-                        metrics: metrics.clone(),
-                    };
-                    let pump_emit = emit.clone();
-                    let pump_metrics = metrics.clone();
-                    let pump_flow = flow_sem.clone();
-                    let pump = tokio::spawn(async move {
-                        while let Some(chunk) = rx.recv().await {
-                            // Flow control: when the caller opted
-                            // in, await one semaphore permit per
-                            // chunk before publishing. The semaphore
-                            // starts at the caller's `initial_window`
-                            // and refills when the caller sends
-                            // STREAM_GRANT events. `forget()`
-                            // consumes the slot — each chunk uses
-                            // exactly one credit, never returned.
-                            // No-op when `pump_flow` is None
-                            // (back-compat path).
-                            if let Some(sem) = pump_flow.as_ref() {
-                                let permit = match sem.clone().acquire_owned().await {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        // Semaphore was closed —
-                                        // shouldn't happen during
-                                        // normal operation; bail.
-                                        break;
-                                    }
-                                };
-                                permit.forget();
-                            }
-                            if let Some(m) = pump_metrics.as_ref() {
-                                m.streaming_chunks_emitted_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            let resp = RpcResponsePayload {
-                                status: RpcStatus::Ok,
-                                headers: vec![(
-                                    HEADER_NRPC_STREAMING.to_string(),
-                                    HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
-                                )],
-                                body: chunk.clone(),
-                            };
-                            // Await per-chunk publish so chunks for
-                            // one call_id reach the network in send
-                            // order. Without this, two chunks emitted
-                            // in tight succession can race into the
-                            // publish path and arrive out of order
-                            // (or be eclipsed by the terminal frame
-                            // and lost entirely on the caller side).
-                            pump_emit(from_node, caller_origin, call_id, resp).await;
-                        }
-                    });
-                    // Run the handler. Catch panics so a
-                    // misbehaving handler can't take down the
-                    // runtime — same shape as the unary fold.
-                    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                        handler.call(ctx, sink),
-                    ))
-                    .await;
-                    // The handler dropped the sink (either by
-                    // returning or by panicking through the
-                    // catch_unwind). Wait for the pump to drain
-                    // any final in-flight chunks.
-                    let _ = pump.await;
-                    if let Some(m) = metrics.as_ref() {
-                        m.handler_in_flight
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        m.record_handler_duration(handler_started.elapsed());
-                        if outcome.is_err() {
-                            m.handler_panics_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    // Emit the terminal frame. CANCEL-wins ordering
-                    // matches the unary fold: if the cancellation
-                    // token fired during execution, override the
-                    // handler's terminal with `RpcStatus::Cancelled`.
-                    let terminal = if cancel_probe.is_cancelled() {
-                        RpcResponsePayload {
-                            status: RpcStatus::Cancelled,
-                            headers: vec![],
-                            body: Bytes::from_static(
-                                b"server observed CANCEL during streaming handler execution",
-                            ),
-                        }
-                    } else {
-                        match outcome {
-                            Ok(Ok(())) => RpcResponsePayload {
-                                status: RpcStatus::Ok,
-                                headers: vec![(
-                                    HEADER_NRPC_STREAMING.to_string(),
-                                    HEADER_NRPC_STREAMING_END.to_vec(),
-                                )],
-                                body: Bytes::new(),
-                            },
-                            Ok(Err(RpcHandlerError::Application { code, message })) => {
-                                RpcResponsePayload {
-                                    status: RpcStatus::Application(code),
-                                    headers: vec![],
-                                    body: Bytes::from(message),
-                                }
-                            }
-                            Ok(Err(RpcHandlerError::Internal(message))) => RpcResponsePayload {
-                                status: RpcStatus::Internal,
-                                headers: vec![],
-                                body: Bytes::from(message),
-                            },
-                            Err(panic) => {
-                                let panic_msg = panic
-                                    .downcast_ref::<&'static str>()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "<non-string panic>".into());
-                                tracing::error!(
-                                    caller_origin = format!("{:#x}", caller_origin),
-                                    call_id,
-                                    panic = %panic_msg,
-                                    "rpc streaming server handler panicked",
-                                );
-                                RpcResponsePayload {
-                                    status: RpcStatus::Internal,
-                                    headers: vec![],
-                                    body: Bytes::from(format!("handler panicked: {panic_msg}")),
-                                }
-                            }
-                        }
-                    };
-                    in_flight.lock().remove(&key);
-                    // Drop the per-call flow-control semaphore
-                    // (if any) so a stale GRANT arriving after
-                    // termination is silently dropped — the entry
-                    // is gone, lookup misses.
-                    flow_control.lock().remove(&key);
-                    // Await the terminal frame's publish too so it
-                    // arrives strictly AFTER the last chunk on the
-                    // wire (the pump has already drained, but the
-                    // emit itself is still async and we must await
-                    // it before the spawned task ends).
-                    emit(from_node, caller_origin, call_id, terminal).await;
+                let deadline_ns = payload.deadline_ns;
+                let ctx = RpcContext {
+                    caller_origin,
+                    session_peer: from_node,
+                    call_id,
+                    payload,
+                    cancellation,
+                    trace_context,
+                    // Streaming is never protected on this path (E1.8):
+                    // protected records ride `apply_inbound_admitted`.
+                    org_admission: None,
+                };
+                // Public calls run the same bounded call shape under the
+                // Q3 shared repairs ONLY: a NONZERO `deadline_ns` is
+                // enforced (C6) with a `Timeout` terminal (C7);
+                // `deadline_ns == 0` keeps meaning "no deadline"; the
+                // documented CANCEL-wins terminal override is preserved;
+                // and there is no §2.2 retire signal / producer gate —
+                // public calls retain their documented outstanding-call
+                // and lossy-sink behavior (Q3 / C9).
+                let deadline = (deadline_ns != 0).then(|| {
+                    let now_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let remaining = deadline_ns.saturating_sub(now_ns);
+                    (
+                        tokio::time::Instant::now() + std::time::Duration::from_nanos(remaining),
+                        StreamTerminalReason::Timeout,
+                    )
                 });
+                tokio::spawn(run_stream_call_supervisor(
+                    Arc::new(Mutex::new(StreamCallRecord::new_server_streaming())),
+                    handler,
+                    ctx,
+                    metrics,
+                    flow_sem,
+                    None,
+                    None,
+                    deadline,
+                    true,
+                    emit,
+                    (from_node, caller_origin, call_id),
+                    StreamCallRegistration {
+                        key,
+                        in_flight: self.in_flight.clone(),
+                        flow_control: self.flow_control.clone(),
+                        protected: self.protected_calls.clone(),
+                    },
+                ));
             }
             DISPATCH_RPC_CANCEL => {
+                // A PROTECTED record enters retirement through its
+                // supervisor (§2.2/§2.6): the signal reaches the
+                // supervisor's `select!`, and terminal selection + map
+                // removal stay that one owner's work (§2.4's single
+                // removal point), so a re-REQUEST under this key cannot
+                // race the retired call's cleanup. The handler still
+                // sees the cancellation token immediately.
+                if let Some(call) = self.protected_calls.get(&key) {
+                    if let Some(token) = self.in_flight.lock().get(&key).cloned() {
+                        token.cancel();
+                    }
+                    call.retire(StreamTerminalReason::Cancelled);
+                    return Ok(());
+                }
                 if let Some(token) = self.in_flight.lock().remove(&key) {
                     token.cancel();
                 }
-                // Also drop the flow-control entry — the spawned
-                // task's terminal cleanup will run too, but doing
+                // Also drop the flow-control entry — the supervisor's
+                // terminal cleanup will run too, but doing
                 // it here makes the CANCEL path immediately stop
                 // refilling the pump (the pending `acquire().await`
                 // will resolve once the semaphore is dropped or
@@ -2945,6 +4040,15 @@ impl RpcServerStreamingFold {
                     return Ok(());
                 }
                 if let Some(sem) = self.flow_control.lock().get(&key).cloned() {
+                    // Protected records classify the frame (§2.6):
+                    // credit survives the handler's return — it is what
+                    // lets a drain finish — and stops once the call is
+                    // terminal or its output half has ended.
+                    if let Some(call) = self.protected_calls.get(&key) {
+                        if !call.record.lock().credit_grantable() {
+                            return Ok(());
+                        }
+                    }
                     // Tokio's `Semaphore::add_permits` is bounded
                     // by `MAX_PERMITS = usize::MAX >> 3`. A
                     // misbehaving caller flooding huge grants
@@ -2997,15 +4101,17 @@ impl RedexFold<()> for RpcServerStreamingFold {
 // ============================================================================
 
 /// Per-call request-direction sender map type. Keyed on
-/// `(from_node, caller_origin_hash, call_id)` (AV-1 item 1): the
-/// AEAD-authenticated last-hop session peer is part of the key so a
-/// peer cannot push a REQUEST_CHUNK into another peer's upload stream
-/// by copying its origin + call_id. Value is the bounded mpsc sender
-/// the fold's `apply_frame()` pushes REQUEST_CHUNK bodies into. The
-/// matching receiver lives inside the handler's [`RequestStream`];
-/// dropping the sender (on REQUEST_END or CANCEL) closes the stream.
+/// `(from_node, receiving_session_id, caller_origin_hash, call_id)`
+/// (AV-1 item 1, C5): the AEAD-authenticated last-hop session peer AND
+/// the receiving incarnation are part of the key so a peer cannot push
+/// a REQUEST_CHUNK into another peer's upload stream by copying its
+/// origin + call_id, and a late chunk from a *replaced* session misses
+/// the map entirely. Value is the bounded mpsc sender the fold's
+/// `apply_frame()` pushes REQUEST_CHUNK bodies into. The matching
+/// receiver lives inside the handler's [`RequestStream`]; dropping the
+/// sender (on REQUEST_END or CANCEL) closes the stream.
 type RequestChunkSenders =
-    Arc<Mutex<HashMap<(u64, u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+    Arc<Mutex<HashMap<StreamCallKey, tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
 
 /// Shared REQUEST_CHUNK handling used by both
 /// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
@@ -3021,6 +4127,7 @@ type RequestChunkSenders =
 /// and the same per-call mpsc + sender-map contract.
 fn apply_request_chunk_to_senders(
     from_node: u64,
+    session_id: u64,
     payload_bytes: Bytes,
     meta: &EventMeta,
     senders: &RequestChunkSenders,
@@ -3049,10 +4156,11 @@ fn apply_request_chunk_to_senders(
         );
         return;
     }
-    // Scope the sender lookup to the authenticated session peer so a
-    // forged REQUEST_CHUNK carrying another peer's origin + call_id
-    // misses the map (AV-1 item 1).
-    let key = (from_node, meta.origin_hash, meta.seq_or_ts);
+    // Scope the sender lookup to the authenticated session peer and its
+    // receiving incarnation so a forged REQUEST_CHUNK carrying another
+    // peer's origin + call_id misses the map (AV-1 item 1) — and a late
+    // chunk from a replaced session cannot feed the successor (C5).
+    let key = (from_node, session_id, meta.origin_hash, meta.seq_or_ts);
     let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
     let sender = senders.lock().get(&key).cloned();
     let Some(sender) = sender else {
@@ -3166,17 +4274,18 @@ impl RpcStreamingRequestFold {
         self
     }
 
-    /// Test-only: snapshot of the in-flight call set.
-    #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
+    /// Test-only: snapshot of the in-flight call set (four-part keys —
+    /// `(from_node, session_id, origin, call_id)`, C5).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn in_flight_keys(&self) -> Vec<StreamCallKey> {
         self.in_flight.lock().keys().copied().collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
     /// Useful for tests that need to assert a call's sender has
     /// been dropped after REQUEST_END / CANCEL.
-    #[cfg(test)]
-    pub fn sender_keys(&self) -> Vec<(u64, u64, u64)> {
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sender_keys(&self) -> Vec<StreamCallKey> {
         self.senders.lock().keys().copied().collect()
     }
 }
@@ -3187,6 +4296,7 @@ impl RpcStreamingRequestFold {
     /// call_id)` so a forged REQUEST_CHUNK / CANCEL from another peer
     /// misses the map and no-ops (AV-1 item 1).
     pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.session_id = ev.session_id;
         self.apply_frame(ev.from_node, &ev.payload)
     }
 
@@ -3204,7 +4314,7 @@ impl RpcStreamingRequestFold {
             );
             return Ok(());
         };
-        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, self.session_id, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
                 let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
@@ -3359,14 +4469,14 @@ impl RpcStreamingRequestFold {
                     None
                 };
                 let deadline_ns = payload.deadline_ns;
-                let ctx = RpcStreamingContext {
-                    caller_origin: meta.origin_hash,
-                    call_id: meta.seq_or_ts,
+                let ctx = RpcStreamingContext::new(
+                    meta.origin_hash,
+                    meta.seq_or_ts,
                     deadline_ns,
-                    headers: payload.headers,
-                    cancellation: cancellation.clone(),
+                    payload.headers,
+                    cancellation.clone(),
                     trace_context,
-                };
+                );
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
@@ -3395,6 +4505,12 @@ impl RpcStreamingRequestFold {
                     let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                         handler.call(ctx, request_stream),
                     ));
+                    // C7 (Q3): a deadline expiry's terminal is typed
+                    // `Timeout` — recorded here so the terminal
+                    // selection below can distinguish the deadline's own
+                    // cancel signal from a caller CANCEL (which keeps
+                    // its documented CANCEL-wins override).
+                    let mut deadline_expired: Option<String> = None;
                     let outcome = if deadline_ns > 0 {
                         let now_ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3402,6 +4518,11 @@ impl RpcStreamingRequestFold {
                             .unwrap_or(0);
                         let remaining = deadline_ns.saturating_sub(now_ns);
                         if remaining == 0 {
+                            if !cancel_for_deadline.is_cancelled() {
+                                deadline_expired = Some(
+                                    "handler deadline_ns already expired at spawn".to_string(),
+                                );
+                            }
                             cancel_for_deadline.cancel();
                             Ok(Err(RpcHandlerError::Internal(
                                 "handler deadline_ns already expired at spawn".to_string(),
@@ -3415,6 +4536,10 @@ impl RpcStreamingRequestFold {
                             {
                                 Ok(o) => o,
                                 Err(_) => {
+                                    if !cancel_for_deadline.is_cancelled() {
+                                        deadline_expired =
+                                            Some("handler deadline_ns exceeded".to_string());
+                                    }
                                     cancel_for_deadline.cancel();
                                     Ok(Err(RpcHandlerError::Internal(
                                         "handler deadline_ns exceeded".to_string(),
@@ -3436,8 +4561,16 @@ impl RpcStreamingRequestFold {
                     }
                     // CANCEL-wins ordering: if the cancellation
                     // token fired during execution, override the
-                    // handler's terminal with Cancelled.
-                    let terminal = if cancel_probe.is_cancelled() {
+                    // handler's terminal with Cancelled. C7 (Q3): a
+                    // deadline expiry that no caller CANCEL preceded is
+                    // typed `Timeout`.
+                    let terminal = if let Some(message) = deadline_expired {
+                        RpcResponsePayload {
+                            status: RpcStatus::Timeout,
+                            headers: vec![],
+                            body: Bytes::from(message),
+                        }
+                    } else if cancel_probe.is_cancelled() {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
@@ -3493,6 +4626,7 @@ impl RpcStreamingRequestFold {
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
                     from_node,
+                    self.session_id,
                     frame.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
@@ -3558,14 +4692,18 @@ impl RedexFold<()> for RpcStreamingRequestFold {
 ///
 /// Bidi streaming plan (Phase D).
 pub struct RpcDuplexFold {
+    /// R2-A/C5: the receiving incarnation of the frame currently being
+    /// applied, set by `apply_inbound` from the event. Part of every
+    /// per-call key below; `0` on test/loopback paths, like `from_node`.
+    session_id: u64,
     handler: Arc<dyn RpcDuplexHandler>,
     /// Async emitter for response chunks (per-call ordering via
     /// awaited emits — same rationale as `RpcServerStreamingFold`).
     emit: RpcAsyncResponseEmitter,
     /// Optional request-direction grant emitter.
     grant_emit: Option<RpcRequestGrantEmitter>,
-    /// (from_node, caller_origin, call_id) → cancellation token —
-    /// authenticated-peer-scoped (AV-1 item 1).
+    /// (from_node, receiving_session_id, caller_origin, call_id) →
+    /// cancellation token — session-fenced (AV-1 item 1, C5).
     in_flight: InFlightCalls,
     senders: RequestChunkSenders,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
@@ -3578,6 +4716,7 @@ impl RpcDuplexFold {
     /// ordering, same as `RpcServerStreamingFold`).
     pub fn new(handler: Arc<dyn RpcDuplexHandler>, emit: RpcAsyncResponseEmitter) -> Self {
         Self {
+            session_id: 0,
             handler,
             emit,
             grant_emit: None,
@@ -3608,15 +4747,16 @@ impl RpcDuplexFold {
         self
     }
 
-    /// Test-only: snapshot of the in-flight call set.
-    #[cfg(test)]
-    pub fn in_flight_keys(&self) -> Vec<(u64, u64, u64)> {
+    /// Test-only: snapshot of the in-flight call set (four-part keys —
+    /// `(from_node, session_id, origin, call_id)`, C5).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn in_flight_keys(&self) -> Vec<StreamCallKey> {
         self.in_flight.lock().keys().copied().collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
-    #[cfg(test)]
-    pub fn sender_keys(&self) -> Vec<(u64, u64, u64)> {
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sender_keys(&self) -> Vec<StreamCallKey> {
         self.senders.lock().keys().copied().collect()
     }
 }
@@ -3627,6 +4767,7 @@ impl RpcDuplexFold {
     /// call_id)` so a forged REQUEST_CHUNK / CANCEL from another peer
     /// misses the map and no-ops (AV-1 item 1).
     pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) -> Result<(), RedexError> {
+        self.session_id = ev.session_id;
         self.apply_frame(ev.from_node, &ev.payload)
     }
 
@@ -3644,7 +4785,7 @@ impl RpcDuplexFold {
             );
             return Ok(());
         };
-        let key = (from_node, meta.origin_hash, meta.seq_or_ts);
+        let key = (from_node, self.session_id, meta.origin_hash, meta.seq_or_ts);
         match meta.dispatch {
             DISPATCH_RPC_REQUEST => {
                 let payload = match RpcRequestPayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..))
@@ -3785,6 +4926,7 @@ impl RpcDuplexFold {
                 let response_sink = RpcResponseSink {
                     inner: resp_tx,
                     metrics: self.metrics.clone(),
+                    gate: None,
                 };
 
                 let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
@@ -3793,14 +4935,14 @@ impl RpcDuplexFold {
                     None
                 };
                 let deadline_ns = payload.deadline_ns;
-                let ctx = RpcStreamingContext {
-                    caller_origin: meta.origin_hash,
-                    call_id: meta.seq_or_ts,
+                let ctx = RpcStreamingContext::new(
+                    meta.origin_hash,
+                    meta.seq_or_ts,
                     deadline_ns,
-                    headers: payload.headers,
-                    cancellation: cancellation.clone(),
+                    payload.headers,
+                    cancellation.clone(),
                     trace_context,
-                };
+                );
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
@@ -3848,6 +4990,11 @@ impl RpcDuplexFold {
                     let call_fut = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                         handler.call(ctx, request_stream, response_sink),
                     ));
+                    // C7 (Q3): a deadline expiry's terminal is typed
+                    // `Timeout` — recorded so the terminal selection can
+                    // distinguish the deadline's own cancel signal from a
+                    // caller CANCEL (CANCEL-wins preserved).
+                    let mut deadline_expired: Option<String> = None;
                     let outcome = if deadline_ns > 0 {
                         let now_ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3855,6 +5002,12 @@ impl RpcDuplexFold {
                             .unwrap_or(0);
                         let remaining = deadline_ns.saturating_sub(now_ns);
                         if remaining == 0 {
+                            if !cancel_for_deadline.is_cancelled() {
+                                deadline_expired = Some(
+                                    "duplex handler deadline_ns already expired at spawn"
+                                        .to_string(),
+                                );
+                            }
                             cancel_for_deadline.cancel();
                             Ok(Err(RpcHandlerError::Internal(
                                 "duplex handler deadline_ns already expired at spawn".to_string(),
@@ -3868,6 +5021,10 @@ impl RpcDuplexFold {
                             {
                                 Ok(o) => o,
                                 Err(_) => {
+                                    if !cancel_for_deadline.is_cancelled() {
+                                        deadline_expired =
+                                            Some("duplex handler deadline_ns exceeded".to_string());
+                                    }
                                     cancel_for_deadline.cancel();
                                     Ok(Err(RpcHandlerError::Internal(
                                         "duplex handler deadline_ns exceeded".to_string(),
@@ -3891,7 +5048,18 @@ impl RpcDuplexFold {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    let terminal = if cancel_probe.is_cancelled() {
+                    // CANCEL-wins ordering: if the cancellation
+                    // token fired during execution, override the
+                    // handler's terminal with Cancelled. C7 (Q3): a
+                    // deadline expiry that no caller CANCEL preceded is
+                    // typed `Timeout`.
+                    let terminal = if let Some(message) = deadline_expired {
+                        RpcResponsePayload {
+                            status: RpcStatus::Timeout,
+                            headers: vec![],
+                            body: Bytes::from(message),
+                        }
+                    } else if cancel_probe.is_cancelled() {
                         RpcResponsePayload {
                             status: RpcStatus::Cancelled,
                             headers: vec![],
@@ -3949,6 +5117,7 @@ impl RpcDuplexFold {
             DISPATCH_RPC_REQUEST_CHUNK => {
                 apply_request_chunk_to_senders(
                     from_node,
+                    self.session_id,
                     frame.slice(RPC_FRAME_BODY_OFFSET..),
                     &meta,
                     &self.senders,
@@ -6191,7 +7360,7 @@ mod tests {
         let req = RpcRequestPayload {
             service: "s".to_string(),
             deadline_ns: 0,
-            flags: 0,
+            flags: FLAG_RPC_STREAMING_RESPONSE,
             headers: vec![(HEADER_NRPC_STREAM_WINDOW_INITIAL.to_string(), b"2".to_vec())],
             body: Bytes::new(),
         };
@@ -6202,13 +7371,15 @@ mod tests {
         .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                || fold
+                    .in_flight_keys()
+                    .contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
                 Duration::from_secs(1)
             )
             .await
         );
         assert_eq!(
-            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            fold.flow_control_permits((VICTIM, 0, ORIGIN, CALL_ID)),
             Some(2),
             "victim's initial window",
         );
@@ -6219,7 +7390,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            fold.flow_control_permits((VICTIM, 0, ORIGIN, CALL_ID)),
             Some(2),
             "a forged STREAM_GRANT from a foreign session must not refill the victim's window",
         );
@@ -6231,7 +7402,8 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            fold.in_flight_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            fold.in_flight_keys()
+                .contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
             "a forged CANCEL from a foreign session must not tear down the victim's stream",
         );
         // The victim's own STREAM_GRANT(5) DOES refill.
@@ -6241,7 +7413,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            fold.flow_control_permits((VICTIM, ORIGIN, CALL_ID)),
+            fold.flow_control_permits((VICTIM, 0, ORIGIN, CALL_ID)),
             Some(7),
             "the victim's own STREAM_GRANT must refill its window",
         );
@@ -6282,7 +7454,7 @@ mod tests {
         .unwrap();
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                || fold.sender_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
                 Duration::from_secs(1)
             )
             .await
@@ -6301,7 +7473,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            fold.sender_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
             "forged frames must not close the victim's upload stream",
         );
         // Victim feeds a legit chunk and ends its own stream.
@@ -6385,7 +7557,7 @@ mod tests {
         .unwrap();
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+                || fold.sender_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
                 Duration::from_secs(1)
             )
             .await
@@ -6403,7 +7575,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            fold.sender_keys().contains(&(VICTIM, ORIGIN, CALL_ID)),
+            fold.sender_keys().contains(&(VICTIM, 0, ORIGIN, CALL_ID)),
             "forged frames must not close the victim's duplex upload stream",
         );
         fold.apply_inbound(&inbound(
@@ -7500,7 +8672,7 @@ mod tests {
         // handler is parked (in_flight key present), then CANCEL.
         assert!(
             wait_until(
-                || !captured.lock().is_empty() && fold.in_flight_keys().contains(&(0, 7, 13)),
+                || !captured.lock().is_empty() && fold.in_flight_keys().contains(&(0, 0, 7, 13)),
                 Duration::from_secs(2)
             )
             .await
@@ -7562,7 +8734,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(0, 1, 99)),
+                || fold.in_flight_keys().contains(&(0, 0, 1, 99)),
                 Duration::from_secs(1)
             )
             .await
@@ -7635,6 +8807,7 @@ mod tests {
         let sink = RpcResponseSink {
             inner: tx,
             metrics: Some(metrics.clone()),
+            gate: None,
         };
         // 5 sends; first 2 buffer, next 3 drop.
         for i in 0..5u8 {
@@ -7797,7 +8970,7 @@ mod tests {
         // picked up the request and the apply path completed).
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(0, 0xCAFE, 7)),
+                || fold.sender_keys().contains(&(0, 0, 0xCAFE, 7)),
                 Duration::from_secs(1)
             )
             .await
@@ -7914,7 +9087,7 @@ mod tests {
         // draining.
         assert!(
             wait_until(
-                || fold.sender_keys().contains(&(0, 2, 17)),
+                || fold.sender_keys().contains(&(0, 0, 2, 17)),
                 Duration::from_secs(1)
             )
             .await
@@ -8080,7 +9253,7 @@ mod tests {
             .unwrap();
         assert!(
             wait_until(
-                || fold.in_flight_keys().contains(&(0, 5, 99)),
+                || fold.in_flight_keys().contains(&(0, 0, 5, 99)),
                 Duration::from_secs(1)
             )
             .await

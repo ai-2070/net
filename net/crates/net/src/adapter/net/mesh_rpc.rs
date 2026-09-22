@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 
 use super::channel::{ChannelHash, ChannelId, ChannelName, ChannelPublisher, PublishConfig};
 use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome, ServiceMetricsAtomic};
+use crate::adapter::net::cortex::rpc::{ProtectedStreamOwners, StreamTerminalReason};
 use crate::adapter::net::cortex::{
     build_trace_headers, encode_request_grant, encode_rpc_route, encode_stream_grant,
     parse_request_window_initial, peek_request_service, request_wire_size, EventMeta,
@@ -425,6 +426,21 @@ pub struct ServeHandle {
     /// Hold an Arc back to the mesh so we can unregister on Drop
     /// without the mesh having to track us.
     mesh: Arc<MeshNode>,
+    /// The registration's live PROTECTED stream calls (§2.2 of the
+    /// org-streaming plan). Drop retires exactly these records
+    /// (`ServeHandleDropped` — the terminal they emit is `Cancelled`,
+    /// per §2.2's queued-data table). Q3/C9: protected-only on handle
+    /// drop — PUBLIC calls are not in this set and keep their
+    /// documented outstanding-call behavior. `None` for the folds with
+    /// no protected admitted entry point yet (the CS/DX folds' lands in
+    /// Stage 2).
+    protected_streams: Option<ProtectedStreamOwners>,
+    /// Test-only handle to this bridge's streaming fold (the
+    /// `origin_node_cache` precedent), so a witness can drive the
+    /// fold's protected admitted seam through a REAL registration and
+    /// observe key/record shape deterministically.
+    #[cfg(any(test, feature = "fixtures"))]
+    test_streaming_fold: Option<Arc<Mutex<RpcServerStreamingFold>>>,
     /// Test-only handle to this bridge's authenticated response-route cache
     /// (the per-serve `origin_node_cache`), so a witness can DETERMINISTICALLY
     /// assert that a rejected frame (origin mismatch / relayed) left no cached
@@ -452,6 +468,34 @@ impl Drop for ServeHandle {
         self.mesh
             .rpc_local_services_arc()
             .remove_if(&self.service, self.registration_id);
+        // Q3/C9 (org-streaming §2.2): retire every live PROTECTED
+        // stream of THIS registration — cancellation signalled,
+        // semaphores closed, pump aborted + joined, one terminal
+        // (`Cancelled`) after pump stop, all by each call's own
+        // supervisor. Synchronous here: the signals fire now; async
+        // cleanup completes after (§2.2: "async cleanup is not
+        // guaranteed to finish before the synchronous revocation
+        // callback returns"). Public calls are untouched.
+        if let Some(owners) = self.protected_streams.take() {
+            let retired = owners.retire_all(StreamTerminalReason::ServeHandleDropped);
+            if retired > 0 {
+                tracing::debug!(
+                    service = %self.service,
+                    retired,
+                    "serve handle dropped: retired the registration's protected streams",
+                );
+            }
+        }
+    }
+}
+
+impl ServeHandle {
+    /// Test-only: this bridge's streaming fold, when the registration
+    /// drives one. Lets a witness feed `apply_inbound_admitted` through
+    /// a REAL handle and observe the fold's maps + protected records.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn streaming_fold_for_test(&self) -> Option<Arc<Mutex<RpcServerStreamingFold>>> {
+        self.test_streaming_fold.clone()
     }
 }
 
@@ -4070,6 +4114,11 @@ impl MeshNode {
             _bridge: bridge,
             _response_drain: Some(response_drain),
             mesh: Arc::clone(self),
+            // Unary registrations own no streaming records (E1.8): no
+            // protected stream retirement on drop.
+            protected_streams: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_streaming_fold: None,
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4199,6 +4248,15 @@ impl MeshNode {
             RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
                 .with_metrics(metrics_handle),
         ));
+        // Q3/C9 (org-streaming §2.2): `ServeHandle::drop` retires this
+        // registration's live PROTECTED streams. The ownership set is
+        // captured here, before the bridge task takes the fold, and is
+        // empty until the protected admitted seam is fed (slice 1.5's
+        // bridge wiring; the fold-level seam is
+        // `RpcServerStreamingFold::apply_inbound_admitted`).
+        let protected_streams = fold.lock().protected_owners();
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_streaming_fold = Arc::clone(&fold);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -4288,6 +4346,9 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            protected_streams: Some(protected_streams),
+            #[cfg(any(test, feature = "fixtures"))]
+            test_streaming_fold: Some(test_streaming_fold),
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4529,6 +4590,9 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            protected_streams: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_streaming_fold: None,
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })
@@ -4887,6 +4951,9 @@ impl MeshNode {
             // unary hot path); no drainer.
             _response_drain: None,
             mesh: Arc::clone(self),
+            protected_streams: None,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_streaming_fold: None,
             #[cfg(test)]
             origin_node_cache: origin_node_cache.clone(),
         })

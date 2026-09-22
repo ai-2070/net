@@ -11,10 +11,12 @@
 //! What each pin is for — the Compatibility-ledger rows of the plan
 //! (`ORG_SCOPED_STREAMING_PLAN.md:813-836`) that are expected to break it:
 //!
-//! * **C1** — [`pin_rpc_streaming_context`]: the `RpcStreamingContext { .. }`
-//!   literal. Adding `org_admission` and `#[non_exhaustive]` (approved Q2)
-//!   makes this literal illegal from outside the defining crate. Expected to
-//!   FAIL in Stage 1 by design.
+//! * **C1 (realized in Stage 1 slice 1.3)** — [`pin_rpc_streaming_context`]:
+//!   the `RpcStreamingContext { .. }` literal. Adding `org_admission` and
+//!   `#[non_exhaustive]` (approved Q2) makes this literal illegal from
+//!   outside the defining crate. The named-break doctrine applied: the
+//!   literal STOPPED compiling and this pin was UPDATED to the stable
+//!   constructor in the same commit as the break (not deleted).
 //! * **C3** — [`pin_admission_context`]: the `AdmissionContext { .. }`
 //!   literal, including `is_unary: true`. Replacing `is_unary` with
 //!   `shape: RpcCallShape` and adding `#[non_exhaustive]` (approved Q7) breaks
@@ -352,19 +354,29 @@ fn pin_call_options() -> CallOptions {
     options
 }
 
-/// **Ledger C1.** `RpcStreamingContext { .. }` by struct literal — the exact
-/// construction Q2's `org_admission` field plus `#[non_exhaustive]` makes
-/// impossible from outside the defining crate
-/// (`src/adapter/net/cortex/rpc.rs:2287-2319`).
+/// **Ledger C1 (realized in Stage 1 slice 1.3).** The
+/// `RpcStreamingContext { .. }` by struct literal — the exact
+/// construction Q2's `org_admission` field plus `#[non_exhaustive]`
+/// makes impossible from outside the defining crate
+/// (`src/adapter/net/cortex/rpc.rs`) — stopped compiling when Q2
+/// landed. This is the named break's migration path, UPDATED not
+/// deleted: the stable constructor (the only external construction the
+/// break leaves), which creates NO admitted org facts.
 fn pin_rpc_streaming_context() -> RpcStreamingContext {
-    let context = RpcStreamingContext {
-        caller_origin: 0,
-        call_id: 1,
-        deadline_ns: 0,
-        headers: vec![("nrpc-probe".to_string(), b"1".to_vec())],
-        cancellation: RpcCancellationToken::new(),
-        trace_context: Some(pin_trace_context()),
-    };
+    let context = RpcStreamingContext::new(
+        0,
+        1,
+        0,
+        vec![("nrpc-probe".to_string(), b"1".to_vec())],
+        RpcCancellationToken::new(),
+        Some(pin_trace_context()),
+    );
+    // The constructor's contract (Q2): it never fabricates verified
+    // attribution — admission facts originate at the verifier.
+    assert!(
+        context.org_admission.is_none(),
+        "RpcStreamingContext::new must create no admitted org facts",
+    );
     let context: net_sdk::mesh_rpc::RpcStreamingContext = context;
     context
 }
@@ -453,12 +465,14 @@ fn main() {
     ];
 
     println!(
-        "org+streaming API probe: 3 ledger literals constructed \
-         (CallOptions.stream_window_initial={:?}, RpcStreamingContext.call_id={}, \
-         AdmissionContext.shape={:?}), {} exhaustive matches ({}), \
+        "org+streaming API probe: 3 ledger surfaces constructed \
+         (CallOptions literal, stream_window_initial={:?}; RpcStreamingContext \
+         constructor, call_id={}, org_admission.is_none()={}; AdmissionContext \
+         constructor, shape={:?}), {} exhaustive matches ({}), \
          {} signatures pinned without running a node",
         options.stream_window_initial,
         context.call_id,
+        context.org_admission.is_none(),
         admission.shape,
         matched.len(),
         handler_error,
