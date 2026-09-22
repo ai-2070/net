@@ -1253,3 +1253,46 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   Stage 1 dispatch proceeds through `spikes/org-streaming/S1_BRIEF.md` (two
   lanes: `S1Session` slice 1.1 and `S1Core` slices 1.2–1.6 sequential, with a
   `mesh.rs` hold point between them). Stage 2+ remains unauthorized.
+
+- 2026-09-22, **Stage 1 executed** (branch `LZL0/org-streaming`, pinned brief
+  `spikes/org-streaming/S1_BRIEF.md` @`096f54009`): slices 1.1–1.6 all landed
+  and accepted at coordinator level. Landed: 1.1/1.1a session-binding
+  carriage and the 11-site handshake migration (`0d4bbfb24`, `4d159e484`,
+  `cc3a1faa3`, `8b1e8bd12`); 1.2 streaming proof + shape-aware admission —
+  **the §1.4 mixed-version gate EXECUTED: the frozen `85ecc77c9` decoder fed
+  the new caller's bytes yields typed `NotSupported`, so the prefix design
+  HOLDS** (`0ed6ecd27`, `8d10471f4`); 1.3 fold 4-tuple keys + §2.1 deadline
+  bounds + §2.2 supervisor + the Q3 public-fold regressions (`b4fc7933f`,
+  `642634b9e`); 1.4 registry §3 bracketing + §2.3 revocation + §2.7 byte
+  accounting + the node-shutdown carve (`62f4358bc`, `bd5de3b5d`); 1.5 bridge
+  seam + `ProtectedAdmission` + NC2 `DirectOnly` (`444a4aab9`, `9e4642e0b`,
+  `21efd0319`); 1.6 the authorized deleted pins + `call_streaming` widening
+  (`c245a29f0`, `08dfb4ea6`). Witness estate at the stage head:
+  `org_rpc_streaming` 27/27 (CI floor 27, roster-validated), preserved +
+  controls 89/89, in-source 216/216 (Stage 0 models green and semantically
+  held), units `org_admission` 21 / `mesh_rpc` 52, wire 278/278.
+  **35 raw inverse receipts** across the slices (3+1+6+6+10+3+4+2 named §2.3
+  rewrite receipts), zero green-under-inverse except the two disclosed
+  partials analyzed as non-inverses with their true inverses red. Coordinator
+  spot-checks independently reproduced five receipts (R-a, the shutdown
+  carve, the DirectOnly flip, the Revoked mapping, the teardown disengage);
+  the remainder are queued for review round 2's isolated-worktree
+  re-executions. Rulings on record: `with_binding` 5-arg spelling (F2),
+  Option-A witness placement in the floor-pinned module, the node-shutdown
+  carve's four conditions, and `Revoked → Denied` per §4.3 (F-S1.4-1 — model
+  corrected at `cddb063a3` with a named rewrite; production was already
+  conformant). **Four brief-drafting defects, all coordinator's**, each
+  caught by a lane and corrected in-plan (`cddb063a3`, `c59842668`): the
+  `with_binding` arity, the `mesh.rs` path shorthand, the
+  transcript-truncation inverse reach (F-S1.2-1), and the C7 premise (F-S1.3-1
+  — CS/DX expiry emitted `Cancelled` via the CANCEL-wins override, not
+  `Internal`). Stage-end validation closed 18 + 6 clippy lints and 5 rustdoc
+  links (`e374f60db`, `f74c3e442`) and landed **two named §2.3 witness
+  rewrites** in `tests/org_ownership.rs` (pre-§2.3 single-subscriber scaffold
+  counts → the approved two-subscriber contract; the teardown leak property
+  unchanged and strengthened to cover both subscriptions, with the
+  disengage-removal receipt red at the leak assertion). Final validation,
+  both chains green: fmt ×3 crates, `check --workspace --all-targets`, clippy
+  ×4 under `-D warnings`, rustdoc ×5 under `-D warnings`, wire 278, probe at
+  its exact CI commands, `cargo tl`, `cargo t` **7071/7071**. Stage 2+
+  remains unauthorized; Stage 1 proceeds to independent review.
