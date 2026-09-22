@@ -79,7 +79,48 @@ It is nonetheless **incorrect as merged**. Three classes of defect run through i
 | 7 | Ownership-charge refusal drops acknowledged fragment bytes | Closed | `f52edc4cf` |
 | 29 | Five floor steps pin witnesses by unanchored substring | Closed | `47fb57694` |
 | 30 | Stale floors: `MIN=196` (wire) and 31 (deck) | **Partly closed** — wire 196→275 and deck 31→35 re-measured in the repair tree; leaf 308 and `sensing_org_lease_wire --min 9` deferred, because those two count a different surface (the lib plus its integration binaries) than the attribute scan used here | `78880312c` |
-| 8–28, 31–130 | — | **In progress** — eight repair streams over disjoint file sets | — |
+| 8–14, 57–59, 108–111 | Leaf teardown, membership and handshake release | Closed | `89c47ead7` |
+| 15–17, 47–50, 60, 106–107 | Credential and signalling leaks | Closed | `3769ad697` |
+| 18–27, 51–56, 110 | wasm effect fencing and the `f64` dialog | Closed | `67c32d25c` |
+| 28, 61–88, 91, 112–113 | Witnesses that could not discriminate | Closed | `36cb4c0d6` |
+| 29–33, 35–36, 97–100, 104–105 | Browser store convergence | Closed | `f2827a081` |
+| 37–46, 101–103 | Reassembly budget and idempotent signalling | Closed | `4be9d419f` |
+| 116 | The Go backpressure guard | Closed | `dea3a2c81` |
+| 89–90, 94, 118, 122–125, 128 | CI selection and the checkers | Closed | `f9fc217aa` |
+| 4–6, 34, 92–93, 95–96, 114–115, 117, 119, 127, 129–130 | Documentation claims contradicted by code | Closed | `f9fc217aa` |
+
+**All 130 findings are closed.** The table above groups by repair commit — each row's findings landed together because they share a file set and one verification run, and every commit message names its findings individually.
+
+### Deferred sub-parts (closed at the finding level, with one named residual each)
+
+Four repairs are complete for the defect the finding names and carry a residual the repair itself identified rather than papered over. None of these is an open finding; each is a boundary the fix could not cross from inside its own files.
+
+1. **#8 — a well-formed forged message 2 can still poison live crypto state.** `complete_handshake` no longer destroys the pending (garbage and delayed stale message 2 are both fully non-destructive, and the superseded attempt is kept as a one-slot classifier), but `snow`'s `read_message` mixes `e`/`ee` before the payload tag check, so one crafted 48-byte forged message 2 has already advanced the state when the tag fails. The entry survives to the deadline sweep and the attempt fails cleanly rather than being mis-routed — the difference between "fails safely" and "settles the wrong attempt as Failed", which is what the finding was about. A full fix needs a failure-atomic read/checkpoint seam in `net-mesh-wire`'s `NoiseHandshake`.
+2. **#94 — `exports.baseline` is a `test-helpers` build.** The check now *concludes* single-carrier rather than assuming it (it scans the build directory, opens every candidate, and names and rejects a second carrier). What remains is that the baseline was generated from a `net-ffi/test-helpers` build, so fixtures-only `#[no_mangle]` symbols sit in the required set: a default build always fails the comparison, and a test seam leaking into shipped builds cannot be detected. Closing it needs a fixture-regeneration policy (default-build baseline, test-helpers extras), which the finding scoped out.
+3. **#50 — zeroization has no runtime witness.** `Credential` now zeroizes psk, the encoded bearer and the invite nonce on drop. Proving that would require reading freed memory, so the evidence is compile + implementation review (with the same volatile-write caveat `IdentitySecrets` states honestly).
+4. **#17 / #47 / #107 — wasm-only runtime behaviour.** The trickle-buffer fencing, `end_attempt` closing the socket it names, and the probe closure lifetime are compile-verified on `wasm32-unknown-unknown` but were not executed in a browser. The browser matrix is the lane that runs them.
+
+Two smaller notes recorded rather than hidden: `#122`'s brief described a three-arm union including `enrollment_storage`; that arm does not exist at this base (it is new in the `net-cli` branch), so the two real arms were split and the discrepancy named instead of inventing a third. And `#10`'s service-name trigger is unreachable through `call()` (the derived reply name is refused first), so its witness drives the live trigger — a body over 4 MiB.
+
+### Validation at the merged tree
+
+| Check | Result |
+|---|---|
+| net `--lib --features "net cortex webrtc"` | clean |
+| net `--lib` (default, no `webrtc`) | clean |
+| leaf `--tests` (host) | clean |
+| leaf `--tests` (wasm32) | clean |
+| leaf lib unit tests | 253 passed, 0 failed |
+| `control_plane_boundary` / `dependency_boundary` / `fixture_parity` | 8 / 5 / 4 passed |
+| RTC `::` / router / sdk acme / `rtc_bootstrap_listener` | 66 / 22 / 12 / 25 passed, 0 failed |
+| `npx tsc -p tsconfig.test.json` | clean |
+| `npx vitest run` (browser-ts) | 23 files, 695 passed (686 baseline + 9 new) |
+
+New witnesses across the pass: 9 in the browser store (each proven red against the unfixed code first), 3 for the credential and dialog-zero defects, 11 in `node.rs`, 12 in the RTC/adapter surface, 1 for the `§12` gate, and 32 witness repairs in the test corpus. Three existing witnesses were **inverted** rather than extended — see below.
+
+### Repair commits
+
+`89f1ed53f` `b0f6ae11c` `078e72a41` `47fb57694` `f52edc4cf` `78880312c` `db6dd0a20` `fc1503437` `f2827a081` `3769ad697` `89c47ead7` `67c32d25c` `36cb4c0d6` `4be9d419f` `dea3a2c81` `f9fc217aa`
 
 ### What the closures changed, and how they are witnessed
 
