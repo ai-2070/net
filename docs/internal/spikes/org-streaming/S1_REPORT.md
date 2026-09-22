@@ -2754,3 +2754,188 @@ is byte-identical to `e25ac28bf`'s). Restored green: same `-E` run, 1/1.
   stage-end list, outside this repair round's scoped proof.
 
 **Session-tree writes:** `S1_REPORT.md` §3 (this section) only.
+
+## 4. Stage 2 — core protected client-streaming and duplex
+
+**Lane:** S2Core (one lane). **Pinned brief:** `spikes/org-streaming/S2_BRIEF.md`
+@`87f89c8da`. **Base:** `87f89c8da` (Stage 1 accepted at `cc15f4d66`). Date
+2026-09-22. Windows host only. Every run `--retries 0 --no-tests=fail` on the
+warm aliases (`cargo tf` / `cargo tfl`, graphs pinned in
+`net/crates/net/.cargo/config.toml`) from `net/crates/net/`. Claims are
+labelled executed vs source-established. This section grows one subsection
+per slice (4.1–4.5 = slices 2.1–2.4 + row 5), each landing with its own
+`S2.n:` commit pair.
+
+**Owner ruling on the F-S1R-2 rider (relayed by Main during S2.1; recorded):**
+the rider is **DECLINED** — the terminal-retarget enhancement, the
+caller-side last mile and the delivery-exactly-once composition note are NOT
+in Stage 2; the plan-as-written governs and the documented limitation stands
+as recorded in `S1_REVIEW_PACKET_2.md` §3.1. Nothing in this stage needs the
+rider; if a closure had required it, it would be a finding, not a build.
+
+**Commit-slice note (stated, F-S2.1-3 below):** the S2.1/S2.2 boundary is
+RECONSTRUCTED into per-slice commits — one lane implemented both slices in
+one working tree before committing. The implementation ORDER was 2.1 then
+2.2 (the dispatch order) and every green claim below is executed, but
+commit-granular "landed green before the next" was not observable at the
+interim moment. The probe worktree
+`C:/Users/chief/orca/workspaces/net/org-streaming-s2probe` (detached at
+`16cd67e85`, own `target/`) executed each reconstructed tree's green run.
+
+### 4.1 Slice 2.1 — lazy-opening mint
+
+**Landed (executed):** `16cd67e85` — `S2.1: mint the CS/DX lazy opening over
+the finalized initial REQUEST` (3 files; `net/crates/net/target/s21.patch` is
+the boundary cut). Base `87f89c8da`. All green claims below are executed at
+`16cd67e85`'s exact tree (probe worktree, exit codes captured).
+
+**What landed (source-established):**
+
+- **The C11 caller half + the lazy mint (contract 2).**
+  `call_client_stream` / `call_duplex` ACCEPT an `org_proof_intent` and mint
+  `OrgStreamCallProof` kinds 2/3 LAZILY — at the first `send`/`finish`, over
+  the **finalized** initial REQUEST whose body IS the first chunk, so the
+  signed opening binds the opening request INCLUDING its body (§1.2's
+  transcript runs `org_request_digest`, which covers `req.body`).
+  `JustOpened` drop still sends and signs nothing (preserved verbatim —
+  the Drop state check is untouched). On `send` (the `&mut self` paths) the
+  initial headers are cloned, not taken, so a refused mint leaves the handle
+  intact rather than silently publishing a header-less retry.
+- **Shared mint helpers (one truth, byte-compatible).** The unary `call` and
+  `call_streaming` inline mint blocks move into `check_provider_binding` +
+  `attach_signed_admission` (pinned-provider clause, exactly-one-header
+  discipline, `sign_admission_proof`, `validate_wire_bounds`, the one-packet
+  measurement — same order, same message strings); the capability/TTL
+  clauses extract into `validate_org_proof_intent` (called by
+  `sign_admission_proof` AND by the CS/DX entries, so a mismatched intent
+  fails LOCAL at the call exactly as the eager mints' — the mirror legs'
+  requirement). `call_streaming`'s behavior is unchanged (its pin test and
+  `a_protected_call_refuses_a_finalized_frame_over_one_packet` stay green).
+- **Row-5 pin inversion, first half (delete; replace at S2.5):**
+  `call_streaming_mints_a_stream_proof`'s CS/DX intent-refusal legs are
+  DELETED (delete-and-replace — the named replacement witness
+  `client_stream_and_duplex_mint_their_stream_proofs` lands at
+  S2.5 per the dispatch), with the capability-mismatch half and the
+  service-routed refusal leg KEPT verbatim and the doc comment naming the
+  inversion.
+
+**Witness + counts (executed):**
+
+| Witness | Where | Proves | Named inverse |
+|---|---|---|---|
+| `client_stream_opening_binds_first_chunk` | `tests/org_rpc_streaming.rs` (integration; the REAL lazy mint + the production §3 transaction `admit_protected_opening`) | the opening's first chunk is bound: altering it AFTER signing is refused with the TYPED `AdmissionDenied::BindingInvalid` and ZERO effects (the §3 reservation rolls back — `record_count` 0, `active_node` 0), while the UNALTERED twin (its own call) admits — the refusal is the alteration, not the construction | R-S2.1 (skip the body digest in the transcript → the altered opening admits → red at its own named assertion) |
+
+- `org_rpc_streaming` binary: **30 → 31** (the 30-roster preserved verbatim +
+  the new witness).
+- `adapter::net::mesh_rpc` in-source units: **52 → 52** (the pin surgery is a
+  named in-place rewrite of `call_streaming_mints_a_stream_proof`, 1 in / 1
+  out). The three-module in-source filter
+  (`adapter::net::cortex::rpc adapter::net::mesh_rpc org_stream`): **219 →
+  219** (Stage 2 adds no in-source units at 2.1 — count-continuous with §3's
+  219).
+- Green at `16cd67e85` (probe worktree, exit-captured):
+  `cargo fmt -p net-mesh -- --check` → exit 0; `cargo tf --retries 0 --test
+  org_rpc_streaming` → **31 run / 31 passed / 0 skipped**, exit 0;
+  `CARGO_INCREMENTAL=0 cargo tfl --retries 0 adapter::net::mesh_rpc
+  adapter::net::cortex::rpc org_stream` → **219 run / 219 passed / 5622
+  skipped**, exit 0.
+
+**Inverse receipt R-S2.1 (executed, raw; post-format, exit-captured).**
+Production site: `net/crates/net/src/adapter/net/org_admission_gate.rs`
+`org_request_digest`'s canonical construction — the transcript skips the
+body digest (both mint and verify then derive the body-less digest):
+
+```diff
+     let canonical = RpcRequestPayload {
+         service: req.service.clone(),
+         deadline_ns: req.deadline_ns,
+         flags: req.flags,
+         headers,
+         // `Bytes` clone is a refcount bump, not a copy.
+-        body: req.body.clone(),
++        body: req.body.slice(0..0), // R-S2.1 MUTATION: skip the body digest
+     };
+```
+
+Run (exact): `cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=client_stream_opening_binds_first_chunk)'` — **exit 100**. Verbatim:
+
+```
+thread 'client_stream_opening_binds_first_chunk' (32740) panicked at tests\org_rpc_streaming.rs:3418:18:
+altering the first chunk after signing must be refused with the TYPED `BindingInvalid` — the signed opening binds the first chunk; got Ok("Admitted")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+error: test run failed
+```
+
+The prescribed outcome exactly: without the body digest the altered opening
+verifies and ADMITS (`got Ok("Admitted")`). Restore: edit-reversed;
+sha256 `69b81aae4532ef73dc2b3364eb3a3ad15680b5c3cb088d630181368040601537`
+== the pre-mutation baseline. Restored green (same `-E` run): **exit 0**, 1/1.
+(Four weakenings: NONE — the witness is the diff's own inverse and reddens
+at its named assertion; nothing was precondition-fixed, widened, relaxed or
+deleted.)
+
+**Findings (stated, not decided):**
+
+1. **F-S2.1-1 — row 5's pin inversion is SPLIT across S2.1 and S2.5
+   (delete-and-replace preserved; stated).** The CS/DX intent-refusal legs
+   inside `call_streaming_mints_a_stream_proof` pin production behavior that
+   C11's acceptance REMOVES: they cannot survive the lazy-mint landing, so
+   the DELETE rides with the change that breaks them (this slice) and their
+   named replacement witness
+   `client_stream_and_duplex_mint_their_stream_proofs` lands at its
+   dispatched slice (S2.5) with the mirror construction (positive kinds 2/3
+   mints + the capability-mismatch half + the service-routed leg). The
+   capability-mismatch half and the service-routed refusal leg are kept
+   verbatim across both commits. (The alternative — holding the legs until
+   S2.5 — would leave the lazy mint unreachable or the estate red.)
+2. **F-S2.1-2 — `client_stream_opening_binds_first_chunk`'s "zero handler
+   effects" is realized at the §3 transaction boundary (interpretation,
+   source-established).** The typed `BindingInvalid` and the reservation
+   rollback (`record_count` / `active_node` both 0) are the refusal's
+   observable effects at 2.1's green point; a refused opening is never
+   fold-driven (no handler, no in-flight entry, no sender, no semaphore).
+   The CS/DX protected BRIDGE wiring — where handler darkness is directly
+   observable through a live registration — lands with slice 2.2, whose
+   witnesses carry the live-bridge darkness probes
+   (`pre_admission_chunks_are_never_delivered` et al.). The witness's
+   positive control keeps the refusal's cause pinned to the alteration.
+3. **F-S2.1-3 — the S2.1/S2.2 commit boundary is RECONSTRUCTED (execution
+   note).** One lane implemented both slices in one working tree before
+   committing — a deviation from commit-granular "each landed green before
+   the next" (the implementation ORDER was the dispatch order and every
+   green claim here is executed). The boundary was cut by hunk
+   classification into `net/crates/net/target/s21.patch` (2.1's caller-side
+   + pin-surgery hunks + the whitespace reflows below; 2.2's hunks and
+   `tests/org_rpc_streaming/s2.rs` ride the S2.2 commit) and each
+   reconstructed tree's green run was executed in the probe worktree named
+   above.
+4. **F-S2.1-4 — scoped rustfmt reflowed PRE-EXISTING code in the owned
+   files (whitespace only).** The S1-precedent scoped pass
+   (`rustfmt --edition 2021 --config skip_children=true` on the touched
+   files) reflowed S1_R-era witness/unit whitespace inside
+   `src/adapter/net/cortex/rpc.rs` and `tests/org_rpc_streaming.rs` — the
+   `cargo fmt -p net-mesh -- --check` gate cannot pass with those hunks
+   unformatted. The reflow-only hunks are `git diff -w`-empty (no semantic
+   change) and ride the S2.1 commit.
+
+**Receipt-baseline shas (post-format, the committed trees):**
+`cortex/rpc.rs` `961d9529cc16254253e2496c67fac79582bd58607a7d1121131d3670807a4fd0`;
+`mesh_rpc.rs` `d71463e5dd0174a80993888661902180b8c73e7802c35f345788a71970e627a8`;
+`tests/org_rpc_streaming.rs`
+`5a8788e5da27655d96357779be329d2aef3b4292d8bc6db007f45f08b73a8b6c`;
+`org_admission_gate.rs`
+`69b81aae4532ef73dc2b3364eb3a3ad15680b5c3cb088d630181368040601537`.
+(Three earlier receipt cycles ran on the PRE-format tree with exit codes
+masked by the output pipeline; they were SUPERSEDED by the post-format,
+exit-captured re-runs recorded here and in §4.2 — only the latter are the
+evidence.)
+
+**What never ran at 4.1 (complete):** `cargo fmt --all -- --check` (the
+evidence rule is per-crate only); the clippy battery, the rustdoc lines and
+`cargo check --workspace --all-targets` (Main's stage-end list, per §2.5's
+precedent); `cargo tl` / `cargo t` full suites; `tests/cross_lang_*`; the
+wire suite; the browser/SDK/facade surfaces (later stages by contract); the
+benches; the `webrtc` feature graph; Linux/macOS and `#[cfg(unix)]` legs
+(Windows host only); CI itself (branch unpushed; nobody pushes but Main).
