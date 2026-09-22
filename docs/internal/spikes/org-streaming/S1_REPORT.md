@@ -131,6 +131,30 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, Stage 2 verified (executed).** Landed over ten commits
+  (`16cd67e85`…`98df0bb0b`, S2.1–S2.5 pairs; §4). Coordinator spot-checks
+  reproduced two Stage-2 receipts with the full cycle: SC3 — R-S2.2c (the
+  F-S2.2-5 fix removed at the CS seam) reddened
+  `opening_body_budget_refusal_completes_the_record` (the pre-supervisor
+  refusal's record leak), restored clean; SC4 — R-S2.1 (the body digest
+  skipped in `org_request_digest`'s canonical construction at
+  `src/adapter/net/org_admission_gate.rs`) reddened
+  `client_stream_opening_binds_first_chunk`, restored clean. **F-S2.2-5
+  credited:** a real pre-supervisor opening-body refusal leak found AND
+  fixed in the CS/DX seams (the unary `ConfirmedOpening` scope-guard
+  precedent) with the fail-pre-fix regression witness and its receipt.
+  Disclosures accepted: **F-S2.1-3** (the S2.1/S2.2 commit boundary is
+  RECONSTRUCTED — one lane implemented both before committing; each
+  reconstructed tree probe-run green at the named probe worktree) and
+  **F-S2.4-1** (`retire_unblocks_both_directions` green under the
+  single-layer inverse because the property is doubly defended — the TRUE
+  two-layer inverse R-S2.4c-v2 reds at the named assertion; the
+  overdetermination pattern, disclosed with its discriminating receipt, as
+  in Stage 0's F9). The F-S1R-2 rider (owner-declined) was not needed by
+  any closure. Estate at head: `org_rpc_streaming` 41/41 (CI floor 41),
+  in-source 220/220 three-module, preserved + controls 134/134, cross-lang
+  32/32, Stage 0 models untouched at 76/76. Stage-end validation sweep
+  next; Stage 2 proceeds to independent review.
 - **2026-09-22, STAGE 1 ACCEPTED — independent review round 2.1 (verdict
   packet `S1_REVIEW_PACKET_2.md`, pinned head `cc15f4d66`).** All nine
   predecessor findings F-1…F-9 closed by their verbatim closure properties
