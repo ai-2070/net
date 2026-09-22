@@ -17,7 +17,11 @@
 //! 1. Import retargets (`crate::…`/`super::…` → `net::…`/`super::old_…`);
 //! 2. the denial-shape block's one `crate::adapter::net::cortex::` prefix is
 //!    retargeted to `net::adapter::net::cortex::` (a test crate cannot name
-//!    the library's `crate::`);
+//!    the library's `crate::`), and that block is RE-INDENTED — every one of
+//!    its five lines shifted +8 columns (4/8 → 12/16) to sit at the shim's
+//!    nesting depth. WHITESPACE ONLY (S1 review finding F-8 named this gap;
+//!    the whitespace-insensitive provenance statement and trimmed-hash
+//!    evidence are below);
 //! 3. two `Self` methods the vendored `serve_rpc_protected` body calls are
 //!    supplied by the shim below (the frozen bodies live inside `MeshNode`
 //!    among private types — `RegisteredRpcService`, `RpcResponseJob`,
@@ -31,6 +35,16 @@
 //! 4. [`UnaryAdmission`] here carries only the `Protected { .. }` variant —
 //!    the only one the vendored body constructs (the full frozen enum is
 //!    `mesh_rpc.rs:6791-6846` at `85ecc77c9`).
+//!
+//! Whitespace-insensitive provenance (the denial-shape block): with each
+//! line's surrounding whitespace trimmed and adaptation 2's one prefix
+//! retarget reversed, the five vendored lines are byte-identical to the
+//! `mesh_rpc.rs:872-876` @`85ecc77c9` extraction — `cmp` clean, sha256
+//! `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7` on
+//! both sides. The raw extraction's own sha256 is the `fa275454…` recorded
+//! above; the raw five-line windows legitimately differ from each other in
+//! leading whitespace (adaptation 2's re-indentation) plus the one named
+//! prefix retarget — nothing else.
 //!
 //! The vendored items are NEVER substituted by the new implementation: the
 //! decode is the frozen prefix-tolerant `OrgCallProof::decode`, the verify is

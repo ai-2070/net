@@ -11757,6 +11757,149 @@ mod tests {
         assert_eq!(budgets.node_bytes(), 0, "the drop still settles the charge");
     }
 
+    /// S1_R Row 3 (F-3's closure) — §2.7's NODE-level rollback: a node
+    /// refusal arriving AFTER both earlier level increments succeeded must
+    /// roll BOTH back exactly (the call counter AND the caller counter).
+    /// The sibling of
+    /// [`byte_reservation_rolls_back_in_order_and_releases_exactly_once`]
+    /// (which pins the caller-level leg), and the production twin of the S0
+    /// model's `node_refusal_rolls_back_call_and_caller_reservations`.
+    ///
+    /// Red witness (the S1_R brief Appendix inverse): **A3** (both counter
+    /// restorations deleted from [`ByteBudgets::reserve`]'s `NodeBudgetFull`
+    /// arm) reddens both exact-value asserts below.
+    #[test]
+    fn node_budget_refusal_rolls_back_call_and_caller_reservations() {
+        // Node-binding budgets: the node is the scarcest scope.
+        let budgets = ByteBudgets::new(ByteLimits {
+            per_call: 1_000,
+            per_caller: 1_500,
+            per_node: 2_000,
+        })
+        .expect("valid limits");
+        let a = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 10,
+        };
+        let b = ProtectedCallKey {
+            caller: EntityId::from_bytes([2u8; 32]),
+            call_id: 11,
+        };
+
+        // Live charges set the node total just below its ceiling.
+        let b_response = budgets
+            .reserve(b.clone(), 1, ByteDirection::Response, 1_000)
+            .expect("b charges 1000");
+        let b_request = budgets
+            .reserve(b.clone(), 1, ByteDirection::Request, 500)
+            .expect("b charges 500 more");
+        let a_first = budgets
+            .reserve(a.clone(), 1, ByteDirection::Response, 400)
+            .expect("a charges 400");
+        assert_eq!(budgets.node_bytes(), 1_900);
+
+        // The refused item passes the CALL level (400 + 200 ≤ 1_000) and
+        // the CALLER level (400 + 200 ≤ 1_500) — two successful level
+        // increments — then hits the NODE level (1_900 + 200 > 2_000).
+        let refusal = budgets
+            .reserve(a.clone(), 1, ByteDirection::Response, 200)
+            .expect_err("refused at the node level");
+        assert_eq!(refusal, ByteRefusal::NodeBudgetFull);
+        assert_eq!(
+            budgets.call_bytes(&a, 1, ByteDirection::Response),
+            400,
+            "the call counter was rolled back",
+        );
+        assert_eq!(
+            budgets.caller_bytes(&a.caller),
+            400,
+            "the caller counter was rolled back",
+        );
+        assert_eq!(
+            budgets.node_bytes(),
+            1_900,
+            "the node counter never moved",
+        );
+
+        // Release-once through the untouched charges, exactly to zero.
+        b_response.release();
+        b_request.release();
+        a_first.release();
+        assert_eq!(budgets.node_bytes(), 0);
+        assert_eq!(budgets.unsettled_drops(), 0);
+    }
+
+    /// S1_R Row 6 (F-6's Main ruling) — [`ItemPermit::transfer`]'s handoff
+    /// semantics at the PRODUCTION permit: the source permit is CONSUMED,
+    /// the target owns the same charge (handoff is not memory reclamation),
+    /// exactly ONE release settles the pair, and another call's live bytes
+    /// stay charged throughout. The production twin of the S0 model's
+    /// `cancel_dequeue_handoff_consumes_one_permit` (whose registry dequeue
+    /// race maps onto `transfer`'s contract here; Stage 2's request-direction
+    /// queues are `transfer`'s named consumer).
+    ///
+    /// Red witness (the S1_R brief Appendix inverse): **A3b** (`self.settled
+    /// = true;` deleted from [`ItemPermit::transfer`]) reddens "the bytes
+    /// stay charged across the handoff" below — the source's drop would
+    /// settle the charge early and count an unsettled drop.
+    #[test]
+    fn item_permit_transfer_consumes_once_across_the_handoff() {
+        let budgets = ByteBudgets::new(ByteLimits {
+            per_call: 1_000,
+            per_caller: 1_500,
+            per_node: 2_000,
+        })
+        .expect("valid limits");
+        let a = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 10,
+        };
+        let b = ProtectedCallKey {
+            caller: EntityId::from_bytes([2u8; 32]),
+            call_id: 11,
+        };
+
+        // Another call's live bytes, which must stay charged throughout.
+        let b_permit = budgets
+            .reserve(b, 1, ByteDirection::Response, 700)
+            .expect("b reserves");
+
+        // The handed-over item.
+        let source = budgets
+            .reserve(a.clone(), 1, ByteDirection::Response, 100)
+            .expect("a reserves");
+        assert_eq!(budgets.call_bytes(&a, 1, ByteDirection::Response), 100);
+
+        let target = source.transfer();
+        assert_eq!(
+            budgets.call_bytes(&a, 1, ByteDirection::Response),
+            100,
+            "transfer is not memory reclamation — the bytes stay charged across the handoff",
+        );
+        assert_eq!(
+            budgets.unsettled_drops(),
+            0,
+            "the source permit is consumed by the handoff, not dropped unsettled",
+        );
+
+        // Exactly one release across the pair.
+        target.release();
+        assert_eq!(
+            budgets.call_bytes(&a, 1, ByteDirection::Response),
+            0,
+            "exactly one release settles the pair",
+        );
+        assert_eq!(budgets.caller_bytes(&a.caller), 0);
+        assert_eq!(
+            budgets.node_bytes(),
+            700,
+            "another call's live bytes stay charged",
+        );
+        assert_eq!(budgets.unsettled_drops(), 0);
+        b_permit.release();
+        assert_eq!(budgets.node_bytes(), 0);
+    }
+
     #[test]
     fn request_chunk_accounting_retires_the_call_and_stops_delivery() {
         // A real store gives the registry its live view (the model's
@@ -11893,5 +12036,144 @@ mod tests {
             });
         }
         drop(lease);
+    }
+
+    /// S1_R Row 4 (F-4's closure) — §2.4's incarnation fencing at retire: a
+    /// LATE retire/complete carrying the OLD incarnation is a no-op for the
+    /// SUCCESSOR on a reused `(caller, call_id)`. The production twin of the
+    /// S0 model's
+    /// `late_operations_with_a_stale_incarnation_cannot_touch_the_successor`:
+    /// the first record is retired and its supervisor-side cleanup completes
+    /// it (the unit drives that single removal directly — there is no
+    /// `record_count()` wait anywhere), the SAME key is reused while the
+    /// first incarnation's cleanup-owner handles stay ARMED across the
+    /// reuse, and every late op carrying the stale incarnation must be
+    /// inert while the successor stays live end to end.
+    ///
+    /// Red witness (the S1_R brief Appendix inverse): **A4** (the
+    /// `record.incarnation != incarnation ||` clause dropped from
+    /// [`ProtectedCallRegistry::retire`]'s guard) reddens the late-retire
+    /// no-op assert below — the stale op would settle the successor.
+    #[test]
+    fn late_retire_against_a_reused_key_is_a_no_op_for_the_successor() {
+        // A real store gives the registry its live view (the model's
+        // abstract authority); AV-9: the scratch dir is left behind.
+        let dir = std::env::temp_dir().join(format!(
+            "net-s1r-late-retire-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+            &dir,
+            crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("real store");
+        let registry = ProtectedCallRegistry::with_q1_defaults().expect("limits validate");
+        registry.bind_store(None, Arc::new(store));
+        let key = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 10,
+        };
+        let opening = || OpeningRequest {
+            key: key.clone(),
+            session: SessionIdentity {
+                peer: 2,
+                session_id: 3,
+                establishment: Some([4u8; 32]),
+            },
+            session_generation: Some(1),
+            registration: 1,
+            shape: RpcCallShape::ServerStreaming,
+            now_ns: 0,
+        };
+        let facts = || VerifiedCallFacts {
+            acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+            member: EntityId::from_bytes([1u8; 32]),
+            member_generation: 1,
+            deadline: None,
+        };
+
+        // The first call — transferred to its supervisor, whose async
+        // cleanup owns the record's single removal.
+        let mut first_guard = registry.reserve(opening()).expect("reserve");
+        let first_incarnation = first_guard.incarnation;
+        let mut first_lease = registry
+            .install(&mut first_guard, facts(), 0)
+            .expect("install");
+        let first_signal = Arc::new(StreamRetireSignal::new());
+        registry
+            .confirm(&mut first_lease, Arc::clone(&first_signal), None)
+            .expect("the first call transfers to its supervisor");
+        assert!(registry.retire(&key, first_incarnation, StreamTerminalReason::Cancelled));
+        assert!(
+            registry.complete(&key, first_incarnation),
+            "the supervisor's cleanup removes the record exactly once",
+        );
+
+        // The key is reused by a fresh call — immediately, while the first
+        // incarnation's cleanup-owner handles (its supervisor-side ref, the
+        // armed late-op source) are still alive and can fire at any time.
+        let mut second_guard = registry.reserve(opening()).expect("the reused key reserves");
+        let second_incarnation = second_guard.incarnation;
+        assert_ne!(second_incarnation, first_incarnation);
+        let mut second_lease = registry
+            .install(&mut second_guard, facts(), 0)
+            .expect("the successor installs");
+        let second_signal = Arc::new(StreamRetireSignal::new());
+        let hook_fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_count = Arc::clone(&hook_fired);
+        registry
+            .confirm(
+                &mut second_lease,
+                Arc::clone(&second_signal),
+                Some(Arc::new(move |_reason| {
+                    hook_count.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .expect("the successor transfers to its supervisor");
+
+        // Everything late from the first incarnation is inert.
+        assert!(
+            !registry.retire(&key, first_incarnation, StreamTerminalReason::Timeout),
+            "a LATE retire carrying the old incarnation must be a no-op for the successor (§2.4)",
+        );
+        assert!(
+            !registry.complete(&key, first_incarnation),
+            "a LATE complete carrying the old incarnation must be a no-op",
+        );
+        assert!(
+            !registry.release(&key, first_incarnation),
+            "a LATE release carrying the old incarnation must be a no-op",
+        );
+        assert_eq!(
+            registry.commit_check(&key, first_incarnation),
+            CommitVerdict::Unknown,
+            "the stale incarnation commits nothing",
+        );
+
+        // The successor survives, untouched.
+        assert_eq!(
+            registry.phase(&key),
+            Some(RegistryPhase::Running),
+            "the successor survives every late op",
+        );
+        assert_eq!(registry.terminal_reason(&key), None, "the successor is unsettled");
+        assert_eq!(second_signal.taken(), None, "the successor's owner was never signaled");
+        assert_eq!(
+            hook_fired.load(Ordering::SeqCst),
+            0,
+            "the successor's on-retire hook never fired",
+        );
+        assert_eq!(
+            registry.commit_check(&key, second_incarnation),
+            CommitVerdict::Proceed,
+        );
+        assert_eq!(registry.removals(&key, second_incarnation), 0);
+
+        // …and its own lifecycle still completes exactly once.
+        assert!(registry.retire(&key, second_incarnation, StreamTerminalReason::Timeout));
+        assert!(registry.complete(&key, second_incarnation));
+        assert_eq!(registry.removals(&key, second_incarnation), 1);
     }
 }

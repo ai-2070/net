@@ -2826,3 +2826,440 @@ async fn provider_policy_veto_denies_before_effects() {
         "the re-submission's reservation rolled back as well",
     );
 }
+
+// ===========================================================================
+// S1_R — the repair round's acceptance witnesses (S1Review HOLD closure).
+// The completion-drain twins ride REAL wire endpoints (the s15 idiom) so the
+// observation is DELIVERY at the authenticated receiving endpoint — the F-7
+// gap was exactly that the success path only ever captured at emit seams.
+// ===========================================================================
+
+/// S1_R Rows 1+2+7 (same-org authority mode). A protected server-streaming
+/// call through the REAL bridge: a handler queues ≥2 CONTENT-LABELLED items
+/// under ZERO credit and RETURNS (producer finished is not terminal — the
+/// drain is owned), a valid `STREAM_GRANT` arrives, the items publish IN
+/// ORDER (body bytes + wire sequence — never counted), and then EXACTLY ONE
+/// terminal frame asserts the success-terminal wire shape at the
+/// AUTHENTICATED RECEIVING ENDPOINT (status `Ok` + `nrpc-streaming: end`).
+///
+/// Red witnesses (the S1_R brief Appendix inverses): **A2b** (post-close
+/// chunks consumed but not published at the supervisor pump) reddens "the
+/// same-org queued items publish IN ORDER" below; **A2c** (`end` → `continue`
+/// on the `Completed(Ok)` terminal arm) reddens "the same-org terminal
+/// frame's exact wire content" below.
+#[tokio::test]
+async fn completed_stream_drains_queued_items_in_order_with_content_and_end_terminal() {
+    use net::adapter::net::cortex::rpc::{HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_END};
+
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x81u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x27);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s1r-r1");
+
+    // The handler queues both content-labelled items under zero credit and
+    // RETURNS — the response pump parks at its first credit acquire until
+    // the grant (§2.2: the credit-blocked drain is owned, not abandoned).
+    let returned = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let serve = server
+        .serve_rpc_owner_scoped_streaming(
+            s14::SERVICE,
+            Arc::new(s14::QueueChunksAndReturn {
+                chunks: vec![b"item-A-CONTENT-17", b"item-B-content-29"],
+                returned: Arc::clone(&returned),
+                dropped: Arc::clone(&dropped),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped streaming");
+
+    // The AUTHENTICATED RECEIVING ENDPOINT: the caller's own reply channel
+    // carries every frame the provider emits for the call.
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    // A VALID owner-delegated streaming opening over the REAL session (full
+    // handshake binding, 1.1a), with a ZERO initial credit window.
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let (frame, _req) = s14::mint_ss_opening(&intent, binding, 42, caller_origin, Some(0), b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || returned
+            .load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler queued its items under zero credit and returned",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "zero credit publishes nothing before the grant",
+    )
+    .await;
+
+    // A valid STREAM_GRANT arrives — exactly the two credits the queued
+    // items need.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 42, 2),
+        )),
+        "the bridge accepted the STREAM_GRANT",
+    );
+
+    // Rows 1+2+7's content observation: BOTH queued items publish IN ORDER
+    // — asserted by body bytes and wire sequence, never by counting.
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || caller_seen
+            .lock()
+            .len()
+            >= 2)
+        .await,
+        "the same-org queued items publish IN ORDER after the grant — a post-close \
+         discard of queued chunks leaves the caller with its terminal only",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            (
+                s15::response_of(&seen[0]).body.as_ref(),
+                s15::response_of(&seen[1]).body.as_ref(),
+            ),
+            (
+                b"item-A-CONTENT-17".as_slice(),
+                b"item-B-content-29".as_slice()
+            ),
+            "the same-org items publish IN ORDER — body bytes and wire sequence",
+        );
+    }
+
+    // …then EXPLICIT COMPLETION whose terminal frame carries the exact wire
+    // content: status Ok + the `nrpc-streaming: end` marker.
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || caller_seen
+            .lock()
+            .len()
+            >= 3)
+        .await,
+        "the explicit-completion terminal follows the items at the authenticated \
+         receiving endpoint",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(seen.len(), 3, "exactly the two items and ONE terminal frame");
+        let terminal = s15::response_of(&seen[2]);
+        assert_eq!(
+            (terminal.status, terminal.headers, terminal.body.as_ref()),
+            (
+                RpcStatus::Ok,
+                vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec()
+                )],
+                b"".as_slice(),
+            ),
+            "the same-org terminal frame's exact wire content is status Ok + the \
+             `nrpc-streaming: end` marker",
+        );
+    }
+    // …and it stays exactly one terminal, ever.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(caller_seen.lock().len(), 3, "exactly one terminal frame, ever");
+}
+
+/// S1_R Row 7's CROSS-ORG twin (the granted / other-org authority intent
+/// shape). Same observations as
+/// [`completed_stream_drains_queued_items_in_order_with_content_and_end_terminal`]
+/// under `OrgAdmission::CrossOrgGranted`: ≥2 content-labelled items queued
+/// under zero credit by a returning handler, a valid `STREAM_GRANT`, the
+/// items IN ORDER (body bytes + sequence), then EXACTLY ONE terminal frame
+/// with the exact wire content (status `Ok` + `nrpc-streaming: end`) at the
+/// authenticated receiving endpoint.
+///
+/// Red witnesses (the S1_R brief Appendix inverses): **A2b** reddens "the
+/// cross-org queued items publish IN ORDER" below; **A2c** reddens "the
+/// cross-org terminal frame's exact wire content" below.
+#[tokio::test]
+async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() {
+    use net::adapter::net::cortex::rpc::{HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_END};
+
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x82u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x29);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s1r-r7");
+    // The CROSS-ORG authority shape: the caller is a member of org A with a
+    // B→A `INVOKE` capability grant for the exact provider.
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    let returned = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let serve = server
+        .serve_rpc_granted_streaming(
+            s14::SERVICE,
+            Arc::new(s14::QueueChunksAndReturn {
+                chunks: vec![b"cross-item-ALPHA-31", b"cross-item-BETA-47"],
+                returned: Arc::clone(&returned),
+                dropped: Arc::clone(&dropped),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve granted streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    let intent = fixture::cross_org_intent(
+        caller_kp,
+        &org_a,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let (frame, _req) = s14::mint_ss_opening(&intent, binding, 43, caller_origin, Some(0), b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the cross-org opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || returned
+            .load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "the cross-org handler queued its items under zero credit and returned",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "zero credit publishes nothing before the grant",
+    )
+    .await;
+
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 43, 2),
+        )),
+        "the bridge accepted the STREAM_GRANT",
+    );
+
+    // The cross-org items — correlated to THIS call — publish IN ORDER.
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || caller_seen
+            .lock()
+            .len()
+            >= 2)
+        .await,
+        "the cross-org queued items publish IN ORDER after the grant — a post-close \
+         discard of queued chunks leaves the caller with its terminal only",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            (
+                s15::response_of(&seen[0]).body.as_ref(),
+                s15::response_of(&seen[1]).body.as_ref(),
+            ),
+            (
+                b"cross-item-ALPHA-31".as_slice(),
+                b"cross-item-BETA-47".as_slice()
+            ),
+            "the cross-org items publish IN ORDER — body bytes and wire sequence",
+        );
+    }
+
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || caller_seen
+            .lock()
+            .len()
+            >= 3)
+        .await,
+        "the explicit-completion terminal follows the cross-org items at the \
+         authenticated receiving endpoint",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(seen.len(), 3, "exactly the two items and ONE terminal frame");
+        let terminal = s15::response_of(&seen[2]);
+        assert_eq!(
+            (terminal.status, terminal.headers, terminal.body.as_ref()),
+            (
+                RpcStatus::Ok,
+                vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec()
+                )],
+                b"".as_slice(),
+            ),
+            "the cross-org terminal frame's exact wire content is status Ok + the \
+             `nrpc-streaming: end` marker",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(caller_seen.lock().len(), 3, "exactly one terminal frame, ever");
+}
+
+/// S1_R Row 5 (F-5's closure) — receiver-side attribution across SESSION
+/// REPLACEMENT: a response arriving after the replacement reaches the LIVE
+/// session's endpoint, and NOTHING reaches the REPLACED session's endpoint —
+/// both asserted at the receiving endpoint's own attribution
+/// (`RpcInboundEvent::session_id`, the AEAD-verified receiving incarnation).
+/// The response is emitted strictly AFTER the replacement (a parked PUBLIC
+/// handler's explicit post-replacement send; protected calls retire at the
+/// replacement boundary and their terminal races the peer transition).
+///
+/// Red witness demanded by the row: the S1_R brief Appendix inverse **A5**
+/// (the streaming emitter's `receiving_session_id` forced to `0` at
+/// `mesh_rpc.rs`). The receipt outcome for this witness is recorded in
+/// `docs/internal/spikes/org-streaming/S1_REPORT.md` §3.
+#[tokio::test]
+async fn response_after_session_replacement_reaches_only_the_live_session() {
+    // The pair's roles are asymmetric ON PURPOSE: `accept()` is only legal
+    // before `start()` (the responder side has no per-pending registry), so
+    // the RESPONDER (the server) never starts and every re-handshake is
+    // legal — while the CALLER runs its dispatch loop so the receiving
+    // endpoint can actually RECORD deliveries. The provider pins the caller
+    // exactly as a signature-verified direct announcement would
+    // (`test_pin_peer_entity`, first-write-wins like the dispatch pin).
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x83u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x28);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::connect_no_start(&caller, &server).await;
+    server.test_pin_peer_entity(caller.node_id(), caller.entity_id().clone());
+    caller.start();
+
+    // A PUBLIC server-streaming call that PARKS with its sink handed out —
+    // every response is the witness's explicit post-replacement decision.
+    let holder = Arc::new(s14::SinkHolder::new());
+    let serve = server
+        .serve_rpc_streaming(s14::SERVICE, holder.clone())
+        .expect("serve public streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    // The call opens on the ORIGINAL session.
+    let session1 = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let replaced_endpoint = caller
+        .peer_session_id(server.node_id())
+        .expect("the caller-side receiving incarnation");
+    let open = s13::ss_request(s14::SERVICE, 0, b"open");
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session1,
+            caller.node_id(),
+            caller_origin,
+            s13::request_frame(caller_origin, 42, &open),
+        )),
+        "the bridge accepted the opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || holder
+            .started
+            .load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "the call is live on the original session",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "the parked call emits nothing before the replacement",
+    )
+    .await;
+
+    // RE-HANDSHAKE: a new establishment replaces the session (public calls
+    // survive it — only PROTECTED calls retire at the boundary).
+    fixture::connect_no_start(&caller, &server).await;
+    let live_endpoint = caller
+        .peer_session_id(server.node_id())
+        .expect("the live session id");
+    assert_ne!(
+        live_endpoint, replaced_endpoint,
+        "a re-handshake is a new establishment",
+    );
+    assert!(
+        !holder.dropped.load(Ordering::SeqCst),
+        "the public call survives the replacement (only protected calls retire)",
+    );
+
+    // THE RESPONSE — emitted strictly AFTER the replacement.
+    let sink = holder.sink.lock().take().expect("the parked handler's sink");
+    sink.send(Bytes::from_static(b"post-replacement-CONTENT"));
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || !caller_seen
+            .lock()
+            .is_empty())
+        .await,
+        "the post-replacement response arrives at the receiving endpoint",
+    );
+    let seen = caller_seen.lock().clone();
+    assert!(
+        seen.iter()
+            .any(|ev| s15::response_of(ev).body.as_ref() == b"post-replacement-CONTENT"),
+        "the response is the post-replacement item the live handler sent",
+    );
+    // Receiver-side attribution on BOTH endpoints.
+    for ev in &seen {
+        assert_eq!(
+            ev.session_id, live_endpoint,
+            "the LIVE session's endpoint receives the post-replacement response",
+        );
+    }
+    assert!(
+        !seen.iter().any(|ev| ev.session_id == replaced_endpoint),
+        "the REPLACED session's endpoint receives nothing",
+    );
+}

@@ -16,8 +16,10 @@
 //!   shape (`:872-876`), and the two named shim seams its body needs.
 //!
 //! Each module's doc lists its extraction command, extraction sha256, and
-//! every adaptation line. See also the runner [`frozen_opening`] in
-//! [`old_serve`].
+//! every adaptation line — including [`old_serve`]'s NAMED re-indentation of
+//! the denial-shape block (whitespace-insensitive provenance statement +
+//! trimmed-hash evidence in that module's doc). See also the runner
+//! [`frozen_opening`] in [`old_serve`].
 
 // `#[rustfmt::skip]` on each vendored module: their bodies are byte-identical
 // to the recorded `85ecc77c9` extractions (sha256 in each file's doc), and a
