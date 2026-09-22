@@ -16,6 +16,15 @@ use core::fmt;
 pub enum LeafError {
     /// The wire layer refused a packet: framing, AEAD, replay window.
     Wire(String),
+    /// The anti-replay window refused the packet's AEAD counter — a
+    /// duplicate or too-late arrival the wire's replay window would
+    /// not admit.
+    ///
+    /// Typed rather than prose inside [`Self::Wire`] so the receive
+    /// path can count a replay-attack signal without matching on
+    /// error text: a wording refactor upstream must not silently
+    /// erase it.
+    Replay,
     /// A session-level failure: no session for a peer, a handshake
     /// that did not complete, a session that was replaced.
     Session(String),
@@ -216,6 +225,9 @@ impl fmt::Display for LeafError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Wire(e) => write!(f, "wire: {e}"),
+            Self::Replay => {
+                write!(f, "replay: the anti-replay window refused the AEAD counter")
+            }
             Self::Session(e) => write!(f, "session: {e}"),
             Self::ControlPlane(e) => write!(f, "control plane: {e}"),
             Self::Rtc(e) => write!(f, "rtc: {e}"),

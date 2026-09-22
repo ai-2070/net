@@ -36,6 +36,7 @@ use crate::rpc_wire::{self, RpcRequestPayload};
 use crate::session::{event_frame_bytes, rtc_addr, PendingHandshake, SessionTable};
 use crate::signal::{self, SeenSignals};
 use crate::stream::{stream_id_from_label, Reliability, RxStream, StreamRecord};
+use net_wire::channel::membership::MembershipMsg;
 use net_wire::route_codec::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use net_wire::stream_window::{
     StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
@@ -410,11 +411,74 @@ struct ProvisionalAdmission {
     deadline: crate::clock::Deadline,
 }
 
+/// How long a pending initiator handshake may sit in
+/// [`LeafNode::handshakes`] before [`LeafNode::tick`] reaps it.
+///
+/// A **backstop**, not the attempt's deadline: the owning attempt's
+/// retirement ([`LeafNode::release_handshake`]) is the normal
+/// disposition, and this only bounds the entry a dead owner left
+/// behind — the one whose `is_handshaking` answer used to stay `true`
+/// forever, steering every later handshake packet from the peer into
+/// the message-2 branch where it was refused without clearing the
+/// entry, so the peer could never initiate again.
+const HANDSHAKE_DEADLINE_MS: u64 = 30_000;
+
+/// How long a `0x0A00` request waits for its Ack before the
+/// correlation is reaped. Bounds [`LeafNode::pending_memberships`]:
+/// one nonce per request, so without a deadline a peer that never
+/// answers grows the table one entry per call.
+const MEMBERSHIP_ACK_DEADLINE_MS: u64 = 30_000;
+
+/// An initiator handshake in flight at the node level: the pending
+/// state, the attempt it superseded, and the node's deadline for the
+/// entry.
+struct InFlightHandshake {
+    /// The live attempt's state. Read by
+    /// [`LeafNode::complete_handshake`] only when it produces a
+    /// session — a failed read takes neither this nor the entry.
+    pending: PendingHandshake,
+    /// The attempt this one superseded, kept solely as a message-2
+    /// classifier: its delayed message 2 completes *it* (a retired
+    /// attempt — nothing installs), which is how a stale message is
+    /// refused without ever reading against `pending`. One slot: an
+    /// older supersession goes when its successor arrives.
+    superseded: Option<PendingHandshake>,
+    /// When [`LeafNode::tick`] gives up on the entry.
+    deadline: clock::Deadline,
+}
+
+/// Which membership request an in-flight nonce asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MembershipKind {
+    /// A `Subscribe`.
+    Subscribe,
+    /// An `Unsubscribe`.
+    Unsubscribe,
+}
+
+/// A `0x0A00` request awaiting its Ack, by the nonce the request
+/// carries and the Ack echoes.
+#[derive(Debug, Clone, Copy)]
+struct PendingMembership {
+    /// The peer the request was sent to. An Ack from anyone else is
+    /// not this request's answer.
+    peer: NodeId,
+    /// Which request it was.
+    kind: MembershipKind,
+    /// The `stream_kinds` registration id the request created.
+    stream_id: u64,
+    /// The canonical channel hash — the `reply_subscriptions` key's
+    /// second field, for the rollback a refusal performs.
+    canonical: u64,
+    /// When the correlation is reaped.
+    deadline: clock::Deadline,
+}
+
 /// The leaf.
 pub struct LeafNode {
     identity: LeafIdentity,
     sessions: SessionTable,
-    handshakes: HashMap<NodeId, PendingHandshake>,
+    handshakes: HashMap<NodeId, InFlightHandshake>,
     /// Responder establishments waiting for their initiator's
     /// establishment proof, keyed by the **claimed** peer id.
     ///
@@ -472,10 +536,25 @@ pub struct LeafNode {
     relays: HashMap<NodeId, NodeId>,
     /// Subscribe nonces, so an Ack can be correlated.
     next_nonce: u64,
+    /// The `0x0A00` requests this leaf is waiting for an Ack to, by
+    /// the nonce [`Self::subscribe`] / [`Self::unsubscribe`] returned.
+    ///
+    /// Correlation is what makes an anchor-side refusal visible: the
+    /// Ack carrying the nonce is the protocol's own "admitted or
+    /// refused", and one that lands nowhere is indistinguishable from
+    /// admission — the failure this table exists to end. Bounded by
+    /// [`MEMBERSHIP_ACK_DEADLINE_MS`] and swept in [`Self::tick`].
+    pending_memberships: HashMap<u64, PendingMembership>,
     /// The delegation chain the anchor issued at enrollment. `None`
     /// means the session is still PROVISIONAL, and §12 refuses
     /// everything above the transport.
     delegation_chain: Option<Vec<u8>>,
+    /// The peer whose session [`Self::delegation_chain`] was issued
+    /// for — the [`Self::begin_enrollment`] caller. The chain
+    /// certifies **that session's** admission ("the session is no
+    /// longer provisional"), so it is released with that session, and
+    /// with the last session for a chain this node cannot attribute.
+    enrolled_peer: Option<NodeId>,
     /// `(peer, reply-channel canonical hash)` this leaf has already
     /// subscribed to.
     ///
@@ -587,12 +666,14 @@ impl LeafNode {
             peer_rtc_addr: HashMap::new(),
             relays: HashMap::new(),
             next_nonce: 1,
+            pending_memberships: HashMap::new(),
             reply_subscriptions: std::collections::HashSet::new(),
             rpc_reply_carriers: std::collections::HashSet::new(),
             send_failed: std::collections::HashSet::new(),
             recv_failed: std::collections::HashSet::new(),
             rx_closed: std::collections::HashSet::new(),
             delegation_chain: None,
+            enrolled_peer: None,
         }
     }
 
@@ -880,7 +961,20 @@ impl LeafNode {
             peer,
             rtc_addr(slot, 1),
         )?;
-        self.handshakes.insert(peer, pending);
+        // Superseding keeps the predecessor in the entry, one slot,
+        // as a message-2 classifier: its delayed message 2 must be
+        // recognisable without ever being read against this pending
+        // (`Self::complete_handshake`). Older supersessions go with
+        // it — the classifier is bounded at one per peer.
+        let superseded = self.handshakes.remove(&peer).map(|old| old.pending);
+        self.handshakes.insert(
+            peer,
+            InFlightHandshake {
+                pending,
+                superseded,
+                deadline: clock::Deadline::in_ms(HANDSHAKE_DEADLINE_MS),
+            },
+        );
         Ok(packet)
     }
 
@@ -897,11 +991,34 @@ impl LeafNode {
     /// material and no identity argument crosses the public API: the
     /// proof is made from the identity this node already holds.
     pub fn complete_handshake(&mut self, peer: NodeId, msg2: &[u8]) -> Result<()> {
-        let pending = self
-            .handshakes
-            .remove(&peer)
-            .ok_or_else(|| LeafError::Session(format!("no handshake in flight with {peer:#x}")))?;
-        let session = pending.read_msg2(msg2)?;
+        let Some(entry) = self.handshakes.get_mut(&peer) else {
+            return Err(LeafError::Session(format!(
+                "no handshake in flight with {peer:#x}"
+            )));
+        };
+        // **Whose message 2 is this?** The `CallTable::deliver` rule:
+        // a frame that is not this attempt's neither completes the
+        // handshake nor takes its pending. The superseded attempt is
+        // kept in the entry to answer exactly that — a message 2 it
+        // accepts is a *stale* one (its transcript is the only thing
+        // that could complete it), so the live pending is never read
+        // against it and the attempt survives. The difference is a
+        // delayed message costing one refused frame instead of the
+        // whole connect attempt.
+        if let Some(stale) = entry.superseded.as_ref() {
+            if stale.read_msg2(msg2).is_ok() {
+                entry.superseded = None;
+                return Err(LeafError::Session(format!(
+                    "message 2 for {peer:#x} completes a superseded handshake attempt; the \
+                     live attempt's pending is untouched"
+                )));
+            }
+            // Not the superseded attempt's message either: the
+            // classifier keeps what state it has (a failed read takes
+            // nothing) and the live pending gets the read.
+        }
+        let session = entry.pending.read_msg2(msg2)?;
+        self.handshakes.remove(&peer);
         let handshake_hash = *session.handshake_hash();
         self.install_session(peer, session);
         if self.peer_is_leaf(peer) {
@@ -1195,6 +1312,17 @@ impl LeafNode {
             self.reply_subscriptions.retain(|(p, _)| *p != peer);
             self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
             self.stream_kinds.retain(|(p, _), _| *p != peer);
+            // In-flight membership requests rode the predecessor and
+            // cannot be answered for the successor.
+            self.pending_memberships.retain(|_, m| m.peer != peer);
+            // The chain certified the PREDECESSOR's admission; a
+            // successor session is provisional again until
+            // re-enrolled, exactly as `drop_session` disposes of the
+            // claim.
+            if self.enrolled_peer == Some(peer) {
+                self.delegation_chain = None;
+                self.enrolled_peer = None;
+            }
         }
         self.events.push(LeafEvent::Connected {
             node_id: self.identity.node_id(),
@@ -1213,6 +1341,50 @@ impl LeafNode {
         self.rx_closed.retain(|(i, _)| *i != incarnation);
         self.reassembler.retire(incarnation);
         self.calls.fail_incarnation(incarnation);
+    }
+
+    /// Release the pending handshake for `peer`, if any; `true` if an
+    /// entry was dropped.
+    ///
+    /// The seam the **attempt's** terminal transition needs — the
+    /// initiator-side mirror of [`Self::retire_provisional`]: an
+    /// attempt can reach a terminal term while its message 2 is still
+    /// in flight, and without this the entry outlives its owner and
+    /// steers every later handshake packet from the peer into the
+    /// message-2 branch until [`Self::tick`]'s deadline sweep. The
+    /// superseded classifier goes with it.
+    pub fn release_handshake(&mut self, peer: NodeId) -> bool {
+        self.handshakes.remove(&peer).is_some()
+    }
+
+    /// The incarnation of the session with `peer`, if any — the
+    /// establishment a channel that installed it carried, and the
+    /// value [`Self::drop_session_if_incarnation`] fences on.
+    pub fn session_incarnation(&self, peer: NodeId) -> Option<u64> {
+        self.sessions.get(peer).map(|s| s.incarnation())
+    }
+
+    /// Tear down the session with `peer` **only if it is still the
+    /// `incarnation` named** — the transport-loss path's fenced
+    /// variant of [`Self::drop_session`]. Returns whether it dropped.
+    ///
+    /// A channel close is a fact about the establishment that channel
+    /// carried. Fencing on its incarnation is what stops a
+    /// predecessor channel's late `close` removing the **successor's**
+    /// entry and failing the successor's in-flight calls — the same
+    /// fence `check_handle` and `CallTable::fail_incarnation` apply
+    /// to every other teardown in this file.
+    pub fn drop_session_if_incarnation(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        reason: impl Into<String>,
+    ) -> bool {
+        if self.session_incarnation(peer) != Some(incarnation) {
+            return false;
+        }
+        self.drop_session(peer, reason);
+        true
     }
 
     /// Tear down the session with `peer`.
@@ -1238,10 +1410,31 @@ impl LeafNode {
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
         self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
+        // Membership requests riding the dead session can no longer
+        // be answered for it: a late Ack must not move state that
+        // belongs to a different establishment.
+        self.pending_memberships.retain(|_, m| m.peer != peer);
         // Addressing dies with the session it addressed. A relay
         // entry left behind would wrap the next attempt's packets
         // for a session that no longer exists.
         self.relays.remove(&peer);
+        // The published socket was that ESTABLISHMENT's: reporting it
+        // again after a reconnect aims the STUN probe at a stale
+        // address and can mint a false `udp_blocked`. The next
+        // establishment re-supplies it via `set_peer_rtc_addr`.
+        self.peer_rtc_addr.remove(&peer);
+        // The chain certified this session's admission — "the session
+        // is no longer provisional" — so with the session gone the
+        // claim is gone: `is_enrolled` must not keep reporting a
+        // state whose one diagnostic explains a call dying at §12
+        // with the service's handler never having run. The
+        // empty-table clause covers a chain this node cannot
+        // attribute to a peer (one earned without
+        // `begin_enrollment`).
+        if self.enrolled_peer == Some(peer) || self.sessions.is_empty() {
+            self.delegation_chain = None;
+            self.enrolled_peer = None;
+        }
         self.events.push(LeafEvent::Disconnected {
             peer_node: peer,
             reason: reason.into(),
@@ -1289,8 +1482,26 @@ impl LeafNode {
         }
         self.sweep_reassemblies(now);
         self.sweep_provisional(now);
+        self.sweep_handshakes(now);
+        self.sweep_memberships(now);
         self.drive_reliability();
         expired.len()
+    }
+
+    /// Reap pending handshakes past their deadline, and the
+    /// superseded classifiers with them.
+    ///
+    /// The bounded backstop for [`Self::release_handshake`]: a
+    /// pending that ends only on a message a dead peer will never
+    /// send must not wedge that peer's every future handshake.
+    fn sweep_handshakes(&mut self, now: Instant) {
+        self.handshakes.retain(|_, h| !h.deadline.expired_at(now));
+    }
+
+    /// Reap membership requests the anchor never answered.
+    fn sweep_memberships(&mut self, now: Instant) {
+        self.pending_memberships
+            .retain(|_, m| !m.deadline.expired_at(now));
     }
 
     /// One sweep of the wire's send-side recovery across every
@@ -1481,7 +1692,26 @@ impl LeafNode {
     ///
     /// Returns the nonce the Ack will echo.
     pub fn subscribe(&mut self, peer: NodeId, channel: &str) -> Result<u64> {
-        let channel = Channel::new(channel)?;
+        let requested = channel;
+        let channel = Channel::new(requested)?;
+        // **A reply carrier is the nRPC plane's reservation**, and
+        // registration is where that is settled in BOTH directions:
+        // an application subscribe on an id the reply plane already
+        // owns would claim traffic the receive path dispatches as
+        // replies (`rpc_reply_carriers`), and its own payloads would
+        // come back `Dropped { UnknownCall }`. Exactly
+        // [`Self::open_stream`]'s fence, for the channel plane.
+        if self
+            .rpc_reply_carriers
+            .contains(&(peer, channel.publish_stream_id()))
+        {
+            return Err(LeafError::Session(format!(
+                "channel {requested:?} on the session with {peer:#x} is reserved by this \
+                 leaf's nRPC reply plane (its id is a reply carrier this leaf subscribed to \
+                 for its own calls, so frames there are dispatched as replies and application \
+                 payloads would be refused as UnknownCall); use another channel name"
+            )));
+        }
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.wrapping_add(1);
         let payload = channel.subscribe_payload(nonce);
@@ -1497,6 +1727,7 @@ impl LeafNode {
         // leaf failed to subscribe to is not a channel it knows.
         self.stream_kinds
             .insert((peer, channel.publish_stream_id()), StreamKind::Channel);
+        self.note_membership(peer, nonce, &channel, MembershipKind::Subscribe);
         Ok(nonce)
     }
 
@@ -1518,7 +1749,31 @@ impl LeafNode {
     /// an application channel must not strand a reply carrier that
     /// happens to hash to the same id.
     pub fn unsubscribe(&mut self, peer: NodeId, channel: &str) -> Result<u64> {
-        let channel = Channel::new(channel)?;
+        let requested = channel;
+        let channel = Channel::new(requested)?;
+        // **The nRPC plane's membership is not this call's to
+        // release.** An id that is a live reply carrier is a
+        // different plane's reservation: the wire Unsubscribe would
+        // destroy the anchor's roster entry while
+        // `reply_subscriptions` still reports the channel subscribed,
+        // `ensure_reply_subscription` then answers `Ok(false)`
+        // forever and never re-subscribes, and every later call to
+        // that service runs its handler at the anchor and strands its
+        // reply to a bare deadline. Refused before ANY frame is
+        // queued — the wire release and the local deregistration are
+        // one disposition, and the doc above is now enforced rather
+        // than claimed.
+        if self
+            .rpc_reply_carriers
+            .contains(&(peer, channel.publish_stream_id()))
+        {
+            return Err(LeafError::Session(format!(
+                "channel {requested:?} on the session with {peer:#x} is reserved by this \
+                 leaf's nRPC reply plane (it is a reply carrier this leaf subscribed to for \
+                 its own calls, and releasing it would strand those replies); wait for the \
+                 calls to end or use another channel name"
+            )));
+        }
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.wrapping_add(1);
         let payload = channel.unsubscribe_payload(nonce);
@@ -1538,6 +1793,7 @@ impl LeafNode {
         if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
             self.stream_kinds.remove(&key);
         }
+        self.note_membership(peer, nonce, &channel, MembershipKind::Unsubscribe);
         Ok(nonce)
     }
 
@@ -1547,7 +1803,21 @@ impl LeafNode {
     /// `MeshNode::try_publish_to_peer` derives, so the receiver's
     /// per-channel dispatcher sees the frame.
     pub fn publish(&mut self, peer: NodeId, channel: &str, payload: &[u8]) -> Result<()> {
-        let channel = Channel::new(channel)?;
+        let requested = channel;
+        let channel = Channel::new(requested)?;
+        // The same reply-carrier fence as [`Self::subscribe`] — a
+        // publish also registers the id as the application's channel.
+        if self
+            .rpc_reply_carriers
+            .contains(&(peer, channel.publish_stream_id()))
+        {
+            return Err(LeafError::Session(format!(
+                "channel {requested:?} on the session with {peer:#x} is reserved by this \
+                 leaf's nRPC reply plane (its id is a reply carrier this leaf subscribed to \
+                 for its own calls, so frames there are dispatched as replies and application \
+                 payloads would be refused as UnknownCall); use another channel name"
+            )));
+        }
         self.send_event_plane(
             peer,
             channel.publish_stream_id(),
@@ -1558,6 +1828,27 @@ impl LeafNode {
         self.stream_kinds
             .insert((peer, channel.publish_stream_id()), StreamKind::Channel);
         Ok(())
+    }
+
+    /// Record what a membership nonce asked for, so its Ack can be
+    /// correlated — and, on a refusal, the claim taken back.
+    fn note_membership(
+        &mut self,
+        peer: NodeId,
+        nonce: u64,
+        channel: &Channel,
+        kind: MembershipKind,
+    ) {
+        self.pending_memberships.insert(
+            nonce,
+            PendingMembership {
+                peer,
+                kind,
+                stream_id: channel.publish_stream_id(),
+                canonical: channel.canonical(),
+                deadline: clock::Deadline::in_ms(MEMBERSHIP_ACK_DEADLINE_MS),
+            },
+        );
     }
 
     /// Open an application stream.
@@ -1786,12 +2077,24 @@ impl LeafNode {
 
         let deadline_ns =
             clock::now_unix_nanos().saturating_add(timeout_ms.saturating_mul(1_000_000));
-        let frame = rpc_wire::encode_request_frame(
+        let frame = match rpc_wire::encode_request_frame(
             self.identity.origin_hash(),
             call_id,
             route,
             &RpcRequestPayload::unary(service, deadline_ns, Bytes::copy_from_slice(payload)),
-        )?;
+        ) {
+            Ok(frame) => frame,
+            Err(e) => {
+                // The REQUEST never left the leaf. Release the slot
+                // exactly as the send-failure arm below does — the
+                // asymmetry leaked one registration (and one of
+                // `MAX_IN_FLIGHT_CALLS`' 256 slots) per refused body
+                // until its deadline, `Backpressure`-refusing every
+                // later call behind one oversized one.
+                self.calls.take(call_id);
+                return Err(e);
+            }
+        };
         if let Err(e) = self.send_event_plane(
             peer,
             request.publish_stream_id(),
@@ -1837,12 +2140,23 @@ impl LeafNode {
         // and nothing recorded yet, so this is a refusal before
         // success rather than a rollback.
         let carrier = route_stream_id(key.1);
-        if self.stream_kinds.get(&(peer, carrier)) == Some(&StreamKind::Stream) {
-            return Err(LeafError::Session(format!(
-                "the reply carrier for {service:?} on the session with {peer:#x} is stream \
-                 {carrier:#x}, which this leaf already opened as an application stream; \
-                 close that stream or call a service whose reply channel does not collide"
-            )));
+        match self.stream_kinds.get(&(peer, carrier)) {
+            Some(StreamKind::Stream) => {
+                return Err(LeafError::Session(format!(
+                    "the reply carrier for {service:?} on the session with {peer:#x} is stream \
+                     {carrier:#x}, which this leaf already opened as an application stream; \
+                     close that stream or call a service whose reply channel does not collide"
+                )));
+            }
+            Some(StreamKind::Channel) => {
+                return Err(LeafError::Session(format!(
+                    "the reply carrier for {service:?} on the session with {peer:#x} is \
+                     channel stream {carrier:#x}, which this leaf already subscribed to or \
+                     published on as an application channel; unsubscribe that channel or call \
+                     a service whose reply channel does not collide"
+                )));
+            }
+            None => {}
         }
         self.subscribe(peer, reply.as_str())?;
         // Recorded only after the frame is queued: a refused
@@ -1903,7 +2217,14 @@ impl LeafNode {
         // only to the name carrying its own origin, and §12's
         // allow-list checks the same equality, so the name is
         // derived and never taken from a caller.
-        self.call(peer, crate::enroll::ENROLL_SERVICE, &body, timeout_ms)
+        let outcome = self.call(peer, crate::enroll::ENROLL_SERVICE, &body, timeout_ms);
+        if outcome.is_ok() {
+            // The chain this exchange earns certifies THIS session's
+            // admission ("the session is no longer provisional"), so
+            // `drop_session` releases the claim with the session.
+            self.enrolled_peer = Some(peer);
+        }
+        outcome
     }
 
     /// Parse an enrollment reply and record the delegation chain.
@@ -2060,7 +2381,7 @@ impl LeafNode {
         };
         let opened = match session.open_packet(&inner) {
             Ok(opened) => opened,
-            Err(LeafError::Wire(reason)) if reason.contains("replay") => {
+            Err(LeafError::Replay) => {
                 self.counters.drop_for(DropReason::Replay);
                 return;
             }
@@ -2294,7 +2615,35 @@ impl LeafNode {
         // a reassembled group carries its first fragment's plane
         // and mode, so the packet that completes it cannot move it
         // to another plane or change how its stream treats a gap.
-        for record in records {
+        self.deliver_records(peer, incarnation, now, records, delivered);
+        // Whatever this arrival's reassembly gave up on is disposed
+        // of after what did assemble is delivered: records released
+        // in order stay in order, and the stream then ends typed.
+        self.dispose_abandoned_groups();
+    }
+
+    /// Offer `records` to their streams' reorder buffers and deliver
+    /// whatever comes out, in order.
+    ///
+    /// **A terminal overflow counts what its break leaves behind.**
+    /// The records were assembled from this packet's events and are
+    /// already acknowledged (`note_received` ran before the batch was
+    /// built), so dropping them silently loses acknowledged payloads
+    /// the sender will never resend — the same class the delivery
+    /// loop's closed-consumer arm counts payload for payload. The
+    /// overflowing stream ends typed in `fail_receive_half`; every
+    /// record not yet iterated is suppressed **and counted**, never
+    /// vanished.
+    fn deliver_records(
+        &mut self,
+        peer: NodeId,
+        incarnation: u64,
+        now: Instant,
+        records: Vec<StreamRecord>,
+        mut delivered: Vec<StreamRecord>,
+    ) {
+        let mut records = records.into_iter();
+        while let Some(record) = records.next() {
             if crate::session::is_stream_control(record.subprotocol_id) {
                 delivered.push(record);
                 continue;
@@ -2318,6 +2667,10 @@ impl LeafNode {
                 // stream takes nothing more.
                 Err(overflow) => {
                     self.fail_receive_half(peer, incarnation, overflow);
+                    for skipped in records.by_ref() {
+                        self.counters
+                            .drop_n(DropReason::StreamFailed, skipped.payloads.len() as u64);
+                    }
                     break;
                 }
             }
@@ -2335,10 +2688,6 @@ impl LeafNode {
                 self.handle_event(peer, incarnation, &record, payload, now);
             }
         }
-        // Whatever this arrival's reassembly gave up on is disposed
-        // of after what did assemble is delivered: records released
-        // in order stay in order, and the stream then ends typed.
-        self.dispose_abandoned_groups();
     }
 
     /// Apply the reassembly deadline, and dispose of what it took.
@@ -2541,14 +2890,19 @@ impl LeafNode {
         payload: Bytes,
         now: Instant,
     ) {
-        let Some(decoded) =
-            dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters)
-        else {
-            self.events.push(LeafEvent::Dropped {
-                reason: DropReason::UnknownSubprotocol,
-            });
-            return;
-        };
+        // The refusal NAMES the classification the dispatcher made: an
+        // unknown subprotocol and an undecodable payload are different
+        // degradations, and one event name for both contradicts the
+        // counter that was just moved — a field report could not be
+        // reconciled with a snapshot.
+        let decoded =
+            match dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
+                    self.events.push(LeafEvent::Dropped { reason });
+                    return;
+                }
+            };
         match decoded {
             Decoded::Event(payload) => {
                 self.handle_event_plane(peer, incarnation, record, payload);
@@ -2633,8 +2987,80 @@ impl LeafNode {
                     reason: StreamFailure::PeerReset,
                 });
             }
+            Decoded::Membership(msg) => self.handle_membership(peer, msg),
+        }
+    }
+
+    /// The membership plane's receive side: the `Ack` answering a
+    /// `0x0A00` request this leaf sent.
+    ///
+    /// **Correlated by the nonce `subscribe`/`unsubscribe` returned,
+    /// and surfaced distinctly.** The Ack is the protocol's own
+    /// "admitted or refused" — the correlation was designed into the
+    /// wire (`Channel::subscribe_payload`'s echoed nonce) and until
+    /// now discarded here, which made an anchor-side refusal
+    /// indistinguishable from success: the local registration claimed
+    /// a membership the anchor never granted, `call()` proceeded, and
+    /// the reply stranded to a bare deadline with no event and no
+    /// counter. So an admission moves `membership_admitted`, a
+    /// refusal moves [`DropReason::MembershipRefused`] **and** a
+    /// [`LeafEvent::Dropped`] — and a refused **Subscribe** takes the
+    /// claim back: `stream_kinds` gives up the channel registration
+    /// exactly as `unsubscribe` would, and the nRPC plane's claim
+    /// (`reply_subscriptions` / `rpc_reply_carriers`) goes too, so
+    /// the next call re-subscribes instead of stranding its reply on
+    /// a membership the anchor refused.
+    ///
+    /// A refusal that can no longer be correlated is still surfaced
+    /// (a refusal is always news); an uncorrelated admission is stale
+    /// good news and is ignored.
+    fn handle_membership(&mut self, from: NodeId, msg: MembershipMsg) {
+        let MembershipMsg::Ack {
+            nonce,
+            accepted,
+            reason: _,
+        } = msg
+        else {
             // A leaf serves no membership requests.
-            Decoded::Membership(_) => {}
+            return;
+        };
+        // The Ack must answer a request this leaf made TO THIS PEER:
+        // nonces are node-global, and honouring one echoed by another
+        // peer would let that peer move a membership it has nothing
+        // to do with.
+        let ours = self
+            .pending_memberships
+            .get(&nonce)
+            .copied()
+            .filter(|pending| pending.peer == from);
+        let Some(pending) = ours else {
+            if !accepted {
+                self.counters.drop_for(DropReason::MembershipRefused);
+                self.events.push(LeafEvent::Dropped {
+                    reason: DropReason::MembershipRefused,
+                });
+            }
+            return;
+        };
+        self.pending_memberships.remove(&nonce);
+        if accepted {
+            self.counters.membership_admitted();
+            return;
+        }
+        self.counters.drop_for(DropReason::MembershipRefused);
+        self.events.push(LeafEvent::Dropped {
+            reason: DropReason::MembershipRefused,
+        });
+        if pending.kind == MembershipKind::Subscribe {
+            // The anchor refused the membership, so the claim is not
+            // one this leaf holds.
+            let key = (from, pending.stream_id);
+            if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
+                self.stream_kinds.remove(&key);
+            }
+            if self.rpc_reply_carriers.remove(&key) {
+                self.reply_subscriptions.remove(&(from, pending.canonical));
+            }
         }
     }
 
@@ -5851,5 +6277,546 @@ mod tests {
         a.stream_send(send, b"opaque").expect("send");
         pump(&mut a, &mut b);
         assert_eq!(delivered(&mut b), vec![b"opaque".to_vec()]);
+    }
+
+    /// Install a session with `peer` on `node`, the way `connected()`
+    /// does for the anchor — no announcement, so no establishment
+    /// proof is owed and `complete_handshake` installs directly.
+    fn connect_peer(node: &mut LeafNode, peer: NodeId, slot: u32) {
+        let anchor_key = anchor_static();
+        let prologue = handshake_prologue(
+            crate::session::routing_id(node.node_id()),
+            crate::session::routing_id(peer),
+        );
+        let mut responder =
+            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+        let msg1 = node
+            .begin_handshake(peer, &PSK, anchor_key.public_key(), slot)
+            .expect("msg1");
+        let parsed = ParsedPacket::parse(msg1, rtc_addr(slot, 1)).expect("parses");
+        responder.read_message(&parsed.payload).expect("reads msg1");
+        let msg2 = responder.write_message(&[]).expect("msg2");
+        let msg2_packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
+        node.complete_handshake(peer, &msg2_packet).expect("install");
+    }
+
+    /// **#8.** A message 2 that fails to validate must not destroy
+    /// the pending it failed to complete — `CallTable::deliver`'s
+    /// rule ("a wrong-owner frame neither completes the call nor
+    /// takes its slot") applied to the handshake. The positive
+    /// control is decisive: after garbage AND a superseded attempt's
+    /// delayed message 2, the live attempt's real message 2 must
+    /// still complete. The remove-then-validate shape fails exactly
+    /// there — and worse, mis-routes the real message 2 into
+    /// `accept_handshake` as a message 1.
+    #[test]
+    fn a_bad_or_stale_message_2_leaves_the_live_handshake_in_flight() {
+        let mut node = LeafNode::new(identity(0x11), 0x1000);
+        let anchor_key = anchor_static();
+        let prologue = handshake_prologue(
+            crate::session::routing_id(node.node_id()),
+            crate::session::routing_id(ANCHOR),
+        );
+
+        // Attempt one: answered by the peer, but its message 2 is
+        // delayed in flight.
+        let mut responder_one =
+            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+        let msg1 = node
+            .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
+            .expect("msg1");
+        let parsed = ParsedPacket::parse(msg1, rtc_addr(0, 1)).expect("parses");
+        responder_one
+            .read_message(&parsed.payload)
+            .expect("reads msg1");
+        let stale_msg2 = PacketBuilder::new(&[0u8; 32], 0)
+            .build_handshake(&responder_one.write_message(&[]).expect("msg2"));
+
+        // Attempt two supersedes it.
+        let mut responder_two =
+            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+        let msg1 = node
+            .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
+            .expect("msg1");
+        let parsed = ParsedPacket::parse(msg1, rtc_addr(0, 1)).expect("parses");
+        responder_two
+            .read_message(&parsed.payload)
+            .expect("reads msg1");
+        let live_msg2 = PacketBuilder::new(&[0u8; 32], 0)
+            .build_handshake(&responder_two.write_message(&[]).expect("msg2"));
+
+        // Garbage: refused, and the handshake is still in flight.
+        assert!(node.complete_handshake(ANCHOR, b"not a packet").is_err());
+        assert!(
+            node.is_handshaking(ANCHOR),
+            "a failed read must take neither the pending nor the entry"
+        );
+
+        // The superseded attempt's delayed message 2: refused as
+        // STALE — nothing installs and the live pending is untouched.
+        assert!(node.complete_handshake(ANCHOR, &stale_msg2).is_err());
+        assert!(
+            node.is_handshaking(ANCHOR),
+            "a stale message 2 must not take the live attempt's pending"
+        );
+        assert!(
+            !node.has_session(ANCHOR),
+            "and a retired attempt's message 2 installs nothing"
+        );
+
+        // The positive control: the live attempt still completes.
+        node.complete_handshake(ANCHOR, &live_msg2)
+            .expect("the real message 2 completes the handshake it belongs to");
+        assert!(node.has_session(ANCHOR));
+    }
+
+    /// **#9.** A pending handshake is bounded twice: the owning
+    /// attempt's retirement releases it, and `tick` reaps one whose
+    /// owner never did. Without either, `is_handshaking` sticks
+    /// `true` and the peer can never initiate again.
+    #[test]
+    fn a_pending_handshake_is_reaped_at_its_deadline_and_released_by_retirement() {
+        let mut node = LeafNode::new(identity(0x11), 0x1000);
+        let anchor_key = anchor_static();
+
+        let _msg1 = node
+            .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
+            .expect("msg1");
+        assert!(node.is_handshaking(ANCHOR));
+        assert!(
+            node.release_handshake(ANCHOR),
+            "the attempt's terminal transition releases the entry"
+        );
+        assert!(!node.is_handshaking(ANCHOR));
+        assert!(!node.release_handshake(ANCHOR), "released exactly once");
+
+        let _msg1 = node
+            .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
+            .expect("msg1");
+        assert!(node.is_handshaking(ANCHOR));
+        let later =
+            clock::now() + core::time::Duration::from_millis(HANDSHAKE_DEADLINE_MS + 1_000);
+        node.tick(later);
+        assert!(
+            !node.is_handshaking(ANCHOR),
+            "a pending that ends only on a message a dead peer will never send must not wedge \
+             every future handshake from that peer"
+        );
+    }
+
+    /// **#10.** The call slot is released on BOTH error paths of the
+    /// request build — the encode refusal took the slot and leaked it
+    /// until its deadline, `Backpressure`-refusing every later call
+    /// behind one oversized body.
+    #[test]
+    fn a_refused_request_encode_releases_its_call_slot() {
+        let (mut node, _anchor) = connected();
+        let oversized = vec![0u8; crate::rpc_wire::MAX_RPC_BODY_LEN + 1];
+        node.call(ANCHOR, "app.orders", &oversized, Some(5_000))
+            .expect_err("an over-cap body is refused at encode");
+        assert_eq!(
+            node.calls.in_flight(),
+            0,
+            "the registration must be released exactly as the send-failure path releases it"
+        );
+    }
+
+    /// **#11.** `unsubscribe` must not release a membership the nRPC
+    /// plane owns: the wire Unsubscribe would destroy the anchor's
+    /// roster entry while the plane still reports the channel
+    /// subscribed, and `ensure_reply_subscription` would then never
+    /// re-subscribe — every later call strands its reply to a bare
+    /// deadline. The observable: no frame reaches the wire, and the
+    /// plane's membership keeps working (a later call does not
+    /// re-subscribe).
+    #[test]
+    fn an_unsubscribe_cannot_release_a_reply_carrier_the_rpc_plane_owns() {
+        let (mut node, _anchor) = connected();
+        node.drain_events();
+        let _call = node
+            .call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect("call");
+        assert_eq!(node.take_outbound().len(), 2, "subscribe + request");
+        let name = node.reply_channel_for("app.orders").expect("name");
+
+        node.unsubscribe(ANCHOR, &name)
+            .expect_err("the nRPC plane's membership is not the application's to release");
+        assert!(
+            node.take_outbound().is_empty(),
+            "no Unsubscribe may reach the wire: it would destroy the anchor roster entry the \
+             plane still reports subscribed"
+        );
+
+        let _call = node
+            .call(ANCHOR, "app.orders", b"b", Some(60_000))
+            .expect("call");
+        assert_eq!(
+            node.take_outbound().len(),
+            1,
+            "the membership is intact: one request and no new Subscribe"
+        );
+    }
+
+    /// **#12.** The reply-carrier fence covers Channel owners in both
+    /// directions — an application `subscribe`/`publish` on an id
+    /// that is (or becomes) a reply carrier used to be silently taken
+    /// over, after which the application's own payloads came back
+    /// `Dropped { UnknownCall }`.
+    #[test]
+    fn the_reply_carrier_fence_covers_channel_owners_in_both_directions() {
+        // Application first: the call is refused at registration, and
+        // nothing is queued.
+        let (mut node, _anchor) = connected();
+        let name = node.reply_channel_for("app.orders").expect("name");
+        node.subscribe(ANCHOR, &name).expect("application subscribe");
+        node.take_outbound();
+        node.call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect_err("a call cannot take a carrier an application channel already owns");
+        assert!(
+            node.take_outbound().is_empty(),
+            "a refused call queues nothing: no membership frame, no request"
+        );
+
+        // Reply plane first: the application is refused at
+        // registration, in both verbs.
+        let (mut node, _anchor) = connected();
+        let _call = node
+            .call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect("call");
+        node.take_outbound();
+        let name = node.reply_channel_for("app.orders").expect("name");
+        node.subscribe(ANCHOR, &name)
+            .expect_err("subscribe on a live reply carrier is refused");
+        node.publish(ANCHOR, &name, b"x")
+            .expect_err("publish on a live reply carrier is refused");
+        assert!(node.take_outbound().is_empty(), "and nothing is queued");
+    }
+
+    /// **#13 / #57.** The transport-loss path releases the session
+    /// fenced by the incarnation the dying channel carried: a
+    /// predecessor channel's late close is a no-op against its
+    /// successor, and the close naming the live establishment
+    /// releases it with in-flight calls failing `SessionLost` — the
+    /// disposition §8 promises — rather than burning their deadline
+    /// into `Timeout`.
+    #[test]
+    fn a_transport_loss_naming_its_incarnation_releases_the_session_and_fails_calls_typed() {
+        const PEER: NodeId = 0x3333_4444_5555_6666;
+        let (mut node, _anchor) = connected();
+        connect_peer(&mut node, PEER, 10);
+        let incarnation = node.session_incarnation(PEER).expect("session");
+
+        // A predecessor channel's late close names an incarnation
+        // this session is not.
+        assert!(
+            !node.drop_session_if_incarnation(
+                PEER,
+                incarnation.wrapping_add(1),
+                "the DataChannel closed"
+            ),
+            "a late close naming a different establishment is refused"
+        );
+        assert!(node.has_session(PEER), "the successor is untouched");
+
+        let mut rx = node
+            .call(PEER, "app.orders", b"a", Some(60_000))
+            .expect("call");
+        node.take_outbound();
+        assert!(node.drop_session_if_incarnation(
+            PEER,
+            incarnation,
+            "the DataChannel closed"
+        ));
+        assert!(!node.has_session(PEER));
+        assert_eq!(
+            rx.try_recv().expect("alive").expect("resolved"),
+            Err(RpcError::SessionLost),
+            "in-flight calls fail SessionLost, not a bare Timeout"
+        );
+    }
+
+    /// **#14.** The membership Ack is correlated by the nonce
+    /// `subscribe` returned and surfaced **distinctly**: a refusal
+    /// moves a counter AND an event and takes the local claim back
+    /// (so a retry can be re-admitted), an admission is counted and
+    /// raises no alarm. The pre-fix arm decoded the Ack and dropped
+    /// it on the floor, making an anchor-side refusal
+    /// indistinguishable from success.
+    #[test]
+    fn a_membership_ack_is_correlated_and_surfaces_admission_and_refusal_distinctly() {
+        use net_wire::channel::membership::{encode, AckReason};
+
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        let refused_channel = Channel::new("app.telemetry").expect("valid");
+
+        // The anchor refuses a Subscribe.
+        let nonce = node.subscribe(ANCHOR, "app.telemetry").expect("subscribe");
+        node.take_outbound();
+        let ack = encode(&MembershipMsg::Ack {
+            nonce,
+            accepted: false,
+            reason: Some(AckReason::Unauthorized),
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                refused_channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                refused_channel.wire_hash(),
+                true,
+                &ack,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().drops(DropReason::MembershipRefused),
+            1,
+            "a refusal is counted, not discarded"
+        );
+        assert_eq!(node.counters().membership_admissions(), 0, "not an admission");
+        assert!(
+            matches!(
+                node.drain_events().as_slice(),
+                [LeafEvent::Dropped {
+                    reason: DropReason::MembershipRefused
+                }]
+            ),
+            "and is surfaced to the application"
+        );
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, refused_channel.publish_stream_id())),
+            None,
+            "the claim the refused Subscribe recorded is taken back"
+        );
+
+        // The anchor admits a different channel's Subscribe.
+        let admitted_channel = Channel::new("app.metrics").expect("valid");
+        let nonce = node.subscribe(ANCHOR, "app.metrics").expect("subscribe");
+        node.take_outbound();
+        let ack = encode(&MembershipMsg::Ack {
+            nonce,
+            accepted: true,
+            reason: None,
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                admitted_channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                admitted_channel.wire_hash(),
+                true,
+                &ack,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().membership_admissions(),
+            1,
+            "admission is counted"
+        );
+        assert_eq!(
+            node.counters().drops(DropReason::MembershipRefused),
+            1,
+            "and stays distinguishable from refusal"
+        );
+        assert!(
+            node.drain_events().is_empty(),
+            "an admission is not an alarm"
+        );
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, admitted_channel.publish_stream_id())),
+            Some(&StreamKind::Channel),
+            "and the admitted claim stands"
+        );
+    }
+
+    /// **#58.** The `Dropped` event must name the classification the
+    /// dispatcher actually made — one event name for both an unknown
+    /// subprotocol and an undecodable payload contradicts the counter
+    /// that was just moved, and mixed-version degradation becomes
+    /// indistinguishable from corruption.
+    #[test]
+    fn a_dropped_event_names_the_classification_the_dispatcher_made() {
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        // 0x0B00 is a KNOWN subprotocol whose payload cannot decode.
+        let packet = anchor_packet(&anchor, 7, 0x0B00, 0, true, b"short");
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::Unparsable), 1);
+        assert_eq!(node.counters().drops(DropReason::UnknownSubprotocol), 0);
+        assert!(
+            matches!(
+                node.drain_events().as_slice(),
+                [LeafEvent::Dropped {
+                    reason: DropReason::Unparsable
+                }]
+            ),
+            "the event must name the classification that was made"
+        );
+    }
+
+    /// **#59.** A batched packet whose later record trips the reorder
+    /// bound loses the not-yet-iterated records — assembled from this
+    /// packet's events and already acknowledged — so they must be
+    /// counted exactly as the delivery loop counts its suppressed
+    /// payloads, not vanish.
+    #[test]
+    fn records_left_behind_a_reorder_overflow_are_counted_not_vanished() {
+        fn rec(stream_id: u64, seq: u64, payload: &'static [u8]) -> StreamRecord {
+            StreamRecord {
+                seq,
+                span: 1,
+                stream_id,
+                subprotocol_id: 0,
+                reliable: true,
+                origin_hash: 0xFEED_FACE_0000_0001,
+                channel_hash: 0,
+                payloads: vec![Bytes::from_static(payload)],
+            }
+        }
+
+        let (mut node, _anchor) = connected();
+        let incarnation = node.session_incarnation(ANCHOR).expect("session");
+        const FAILED: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x77;
+        const SURVIVOR: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x78;
+
+        // Prime one reliable stream to the bound with its head gap at
+        // sequence 0 still open: one more record ends it.
+        {
+            let stream = node
+                .rx_streams
+                .entry((incarnation, FAILED))
+                .or_insert_with(|| RxStream::new(Reliability::Reliable));
+            for seq in 1..=crate::stream::MAX_REORDER_HELD as u64 {
+                assert!(stream.accept(rec(FAILED, seq, b"x"), &node.counters).is_ok());
+            }
+        }
+
+        let before = node.counters().drops(DropReason::StreamFailed);
+        let mut survivor = rec(SURVIVOR, 1, b"y");
+        survivor.payloads.push(Bytes::from_static(b"z"));
+        node.deliver_records(
+            ANCHOR,
+            incarnation,
+            clock::now(),
+            vec![
+                rec(FAILED, crate::stream::MAX_REORDER_HELD as u64 + 1, b"x"),
+                survivor,
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            node.counters().drops(DropReason::StreamFailed) - before,
+            1 + 2,
+            "the terminal verdict is one drop for the ended stream, and every acknowledged \
+             PAYLOAD (2 in the skipped record) the break left un-iterated is counted beside \
+             it — not vanished"
+        );
+    }
+
+    /// **#108 / #109.** `drop_session` releases what the departed
+    /// establishment owned: the delegation chain that certified ITS
+    /// session's admission (an unrelated session's loss must not
+    /// release it, and its own loss must — `is_enrolled` masking §12
+    /// refusals is the one diagnostic that explains a call dying on
+    /// its deadline), and the published RTC socket that establishment
+    /// reported (a reconnect must not re-report it and aim the STUN
+    /// probe at a stale address).
+    #[test]
+    fn losing_a_session_releases_its_enrollment_claim_and_its_published_rtc_addr() {
+        const PEER: NodeId = 0x4444_5555_6666_7777;
+        const BYSTANDER: NodeId = 0x5555_6666_7777_8888;
+        let admitted = || {
+            let mut outcome = Vec::new();
+            outcome.extend_from_slice(b"NMO1");
+            outcome.push(0);
+            outcome.extend_from_slice(&(11u32).to_le_bytes());
+            outcome.extend_from_slice(b"chain-bytes");
+            outcome
+        };
+        let invite = crate::enroll::Invite {
+            root: [0x77; 32],
+            nonce: [0x5A; 16],
+            expires_at: clock::now_unix_secs() + 600,
+            rendezvous: "https://anchor.example/rtc".into(),
+        };
+
+        let (mut node, _anchor) = connected();
+        connect_peer(&mut node, PEER, 10);
+
+        // The chain is issued for PEER's session.
+        let _rx = node
+            .begin_enrollment(PEER, &invite, "tab", &[], Some(5_000))
+            .expect("begin enrollment");
+        node.take_outbound();
+        node.finish_enrollment(&admitted()).expect("admitted");
+        assert!(node.is_enrolled());
+
+        // Its loss releases the claim — while ANCHOR's session is
+        // very much alive.
+        node.drop_session(PEER, "the DataChannel closed");
+        assert!(
+            !node.is_enrolled(),
+            "the chain certified PEER's session, which is gone; is_enrolled must not mask the \
+             one fact that explains a call dying at §12 with its handler never having run"
+        );
+
+        // Re-enroll on ANCHOR's session.
+        let _rx = node
+            .begin_enrollment(ANCHOR, &invite, "tab", &[], Some(5_000))
+            .expect("begin enrollment");
+        node.take_outbound();
+        node.finish_enrollment(&admitted()).expect("admitted");
+        assert!(node.is_enrolled());
+
+        // A bystander's loss must NOT release ANCHOR's claim.
+        connect_peer(&mut node, BYSTANDER, 11);
+        node.drop_session(BYSTANDER, "the DataChannel closed");
+        assert!(
+            node.is_enrolled(),
+            "another session's loss must not release the claim this session earned"
+        );
+
+        // And ANCHOR's loss takes its own: the claim and the
+        // establishment's published socket.
+        assert!(node.peer_rtc_addr.contains_key(&ANCHOR));
+        node.drop_session(ANCHOR, "the DataChannel closed");
+        assert!(!node.is_enrolled());
+        assert!(
+            !node.peer_rtc_addr.contains_key(&ANCHOR),
+            "the published socket was that establishment's; a reconnect must not re-report it"
+        );
+    }
+
+    /// **#111.** A duplicate AEAD counter is refused by the TYPED
+    /// `LeafError::Replay` seam — the only thing that keeps the
+    /// operator's replay-attack signal alive when an upstream error
+    /// string is reworded — and is counted as a replay, never as
+    /// corruption.
+    #[test]
+    fn a_replayed_packet_is_refused_by_the_typed_replay_seam() {
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        let packet = anchor_packet(&anchor, 7, 0, 0, true, b"hello");
+        {
+            let session = node.sessions.get(ANCHOR).expect("session");
+            assert!(session.open_packet(&packet).is_ok(), "the first arrival opens");
+            assert!(
+                matches!(session.open_packet(&packet), Err(LeafError::Replay)),
+                "a duplicate counter must be the typed Replay refusal, not error prose"
+            );
+        }
+        node.on_datagram(ANCHOR, packet, clock::now());
+        assert_eq!(node.counters().drops(DropReason::Replay), 1);
+        assert_eq!(
+            node.counters().drops(DropReason::Unparsable),
+            0,
+            "a replay is an attack signal, not corruption"
+        );
     }
 }
