@@ -1,0 +1,14 @@
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  h_64425bc75e3f3d 36,110,112,119-120,491,500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a399032b3839a5c5e635f71e722d73a6b68940c5",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
