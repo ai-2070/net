@@ -1300,6 +1300,24 @@ borrow `inner`, so the held `Ref` panicked on re-entrancy and tab b's answer
 path died mid-flight. The borrow-hoist fixed the witness and the lint
 together.)
 
+**Follow-up (named, non-blocking): the drop-and-log floor is unconstrained
+for the answer class.** The fix lane's own reconciliation closes the loop on
+why nothing caught the hazard: every #55 probe ran in the fixture world,
+whose `signal()` refuses *synchronously* — no fetch, no yield, so a `Ref`
+held across the await could never be re-entered on any executed path. The
+inverse receipts discriminate the three semantics correctly while being
+structurally blind to the borrow seam (the classic unconstrained-seam case).
+By the same test, the drop-and-log floor is sound as a *transport* floor for
+fire-and-forget signalling but unconstrained-on-principle for offers and
+answers: no oracle pins an uncarriable answer's disposition, and silent
+swallow converts a must-deliver (`send_signal_frame`'s no-session case is
+`ControlPlane::signal`'s job; the answer is the operation's step-3 contract)
+into best-effort — the same invisible-death shape as the borrow hazard once
+removed. Recommended hardening (owner's call): split the envelope classes —
+offer/answer failures surface typed to the caller (the pre-fix visibility
+stage5 relied on), trickle/candidate envelopes keep drop-and-log — and pin
+one witness per disposition so the floor stops being unconstrained.
+
 ---
 
 ## Open owner questions
