@@ -87,14 +87,29 @@ pub struct TasksAdapter {
 }
 
 impl TasksAdapter {
+    /// Validate a snapshot payload WITHOUT opening a store: the
+    /// envelope, the `last_seq` position check, and the EMBEDDED
+    /// adapter state (review finding 10).
     #[cfg(feature = "netdb")]
     pub(crate) fn validate_snapshot(
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<(), CortexAdapterError> {
-        Self::decode_snapshot(state_bytes, last_seq).map(|_| ())
+        let payload = Self::decode_snapshot(state_bytes, last_seq)?;
+        // The nested check lives HERE, once. `decode_snapshot` returns
+        // the payload after the position check only: the open path
+        // hands `payload.inner` to `CortexAdapter::open_from_snapshot`,
+        // which decodes it as `TasksState` anyway — decoding it in
+        // `decode_snapshot` too parsed and allocated the entire
+        // adapter state twice on every checkpointed restart.
+        let _: TasksState = postcard::from_bytes(&payload.inner)
+            .map_err(|e| RedexError::Decode(format!("tasks snapshot state: {e}")))?;
+        Ok(())
     }
 
+    /// Unwrap the envelope and check the position sentinel. Does NOT
+    /// decode the embedded state — see [`Self::validate_snapshot`] for
+    /// where that check lives and why it is not repeated here.
     fn decode_snapshot(
         state_bytes: &[u8],
         last_seq: Option<u64>,
@@ -106,8 +121,6 @@ impl TasksAdapter {
         }
         let payload: TasksSnapshotPayload = postcard::from_bytes(state_bytes)
             .map_err(|e| RedexError::Decode(format!("tasks snapshot unwrap: {e}")))?;
-        let _: TasksState = postcard::from_bytes(&payload.inner)
-            .map_err(|e| RedexError::Decode(format!("tasks snapshot state: {e}")))?;
         Ok(payload)
     }
 
@@ -635,6 +648,33 @@ impl std::fmt::Debug for TasksAdapter {
 mod tests {
     use super::*;
     use crate::adapter::net::redex::Redex;
+
+    /// Review finding 10 behaviour witness: `validate_snapshot` — the
+    /// API that promises to validate embedded adapter state WITHOUT
+    /// opening a store — must reject a well-formed envelope wrapping
+    /// corrupt state bytes (the loud failure the moved nested check
+    /// provides). Inverse: removing the nested check from
+    /// `validate_snapshot` reddens this — after finding 10 nothing
+    /// else on the validate path performs it. (The companion property
+    /// "the nested state is parsed exactly once per checkpointed
+    /// restart" is structural: `decode_snapshot` no longer touches
+    /// `payload.inner`, leaving `CortexAdapter::open_from_snapshot`'s
+    /// decode as the single parse site — this witness pins the
+    /// behaviour, not the parse count.)
+    #[cfg(feature = "netdb")]
+    #[test]
+    fn validate_snapshot_rejects_corrupt_embedded_state() {
+        let payload = TasksSnapshotPayload {
+            app_seq: 3,
+            inner: vec![0xFF; 32],
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let result = TasksAdapter::validate_snapshot(&bytes, Some(0));
+        assert!(
+            result.is_err(),
+            "validate_snapshot must reject corrupt embedded adapter state, got: {result:?}"
+        );
+    }
 
     /// Cross-origin aliasing protection on the RYW surface. A
     /// `WriteToken` is `(origin_hash, seq)`; if the adapter accepted
