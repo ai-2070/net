@@ -250,7 +250,7 @@ before acceptance, verbatim matching the lane's recorded red:
 | Spot-check | Mutation | Red (exit 100) | Restore |
 |---|---|---|---|
 | lifecycle comp-3 `protected_output_refusal_cannot_complete_ok` | drop `output_admission_failed()` at `sink_send`'s `len > budget` refusal | `Completed(Ok)` vs `ResourceExhausted`, `org_stream_lifecycle.rs:1811` at the reviewed head (`:1810` as observed under the inverse, which deletes one line above the assertion) | green |
-| registry receipt 1 `retire_between_confirm_check_and_owner_transfer` | `ConfirmTxn` re-locking pre-fix shape | `Applied(true)` vs `Blocked`, `org_stream_registry.rs:2593` (pristine — the receipt's own citation; `:2585` as observed under the inverse, which shortens the confirm-transaction comments by eight lines) | sha `348fc6f4…`, green |
+| registry receipt 1 `retire_between_confirm_check_and_owner_transfer` | `ConfirmTxn` re-locking pre-fix shape | `Applied(true)` vs `Blocked`, `org_stream_registry.rs:2592` pristine (assert start; message literal `:2596`) — `:2593:9` is receipt 1's and the reviewer's R1 observation under their identical **+1-line** mutations, `:2585` my spot-check observation under my shortening inverse (**−7 lines**; my earlier "eight lines" attribution was one off and is superseded by the reviewer's measurement) | sha `348fc6f4…`, green |
 
 Line-number convention (review finding F-1, corrected here): this table
 initially cited the mutated-tree numbering of each panic. Citations are

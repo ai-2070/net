@@ -23,16 +23,20 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 
 ## Status
 
-**STAGE 0 DELIVERED 2026-09-22 (branch `LZL0/org-streaming`), PENDING
-ACCEPTANCE; Q1–Q7 RESOLVED; STAGE 1 DISPATCH GATED ON THAT ACCEPTANCE AND ITS
-OWN PINNED BRIEF — source specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21`
-(`master`), revised 2026-09-19 after reviewer HOLD (Kyra). Stage 0 changed no
-production wire, behaviour or export: the two models are `#[cfg(test)]`, the
-bench groups are bench-only, and the probe is a guard workspace plus one CI
-step. Stage 0 evidence is `docs/internal/spikes/org-streaming/S0_REPORT.md`
-with `S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md`; its findings
-F1–F14 are named there. Delivered is not accepted: no later stage is
-dispatched or authorized by this document.**
+**STAGE 0 ACCEPTED 2026-09-22 (branch `LZL0/org-streaming`); Q1–Q7 RESOLVED;
+STAGE 1 DISPATCH AUTHORIZED ON THAT ACCEPTANCE AND ITS PINNED BRIEF — source
+specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`),
+revised 2026-09-19 after reviewer HOLD (Kyra). Stage 0 changed no production
+wire, behaviour or export: the two models are `#[cfg(test)]`, the bench groups
+are bench-only, and the probe is a guard workspace plus one CI step. Stage 0
+evidence is `docs/internal/spikes/org-streaming/S0_REPORT.md` with
+`S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md` (findings F1–F16 named
+there) and the independent verdict packet
+`docs/internal/spikes/org-streaming/S0_REVIEW_PACKET.md` (ACCEPT at
+`736469448`: all five slice rows and all ten composition rows pass; three P2/P3
+record-quality findings, all closed in `3dc043c1e`). Stage 1 proceeds only
+through `spikes/org-streaming/S1_BRIEF.md`; Stage 2+ is not authorized by this
+document.**
 
 This revision replaces the older baseline (`3e88e50f…`) with a source trace at
 the current head across six lanes (admission/proof/replay, streaming folds,
@@ -1220,3 +1224,25 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   and the confirm-transaction). Interleavings driven deterministically at the
   exposed transaction boundaries (loom unused, stated as such). Probe green at
   its exact CI commands. No production code changed. Stage 1 not dispatched.
+
+- 2026-09-22, independent review verdict (reviewer `S0Review`, packet
+  `docs/internal/spikes/org-streaming/S0_REVIEW_PACKET.md`): **ACCEPT** at
+  `736469448` — all five slice rows and all ten composition rows pass; 76/76
+  reproduced against a source-regenerated roster (39 + 37); the report's
+  74 → 76 accounting exact; probe green at its exact CI commands (executed).
+  Three receipt re-executions including the ConfirmTxn fix reproduced their
+  quoted reds byte-identically (R1 `Applied(true)`/`Blocked`, R2 comp-3,
+  R3 receipt 2); five lane-unused inverses all red at the predicted assertions
+  (tie precedence, supervisor break-on-handler-return, retire incarnation
+  fencing, requalify refresh, transfer double-release); P6 independently
+  reproduced the node-rollback red (`left: 600 / right: 400` at `:3418`),
+  matching registry receipt 25. Findings: numbering-convention mix (P3),
+  missing finding labels (P3), node-rollback witness receipt gap (P2) — all
+  closed in `3dc043c1e`, with the measured citation resolution applied
+  (pristine assert `:2592`, message `:2596`; observed forms attributed per
+  mutation's line delta). Local pre-push checklist green at the closure:
+  fmt, `check --workspace --all-targets`, clippy ×4 under `-D warnings`,
+  rustdoc ×5 under `-D warnings`, `cargo tl` 5831, `cargo t` 7037/7037.
+  Stage 1 dispatch proceeds through `spikes/org-streaming/S1_BRIEF.md` (two
+  lanes: `S1Session` slice 1.1 and `S1Core` slices 1.2–1.6 sequential, with a
+  `mesh.rs` hold point between them). Stage 2+ remains unauthorized.
