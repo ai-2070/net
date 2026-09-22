@@ -395,7 +395,7 @@ pub fn resolve_remote_attach(
         hex_decode_32(pubkey_str).map_err(|e| invalid_args(format!("--node-pubkey: {e}")))?;
     let node_id =
         parse_u64_flexible(node_id_str).map_err(|e| invalid_args(format!("--node-id: {e}")))?;
-    let psk = hex_decode_32(psk_str).map_err(|e| invalid_args(format!("--psk-hex: {e}")))?;
+    let psk = parse_psk_hex(psk_str)?;
 
     Ok(Some(RemoteAttach {
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -442,13 +442,12 @@ pub(crate) fn resolve_attach_args(
         args.psk_hex.as_deref(),
     )?;
     if let Some(remote) = &mut remote {
-        remote.bind = args
-            .bind
-            .as_deref()
-            .or(profile.bind.as_deref())
-            .unwrap_or(default_bind)
-            .parse()
-            .map_err(|_| invalid_args("--bind/profile bind must be an IP:port literal"))?;
+        remote.bind = parse_bind_literal(
+            args.bind
+                .as_deref()
+                .or(profile.bind.as_deref())
+                .unwrap_or(default_bind),
+        )?;
         validate_bind(remote.bind, remote.addr)?;
     } else if args.bind.is_some() {
         return Err(invalid_args("--bind requires a complete remote target"));
@@ -467,11 +466,7 @@ fn validate_bind(bind: SocketAddr, target: SocketAddr) -> Result<(), CliError> {
             "--bind and remote target must use the same IP address family",
         ));
     }
-    if bind.ip().is_multicast() {
-        return Err(invalid_args(
-            "--bind must be a local interface or wildcard, not multicast",
-        ));
-    }
+    validate_bind_literal(bind)?;
     if bind.ip().is_loopback() && !target.ip().is_loopback() {
         return Err(invalid_args(
             "loopback bind cannot reach a non-loopback peer; set --bind to a reachable local \
@@ -479,6 +474,44 @@ fn validate_bind(bind: SocketAddr, target: SocketAddr) -> Result<(), CliError> {
         ));
     }
     Ok(())
+}
+
+/// Parse a `--bind` / profile-`bind` literal and validate its address
+/// class. THE single bind-literal implementation behind
+/// [`resolve_attach_args`] (attach verbs) and `wrap --listen`'s
+/// `resolve_listener` — they used to carry a copy each, and the copies had
+/// drifted (the listener copy refused broadcast, the attach copy did not),
+/// so one malformed literal produced two exit-code classes (review
+/// finding 7).
+pub(crate) fn parse_bind_literal(raw: &str) -> Result<SocketAddr, CliError> {
+    let bind: SocketAddr = raw
+        .parse()
+        .map_err(|_| invalid_args("--bind/profile bind must be an IP:port literal"))?;
+    validate_bind_literal(bind)?;
+    Ok(bind)
+}
+
+/// Address-class gate for a bind literal: a local interface or wildcard
+/// only. Multicast and broadcast are refused on every verb, at argument
+/// resolution, before any socket or mesh effect. The one implementation,
+/// reached from [`parse_bind_literal`] and [`validate_bind`].
+pub(crate) fn validate_bind_literal(bind: SocketAddr) -> Result<(), CliError> {
+    if bind.ip().is_multicast()
+        || bind.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+    {
+        return Err(invalid_args(
+            "--bind must be a local interface or wildcard, not multicast or broadcast",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a `--psk-hex` / profile-`psk_hex` literal. The one implementation
+/// behind the attach path and `wrap --listen`, so a malformed PSK surfaces
+/// the parse cause identically on every verb (review finding 7).
+pub(crate) fn parse_psk_hex(raw: &str) -> Result<[u8; 32], CliError> {
+    crate::parsers::hex_decode_32(raw)
+        .map_err(|e| invalid_args(format!("--psk-hex must be exactly 32 bytes of hex: {e}")))
 }
 
 pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {

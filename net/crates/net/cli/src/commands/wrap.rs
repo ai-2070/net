@@ -434,26 +434,22 @@ fn resolve_listener(
     {
         return Err(invalid_args("--listen conflicts with remote peer settings; use a profile without node_addr/node_pubkey/node_id"));
     }
-    let bind: std::net::SocketAddr = args
-        .bind
-        .as_deref()
-        .or(profile.bind.as_deref())
-        .unwrap_or("127.0.0.1:0")
-        .parse()
-        .map_err(|_| invalid_args("--bind/profile bind must be an IP:port literal"))?;
-    if bind.ip().is_multicast() || bind.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
-    {
-        return Err(invalid_args(
-            "listener bind cannot be multicast or broadcast",
-        ));
-    }
-    let raw = args
-        .psk_hex
-        .as_deref()
-        .or(profile.psk_hex.as_deref())
-        .ok_or_else(|| invalid_args("--listen requires --psk-hex or profile psk_hex"))?;
-    let psk = crate::parsers::hex_decode_32(raw)
-        .map_err(|_| invalid_args("listener PSK must be exactly 32 bytes of hex"))?;
+    // Bind and PSK literals parse through the same helpers as the attach
+    // path (`context::parse_bind_literal` / `context::parse_psk_hex`): one
+    // malformed literal is one exit-code class on every verb (review
+    // finding 7 — these used to be a second copy and had drifted).
+    let bind = crate::context::parse_bind_literal(
+        args.bind
+            .as_deref()
+            .or(profile.bind.as_deref())
+            .unwrap_or("127.0.0.1:0"),
+    )?;
+    let psk = crate::context::parse_psk_hex(
+        args.psk_hex
+            .as_deref()
+            .or(profile.psk_hex.as_deref())
+            .ok_or_else(|| invalid_args("--listen requires --psk-hex or profile psk_hex"))?,
+    )?;
     Ok((bind, psk))
 }
 

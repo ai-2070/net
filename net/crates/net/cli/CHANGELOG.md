@@ -8,6 +8,18 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — one bind/PSK validation for every verb
+
+- A malformed `--bind` / profile `bind` literal is now one exit-code class on
+  every verb: `wrap --listen` and the attach verbs (`wrap`, `mcp serve`) both
+  reject it with exit 2 (invalid arguments) during argument resolution. A
+  broadcast literal such as `--bind 255.255.255.255:0` previously exited 2 on
+  `wrap --listen` but slipped through attach-side validation and exited 6
+  (connection failure). Scripts matching exit 6 for a malformed bind literal
+  on an attach verb must now match exit 2. Multicast and broadcast binds are
+  refused on both paths, and PSK hex parse failures now surface their cause
+  on `wrap --listen` as they already did on the attach path.
+
 ## Unreleased — standalone capability publisher
 
 - `wrap --listen` starts a publisher without a bootstrap peer. It requires a
