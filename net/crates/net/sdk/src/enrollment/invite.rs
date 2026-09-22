@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Signed membership invitation (`net-mesh://` join link) and canonical redemption intent.
+//! Signed membership invitation (`netmesh-join_` token) and canonical redemption intent.
 //!
 //! A [`MembershipInvite`] binds, under one issuer signature: the full issuer
 //! identity, a named trust domain and its public [`TrustDomainId`], the TCP
@@ -33,11 +33,11 @@ use super::{fingerprint, Reader};
 use crate::bootstrap_credential::TrustDomainId;
 use crate::identity::{EntityId, Identity};
 
-/// Scheme of the join link: `net-mesh://<host:port>/join/<base64url invite>`.
-/// Distinct from the legacy `net-invite:` form.
-pub const JOIN_LINK_SCHEME: &str = "net-mesh://";
-/// Path separator between the visible address and the signed invite.
-const JOIN_LINK_PATH: &str = "/join/";
+/// Prefix of the join token: `netmesh-join_<base64url invite>`. Deliberately
+/// not URL-shaped, so browsers and chat apps do not treat it as a link, and
+/// fixed so secret scanners can recognize a leaked token. Distinct from the
+/// legacy `net-invite:` form.
+pub const JOIN_TOKEN_PREFIX: &str = "netmesh-join_";
 /// Maximum canonical invite size in bytes (before base64).
 pub const MAX_INVITE_BYTES: usize = 1024;
 /// Maximum trust-domain name length.
@@ -68,9 +68,6 @@ pub enum InviteError {
     /// The issuer signature does not verify.
     #[error("membership invite signature is invalid")]
     BadSignature,
-    /// The link's visible address differs from the signed endpoint.
-    #[error("join link address does not match the signed enrollment endpoint")]
-    AddressMismatch,
     /// The enrollment endpoint is not an acceptable `host:port`.
     #[error("invalid redemption endpoint: {0}")]
     Endpoint(&'static str),
@@ -408,41 +405,32 @@ impl MembershipInvite {
         })
     }
 
-    /// The join link, `net-mesh://<host:port>/join/<base64url invite>`. The
-    /// visible address is the signed endpoint, for human readability only.
+    /// The join token, `netmesh-join_<base64url invite>`. It carries the
+    /// address, keys and policy inside the signed invite; show them to humans
+    /// through inspection, not by reading the token.
     /// **Bearer material** unless subject-bound: never log it.
     pub fn encode(&self) -> String {
-        let mut s = String::from(JOIN_LINK_SCHEME);
-        s.push_str(self.endpoint.as_str());
-        s.push_str(JOIN_LINK_PATH);
+        let mut s = String::from(JOIN_TOKEN_PREFIX);
         s.push_str(&URL_SAFE_NO_PAD.encode(&self.bytes));
         s
     }
 
-    /// Parse and verify a `net-mesh://` join link. Tolerates surrounding
-    /// whitespace only. The visible address must equal the signed endpoint
-    /// exactly; callers connect only to [`Self::endpoint`]. Offline: performs no
-    /// network request and consumes nothing.
-    pub fn decode(link: &str) -> Result<Self, InviteError> {
-        let rest = link
+    /// Parse and verify a `netmesh-join_` token. Tolerates surrounding
+    /// whitespace only. Offline: performs no network request and consumes
+    /// nothing.
+    pub fn decode(token: &str) -> Result<Self, InviteError> {
+        let body = token
             .trim()
-            .strip_prefix(JOIN_LINK_SCHEME)
-            .ok_or(InviteError::Malformed("missing net-mesh:// scheme"))?;
-        let (address, body) = rest
-            .split_once(JOIN_LINK_PATH)
-            .ok_or(InviteError::Malformed("missing /join/ path"))?;
+            .strip_prefix(JOIN_TOKEN_PREFIX)
+            .ok_or(InviteError::Malformed("missing netmesh-join_ prefix"))?;
         // base64 expands 3 bytes to 4 characters; refuse before decoding.
-        if address.len() > MAX_ENDPOINT_BYTES || body.len() > MAX_INVITE_BYTES.div_ceil(3) * 4 {
+        if body.len() > MAX_INVITE_BYTES.div_ceil(3) * 4 {
             return Err(InviteError::TooLarge);
         }
         let bytes = URL_SAFE_NO_PAD
             .decode(body)
             .map_err(|_| InviteError::Malformed("invalid base64"))?;
-        let invite = Self::from_bytes(&bytes)?;
-        if address != invite.endpoint.as_str() {
-            return Err(InviteError::AddressMismatch);
-        }
-        Ok(invite)
+        Self::from_bytes(&bytes)
     }
 
     /// Canonical signed bytes (bearer material).

@@ -8,7 +8,7 @@ use std::time::Duration;
 use net_sdk::bootstrap_credential::Psk;
 use net_sdk::enrollment::invite::{
     EnrollmentEndpoint, EnrollmentKey, InviteError, InviteSpec, MembershipInvite, RedemptionIntent,
-    Relation, JOIN_LINK_SCHEME, MAX_INVITE_BYTES,
+    Relation, JOIN_TOKEN_PREFIX, MAX_INVITE_BYTES,
 };
 use net_sdk::enrollment::policy::{ApprovalMode, InvitationPolicy};
 use net_sdk::enrollment::store::{ClaimOutcome, EnrollmentLedger, LedgerLimits};
@@ -42,11 +42,12 @@ fn a_signed_link_round_trips_every_bound_field() {
     let issuer = Identity::generate();
     let invite = mint(&issuer, None);
     let link = invite.encode();
+    assert!(link.starts_with(JOIN_TOKEN_PREFIX), "{link}");
+    // Not URL-shaped: no scheme separator, no visible address.
     assert!(
-        link.starts_with("net-mesh://enroll.example.net:7443/join/"),
+        !link.contains("://") && !link.contains("enroll.example.net"),
         "{link}"
     );
-    assert!(link.starts_with(JOIN_LINK_SCHEME));
 
     let back = MembershipInvite::decode(&format!("  {link}\n")).unwrap();
     assert_eq!(back, invite);
@@ -103,24 +104,16 @@ fn a_different_issuer_cannot_reuse_the_signature() {
 fn malformed_oversize_and_legacy_links_are_refused() {
     let issuer = Identity::generate();
     let link = mint(&issuer, None).encode();
-    let (address, body) = link
-        .strip_prefix(JOIN_LINK_SCHEME)
-        .unwrap()
-        .split_once("/join/")
-        .unwrap();
-    assert_eq!(address, "enroll.example.net:7443");
+    let body = link.strip_prefix(JOIN_TOKEN_PREFIX).unwrap();
     for bad in [
         body.to_string(),
         format!("net-join:{body}"),
         format!("net-invite:{body}"),
-        format!("https://{address}/join/{body}"),
-        format!("{JOIN_LINK_SCHEME}{address}/{body}"),
-        format!("{JOIN_LINK_SCHEME}{address}/join/{body}!"),
-        format!("{JOIN_LINK_SCHEME}{address}/join/{body}?x=1"),
-        format!(
-            "{JOIN_LINK_SCHEME}{address}/join/{}",
-            "A".repeat(MAX_INVITE_BYTES * 2)
-        ),
+        format!("net-mesh://enroll.example.net:7443/join/{body}"),
+        format!("NETMESH-JOIN_{body}"),
+        format!("{JOIN_TOKEN_PREFIX}{body}!"),
+        format!("{JOIN_TOKEN_PREFIX}{body}?x=1"),
+        format!("{JOIN_TOKEN_PREFIX}{}", "A".repeat(MAX_INVITE_BYTES * 2)),
         InviteToken::mint_at(
             issuer.entity_id(),
             "127.0.0.1:1",
@@ -135,28 +128,6 @@ fn malformed_oversize_and_legacy_links_are_refused() {
         MembershipInvite::from_bytes(&vec![0; MAX_INVITE_BYTES + 1]),
         Err(InviteError::TooLarge)
     );
-}
-
-#[test]
-fn the_visible_address_must_be_the_signed_endpoint() {
-    let link = mint(&Identity::generate(), None).encode();
-    let body = link.split_once("/join/").unwrap().1;
-    for forged in [
-        "attacker.example:7443",
-        "enroll.example.net:7444",
-        "ENROLL.example.net:7443",
-    ] {
-        assert_eq!(
-            MembershipInvite::decode(&format!("{JOIN_LINK_SCHEME}{forged}/join/{body}")),
-            Err(InviteError::AddressMismatch),
-            "{forged}"
-        );
-    }
-    MembershipInvite::decode(&format!(
-        "  {link}
-"
-    ))
-    .unwrap();
 }
 
 #[test]
@@ -314,7 +285,7 @@ fn debug_output_redacts_the_invitation_identifier_and_link() {
     let text = format!("{invite:?}");
     assert!(text.contains("<redacted>"), "{text}");
     let link = invite.encode();
-    let body = link.split_once("/join/").unwrap().1;
+    let body = link.strip_prefix(JOIN_TOKEN_PREFIX).unwrap();
     assert!(!text.contains(&body[..24]), "{text}");
     let id = format!("{:?}", invite.invitation_id().as_bytes());
     assert!(!text.contains(&id[1..id.len() - 1]), "{text}");
