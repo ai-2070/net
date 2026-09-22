@@ -1734,13 +1734,13 @@ jobs:
             relay_reauthors_org_provider_under_its_own_membership \
             a_floored_peer_with_sensing_off_drops_the_org_frame_and_stays_unknown || exit 1
 
-          # ORG_SCOPED_STREAMING_PLAN Stage 1 — protected server-streaming
-          # openings (binary tests/org_rpc_streaming.rs). Floor = the count
-          # the binary reports at the pinned head (27 after slice 1.5: 24 +
-          # the three bridge/routing witnesses). Raised with each slice that
-          # lands witnesses; REQUIRED names extended in the same commit as
-          # the witnesses.
-          run_binary org_rpc_streaming 30 \
+          # ORG_SCOPED_STREAMING_PLAN Stages 1-2 — protected server-streaming
+          # (binary tests/org_rpc_streaming.rs). Floor = the count the binary
+          # reports at the pinned head (41 after Stage 2: the 30-roster
+          # preserved verbatim + 11 CS/DX + duplex-flow + half-close
+          # witnesses). Raised with each slice that lands witnesses;
+          # REQUIRED names extended in the same commit as the witnesses.
+          run_binary org_rpc_streaming 41 \
             stream_opening_admits_same_org \
             stream_opening_admits_cross_org \
             unary_context_proof_is_binding_invalid_on_stream_registration \
@@ -1770,7 +1770,18 @@ jobs:
             provider_policy_veto_denies_before_effects \
             completed_stream_drains_queued_items_in_order_with_content_and_end_terminal \
             cross_org_completed_stream_drains_correlated_items_with_end_terminal \
-            response_after_session_replacement_reaches_only_the_live_session || exit 1
+            response_after_session_replacement_reaches_only_the_live_session \
+            client_stream_aggregate_with_valid_proof \
+            client_stream_opening_binds_first_chunk \
+            cross_direction_grant_is_ignored \
+            duplex_exchange_with_valid_proof \
+            duplex_response_window_blocks_until_grant \
+            end_cannot_cancel_another_stream_or_reopen_terminal_half \
+            opening_body_budget_refusal_completes_the_record \
+            pre_admission_chunks_are_never_delivered \
+            retire_unblocks_both_directions \
+            upload_end_then_remaining_output_completes \
+            wrong_session_grant_does_not_release_credit || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
