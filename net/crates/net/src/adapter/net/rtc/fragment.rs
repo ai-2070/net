@@ -419,7 +419,7 @@ pub struct AbandonedGroup {
     /// Every destruction owes a record and a fence, including one that
     /// happened AT the charge — but a group that was refused because
     /// nothing was left to charge never took a slot, and releasing one for
-    /// it at drain time would drift [`OwnershipCharge`] downward and admit
+    /// it at drain time would drift `OwnershipCharge` downward and admit
     /// more groups than the bound allows.
     pub charged: bool,
 }
@@ -2094,8 +2094,7 @@ mod tests {
         assert_eq!(records[0].reason, AbandonReason::Refused);
         assert_eq!(records[0].fragment_id, 99);
         assert_eq!(
-            records[0].held,
-            chunk,
+            records[0].held, chunk,
             "the record names the acknowledged bytes the refusal destroyed"
         );
         // …and the fence refuses the group's tail rather than letting

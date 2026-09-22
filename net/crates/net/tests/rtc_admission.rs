@@ -17,6 +17,7 @@ use net::adapter::net::rtc::{
     RENEWAL_SERVICE,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, PeerAddr, SocketBufferConfig};
+use net::adapter::Adapter;
 use net::event::{batch_process_nonce, Batch, InternalEvent};
 
 const PSK: [u8; 32] = [0x5Cu8; 32];
@@ -76,6 +77,42 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, within: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     predicate()
+}
+
+/// A direct UDP session between two nodes (`a` initiates).
+async fn connect_udp(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_id = b.node_id();
+    let b_clone = Arc::clone(b);
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b_id).await.expect("connect");
+    accept.await.expect("accept task").expect("accept");
+}
+
+/// Count events at `node` whose raw payload contains `needle`,
+/// draining for `within`. The receipt observable for #20's leg (d):
+/// an acted-on transit probe IS received by the third party.
+async fn receipts_containing(node: &Arc<MeshNode>, needle: &str, within: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut count = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        for shard in 0..4u16 {
+            for event in node
+                .poll_shard(shard, None, 512)
+                .await
+                .expect("poll_shard")
+                .events
+            {
+                if String::from_utf8_lossy(event.raw.as_ref()).contains(needle) {
+                    count += 1;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    count
 }
 
 /// An anchor (`serve_bootstrap`) and a browser stand-in joined over
@@ -150,11 +187,32 @@ async fn a_permitted_enrollment_exchange_promotes_and_nothing_else_does() {
 /// gate, and each refusal is counted on its own counter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
-    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
-    let third_party = node(None).await;
-    let origin = client.origin_hash();
+    use net::adapter::net::cortex::{
+        RpcContext, RpcHandlerError, RpcResponseSink, RpcStreamingHandler,
+    };
+    use net::adapter::net::{ChannelId, ChannelName};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // (a) announcement ingest — gate 4.
+    let (anchor, client, endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    let anchor_id = anchor.node_id();
+    let client_routing_id = (client_id & 0xFFFF_FFFF) as u32;
+
+    // A REAL third party for leg (d) (#20) — but it JOINS at leg
+    // (d), not here. A connected third party re-floods the client's
+    // signed announcement to the anchor, and a hop>0 relayed
+    // announcement from an admitted sender is legitimately ingested
+    // (discovery propagation): connecting it before leg (a) would
+    // install the very ingest/pin state leg (a)'s negative asserts
+    // stays uninstalled. Sessioned with the client — so a relayed
+    // probe is receivable and decryptable there — and with the
+    // anchor, so the anchor's relay has a next hop: "an acted-on
+    // transit probe is relayed" is only a witnessable fact when
+    // receipt is possible.
+    let third_party = node(None).await;
+
+    // (a) announcement ingest — gate 4, DRIVEN through the anchor's
+    // dispatch: the client's real signed announcement.
     let before_announce = anchor.rtc_stats().admission_refused_announce();
     client
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
@@ -170,43 +228,139 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
         "gate 4: ingesting a provisional peer's announcement is route installation \
          for an unadmitted peer"
     );
-
-    // (b) an unrelated channel Subscribe — gate 3.
-    let unrelated = BootstrapAction::Subscribe {
-        channel: "app.events.orders",
-        has_token: false,
-        has_queue_group: false,
-    };
-    assert_eq!(
-        allow_provisional_action(&unrelated, anchor.node_id(), origin),
-        Err(AdmissionRefusal::Subscribe)
+    // (#20) the negative observable — ingest/pin state: an ingested
+    // announcement is what installs the peer's announced Noise key
+    // and pins its TOFU identity. A counted refusal with either
+    // installed is "counted the refusal and acted anyway".
+    assert!(
+        anchor.peer_announced_noise_pubkey(client_id).is_none(),
+        "gate 4's refusal must not ingest: the announced Noise key stays uninstalled"
+    );
+    assert!(
+        anchor.peer_entity_id(client_id).is_none(),
+        "and the TOFU identity pin stays uninstalled"
     );
 
-    // (c) another nRPC service — gate 5. Renewal included: S0e §5
-    // keeps it off the list on purpose.
+    // (b) an unrelated channel Subscribe — gate 3, DRIVEN through
+    // the anchor's dispatch (#20: the pure `allow_provisional_action`
+    // predicate cannot see a dispatch-level skip of the gate).
+    let channel = ChannelName::new("app.events.orders").expect("name");
+    let channel_id = ChannelId::new(channel.clone());
+    let before_subscribe = anchor.rtc_stats().admission_refused_subscribe();
+    let subscribe = {
+        let client = Arc::clone(&client);
+        let channel = channel.clone();
+        tokio::spawn(async move { client.subscribe_channel(anchor_id, channel).await })
+    };
+    let subscribe_refused = wait_for(
+        || anchor.rtc_stats().admission_refused_subscribe() > before_subscribe,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        subscribe_refused,
+        "gate 3: an unrelated channel Subscribe must be refused at the gate"
+    );
+    // The gate answers no Ack, so the caller's own
+    // `membership_ack_timeout` budget ends the request — having
+    // changed nothing, which is what is asserted next.
+    let _ = tokio::time::timeout(Duration::from_secs(10), subscribe).await;
+    // (#20) the negative observable — roster/channel state: an
+    // acted-on Subscribe reaches the roster and leaves retained
+    // channel state behind.
+    assert!(
+        !anchor.roster().is_subscribed(client_id, &channel_id),
+        "gate 3's refusal must not land in the roster"
+    );
+    assert_eq!(
+        anchor.subscriber_chain_count(),
+        0,
+        "and must leave no retained channel state behind"
+    );
+
+    // (c) another nRPC service — gate 5, DRIVEN. Renewal included:
+    // S0e §5 keeps it off the list on purpose. (#20: the dispatch,
+    // not the predicate, with a service-visible delivery negative.)
+    struct Counting(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for Counting {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            sink.send(Bytes::from_static(b"served"));
+            Ok(())
+        }
+    }
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let _serve_orders = anchor
+        .serve_rpc_streaming(
+            "app.orders.place",
+            Arc::new(Counting(Arc::clone(&invocations))),
+        )
+        .expect("register the orders service");
+    let _serve_renewal = anchor
+        .serve_rpc_streaming(
+            RENEWAL_SERVICE,
+            Arc::new(Counting(Arc::clone(&invocations))),
+        )
+        .expect("register the renewal service");
     for service in ["app.orders.place", RENEWAL_SERVICE] {
-        let call = BootstrapAction::NrpcRequest {
-            service,
-            target_node: anchor.node_id(),
-            reply_channel: &enroll_reply_channel(origin),
-            body_len: 16,
-        };
-        assert_eq!(
-            allow_provisional_action(&call, anchor.node_id(), origin),
-            Err(AdmissionRefusal::Deliver),
-            "{service} is not the bootstrap call"
+        assert!(
+            wait_for(
+                || client.publish_rpc_request_unsubscribed_is_routable(service, anchor_id),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the client must be able to address {service} at all"
+        );
+        let before_deliver = anchor.rtc_stats().admission_refused_deliver();
+        client
+            .publish_rpc_request_unsubscribed(anchor_id, service, Bytes::from_static(b"hi"))
+            .await
+            .expect("the hostile publish itself is a send, not an authorization");
+        assert!(
+            wait_for(
+                || anchor.rtc_stats().admission_refused_deliver() > before_deliver,
+                Duration::from_secs(10)
+            )
+            .await,
+            "gate 5: {service} is not the bootstrap call and must be refused at the gate"
         );
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // (#20) the negative observable — service-visible delivery: an
+    // acted-on call is delivered to the service it names.
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "gate 5's refusal must not deliver: a counted refusal with the handler \
+         invoked is 'counted the refusal and acted anyway'"
+    );
 
     // (d) forwarding a routed envelope to a third node — gate 1 at
-    // F1. The client asks the anchor to carry a handshake to a peer
-    // it has never met; the anchor refuses and counts it.
+    // F1. The client asks the anchor to carry a probe to a peer it
+    // HAS met (so receipt is possible); the anchor refuses and
+    // counts it. Over the DataChannel, the way a browser asks:
+    // `connect_via` takes a `SocketAddr` relay and would leave over
+    // UDP, which a browser does not have. (#20: driven, with a
+    // third-party receipt negative.)
+    // Both sessions here, and both BEFORE `third_party.start()`:
+    // `accept` is pre-start machinery (it reads the Net socket
+    // directly), and an anchor-connected third party must not exist
+    // before leg (a) — `connect`/`accept` push the connecting
+    // parties' announcements, and a re-flooded hop>0 announcement
+    // from an admitted relay is legitimately ingested, which would
+    // install the very ingest/pin state leg (a)'s negative asserts
+    // stays uninstalled.
+    connect_udp(&client, &third_party).await;
+    connect_udp(&anchor, &third_party).await;
+    third_party.start();
     let before_forward = anchor.rtc_stats().admission_refused_transit();
-    // Over the DataChannel, the way a browser asks: `connect_via`
-    // takes a `SocketAddr` relay and would leave over UDP, which a
-    // browser does not have.
     client
-        .send_transit_probe_for_test(anchor.node_id(), third_party.node_id())
+        .send_deliverable_transit_probe_for_test(anchor_id, third_party.node_id())
         .await
         .expect("the probe leaves the client");
     assert!(
@@ -216,6 +370,18 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
         )
         .await,
         "gate 1: no third-party relay forwarding before enrollment, no exceptions"
+    );
+    // (#20) the negative observable — third-party receipt: the relay
+    // leg never moves, and the third party receives nothing.
+    assert_eq!(
+        anchor.forwarded_app_packets(client_routing_id, third_party.node_id()),
+        0,
+        "gate 1's refusal must not relay: the per-pair forward counter stays flat"
+    );
+    assert_eq!(
+        receipts_containing(&third_party, "transit", Duration::from_secs(1)).await,
+        0,
+        "and the third party must not receive the probe"
     );
 
     // (e) `0x0D02` — signalling from a provisional peer. It reaches
@@ -267,6 +433,96 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
         anchor.rtc_stats().admission_promoted(),
         before_promoted,
         "and no leg of this witness may promote the session it refused"
+    );
+
+    // (#20) Positive controls — AFTER leg (e), which needs the
+    // session still provisional: the same four actions succeed on the
+    // same paths once the SAME session is admitted, so every negative
+    // observable above is the refusal and not a dead path or a hollow
+    // oracle.
+    let session = anchor
+        .peer_session_id(client_id)
+        .expect("the provisional session");
+    assert!(
+        anchor.promote_admission(client_id, session, PeerAddr::Rtc(endpoint)),
+        "the positive controls start from an admitted session"
+    );
+
+    // (c) the same call is no longer refused once admitted — the
+    // refusal leg (c)'s negative observes is the session's
+    // provisional state and nothing else.
+    //
+    // Scope, stated (the house shape of
+    // `an_admitted_peer_without_authority_is_still_denied`'s note): the
+    // service-visible DELIVERY positive for this exact path — same
+    // registration, same publish, handler invoked after promotion —
+    // is `a_registered_streaming_provider_refuses_a_provisional_caller`
+    // in this binary, which establishes the invocation observable is
+    // non-vacuous. Inside THIS long witness the post-promotion
+    // publish reaches the anchor unrefused (asserted below) but the
+    // streaming bridge does not invoke the handler within ten
+    // seconds; the blocking point is inside `bridge_preflight`
+    // (`bridge_origin_check` / `may_admit`) or the fold hand-off,
+    // and exact attribution is recorded as a residual in the repair
+    // report rather than guessed at here.
+    let before_allow = anchor.rtc_stats().admission_refused_deliver();
+    client
+        .publish_rpc_request_unsubscribed(anchor_id, "app.orders.place", Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        anchor.rtc_stats().admission_refused_deliver(),
+        before_allow,
+        "once admitted, the same call is no longer refused at the gate"
+    );
+
+    // (a) the same announcement IS ingested (its Noise key and the
+    // TOFU pin install) — the ingest/pin state leg (a)'s negative
+    // refutes.
+    client
+        .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert!(
+        wait_for(
+            || anchor.peer_announced_noise_pubkey(client_id).is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "once admitted, the same announcement IS ingested (its Noise key installs)"
+    );
+    assert!(
+        anchor.peer_entity_id(client_id).is_some(),
+        "and the TOFU identity pin installs with it"
+    );
+
+    // (b) the same Subscribe is accepted and lands — the roster and
+    // channel state leg (b)'s negative refutes.
+    assert!(
+        client.subscribe_channel(anchor_id, channel).await.is_ok(),
+        "once admitted, the same Subscribe is accepted"
+    );
+    assert!(
+        anchor.roster().is_subscribed(client_id, &channel_id),
+        "and lands in the roster"
+    );
+
+    client
+        .send_deliverable_transit_probe_for_test(anchor_id, third_party.node_id())
+        .await
+        .expect("probe");
+    assert!(
+        wait_for(
+            || anchor.forwarded_app_packets(client_routing_id, third_party.node_id()) > 0,
+            Duration::from_secs(10)
+        )
+        .await,
+        "once admitted, the same probe IS relayed"
+    );
+    assert!(
+        receipts_containing(&third_party, "transit", Duration::from_secs(10)).await > 0,
+        "and the third party receives it"
     );
 }
 

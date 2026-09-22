@@ -63,8 +63,19 @@ impl DialogTable {
     /// Record a dialog we are driving. Returns the displaced entry
     /// when the id was already live: a silent replacement would leak
     /// the predecessor's ICE session and double-count the attempt,
-    /// so displacement is surfaced to the caller. Every in-tree
-    /// caller short-circuits before it can displace.
+    /// so displacement is surfaced to the caller. A returned entry
+    /// is a **live attempt** — the caller MUST retire it (close its
+    /// session, terminal-charge it) and NEVER drop the `Option`.
+    ///
+    /// Displacement is only reachable for a caller that inserts into
+    /// a key it neither checked nor vacated under the same
+    /// table-lock hold. Every in-tree call site holds the lock
+    /// across its check (`handle_signal`'s `Offer` arm and
+    /// `start_dialog` short-circuit on [`DialogTable::peer_for`]) or
+    /// across its remove-and-restore (`spawn_dialog_completion`'s
+    /// lost-claim path re-inserts into the key it just removed, in
+    /// one hold), so a displaced entry is unreachable in-tree — and
+    /// retired as a live attempt regardless.
     pub fn insert(&mut self, peer_node: u64, dialog: u64, entry: Dialog) -> Option<Dialog> {
         self.dialogs.insert((peer_node, dialog), entry)
     }
@@ -199,7 +210,7 @@ pub async fn handle_signal(
             // path the offer arrived on.
             match driver.accept_offer(sdp).await {
                 Ok((peer, answer)) => {
-                    let _displaced = dialogs.insert(
+                    let displaced = dialogs.insert(
                         from_node,
                         dialog,
                         Dialog {
@@ -209,6 +220,11 @@ pub async fn handle_signal(
                             answered: false,
                         },
                     );
+                    // Unreachable while callers hold the table lock
+                    // across the `peer_for` short-circuit above — but
+                    // a displaced row is a live attempt, never a
+                    // dropped `Option` (#2).
+                    retire_displaced_attempt(driver, displaced).await;
                     driver.stats().note_ice_attempted();
                     SignalOutcome::Answer {
                         dialog,
@@ -291,6 +307,17 @@ pub async fn handle_signal(
     }
 }
 
+/// Retire a row [`DialogTable::insert`] displaced (#2): it is a LIVE
+/// attempt — its ICE session is closed and its attempt is
+/// terminal-charged here, so no attempt can end with no terminal
+/// owner. `None` — every in-tree call site — is a no-op.
+async fn retire_displaced_attempt(driver: &RtcDriverHandle, displaced: Option<Dialog>) {
+    if let Some(entry) = displaced {
+        driver.stats().note_ice_failed();
+        let _ = driver.close(entry.peer).await;
+    }
+}
+
 /// Start a dialog: create a local session, produce the offer, and
 /// record the attempt. The caller sends the returned frame.
 pub async fn start_dialog(
@@ -308,7 +335,7 @@ pub async fn start_dialog(
         return Err("dialog id already live".into());
     }
     let (peer, sdp) = driver.create_offer().await?;
-    let _displaced = dialogs.insert(
+    let displaced = dialogs.insert(
         to_node,
         dialog,
         Dialog {
@@ -318,6 +345,7 @@ pub async fn start_dialog(
             answered: false,
         },
     );
+    retire_displaced_attempt(driver, displaced).await;
     driver.stats().note_ice_attempted();
     Ok(RtcSignalMsg::Offer { dialog, sdp })
 }
@@ -407,7 +435,8 @@ mod tests {
         };
 
         let attempted = responder.stats().ice_attempted();
-        let second = handle_signal(&responder, &mut dialogs, 7, offer, Duration::from_secs(10)).await;
+        let second =
+            handle_signal(&responder, &mut dialogs, 7, offer, Duration::from_secs(10)).await;
         assert_eq!(
             second,
             SignalOutcome::Ignored,
@@ -500,7 +529,10 @@ mod tests {
             &responder,
             &mut dialogs,
             7,
-            RtcSignalMsg::Offer { dialog: 8, sdp: sdp.clone() },
+            RtcSignalMsg::Offer {
+                dialog: 8,
+                sdp: sdp.clone(),
+            },
             Duration::from_secs(10),
         )
         .await;

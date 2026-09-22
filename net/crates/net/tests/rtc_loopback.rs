@@ -171,30 +171,47 @@ async fn rtc_ingress_preserves_per_source_order_through_one_owner() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut batch_indices = Vec::new();
     let mut stream_indices = Vec::new();
-    while tokio::time::Instant::now() < deadline && batch_indices.len() < N {
-        let result = b.poll_shard(0, None, 256).await.expect("poll_shard");
-        for event in &result.events {
-            let Ok(text) = event.raw_str() else {
-                continue;
-            };
-            if text.contains("\"order\"") {
-                let value: serde_json::Value =
-                    serde_json::from_str(text).expect("a batch event is JSON");
-                let index = value
-                    .get("index")
-                    .or_else(|| value.pointer("/value/index"))
-                    .and_then(|index| index.as_u64())
-                    .expect("the batch event carries its index");
-                batch_indices.push(index);
-                continue;
-            }
-            // The stream input rides the same channel: sixteen
-            // identical bytes whose value is its sequence number.
-            if event.raw.len() == 16 && event.raw.iter().all(|byte| *byte == event.raw[0]) {
-                stream_indices.push(u64::from(event.raw[0]));
+    // #21: the window is bounded by EACH input's own completion, not
+    // by the batch count alone. Ending the drain when the batch leg
+    // filled left stream events still in flight undrained, so a
+    // per-source reorder confined to that tail failed nothing.
+    while tokio::time::Instant::now() < deadline
+        && (batch_indices.len() < N || stream_indices.len() < N)
+    {
+        // Every shard, not just shard 0 (#21): the receive side
+        // queues a packet's events at `stream_id % num_shards`, so
+        // the batch input (stream 0) lands in shard 0 while the
+        // stream input (stream 0x52) lands in shard 2. Polling shard
+        // 0 alone is BLIND to the stream input — which is exactly how
+        // "each input's own sequence exactly" survived as a vacuous
+        // skip.
+        let mut drained_any = false;
+        for shard in 0..4u16 {
+            let result = b.poll_shard(shard, None, 256).await.expect("poll_shard");
+            drained_any = drained_any || !result.events.is_empty();
+            for event in &result.events {
+                let Ok(text) = event.raw_str() else {
+                    continue;
+                };
+                if text.contains("\"order\"") {
+                    let value: serde_json::Value =
+                        serde_json::from_str(text).expect("a batch event is JSON");
+                    let index = value
+                        .get("index")
+                        .or_else(|| value.pointer("/value/index"))
+                        .and_then(|index| index.as_u64())
+                        .expect("the batch event carries its index");
+                    batch_indices.push(index);
+                    continue;
+                }
+                // The stream input rides the same channel: sixteen
+                // identical bytes whose value is its sequence number.
+                if event.raw.len() == 16 && event.raw.iter().all(|byte| *byte == event.raw[0]) {
+                    stream_indices.push(u64::from(event.raw[0]));
+                }
             }
         }
-        if result.events.is_empty() {
+        if !drained_any {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -204,13 +221,19 @@ async fn rtc_ingress_preserves_per_source_order_through_one_owner() {
         "the batch input's sequence numbers must arrive contiguous and ascending \
          (0..{N}) — per input, not across the two inputs"
     );
-    if !stream_indices.is_empty() {
-        assert_eq!(
-            stream_indices,
-            (0..stream_indices.len() as u64).collect::<Vec<_>>(),
-            "and the stream input's own sequence must be too: {stream_indices:?}"
-        );
-    }
+    // #21: zero stream delivery is a FAILURE, not a skip — the old
+    // `if !stream_indices.is_empty()` made "each input's own sequence
+    // exactly" vacuous for an input that delivered nothing.
+    assert!(
+        !stream_indices.is_empty(),
+        "the stream input delivered nothing — its sequence claim cannot be vacuous"
+    );
+    assert_eq!(
+        stream_indices,
+        (0..N as u64).collect::<Vec<_>>(),
+        "and the stream input's own sequence must be exactly 0..{N}, in order: \
+         {stream_indices:?}"
+    );
 
     let stats = b.rtc_stats();
     assert_eq!(
