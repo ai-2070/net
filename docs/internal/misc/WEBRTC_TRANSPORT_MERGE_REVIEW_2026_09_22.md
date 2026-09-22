@@ -64,6 +64,49 @@ It is nonetheless **incorrect as merged**. Three classes of defect run through i
 
 ---
 
+## Resolution status
+
+**Repair pass in progress** on `LZL0/webrtc-fixes` (branched from `0efc4ab39`). The findings below are unedited — they record what was true at the reviewed commit `801ae18c7`, and the values and line numbers they quote are evidence, not claims. This table is updated at each batch boundary.
+
+| # | Finding | Status | Commit |
+|---|---|---|---|
+| 1 | Lost owner-initiated MANIFEST wedges a replica | Closed | `89f1ed53f` |
+| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | Closed | `89f1ed53f` |
+| 3 | Read revocation never reaches the delta feed | Closed | `b0f6ae11c` |
+| 4 | A failed reply-stream open is cached as a permanent rejection | Closed | `078e72a41` |
+| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | Closed | `f52edc4cf` |
+| 6 | The `§12` provisional-signalling witness cannot fail | Closed | `db6dd0a20` |
+| 7 | Ownership-charge refusal drops acknowledged fragment bytes | Closed | `f52edc4cf` |
+| 29 | Five floor steps pin witnesses by unanchored substring | Closed | `47fb57694` |
+| 30 | Stale floors: `MIN=196` (wire) and 31 (deck) | **Partly closed** — wire 196→275 and deck 31→35 re-measured in the repair tree; leaf 308 and `sensing_org_lease_wire --min 9` deferred, because those two count a different surface (the lib plus its integration binaries) than the attribute scan used here | `78880312c` |
+| 8–28, 31–130 | — | **In progress** — eight repair streams over disjoint file sets | — |
+
+### What the closures changed, and how they are witnessed
+
+- **#1** A delta for a generation the replica never installed is now split by direction: *below* the installed one is still dropped (`stale-generation`, a retransmission of a document already moved past), *above* it provokes `resync` through the existing `#behind` machinery, coalesced so a flood of deltas for the missed generation asks once. Witness: `replica.test.ts` observes the ask, the coalescing, and that nothing was applied.
+- **#2** `closed` is now handle news however it was provoked — `errors.ts` makes it terminal for the handle and for any action in flight on it, and `receive`'s foreign-handle gate already discards any `closed` naming a different handle. The `q`-of-a-dead-question guard is kept for the request refusals, which do answer a question.
+- **#3** `propagate` re-consults `permitsRead` per handle per commit and forgets the handle on refusal. The feed *is* the read delivered fresh, so leaving the handle alive would let `alive` renew the lease of a peer the policy now forbids.
+- **#4** `replyStream` (host) and `stream()` (join) clear their cached open on failure as well as on success, so a transient `openStream` failure is a retry rather than a verdict on the peer.
+- **#5** All three `§12` gate families — forward (1), subscribe (3), announce (4) — now `let Some(endpoint) = … else { return; }`: an unresolvable endpoint is the eviction race the ingress documents as reachable, and gate 5 already failed closed there. `cargo check --lib --features "net cortex webrtc"` clean.
+- **#6** The signalling leg's `after >= before` (monotone counters — cannot fail) is now a `wait_for` on a strict `>`, plus the absence the claim is really about: no `ice_pending()` and no `admission_promoted()` movement across the whole witness. Counting a refusal is not the same as not participating, and the absence covers legs (a)–(d) too. Verified: `cargo nextest run --test rtc_admission --features "webrtc fixtures cortex" --no-tests=fail --retries 0` → 1 test run, 1 passed.
+- **#7** The charge refusal now emits the `AbandonedGroup` record and the fence the capacity refusal twelve lines below already had. The record carries `charged: false` — no obligation slot was taken there — and `take_terminals` and the coalesce path release only for records that hold one; `Partial::abandoned` and the capacity refusal's record carry `charged: true`. Without that distinction every charge refusal drifted `OwnershipCharge` downward and admitted more groups than the bound allows.
+- **#29** All five pins require the witness name as a complete identifier token (not preceded or followed by `[A-Za-z0-9_]`), which defeats the `<required>_extra` and renamed-supersets shapes the file itself documents as spoofable. Anchored by token rather than by line shape because the five steps read three different output formats.
+
+### Witnesses inverted rather than extended
+
+Three existing witnesses encoded the old buggy behavior and had to change sides, which is worth recording because each is now a regression guard against a repair being reverted:
+
+1. `review_repairs.test.ts` — *"does not let a stale refusal tear down a healthy view"* pinned the `closed` drop that **#2** reports as the defect. Its property belongs to `forbidden` (a request refusal answering a dead question), and the `closed` case is now asserted to tear down and rejoin.
+2. `replica.test.ts` — *"drops a delta for a generation other than the installed one"* asserted exactly the behaviour **#1** reports as a bug. It is now two tests, one per direction.
+3. `hosted.test.ts` — the adoption witness's `successor.counts().handles === 0` was an *incidental* consequence of the replica never recovering from handle death. The claim it was written for — the successor never adopted the stale handle, and its write was not applied — is asserted directly above; the count is now `=== 1`, a handle the successor minted for the replica's rejoin.
+
+### Process notes from the repair pass
+
+- **The silent-no-op trap is real and it bit.** `tests/rtc_admission.rs` is `#![cfg(all(feature = "webrtc", feature = "fixtures"))]`; under `--features "net cortex webrtc"` it compiles to **zero tests**, and `nextest` reported `0 tests run: no tests to run`. Only `--no-tests=fail` turned that into a failure instead of a green. The same feature gap also made an early `cargo check` "pass" without compiling `rtc/fragment.rs` or any `#[cfg(feature = "webrtc")]` gate at all. Every verification in this pass names the feature set it ran under.
+- **An early green was retracted.** A 686-test `vitest` run was reported as covering two new witnesses before anyone noticed the edits had landed in the wrong worktree (relative paths resolve to `net-cli`; the repair tree is `webrtc-fixes`). The work was relocated, the claim corrected, and all file access since has used absolute paths. The second run — same 686, then 688 with the new tests — is the one that counts.
+
+---
+
 ## Method and limits
 
 Read-only review at a detached worktree pinned to `801ae18c7`; the main working tree is a different branch and was not read. No build, test, lint or format command was run, so this document makes no claim about compilation or test outcomes. Line numbers were read at the reviewed commit.
