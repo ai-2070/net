@@ -1,0 +1,220 @@
+net/crates/net/browser-ts/src/store/host.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 320-334
+net/crates/net/sdk/src/rtc_bootstrap_acme.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 102-137,143,208,213,220-232,244-246,250-254,752-788
+  s_cb1145d4b22cd4::t_3013f47374a82e 789
+web/src/content/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 55,142-143,148,182
+net/crates/net/browser-ts/test/leader.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 167-179,423-481
+  s_cb1145d4b22cd4::t_eb3f353e232e82 482
+net/crates/net/src/adapter/net/rtc/admission.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 283-299,475-516
+  s_cb1145d4b22cd4::t_c1437f72dee86d 517
+net/crates/net/browser-ts/src/leader/wasm.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 77
+.claude/skills/net-event-bus/observability.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 101,125
+.github/scripts/check-abi-commit.py
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 1-547
+net/crates/net/browser-ts/src/node.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 37,460-465,467,469-474
+net/crates/net/browser-ts/test/store/hosted.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 26,133-134,176-182,390-393,1311-1404,2371-2372,2374-2379,2509-2965
+net/crates/net/leaf/tests/fixture_parity.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 82-131
+net/crates/net/src/adapter/net/rtc/engine.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 44-48,63-80,88-106,199-207,213,220,223-227,242-251,255-258,310-320,330-336,338,345,348,389,393-563
+  s_cb1145d4b22cd4::t_55fc025f65b920 564
+net/crates/net/browser-ts/src/store/assembly.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 275-281,337-345,348-351,377-384
+net/crates/net/browser-ts/src/store/owner.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 253-262,264,266,268,296-302,313-359,374-377,677-692,694,754-763
+net/crates/net/browser-ts/test/store/review_repairs.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 219-280,375-379,387-417,761-823
+  s_cb1145d4b22cd4::t_ca4fadbd63a2bb 824
+net/crates/net/leaf/src/anchor_control_plane.rs
+  s_cb1145d4b22cd4::t_54457b4853a13f 435-436,438-442,446-454,456-457,460-463
+  s_cb1145d4b22cd4::t_1dd677dcb3af3d 443-445
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 99-126,135-138,235-266,271-279,324-328,331,340-349,360-361,363,367-371,374-375,397-399,401,429-434,464
+net/crates/net/leaf/src/counters.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 118-125,152,158,179,198,358-373,402-404
+  s_cb1145d4b22cd4::t_f85a02f5783b8e 405
+net/crates/net/leaf/tests/control_plane_boundary.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 46,77-116,130-631,672-755,766-770,790-809,862-867,877-948,974-985,988-1008,1025-1036,1044-1055
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_cb1145d4b22cd4::t_e6fbaa55335de2 1403-1405,1454
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 513-520,524,529-547,569,578-581,583-589,596-606,1376,1464-1471,1561-1675
+net/crates/net/leaf/src/error.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 19-27,228-230
+net/crates/net/wire/src/stream.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 41,43-49,51-52
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 1835-1842
+.github/scripts/check-witness-results.py
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 31-37,53,123-135,140,142,225-246,273-277,333-336,403-425,519,523-533,541,573-603
+net/crates/net/browser-ts/src/store/core.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 105-115,250-256,260-264
+go/stream_close_test.go
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 17-41,128-359
+net/crates/net/browser-ts/src/store/types.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 6-12
+.claude/skills/net-event-bus/streams.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 34,36,66,254,273,277
+net/crates/net/leaf/src/bootstrap.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 42,117-135,191,193-194,224-297,380-393,398-399,405-414,431-441,467-475,659-662,664-671,718-722,836-889,982-1073
+  s_cb1145d4b22cd4::t_4cf3679f25baf7 1074
+net/crates/net/leaf/src/control_plane.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 40-44,137-138,199-201
+net/crates/net/tests/rtc_signalling.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 12-13,647-653,655-656,800-803,1028,1207-1482
+net/crates/net/src/adapter/net/rtc/driver.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 2007-2008,2015-2021
+net/crates/net/browser-ts/src/leader/session.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 46,290-294
+net/crates/net/leaf/src/leader_session.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 299-312,338-344,500,597-610,1064-1090,1100,1104-1118,1239-1241,1644-1648,1650-1665,1747-1753,1765-1785,2091-2095,2099,2538,2553-2559,2563
+net/crates/net/browser-ts/src/store/ledger.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 41,274-278
+net/crates/net/browser-ts/src/store/wire.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 805-812,815-816,818-823,833-865,869-870
+net/crates/net/leaf/src/session.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 152-159,164-165,196,210-225,233-237,240,249,252-255,977
+.github/workflows/ci.yml
+  s_cb1145d4b22cd4::t_c46e158b4dedb6 5260-5266
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 23-39,141,334-344,346,394-396,398,496-498,500,544-546,548,633,645-650,983-999,2330,2557-2558,3990-3994,4021-4035,4099-4102,4236-4248,5256-5259,5268-5274,6329,6448-6455,6457,6506-6513,6695-6698,6826,6893-6896,7201-7208,7210
+net/crates/net/leaf/tests/wasm_leaf.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 350-353,362
+net/crates/net/tests/rtc_loopback.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 165-226,228-235
+net/crates/net/browser-ts/test/store/replica.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 385,390-393,400-426
+  s_cb1145d4b22cd4::t_789bfa161d5d52 427-428
+.claude/skills/net-event-bus/dataforts.md
+  s_cb1145d4b22cd4::t_3e67581066bc0e 167
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 89,218
+net/crates/net/browser-ts/test/store/core.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 320-361
+net/crates/net/browser-ts/test/store/assembly.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 36,165-192,272-307,688-813
+net/crates/net/docs/releases/RELEASE_v0.15_REBEL_YELL.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 51,138-139,144,178
+docs/internal/misc/PERF_AUDIT_2026_09_13_TEST_EXECUTION.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 166,169-170,174-178,184-185,281-282
+.github/scripts/check-ffi-exports.py
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 2-3,10-14,20-27,68-69,101-102,110-117,182-208,299-317,323-328,349-377
+  s_cb1145d4b22cd4::t_d039abaef125ec 378
+net/crates/net/leaf/tests/dependency_boundary.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 29-67,138-150,152-157,159-172,236-237,261-262
+net/crates/net/leaf/src/stream.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 339-354,357-366,369,371,680-742
+net/crates/net/leaf/tests/kyra_followup.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 21-39,136-140,144-179,181-199,203,215,223-224
+net/crates/net/leaf/src/leader.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 2268-2270,2383,2634
+net/crates/net/tests/cross_lang_wire/README.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 9-12,28-31
+net/crates/net/browser-ts/src/store/replica.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 620-635,666-678
+net/crates/net/browser-ts/test/fake-wasm.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 153,234-254,256-257,419-458
+net/crates/net/src/adapter/net/router.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 666-668,705,710-712,746,1056-1057,1128,1176,1361-1385
+  s_cb1145d4b22cd4::t_c5dd1eb5add0da 1386
+docs/internal/misc/CODE_REVIEW_2026_09_22_WEBRTC_REPAIR_PASS.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 1-1344
+net/crates/net/sdk/tests/enroll_parity.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 1-520
+net/crates/net/sdk/src/bootstrap_credential.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 576-585,590,605-673,921-1063
+  s_cb1145d4b22cd4::t_fd9d9b889a90e4 1064
+docs/internal/performance/WEBRTC_DOUBLE_AEAD.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 13-15,223-224
+net/crates/net/leaf/src/rtc.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 219-232,235-241,310-319,321-322,325-327,348-352,356-357,367,378,403,405-411,415-439,468-479,507-508,525,580-581,625,879,902-905
+net/crates/net/leaf/src/wasm_witnesses.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 73-83,148-159,162-174,176-181,212,216-217,234-235,322,326-330,332,334,621-653,656,660-664,666-675,678-679,862-874,1203-1257,1295-1299,1301-1305,1307-1309,1311-1350,1456-1470,1480-1481,1488-1492,1494-1511,1517-1530,1567-1578,1603-1624,1630-1635,1639-1642,1644-1648,1650-1653,1660-1664,1671-1677,1686-1696,1704-1707,1709,1793,1799-1824,2003-2315
+net/crates/net/leaf/tests/kyra_round3_review.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 8-22,166
+docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 908-910,933-936,2024-2025
+net/crates/net/leaf/tests/kyra_round4_parent.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 9-24,275-300
+net/crates/net/browser-ts/src/store/join.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 46-62,123-153,225-226,271-280,348-350,367-371,388,392-452,508-526,528-532,567-581,594,641-659,674-688,694-703,705-711,715-723,730-745,766-771
+net/crates/net/leaf/tests/wasm_leader.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 143-147,199-202,341-389,1103-1113,1263-1282,1397-1403,1411,1414-1417,1419-1435,1444,1448,1453-1468,1470-1472,1474-1485,1487,1499-1504,1508,1510-1516,1896-1905,2084-2095,2109,2113,2120-2126,2141-2156,2568-2585,2607-2629,2735-2741,2744,2750-2751,2778-2816,2877-2884,2886-2887,3413-3417,3419-3420,3533-3535,3537
+net/crates/net/sdk/src/enrollment.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 219,235-254
+  s_cb1145d4b22cd4::t_6c0254f1b00fa9 255-256
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 646-707,794,798,940,948-950,971,974-984,1016-1019,1047-1048,1061-1243
+net/crates/net/src/adapter/net/rtc/stun.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 56-62,79-83,86-90,273-318
+  s_cb1145d4b22cd4::t_f581785b11f990 319
+net/crates/net/leaf/src/rpc_wire.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 36
+net/crates/net/leaf/tests/leader_e2e/frozen_tab_probe.mjs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 98-104,149-154,176-179,183-187,192-198,201-226
+net/crates/net/browser-ts/src/wasm.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 242-257,259,501-530
+  s_cb1145d4b22cd4::t_3fd38b82296d91 531
+net/crates/net/tests/rtc_admission.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 20,82-117,190-211,214-215,231-253,255-274,276-278,281-309,311-330,333-341,344-360,363,374-385,391,403-405,407-428,430-540,1948-2010
+TESTS.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 139-145
+AGENTS.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 224
+net/crates/net/leaf/src/stream_ownership.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 26,120-172,191-194,219-249,283-285,293,304-314,317,327-340,344-348,350-352,360-374,379-387,392,410-417,430-431,446-447,462,464,476,571-595,598-600,603,609-611,627-638,641,651-662,666,668-678,687-690,724-727,737,854-855,863-1067
+net/crates/net/leaf/src/signal.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 17-18,216,424
+net/crates/net/src/adapter/net/rtc/fragment.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 42-49,145-161,417-424,509-512,907-908,1249,1264-1290,1294,1317-1320,1528-1530,1719,1731-1765,2061-2066,2073-2077,2079-2082,2084-2101,2106,2108,2113-2114
+net/crates/net/tests/natsim/run_scenario.sh
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 450-453
+net/crates/net/browser-ts/test/fake-leader-wasm.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 19,119,252-267,269
+net/crates/net/leaf/src/node.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 39,414-476,481,505-526,561-569,574-579,680,692,699,987-1000,1017-1044,1338-1349,1370-1413,1433,1438-1441,1446-1462,1510-1511,1516-1531,1545-1564,1615-1616,1740-1759,1775-1781,1803-1827,1847-1849,1859-1873,1883-1887,1891-1911,1975-1977,1980,2044,2142,2147-2159,2205-2221,2282-2289,2446,2680-2708,2732-2735,2955-2966,3052-3085,3087-3139,6062-6135,6431-7289
+net/crates/net/src/adapter/net/rtc/transport.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 20,119-129,251,578-580,585,609-613,630,760-790
+  s_cb1145d4b22cd4::t_c551ada87d43ed 791-792
+net/crates/net/leaf/src/wasm.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 391-422,483-498,518-526,560-570,655-663,720-822,897-906,924,962-983,1079-1120,1195-1204,1207-1211,1219-1244,1493-1498,1538-1542,1547,1552-1562,1570-1587,1590-1591,1605,1668,1708-1715,1869-1872,1886,1890,1894,1928-1939,2342-2356,2358-2359,2361-2379,2493,2508-2518,2529,2649-2660,2688-2690,2712-2729,2773-2800,2810,2819-2828,2838-2845,2848,2872-2874,2892-2911,2913-2915,2923-2948,2950,2952-2989,3143-3159,3161,3175-3182,3216-3220,3223-3255,3262-3271,3275,3282-3304,3306-3308,3311-3315,3324-3327,3329-3330,3336-3340,3345-3347,3361-3399,3445-3452,3459,3600-3603,4057-4086,4148-4168,4286-4293,5177-5311
+net/crates/net/browser-ts/test/node.test.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 285-298,300-311,854-940
+  s_cb1145d4b22cd4::t_3b90e26e7e4c5b 941-942
+net/crates/net/browser-ts/src/store/chunker.ts
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 21,83-94,119-150,184-193,197-199,203-210,213-214
+docs/internal/plans/BROWSER_GAME_STORE_API_DESIGN.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 20-22,97,99-105,126,128-130,135,137,139,146,149,151-152,155-156,180-183,277-278,314-319,327,330-332,348-349,356,358,375-378,387-389,408
+net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 136
+docs/internal/misc/WEBRTC_TRANSPORT_MERGE_REVIEW_2026_09_22.md
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 28-63,69-154
+  s_cb1145d4b22cd4::t_29faf52ecc2869 155-157
+net/crates/net/src/adapter/net/mesh.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 2059-2135,2163-2167,11575-11579,11605-11611,14152-14153,14162-14163,23530-23558,23791-23804,26299-26300,26551-26554,26595-26633,26656-26671,26705,26880-26892,27236,27238-27269,27272-27290,29770-29789,31716-31732,32369-32373,32375-32399,32401,34486-34504,38201-38251,38330,39492-39504,39952-39964,40018-40031,40121-40133,40769-40781,40787-40791,40793-40798,49384-49391,49395,49398,60329-60368,60388-60392,60440-60442,60463-60525,61967-62168
+net/crates/net/leaf/src/dispatch.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 214-221,226,229,232,235,300-310,322-328,402,416,426,432,442,463,474,479
+net/crates/net/leaf/src/enroll.rs
+  s_cb1145d4b22cd4::t_6d17dd45e8a714 35,122,137-155
+  s_cb1145d4b22cd4::t_ed4396b85a8f0f 156-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c47fd448a06f105db6ad12b2a527c26e95e9edad",
+  "prompts": {},
+  "sessions": {
+    "s_cb1145d4b22cd4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2cba0ee-2f15-479d-8e02-45afeeb3fcec",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
