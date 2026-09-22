@@ -66,7 +66,7 @@ use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECO
 /// Does not change the legacy delegation-based enrollment APIs in this module.
 pub mod policy;
 
-// Signed membership invite (`net-join:`) and canonical redemption intent.
+// Signed membership invite (`net-mesh://` join link) and canonical redemption intent.
 pub mod invite;
 
 // PSK-free Noise enrollment session: protocol, responder key and client.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Signed membership invitation (`net-join:` link) and canonical redemption intent.
+//! Signed membership invitation (`net-mesh://` join link) and canonical redemption intent.
 //!
 //! A [`MembershipInvite`] binds, under one issuer signature: the full issuer
 //! identity, a named trust domain and its public [`TrustDomainId`], the TCP
@@ -33,8 +33,11 @@ use super::{fingerprint, Reader};
 use crate::bootstrap_credential::TrustDomainId;
 use crate::identity::{EntityId, Identity};
 
-/// Prefix of the copy-paste link form. Distinct from legacy `net-invite:`.
-pub const JOIN_LINK_PREFIX: &str = "net-join:";
+/// Scheme of the join link: `net-mesh://<host:port>/join/<base64url invite>`.
+/// Distinct from the legacy `net-invite:` form.
+pub const JOIN_LINK_SCHEME: &str = "net-mesh://";
+/// Path separator between the visible address and the signed invite.
+const JOIN_LINK_PATH: &str = "/join/";
 /// Maximum canonical invite size in bytes (before base64).
 pub const MAX_INVITE_BYTES: usize = 1024;
 /// Maximum trust-domain name length.
@@ -65,6 +68,9 @@ pub enum InviteError {
     /// The issuer signature does not verify.
     #[error("membership invite signature is invalid")]
     BadSignature,
+    /// The link's visible address differs from the signed endpoint.
+    #[error("join link address does not match the signed enrollment endpoint")]
+    AddressMismatch,
     /// The enrollment endpoint is not an acceptable `host:port`.
     #[error("invalid redemption endpoint: {0}")]
     Endpoint(&'static str),
@@ -402,28 +408,41 @@ impl MembershipInvite {
         })
     }
 
-    /// The `net-join:` link. **Bearer material** unless subject-bound: never log it.
+    /// The join link, `net-mesh://<host:port>/join/<base64url invite>`. The
+    /// visible address is the signed endpoint, for human readability only.
+    /// **Bearer material** unless subject-bound: never log it.
     pub fn encode(&self) -> String {
-        let mut s = String::from(JOIN_LINK_PREFIX);
+        let mut s = String::from(JOIN_LINK_SCHEME);
+        s.push_str(self.endpoint.as_str());
+        s.push_str(JOIN_LINK_PATH);
         s.push_str(&URL_SAFE_NO_PAD.encode(&self.bytes));
         s
     }
 
-    /// Parse and verify a `net-join:` link. Tolerates surrounding whitespace only.
-    /// Offline: performs no network request and consumes nothing.
+    /// Parse and verify a `net-mesh://` join link. Tolerates surrounding
+    /// whitespace only. The visible address must equal the signed endpoint
+    /// exactly; callers connect only to [`Self::endpoint`]. Offline: performs no
+    /// network request and consumes nothing.
     pub fn decode(link: &str) -> Result<Self, InviteError> {
-        let body = link
+        let rest = link
             .trim()
-            .strip_prefix(JOIN_LINK_PREFIX)
-            .ok_or(InviteError::Malformed("missing net-join: prefix"))?;
+            .strip_prefix(JOIN_LINK_SCHEME)
+            .ok_or(InviteError::Malformed("missing net-mesh:// scheme"))?;
+        let (address, body) = rest
+            .split_once(JOIN_LINK_PATH)
+            .ok_or(InviteError::Malformed("missing /join/ path"))?;
         // base64 expands 3 bytes to 4 characters; refuse before decoding.
-        if body.len() > MAX_INVITE_BYTES.div_ceil(3) * 4 {
+        if address.len() > MAX_ENDPOINT_BYTES || body.len() > MAX_INVITE_BYTES.div_ceil(3) * 4 {
             return Err(InviteError::TooLarge);
         }
         let bytes = URL_SAFE_NO_PAD
             .decode(body)
             .map_err(|_| InviteError::Malformed("invalid base64"))?;
-        Self::from_bytes(&bytes)
+        let invite = Self::from_bytes(&bytes)?;
+        if address != invite.endpoint.as_str() {
+            return Err(InviteError::AddressMismatch);
+        }
+        Ok(invite)
     }
 
     /// Canonical signed bytes (bearer material).
