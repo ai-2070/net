@@ -2312,13 +2312,20 @@ jobs:
           JUNIT="$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/nextest/default/junit.xml"
           rm -f "$JUNIT"
+          st=0
           cargo nextest run --no-fail-fast --no-tests=fail \
             --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures" \
-            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
-          st=$?
+            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)' \
+            || st=$?
           # PRESERVE this run's result set before any later step's run
           # overwrites it. The named-witness steps below verify against this
           # artifact instead of re-executing each witness by name.
+          #
+          # `|| st=$?`, never a bare invocation followed by `st=$?`: this
+          # block runs under the runner's `bash -e`, which ABORTS at the
+          # failing run and skips this copy entirely — a red run then reads
+          # downstream as "no JUnit artifact ... the run did not produce
+          # results" instead of as the result set it actually produced.
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
