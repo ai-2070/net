@@ -4946,6 +4946,53 @@ jobs:
               echo "::error::$t did not run"; exit 1; }
           done
 
+      # `keychain` (the OS-keychain secret value store) is explicitly
+      # non-default — `cli/Cargo.toml`: "NOT a default: it pulls the `keyring`
+      # dependency" — and it CHANGES THE ARGUMENT SURFACE: `forwarding
+      # set-value --inspect-target` exists only under
+      # `#[cfg(feature = "keychain")]`. So `if cfg!(feature = "keychain")` in
+      # `policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct`
+      # is never true in either step above, its `else` branch is all that ever
+      # executes, and half the witness is silently dropped on every run: wrong
+      # `keychain_service` / `keychain_account`, wrong stdin provenance, a
+      # flipped `ignored_profile_remote_defaults`, or `forwarding set-value`
+      # accepting an invalid keychain account all pass today. This step runs the
+      # gated branch; the default run above covers the `else` branch, so both
+      # halves execute.
+      #
+      # Scoped to `--test local_target_inspection` — the binary that owns the
+      # gated branch — rather than a whole-crate sweep like the `rtc-bootstrap`
+      # step above. Deliberate and narrower, not an oversight. Checked and NOT
+      # the reason: a whole-crate run would very likely stay green —
+      # `readme_commands` extracts only fenced commands (README's keychain
+      # example is prose) and `help_is_self_contained` asserts repo-file and
+      # installed-binary-name hygiene, not flag sets. The real grounds are cost
+      # and verifiability: cargo fingerprints per feature set, so this is a full
+      # rebuild either way, but an unscoped `cargo test -p net-cli` additionally
+      # LINKS every integration-test binary — ~40 large executables plus PDBs —
+      # which produced `LNK1180: insufficient disk space to complete link` on a
+      # workstation and is a material extra cost inside this job's 20-minute
+      # budget. Raise the scope only together with the job timeout.
+      #
+      # The name pin is the same silent-skip guard used for the four journey
+      # witnesses above: `cargo test -- <filter>` exits 0 when it matches
+      # nothing, so a rename would turn an unpinned run into a green no-op.
+      #
+      # Headless-safe: `forwarding set-value --inspect-target` returns before
+      # any `KeychainSecretBackend` is built (`cli/src/commands/forwarding.rs`),
+      # so it is inspect-only and never opens a keyring. `net-mesh-mcp`'s
+      # `keychain` path is pure Rust on Linux (kernel keyutils; no libdbus), so
+      # no system library is needed here.
+      - name: Run net-cli keychain inspection branch
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features keychain --test local_target_inspection \
+            2>&1 | tee /tmp/cli_keychain.log
+          for t in policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct; do
+            grep -q "test $t ... ok" /tmp/cli_keychain.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
   aggregator-daemon-tests:
     # `net-aggregator-daemon` is a lib + bin crate. The lib hosts
     # the `boot` / `run` entry points + config parsing + template
