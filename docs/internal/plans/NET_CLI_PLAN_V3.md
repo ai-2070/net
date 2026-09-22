@@ -24,7 +24,7 @@ V2's deferred transfer holder, generic unary RPC, remote Deck, and crash-safe Ne
 
 ## 2. The complete operator journey
 
-1. On operator A, select the real identity, authority stores, trust domain and reachable listener. Optionally select a protected PSK source; otherwise let `up` generate and persist a fresh protected trust-domain PSK. Start or attach to the explicitly named long-lived node, then start or attach to its enrollment service. Both lifetimes are visible and independently stoppable.
+1. On operator A, select the real identity, authority stores, trust domain and reachable listener. Optionally select a protected PSK source; otherwise let `up` generate and persist a fresh protected trust-domain PSK. Start the explicitly named long-lived node with `up`, opting in to enrollment with `--enroll` (which requires the issuer identity and ledger store). Enrollment runs inside that node's process, not as a separate service; the node's lifetime and whether enrollment is active are both visible through its local control endpoint.
 2. Create a short-lived join link for the intended target. Mesh and organization invitations can carry explicitly authorized, independently evaluated channel and subnet scopes. A device already on the mesh can receive a standalone organization, channel or subnet link.
 3. On device B, inspect the link locally, confirm the intended roots/scope, generate or load its own persistent identity, and explicitly redeem. Root private keys never leave A.
 4. A validates B's proof of identity, the invitation and current policy, and issues exactly the preauthorized bundle. Creating the invitation is the inviter's authorization: by default there is no second human approval. Only invitations explicitly created with `--require-approval` wait for a subsequent operator decision.
@@ -75,13 +75,13 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 
 | Proposed surface | Meaning and execution owner |
 |---|---|
-| `net-mesh up [--psk-from <SOURCE>]` | Start one real long-lived node under the selected profile/identity. With no source, generate and durably protect a fresh random trust-domain PSK on first start and reuse it for that profile; never use a public, empty or all-zero PSK. Foreground by default; `--detach` explicitly transfers ownership to a managed child only after readiness. `<SOURCE>` is a protected `file:`, `stdin`, or configured `kms:` reference, never a literal PSK on argv. |
+| `net-mesh up [--psk-from <SOURCE>] [--enroll]` | Start one real long-lived node under the selected profile/identity. With no source, generate and durably protect a fresh random trust-domain PSK on first start and reuse it for that profile; never use a public, empty or all-zero PSK. Foreground by default; `--detach` explicitly transfers ownership to a managed child only after readiness. `<SOURCE>` is a protected `file:`, `stdin`, or configured `kms:` reference, never a literal PSK on argv. `--enroll` is the explicit opt-in that makes this node the enrollment owner: it loads the selected issuer identity and durable ledger store, taking the ledger's exclusive lock, and opens the PSK-free Noise enrollment listener in the same process. `up --enroll` refuses before binding if the issuer identity or ledger store is missing, invalid or already owned. Without `--enroll` the node mints nothing and exposes no enrollment listener. |
 | `net-mesh down` | Ask the selected locally managed node instance to drain and stop through authenticated owner-only local control, then verify that exact instance exited. It does not revoke enrollment, delete identity, rotate the PSK, or stop unrelated SDK processes. |
 | `net-mesh node status` | Report the selected managed instance, exact incarnation, readiness, bind/public endpoint, identity fingerprint and control-owner state without exposing the PSK or treating a stale PID/metadata file as liveness. |
-| `net-mesh enrollment serve` | Foreground, operator-owned enrollment/status service using selected durable stores. Explicit bind and readiness; stopping the process stops service. No implicit background daemon or hosted SaaS. |
-| `net-mesh invite create` | Create a mesh invitation through the actual authority owner; optional exact `--subnet` scope. |
+| `net-mesh enrollment stop` / `enrollment start` (optional) | If offered, local control operations on the running `up --enroll` node that close or reopen only its enrollment listener; the node and its ledger ownership stay up. Not a separate process. `start` on a node launched without `--enroll` refuses. |
+| `net-mesh invite create` | Create a mesh invitation through the running `up --enroll` node's local control endpoint, which records it in the ledger it owns before returning the link; optional exact `--subnet` scope. Refuses when no enrolling node is running; never opens the ledger itself. |
 | `net-mesh invite inspect` | Offline, redacted parse/signature/expiry inspection where verifiable; never consumes a nonce or claims current authority. |
-| `net-mesh invite revoke <invite-id>` | Invalidate an unredeemed invitation at its owner. This does not revoke previously issued credentials or a leaked standing PSK. |
+| `net-mesh invite revoke <invite-id>` / `invite status [<invite-id>]` | Through `up`'s local control endpoint: invalidate an unredeemed invitation, or report non-secret offer/claim/issuance state, at the ledger's single owner. This does not revoke previously issued credentials or a leaked standing PSK. |
 | `net-mesh join <join-link>` | Enroll a new device into the stated mesh; persist and apply the selected bundle. Also support protected file/stdin input to avoid shell-history leakage. |
 | `net-mesh org invite <org-ref>` / `org join <join-link>` | Explicit organization membership enrollment, optionally composed with mesh connectivity and subnet attachment. No owner replacement. |
 | `net-mesh channel invite <channel-name> --rights <RIGHTS> [--subscribe-from <entity-id>]` / `channel join <join-link>` | Preauthorize one subject-bound channel chain, then install it and report each right through its actual execution path. `subscribe` requires a publisher runtime controlled by the issuer owner and names its intended full entity as metadata/routing selection; `publish` installs on the subject's local managed runtime and does not use that flag. Mixed rights do both independently. `<RIGHTS>` must contain `subscribe`, `publish`, or both; optional bounded `delegate` is never standalone. No implicit `ADMIN`, wildcard, root installation or capability invocation. Canonical name/`u64` are computed locally; no command accepts a `u16` hint. |
@@ -90,7 +90,7 @@ The following is **proposed V3 syntax**, not shipped commands. Final parser fact
 | `net-mesh org leave <org-ref>` | Voluntary local deactivation of that organization enrollment and dependent use; not an owner transfer or issuer-side membership revocation. |
 | `net-mesh channel leave <channel-name> --subscribe-from <entity-id>` / `channel leave <channel-name> --publish-local` | Leave the selected channel execution path, or specify both flags to leave both. Subscribe leave persists disabled intent and obtains acknowledged unsubscribe from the routing target. Publish leave conditionally removes only the exact managed local chain/cache incarnation. If several matching relations exist, require `--relation <id>` instead of broad deletion. Neither form revokes copied token bytes. |
 | `net-mesh subnet leave <subnet-ref>` | Voluntary local withdrawal from that exact qualified subnet; unrelated memberships and authority remain unchanged. |
-| `net-mesh enrollment status` / `enrollment devices` | Own service/enrollment status and issuer inventory, with separately attributed live observations. Not an omniscient mesh roster. |
+| `net-mesh enrollment status` / `enrollment devices` | Through `up`'s local control endpoint: whether enrollment is active on that node, and issuer inventory, with separately attributed live observations. Not an omniscient mesh roster. |
 | `net-mesh org members <org-ref>` / `subnet members <subnet-ref>` | Authorized issuer inventory plus scoped enforcement-point observations, distinguishing issued from live-admitted and unknown. |
 | `net-mesh org remove <org-ref> <entity-id>` | Revoke the selected membership relation using the actual organization floor/admission mechanism. |
 | `net-mesh subnet remove <subnet-ref> <entity-id>` | Revoke the selected subject's covered attachment authority; requires the selective-revocation mechanism below. Not a synonym for list deletion or disconnect. |
@@ -103,7 +103,7 @@ For `subscribe`, `--subscribe-from` binds an intended full publisher identity in
 
 Local operator commands must operate on the same durable authority state as the running service, through a locked local control path or authenticated bounded SDK service. Choose the minimum existing-compatible path at V3-0. Spawning a fresh `OperatorEnrollment` for every invite while the server owns a different in-memory map is invalid. Remote issuance/removal must never be exposed merely because a caller holds a PSK or membership certificate; keep remote mutation unavailable unless the exact management authority is implemented and tested.
 
-`up` owns an ordinary Net node lifetime, not enrollment authority by implication. `enrollment serve` may attach to that exact managed node through the accepted local owner path, but starting a PSK-authenticated node must not mint invitations, expose management operations, or grant application invocation rights. Conversely, stopping enrollment service must not silently stop a node that the operator started independently.
+**Enrollment hosting (user decision, 2026-09-23):** there is no separate `enrollment serve` process. `up` owns an ordinary Net node lifetime, and enrollment authority only when the operator explicitly passes `--enroll`, which refuses without a valid issuer identity and ledger store. The enrolling node owns the ledger lock, the PSK-free enrollment listener and the invitation state for its whole lifetime. `invite create`/`revoke`/`status` and `enrollment status` are clients of `up`'s owner-only local control endpoint; they never open the ledger or instantiate a coordinator themselves. `enrollment stop`/`start`, if offered, are control operations on that running node, not processes. Starting a PSK-authenticated node without `--enroll` must not mint invitations, expose management operations or grant application invocation rights; `down` stops the node and therefore its enrollment listener, without revoking anything already issued.
 
 ## 5. Non-negotiable authority and secret boundaries
 
@@ -293,7 +293,7 @@ design direction requiring the listed proof, not an implemented mechanism.
 
 | Boundary | Re-survey finding | V3 direction / remaining decision |
 |---|---|---|
-| Operator ownership | `sdk/src/operator.rs::OperatorEnrollment` owns an in-memory `pending` map; `EnrollmentAuthority` separately tracks spent nonces. Inventory/revocation file persistence does not persist either invitation ledger. | Proposed: one foreground service holds a lifetime lock on its selected authority store and owns durable invite/claim/receipt transitions. Mint/approve/revoke clients must talk to that owner; never instantiate a fresh coordinator. Root keys stay with that owner. Choose and test protected local IPC on Unix and Windows before adding mutation commands; remote management stays unavailable. |
+| Operator ownership | `sdk/src/operator.rs::OperatorEnrollment` owns an in-memory `pending` map; `EnrollmentAuthority` separately tracks spent nonces. Inventory/revocation file persistence does not persist either invitation ledger. | Decided: the `up --enroll` node holds a lifetime lock on its selected authority store and owns durable invite/claim/receipt transitions. Mint/approve/revoke clients must talk to that owner; never instantiate a fresh coordinator. Root keys stay with that owner. Choose and test protected local IPC on Unix and Windows before adding mutation commands; remote management stays unavailable. |
 | Native first contact | `sdk/src/mesh_enroll.rs::Rendezvous` contains address, Noise public key and routing ID, but explicitly assumes an out-of-band PSK. `Mesh::join` starts from an already-built mesh. | Product choice resolved: preauthorized, single-use invitations redeemed through an authenticated adapter, without a standing PSK in the link or a second approval by default. Optional `--require-approval` is invitation-bound policy. The concrete transport/control proposal below remains subject to security witnesses and V3-0 exit, not a shipped guarantee. No public/default PSK workaround or secret-bearing mode is selected for V3-1. |
 | Existing browser bootstrap | `sdk/src/bootstrap_credential.rs::BrowserBootstrapCredential` is signed and secret-bearing. SDK HTTP/TLS dependencies and the CLI listener are gated by `rtc-bootstrap`, which also enables WebRTC. | Reuse verification/secret-redaction concepts, not a silent browser-feature dependency. This is not evidence for native secure redemption. Do not enable `rtc-bootstrap` globally to make a new default command appear to work. |
 | Membership-only outcome | `sdk/src/enrollment.rs::JoinOutcome::Admitted` contains a delegation chain; `sdk/src/delegation.rs::derive_device` issues `INVOKE_ACTION | DELEGATE`. `InviteToken` itself has no issuer signature or operation/scope fields. | Preserve existing agent enrollment and `NMI1`/`NMO1` behavior. V3 needs a separately versioned integrity-bound invite and membership-only receipt/bundle, never an empty/fake delegation chain. Proposed receipt binds issuer, full subject, invitation/operation ID, exact requested relations, request-intent digest and committed result; finalize encoding after transport/store decisions. |
@@ -331,8 +331,9 @@ Creation requires existing local operator authority in either mode.
 existing mesh listener, because its Noise NKpsk0 handshake mixes the PSK into the
 first message and a clean device has none. It also does not add a pre-PSK
 handshake type to the mesh socket, which would widen the core admission path
-every peer runs. Instead `enrollment serve` owns one separate UDP enrollment
-listener, distinct from the mesh socket and local management IPC. The device
+every peer runs. Instead the `up --enroll` node owns one separate TCP enrollment
+listener (TCP rather than UDP; see the session receipt below), distinct from the
+mesh socket and local management IPC. The device
 runs a PSK-free Noise handshake that authenticates the responder by the X25519
 static key signed into the invite (`EnrollmentKey`), then performs challenge →
 signed request → bundle inside that session. It reuses the workspace Noise stack:
@@ -357,7 +358,7 @@ still required before claiming the shipped join journey.
 **Invite/request/response contract (semantic, not allocated wire bytes):**
 
 1. The versioned issuer-signed invite binds full issuer identity, named trust
-   domain, UDP enrollment endpoint and its Noise static key, random invitation identifier,
+   domain, TCP enrollment endpoint and its Noise static key, random invitation identifier,
    expiry, exact authorized relations, optional intended full device identity
    and approval policy. The link contains no standing PSK, root key or audience
    secret, but **is still sensitive bearer authorization** when subject-unbound.
@@ -408,7 +409,8 @@ explicit DACL and remote-client rejection. Both require client identity/access
 checks and an exclusive lifetime store lock, not trust in a pathname or PID alone.
 The service publishes non-secret endpoint/instance metadata only after ownership
 is acquired; clients never instantiate a replacement store on connection failure.
-Local mint/approve/revoke/status use this owner. Device-side lifecycle control is
+Local mint/approve/revoke/status use this owner, which is `up`'s node control
+endpoint when the node runs with `--enroll` (one control endpoint, not two). Device-side lifecycle control is
 a separate local instance, not an assumption that the remote issuer can stop
 arbitrary consumers. Exact runtime registration/stop fencing remains open.
 
@@ -757,7 +759,7 @@ API cannot reach (an invite with the same random ID needs the issuer's key), so
 no inverse witnesses them.
 
 Not included: the membership-only bundle format (the bundle is opaque here);
-device-side durable identity/intent persistence and install; `enrollment serve`
+device-side durable identity/intent persistence and install; `up --enroll`
 / `invite` / `join` CLI; release-binary inclusion and CI job for the live path;
 Unix execution. SDK CI auto-discovers the new binary.
 
@@ -780,44 +782,47 @@ Tasks:
 
 **Exit:** No unresolved authority/bootstrap/state-owner decision may be passed to a command wrapper. If a mechanism needs a wider protocol redesign than this bounded lifecycle, stop that slice for an explicit scope decision; do not declare V3 complete or reopen serverless/remote Deck. This is a bounded design gate for named blockers, not a new platform-foundation project.
 
-### V3-1 — durable operator service and mesh join links
+### V3-1 — managed node, protected PSK sources, opt-in enrollment and mesh join links
 
-**Modify:** `sdk/src/enrollment.rs`, `sdk/src/operator.rs`, `sdk/src/mesh_enroll.rs`, applicable persistence/bootstrap owners, CLI `main.rs`, `context.rs`, `target.rs`, `config.rs`.
-**Proposed new files:** `sdk/src/enrollment_store.rs`, `cli/src/commands/enrollment.rs`, `cli/tests/enrollment_lifecycle.rs`. Module factoring may reuse an existing owner instead; record the final paths.
+Merged from the former V3-1 (operator service and join links) and V3-1A (managed
+node up/down). One process, `up`, owns the node, its local control endpoint and,
+with `--enroll`, the ledger and enrollment listener; there is no second daemon.
 
-Tasks:
-1. Write RED tests for clean-device bootstrap, preview-without-redemption, no implicit INVOKE/DELEGATE, and mint/serve using the same durable state.
-2. Implement the selected listener lifecycle, reusable receipt store and membership-only SDK path; reuse current crypto/parser/storage conventions.
-3. Add invite create/inspect/revoke and join with explicit scope, redaction and protected link input. Default creation preauthorizes one scoped redemption; optional `--require-approval` adds a later human decision. Show bearer-versus-intended-subject policy without exposing the link. Keep the default CLI build usable without silently enabling browser/server features.
-4. Persist device identity and enrollment/profile references; consume them through one existing V2 hosted/client path after CLI exit and restart.
-5. Prove default redemption succeeds without a second approval and optional approval cannot be bypassed. Cover concurrent same/different identity redemption, lost response after commit, operator/device crash points, revoke during claim/approval, corruption and saturation. A second redemption is not an implicit grant reissue.
-
-**Exit:** Two clean participants enroll through a link without manual PSK handling or a second approval in default mode; restart and retry recover the same identity/result. Invalid/mismatched requesters cannot redeem; optional approval cannot be bypassed. Even a valid enrolled device receives no implicit application authority. No organization/channel/subnet success is claimed yet.
-
-### V3-1A — managed node up/down and protected PSK sources
-
-**Modify:** CLI `main.rs`, `context.rs`, `config.rs`, `secret.rs`, the selected
-SDK/runtime lifecycle owner and platform-local control implementation.
+**Modify:** CLI `main.rs`, `context.rs`, `target.rs`, `config.rs`, `secret.rs`;
+`sdk/src/enrollment.rs` and its `enrollment/*` modules; the selected SDK/runtime
+lifecycle owner and platform-local control implementation.
 **Proposed new files:** `cli/src/commands/lifecycle.rs`,
-`cli/tests/node_lifecycle.rs`. Reuse the V3-1 protected local owner if its
-authority and process-lifetime contract fits; do not create two control daemons.
+`cli/src/commands/enrollment.rs`, `cli/tests/node_lifecycle.rs`,
+`cli/tests/enrollment_lifecycle.rs`. SDK owners already landed or in progress:
+`sdk/src/enrollment/{policy,store,invite,redeem,service,bundle,device}.rs`.
 
 Tasks:
-1. Write RED subprocess witnesses showing the current CLI cannot start a persistent node, report its verified readiness, or stop that exact instance. Cover duplicate `up`, stale metadata/PID reuse, wrong profile/incarnation, startup failure after spawn, shutdown timeout and a second unrelated node.
+1. Write RED subprocess witnesses showing the current CLI cannot start a persistent node, report its verified readiness, or stop that exact instance. Cover duplicate `up`, stale metadata/PID reuse, wrong profile/incarnation, startup failure after spawn, shutdown timeout and a second unrelated node. Add RED for clean-device bootstrap, preview-without-redemption, no implicit INVOKE/DELEGATE, and invite create/redeem operating on the same ledger the running node owns.
 2. Implement `net-mesh up [--psk-from <SOURCE>]` with foreground default and explicit `--detach`. Persist or load the selected node identity under existing protected-file rules; do not silently create a new identity on every restart. With no source and no existing managed PSK, generate one CSPRNG PSK and commit it before bind; concurrent first starts must converge on one durable value. Return success only after the production node is live and the protected control owner acknowledges the exact incarnation.
 3. Implement bounded `file:` and `stdin` sources first, with permission/type/length checks, secret-free diagnostics and in-memory scrubbing. Implement only explicitly selected `kms:` provider adapters behind named features; use workload identity and reject unsupported/malformed references before binding. Prove generated-secret restart reuse and missing/corrupt/insecure generated-store refusal rather than silent replacement. No shell-command resolver, argv literal, environment-value shortcut or secret-bearing temporary file.
 4. Implement `net-mesh down` and `net-mesh node status` through authenticated owner-only local control. Prove graceful drain/stop, advertisement withdrawal where owned, exact-instance termination and honest partial results. Preserve identity, stores and source configuration; do not claim revocation or PSK rotation.
-5. Cross foreground/detached mode with Unix and Windows process/control semantics, parent crash, child crash, terminal closure, Ctrl-C/service-manager stop, restart and concurrent status/down. Ensure a failed detached readiness handshake cannot leave an unreported live child.
-6. In a disposable review worktree, mutate readiness to answer before `MeshNode` runtime start and mutate `down` to trust PID metadata; the named witnesses must fail. Restore the candidate and run existing remote-attach, temporary-supervisor, wrap and MCP-service compatibility controls.
+5. Add `up --enroll`: refuse before binding without a valid issuer identity and ledger store (missing, corrupt, foreign issuer, already locked). On success the node holds the ledger lock and runs `EnrollmentService` with `MembershipIssuer` delivering its own trust-domain PSK and mesh contact; readiness includes the enrollment listener. Expose `invite create` (sign, record, then return the link; `--require-approval`, `--ttl`, optional intended subject), `invite revoke`, `invite status` and `enrollment status` only through the node's local control endpoint, and optional `enrollment stop`/`start` as control operations. With no enrolling node running these commands refuse rather than touching the ledger. Show bearer-versus-intended-subject policy without printing the link except to its requested protected destination.
+6. Add `net-mesh join <link>` (protected file/stdin input to avoid shell history) over `DeviceJoin`: persist identity and intent before redeeming, verify and install the bundle, then attach with the delivered PSK and contact and report credential install and observed live admission separately. Persist enrollment/profile references and consume them through one existing V2 hosted/client path after CLI exit and restart.
+7. Prove default redemption succeeds without a second approval and optional approval cannot be bypassed. Cover concurrent same/different identity redemption, lost response after commit, operator/device crash points, revoke during claim/approval, corruption and saturation. A second redemption is not an implicit grant reissue.
+8. Cross foreground/detached mode with Unix and Windows process/control semantics, parent crash, child crash, terminal closure, Ctrl-C/service-manager stop, restart and concurrent status/down/invite. Ensure a failed detached readiness handshake cannot leave an unreported live child, and that `down` closes the enrollment listener with the node.
+9. In a disposable review worktree, mutate readiness to answer before `MeshNode` runtime start, mutate `down` to trust PID metadata, and let `invite create` open the ledger directly; the named witnesses must fail. Restore the candidate and run existing remote-attach, temporary-supervisor, wrap and MCP-service compatibility controls.
 
 **Exit:** A fresh profile can start one production node with no supplied PSK
 (generating and protecting a stable value), from protected file, from stdin and
 from every advertised feature-enabled KMS source; prove live readiness; be used
 by an existing capability/provider path; stop through a second CLI process; and
 prove that exact runtime is no longer reachable. Restart without a source reuses
-the generated trust domain. Secrets never appear in argv, environment, output,
+the generated trust domain. With `--enroll`, two clean participants enroll
+through a link without manual PSK handling or a second approval in default
+mode, and attach to the running node with the delivered PSK; restart and retry
+recover the same identity/result. `up --enroll` without issuer identity or
+ledger store refuses before binding; invite commands without a running enrolling
+node refuse. Invalid/mismatched requesters cannot redeem; optional approval
+cannot be bypassed. Even a valid enrolled device receives no implicit
+application authority. Secrets never appear in argv, environment, output,
 metadata or test logs. Duplicate/stale/wrong-instance operations fail without
-affecting another node. Sources not shipped are not advertised.
+affecting another node. Sources not shipped are not advertised. No
+organization/channel/subnet success is claimed yet.
 
 ### V3-2 — organization and subnet-scoped enrollment
 
