@@ -46,6 +46,12 @@
 #               outbound.
 #   symmetric — `masquerade fully-random`: a fresh public port per
 #               connection tuple → classifies Symmetric.
+#   upnp      — a home router that forwards NOTHING by itself: plain
+#               port-preserving `masquerade`, no static mapping, no DNAT.
+#               Inbound reaches the LAN only through mappings a
+#               port-mapping daemon (miniupnpd: NAT-PMP / PCP / UPnP-IGD,
+#               started by the enrollment scenario) installs on request.
+#               This is the "no manual router configuration" row.
 #   none      — the joiner is expected to run publicly in nsim_wan
 #               instead; no gateway/ns is created for that side.
 #
@@ -100,10 +106,10 @@ done
 # unrecognized used to fall through to the cone masquerade).
 for mode in "$NAT_A" "$NAT_B"; do
   case "$mode" in
-    cone|cone-ar|cone-pr|symmetric|none) ;;
+    cone|cone-ar|cone-pr|symmetric|upnp|none) ;;
     *)
       echo "invalid NAT mode: '$mode'" \
-        "(want cone|cone-ar|cone-pr|symmetric|none)" >&2
+        "(want cone|cone-ar|cone-pr|symmetric|upnp|none)" >&2
       exit 2
       ;;
   esac
@@ -302,6 +308,21 @@ EOF
   # stranger is still refused, and nothing is reachable unsolicited.
   # Everything lives in ONE table because an nftables set is
   # table-scoped and the nat rule has to reference it.
+  if [[ "$MODE" == "upnp" ]]; then
+    # Outbound masquerade only. Anything reaching the LAN from outside
+    # must come from a DNAT the port-mapping daemon added; the daemon's
+    # own tables are created by the scenario that starts it.
+    ip netns exec "$GW" nft -f - <<EOF
+table ip natsim {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "gw$L-wan" masquerade
+  }
+}
+EOF
+    return 0
+  fi
+
   if [[ "$MODE" == "cone-ar" || "$MODE" == "cone-pr" ]]; then
     local AR_LEARN="" AR_DNAT=""
     if [[ "$MODE" == "cone-ar" ]]; then
