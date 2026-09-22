@@ -3,6 +3,7 @@
 package net
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -56,6 +57,7 @@ func TestLargeResponseWireVector(t *testing.T) {
 	if len(encoded) != fixture.Length || len(fixture.Fragments) != (len(encoded)+fixture.Chunk-1)/fixture.Chunk {
 		t.Fatal("encoded length mismatch")
 	}
+	assembled := make([]byte, 0, len(encoded))
 	for _, piece := range fixture.Fragments {
 		header := make([]byte, 6)
 		binary.LittleEndian.PutUint32(header, uint32(len(encoded)))
@@ -63,5 +65,9 @@ func TestLargeResponseWireVector(t *testing.T) {
 		if hex.EncodeToString(header) != piece.Header || min(fixture.Chunk, len(encoded)-piece.Index*fixture.Chunk) != piece.Length {
 			t.Fatalf("fragment %d mismatch", piece.Index)
 		}
+		assembled = append(assembled, encoded[piece.Index*fixture.Chunk:min((piece.Index+1)*fixture.Chunk, len(encoded))]...)
+	}
+	if !bytes.Equal(assembled, encoded) {
+		t.Fatal("fragment bodies do not tile the encoded response in index order")
 	}
 }
