@@ -2647,6 +2647,12 @@ pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u64, u32) + Send + Sync +
 /// Bidi streaming plan (Phase B).
 pub struct RequestStream {
     inner: tokio::sync::mpsc::Receiver<ChargedChunk>,
+    /// §2.2 (Stage 2 slice 2.4): a PROTECTED call's retire signal —
+    /// `poll_next` honors the RETIRED call BEFORE yielding, discarding
+    /// buffered items through the queue owner ("dropping a sender alone
+    /// does not discard a receiver's buffered items"). `None` on public
+    /// uploads (their documented contract is unchanged).
+    retired: Option<Arc<StreamRetireSignal>>,
     grant_emitter: Option<RpcRequestGrantEmitter>,
     /// AEAD-authenticated session that issued this call (R3-1) — the
     /// grant identity, so a grant refills only THIS call's semaphore.
@@ -2670,6 +2676,28 @@ impl RequestStream {
     ) -> Self {
         Self {
             inner,
+            retired: None,
+            grant_emitter,
+            from_node,
+            caller_origin,
+            call_id,
+        }
+    }
+
+    /// The PROTECTED constructor (Stage 2 slice 2.4): same stream, wired
+    /// to the call's retire signal so `poll_next` honors a retired call
+    /// before yielding (§2.2's request-chunk-queue row).
+    pub(crate) fn new_protected(
+        inner: tokio::sync::mpsc::Receiver<ChargedChunk>,
+        grant_emitter: Option<RpcRequestGrantEmitter>,
+        from_node: u64,
+        caller_origin: u64,
+        call_id: u64,
+        retire: Arc<StreamRetireSignal>,
+    ) -> Self {
+        Self {
+            inner,
+            retired: Some(retire),
             grant_emitter,
             from_node,
             caller_origin,
@@ -2685,6 +2713,17 @@ impl futures::Stream for RequestStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        // §2.2 (Stage 2 slice 2.4): a PROTECTED `poll_next` honors the
+        // RETIRED call BEFORE yielding — buffered items are discarded
+        // through the queue owner, never drained late after the call is
+        // retired (dropping the sender alone would not discard them).
+        if self
+            .retired
+            .as_ref()
+            .is_some_and(|signal| signal.taken().is_some())
+        {
+            return std::task::Poll::Ready(None);
+        }
         match self.inner.poll_recv(cx) {
             std::task::Poll::Ready(Some(chunk)) => {
                 // §2.7: the item's byte reservation releases when the
@@ -7541,12 +7580,13 @@ impl RpcStreamingRequestFold {
         } else {
             None
         };
-        let request_stream = RequestStream::new(
+        let request_stream = RequestStream::new_protected(
             rx,
             grant_emitter,
             ev.from_node,
             meta.origin_hash,
             meta.seq_or_ts,
+            Arc::clone(&retire_signal),
         );
         let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
             extract_trace_context(&payload.headers)
@@ -8382,12 +8422,13 @@ impl RpcDuplexFold {
         } else {
             None
         };
-        let request_stream = RequestStream::new(
+        let request_stream = RequestStream::new_protected(
             rx,
             grant_emitter,
             ev.from_node,
             meta.origin_hash,
             meta.seq_or_ts,
+            Arc::clone(&retire_signal),
         );
         let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
             extract_trace_context(&payload.headers)

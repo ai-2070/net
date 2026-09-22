@@ -4904,3 +4904,353 @@ async fn cross_direction_grant_is_ignored() {
         "the single response carries the aggregate",
     );
 }
+
+// ===========================================================================
+// Slice 2.4 — half-close + both-direction retirement (the §2.6 table +
+// its Stage 0 model witnesses bind): END closes input ONCE; retire closes
+// both halves; independent halves under one record.
+// ===========================================================================
+
+/// Slice 2.4 — `upload_end_then_remaining_output_completes`. The §2.6
+/// half-close independence: the caller's upload END closes the INPUT half
+/// ONCE (`input_half() == Ended`; a SECOND END never reopens it) while the
+/// OUTPUT half stays independent — the handler's remaining output (echoes
+/// IN ORDER, then the post-EOF tail) and ONE terminal complete after the
+/// early END, and a late post-END chunk is discarded without replacing the
+/// handler's result.
+#[tokio::test]
+async fn upload_end_then_remaining_output_completes() {
+    use net::adapter::net::cortex::rpc::{HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_END};
+
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x9Au8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x32);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-hc");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_b.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            "svc-hc",
+            Arc::new(s2::ExchangeDX {
+                entries: entries.clone(),
+                tail: b"UT-tail-5",
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc-hc.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), "svc-hc");
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        50,
+        caller_origin,
+        &s2::dx_opening("svc-hc", Some(0), b"UT-req-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the duplex opening",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                50,
+                &s13::chunk_payload(50, b"UT-req-2", false)
+            ),
+        )),
+        "the bridge accepted the continuation chunk",
+    );
+    // The upload END — input closes ONCE.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 50, &s13::chunk_payload(50, b"", true)),
+        )),
+        "the bridge accepted the upload END",
+    );
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    let owners = fold.lock().protected_owners();
+    let key = (caller.node_id(), session_id, caller_origin, 50u64);
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || owners
+            .get(&key)
+            .is_some_and(|c| c.input_half() == StreamCallInput::Ended))
+        .await,
+        "the upload END closes the input half",
+    );
+    // A SECOND END and a late post-END chunk change NOTHING.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 50, &s13::chunk_payload(50, b"", true)),
+        )),
+        "the bridge accepted the second END",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                50,
+                &s13::chunk_payload(50, b"UT-LATE", false)
+            ),
+        )),
+        "the bridge accepted the late chunk",
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        owners
+            .get(&key)
+            .expect("the record is alive (its output is credit-parked)")
+            .input_half(),
+        StreamCallInput::Ended,
+        "a second END can never reopen the closed input half",
+    );
+    // Release the credit-parked output so the remaining output drains.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 50, 3),
+        )),
+        "the bridge accepted the STREAM_GRANT for the remaining output",
+    );
+
+    // The REMAINING OUTPUT completes: echoes IN ORDER, the post-EOF tail,
+    // then ONE terminal with the exact wire content.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 4).await,
+        "the remaining output after the upload END completes — echoes + tail + terminal",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            seen.len(),
+            4,
+            "exactly two echoes, one tail and ONE terminal"
+        );
+        assert_eq!(
+            (
+                s15::response_of(&seen[0]).body.as_ref(),
+                s15::response_of(&seen[1]).body.as_ref(),
+                s15::response_of(&seen[2]).body.as_ref(),
+            ),
+            (
+                b"UT-req-1".as_slice(),
+                b"UT-req-2".as_slice(),
+                b"UT-tail-5".as_slice(),
+            ),
+            "the remaining output completes in order and the late chunk is nowhere",
+        );
+        let terminal = s15::response_of(&seen[3]);
+        assert_eq!(
+            (terminal.status, terminal.headers, terminal.body.as_ref()),
+            (
+                RpcStatus::Ok,
+                vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec()
+                )],
+                b"".as_slice(),
+            ),
+            "the terminal's exact wire content is Ok + `nrpc-streaming: end`",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        4,
+        "exactly one terminal, ever — the early END never mints a second one",
+    );
+}
+
+/// Slice 2.4 — `retire_unblocks_both_directions`. Under ONE record the
+/// retire closes BOTH halves: the INPUT-side waiter (the handler parked on
+/// request reads) is released — its owned future drops (§2.2's "canceled
+/// and dropped" — named) and the input admission is closed through the
+/// queue owner (`sender_keys()` empty — named) — and the OUTPUT-side
+/// waiter (the credit-parked pump holding a queued echo) is stopped:
+/// exactly ONE `Cancelled` terminal arrives, no chunk ever publishes (a
+/// LATE `STREAM_GRANT` after the terminal must NOT resurrect the parked
+/// pump — "no chunk is published after the terminal", §2.2's abort+join
+/// invariant — named), and a late input chunk is discarded.
+#[tokio::test]
+async fn retire_unblocks_both_directions() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x9Bu8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x33);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-ret");
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            "svc-ret",
+            Arc::new(s2::RetireProbeDX {
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&dropped),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+    let caller_origin = caller.origin_hash();
+    let reply_channel = ChannelName::new(&format!("svc-ret.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), "svc-ret");
+    // Zero response credit: the pump parks holding the handler's queued
+    // echo (the OUTPUT-side waiter).
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        51,
+        caller_origin,
+        &s2::dx_opening("svc-ret", Some(0), b"ret-item-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the zero-credit duplex opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || started.load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler started and parked on its input reads (the input-side waiter)",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "zero credit publishes nothing before the retire",
+    )
+    .await;
+
+    // The retire (the caller's CANCEL) closes BOTH halves.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::cancel_frame(caller_origin, 51),
+        )),
+        "the bridge accepted the CANCEL",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || dropped.load(Ordering::SeqCst)).await,
+        "the retire released the input-side waiter — its owned future dropped",
+    );
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || !fold
+            .lock()
+            .sender_keys()
+            .contains(&(caller.node_id(), session_id, caller_origin, 51u64)))
+        .await,
+        "the retire closed the input admission through the queue owner",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "exactly ONE terminal arrived — the output half completed its one terminal",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            s15::response_of(&seen[0]).status,
+            RpcStatus::Cancelled,
+            "the terminal is the retire's `Cancelled`",
+        );
+    }
+
+    // A LATE grant after the terminal must NOT resurrect the stopped pump
+    // ("no chunk is published after the terminal" — §2.2's abort+join), and
+    // a late input chunk is discarded.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 51, 5),
+        )),
+        "the bridge accepted the late STREAM_GRANT",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                51,
+                &s13::chunk_payload(51, b"ret-LATE", false)
+            ),
+        )),
+        "the bridge accepted the late chunk",
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        1,
+        "no chunk is published after the terminal — the late grant never \
+         resurrects the stopped pump",
+    );
+}

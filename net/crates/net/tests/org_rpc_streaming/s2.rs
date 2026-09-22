@@ -240,6 +240,39 @@ impl RpcDuplexHandler for EchoDX {
     }
 }
 
+/// A duplex handler for the retirement witness (Stage 2 slice 2.4): it
+/// queues ONE echo (the output-side waiter's parked item — the window is
+/// zero-credit so the pump parks holding it) and then parks on input reads
+/// (the input-side waiter). A retire releases BOTH: the owned handler
+/// future drops (§2.2's "cancellation signaled and the owned future
+/// dropped" — the `DropFlag` flips) and the credit-parked pump is stopped.
+pub(crate) struct RetireProbeDX {
+    pub(crate) started: Arc<AtomicUsize>,
+    pub(crate) dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for RetireProbeDX {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        mut requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _flag = DropFlag(Arc::clone(&self.dropped));
+        self.started.fetch_add(1, Ordering::SeqCst);
+        responses.send(Bytes::from_static(b"ret-queued-7"));
+        while requests.next().await.is_some() {}
+        Ok(())
+    }
+}
+
 /// A duplex handler for the exchange witness: echoes each request body as
 /// a response chunk, emits a content-labelled TAIL after input EOF, and
 /// completes — with the four-party attribution probes.
