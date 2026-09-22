@@ -131,6 +131,24 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, coordinator spot-checks (between-lanes window, executed).**
+  Two deferred receipts independently reproduced with the full cycle
+  (mutated red → `RESTORED_BYTE_IDENTICAL` → green):
+  (1) **S1.5's REQUIRED DirectOnly flip** — the protected arm of
+  `ProtectedAdmission::response_route_fallback` (`mesh_rpc.rs:7901-7904`)
+  flipped to `RosterOnStaleDirect` redden
+  `streaming_denial_is_not_fanned_out_to_the_reply_roster` byte-identically
+  to the lane's quote ("1 frame(s) reached the roster subscriber — a
+  protected response was fanned out / left: 1 / right: 0" at
+  `tests/org_rpc_streaming/s15.rs:202:9`).
+  (2) **S1.6's Revoked-mapping receipt** — `AdmissionDenied::coarse()`'s
+  `Revoked` moved to `Unavailable` redden
+  `every_denial_maps_to_a_defined_coarse_reason` ("left: Unavailable /
+  right: Denied" at `org_admission.rs:1895:13`) — the production-side proof
+  of the F-S1.4-1 ruling and its extended pin. Slices 1.5 and 1.6 accepted
+  at coordinator level. The remaining deferred receipts (R-1.1a; 1.2's six;
+  1.3's six; 1.4's ten; 1.5's other two; 1.6's other three) are queued for
+  review round 2's isolated-worktree re-executions.
 
 ## 1. S1Session — slice 1.1
 

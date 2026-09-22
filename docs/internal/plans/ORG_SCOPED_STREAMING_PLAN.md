@@ -115,7 +115,11 @@ by its separate unary plan and named-consumer streaming deferral.
 
 ## Context — verified boundary (head `85ecc77c9`)
 
-Paths under `net/crates/net/` unless prefixed.
+Paths under `net/crates/net/` unless prefixed. Shorthand `mesh.rs`,
+`mesh_rpc.rs`, `mod.rs`, `cortex/rpc.rs` and `behavior/*` resolve under
+`src/adapter/net/` (and `src/adapter/net/cortex/`) — the bare `mesh.rs:…`
+citations were drafting ambiguity, resolved 2026-09-22 (finding F3 of the
+S1 brief-drafting defects).
 
 | Surface | Evidence | Consequence |
 |---|---|---|
@@ -323,8 +327,11 @@ computed at `wire/src/crypto.rs:351`, discarded at `:419`). Q7 chooses C2's
 additive path: keep `SessionKeys` unchanged and add a finalization operation
 that returns keys plus the full binding before handshake state is consumed.
 The existing finalization API remains a compatible wrapper. Pass that binding
-through `NetSession::with_binding(keys, hash)` and store `Option<[u8; 32]>` on
-`NetSession`; existing hand-built sessions retain `None`. Expose
+through `NetSession::with_binding(keys, handshake_hash, peer_addr, pool_size,
+default_reliable)` — the contract's 2-arg spelling was a drafting error;
+`NetSession::new`'s three construction parameters are unchanged (arity ruling
+2026-09-22, defect F2) — and store `Option<[u8; 32]>` on `NetSession`;
+existing hand-built sessions retain `None`. Expose
 `MeshNode::peer_session_binding(node_id) -> Option<[u8; 32]>` beside
 `peer_session_id` (`mesh.rs:19623`). The caller signs the raw hash inside the
 domain-separated transcript (an HKDF label adds nothing the context string does
@@ -837,7 +844,7 @@ implementation and release evidence remain separately required.
 | C4 | New `AdmissionDenied` variants (`ShapeMismatch`, `SessionBindingMismatch`, `ActiveCallOwned`, `ActiveStreamCapacity`, `DeadlineExceedsPolicy`, `Revoked`, `ResourceExhausted`) | source break | `net` pub enum, **not** `#[non_exhaustive]` (`org_admission.rs:86`); external exhaustive `match` breaks | necessary | none that keeps one enum; add `#[non_exhaustive]` now (itself a break) | **Approved Q7; source-breaking release** |
 | C5 | Streaming in-flight keys gain `session_id` | behavioural | public SS/CS/DX folds | necessary for protected; optional for public | protected-only record keyed 4-tuple beside the 3-tuple public maps (second keying scheme) | **Approved Q3: public + protected** |
 | C6 | SS fold enforces `deadline_ns` (today advisory, `cortex/rpc.rs:2299-2302`) — a public SS handler that ignored an expired deadline previously kept running | behavioural, observable | public SS fold | necessary for protected; optional for public | enforce only for protected records | **Approved Q3: public nonzero deadlines + protected finite policy** |
-| C7 | CS/DX deadline terminal `Internal` → `Timeout` | behavioural, observable by callers matching status | public CS/DX folds | optional | leave public classification; protected uses `Timeout` | **Approved Q3: Timeout for both public and protected** |
+| C7 | CS/DX deadline terminal `Cancelled` → `Timeout` (premise corrected 2026-09-22, defect F-S1.3-1: CS/DX expiry emitted `Cancelled` via the deadline-cancel's CANCEL-wins override at `cortex/rpc.rs` terminal selection — **not** `Internal`; the executed citation governs over this table's original source trace) | behavioural, observable by callers matching status | public CS/DX folds | optional | leave public classification; protected uses `Timeout` | **Approved Q3: Timeout for both public and protected** |
 | C8 | Duplex response flow control honoured | behavioural | public duplex fold | necessary for protected duplex; optional for public — a public caller that sets `stream_window_initial` and never grants would now stall instead of receiving unbounded | protected-only map | **Approved Q3: honor opted-in windows on both** |
 | C9 | Distinguish service unregister from node shutdown | behavioural; public serve-handle drop contract preserved, node-wide teardown clarified | all node-owned streaming tasks; protected registration tasks on drop | protected drop and node shutdown need retirement | public serve-handle drop allows existing calls to finish while the node remains alive; all calls remain tracked for node shutdown | **Approved Q3 with this split; no unbounded join or rollback claim** |
 | C10 | `UnaryAdmission` → `ProtectedAdmission` | source, private enum | none | — | — | none needed |
