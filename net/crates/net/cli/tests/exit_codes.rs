@@ -127,6 +127,11 @@ fn code_2_on_malformed_bind_literal_for_listen_and_attach() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let psk = "42".repeat(32);
     let key = "01".repeat(32);
 
