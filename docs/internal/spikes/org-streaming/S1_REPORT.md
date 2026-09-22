@@ -2264,3 +2264,348 @@ the wire suite; the browser/SDK surfaces; the 1.1/1.1a witnesses
 Main); CS/DX protected admission and the `call_service_streaming` widening
 (later stages by contract); Windows workstation only — `#[cfg(unix)]` legs
 never compile here, no Linux/macOS execution.
+
+---
+
+## 3. Repair round (S1_R)
+
+**Lane:** S1Repair. **Pinned brief:** `spikes/org-streaming/S1_R_BRIEF.md`
+@`27d7a72ee`. HOLD closed over: `e25ac28bf` (the packet's reviewed head).
+Date: 2026-09-22. Windows host only. Every run `--retries 0 --no-tests=fail`
+on the warm aliases (`cargo tf` / `cargo tfl`, the graphs pinned in
+`net/crates/net/.cargo/config.toml`) from `net/crates/net/`. Claims are
+labelled executed vs source-established.
+
+### 3.1 Landed commits
+
+| commit | content |
+|---|---|
+| `60c287d1e` | the acceptance witnesses (rows 1–8): 3 new tests in `tests/org_rpc_streaming.rs`, 3 new in-source units in the `cortex/rpc.rs` test module, and the Row-8 doc naming (4 files, +738/−3) |
+| `4ab5738cf` | the per-row inverse receipts — an empty tree-change BY CONSTRUCTION (every mutation restored sha-proven); the receipts raw in the commit message |
+| (this commit) | this section |
+
+File ownership held exactly (executed: `git status` clean at both prior
+commits' trees): `net/crates/net/tests/org_rpc_streaming.rs`,
+`net/crates/net/tests/org_rpc_streaming/**` (incl. the frozen module docs),
+and the TEST MODULES ONLY of
+`net/crates/net/src/adapter/net/cortex/rpc.rs`. NO production-path edits:
+`mesh_rpc.rs` is sha-identical to `e25ac28bf`'s
+(`eda1c392eff64b26dd98c90f5a7b5df998af5c3f40b879cc1b6be8350e9d8f47`),
+and `cortex/rpc.rs`'s three additions live inside `#[cfg(test)] mod tests`.
+
+### 3.2 Witnesses, counts, and the per-row map
+
+`org_rpc_streaming`'s new count: **30** — the existing 27 preserved verbatim
+plus 3 new. Roster FROM SOURCE (30 `#[test]`/`#[tokio::test]` fns in
+`tests/org_rpc_streaming.rs`; the helper modules carry none) == 30 executed
+(`cargo tf --retries 0 --test org_rpc_streaming`, 30/30, exit 0). Full name
+list (sorted) — for Main's same-commit CI floor re-pin 27 → 30:
+
+```
+active_call_id_reuse_after_replay_window_is_refused
+completed_stream_drains_queued_items_in_order_with_content_and_end_terminal
+credential_clamp_expiry_is_admission_denied_not_timeout
+cross_org_completed_stream_drains_correlated_items_with_end_terminal
+floor_raise_retires_blocked_stream_before_publish_returns
+forbidden_stream_opening_causes_zero_handler_effects
+frozen_old_provider_refuses_stream_proof_with_not_supported
+late_chunk_from_replaced_session_is_dropped
+node_shutdown_retires_live_protected_streams
+omitted_deadline_gets_default_and_expires_idle
+poisoned_store_retires_all_protected_streams
+provider_policy_veto_denies_before_effects
+public_client_stream_deadline_expiry_is_typed_timeout
+public_ss_nonzero_deadline_expires_with_typed_timeout
+pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal
+queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire
+raise_between_reserve_and_install_denies_with_zero_effects
+replayed_opening_on_new_session_is_session_binding_mismatch
+requested_deadline_over_cap_is_refused_with_zero_effects
+requested_deadline_within_cap_is_honoured
+response_after_session_replacement_reaches_only_the_live_session
+serve_handle_drop_retires_live_stream_and_sibling_survives
+session_replacement_retires_old_call
+sibling_stream_of_other_org_sends_next_item_after_publication
+store_replacement_retires_all_and_resubscribes
+stream_opening_admits_cross_org
+stream_opening_admits_same_org
+stream_proof_on_unary_registration_is_not_supported
+streaming_denial_is_not_fanned_out_to_the_reply_roster
+unary_context_proof_is_binding_invalid_on_stream_registration
+```
+
+New in-source units (test module of `adapter/net/cortex/rpc.rs`): the
+three-module in-source filter (`adapter::net::cortex::rpc
+adapter::net::mesh_rpc org_stream`) runs **219/219** = the previous 216 +
+these 3, exit 0 (executed).
+
+| row | witness | where | asserted observation (the closure property) | named inverse |
+|---|---|---|---|---|
+| 1+2+7 same-org | `completed_stream_drains_queued_items_in_order_with_content_and_end_terminal` | integration, real bridge + REAL wire endpoint (the caller's reply-channel recorder) | a handler queues 2 CONTENT-LABELLED items under ZERO credit and RETURNS; a valid `STREAM_GRANT` arrives; the items publish IN ORDER (body bytes + wire sequence, never counted); then EXACTLY ONE terminal frame at the authenticated receiving endpoint with the exact wire content (status `Ok` + `nrpc-streaming: end`) — and stays one terminal ever | A2b (the items assertion) + A2c (the terminal assertion) |
+| 7 cross-org | `cross_org_completed_stream_drains_correlated_items_with_end_terminal` | integration, `serve_rpc_granted_streaming` + the granted/other-org intent (`fixture::cross_org_intent`) | the same observations under the cross-org authority intent shape | A2b + A2c (its own copies of both assertions) |
+| 3 | `node_budget_refusal_rolls_back_call_and_caller_reservations` | in-source sibling of `byte_reservation_rolls_back_in_order_and_releases_exactly_once` | a node-level refusal AFTER two successful level increments (call + caller); BOTH counters rolled back to exact values (400/400) and the node total unmoved | A3 |
+| 4 | `late_retire_against_a_reused_key_is_a_no_op_for_the_successor` | in-source unit (production `ProtectedCallRegistry`) | the S0 model's `late_operations_with_a_stale_incarnation_cannot_touch_the_successor` shape: the first record is retired and its supervisor-side single removal is driven directly (`complete`) — the key is reused IMMEDIATELY (NO `record_count()` wait or poll anywhere) while the first incarnation's cleanup-owner handles stay armed across the reuse; every late op carrying the stale incarnation (retire/complete/release/commit) is inert; the successor survives end to end (unsettled, un-signalled, own retire+complete exactly once) | A4 |
+| 5 | `response_after_session_replacement_reaches_only_the_live_session` | integration, real re-handshake + real wire endpoint | a response emitted strictly AFTER a session replacement reaches the LIVE session's endpoint while the REPLACED session's endpoint receives NOTHING — receiver-side attribution asserted on BOTH endpoints (`RpcInboundEvent::session_id`) | A5 — see F-S1R-1 |
+| 6 | `item_permit_transfer_consumes_once_across_the_handoff` | in-source unit (production `ItemPermit`) | the S0 model's `cancel_dequeue_handoff_consumes_one_permit` semantics at the production permit: source consumed, target owns (handoff is not memory reclamation — bytes stay charged), exactly ONE release across the pair, another call's live bytes stay charged throughout | A3b |
+| 8 | (documentation) | `frozen_85ecc77c9/old_serve.rs` + `frozen_85ecc77c9.rs` module docs | the denial-shape block's re-indentation is NAMED (whitespace-insensitive provenance statement + trimmed-hash evidence; vendored bodies untouched — their extraction sha256s remain the record) | no runtime inverse (R-Row8 below) |
+
+Preserved + controls (executed, one invocation): `org_ownership` 32/32 and
+the 8 preserved/control binaries (nrpc_streaming_gate,
+integration_nrpc_streaming, integration_nrpc_client_streaming,
+integration_nrpc_duplex, nrpc_registration_order, integration_nrpc_protected,
+org_admission_wire, subnet_org_boundary) 89/89 — **121/121, exit 0**.
+
+### 3.3 The six receipts (raw)
+
+Baselines: `cortex/rpc.rs`
+`35b003e55f5f75fe25350312ae5107bc3a11ed189b82f4d119a9ee5ddb8c0c92`;
+`mesh_rpc.rs`
+`eda1c392eff64b26dd98c90f5a7b5df998af5c3f40b879cc1b6be8350e9d8f47`.
+Each receipt: bounded diff at the production site → the row's NAMED RED (an
+assertion failure in every case — a compile error is never a red) →
+`git checkout --` restore proven `sha256sum ==` the baseline → restored
+green run. Identical text is committed verbatim as `4ab5738cf`'s message.
+
+**R-A2b (rows 1+2+7)** — supervisor pump post-close publish. Mutation
+(`cortex/rpc.rs` `run_stream_call_supervisor`, the pump's send-order comment
+anchor):
+
+```diff
+-            pump_emit(from_node, caller_origin, call_id, resp).await;
++            if !pump_gate.as_ref().is_some_and(|g| g.is_finished()) {
++                pump_emit(from_node, caller_origin, call_id, resp).await;
++            }
+```
+
+Run: `cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=completed_stream_drains_queued_items_in_order_with_content_and_end_terminal)
++ test(=cross_org_completed_stream_drains_correlated_items_with_end_terminal)'`
+— exit 100 (2 run: 0 passed, 2 failed), each witness red at ITS OWN named
+assertion:
+
+```
+tests/org_rpc_streaming.rs:2939:5: the same-org queued items publish IN ORDER
+  after the grant — a post-close discard of queued chunks leaves the caller
+  with its terminal only
+tests/org_rpc_streaming.rs:3092:5: the cross-org queued items publish IN
+  ORDER after the grant — a post-close discard of queued chunks leaves the
+  caller with its terminal only
+```
+
+Restore sha `35b003e5…` == baseline; restored green: same `-E` run, 2/2.
+
+**R-A2c (rows 1+2+7)** — the `Completed(Ok)` terminal's wire shape. Mutation
+(`cortex/rpc.rs` `stream_terminal_payload`, the `Completed(Ok)` arm):
+
+```diff
+-                HEADER_NRPC_STREAMING_END.to_vec(),
++                HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
+```
+
+Run: same `-E` pair — exit 100 (2 run, 2 failed), each witness red at ITS
+OWN named assertion with the exact wire diff visible:
+
+```
+tests/org_rpc_streaming.rs:2978:9: assertion `left == right` failed: the
+  same-org terminal frame's exact wire content is status Ok + the
+  `nrpc-streaming: end` marker
+  left: (Ok, [("nrpc-streaming", [99, 111, 110, 116, 105, 110, 117, 101])], [])
+ right: (Ok, [("nrpc-streaming", [101, 110, 100])], [])
+tests/org_rpc_streaming.rs:3129:9: assertion `left == right` failed: the
+  cross-org terminal frame's exact wire content is status Ok + the
+  `nrpc-streaming: end` marker (same left/right)
+```
+
+Restore sha `35b003e5…` == baseline; restored green: same `-E` run, 2/2.
+
+**R-A3 (row 3)** — `ByteBudgets::reserve`'s `NodeBudgetFull` arm rollback.
+Mutation (`cortex/rpc.rs`, both counter restorations deleted; the
+`return Err(ByteRefusal::NodeBudgetFull);` kept):
+
+```diff
+             Some(_) => {
+-                state.per_caller.insert(key.caller.clone(), caller_cur);
+-                state
+-                    .per_call
+-                    .insert((key.clone(), incarnation, direction), call_cur);
+                 return Err(ByteRefusal::NodeBudgetFull);
+             }
+```
+
+Run: `cargo tfl --retries 0 -E
+'test(=adapter::net::cortex::rpc::tests::node_budget_refusal_rolls_back_call_and_caller_reservations)'`
+— exit 100 (1 run, 1 failed):
+
+```
+src/adapter/net/cortex/rpc.rs:11804:9: assertion `left == right` failed:
+  the call counter was rolled back
+  left: 600
+ right: 400
+```
+
+Restore sha `35b003e5…` == baseline; restored green: same `-E` run, 1/1.
+
+**R-A3b (row 6)** — `ItemPermit::transfer` ownership consumption. Mutation
+(`cortex/rpc.rs`):
+
+```diff
+-    pub fn transfer(mut self) -> ItemPermit {
+-        self.settled = true;
++    pub fn transfer(self) -> ItemPermit {
+         ItemPermit {
+```
+
+Run: `cargo tfl --retries 0 -E
+'test(=adapter::net::cortex::rpc::tests::item_permit_transfer_consumes_once_across_the_handoff)'`
+— exit 100 (1 run, 1 failed/ABORT). FIRST failure is the named assertion:
+
+```
+src/adapter/net/cortex/rpc.rs:11873:9: assertion `left == right` failed:
+  transfer is not memory reclamation — the bytes stay charged across the
+  handoff
+  left: 0
+ right: 100
+```
+
+Disclosure (verbatim, after the named red): the unwinding drop of the source
+permit then trips the release-once guard —
+`panicked at src/adapter/net/cortex/rpc.rs:3963:14: byte permit released
+twice, or against the wrong call` — the process aborts (0xc0000409, fail-fast
+during the second panic). The named assertion at `11873` fired FIRST; the
+cascade is the release-once invariant confirming the pair's exactly-once
+semantics. Restore sha `35b003e5…` == baseline; restored green: same `-E`
+run, 1/1.
+
+**R-A4 (row 4)** — `retire_locked`'s incarnation fence. Mutation
+(`cortex/rpc.rs` `ProtectedCallRegistry::retire_locked`):
+
+```diff
+-        if record.incarnation != incarnation || record.phase == RegistryPhase::Terminal {
++        if record.phase == RegistryPhase::Terminal {
+```
+
+Run: `cargo tfl --retries 0 -E
+'test(=adapter::net::cortex::rpc::tests::late_retire_against_a_reused_key_is_a_no_op_for_the_successor)'`
+— exit 100 (1 run, 1 failed):
+
+```
+src/adapter/net/cortex/rpc.rs:12137:9: a LATE retire carrying the old
+  incarnation must be a no-op for the successor (§2.4)
+```
+
+(one `unused variable: incarnation` warning; compiled otherwise clean — the
+red is the assertion, not a build failure.) Restore sha `35b003e5…` ==
+baseline; restored green: same `-E` run, 1/1.
+
+**R-A5 (row 5)** — the streaming emitter's receiving-incarnation
+attribution. Mutation (`mesh_rpc.rs` `serve_rpc_streaming_impl`'s async emit
+closure):
+
+```diff
+-                let receiving_session_id = cached.map(|(_node, session)| session).unwrap_or(0);
++                let receiving_session_id = 0;
+```
+
+Run: `cargo tf --retries 0 --test org_rpc_streaming` (whole binary) —
+**exit 0: 30/30 GREEN, inclusive of `response_after_session_replacement_
+reaches_only_the_live_session`. GREEN UNDER ITS OWN INVERSE — finding
+F-S1R-1 below.** Restore sha `eda1c392…` == baseline; restored green:
+`cargo tf --retries 0 --test org_rpc_streaming -E
+'test(=response_after_session_replacement_reaches_only_the_live_session)'`,
+1/1.
+
+**R-Row8 (row 8)** — NO runtime inverse (documentation only): the re-indent
+naming is provenance text, receipted by the whitespace-trimmed sha256
+equality recorded in the frozen module's doc
+(`f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7` on both
+sides after reversing the one named prefix retarget; `cmp` clean). The
+vendored bodies are untouched; their extraction sha256s remain the record.
+
+### 3.4 Findings (stated, not decided)
+
+1. **F-S1R-1 — Row 5's named closure is unsatisfiable against A5 as written
+   (the witness is GREEN under its own inverse; P2; four weakenings: NONE
+   applies — the witness asserts the closure's literal observables and was
+   not widened, relaxed, deleted, or precondition-fixed).**
+   Source-established: the A5 site's value (`receiving_session_id`,
+   `mesh_rpc.rs:4771`) flows only into `RpcResponseJob.session_id` and
+   `publish_response_to_caller`'s same-named parameter, and those are
+   consumed ONLY inside `#[cfg(feature = "webrtc")]` — the enrollment-
+   promotion block (`enrollment_reservation_owner` /
+   `promote_on_enrollment_response` / `note_enrollment_rejected` /
+   `retire_enrollment_call`), itself further gated on `reply_channel ==
+   rtc::enroll_reply_channel(origin)` (unreachable from `<service>.replies.*`
+   reply channels) — plus `tracing` fields. Both sanctioned warm-alias
+   graphs deliberately exclude `webrtc` (`net/crates/net/.cargo/config.toml`:
+   "deliberately absent because it is the one feature with a C toolchain
+   dependency"). No receiver-side attribution surface — wire, emit seam, or
+   fold key — reads that value in any sanctioned graph, so "reddening under
+   A5" cannot be realized there. The witness LANDED as the row's
+   receiver-side-attribution pin (the executed property: post-replacement
+   response reaches the live session's endpoint, the replaced endpoint
+   receives nothing). **Stated for Main's ruling, not decided here:**
+   whether the witness stands on its own property value, or the closure
+   wording is revised to name an observable seam (e.g. the webrtc
+   enrollment-targeting behavior the value actually feeds).
+2. **F-S1R-2 — a displaced PROTECTED call's `SessionReplaced` terminal is
+   not a reliable wire observation (executed observation; mechanism
+   [INFERENCE]).** During Row-5 construction (executed iterations at this
+   head's parent): with the protected registration, the re-handshake DID
+   rotate the establishment and retire the call (the registry's record was
+   retired-and-removed inside the transition window — `record_count() == 0`
+   and no `terminal_reason` remained by probe time), yet the terminal frame
+   never reached a recording endpoint across a 30 s bound. [INFERENCE] The
+   terminal's publish races `install_peer_locked`'s peer transition
+   (`try_publish_to_peer` resolves the peer's session mid-transition;
+   `TxAdmit::SessionSuperseded` / `NoSession` at that instant are logged and
+   dropped, "not retried on the roster"). The witness therefore drives a
+   PUBLIC call whose response is emitted STRICTLY AFTER the replacement —
+   the deterministic shape of the closure's observables. The racy protected
+   terminal is left as an observation for Main (a possible follow-up
+   property: a post-replacement terminal that cannot be silently dropped).
+3. **F-S1R-3 — the HOLD packet's `a1c518dd…` trimmed hash is not
+   reproducible with standard tooling (record coherence; P3).** Executed:
+   `b2sum`/`b2sum -l 256`/`sha256sum`/`sha512sum`/`sha384sum`/`sha1sum`/
+   `md5sum` over the whitespace-trimmed five-line window (several newline/
+   trim framings) produced no `a1c518dd…` value. The frozen doc therefore
+   records a REPRODUCIBLE procedure and value instead: whitespace-trimmed
+   window, the one named prefix retarget reversed → byte-identical (`cmp`),
+   sha256 `f31eb08ec127c32f1a4ccf1892ec4dadf0fac151af89aad03cce65b60ad327a7`
+   on both sides (the raw extraction's `fa275454…` reproduces exactly). The
+   re-indentation itself is confirmed and now named (the raw windows differ
+   exactly in leading whitespace plus the named prefix).
+4. **Row-4 interpretation note (stated).** The closure phrase "reuses
+   `(caller, call_id)` while the old record's async cleanup is still armed
+   (do NOT wait for `record_count() == 0`)" is realized as the S0 model's
+   own §2.4 shape (`late_operations_with_a_stale_incarnation_cannot_touch_
+   the_successor`, named by the brief's Row-6 precedent): the first
+   record's supervisor-side single removal is driven DIRECTLY (`complete`)
+   and the same key is reused immediately — the witness contains no
+   `record_count()` wait or poll — while the first incarnation's
+   cleanup-owner handles stay armed (alive, late-op-capable) across the
+   reuse. (Source-established constraint on any other reading: production
+   `reserve` refuses `ActiveCallOwned` while ANY record exists for the key,
+   model and production alike — "a terminal record not yet reclaimed still
+   owns its key" — so a successor cannot install before the cleanup runs.)
+
+### 3.5 Never executed here (complete)
+
+- **The `webrtc` feature graph** — the only graph where the A5 value is
+  consumed (F-S1R-1). Never executed here: both warm aliases exclude it (C
+  toolchain dependency), and this round stayed on the pinned warm graphs by
+  the brief's evidence rules.
+- Linux/macOS and `#[cfg(unix)]` legs (Windows host only).
+- CI itself (branch unpushed; nobody pushes but Main) — the
+  `org_rpc_streaming` floor re-pin 27 → 30 (full name list in §3.2) is
+  delivered to Main with this round for a same-commit pin.
+- The benches (0.1 baselines), the wasm32 runner, `tests/cross_lang_*`, the
+  wire suite, the browser/SDK/facade surfaces.
+- The Stage-1 deferred receipts and the coordinator/reviewer spot-checks
+  (packet §5 preserved credit — not re-litigated here; nothing in this round
+  touches their code paths: `mesh_rpc.rs` production is sha-identical and
+  `cortex/rpc.rs` production is untouched).
+- The stage-end lint battery (`cargo fmt --check`, the clippy invocations,
+  the rustdoc lines, `cargo check --workspace --all-targets`) — Main's
+  stage-end list, outside this repair round's scoped proof.
+
+**Session-tree writes:** `S1_REPORT.md` §3 (this section) only.
