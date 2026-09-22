@@ -1047,6 +1047,58 @@ network namespaces with real nftables NAT, CI-only) with a port-mapping gateway
   working, proving the relay is not a prerequisite.
 These cannot run on the Windows development machine; they gate in CI.
 
+**R1a — TCP port mapping in the core (`47f497b46`):** each mapper is bound to
+one `MapTransport` (UDP default, so the mesh's own mapping task is unchanged).
+NAT-PMP gains `MapTcp` on opcode 2 and accepts only a map answer for its own
+transport; UPnP maps with the matching IGD protocol; `SequentialMapper::new_for`
+and `sequential_mapper_from_os_for` build either transport. Witnesses: TCP
+opcode/codec test and a mock-gateway TCP install that also refuses a
+UDP-opcode answer. 64/64 port-mapping unit tests; all-features clippy
+(all targets) and rustdoc clean. Inverses: forcing UDP in the TCP mapper,
+accepting any transport's answer — both caught.
+
+**R1b — minimal-config `up --enroll` with router mapping (`765d11299`):**
+
+- `up --enroll` needs no other flags. First run creates and persists a fixed
+  port (allocated TCP-first, then checked free for UDP — Windows reserves large
+  TCP-only ranges that sequential UDP allocation kept hitting), an issuer seed
+  (node state format v2 adds issuer + port; v1 still reads) and the default
+  ledger, and reports them in `enrollment.created`. `--issuer-identity`,
+  `--ledger` (must exist), `--bind` and `--public-addr` override. A foreign or
+  corrupt ledger/state still refuses.
+- Port mapping (default on, `--no-port-mapping` to disable): the mesh maps its
+  UDP port (`try_port_mapping`) and the new SDK `enrollment::portmap::TcpMapping`
+  maps the enrollment TCP port (install, 30-minute renewal, abandon + remove
+  after three failures, remove on shutdown). `up` waits up to 4 s for both and
+  reports `port_mapping` (`active` / `partial` / `unavailable` / `disabled`)
+  with the mapped addresses.
+- Token address, in order: `invite create --addr`, `--public-addr`, the
+  router mapping (only when **both** TCP and UDP were mapped), a concrete bind
+  address. With none, `invite create` refuses and names the fix — no guessing.
+  Bundles carry the mesh contact matching each token's address (the UDP
+  mapping for the mapped TCP address, otherwise the token's host and port).
+- **Dependency trade-off (for review):** the CLI now enables SDK
+  `port-mapping`; UPnP-IGD is SOAP over HTTP, so the default CLI binary gains
+  `igd-next` and a `hyper` HTTP *client* (no server, no TLS). NAT-PMP/PCP alone
+  would avoid it but misses routers that only speak UPnP.
+
+Validation (Windows): `enrollment_lifecycle` 6/6 and `node_lifecycle` 6/6
+(stable over repeated runs), including the minimal-config journey (auto-created
+port/issuer/ledger, device joins and attaches, restart reuses all three,
+per-invite `--addr` signed into the token) and the reduced refusal set
+(missing explicit ledger, unusable public address, foreign-issuer ledger).
+Unit: endpoint selection order, node-state v2 round trip + v1 read + tamper
+refusal, SDK TCP keeper (no gateway, install/renew/remove, abandon after
+failures). Full `net-cli` 335/335; SDK enrollment units 28/28; CLI and SDK
+clippy, SDK rustdoc (`full port-mapping`), rustfmt clean. Inverses: TCP-only
+mapping treated as direct, port not persisted, issuer regenerated, `--addr`
+ignored, wildcard bind claimed as an address — all caught.
+
+**Not yet proven:** that a real router mapping makes a NATed device joinable
+(tests always pass `--no-port-mapping` so a developer's own router is never
+touched). That is R1c: a natsim row with a port-mapping gateway (e.g.
+`miniupnpd`) and no relay in the topology, CI-only.
+
 **Next:** the device-side `net-mesh join <TOKEN|->` over `DeviceJoin` (show the
 inspection summary and require confirmation or `--yes`, persist before
 redeeming, install, then prove live attach), and `up` running as a joined node
