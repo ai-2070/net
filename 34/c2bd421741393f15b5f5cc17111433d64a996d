@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/cortex/checkpoint.rs
+  s_38828de26a56bb::t_cc7bdb56bc40d9 5-6,10-11,17-30,122-163,165-188,190-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "34c2bd421741393f15b5f5cc17111433d64a996d",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
