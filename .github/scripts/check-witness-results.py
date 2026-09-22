@@ -28,10 +28,13 @@ JUnit XML nextest writes for a run (`[profile.default.junit]` in
      reason), so a witness that only passed on attempt 2 is rejected here
      rather than being laundered into a green run. `--allow-flaky` opts out
      where a suite legitimately rides the default retry budget.
-  4. NO SILENT SHRINK — `--min` is the floor on executed cases in the suite,
-     the same anti-vacuity guard the per-name loops carried. The floor is
-     checked against COUNTED `<testcase>` elements and cross-checked against
-     the suite's `tests` attribute, so a doctored attribute cannot satisfy it.
+  4. NO SILENT SHRINK — `--min` is the floor on executed, NAMED cases in
+     the suite, the same anti-vacuity guard the per-name loops carried. A
+     nameless `<testcase/>` is rejected outright and counts toward nothing:
+     padding an artifact with empty-named elements is the doctored-artifact
+     shape this floor exists to refuse. The floor is checked against the
+     COUNTED elements and cross-checked against the suite's `tests`
+     attribute, so a doctored attribute cannot satisfy it either.
 
 Fail-closed on every axis: a missing file, an unparseable file, a suite that
 is absent, a zero-case suite, or a required name that is absent all exit 1.
@@ -117,14 +120,26 @@ def verify(
     name = suite_el.get("name") or "?"
     cases = suite_el.findall("testcase")
 
-    counted = len(cases)
+    # Only NAMED cases count toward anything: a bare `<testcase/>` is
+    # element padding, not an executed witness — the doctored-artifact
+    # shape this floor exists to refuse — so it is rejected outright and
+    # counts toward `--min` as nothing. Skipped and failed cases need no
+    # filter here; the verdict scan below already fails the suite for them.
+    nameless = sum(1 for c in cases if not (c.get("name") or "").strip())
+    if nameless:
+        failures.append(
+            f"suite {name!r} carries {nameless} nameless <testcase> element(s) "
+            "— a case with no name is not an executed witness and is rejected "
+            "outright"
+        )
+    counted = len(cases) - nameless
     if counted == 0:
         failures.append(f"suite {name!r} executed no tests at all")
 
     declared = suite_el.get("tests")
-    if declared is not None and declared.isdigit() and int(declared) != counted:
+    if declared is not None and declared.isdigit() and int(declared) != len(cases):
         failures.append(
-            f"suite {name!r} declares tests={declared} but carries {counted} "
+            f"suite {name!r} declares tests={declared} but carries {len(cases)} "
             "testcase element(s) — the artifact disagrees with itself"
         )
 
@@ -383,6 +398,29 @@ def self_test() -> int:
     expect(
         "a floor above the executed count is rejected",
         any("below the floor" in f for f in verify(ok_suite, ["alpha"], 4, False)),
+    )
+
+    padded = """<?xml version="1.0"?>
+<testsuites>
+  <testsuite name="sensing_consumer" tests="5" skipped="0" errors="0" failures="0">
+    <testcase name="alpha" classname="sensing_consumer"/>
+    <testcase name="beta" classname="sensing_consumer"/>
+    <testcase name="gamma" classname="sensing_consumer"/>
+    <testcase/>
+    <testcase name="" classname="sensing_consumer"/>
+  </testsuite>
+</testsuites>
+"""
+    expect(
+        "nameless padding cannot satisfy a floor (only named cases count)",
+        any("below the floor" in f for f in verify(_suite_from(padded), [], 5, False)),
+    )
+    expect(
+        "empty-named testcases are rejected outright",
+        any(
+            "nameless" in f
+            for f in verify(_suite_from(padded), ["alpha"], 3, False)
+        ),
     )
 
     failed = _PASS_XML.replace(

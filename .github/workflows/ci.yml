@@ -20,20 +20,23 @@ on:
       # green. `skills.yml` fires on the same files for the compile floor.
       - ".claude/skills/net-event-bus/examples/**"
       - "docs/data/examples.yaml"
-      - ".github/scripts/run-skill-examples.sh"
-      - ".github/scripts/skill_examples.py"
-      # `go-tests` runs the C-surface text guards before its toolchains.
-      # Editing a checker itself has to re-run it, or a loosened pattern
-      # lands green. Their other roots (`.claude/skills/`,
-      # `web/src/content/docs/`) are covered by the copies in `web.yml`.
-      - ".github/scripts/check-one-library-docs.py"
-      - ".github/scripts/check-header-count.py"
-      # The same rule for the checkers the test jobs ride on: editing one
-      # of these must re-run the workflow it gates, or a loosened predicate
-      # lands green.
-      - ".github/scripts/check-witness-results.py"
-      - ".github/scripts/check-roster.py"
-      - ".github/scripts/check-abi-commit.py"
+      # Every script under `.github/scripts/` is executed by a step of this
+      # workflow — the skill-example runners (`run-skill-examples.sh`,
+      # `skill_examples.py`), the C-surface text guards
+      # (`check-one-library-docs.py`, `check-header-count.py`), the
+      # witness/roster/ABI checkers, and the rest. Editing one must re-run
+      # the step that executes it, or a loosened predicate lands green.
+      # The WHOLE directory is watched rather than an enumerated list: the
+      # list rots (it once omitted ten of the scripts these steps run —
+      # `check-ffi-exports.py`, `check-callback-buffer-ownership.py`,
+      # `check-rpc-abi-parity.py`, `go-test-with-native-stacks.sh`,
+      # `check-script-permissions.py`, `check-npm-peer-range.py`,
+      # `check-npm-platform-packages.py`, `check-ts-consumer.sh`,
+      # `check-skill-example-ts.sh`, `check-python-wheel-features.py`)
+      # and over-firing is free. The checkers' other roots
+      # (`.claude/skills/`, `web/src/content/docs/`) are covered by the
+      # copies in `web.yml`.
+      - ".github/scripts/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -328,8 +331,19 @@ jobs:
           a_captured_stamp_compares_the_revocation_floor_generation
           a_cold_capture_cannot_observe_the_pre_publication_window
           a_torn_authority_vector_cannot_compare_current"
+          # The pin is the witness's OWN libtest run record —
+          # `test [<module>::…::]<name> ... ok`, the name as the final
+          # module segment — not the bare name anywhere in the output.
+          # Must-fail matrix (all rejected): a line that merely PRINTS the
+          # name (an error echo, a panic message),
+          # `test <name>::helper ... ok` (the name is a module segment,
+          # not the test), `test <name>_extra ... ok`, `test x<name>
+          # ... ok`. Must-pass: the run record itself, with or without its
+          # module path. The old token regex
+          # `(^|[^A-Za-z0-9_])<name>([^A-Za-z0-9_]|$)` accepted the first
+          # two.
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
+            if ! printf "%s" "$out" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required routing witness missing: $required"
               exit 1
             fi
@@ -377,8 +391,11 @@ jobs:
           cancelling_the_supervisor_drops_the_incarnation_and_frees_the_lease
           a_closed_watch_without_shutdown_is_loud_and_terminal
           a_sustained_superseded_streak_backs_off_and_reports_degraded"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
+            if ! printf "%s" "$out" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required routing supervisor witness missing: $required"
               exit 1
             fi
@@ -476,8 +493,11 @@ jobs:
           no_reader_can_observe_a_pool_beside_foreign_facts
           an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms
           the_two_hundred_fifty_seventh_slot_can_publish_no_pool"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED; do
-            if ! printf "%s" "$reg" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
+            if ! printf "%s" "$reg" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required org_routing_registry witness missing: $required"
               exit 1
             fi
@@ -521,8 +541,11 @@ jobs:
           two_snapshots_at_one_revision_are_refused_as_an_invariant_breach
           unrelated_newer_movement_advances_freshness_without_churn
           dropping_the_state_releases_every_demand"
+          # Same run-record anchor and must-fail matrix as the wiring
+          # step's pin above: printed names and
+          # `test <name>::helper ... ok` must fail it.
           for required in $REQUIRED_STATE; do
-            if ! printf "%s" "$state" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
+            if ! printf "%s" "$state" | grep -qE "^test ([A-Za-z0-9_]+::)*${required} \.\.\. ok$"; then
               echo "::error::required org_routing_state witness missing: $required"
               exit 1
             fi
@@ -957,9 +980,23 @@ jobs:
           cargo test -p net-deck --bins 2>&1 | tee /tmp/deck.log
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/deck.log || true)
           echo "deck unit tests: $ran"
-          # Stage 6 added the ICE column's ledger + rollup tests.
-          if [ "$ran" -lt 35 ]; then
-            echo "::error::net-deck ran $ran tests, floor is 35 — \
+          # Floor = what THIS command reports (33), with net-deck's
+          # `default = []` (deck/Cargo.toml). The tree carries 35 test
+          # attributes (the Stage 6 ICE column's ledger + rollup tests
+          # among them); two of the 35 are feature-gated out of this
+          # command by design and are excluded from the floor deliberately
+          # and by name:
+          #   * `the_rollup_the_anchor_column_renders_carries_an_ingested_anchor`
+          #     — app.rs, `#[cfg(feature = "webrtc")]` ("off by default");
+          #   * `demo_boots_and_logs_appear` — demo/spawn.rs via `mod demo`,
+          #     `#[cfg(feature = "demo")]` in main.rs ("dev-only").
+          # A floor the pinned command cannot reach (35) false-reds every
+          # run and guards nothing; the floor's real purpose — a suite that
+          # silently shrinks — is served only by the measured count. Stage
+          # counts follow measured counts: re-measure this exact command
+          # and its exact `grep -c` shape when tests move.
+          if [ "$ran" -lt 33 ]; then
+            echo "::error::net-deck ran $ran tests, floor is 33 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -6294,8 +6331,16 @@ jobs:
             --label "browser package ABI" --mode literal \
             --source tests/abi_real_package.mjs $REQUIRED
           node tests/abi_real_package.mjs | tee /tmp/abi-real.log
+          # The pin is the probe's own JSON run record — the `"name"`
+          # field of a `records` entry, exactly the shape
+          # `JSON.stringify({…, records}, null, 2)` prints — at least as
+          # tight as the quoted grep (`grep -q "\"$required\""`) this was
+          # once replaced by the looser token regex with. Must-fail matrix
+          # (all rejected): a bare print of the name, the name inside the
+          # evidence text, the name inside an `error` message. Must-pass:
+          # `      "name": "<name>",`.
           for required in $REQUIRED; do
-            grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)" /tmp/abi-real.log || {
+            grep -qE "^[[:space:]]*\"name\": \"${required}\",?\$" /tmp/abi-real.log || {
               echo "::error::ABI probe $required did not run"; exit 1; }
           done
           if grep -q '"pass": false' /tmp/abi-real.log; then
@@ -7039,8 +7084,16 @@ jobs:
                   --test acme_cold_start 2>&1) \
             || { printf '%s\n' "$out"; echo "::error::the cold-start ACME witness did not pass"; exit 1; }
           printf '%s\n' "$out" | tail -5
+          # The pin is the witness's own nextest run record —
+          # `PASS [time] <binary-id> <name>`, the name at end of line — not
+          # the bare name anywhere in the output. Must-fail matrix (all
+          # rejected): a line that merely PRINTS the name,
+          # `PASS [time] <id> <name>::helper`, `PASS [time] <id>
+          # <name>_extra`. Must-pass: the run record itself; `FAIL`/`SKIP`
+          # lines end the same way and are excluded by the `PASS` anchor
+          # (a failing run already exits nonzero above).
           printf '%s\n' "$out" \
-            | grep -qE '(^|[^A-Za-z0-9_])a_cold_cache_orders_a_certificate_and_then_serves_tls([^A-Za-z0-9_]|$)' \
+            | grep -qE '^ *PASS \[.* [^ ]+ a_cold_cache_orders_a_certificate_and_then_serves_tls$' \
             || { echo "::error::the cold-start witness did not run"; exit 1; }
 
       - name: Pebble log
