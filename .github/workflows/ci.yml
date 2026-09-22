@@ -323,7 +323,7 @@ jobs:
           a_cold_capture_cannot_observe_the_pre_publication_window
           a_torn_authority_vector_cannot_compare_current"
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -q "$required"; then
+            if ! printf "%s" "$out" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
               echo "::error::required routing witness missing: $required"
               exit 1
             fi
@@ -372,7 +372,7 @@ jobs:
           a_closed_watch_without_shutdown_is_loud_and_terminal
           a_sustained_superseded_streak_backs_off_and_reports_degraded"
           for required in $REQUIRED; do
-            if ! printf "%s" "$out" | grep -q "$required"; then
+            if ! printf "%s" "$out" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
               echo "::error::required routing supervisor witness missing: $required"
               exit 1
             fi
@@ -471,7 +471,7 @@ jobs:
           an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms
           the_two_hundred_fifty_seventh_slot_can_publish_no_pool"
           for required in $REQUIRED; do
-            if ! printf "%s" "$reg" | grep -q "$required"; then
+            if ! printf "%s" "$reg" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
               echo "::error::required org_routing_registry witness missing: $required"
               exit 1
             fi
@@ -516,7 +516,7 @@ jobs:
           unrelated_newer_movement_advances_freshness_without_churn
           dropping_the_state_releases_every_demand"
           for required in $REQUIRED_STATE; do
-            if ! printf "%s" "$state" | grep -q "$required"; then
+            if ! printf "%s" "$state" | grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)"; then
               echo "::error::required org_routing_state witness missing: $required"
               exit 1
             fi
@@ -6246,7 +6246,7 @@ jobs:
             --source tests/abi_real_package.mjs $REQUIRED
           node tests/abi_real_package.mjs | tee /tmp/abi-real.log
           for required in $REQUIRED; do
-            grep -q "\"$required\"" /tmp/abi-real.log || {
+            grep -qE "(^|[^A-Za-z0-9_])${required}([^A-Za-z0-9_]|$)" /tmp/abi-real.log || {
               echo "::error::ABI probe $required did not run"; exit 1; }
           done
           if grep -q '"pass": false' /tmp/abi-real.log; then
@@ -6978,7 +6978,7 @@ jobs:
             || { printf '%s\n' "$out"; echo "::error::the cold-start ACME witness did not pass"; exit 1; }
           printf '%s\n' "$out" | tail -5
           printf '%s\n' "$out" \
-            | grep -q 'a_cold_cache_orders_a_certificate_and_then_serves_tls' \
+            | grep -qE '(^|[^A-Za-z0-9_])a_cold_cache_orders_a_certificate_and_then_serves_tls([^A-Za-z0-9_]|$)' \
             || { echo "::error::the cold-start witness did not run"; exit 1; }
 
       - name: Pebble log
