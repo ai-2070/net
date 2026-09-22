@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/mesh_rpc_large_response_tests.rs
+  s_38828de26a56bb::t_10cfac0fa014a7 65-69,75,83,85-114,297-307,309-321,323-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "66568be71cc726673b278e43199d9e88f62e40a7",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
