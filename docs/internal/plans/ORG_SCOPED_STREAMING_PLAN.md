@@ -23,10 +23,16 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 
 ## Status
 
-**STAGE 0 READY; Q1–Q7 RESOLVED; PRODUCTION GATED ON EXECUTABLE EVIDENCE — source specification at head
-`85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`), revised 2026-09-19 after
-reviewer HOLD (Kyra). No production code changed; no stage is authorized by
-this document.**
+**STAGE 0 DELIVERED 2026-09-22 (branch `LZL0/org-streaming`), PENDING
+ACCEPTANCE; Q1–Q7 RESOLVED; STAGE 1 DISPATCH GATED ON THAT ACCEPTANCE AND ITS
+OWN PINNED BRIEF — source specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21`
+(`master`), revised 2026-09-19 after reviewer HOLD (Kyra). Stage 0 changed no
+production wire, behaviour or export: the two models are `#[cfg(test)]`, the
+bench groups are bench-only, and the probe is a guard workspace plus one CI
+step. Stage 0 evidence is `docs/internal/spikes/org-streaming/S0_REPORT.md`
+with `S0_RECEIPTS_LIFECYCLE.md` / `S0_RECEIPTS_REGISTRY.md`; its findings
+F1–F14 are named there. Delivered is not accepted: no later stage is
+dispatched or authorized by this document.**
 
 This revision replaces the older baseline (`3e88e50f…`) with a source trace at
 the current head across six lanes (admission/proof/replay, streaming folds,
@@ -1189,3 +1195,28 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   lifecycle and transaction models (0.3, 0.4) as the gate. Prefix-compatible
   proof retained, with execution against the frozen old decoder required in
   slice 1.2. No production edits.
+
+- 2026-09-22, Stage 0 executed on branch `LZL0/org-streaming` over the
+  unreviewed partial-state commit `23f33bf98` (which had landed the five slice
+  deliverables: bench groups + `Pair::protected()`, the `org_api_probe` guard
+  and its CI step, both model files at 74 witnesses, and the 0.5 mapping).
+  Verified and closed to 76 witnesses: the two composition checks the base
+  tree lacked (`protected_output_refusal_cannot_complete_ok`,
+  `terminal_queue_refusal_is_not_peer_receipt`) were written with in-test
+  positive controls; two more were renamed to the check table's exact names;
+  the §2.7 output-refusal latch and the §2.8 terminal-emission disposition
+  (`Queued`/`Sent`/`Unreachable`/`Refused`) were added to both drivers; and
+  the `ConfirmTxn` check→transfer window was closed (the registry guard is
+  held across the transaction — receipt 1 of `S0_RECEIPTS_REGISTRY.md` shows
+  the pre-fix shape losing a retire to `Applied(true)`). One pinned assertion
+  contradicting §2.7 (`is_live()` after a refused over-budget item) was
+  rewritten to the latching rule and named as finding F1 rather than silently
+  changed. Baselines measured (S0_REPORT §5): public control ≈ 39.6–49.5 µs
+  matching the June-13 audit's order, `org_unary_open` ≈ 236–245 µs, opening
+  delta ≈ **+195–200 µs per admitted call**, payload-independent. Inverse
+  receipts: 23 lifecycle mutation/restore cycles and 24 registry receipts
+  over 30 witnesses with zero green-under-inverse; two receipts independently
+  reproduced by the coordinator before acceptance (the output-refusal latch
+  and the confirm-transaction). Interleavings driven deterministically at the
+  exposed transaction boundaries (loom unused, stated as such). Probe green at
+  its exact CI commands. No production code changed. Stage 1 not dispatched.
