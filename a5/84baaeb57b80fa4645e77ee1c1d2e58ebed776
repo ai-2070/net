@@ -1,0 +1,18 @@
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  h_64425bc75e3f3d 7926-7939,7966-7968,7971,7974-7982,8213-8215
+net/crates/net/tests/org_rpc_streaming.rs
+  h_64425bc75e3f3d 4462-4906
+net/crates/net/tests/org_rpc_streaming/s2.rs
+  h_64425bc75e3f3d 23-26,28,34-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a584baaeb57b80fa4645e77ee1c1d2e58ebed776",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
