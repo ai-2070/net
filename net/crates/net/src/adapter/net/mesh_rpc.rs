@@ -2330,6 +2330,13 @@ pub struct ClientStreamCallRaw {
     /// `FLAG_RPC_PROPAGATE_TRACE` when the caller supplied a
     /// trace context.
     initial_flags: u16,
+    /// C11 (slice 2.1): the LAZY-OPENING mint's intent. `Some` on a
+    /// protected call: the client-streaming proof (kind 2) is signed over
+    /// the FINALIZED initial REQUEST at the first `send`/`finish` — its
+    /// body is the first chunk and the signed opening binds it (contract 2).
+    /// `None` on a public call (no proof is minted). A `JustOpened` drop
+    /// signs and sends nothing.
+    org_proof_intent: Option<OrgProofIntent>,
     /// `deadline_ns` from `CallOptions::deadline`. Embedded in the
     /// initial REQUEST.
     deadline_ns: u64,
@@ -2399,15 +2406,30 @@ impl ClientStreamCallRaw {
         self.observer.add_request_bytes(body.len() as u32);
         match self.state {
             ClientStreamState::JustOpened => {
-                // First send → initial REQUEST.
-                let req = RpcRequestPayload {
+                // First send → initial REQUEST. C11 (slice 2.1): the LAZY
+                // mint runs HERE, over the FINALIZED initial REQUEST — its
+                // body IS this first chunk, so the signed opening binds the
+                // first chunk (contract 2). The headers are cloned (not
+                // taken) so a refused mint leaves the handle intact.
+                let mut req = RpcRequestPayload {
                     service: self.service.clone(),
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags,
-                    headers: std::mem::take(&mut self.initial_headers),
+                    headers: self.initial_headers.clone(),
                     body: body.clone(),
                 };
+                if let Some(intent) = self.org_proof_intent.as_ref() {
+                    attach_signed_admission(
+                        &self.mesh,
+                        self.target_node_id,
+                        self.call_id,
+                        intent,
+                        &mut req,
+                        RpcCallShape::ClientStreaming,
+                    )?;
+                }
                 self.publish_initial_request(&req).await?;
+                self.initial_headers.clear();
                 self.state = ClientStreamState::Sending;
             }
             ClientStreamState::Sending => {
@@ -2444,13 +2466,26 @@ impl ClientStreamCallRaw {
     pub async fn finish(mut self) -> Result<RpcReply, RpcError> {
         match self.state {
             ClientStreamState::JustOpened => {
-                let req = RpcRequestPayload {
+                // Zero-item degenerate path + C11 (slice 2.1): the LAZY mint
+                // over the FINALIZED initial REQUEST (contract 2 — the signed
+                // opening binds this opening request, empty body and all).
+                let mut req = RpcRequestPayload {
                     service: self.service.clone(),
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags | FLAG_RPC_REQUEST_END,
                     headers: std::mem::take(&mut self.initial_headers),
                     body: Bytes::new(),
                 };
+                if let Some(intent) = self.org_proof_intent.as_ref() {
+                    attach_signed_admission(
+                        &self.mesh,
+                        self.target_node_id,
+                        self.call_id,
+                        intent,
+                        &mut req,
+                        RpcCallShape::ClientStreaming,
+                    )?;
+                }
                 self.publish_initial_request(&req).await?;
             }
             ClientStreamState::Sending => {
@@ -2675,6 +2710,11 @@ pub struct DuplexSink {
     service: String,
     initial_headers: Vec<(String, Vec<u8>)>,
     initial_flags: u16,
+    /// C11 (slice 2.1): the LAZY-OPENING mint's intent — see
+    /// [`ClientStreamCallRaw::org_proof_intent`]. The duplex proof (kind 3)
+    /// is signed over the finalized initial REQUEST at the first
+    /// `send`/`finish_sending`; `None` on a public call.
+    org_proof_intent: Option<OrgProofIntent>,
     deadline_ns: u64,
     credit_sem: Option<Arc<tokio::sync::Semaphore>>,
     grant_pump: Option<JoinHandle<()>>,
@@ -2703,14 +2743,30 @@ impl DuplexSink {
         self.inner.observer.add_request_bytes(body.len() as u32);
         match self.state {
             ClientStreamState::JustOpened => {
-                let req = RpcRequestPayload {
+                // First send → initial REQUEST. C11 (slice 2.1): the LAZY
+                // mint runs HERE, over the FINALIZED initial REQUEST — its
+                // body IS this first chunk, so the signed opening binds the
+                // first chunk (contract 2). The headers are cloned (not
+                // taken) so a refused mint leaves the handle intact.
+                let mut req = RpcRequestPayload {
                     service: self.service.clone(),
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags,
-                    headers: std::mem::take(&mut self.initial_headers),
+                    headers: self.initial_headers.clone(),
                     body: body.clone(),
                 };
+                if let Some(intent) = self.org_proof_intent.as_ref() {
+                    attach_signed_admission(
+                        &self.inner.mesh,
+                        self.inner.target_node_id,
+                        self.inner.call_id,
+                        intent,
+                        &mut req,
+                        RpcCallShape::Duplex,
+                    )?;
+                }
                 self.publish_initial_request(&req).await?;
+                self.initial_headers.clear();
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
                 self.state = ClientStreamState::Sending;
             }
@@ -2742,13 +2798,26 @@ impl DuplexSink {
     pub async fn finish_sending(mut self) -> Result<(), RpcError> {
         match self.state {
             ClientStreamState::JustOpened => {
-                let req = RpcRequestPayload {
+                // Zero-item degenerate path + C11 (slice 2.1): the LAZY mint
+                // over the FINALIZED initial REQUEST (contract 2 — the signed
+                // opening binds this opening request, empty body and all).
+                let mut req = RpcRequestPayload {
                     service: self.service.clone(),
                     deadline_ns: self.deadline_ns,
                     flags: self.initial_flags | FLAG_RPC_REQUEST_END,
                     headers: std::mem::take(&mut self.initial_headers),
                     body: Bytes::new(),
                 };
+                if let Some(intent) = self.org_proof_intent.as_ref() {
+                    attach_signed_admission(
+                        &self.inner.mesh,
+                        self.inner.target_node_id,
+                        self.inner.call_id,
+                        intent,
+                        &mut req,
+                        RpcCallShape::Duplex,
+                    )?;
+                }
                 self.publish_initial_request(&req).await?;
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
             }
@@ -2941,6 +3010,7 @@ impl DuplexCallRaw {
             service: String::new(),
             initial_headers: Vec::new(),
             initial_flags: 0,
+            org_proof_intent: None,
             deadline_ns: 0,
             credit_sem: None,
             grant_pump: None,
@@ -5428,15 +5498,18 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<ClientStreamCallRaw, RpcError> {
-        // Org admission is unary-only (E1.8): a proof intent on a streaming call
-        // shape is a caller error, never a silently-ignored security intent.
-        if opts.org_proof_intent.is_some() {
-            return Err(RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
-                          protected service"
-                    .to_string(),
-            });
+        // C11 (slices 2.1 + row 5): `call_client_stream` ACCEPTS an
+        // `org_proof_intent` and mints a CLIENT-STREAMING call proof (kind 2)
+        // LAZILY — over the finalized initial REQUEST at the first
+        // `send`/`finish` (contract 2: the signed opening binds the opening
+        // request INCLUDING its body, and the initial REQUEST's body IS the
+        // first chunk). The intent's local refusals still fail HERE, at the
+        // call — the pinned-provider clause first (it would disclose the
+        // credential), then the capability/TTL clauses — exactly as the eager
+        // mints' do; `JustOpened` drop still sends (and signs) nothing.
+        if let Some(intent) = opts.org_proof_intent.as_ref() {
+            check_provider_binding(self, target_node_id, intent)?;
+            validate_org_proof_intent(intent, service)?;
         }
         // `request_window_initial = Some(0)` would deadlock the
         // caller: every `send` awaits a credit, but the initial
@@ -5517,6 +5590,7 @@ impl MeshNode {
             service: service.to_string(),
             initial_headers,
             initial_flags,
+            org_proof_intent: opts.org_proof_intent,
             deadline_ns,
             credit_sem,
             grant_pump,
@@ -5798,15 +5872,18 @@ impl MeshNode {
         service: &str,
         opts: CallOptions,
     ) -> Result<DuplexCallRaw, RpcError> {
-        // Org admission is unary-only (E1.8): a proof intent on a streaming call
-        // shape is a caller error, never a silently-ignored security intent.
-        if opts.org_proof_intent.is_some() {
-            return Err(RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: "org admission (org_proof_intent) is unary-only; use `call` for a \
-                          protected service"
-                    .to_string(),
-            });
+        // C11 (slices 2.1 + row 5): `call_duplex` ACCEPTS an
+        // `org_proof_intent` and mints a DUPLEX call proof (kind 3) LAZILY —
+        // over the finalized initial REQUEST at the first `send`/
+        // `finish_sending` (contract 2: the signed opening binds the opening
+        // request INCLUDING its body, and the initial REQUEST's body IS the
+        // first chunk). The intent's local refusals still fail HERE, at the
+        // call — the pinned-provider clause first (it would disclose the
+        // credential), then the capability/TTL clauses — exactly as the eager
+        // mints' do; `JustOpened` drop still sends (and signs) nothing.
+        if let Some(intent) = opts.org_proof_intent.as_ref() {
+            check_provider_binding(self, target_node_id, intent)?;
+            validate_org_proof_intent(intent, service)?;
         }
         // Same deadlock guard as `call_client_stream`: Some(0)
         // means "send must await a credit that can never arrive"
@@ -5912,6 +5989,7 @@ impl MeshNode {
             service: service.to_string(),
             initial_headers,
             initial_flags,
+            org_proof_intent: opts.org_proof_intent,
             deadline_ns,
             credit_sem,
             grant_pump,
@@ -6008,77 +6086,23 @@ impl MeshNode {
         };
         // C11 (slice 1.6): `call_streaming` accepts an `org_proof_intent` and
         // mints a STREAMING call proof (kind = server-streaming) bound to the
-        // exact session this call rides (§1.3). The shared mint helper is the
-        // unary `call`'s verbatim block below — pinned-entity binding,
-        // exactly-one-header discipline, the finalized wire bounds and the
-        // one-packet measurement — with the shape and the receiving session's
-        // Noise handshake hash threaded through. A streaming mint without a
-        // binding (a hand-built session) fails LOCAL, fail-closed.
+        // exact session this call rides (§1.3) — through the shared
+        // finalization helper ([`attach_signed_admission`], the unary `call`'s
+        // verbatim block: pinned-entity binding, exactly-one-header
+        // discipline, the finalized wire bounds and the one-packet
+        // measurement) with the shape and the receiving session's Noise
+        // handshake hash threaded through. A streaming mint without a binding
+        // (a hand-built session) fails LOCAL, fail-closed.
         if let Some(intent) = opts.org_proof_intent.as_ref() {
-            // Publishing an A-bound proof to provider B would DISCLOSE the
-            // credential to the wrong peer (the unary block's verbatim
-            // clause)…
-            match self.peer_entity_id(target_node_id) {
-                Some(pinned) if pinned == intent.provider => {}
-                Some(_) => {
-                    return Err(RpcError::Codec {
-                        direction: CodecDirection::Encode,
-                        message: format!(
-                            "org admission: proof provider does not match the pinned entity \
-                             of target {target_node_id:#x}"
-                        ),
-                    });
-                }
-                None => {
-                    return Err(RpcError::Codec {
-                        direction: CodecDirection::Encode,
-                        message: format!(
-                            "org admission: target {target_node_id:#x} has no pinned entity \
-                             to bind the proof to"
-                        ),
-                    });
-                }
-            }
-            // Exactly ONE proof header may ride, and only the builder sets it.
-            if req
-                .headers
-                .iter()
-                .any(|(name, _)| name == ORG_ADMISSION_HEADER)
-            {
-                return Err(RpcError::Codec {
-                    direction: CodecDirection::Encode,
-                    message: "org admission: request already carries a net-org-admission header"
-                        .to_string(),
-                });
-            }
-            // §1.3: the streaming proof binds the RECEIVING session's full
-            // Noise handshake hash — the exact session this call rides.
-            let session_binding = self.peer_session_binding(target_node_id);
-            let header = sign_admission_proof(
-                intent,
+            check_provider_binding(self, target_node_id, intent)?;
+            attach_signed_admission(
+                self,
+                target_node_id,
                 call_id,
-                &req,
+                intent,
+                &mut req,
                 RpcCallShape::ServerStreaming,
-                session_binding,
             )?;
-            req.headers.push(header);
-            req.validate_wire_bounds().map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: format!("org admission: finalized request exceeds wire bounds: {e}"),
-            })?;
-            // The unary block's verbatim one-packet clause.
-            let finalized = request_wire_size(&req);
-            if finalized > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE {
-                let budget = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
-                return Err(RpcError::Codec {
-                    direction: CodecDirection::Encode,
-                    message: format!(
-                        "org admission: the finalized request is {finalized} bytes with the \
-                         signed admission proof on it, over the {budget}-byte per-packet \
-                         budget; a frame that large is never delivered, so it is refused here"
-                    ),
-                });
-            }
         }
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
@@ -6681,87 +6705,21 @@ impl MeshNode {
         // E2.1 / Kyra #47 B3: finalize a protected call ATOMICALLY and validate
         // the FINAL wire before registering the pending oneshot, so a local
         // construction failure cannot leak a pending entry and an over-cap
-        // finalized frame cannot panic/truncate at encode.
+        // finalized frame cannot panic/truncate at encode. The block is the
+        // shared finalization helper verbatim (pinned-entity binding,
+        // exactly-one-header discipline, the finalized wire bounds and the
+        // one-packet measurement); the unary proof carries no session binding
+        // (§1.3 is streaming-only).
         if let Some(intent) = opts.org_proof_intent.as_ref() {
-            // The proof binds EXACTLY ONE provider (P). Refuse to publish it to a
-            // transport target that is not P: look up the pinned entity for
-            // `target_node_id` and require it to equal `intent.provider`.
-            // Publishing an A-bound proof to provider B would DISCLOSE the
-            // credential to the wrong peer and can only end in a remote binding
-            // denial — fail the caller LOCALLY instead (Kyra #47 tail). An
-            // unpinned target (no TOFU binding yet) is refused too: we cannot
-            // prove it is P.
-            match self.peer_entity_id(target_node_id) {
-                Some(pinned) if pinned == intent.provider => {}
-                Some(_) => {
-                    return Err(RpcError::Codec {
-                        direction: CodecDirection::Encode,
-                        message: format!(
-                            "org admission: proof provider does not match the pinned entity \
-                             of target {target_node_id:#x}"
-                        ),
-                    });
-                }
-                None => {
-                    return Err(RpcError::Codec {
-                        direction: CodecDirection::Encode,
-                        message: format!(
-                            "org admission: target {target_node_id:#x} has no pinned entity \
-                             to bind the proof to"
-                        ),
-                    });
-                }
-            }
-            // Exactly ONE proof header may ride, and only the builder sets it:
-            // reject a caller-supplied one here rather than appending a second
-            // and letting the provider deny MultipleHeaders.
-            if req
-                .headers
-                .iter()
-                .any(|(name, _)| name == ORG_ADMISSION_HEADER)
-            {
-                // Local caller-input error, before any network work AND before
-                // the metrics guard is created — no `in_flight` bump to undo and
-                // no CallOutcome to record.
-                return Err(RpcError::Codec {
-                    direction: CodecDirection::Encode,
-                    message: "org admission: request already carries a net-org-admission header"
-                        .to_string(),
-                });
-            }
-            // Sign over the FINALIZED request (the digest strips the header, so
-            // caller + provider agree), append exactly one proof header, then
-            // validate the FINAL bounds — 32 supplied headers + the proof header
-            // would otherwise be 33 > MAX_RPC_HEADERS and panic (debug) /
-            // truncate (release) at `encode_into`.
-            let header = sign_admission_proof(intent, call_id, &req, RpcCallShape::Unary, None)?;
-            req.headers.push(header);
-            req.validate_wire_bounds().map_err(|e| RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: format!("org admission: finalized request exceeds wire bounds: {e}"),
-            })?;
-            // Field ceilings are not the packet. One nRPC frame rides ONE
-            // mesh packet, and a frame that does not fit is neither
-            // delivered nor refused — it disappears, and the caller waits
-            // out its deadline for an answer nobody could send. The
-            // signed proof is request bytes like any others, so a request
-            // a caller sized against the accepted budget can be pushed
-            // over it by an addition made HERE, after every caller-side
-            // check has already passed. Measure what will actually be
-            // sent, and refuse it locally — before the pending oneshot is
-            // registered, so nothing is left waiting.
-            let finalized = request_wire_size(&req);
-            if finalized > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE {
-                let budget = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
-                return Err(RpcError::Codec {
-                    direction: CodecDirection::Encode,
-                    message: format!(
-                        "org admission: the finalized request is {finalized} bytes with the \
-                         signed admission proof on it, over the {budget}-byte per-packet \
-                         budget; a frame that large is never delivered, so it is refused here"
-                    ),
-                });
-            }
+            check_provider_binding(self, target_node_id, intent)?;
+            attach_signed_admission(
+                self,
+                target_node_id,
+                call_id,
+                intent,
+                &mut req,
+                RpcCallShape::Unary,
+            )?;
         }
 
         // Caller-side metrics guard, created ONLY after all fallible LOCAL
@@ -7446,6 +7404,153 @@ const REPLY_SUBSCRIBE_ATTEMPTS: usize = 3;
 /// silently degraded to "always use the backup".
 const REPLY_SUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// The caller-side [`OrgProofIntent`] checks that do NOT need the finalized
+/// request body: the intent's capability must match the invoked service
+/// (`nrpc:<service>`), and the requested TTL must be an honest, finite
+/// lifetime the provider will accept. Shared by the eager mint
+/// ([`sign_admission_proof`]) and the lazy-opening ENTRIES
+/// ([`MeshNode::call_client_stream`] / [`MeshNode::call_duplex`], slice 2.1)
+/// so a mismatched intent fails LOCAL at the call — never at the first
+/// `send`, and never reaching a provider as a `CapabilityMismatch` denial
+/// (Kyra #47 tail, verbatim clauses).
+fn validate_org_proof_intent(intent: &OrgProofIntent, service: &str) -> Result<(), RpcError> {
+    // The intent's capability must match the invoked service (`nrpc:<service>`),
+    // else the provider would deny `CapabilityMismatch` — fail the caller locally
+    // (Kyra #47 tail).
+    let expected = CapabilityAuthorityId::for_tag(&format!("nrpc:{}", service));
+    if intent.capability != expected {
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: intent capability does not match the invoked service `{}`",
+                service
+            ),
+        });
+    }
+    // The requested TTL must be an honest, finite lifetime the provider will
+    // accept: fail the CALLER locally unless `1..=MAX_ORG_PROOF_TTL_SECS`
+    // (Kyra #47 tail). This is the SAME ceiling (`org_call::MAX_ORG_PROOF_TTL_SECS`,
+    // 30 s) the provider enforces at verify time (§2.3), so a caller cannot mint a
+    // proof the provider is guaranteed to reject as `TtlTooLong`. We do NOT clamp:
+    // silently capping would mint a proof with a lifetime the caller did not
+    // request. 0 is rejected too — a proof that expires within the same whole
+    // second is not a usable credential and only differs from a live one inside
+    // the provider's clock-skew tolerance, so it must not be treated as a valid
+    // request.
+    if intent.proof_ttl_secs == 0 || intent.proof_ttl_secs > MAX_ORG_PROOF_TTL_SECS {
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: proof TTL {}s out of range (1..={MAX_ORG_PROOF_TTL_SECS})",
+                intent.proof_ttl_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The unary `call`'s verbatim provider-binding clause (E2.1), shared by
+/// every protected caller: the proof binds EXACTLY ONE provider (P).
+/// Refuse to publish it to a transport target that is not P: look up the
+/// pinned entity for `target_node_id` and require it to equal
+/// `intent.provider`. Publishing an A-bound proof to provider B would
+/// DISCLOSE the credential to the wrong peer and can only end in a remote
+/// binding denial — fail the caller LOCALLY instead (Kyra #47 tail). An
+/// unpinned target (no TOFU binding yet) is refused too: we cannot prove
+/// it is P.
+fn check_provider_binding(
+    mesh: &MeshNode,
+    target_node_id: u64,
+    intent: &OrgProofIntent,
+) -> Result<(), RpcError> {
+    match mesh.peer_entity_id(target_node_id) {
+        Some(pinned) if pinned == intent.provider => Ok(()),
+        Some(_) => Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: proof provider does not match the pinned entity \
+                 of target {target_node_id:#x}"
+            ),
+        }),
+        None => Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: target {target_node_id:#x} has no pinned entity \
+                 to bind the proof to"
+            ),
+        }),
+    }
+}
+
+/// The shared FINALIZATION step of every protected call (E2.1 / contract 2):
+/// sign the admission proof over the **finalized** `req` (the digest strips
+/// the header, so caller + provider agree), append exactly one proof header,
+/// then validate the FINAL wire — the finalized wire bounds AND the one-packet
+/// measurement. The unary `call`'s verbatim block, shared by the eager
+/// streaming mint ([`MeshNode::call_streaming`]) and the lazy-opening mint of
+/// client-streaming / duplex (slice 2.1: the initial REQUEST is finalized at
+/// the first `send`/`finish`, its body IS the first chunk, and the signed
+/// opening binds it — [`org_request_digest`] covers the body).
+///
+/// The exactly-one-header discipline holds here: only the builder sets the
+/// proof header — reject a caller-supplied one rather than appending a second
+/// and letting the provider deny `MultipleHeaders`.
+fn attach_signed_admission(
+    mesh: &MeshNode,
+    target_node_id: u64,
+    call_id: u64,
+    intent: &OrgProofIntent,
+    req: &mut RpcRequestPayload,
+    call_shape: RpcCallShape,
+) -> Result<(), RpcError> {
+    if req
+        .headers
+        .iter()
+        .any(|(name, _)| name == ORG_ADMISSION_HEADER)
+    {
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: "org admission: request already carries a net-org-admission header"
+                .to_string(),
+        });
+    }
+    // §1.3: a STREAMING proof binds the RECEIVING session's full Noise
+    // handshake hash — the exact session this call rides. A streaming mint
+    // without one (a hand-built session) fails LOCAL, fail-closed. The unary
+    // proof carries no session binding (§1.3 is streaming-only).
+    let session_binding = match call_shape {
+        RpcCallShape::Unary => None,
+        _ => mesh.peer_session_binding(target_node_id),
+    };
+    let header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
+    req.headers.push(header);
+    req.validate_wire_bounds().map_err(|e| RpcError::Codec {
+        direction: CodecDirection::Encode,
+        message: format!("org admission: finalized request exceeds wire bounds: {e}"),
+    })?;
+    // Field ceilings are not the packet. One nRPC frame rides ONE mesh
+    // packet, and a frame that does not fit is neither delivered nor refused
+    // — it disappears, and the caller waits out its deadline for an answer
+    // nobody could send. The signed proof is request bytes like any others,
+    // so a request a caller sized against the accepted budget can be pushed
+    // over it by an addition made HERE, after every caller-side check has
+    // already passed. Measure what will actually be sent, and refuse it
+    // locally.
+    let finalized = request_wire_size(req);
+    if finalized > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE {
+        let budget = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE;
+        return Err(RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!(
+                "org admission: the finalized request is {finalized} bytes with the \
+                 signed admission proof on it, over the {budget}-byte per-packet \
+                 budget; a frame that large is never delivered, so it is refused here"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Mint a random 64-bit call_id. Used as the correlation token
 /// for REQUEST/RESPONSE pairing. The fold keys pending oneshots on
 /// this value; any session peer with publish access to the reply
@@ -7509,38 +7614,7 @@ fn sign_admission_proof(
     call_shape: RpcCallShape,
     session_binding: Option<[u8; 32]>,
 ) -> Result<(String, Vec<u8>), RpcError> {
-    // The intent's capability must match the invoked service (`nrpc:<service>`),
-    // else the provider would deny `CapabilityMismatch` — fail the caller locally
-    // (Kyra #47 tail).
-    let expected = CapabilityAuthorityId::for_tag(&format!("nrpc:{}", req.service));
-    if intent.capability != expected {
-        return Err(RpcError::Codec {
-            direction: CodecDirection::Encode,
-            message: format!(
-                "org admission: intent capability does not match the invoked service `{}`",
-                req.service
-            ),
-        });
-    }
-    // The requested TTL must be an honest, finite lifetime the provider will
-    // accept: fail the CALLER locally unless `1..=MAX_ORG_PROOF_TTL_SECS`
-    // (Kyra #47 tail). This is the SAME ceiling (`org_call::MAX_ORG_PROOF_TTL_SECS`,
-    // 30 s) the provider enforces at verify time (§2.3), so a caller cannot mint a
-    // proof the provider is guaranteed to reject as `TtlTooLong`. We do NOT clamp:
-    // silently capping would mint a proof with a lifetime the caller did not
-    // request. 0 is rejected too — a proof that expires within the same whole
-    // second is not a usable credential and only differs from a live one inside
-    // the provider's clock-skew tolerance, so it must not be treated as a valid
-    // request.
-    if intent.proof_ttl_secs == 0 || intent.proof_ttl_secs > MAX_ORG_PROOF_TTL_SECS {
-        return Err(RpcError::Codec {
-            direction: CodecDirection::Encode,
-            message: format!(
-                "org admission: proof TTL {}s out of range (1..={MAX_ORG_PROOF_TTL_SECS})",
-                intent.proof_ttl_secs
-            ),
-        });
-    }
+    validate_org_proof_intent(intent, &req.service)?;
     let digest = org_request_digest(req).map_err(|e| RpcError::Codec {
         direction: CodecDirection::Encode,
         message: format!("org admission: request digest failed: {e}"),
@@ -9837,12 +9911,15 @@ mod roster_fallback_tests {
     /// `session_binding` = the exact live session's Noise handshake hash
     /// (§1.3). The capability-mismatch half is KEPT verbatim (an intent whose
     /// capability does not match the invoked service still fails LOCALLY,
-    /// before it can reach a provider as a `CapabilityMismatch` denial); the
-    /// client-streaming / duplex / service-routed refusal legs are KEPT too
-    /// (their widening is a later stage's — C11 names all of them; only
-    /// `call_streaming` flips here, and `call_service_streaming` keeps
+    /// before it can reach a provider as a `CapabilityMismatch` denial), and
+    /// the service-routed refusal leg is KEPT (`call_service_streaming` keeps
     /// refusing because capability-index routing cannot pin a provider
-    /// entity).
+    /// entity). The client-streaming / duplex refusal legs this test used to
+    /// pin are DELETED here (Stage 2 row 5's pin inversion): their C11
+    /// widening landed with slice 2.1's lazy-opening mint — the very code
+    /// that mints their kinds at first `send`/`finish` — and their named
+    /// replacement witness is `client_stream_and_duplex_mint_their_stream_proofs`
+    /// (delete-and-replace).
     #[tokio::test]
     async fn call_streaming_mints_a_stream_proof() {
         use crate::adapter::net::behavior::org::OrgKeypair;
@@ -9947,18 +10024,6 @@ mod roster_fallback_tests {
             ..Default::default()
         };
 
-        // Client-streaming / duplex still refuse a proof intent up front
-        // (their protected admission is a later stage).
-        assert!(matches!(
-            server
-                .call_client_stream(TARGET, "svc", intent_opts())
-                .await,
-            Err(RpcError::Codec { .. })
-        ));
-        assert!(matches!(
-            server.call_duplex(TARGET, "svc", intent_opts()).await,
-            Err(RpcError::Codec { .. })
-        ));
         // Service-routed streaming rejects the intent at the TOP, before
         // discovery: with NO service advertised, empty discovery would yield
         // `NoRoute` — a `Codec` proves the guard fired first and routing

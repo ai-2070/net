@@ -2909,8 +2909,7 @@ async fn completed_stream_drains_queued_items_in_order_with_content_and_end_term
         "the bridge accepted the opening",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || returned
-            .load(Ordering::SeqCst)
+        s13::wait_for(Duration::from_secs(10), || returned.load(Ordering::SeqCst)
             == 1)
         .await,
         "the handler queued its items under zero credit and returned",
@@ -2937,11 +2936,7 @@ async fn completed_stream_drains_queued_items_in_order_with_content_and_end_term
     // Rows 1+2+7's content observation: BOTH queued items publish IN ORDER
     // — asserted by body bytes and wire sequence, never by counting.
     assert!(
-        s13::wait_for(Duration::from_secs(30), || caller_seen
-            .lock()
-            .len()
-            >= 2)
-        .await,
+        s13::wait_for(Duration::from_secs(30), || caller_seen.lock().len() >= 2).await,
         "the same-org queued items publish IN ORDER after the grant — a post-close \
          discard of queued chunks leaves the caller with its terminal only",
     );
@@ -2963,17 +2958,17 @@ async fn completed_stream_drains_queued_items_in_order_with_content_and_end_term
     // …then EXPLICIT COMPLETION whose terminal frame carries the exact wire
     // content: status Ok + the `nrpc-streaming: end` marker.
     assert!(
-        s13::wait_for(Duration::from_secs(30), || caller_seen
-            .lock()
-            .len()
-            >= 3)
-        .await,
+        s13::wait_for(Duration::from_secs(30), || caller_seen.lock().len() >= 3).await,
         "the explicit-completion terminal follows the items at the authenticated \
          receiving endpoint",
     );
     {
         let seen = caller_seen.lock();
-        assert_eq!(seen.len(), 3, "exactly the two items and ONE terminal frame");
+        assert_eq!(
+            seen.len(),
+            3,
+            "exactly the two items and ONE terminal frame"
+        );
         let terminal = s15::response_of(&seen[2]);
         assert_eq!(
             (terminal.status, terminal.headers, terminal.body.as_ref()),
@@ -2991,7 +2986,11 @@ async fn completed_stream_drains_queued_items_in_order_with_content_and_end_term
     }
     // …and it stays exactly one terminal, ever.
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(caller_seen.lock().len(), 3, "exactly one terminal frame, ever");
+    assert_eq!(
+        caller_seen.lock().len(),
+        3,
+        "exactly one terminal frame, ever"
+    );
 }
 
 /// S1_R Row 7's CROSS-ORG twin (the granted / other-org authority intent
@@ -3065,8 +3064,7 @@ async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() 
         "the bridge accepted the cross-org opening",
     );
     assert!(
-        s13::wait_for(Duration::from_secs(10), || returned
-            .load(Ordering::SeqCst)
+        s13::wait_for(Duration::from_secs(10), || returned.load(Ordering::SeqCst)
             == 1)
         .await,
         "the cross-org handler queued its items under zero credit and returned",
@@ -3090,11 +3088,7 @@ async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() 
 
     // The cross-org items — correlated to THIS call — publish IN ORDER.
     assert!(
-        s13::wait_for(Duration::from_secs(30), || caller_seen
-            .lock()
-            .len()
-            >= 2)
-        .await,
+        s13::wait_for(Duration::from_secs(30), || caller_seen.lock().len() >= 2).await,
         "the cross-org queued items publish IN ORDER after the grant — a post-close \
          discard of queued chunks leaves the caller with its terminal only",
     );
@@ -3114,17 +3108,17 @@ async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() 
     }
 
     assert!(
-        s13::wait_for(Duration::from_secs(30), || caller_seen
-            .lock()
-            .len()
-            >= 3)
-        .await,
+        s13::wait_for(Duration::from_secs(30), || caller_seen.lock().len() >= 3).await,
         "the explicit-completion terminal follows the cross-org items at the \
          authenticated receiving endpoint",
     );
     {
         let seen = caller_seen.lock();
-        assert_eq!(seen.len(), 3, "exactly the two items and ONE terminal frame");
+        assert_eq!(
+            seen.len(),
+            3,
+            "exactly the two items and ONE terminal frame"
+        );
         let terminal = s15::response_of(&seen[2]);
         assert_eq!(
             (terminal.status, terminal.headers, terminal.body.as_ref()),
@@ -3141,7 +3135,11 @@ async fn cross_org_completed_stream_drains_correlated_items_with_end_terminal() 
         );
     }
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(caller_seen.lock().len(), 3, "exactly one terminal frame, ever");
+    assert_eq!(
+        caller_seen.lock().len(),
+        3,
+        "exactly one terminal frame, ever"
+    );
 }
 
 /// S1_R Row 5 (F-5's closure) — receiver-side attribution across SESSION
@@ -3244,13 +3242,14 @@ async fn response_after_session_replacement_reaches_only_the_live_session() {
     );
 
     // THE RESPONSE — emitted strictly AFTER the replacement.
-    let sink = holder.sink.lock().take().expect("the parked handler's sink");
+    let sink = holder
+        .sink
+        .lock()
+        .take()
+        .expect("the parked handler's sink");
     sink.send(Bytes::from_static(b"post-replacement-CONTENT"));
     assert!(
-        s13::wait_for(Duration::from_secs(30), || !caller_seen
-            .lock()
-            .is_empty())
-        .await,
+        s13::wait_for(Duration::from_secs(30), || !caller_seen.lock().is_empty()).await,
         "the post-replacement response arrives at the receiving endpoint",
     );
     let seen = caller_seen.lock().clone();
@@ -3270,4 +3269,216 @@ async fn response_after_session_replacement_reaches_only_the_live_session() {
         !seen.iter().any(|ev| ev.session_id == replaced_endpoint),
         "the REPLACED session's endpoint receives nothing",
     );
+}
+
+// ===========================================================================
+// Stage 2 — core protected client-streaming and duplex
+// (`ORG_SCOPED_STREAMING_PLAN.md` Stage 2 table; pinned brief
+// `spikes/org-streaming/S2_BRIEF.md`).
+//
+// Slice 2.1 — the LAZY-OPENING MINT (contract 2's caller half):
+// `call_client_stream` / `call_duplex` accept `org_proof_intent` (C11) and
+// mint their kinds (2/3) over the FINALIZED initial REQUEST at the first
+// `send`/`finish` — the initial REQUEST's body IS the first chunk, so the
+// signed opening binds it. `JustOpened` drop still sends (and signs) nothing
+// (preserved behavior, untouched).
+// ===========================================================================
+
+// (`OpeningRefusal`, `SessionIdentity`, `ChannelName`, `Duration`, `Bytes`
+// are already in scope module-wide from the sections above.)
+use net::adapter::net::behavior::org_call::STREAM_CALL_KIND_CLIENT_STREAMING;
+use net::adapter::net::cortex::rpc::{
+    RpcInboundDispatcher, RpcInboundEvent, RPC_FRAME_BODY_OFFSET,
+};
+use net::adapter::net::cortex::{EventMeta, EVENT_META_SIZE};
+use net::adapter::net::mesh_rpc::{admit_protected_opening, CallOptions, ProtectedOpeningOutcome};
+
+/// Slice 2.1 — `client_stream_opening_binds_first_chunk`. The REAL
+/// caller-side lazy mint (`call_client_stream` + first `send`) puts a full
+/// kind-2 `OrgStreamCallProof` on the wire over the finalized initial
+/// REQUEST whose body is the first chunk. ALTERING that first chunk after
+/// signing is refused by the production §3 admission transaction
+/// (`admit_protected_opening` — reserve → verify → install) with the TYPED
+/// `AdmissionDenied::BindingInvalid` (the signed transcript's request digest
+/// covers the body) and ZERO effects: the reservation rolls back and no
+/// registry record survives. The unaltered twin — the same construction, its
+/// own call — ADMITS, so the refusal is the alteration, not the construction.
+///
+/// "Zero handler effects" is observed here as the §3 transaction's boundary:
+/// a refused opening is never fold-driven (no handler, no in-flight entry,
+/// no sender, no semaphore). The live-bridge darkness probes over real
+/// protected CS/DX registrations are the slice-2.2 witnesses.
+///
+/// Inverse (S2 brief): "skip the body digest in the transcript" (mutate
+/// `org_request_digest` to exclude `req.body`) — the altered opening then
+/// derives the SIGNED digest and ADMITS, so the `BindingInvalid` assertion
+/// below reddens at its own named assertion.
+#[tokio::test]
+async fn client_stream_opening_binds_first_chunk() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x91u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x28);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-mint");
+
+    // The provider's request channel with a CAPTURE dispatcher: the lazily
+    // minted opening is observed exactly where a serve's request dispatcher
+    // would receive it (the `call_streaming_mints_a_stream_proof` idiom).
+    let req_channel = ChannelName::new("svc.requests").expect("channel name");
+    let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<RpcInboundEvent>();
+    let capture: RpcInboundDispatcher = Arc::new(move |ev| {
+        let _ = cap_tx.send(ev);
+    });
+    assert!(
+        server
+            .register_rpc_inbound(req_channel.hash(), capture)
+            .is_some(),
+        "the provider captures its request channel",
+    );
+
+    let intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), SERVICE);
+
+    // ---- the REAL lazy mint: the first `send` finalizes and signs. ----
+    let mut call = caller
+        .call_client_stream(
+            server.node_id(),
+            SERVICE,
+            CallOptions {
+                org_proof_intent: Some(intent.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_client_stream accepts the intent (C11)");
+    call.send(Bytes::from_static(b"first-chunk-11"))
+        .await
+        .expect("the first send publishes the signed opening");
+    let ev = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+        .await
+        .expect("the minted opening reaches the provider's dispatcher")
+        .expect("capture channel open");
+    let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE]).expect("frame meta decodes");
+    let (call_id, origin) = (meta.seq_or_ts, meta.origin_hash);
+    let req = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+        .expect("the captured opening decodes");
+    let proof_bytes = req
+        .headers
+        .iter()
+        .find(|(name, _)| name == fixture::ORG_ADMISSION_HEADER)
+        .map(|(_, value)| value.clone())
+        .expect("the lazily minted proof rides as the single admission header");
+    let proof = OrgStreamCallProof::decode(&proof_bytes)
+        .expect("the lazy mint produced a FULL streaming proof (strict decode)");
+    assert_eq!(
+        proof.kind, STREAM_CALL_KIND_CLIENT_STREAMING,
+        "the lazy mint's kind is client-streaming (2)",
+    );
+
+    // ---- the alteration AFTER signing: the first chunk's bytes move. ----
+    let mut altered = req.clone();
+    altered.body = Bytes::from_static(b"first-chunk-12");
+
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let session = SessionIdentity {
+        peer: caller.node_id(),
+        session_id,
+        establishment: Some(binding),
+    };
+    let reg = s14::owner_reg(7);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let outcome = admit_protected_opening(
+        &server,
+        &s13::inbound(
+            session_id,
+            caller.node_id(),
+            origin,
+            s13::request_frame(origin, call_id, &altered),
+        ),
+        call_id,
+        caller.entity_id(),
+        &s14::tag(),
+        &reg,
+        &replay,
+        ClockSample::now(),
+        RpcCallShape::ClientStreaming,
+        Some(binding),
+        session.clone(),
+        Some(1),
+    );
+    match outcome {
+        Err(OpeningRefusal::Denied(AdmissionDenied::BindingInvalid)) => {}
+        other => panic!(
+            "altering the first chunk after signing must be refused with the TYPED \
+             `BindingInvalid` — the signed opening binds the first chunk; got {:?}",
+            other.map(|_| "Admitted"),
+        ),
+    }
+
+    // ZERO effects at the admission boundary: the §3 reservation rolled
+    // back — no registry record and no active-call charge survive.
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "the refused opening left no registry record (the reservation rolled back)",
+    );
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
+
+    // ---- positive control: the UNALTERED twin admits (its own call). ----
+    let mut call2 = caller
+        .call_client_stream(
+            server.node_id(),
+            SERVICE,
+            CallOptions {
+                org_proof_intent: Some(intent),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_client_stream accepts the intent (C11)");
+    call2
+        .send(Bytes::from_static(b"first-chunk-11"))
+        .await
+        .expect("the first send publishes the signed opening");
+    let ev2 = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+        .await
+        .expect("the second minted opening reaches the provider's dispatcher")
+        .expect("capture channel open");
+    let meta2 = EventMeta::from_bytes(&ev2.payload[..EVENT_META_SIZE]).expect("frame meta decodes");
+    let (call_id2, origin2) = (meta2.seq_or_ts, meta2.origin_hash);
+    let req2 = RpcRequestPayload::decode(ev2.payload.slice(RPC_FRAME_BODY_OFFSET..))
+        .expect("the second captured opening decodes");
+    let outcome2 = admit_protected_opening(
+        &server,
+        &s13::inbound(
+            session_id,
+            caller.node_id(),
+            origin2,
+            s13::request_frame(origin2, call_id2, &req2),
+        ),
+        call_id2,
+        caller.entity_id(),
+        &s14::tag(),
+        &reg,
+        &replay,
+        ClockSample::now(),
+        RpcCallShape::ClientStreaming,
+        Some(binding),
+        session,
+        Some(1),
+    );
+    match outcome2 {
+        Ok(ProtectedOpeningOutcome::Admitted { .. }) => {}
+        other => panic!(
+            "the UNALTERED twin must admit — the refusal is the alteration, not the \
+             construction; got {:?}",
+            other.map(|_| "Admitted"),
+        ),
+    }
 }

@@ -11815,11 +11815,7 @@ mod tests {
             400,
             "the caller counter was rolled back",
         );
-        assert_eq!(
-            budgets.node_bytes(),
-            1_900,
-            "the node counter never moved",
-        );
+        assert_eq!(budgets.node_bytes(), 1_900, "the node counter never moved",);
 
         // Release-once through the untouched charges, exactly to zero.
         b_response.release();
@@ -12114,7 +12110,9 @@ mod tests {
         // The key is reused by a fresh call — immediately, while the first
         // incarnation's cleanup-owner handles (its supervisor-side ref, the
         // armed late-op source) are still alive and can fire at any time.
-        let mut second_guard = registry.reserve(opening()).expect("the reused key reserves");
+        let mut second_guard = registry
+            .reserve(opening())
+            .expect("the reused key reserves");
         let second_incarnation = second_guard.incarnation;
         assert_ne!(second_incarnation, first_incarnation);
         let mut second_lease = registry
@@ -12158,8 +12156,16 @@ mod tests {
             Some(RegistryPhase::Running),
             "the successor survives every late op",
         );
-        assert_eq!(registry.terminal_reason(&key), None, "the successor is unsettled");
-        assert_eq!(second_signal.taken(), None, "the successor's owner was never signaled");
+        assert_eq!(
+            registry.terminal_reason(&key),
+            None,
+            "the successor is unsettled"
+        );
+        assert_eq!(
+            second_signal.taken(),
+            None,
+            "the successor's owner was never signaled"
+        );
         assert_eq!(
             hook_fired.load(Ordering::SeqCst),
             0,
