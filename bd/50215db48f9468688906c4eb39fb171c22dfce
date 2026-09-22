@@ -1,0 +1,14 @@
+docs/internal/plans/BROWSER_NODE_LIFECYCLE_PLAN.md
+  h_64425bc75e3f3d 1-1333
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bd50215db48f9468688906c4eb39fb171c22dfce",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
