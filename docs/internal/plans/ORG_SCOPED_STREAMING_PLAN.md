@@ -1296,3 +1296,34 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   ×4 under `-D warnings`, rustdoc ×5 under `-D warnings`, wire 278, probe at
   its exact CI commands, `cargo tl`, `cargo t` **7071/7071**. Stage 2+
   remains unauthorized; Stage 1 proceeds to independent review.
+
+- 2026-09-22, **Stage 1 repair round (S1_R)** closed over the S1Review HOLD
+  (`S1_REVIEW_PACKET.md`, reviewed head `e25ac28bf`; repair brief
+  `spikes/org-streaming/S1_R_BRIEF.md` @`27d7a72ee`). Landed over five
+  commits (`60c287d1e`, `4ab5738cf`, `74c9bd99c`, `3620fed0b`,
+  `08dd849e2`): the Exit paragraph's positive claim is now witnessed per
+  authority mode — `completed_stream_drains_queued_items_in_order_with_content_and_end_terminal`
+  (same-org) and `cross_org_completed_stream_drains_correlated_items_with_end_terminal`
+  deliver multiple CONTENT-LABELLED items in order and then EXACTLY ONE
+  terminal with the exact success wire content (status `Ok` +
+  `nrpc-streaming: end`) at the authenticated receiving endpoint — closing
+  F-1/F-2/F-7 with both named inverses (A2b/A2c) reddening at their own
+  named assertions. F-3 (`node_budget_refusal_rolls_back_call_and_caller_reservations`),
+  F-4 (`late_retire_against_a_reused_key_is_a_no_op_for_the_successor`),
+  F-5 (`response_after_session_replacement_reaches_only_the_live_session`,
+  closure amended to the observable seam with the discriminating R-A5'
+  receipt), F-6 (`item_permit_transfer_consumes_once_across_the_handoff`,
+  per the Main ruling: witness the handoff, do not delete — Stage 2 is its
+  named consumer) and F-8 (the frozen denial-shape re-indentation NAMED in
+  the module doc) all closed. Estate at the repair head: `org_rpc_streaming`
+  **30/30** (27 preserved verbatim + 3 new; CI floor 30 at `dd2a31c8e`,
+  roster-validated), in-source 219/219, preserved+controls+org_ownership
+  121/121. Coordinator spot-checks reproduced two repair receipts isolated
+  (A2c and A3 inverses red at named assertions, restored clean). Open for
+  review round 2.1 adjudication: F-S1R-2 (a displaced protected call's
+  `SessionReplaced` terminal is emitted but not reliably delivered across a
+  30 s executed construction — mechanism [INFERENCE], the race with
+  `install_peer_locked`'s transition) and F-S1R-3 (the HOLD packet's
+  `a1c518dd…` trimmed-hash framing is unreproducible; the recorded
+  `f31eb08e…` procedure reproduces byte-clean). Stage 2+ remains
+  unauthorized.

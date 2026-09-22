@@ -131,6 +131,33 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, repair round (S1_R) verified (executed).** The HOLD closure
+  landed over five commits (`60c287d1e` witnesses rows 1–8, `4ab5738cf` six
+  Appendix-inverse receipts, `74c9bd99c` §3, `3620fed0b`+`08dd849e2` R-A5'
+  and the §3.4 hash side-by-side). Coordinator spot-checks in the isolated
+  worktree at `74c9bd99c` reproduced two repair receipts: SC1 — A2c
+  (`end`→`continue`) reddened
+  `completed_stream_drains_queued_items_in_order_with_content_and_end_terminal`;
+  SC2 — A3 (node-arm rollback deleted) reddened
+  `node_budget_refusal_rolls_back_call_and_caller_reservations`; both
+  `git checkout`-restored with a clean tree. **F-S1R-1 resolved (a)-sharpened,
+  executed:** R-A5' flips the three `RpcInboundEvent` attribution stamps at
+  the observable ingress seam the witness reads → red at its own named
+  assertion (`:3256:9`, `left: 0 / right: 17873330928486580960`), sha-restored
+  to the packet's own `a5581890…` mesh.rs baseline — the witness
+  discriminates and stands on its receiver-side property with the closure
+  wording naming the observable seam (amended, not weakened). The lane also
+  corrected the coordinator's suggested inverse with evidence: no retained
+  stale session exists at any selectable seam (`install_peer_locked` consumes
+  the displaced `NetSession` and its `session_id_to_node` entry; ingress
+  verifies the claimed id against the carrying one), so the attribution flip
+  is the discriminating mutation available — credited as a correction.
+  F-9's 52-count label fixed above (filter semantics: 39 + 13). F-S1R-2
+  (protected `SessionReplaced` terminal emitted-but-undelivered across a 30 s
+  executed construction; mechanism [INFERENCE]) and F-S1R-3 (the packet's
+  `a1c518dd…` framing unreproducible across 6 digests × 3 framings vs the
+  recorded reproducible `f31eb08e…` procedure, raw `fa275454…` exact) are
+  recorded with side-by-side evidence for review round 2.1 adjudication.
 - **2026-09-22, coordinator spot-checks (between-lanes window, executed).**
   Two deferred receipts independently reproduced with the full cycle
   (mutated red → `RESTORED_BYTE_IDENTICAL` → green):
@@ -2102,7 +2129,8 @@ the pre-format `ef5fe07246503e44…` / `d4bde8ccb31b40fe…`.
 - `behavior/org_admission.rs` tests: `19 → 21` (+2 = the split's
   1→3; the rewrite and the extension are count-neutral; 2 pre-existing
   unlisted variants added to the extension's enumeration).
-- `adapter/net/mesh_rpc.rs` tests: `52 → 52` (the inversion is a
+- `adapter::net::mesh_rpc` filter tests (39 in `mesh_rpc.rs` + 13 in
+  `mesh_rpc_metrics.rs`; F-9 label fix 2026-09-22): `52 → 52` (the inversion is a
   named rewrite, 1 test in, 1 test out).
 - `cortex/rpc.rs`, the Stage 0 models, `behavior/org_call.rs`: unchanged.
 
@@ -2199,7 +2227,8 @@ none).
 
 **Witnesses and counts (executed):** the four named pin operations above, at
 `--retries 0` (unit totals: `behavior/org_admission.rs` tests `19 → 21`,
-`adapter/net/mesh_rpc.rs` tests `52 → 52`):
+`adapter::net::mesh_rpc` filter tests (39 in `mesh_rpc.rs` + 13 in
+  `mesh_rpc_metrics.rs`; F-9 label fix 2026-09-22) `52 → 52`):
 
 | Pin | Kind | Proves |
 |---|---|---|
