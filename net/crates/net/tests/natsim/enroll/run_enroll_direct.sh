@@ -126,7 +126,6 @@ cat > "$STATE/miniupnpd.conf" <<EOF
 ext_ifname=gwa-wan
 listening_ip=gwa-lan
 ext_ip=$PUBLIC_A
-ext_allow_private_ipv4=yes
 port=0
 enable_natpmp=yes
 enable_pcp_pmp=yes
