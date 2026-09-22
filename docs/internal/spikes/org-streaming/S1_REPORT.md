@@ -10,6 +10,80 @@ Lanes append their numbered sections below (`## 1. S1Session — slice 1.1`,
 review-verification subsections. Every claim carries its executed vs
 source-established label and its receipt per the brief's evidence rules.
 
+## 0. Coordinator record (Main)
+
+- **2026-09-22, S1.1 verified and the hold relayed.** `S1.1` landed at
+  `0d4bbfb24` + `4d159e484` (wire lib tests 275 → 278; three witnesses with
+  individual inverse receipts; wasm32 check green). `mesh.rs` released and
+  `S1Core` unblocked for 1.2.
+- **F2 ruling (contract 1 spelling).** `NetSession::with_binding(keys,
+  handshake_hash, peer_addr, pool_size, default_reliable)` is **accepted as
+  contract-1-conformant**. The brief's 2-arg spelling was a drafting error:
+  `NetSession::new` already requires `peer_addr`/`pool_size`/`default_reliable`
+  and the contract's intent (additive carriage; hand-built sessions stay
+  `None`) never meant to remove them. The binding properties, not the arity,
+  are the contract.
+- **F1 assignment — slice 1.1a (priority, hard blocker).** S1.1's finding that
+  the 11 real handshake-completion sites (`mesh.rs:23390,23869,28335,28415,
+  28592,28635,47560,48054`; `adapter/net/mod.rs:889,1152,1459`) still use
+  `into_session_keys` + `NetSession::new` is a contract hole: live sessions
+  carry `binding: None`, so §1.3 would refuse every protected opening and no
+  1.2+ fixture could pass. Assigned back to `S1Session` as **1.1a** with an
+  exclusive `mesh.rs` handshake-site window (`S1Core` holds all `mesh.rs`
+  writes — 1.4 included — until "F1 landed" is relayed). Witness + inverse
+  required: a real completed handshake stores its binding and
+  `peer_session_binding` returns `Some(the real hash)`.
+- **F3 noted.** The brief's `net/crates/net/mesh.rs` path shorthand was a
+  drafting error; the real path is `net/crates/net/src/adapter/net/mesh.rs`
+  (both lanes resolved it correctly). Correction recorded; the pinned brief is
+  not rewritten under a dispatched lane.
+- **2026-09-22, ownership clarifications (the C3 rename's mechanical
+  fallout).** Three rulings on files outside the brief's ownership table:
+  (a) `tests/subnet_org_boundary.rs` — `S1Core`'s mechanical C3 migration
+  (literal → stable constructor, identical values) is within the carve:
+  names, assertions and counts byte-stable, floors untouched;
+  (b) `guards/org_api_probe` — `S1Core` is authorized its C3/C4 named-break
+  update **despite** the file's absence from the table: the brief's 1.3
+  requires the probe updated in the same commit as the Q2 break. Doctrine
+  held: no exhaustive-match arm deleted, MANIFEST discipline kept;
+  (c) `org_routing_wiring_tests.rs` (+88, attributed by `S1Core` to
+  `S1Session`'s F1 fallout) — bounded carve: mechanical signature adaptation
+  only; this is a CI floor-pinned file (MIN=93 + REQUIRED names) so NO test
+  may be deleted, renamed, weakened or re-pinned and floors stay Main's;
+  `S1Core` is barred from touching it even for compilation fixes.
+- **2026-09-22, disk hazard (F16-class) recurred and was resolved by the
+  owner.** Transient ENOSPC during `S1Core`'s 1.2 build (rustc rmeta write);
+  the lane reclaimed `target/debug/incremental` (3.7 GB, regenerable) and
+  retried correctly; the owner then freed the volume (73 GB free at
+  confirmation). Coordinator integrity sweep of all 10 in-flight files showed
+  sane deltas — no truncation. Both lanes carry the verify-before-trust rule
+  for the pressure window.
+- **2026-09-22, ruling — the 1.1a witness may live in the floor-pinned file
+  (Option A, blessed).** `S1Session` STOPped correctly at the carve: the 1.1a
+  witness (a real routed-handshake completion storing its binding) needs
+  `handle_routed_handshake`/`dispatch_ctx` — mesh-module-private, reachable
+  only from the module tree. Ruling: the +1 new test lands in
+  `org_routing_wiring_tests.rs`; floor discipline permits addition by
+  construction (MIN=93 is a minimum, the REQUIRED-names roster is unaffected,
+  and floor raises are Main's at CI-pin time) and the prohibition binds
+  deletion/rename/weakening only. Conditions: the 4 mechanical None-binding
+  slots stay minimum-adaptation with names/assertions byte-stable and are
+  named as mechanical in the lane report; the one-line fix to the lane's OWN
+  new assertion is blessed; the 1.1a receipt (inverse at a migrated handshake
+  site reddening the new witness) still lands as assigned. Option C's blocker
+  is recorded as a finding for Stage 3+ API review: no public getter exists
+  for the node's own static X25519 key (`peer_static_x25519` is peers-only),
+  so a public-API handshake witness would require a new API and still would
+  not cover the routed F1 sites.
+- **2026-09-22, S1.1 coordinator spot-check (executed).** Receipt R-a
+  reproduced independently: the prescribed widening inverse at
+  `wire/src/crypto.rs:437` → red at `wire/src/session.rs:3443:9`
+  byte-identical to the lane's quote (left = widened session id + 24 zeros /
+  right = full transcript hash), restore proven byte-identical against
+  `0d4bbfb24` (`git diff --quiet`), restored run green (278-test wire suite
+  unaffected). Slice 1.1 accepted at coordinator level pending stage-end
+  validation; slice 1.1a (F1 migration) in flight.
+
 ## 1. S1Session — slice 1.1
 
 **Landed (executed):** `0d4bbfb24` — `S1.1: retain the full Noise handshake
@@ -257,3 +331,156 @@ record's citations resolve.
 
 Rosters above are taken from the executed run outputs (the 278-line suite
 roster and the filtered `3 run / 275 skipped` counts), not from intent.
+
+### 1.1a — F1 migration: handshake completion carries the binding
+
+**Landed (executed):** `cc3a1faa3` — `S1.1a: carry the session binding through
+handshake completion` (3 files, +220/−69) on `LZL0/org-streaming`; this record
+rides in the following `S1.1a:` commit. Scope: Main's F1 assignment (the 11
+handshake-completion sites) under the explicit-and-bounded carve (`mod.rs`
+fully; `mesh.rs` at the handshake sites with an exclusive window;
+`org_routing_wiring_tests.rs` per the Option-A ruling below).
+`tests/subnet_org_boundary.rs` is **S1Core's** C3 mechanical edit, not this
+lane's (scope confirmed by Main).
+
+**What landed** (line numbers pristine-at-`cc3a1faa3`; source-established +
+executed via compile):
+
+| Site (the 11) | Migration |
+|---|---|
+| `mesh.rs:28387` routed case 1 (msg2 for pending initiator) | closure now returns `(SessionKeys, [u8; 32])` via `into_session_keys_with_binding`; `PendingHandshake.tx` type follows (`:3887`) |
+| `mesh.rs:28467` routed case 2 (msg1 responder) extraction | `into_session_keys_with_binding` |
+| `mesh.rs:28644`, `:28688` routed case 2 install arms | `NetSession::with_binding(keys, handshake_hash, …)` |
+| `mesh.rs:23409` `accept_rtc` extraction | `into_session_keys_with_binding` + `install_direct_fenced(…, Some(hash), …)` |
+| `mesh.rs:47632` `handshake_initiator` | returns `(SessionKeys, [u8; 32])`; `connect`/`connect_rtc` pass `Some(hash)` |
+| `mesh.rs:48126` `try_handshake_responder` | returns `(SessionKeys, [u8; 32], PeerAddr)`; `handshake_responder`/`accept` pass `Some(hash)` |
+| `mod.rs:890` `perform_handshake` initiator arm | returns `(keys, handshake_hash, addr)` |
+| `mod.rs:1153` `try_handshake_responder` (NetAdapter) | same tuple |
+| `mod.rs:1460` `init` | `NetSession::with_binding` |
+
+The install funnels (`install_direct`, `install_routed`,
+`install_peer_transition(+inner/locked)`, `install_direct_fenced`) carry
+`handshake_hash: Option<[u8; 32]>`; the central construction at
+`install_peer_locked` (`mesh.rs:23906`) binds via `with_binding` when present
+and keeps `NetSession::new` → `None` otherwise, so hand-built/test sessions
+remain fail-closed exactly per contract 1 (the remaining `into_session_keys()`
+callers are test key factories only — verified by source sweep).
+
+**Witness + counts** (executed): `a_real_completed_handshake_stores_its_binding_and_peer_session_binding_returns_it`
+(`org_routing_wiring_tests.rs:7055`, `#[tokio::test]`) drives a REAL routed
+handshake end-to-end through the production path: a manual initiator mirroring
+`try_connect_via_once` exactly (prologue convention, msg1 payload, packet
+wrapping) against the production `handle_routed_handshake` Case 2 responder;
+the production `msg2` is received over the wire, the initiator finishes its own
+Noise state, and the expected binding is captured **independently** as the
+initiator's final transcript hash (`handshake_hash()`, never through the
+production finalizer). Asserts
+`node.peer_session_binding(initiator_node_id) == Some(captured)` at `:7115`.
+The msg2 send succeeding also disarms the install's rollback guard, so the
+registration is durable, not raced. Net-mesh lib tests **5833 → 5834** (+1,
+zero removed/renamed); `org_routing_wiring_tests` module **93 → 94** (the 93
+floor-pinned tests byte-stable per the carve conditions below).
+
+Green at this head (executed): `CARGO_INCREMENTAL=0 cargo tfl
+org_routing_wiring_tests --retries 0` → `Summary [9.076s] 94 tests run: 94
+passed, 5740 skipped`, **exit 0**.
+
+**Inverse receipt R-1.1a** (raw; per Main's condition (c)):
+
+Bounded diff at the **production** sites the witness drives — leave the routed
+case-2 site on the OLD path (the pre-migration F1 shape), 3 hunks:
+`mesh.rs:28467` extraction back to `let keys = match noise.into_session_keys()`,
+and both install arms (`:28644`, `:28688`) back to `NetSession::new(…)` with
+the `handshake_hash` argument removed.
+
+Command (from `net/crates/net/`): `CARGO_INCREMENTAL=0 cargo tfl
+a_real_completed_handshake_stores_its_binding_and_peer_session_binding_returns_it
+--retries 0; echo "EXITCODE=$?"`. **Exit 100.** Verbatim failure:
+
+```
+thread 'adapter::net::mesh::org_routing_wiring_tests::a_real_completed_handshake_stores_its_binding_and_peer_session_binding_returns_it' (166248) panicked at src\adapter\net\org_routing_wiring_tests.rs:7107:5:
+assertion `left == right` failed: the installed session must carry the full handshake hash of the establishment that created it, and peer_session_binding must return it
+  left: None
+ right: Some([146, 233, 143, 29, 139, 208, 141, 201, 150, 188, 6, 211, 129, 204, 215, 130, 161, 114, 88, 39, 210, 92, 189, 37, 4, 232, 132, 228, 179, 188, 61, 45])
+...
+Summary [   0.111s] 1 test run: 0 passed, 1 failed, 5833 skipped
+EXITCODE=100
+```
+
+Numbering: `:7107:5` is **observed-under-mutation** on the pre-format tree;
+the same `assert_eq!` is **`:7115:5` pristine-at-`cc3a1faa3`** (+8 pure
+formatting delta — the rustfmt-conformance pass split calls at `:7080`/`:7092`
+and above; both numbers quoted explicitly, per the numbering convention).
+
+Restore: the 3 hunks reversed; `sha256sum mesh.rs` =
+`b84a98904063f141e034467c164c2397d453d045c657522eec295af375db42b5` ==
+the pre-mutation baseline (byte-identical). Restored green (same command):
+`Summary [0.212s] 1 test run: 1 passed, 5833 skipped`, **exit 0**. No
+green-under-inverse; the red is an assertion failure at the named property.
+
+**Carve compliance** (Main's conditions (a)/(b), executed + source-established):
+the four mechanical binding slots in the floor-pinned file are exactly
+signature adaptation — `org_routing_wiring_tests.rs:7608`, the `let lost =
+node.install_direct(…)` block at `:7621-7628`, `:8265`, `:8317-8318` — each a
+`None` (no-binding) argument added to an `install_direct` call; every existing
+test name and assertion byte-stable. The one-line fix to the NEW witness's own
+assertion (msg2 sender compared to `node.local_addr()` instead of the test's
+own socket — Main's condition (b)) is the only assertion this lane wrote in
+that file. Floor `MIN=93` unaffected: 94 > 93, and the floor raise is Main's
+at CI-pin time.
+
+**Ruling recorded** (Main, 2026-09-22 — condition (d)): **Option A** blessed
+the +1 witness in `org_routing_wiring_tests.rs` — the mesh module tree is the
+only honest home for a witness that drives the production
+`handle_routed_handshake`/`dispatch_ctx` seam (mesh-module-private); the
+floor rules bind deletion/rename/weakening, which this addition does not do.
+
+**Findings** (state, not decide):
+
+**F4 — no public getter for a node's own static X25519 key (source-established;
+Main-flagged for Stage 3+ API review).** The Option-C redesign (a public-API
+witness in `mod.rs` driving `accept()`) is blocked because a manual initiator
+cannot complete a real handshake without the responder's static key:
+`MeshNode::peer_static_x25519` (`mesh.rs:19566`) exposes **peers'** keys only,
+and `MeshNode::static_keypair` has no public accessor (`node_id()` `:14434`
+and `local_addr()` `:20207` do exist). Any future external-consumer test of a
+handshake, and the Stage 3+ probe story, will want a read-only
+`static_pubkey()`-style accessor; that is an API addition = ruling territory.
+
+**F5 — sibling fmt drift observed, untouched (executed observation).** The
+scoped `rustfmt --check` reports pre-existing formatting drift in S1Core's
+in-flight files: `behavior/org_admission.rs:511,547,591` and
+`behavior/org_call.rs:669,1126` (multi-line match-arm and method-chain
+shapes). Left untouched (sibling lane's files); named so the stage-end
+`cargo fmt` pass knows exactly where drift lives.
+
+**Verification hygiene** (executed): F16 discipline held through the ENOSPC
+window — every file this lane wrote carries recorded size+sha256 (mesh.rs
+`b84a9890…` → post-format `08c5f3cf…`; mod.rs `38af5581…` → `b1b8d8e4…`;
+org_routing_wiring_tests.rs → post-format `4a6b290b…`), and a hunk-level
+`git diff --numstat` audit against `0d4bbfb24` confirmed every change sits at
+an expected migration site (no truncation, no out-of-band hunks). Two
+build-infrastructure transients during the shared-disk window (an incremental
+cache copy error, and one real E0061 arity error at a call site the AST pass
+missed — fixed) — the former was the shared event Main broadcast, not a code
+defect; all subsequent runs used `CARGO_INCREMENTAL=0`.
+
+**What never ran** (complete):
+
+- `cargo fmt -p <crate> -- --check`, clippy ×4, rustdoc ×5, `cargo check
+  --workspace --all-targets`, `cargo tl`, `cargo t`, the preserved-witness
+  list, the public streaming regression control — Main's stage-end list,
+  never executed here. Formatting was converged with `rustfmt --check`/apply
+  scoped to this lane's three files via `--config skip_children=true` (no
+  submodule traversal; sibling files proven byte-untouched by sha/byte-form
+  probes).
+- Direct witness coverage: the witness exercises routed case 2 end-to-end
+  (extraction `:28467`, arms `:28644`/`:28688`, peers install,
+  `peer_session_binding`). Routed case 1 (`:28387`), `handshake_initiator`
+  (`:47632`), `try_handshake_responder` (`:48126`) and the `mod.rs` trio are
+  migrated on the same carriage shape and compile-verified (full lib-test
+  surface + the `net,webrtc` check) but have no dedicated witness — stated,
+  not inferred.
+- `tests/subnet_org_boundary.rs` and `guards/org_api_probe` runs — S1Core's
+  scope.
+- Windows workstation only: `#[cfg(unix)]` legs.
