@@ -479,18 +479,33 @@ async fn every_denied_action_is_refused_at_its_named_gate_and_counted() {
 
     // (a) the same announcement IS ingested (its Noise key and the
     // TOFU pin install) — the ingest/pin state leg (a)'s negative
-    // refutes.
+    // refutes. WAIT ON THE EFFECT: the announcement ingest installs
+    // the announced key and the TOFU pin through its own async
+    // transition, so the reads must poll that post-state — sampling
+    // a fixed instant after the send raced the pin's install (the
+    // key had landed first) under CI load.
     client
         .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
         .expect("announce");
+    let ingested = wait_for(
+        || {
+            anchor.peer_announced_noise_pubkey(client_id).is_some()
+                && anchor.peer_entity_id(client_id).is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .await;
     assert!(
-        wait_for(
-            || anchor.peer_announced_noise_pubkey(client_id).is_some(),
-            Duration::from_secs(10)
-        )
-        .await,
-        "once admitted, the same announcement IS ingested (its Noise key installs)"
+        ingested,
+        "once admitted, the same announcement IS ingested — its Noise key AND the \
+         TOFU identity pin must both install (key: {}, pin: {})",
+        anchor.peer_announced_noise_pubkey(client_id).is_some(),
+        anchor.peer_entity_id(client_id).is_some(),
+    );
+    assert!(
+        anchor.peer_announced_noise_pubkey(client_id).is_some(),
+        "the announced Noise key installs with the ingest"
     );
     assert!(
         anchor.peer_entity_id(client_id).is_some(),
