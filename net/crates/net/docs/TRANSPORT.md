@@ -53,8 +53,13 @@ pub struct SessionKeys {
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
     pub session_id: u64,
+    pub remote_static_pub: [u8; 32],
+    pub route_hop_tx_key: [u8; 32],
+    pub route_hop_rx_key: [u8; 32],
 }
 ```
+
+`session_id` is the first eight bytes of the Noise handshake hash -- a session *name*, not a binding. The **full** 32-byte handshake hash is the session binding: `NoiseHandshake::into_session_keys_with_binding` returns it beside the keys before the handshake state is consumed (the older `into_session_keys` is a compatible wrapper that drops it), `NetSession::with_binding(keys, hash)` stores it, and `NetSession::handshake_binding()` / `MeshNode::peer_session_binding(node_id)` read it back. Hand-built sessions (`NetSession::new`) carry no binding and read as `None` -- anything requiring an established-session binding must fail closed on them. A re-handshake always produces a different binding, so state signed for one establishment cannot ride the next.
 
 `PacketCipher` wraps the AEAD primitive with a monotonic counter for nonce generation, eliminating nonce-reuse risk without randomness.
 
@@ -73,21 +78,22 @@ ThreadLocalPool::new(capacity: usize)   // Per-thread, zero contention
 
 ## Sessions
 
-`NetSession` holds post-handshake state: TX/RX ciphers, per-stream sequence numbers, packet pool, and activity timestamps.
+`NetSession` holds post-handshake state: the RX cipher, the thread-local TX packet pool, per-stream sequence numbers, route-hop keys, and activity timestamps. The optional `handshake_binding` is the full Noise handshake hash of the establishment that created the session -- `None` on hand-built sessions (see the binding paragraph under **Encryption**).
 
 ```rust
 pub struct NetSession {
     session_id: u64,
-    tx_cipher: Mutex<PacketCipher>,
-    rx_cipher: Mutex<PacketCipher>,
+    handshake_binding: Option<[u8; 32]>,
+    rx_cipher: PacketCipher,
     streams: DashMap<u64, StreamState>,
-    pool: SharedPacketPool,
-    origin_hash: u32,
+    thread_local_pool: SharedLocalPool,
+    route_hop_tx_key: [u8; 32],
+    route_hop_rx_key: [u8; 32],
     // ...
 }
 ```
 
-`SessionManager` validates session health and handles timeouts. Sessions are long-lived -- new sessions only form on handshake.
+`SessionManager` holds the current session and validates session health and handles timeouts. Sessions are long-lived -- new sessions only form on handshake, and every new handshake is a new `session_id` *and* a new binding.
 
 ## Stream Routing & Fair Scheduling
 

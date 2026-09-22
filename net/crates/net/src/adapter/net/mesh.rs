@@ -19624,6 +19624,18 @@ impl MeshNode {
         self.peers.get(&node_id).map(|p| p.session.session_id())
     }
 
+    /// Full Noise handshake hash binding the live session incarnation
+    /// for `node_id` — the session binding a protected opening signs —
+    /// or `None` when no session exists or that session carries no
+    /// binding (hand-built sessions). A replaced incarnation carries a
+    /// different binding by construction, so an opening signed for one
+    /// establishment cannot admit on another.
+    pub fn peer_session_binding(&self, node_id: u64) -> Option<[u8; 32]> {
+        self.peers
+            .get(&node_id)
+            .and_then(|p| p.session.handshake_binding())
+    }
+
     /// Topology epoch this node evaluates subnet authority against.
     pub fn subnet_topology_epoch(&self) -> u32 {
         self.subnet_topology_epoch.load(Ordering::Acquire)
