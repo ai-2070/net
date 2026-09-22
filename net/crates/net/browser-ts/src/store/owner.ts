@@ -292,6 +292,21 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // old one locally.
       if (this.deferred.has(handle.h)) continue;
 
+      // Re-authorize before shipping. Permission does not carry forward
+      // across time (the rule the read paths below all hold to), and the
+      // delta feed IS the read delivered fresh: a policy revocation has to
+      // stop it, not only the next projection. `join`, `aud`/`resume` and
+      // `resync` are all gated, and the `resync` refusal deliberately keeps
+      // the handle warm — which is why the feed cannot rely on the grant
+      // having been checked once at admission. The handle goes with the
+      // refusal here because the feed is the grant: leaving it alive would
+      // let `alive` renew the lease of a peer the policy now forbids.
+      if (!this.permitsRead(handle.peer, handle.audience)) {
+        this.forget(handle.h);
+        out.push(this.no(handle.peer, handle.h, 'forbidden', null));
+        continue;
+      }
+
       const before = this.project(handle.audience, previous);
       const after = this.project(handle.audience, current);
       if (before === null || after === null) continue;
