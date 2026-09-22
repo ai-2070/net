@@ -42,6 +42,8 @@ net = { package = "net-mesh", version = "0.36.0", path = "..", default-features 
 net-sdk = { package = "net-mesh-sdk", version = "0.36.0", path = "../sdk", default-features = false, features = [
     "net",
     "nat-traversal",
+    # `up --enroll` asks the router to forward its port (UPnP / NAT-PMP / PCP).
+    "port-mapping",
     "cortex",
     "compute",
     "groups",

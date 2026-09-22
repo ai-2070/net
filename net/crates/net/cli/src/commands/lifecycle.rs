@@ -63,7 +63,7 @@ pub(crate) const NODE_SUBDIR: &str = "node";
 const LOCK_FILE: &str = "up.lock";
 const CONTROL_FILE: &str = "control.json";
 const SECRETS_MAGIC: [u8; 4] = *b"NMUP";
-const SECRETS_VERSION: u16 = 1;
+const SECRETS_VERSION: u16 = 2;
 const SECRETS_CHECKSUM: &str = "net-mesh up node secrets v1";
 const CONTROL_MAGIC: [u8; 4] = *b"NMCT";
 const MAX_CONTROL_FRAME: usize = 16 * 1024;
@@ -96,25 +96,34 @@ pub struct UpArgs {
     pub identity: Option<PathBuf>,
 
     /// Make this node the enrollment owner: serve join-token redemption and
-    /// accept `net-mesh invite` operations. Requires `--public-addr`,
-    /// `--issuer-identity`, a fixed `--bind` port and an initialized ledger
-    /// (`net-mesh enrollment init`); refuses before binding without them.
+    /// accept `net-mesh invite` operations. On first run it creates and keeps
+    /// an issuer key, a ledger and a fixed port (explicit flags override), and
+    /// asks the router to forward that port (UPnP / NAT-PMP / PCP) unless
+    /// `--no-port-mapping` is given.
     #[arg(long)]
     pub enroll: bool,
 
-    /// Address joiners reach this node at (`host:port`), signed into every
-    /// join token. The same port number must reach the node over TCP
-    /// (enrollment) and UDP (mesh).
+    /// Address joiners reach this node at (`host:port`), signed into join
+    /// tokens by default. Optional: without it the router-mapped address, or a
+    /// concrete bind address, is used. The same port number must reach the node
+    /// over TCP (enrollment) and UDP (mesh).
     #[arg(long, value_name = "HOST:PORT", requires = "enroll")]
     pub public_addr: Option<String>,
 
     /// Issuer identity file that signs invitations and membership receipts.
+    /// Defaults to an issuer key created once and kept in the state directory.
     #[arg(long, value_name = "PATH", requires = "enroll")]
     pub issuer_identity: Option<PathBuf>,
 
-    /// Enrollment ledger directory. Defaults to `<state-dir>/ledger`.
+    /// Enrollment ledger directory (must exist). Defaults to
+    /// `<state-dir>/ledger`, created on first `--enroll` run.
     #[arg(long, value_name = "DIR", requires = "enroll")]
     pub ledger: Option<PathBuf>,
+
+    /// Do not ask the router to forward the enrollment/mesh port. Tokens then
+    /// need `--public-addr`, a concrete `--bind` address or `invite create --addr`.
+    #[arg(long, requires = "enroll")]
+    pub no_port_mapping: bool,
 
     /// Trust-domain label shown to joiners (`[A-Za-z0-9._-]`, at most 64).
     /// Defaults to the profile name.
@@ -177,9 +186,14 @@ fn random<const N: usize>() -> Result<[u8; N], CliError> {
 
 // ---- node secrets (generated identity seed + generated PSK) ----------------
 
-struct NodeSecrets {
+pub(crate) struct NodeSecrets {
     seed: [u8; 32],
     psk: Option<[u8; 32]>,
+    /// Auto-provisioned enrollment issuer seed (`up --enroll` without
+    /// `--issuer-identity`). Distinct from the node identity.
+    pub(crate) issuer: Option<[u8; 32]>,
+    /// Fixed enrollment port chosen on first `up --enroll` with port 0.
+    pub(crate) enroll_port: Option<u16>,
 }
 
 impl Drop for NodeSecrets {
@@ -188,22 +202,31 @@ impl Drop for NodeSecrets {
         if let Some(psk) = self.psk.as_mut() {
             zeroize_slice(psk);
         }
+        if let Some(issuer) = self.issuer.as_mut() {
+            zeroize_slice(issuer);
+        }
     }
 }
 
+// v2: MAGIC | u16 2 | seed[32] | u8 has_psk [32] | u8 has_issuer [32] |
+//     u16 enroll_port (0 = none) | blake3 checksum[32].
+// v1 (still read): MAGIC | u16 1 | seed[32] | u8 has_psk [32] | checksum[32].
 impl NodeSecrets {
     fn encode(&self) -> ScrubbedBytes {
-        let mut out = Vec::with_capacity(4 + 2 + 32 + 1 + 32 + 32);
+        let mut out = Vec::with_capacity(4 + 2 + 32 + 33 + 33 + 2 + 32);
         out.extend_from_slice(&SECRETS_MAGIC);
         out.extend_from_slice(&SECRETS_VERSION.to_le_bytes());
         out.extend_from_slice(&self.seed);
-        match &self.psk {
-            Some(psk) => {
-                out.push(1);
-                out.extend_from_slice(psk);
+        for field in [&self.psk, &self.issuer] {
+            match field {
+                Some(bytes) => {
+                    out.push(1);
+                    out.extend_from_slice(bytes);
+                }
+                None => out.push(0),
             }
-            None => out.push(0),
         }
+        out.extend_from_slice(&self.enroll_port.unwrap_or(0).to_le_bytes());
         let sum = blake3::derive_key(SECRETS_CHECKSUM, &out);
         out.extend_from_slice(&sum);
         ScrubbedBytes::new(out)
@@ -218,25 +241,50 @@ impl NodeSecrets {
         if blake3::derive_key(SECRETS_CHECKSUM, body) != sum
             || body.len() < 4 + 2 + 32 + 1
             || body[..4] != SECRETS_MAGIC
-            || body[4..6] != SECRETS_VERSION.to_le_bytes()
         {
             return Err(corrupt());
         }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&body[6..38]);
-        let psk = match (body[38], body.len()) {
-            (0, 39) => None,
-            (1, 71) => {
-                let mut psk = [0u8; 32];
-                psk.copy_from_slice(&body[39..71]);
-                Some(psk)
-            }
-            _ => {
-                zeroize_slice(&mut seed);
-                return Err(corrupt());
+        let version = u16::from_le_bytes([body[4], body[5]]);
+        let mut secrets = Self {
+            seed: [0u8; 32],
+            psk: None,
+            issuer: None,
+            enroll_port: None,
+        };
+        secrets.seed.copy_from_slice(&body[6..38]);
+        let mut pos = 38;
+        let take32 = |pos: &mut usize| -> Option<Option<[u8; 32]>> {
+            match *body.get(*pos)? {
+                0 => {
+                    *pos += 1;
+                    Some(None)
+                }
+                1 => {
+                    let raw = body.get(*pos + 1..*pos + 33)?;
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(raw);
+                    *pos += 33;
+                    Some(Some(out))
+                }
+                _ => None,
             }
         };
-        Ok(Self { seed, psk })
+        secrets.psk = take32(&mut pos).ok_or_else(corrupt)?;
+        match version {
+            1 => {}
+            2 => {
+                secrets.issuer = take32(&mut pos).ok_or_else(corrupt)?;
+                let port = body.get(pos..pos + 2).ok_or_else(corrupt)?;
+                let port = u16::from_le_bytes([port[0], port[1]]);
+                secrets.enroll_port = (port != 0).then_some(port);
+                pos += 2;
+            }
+            _ => return Err(corrupt()),
+        }
+        if pos != body.len() {
+            return Err(corrupt());
+        }
+        Ok(secrets)
     }
 }
 
@@ -269,6 +317,8 @@ fn acquire(dir: &Path, generate_psk: bool) -> Result<(EnrollmentStorage, NodeSec
             let secrets = NodeSecrets {
                 seed: random()?,
                 psk: if generate_psk { Some(random()?) } else { None },
+                issuer: None,
+                enroll_port: None,
             };
             let storage = EnrollmentStorage::create(dir, secrets.encode().as_slice()).map_err(
                 |e| match e {
@@ -789,7 +839,7 @@ pub async fn run_up(
             args.issuer_identity,
             args.ledger,
             args.domain_name,
-            bind,
+            !args.no_port_mapping,
             &state,
             profile_name,
         )?)
@@ -813,10 +863,20 @@ pub async fn run_up(
         .await
         .map_err(|e| generic(format!("node state task failed: {e}")))??;
     let lifetime_lock = hold_lifetime_lock(&dir)?;
-    // Enrollment ownership (issuer + ledger lock) is taken before any bind.
-    let enroll_owner = match enroll_plan {
-        Some(plan) => Some(plan.open().await?),
-        None => None,
+    // Enrollment is provisioned (fixed port, issuer, ledger lock) before any bind.
+    let port_mapping = enroll_plan.as_ref().is_some_and(|p| p.port_mapping());
+    let (bind, enroll_owner) = match enroll_plan {
+        Some(plan) => {
+            let (bind, owner) = plan
+                .provision(bind, &mut secrets, |s| {
+                    storage
+                        .replace(s.encode().as_slice())
+                        .map_err(|e| storage_error(&dir, e))
+                })
+                .await?;
+            (bind, Some(owner))
+        }
+        None => (bind, None),
     };
 
     let mut psk = match supplied {
@@ -847,6 +907,7 @@ pub async fn run_up(
     zeroize_slice(&mut psk);
     let mesh = built?
         .identity(identity.clone())
+        .try_port_mapping(port_mapping)
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
@@ -1077,6 +1138,40 @@ pub async fn run_down(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_state_v2_round_trips_and_v1_state_still_reads() {
+        let v2 = NodeSecrets {
+            seed: [1; 32],
+            psk: Some([2; 32]),
+            issuer: Some([3; 32]),
+            enroll_port: Some(7443),
+        };
+        let back = NodeSecrets::decode(v2.encode().as_slice()).unwrap();
+        assert_eq!(
+            (back.seed, back.psk, back.issuer, back.enroll_port),
+            ([1; 32], Some([2; 32]), Some([3; 32]), Some(7443))
+        );
+
+        // A v1 snapshot (before enrollment fields existed) is still accepted.
+        let mut v1 = SECRETS_MAGIC.to_vec();
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.extend_from_slice(&[4; 32]);
+        v1.push(1);
+        v1.extend_from_slice(&[5; 32]);
+        let sum = blake3::derive_key(SECRETS_CHECKSUM, &v1);
+        v1.extend_from_slice(&sum);
+        let old = NodeSecrets::decode(&v1).unwrap();
+        assert_eq!(
+            (old.seed, old.psk, old.issuer, old.enroll_port),
+            ([4; 32], Some([5; 32]), None, None)
+        );
+
+        // Any altered byte is refused rather than repaired.
+        let mut bad = v2.encode().as_slice().to_vec();
+        bad[40] ^= 1;
+        assert!(NodeSecrets::decode(&bad).is_err());
+    }
 
     #[tokio::test]
     async fn control_messages_are_encrypted_and_bound_to_direction_and_sequence() {

@@ -69,6 +69,10 @@ pub mod policy;
 // Signed membership invite (`netmesh-join_` token) and canonical redemption intent.
 pub mod invite;
 
+// Router TCP port mapping for the enrollment listener (UPnP / NAT-PMP / PCP).
+#[cfg(feature = "port-mapping")]
+pub mod portmap;
+
 // PSK-free Noise enrollment session: protocol, responder key and client.
 pub mod redeem;
 

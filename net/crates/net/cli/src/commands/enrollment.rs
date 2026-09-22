@@ -20,7 +20,8 @@ use net_sdk::enrollment::invite::{
     EnrollmentEndpoint, EnrollmentKey, InviteSpec, MembershipInvite, Relation,
 };
 use net_sdk::enrollment::policy::{ApprovalMode, InvitationPolicy, DEFAULT_INVITATION_TTL};
-use net_sdk::enrollment::service::{EnrollmentService, ServiceConfig, SharedLedger};
+use net_sdk::enrollment::redeem::Refusal;
+use net_sdk::enrollment::service::{BundleIssuer, EnrollmentService, ServiceConfig, SharedLedger};
 use net_sdk::enrollment::store::{
     EnrollmentLedger, LedgerError, LedgerLimits, OfferId, OfferState,
 };
@@ -38,44 +39,40 @@ const LEDGER_SUBDIR: &str = "ledger";
 
 /// Validated `up --enroll` inputs. Built before any filesystem or network effect.
 pub(crate) struct EnrollPlan {
-    endpoint: EnrollmentEndpoint,
-    issuer_path: PathBuf,
-    ledger: PathBuf,
+    public: Option<EnrollmentEndpoint>,
+    issuer_path: Option<PathBuf>,
+    /// `Some` when the operator named a ledger; it must already exist.
+    explicit_ledger: Option<PathBuf>,
+    default_ledger: PathBuf,
     domain_name: String,
-    bind: SocketAddr,
+    port_mapping: bool,
 }
 
 impl EnrollPlan {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate(
         public_addr: Option<String>,
         issuer_identity: Option<PathBuf>,
         ledger: Option<PathBuf>,
         domain_name: Option<String>,
-        bind: SocketAddr,
+        port_mapping: bool,
         state: &Path,
         profile: &str,
     ) -> Result<Self, CliError> {
-        let public_addr = public_addr.ok_or_else(|| {
-            invalid_args("--enroll requires --public-addr <host:port>, the address joiners reach")
-        })?;
-        let endpoint = EnrollmentEndpoint::parse(&public_addr)
-            .map_err(|e| invalid_args(format!("--public-addr: {e}")))?;
-        if bind.port() == 0 {
-            return Err(invalid_args(
-                "--enroll requires a fixed --bind port: join tokens and bundles point at it",
-            ));
-        }
-        let issuer_path = issuer_identity.ok_or_else(|| {
-            invalid_args(
-                "--enroll requires --issuer-identity <PATH> (the key that signs invitations)",
-            )
-        })?;
-        let ledger = ledger.unwrap_or_else(|| state.join(LEDGER_SUBDIR));
-        if !ledger.is_dir() {
-            return Err(invalid_args(format!(
-                "no enrollment ledger at {}; run `net-mesh enrollment init` first",
-                ledger.display()
-            )));
+        let public = match public_addr {
+            Some(raw) => Some(
+                EnrollmentEndpoint::parse(&raw)
+                    .map_err(|e| invalid_args(format!("--public-addr: {e}")))?,
+            ),
+            None => None,
+        };
+        if let Some(ledger) = &ledger {
+            if !ledger.is_dir() {
+                return Err(invalid_args(format!(
+                    "no enrollment ledger at {}; run `net-mesh enrollment init` or omit --ledger",
+                    ledger.display()
+                )));
+            }
         }
         let domain_name = domain_name.unwrap_or_else(|| profile.to_string());
         let usable = !domain_name.is_empty()
@@ -89,36 +86,120 @@ impl EnrollPlan {
             ));
         }
         Ok(Self {
-            endpoint,
-            issuer_path,
-            ledger,
+            public,
+            issuer_path: issuer_identity,
+            explicit_ledger: ledger,
+            default_ledger: state.join(LEDGER_SUBDIR),
             domain_name,
-            bind,
+            port_mapping,
         })
     }
 
-    /// Load the issuer and take the ledger's exclusive lock (before any bind).
-    pub(crate) async fn open(self) -> Result<EnrollOwner, CliError> {
-        let issuer = crate::context::load_operator_identity(&self.issuer_path).await?;
-        let (dir, entity) = (self.ledger.clone(), issuer.entity_id().clone());
+    /// Whether the mesh should also map its UDP port on the router.
+    pub(crate) fn port_mapping(&self) -> bool {
+        self.port_mapping
+    }
+
+    /// Provision everything enrollment needs before any bind: a fixed port
+    /// (persisted on first use), the issuer (explicit file, or an issuer seed
+    /// created once and persisted with the node state) and the ledger (explicit,
+    /// or created once at the default path). Returns the bind address to use.
+    pub(crate) async fn provision(
+        self,
+        bind: SocketAddr,
+        secrets: &mut super::lifecycle::NodeSecrets,
+        persist: impl FnOnce(&super::lifecycle::NodeSecrets) -> Result<(), CliError>,
+    ) -> Result<(SocketAddr, EnrollOwner), CliError> {
+        let mut changed = false;
+        let mut created = Vec::new();
+        let port = match (bind.port(), secrets.enroll_port) {
+            (0, Some(port)) => port,
+            (0, None) => {
+                let port = free_port(bind.ip())?;
+                secrets.enroll_port = Some(port);
+                changed = true;
+                created.push("port");
+                port
+            }
+            (port, _) => port,
+        };
+        let issuer = match &self.issuer_path {
+            Some(path) => crate::context::load_operator_identity(path).await?,
+            None => {
+                let seed = match secrets.issuer {
+                    Some(seed) => seed,
+                    None => {
+                        let mut seed = [0u8; 32];
+                        getrandom::fill(&mut seed)
+                            .map_err(|_| generic("operating-system CSPRNG unavailable"))?;
+                        secrets.issuer = Some(seed);
+                        changed = true;
+                        created.push("issuer");
+                        seed
+                    }
+                };
+                Identity::from_seed(seed)
+            }
+        };
+        if changed {
+            persist(secrets)?;
+        }
+        let ledger_dir = self
+            .explicit_ledger
+            .clone()
+            .unwrap_or_else(|| self.default_ledger.clone());
+        let create = self.explicit_ledger.is_none() && !ledger_dir.exists();
+        let (dir, entity) = (ledger_dir.clone(), issuer.entity_id().clone());
         let ledger = tokio::task::spawn_blocking(move || {
-            EnrollmentLedger::open(&dir, entity, LedgerLimits::default())
+            if create {
+                EnrollmentLedger::create(&dir, entity, LedgerLimits::default())
+            } else {
+                EnrollmentLedger::open(&dir, entity, LedgerLimits::default())
+            }
         })
         .await
         .map_err(|e| generic(format!("ledger task failed: {e}")))?
-        .map_err(|e| ledger_open_error(&self.ledger, e))?;
-        Ok(EnrollOwner {
-            plan: self,
-            issuer,
-            ledger: Arc::new(parking_lot::Mutex::new(ledger)),
-        })
+        .map_err(|e| ledger_open_error(&ledger_dir, e))?;
+        if create {
+            created.push("ledger");
+        }
+        Ok((
+            SocketAddr::new(bind.ip(), port),
+            EnrollOwner {
+                plan: self,
+                issuer,
+                ledger: Arc::new(parking_lot::Mutex::new(ledger)),
+                bind: SocketAddr::new(bind.ip(), port),
+                created,
+            },
+        ))
     }
+}
+
+/// A port currently free for both UDP and TCP on `ip`. TCP allocates first:
+/// some platforms reserve large TCP-only port ranges (e.g. Windows exclusions)
+/// that sequential UDP ephemeral allocation would keep landing in.
+fn free_port(ip: std::net::IpAddr) -> Result<u16, CliError> {
+    for _ in 0..32 {
+        let tcp = std::net::TcpListener::bind((ip, 0))
+            .map_err(|e| generic(format!("choose enrollment port: {e}")))?;
+        let port = tcp
+            .local_addr()
+            .map_err(|e| generic(format!("choose enrollment port: {e}")))?
+            .port();
+        if std::net::UdpSocket::bind((ip, port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err(generic(
+        "could not find a port free for both UDP and TCP; pass --bind",
+    ))
 }
 
 fn ledger_open_error(dir: &Path, e: LedgerError) -> CliError {
     match e {
         LedgerError::IssuerMismatch => invalid_args(format!(
-            "ledger {} belongs to a different issuer than --issuer-identity",
+            "ledger {} belongs to a different issuer",
             dir.display()
         )),
         LedgerError::Storage(
@@ -136,56 +217,172 @@ pub(crate) struct EnrollOwner {
     plan: EnrollPlan,
     issuer: Identity,
     ledger: SharedLedger,
+    bind: SocketAddr,
+    created: Vec<&'static str>,
+}
+
+/// How long `up --enroll` waits for the router to answer mapping requests.
+const MAPPING_WAIT: Duration = Duration::from_secs(4);
+
+/// The direct address signed into tokens by default: the operator's
+/// `--public-addr`, else the router-mapped address (only when both TCP and UDP
+/// were mapped), else a concrete bind address. `None` means no direct path is
+/// known; `invite create --addr` can still supply one.
+pub(crate) fn select_endpoint(
+    public: Option<&EnrollmentEndpoint>,
+    mapped_tcp: Option<SocketAddr>,
+    mapped_udp: Option<SocketAddr>,
+    bind: SocketAddr,
+) -> Option<EnrollmentEndpoint> {
+    if let Some(public) = public {
+        return Some(public.clone());
+    }
+    if let (Some(tcp), Some(_udp)) = (mapped_tcp, mapped_udp) {
+        return EnrollmentEndpoint::parse(&tcp.to_string()).ok();
+    }
+    if bind.ip().is_unspecified() {
+        return None;
+    }
+    EnrollmentEndpoint::parse(&bind.to_string()).ok()
 }
 
 impl EnrollOwner {
-    /// Bind the enrollment listener on the mesh's port number (TCP) and start
-    /// delivering this node's PSK and public contact.
+    /// Map ports (unless disabled), bind the enrollment listener on the mesh's
+    /// port number (TCP), and start delivering this node's PSK and contact.
     pub(crate) async fn start(
         self,
         mesh: &net_sdk::Mesh,
         psk: Psk,
     ) -> Result<RunningEnrollment, CliError> {
-        let contact_addr = tokio::net::lookup_host(self.plan.endpoint.as_str())
-            .await
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .ok_or_else(|| {
-                invalid_args(format!(
-                    "--public-addr {} does not resolve",
-                    self.plan.endpoint.as_str()
-                ))
-            })?;
-        let contact = MeshContact {
-            addr: contact_addr,
+        let (tcp_mapping, udp_mapped) = if self.plan.port_mapping {
+            let udp = async {
+                let deadline = tokio::time::Instant::now() + MAPPING_WAIT;
+                loop {
+                    if let Some(addr) = mesh.traversal_stats().port_mapping_external {
+                        return Some(addr);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let tcp = tokio::time::timeout(
+                MAPPING_WAIT,
+                net_sdk::enrollment::portmap::TcpMapping::establish(self.bind.port()),
+            );
+            let (tcp, udp) = tokio::join!(tcp, udp);
+            (tcp.ok().flatten(), udp)
+        } else {
+            (None, None)
+        };
+        let tcp_mapped = tcp_mapping.as_ref().and_then(|m| m.external());
+        let default_endpoint =
+            select_endpoint(self.plan.public.as_ref(), tcp_mapped, udp_mapped, self.bind);
+        let trust_domain = psk.trust_domain();
+        let bundles = Arc::new(NodeBundles {
+            issuer: self.issuer.clone(),
+            psk,
             noise_pubkey: *mesh.public_key(),
             node_id: mesh.node_id(),
-        };
-        let trust_domain = psk.trust_domain();
-        let issuer_bundles = MembershipIssuer::new(self.issuer.clone(), psk, contact);
+            tcp_mapped,
+            udp_mapped,
+            contacts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        });
         let service = EnrollmentService::bind(
-            self.plan.bind,
+            self.bind,
             &self.issuer,
             self.ledger.clone(),
-            Arc::new(issuer_bundles),
+            bundles.clone(),
             ServiceConfig::default(),
         )
         .await
         .map_err(|e| {
-            connection_failure(format!(
-                "enrollment listener on TCP {}: {e}",
-                self.plan.bind
-            ))
+            connection_failure(format!("enrollment listener on TCP {}: {e}", self.bind))
         })?;
         let context = Arc::new(EnrollContext {
             issuer: self.issuer,
             ledger: self.ledger,
             key: service.enrollment_key(),
-            endpoint: self.plan.endpoint,
+            default_endpoint,
             trust_domain,
             domain_name: self.plan.domain_name,
+            bundles,
         });
-        Ok(RunningEnrollment { service, context })
+        Ok(RunningEnrollment {
+            service,
+            context,
+            tcp_mapping,
+            port_mapping: self.plan.port_mapping,
+            created: self.created,
+        })
+    }
+}
+
+/// Delivers bundles whose mesh contact matches the address each token named.
+struct NodeBundles {
+    issuer: Identity,
+    psk: Psk,
+    noise_pubkey: [u8; 32],
+    node_id: u64,
+    tcp_mapped: Option<SocketAddr>,
+    udp_mapped: Option<SocketAddr>,
+    contacts: parking_lot::Mutex<std::collections::HashMap<String, SocketAddr>>,
+}
+
+impl NodeBundles {
+    /// The UDP mesh address matching a token's enrollment endpoint: the
+    /// router's UDP mapping for the mapped TCP address, otherwise the same
+    /// host and port the token names (TCP and UDP share the port number).
+    fn contact_addr(&self, endpoint: &EnrollmentEndpoint) -> Option<SocketAddr> {
+        if let Some(addr) = self.contacts.lock().get(endpoint.as_str()) {
+            return Some(*addr);
+        }
+        let addr = match (self.tcp_mapped, self.udp_mapped) {
+            (Some(tcp), Some(udp)) if tcp.to_string() == endpoint.as_str() => udp,
+            _ => {
+                use std::net::ToSocketAddrs as _;
+                endpoint.as_str().to_socket_addrs().ok()?.next()?
+            }
+        };
+        self.contacts
+            .lock()
+            .insert(endpoint.as_str().to_string(), addr);
+        Some(addr)
+    }
+
+    fn issuer_for(&self, contact: SocketAddr) -> MembershipIssuer {
+        MembershipIssuer::new(
+            self.issuer.clone(),
+            self.psk.clone(),
+            MeshContact {
+                addr: contact,
+                noise_pubkey: self.noise_pubkey,
+                node_id: self.node_id,
+            },
+        )
+    }
+}
+
+impl BundleIssuer for NodeBundles {
+    fn issue(
+        &self,
+        invite: &MembershipInvite,
+        intent: &net_sdk::enrollment::invite::RedemptionIntent,
+    ) -> Result<Vec<u8>, Refusal> {
+        let contact = self
+            .contact_addr(invite.endpoint())
+            .ok_or(Refusal::Unavailable)?;
+        self.issuer_for(contact).issue(invite, intent)
+    }
+
+    fn may_recover(
+        &self,
+        invite: &MembershipInvite,
+        intent: &net_sdk::enrollment::invite::RedemptionIntent,
+    ) -> Result<(), Refusal> {
+        let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+        self.issuer_for(unspecified).may_recover(invite, intent)
     }
 }
 
@@ -193,29 +390,49 @@ impl EnrollOwner {
 pub(crate) struct RunningEnrollment {
     service: EnrollmentService,
     context: Arc<EnrollContext>,
+    tcp_mapping: Option<net_sdk::enrollment::portmap::TcpMapping>,
+    port_mapping: bool,
+    created: Vec<&'static str>,
 }
 
 /// Non-secret enrollment facts reported by `up` and `node status`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct EnrollmentReport {
-    endpoint: String,
+    /// Default direct address signed into tokens; `None` when none is known.
+    endpoint: Option<String>,
     listen: String,
+    port_mapping: String,
+    mapped_tcp: Option<String>,
+    mapped_udp: Option<String>,
     enrollment_key: String,
     issuer: String,
     issuer_fingerprint: String,
     domain_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    created: Vec<String>,
 }
 
 impl RunningEnrollment {
     pub(crate) fn report(&self) -> EnrollmentReport {
         let c = &self.context;
+        let b = &c.bundles;
+        let port_mapping = match (self.port_mapping, b.tcp_mapped, b.udp_mapped) {
+            (false, _, _) => "disabled",
+            (true, Some(_), Some(_)) => "active",
+            (true, None, None) => "unavailable",
+            (true, _, _) => "partial",
+        };
         EnrollmentReport {
-            endpoint: c.endpoint.as_str().to_string(),
+            endpoint: c.default_endpoint.as_ref().map(|e| e.as_str().to_string()),
             listen: self.service.local_addr().to_string(),
+            port_mapping: port_mapping.to_string(),
+            mapped_tcp: b.tcp_mapped.map(|a| a.to_string()),
+            mapped_udp: b.udp_mapped.map(|a| a.to_string()),
             enrollment_key: hex::encode(c.key.0),
             issuer: hex::encode(c.issuer.entity_id().as_bytes()),
             issuer_fingerprint: net_sdk::enrollment::fingerprint(c.issuer.entity_id()),
             domain_name: c.domain_name.clone(),
+            created: self.created.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -225,6 +442,9 @@ impl RunningEnrollment {
 
     pub(crate) async fn shutdown(self) {
         self.service.shutdown().await;
+        if let Some(mapping) = self.tcp_mapping {
+            mapping.shutdown().await;
+        }
     }
 }
 
@@ -233,9 +453,10 @@ pub(crate) struct EnrollContext {
     issuer: Identity,
     ledger: SharedLedger,
     key: EnrollmentKey,
-    endpoint: EnrollmentEndpoint,
+    default_endpoint: Option<EnrollmentEndpoint>,
     trust_domain: TrustDomainId,
     domain_name: String,
+    bundles: Arc<NodeBundles>,
 }
 
 impl EnrollContext {
@@ -267,13 +488,25 @@ impl EnrollContext {
             Some(hex) => Some(parse_entity(hex)?),
             None => None,
         };
+        let endpoint = match request["addr"].as_str() {
+            Some(addr) => EnrollmentEndpoint::parse(addr).map_err(|e| format!("--addr: {e}"))?,
+            None => self.default_endpoint.clone().ok_or_else(|| {
+                "no direct address is known for this node (no --public-addr, no router                  mapping, wildcard bind); pass --addr <host:port> reachable by the joiner"
+                    .to_string()
+            })?,
+        };
+        // Resolve the matching mesh contact now so an unusable address fails
+        // here, not at redemption.
+        self.bundles
+            .contact_addr(&endpoint)
+            .ok_or_else(|| format!("address {} does not resolve", endpoint.as_str()))?;
         let policy = InvitationPolicy::with_options(now, ttl, mode).map_err(|e| e.to_string())?;
         let invite = MembershipInvite::sign(
             &self.issuer,
             InviteSpec {
                 trust_domain_name: self.domain_name.clone(),
                 trust_domain: self.trust_domain,
-                endpoint: self.endpoint.clone(),
+                endpoint: endpoint.clone(),
                 enrollment_key: self.key,
                 relations: vec![Relation::Mesh],
                 intended_subject: intended,
@@ -292,7 +525,7 @@ impl EnrollContext {
             "expires_at": policy.expires_at(),
             "approval": approval_name(mode),
             "bearer": invite.is_bearer(),
-            "endpoint": self.endpoint.as_str(),
+            "endpoint": endpoint.as_str(),
             "issuer_fingerprint": invite.issuer_fingerprint(),
         }))
     }
@@ -496,6 +729,10 @@ pub struct CreateArgs {
     /// Write the token to this new owner-only file instead of stdout.
     #[arg(long, value_name = "PATH")]
     pub out: Option<PathBuf>,
+    /// Address the joiner reaches this node at (`host:port`), overriding the
+    /// node's default direct address for this token.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub addr: Option<String>,
 }
 
 /// `invite inspect` arguments.
@@ -580,6 +817,10 @@ pub async fn run_invite(
             if let Some(subject) = &args.for_subject {
                 request["subject"] = json!(subject.trim_start_matches("0x"));
             }
+            if let Some(addr) = &args.addr {
+                EnrollmentEndpoint::parse(addr).map_err(|e| invalid_args(format!("--addr: {e}")))?;
+                request["addr"] = json!(addr);
+            }
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
                 eprintln!(
@@ -663,5 +904,43 @@ pub async fn run_invite(
             )
             .await?,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ep(s: &str) -> EnrollmentEndpoint {
+        EnrollmentEndpoint::parse(s).unwrap()
+    }
+
+    #[test]
+    fn default_endpoint_prefers_public_then_full_mapping_then_concrete_bind() {
+        let bind_any: SocketAddr = "0.0.0.0:7443".parse().unwrap();
+        let bind_lan: SocketAddr = "192.168.1.20:7443".parse().unwrap();
+        let tcp: SocketAddr = "203.0.113.9:40001".parse().unwrap();
+        let udp: SocketAddr = "203.0.113.9:40002".parse().unwrap();
+        let public = ep("node.example.net:7443");
+
+        let pick = |p: Option<&EnrollmentEndpoint>, t, u, b| {
+            select_endpoint(p, t, u, b).map(|e| e.as_str().to_string())
+        };
+        assert_eq!(
+            pick(Some(&public), Some(tcp), Some(udp), bind_lan).as_deref(),
+            Some("node.example.net:7443")
+        );
+        assert_eq!(
+            pick(None, Some(tcp), Some(udp), bind_any).as_deref(),
+            Some("203.0.113.9:40001")
+        );
+        // A TCP-only mapping is not a usable direct path (the mesh is UDP).
+        assert_eq!(pick(None, Some(tcp), None, bind_any), None);
+        assert_eq!(
+            pick(None, None, Some(udp), bind_lan).as_deref(),
+            Some("192.168.1.20:7443")
+        );
+        // Wildcard bind and no mapping: no direct address is claimed.
+        assert_eq!(pick(None, None, None, bind_any), None);
     }
 }

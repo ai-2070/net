@@ -109,7 +109,15 @@ impl Fx {
         let addr = format!("127.0.0.1:{port}");
         let mut child = self
             .base()
-            .args(["--output", "ndjson", "up", "--enroll", "--bind", &addr])
+            .args([
+                "--output",
+                "ndjson",
+                "up",
+                "--enroll",
+                "--no-port-mapping",
+                "--bind",
+                &addr,
+            ])
             .args(["--public-addr", &addr, "--issuer-identity"])
             .arg(issuer)
             .arg("--state-dir")
@@ -160,12 +168,13 @@ fn read_row(stdout: &mut BufReader<ChildStdout>, child: &mut Child) -> Value {
     })
 }
 
-/// A port currently free for both UDP and TCP on loopback.
+/// A port currently free for both UDP and TCP on loopback (TCP first: see the
+/// CLI's own port picker for why).
 fn free_port() -> u16 {
     for _ in 0..50 {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp.local_addr().unwrap().port();
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
@@ -219,68 +228,26 @@ fn offer(status: &Value, offer_id: &str) -> Value {
 }
 
 #[test]
-fn up_enroll_refuses_before_binding_without_its_inputs() {
+fn up_enroll_refuses_only_unusable_explicit_inputs() {
     let fx = Fx::new();
     let issuer = fx.issuer("issuer.toml");
     let issuer_s = issuer.to_str().unwrap();
-    // A valid ledger exists, so each case below lacks exactly one input.
-    assert!(fx.init(&issuer).status.success());
-    let port = free_port().to_string();
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{}", free_port());
     let missing_ledger = fx.path("no-such-ledger");
-    let missing_ledger_s = missing_ledger.to_str().unwrap();
-    let cases: [(&str, &str, Vec<&str>); 5] = [
+    let cases: [(&str, &str, Vec<&str>); 2] = [
         (
-            "missing public address",
-            "--public-addr",
-            vec!["--bind", &addr, "--issuer-identity", issuer_s],
-        ),
-        (
-            "ephemeral port",
-            "fixed --bind port",
-            vec![
-                "--bind",
-                "127.0.0.1:0",
-                "--public-addr",
-                &addr,
-                "--issuer-identity",
-                issuer_s,
-            ],
-        ),
-        (
-            "missing issuer",
-            "--issuer-identity",
-            vec!["--bind", &addr, "--public-addr", &addr],
-        ),
-        (
-            "missing ledger",
+            "explicit ledger that does not exist",
             "enrollment init",
-            vec![
-                "--bind",
-                &addr,
-                "--public-addr",
-                &addr,
-                "--issuer-identity",
-                issuer_s,
-                "--ledger",
-                missing_ledger_s,
-            ],
+            vec!["--ledger", missing_ledger.to_str().unwrap()],
         ),
         (
             "unusable public address",
             "--public-addr",
-            vec![
-                "--bind",
-                &addr,
-                "--public-addr",
-                "https://x:1",
-                "--issuer-identity",
-                issuer_s,
-            ],
+            vec!["--public-addr", "https://x:1"],
         ),
     ];
     for (what, reason, extra) in cases {
-        let mut args = vec!["up", "--enroll"];
+        let mut args = vec!["up", "--enroll", "--no-port-mapping", "--bind", &addr];
         args.extend(extra);
         let out = fx.run(&args);
         assert_eq!(out.status.code(), Some(2), "{what}: {out:?}");
@@ -293,32 +260,16 @@ fn up_enroll_refuses_before_binding_without_its_inputs() {
         );
     }
 
-    // A ledger initialized for another issuer is refused; nothing keeps running.
-    let other = fx.path("other-ledger");
-    let other_s = other.to_str().unwrap();
-    let other_issuer = fx.issuer("other.toml");
-    assert!(fx
-        .run(&[
-            "enrollment",
-            "init",
-            "--issuer-identity",
-            other_issuer.to_str().unwrap(),
-            "--ledger",
-            other_s,
-        ])
-        .status
-        .success());
+    // An explicit issuer that does not own the default ledger is refused.
+    assert!(fx.init(&fx.issuer("other.toml")).status.success());
     let out = fx.run(&[
         "up",
         "--enroll",
+        "--no-port-mapping",
         "--bind",
-        &addr,
-        "--public-addr",
         &addr,
         "--issuer-identity",
         issuer_s,
-        "--ledger",
-        other_s,
     ]);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("different issuer"));
@@ -327,6 +278,71 @@ fn up_enroll_refuses_before_binding_without_its_inputs() {
     // A second init never replaces a ledger; invite commands need a running node.
     assert_eq!(fx.init(&issuer).status.code(), Some(2));
     assert_eq!(fx.run(&["invite", "status"]).status.code(), Some(6));
+}
+
+#[test]
+fn minimal_config_up_enroll_provisions_once_and_a_device_joins() {
+    let fx = Fx::new();
+    let start = |fx: &Fx| {
+        let mut child = fx
+            .base()
+            .args(["--output", "ndjson", "up", "--enroll", "--no-port-mapping"])
+            .args(["--bind", "127.0.0.1:0", "--state-dir"])
+            .arg(fx.state())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let ready = read_row(&mut stdout, &mut child);
+        Up { child, ready }
+    };
+
+    // First run: nothing configured beyond a loopback bind.
+    let first = start(&fx);
+    let e = first.ready["enrollment"].clone();
+    let endpoint = e["endpoint"].as_str().unwrap().to_string();
+    assert!(
+        endpoint.starts_with("127.0.0.1:") && !endpoint.ends_with(":0"),
+        "{e}"
+    );
+    assert_eq!(e["port_mapping"], "disabled");
+    let mut created: Vec<String> = serde_json::from_value(e["created"].clone()).unwrap();
+    created.sort();
+    assert_eq!(created, ["issuer", "ledger", "port"]);
+
+    let created_invite = fx.json(&["invite", "create"]);
+    let (status, device) = redeem(
+        &fx.path("device"),
+        created_invite["token"].as_str().unwrap(),
+    );
+    assert!(matches!(status.unwrap(), JoinStatus::Installed { .. }));
+    attach(&device).expect("attach to the auto-provisioned node");
+    fx.json(&["down"]);
+    drop(first);
+
+    // Restart: same port, issuer and ledger; nothing is created again.
+    let second = start(&fx);
+    let e2 = &second.ready["enrollment"];
+    assert_eq!(e2["endpoint"], endpoint.as_str());
+    assert_eq!(e2["issuer"], e["issuer"]);
+    assert!(e2.get("created").is_none(), "{e2}");
+    let row = offer(
+        &fx.json(&["invite", "status"]),
+        created_invite["offer_id"].as_str().unwrap(),
+    );
+    assert_eq!(row["state"], "issued");
+
+    // A per-invite address overrides the default.
+    let port = endpoint.rsplit_once(':').unwrap().1;
+    let named = format!("localhost:{port}");
+    let other = fx.json(&["invite", "create", "--addr", &named]);
+    assert_eq!(other["endpoint"], named.as_str());
+    let shown = MembershipInvite::decode(other["token"].as_str().unwrap()).unwrap();
+    assert_eq!(shown.endpoint().as_str(), named);
+    fx.json(&["down"]);
+    drop(second);
 }
 
 #[test]
