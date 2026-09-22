@@ -666,7 +666,7 @@ binary; no new root pin is needed.
 **Signed membership invite and intent (2026-09-22, uncommitted working tree):**
 `sdk/src/enrollment/invite.rs`, witnesses `sdk/tests/enrollment_invite.rs`.
 `MembershipInvite` (`NMM1`, signature domain `net-mesh membership invite v1`,
-join link `net-mesh://<host:port>/join/<base64url>` — see the link-format decision below, ≤1 KiB) signs over the full issuer `EntityId`, a
+join token `netmesh-join_<base64url>` — see the join-token decision below, ≤1 KiB) signs over the full issuer `EntityId`, a
 trust-domain label (`[A-Za-z0-9._-]`, 1..=64) plus the existing public
 `TrustDomainId`, a strict UDP `host:port` enrollment endpoint (DNS name, IPv4 or
 bracketed IPv6; port required; no scheme/path/userinfo/whitespace), the
@@ -813,21 +813,22 @@ Not included: CLI `up --enroll` / `invite` / `join`, the local control endpoint,
 profile integration, standing-PSK rotation and membership revocation, Unix
 execution and CI. Loopback single-process evidence only.
 
-**Join link format decision (user, 2026-09-23):** `invite create` returns
-`net-mesh://<host:port>/join/<base64url of the signed NMM1 invite>`. The
-visible address is only for human readability: `MembershipInvite::decode`
-verifies the signature and then requires the visible `host:port` to equal the
-signed endpoint byte-for-byte (`InviteError::AddressMismatch` otherwise), and
-clients connect only to the signed endpoint. The earlier `net-join:` form is
-dropped (never published). A custom scheme is not fetched by HTTP link
-previewers; OS URL-handler registration stays deferred, so the link is passed
-to `net-mesh join`. The link remains bearer material unless subject-bound.
-Witnesses: `the_visible_address_must_be_the_signed_endpoint` (forged host,
-port and case refused; inverse removing the equality check fails it) and the
-extended malformed-link table (legacy `net-join:`/`net-invite:`, `https://`,
-missing `/join/`, query suffix, oversize). Because the link carries the
+**Join token decision (user, 2026-09-23):** `invite create` returns
+`netmesh-join_<base64url of the signed NMM1 invite>`. A briefly adopted
+`net-mesh://<host:port>/join/…` URL form was replaced before release because a
+URL-shaped string invites browsers, chat apps and people to treat it as a web
+link (failed opens, search-engine leaks of a bearer credential, linkified
+"click me" text). The token is deliberately not URL-shaped, carries no visible
+address, and has a fixed prefix so secret scanners can recognize a leaked
+invite. Humans verify issuer fingerprint, enrollment address, trust domain,
+expiry and bearer status through `invite inspect` and `join`'s confirmation
+prompt, never by reading the token. The earlier `net-join:` form is dropped
+(never published). Witnesses: the round-trip test asserts the prefix and that
+no `://` or address appears; the malformed table refuses the bare body,
+`net-join:`, `net-invite:`, the `net-mesh://` URL form, a case-changed prefix,
+suffix characters and oversize input. Because the token carries the
 operator's address, `up --enroll` must advertise a reachable public address
-(`--public-addr`) and a fixed port; see the NAT scope note in the next slice.
+(`--public-addr`) and a fixed port.
 
 **Control endpoint decision (user, 2026-09-23):** loopback TCP plus an
 owner-only per-run secret file with mutual keyed-BLAKE3 authentication, instead
