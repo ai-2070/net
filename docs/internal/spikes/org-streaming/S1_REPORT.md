@@ -2019,3 +2019,230 @@ exactly the twenty-seven (the twenty-four of §2.3 plus):
   per-registration lifetime-policy knob (F-S1.5-4).
 - Windows workstation only: `#[cfg(unix)]` legs never compile here; no
   Linux/macOS execution.
+### 2.5 Slice 1.6 — deleted pins
+
+**Landed (executed):** `c245a29f0` — `S1.6: invert the streaming refusal pins
+and widen call_streaming` (3 files, +416/−49) on `LZL0/org-streaming`; this
+record rides in the following `S1.6:` commit. Base `21efd0319` (the slice
+1.5 record chain on Main's CI pin `86c7ef358`). All green claims below are
+at `c245a29f0`'s exact tree (the scoped rustfmt pass is whitespace-only and
+landed inside it; the receipt cycles ran on the pre-format tree with
+post-format shas recorded below). Post-format shas:
+`behavior/org_admission.rs` `db305c207ff45c43…`, `mesh_rpc.rs`
+`a133189bc35cc6ee…`; the receipt baselines they were restored against are
+the pre-format `ef5fe07246503e44…` / `d4bde8ccb31b40fe…`.
+
+**What landed** (source-established):
+- `behavior/org_admission.rs` tests (the named pin regions ONLY):
+  - `malformed_and_streaming_are_distinct` SPLIT into three named tests:
+    `malformed_proof_is_refused` (the malformed-proof refusal),
+    `unary_registration_streaming_flags_are_streaming_unsupported` (the
+    SURVIVING unary denial invariant — step 4a's typed `StreamingUnsupported`,
+    NOT deleted), and `streaming_registration_admits_the_supported_shape`
+    (the new supported-shape positive: a streaming registration with coherent
+    flags admits a full streaming proof whose `kind` matches and whose
+    `session_binding` matches the receiving session — asserted on the
+    four-party attribution).
+  - `stability_recheck_runs_after_credential_checks` REWRITTEN for the new
+    step-4 shape check, the ordering property KEPT and strengthened: (i) a
+    step-4 `ShapeMismatch` preempts the recheck; (ii) a credential failure
+    (`ProofExpired`) preempts the recheck; (iii) everything valid + an
+    unstable view denies `AuthorityChanged` AND consumes no replay slot.
+  - `every_denial_maps_to_a_defined_coarse_reason` EXTENDED to the seven C4
+    variants (`ShapeMismatch`, `SessionBindingMismatch`,
+    `DeadlineExceedsPolicy`, `ActiveCallOwned`, `ActiveStreamCapacity`,
+    `Revoked`, `ResourceExhausted`) AND to the two pre-existing unlisted
+    variants (`PerOrganizationReplayCapacity`, `ExternalPoolReplayCapacity`)
+    so the enumeration matches its "EVERY variant" claim. Bucket anchors:
+    `Revoked` → `Denied` (Main's §4.3 ruling), `ActiveStreamCapacity` /
+    `ResourceExhausted` → `Unavailable`, the rest of the new ones → `Denied`.
+- `mesh_rpc.rs`:
+  - `call_streaming` WIDENED (C11's SS half): `org_proof_intent` is accepted
+    and mints a streaming call proof through the shared mint helper
+    (`RpcCallShape::ServerStreaming` + the receiving session's Noise
+    handshake hash, §1.3) — the unary `call`'s verbatim mint block (pinned
+    provider binding, exactly-one-header discipline, finalized wire bounds,
+    the one-packet measurement). A streaming mint without a binding fails
+    LOCAL, fail-closed. `call_client_stream`/`call_duplex` keep refusing
+    (their protected admission is Stage 2's) and `call_service_streaming`
+    keeps refusing (capability-index routing cannot pin a provider entity).
+  - `org_proof_intent_rejected_on_streaming_and_capability_mismatch` INVERTED
+    into `call_streaming_mints_a_stream_proof`: the positive proves the
+    minted bytes are a FULL `OrgStreamCallProof` (strict decode) with
+    `kind = server-streaming` and `session_binding` = the exact live
+    session's binding, observed at the provider's request dispatcher (the
+    caller-side mint output on the wire). The capability-mismatch half is
+    KEPT verbatim (local refusal) and the CS/DX/service-routed refusal legs
+    are KEPT (production behavior until their stages).
+- `docs/ORGANIZATIONS.md`: the check-order step 4 rewritten for the shape
+  term (unary registration + streaming flags → `NotSupported`; streaming
+  registration + flags ≠ shape or proof kind ≠ shape → `Denied`) + the
+  streaming-decode note at step 3; the verbs section records slice 1.5's
+  protected server-streaming core seams and the caller-side mint.
+
+**Unit totals before/after by module (executed):**
+- `behavior/org_admission.rs` tests: `19 → 21` (+2 = the split's
+  1→3; the rewrite and the extension are count-neutral; 2 pre-existing
+  unlisted variants added to the extension's enumeration).
+- `adapter/net/mesh_rpc.rs` tests: `52 → 52` (the inversion is a
+  named rewrite, 1 test in, 1 test out).
+- `cortex/rpc.rs`, the Stage 0 models, `behavior/org_call.rs`: unchanged.
+
+**Inverse receipts (executed, raw).** Baselines at receipt time:
+`org_admission.rs` `ef5fe07246503e44…`, `mesh_rpc.rs` `d4bde8ccb31b40fe…`;
+restores are edits-reversed + sha256-proven byte-identical.
+
+**R1 — the supported-shape positive's inverse: the step-4 kind check
+inverted** (`org_admission.rs:556` guard `== Some(ctx.shape)` → `!=`): a
+proof whose kind MATCHES the shape is refused. Command: `CARGO_INCREMENTAL=0
+cargo tfl --retries 0
+adapter::net::behavior::org_admission::tests::streaming_registration_admits_the_supported_shape`.
+**Exit 100.** Verbatim:
+
+```
+thread 'adapter::net::behavior::org_admission::tests::streaming_registration_admits_the_supported_shape' (155352) panicked at src\adapter\net\behavior\org_admission.rs:1221:28:
+the coherent streaming shape admits: ShapeMismatch
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test run failed
+```
+
+Collateral red under the same mutation (one run, disclosed):
+`stability_recheck_runs_after_credential_checks` leg (ii) (`left:
+Err(ShapeMismatch) / right: Err(ProofExpired)` — the mutated kind guard
+preempts the expiry check for the matching-kind expired proof). Restore:
+`ef5fe07246503e44…` == baseline.
+
+**R2 — the mint's own inverse: the mint shape flipped to `Unary`**
+(`mesh_rpc.rs` `call_streaming`'s `sign_admission_proof` call):
+`call_streaming` mints UNARY-format bytes instead of a streaming proof.
+Command: `CARGO_INCREMENTAL=0 cargo tfl --retries 0
+adapter::net::mesh_rpc::roster_fallback_tests::call_streaming_mints_a_stream_proof`.
+**Exit 100.** Verbatim:
+
+```
+thread 'adapter::net::mesh_rpc::roster_fallback_tests::call_streaming_mints_a_stream_proof' (168512) panicked at src\adapter\net\mesh_rpc.rs:9928:14:
+the minted bytes are a FULL streaming proof (strict decode): InvalidFormat
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test run failed
+```
+
+The strict streaming decoder refuses the unary-format value (`InvalidFormat`
+— the 1.2 decoder's truncation refusal), so the witness discriminates "mints
+a STREAM proof" exactly. Restore: `d4bde8ccb31b40fe…` == baseline.
+
+**R3 — the ordering property's inverse: the §9.5 recheck hoisted above the
+shape/credential checks** (`org_admission.rs` — the `if !stability_recheck()`
+block moved to the top of `verify_org_admission`, its step-9.5 site removed;
+two bounded hunks). Command: `CARGO_INCREMENTAL=0 cargo tfl --retries 0
+adapter::net::behavior::org_admission::tests::stability_recheck_runs_after_credential_checks`.
+**Exit 100.** Verbatim:
+
+```
+thread 'adapter::net::behavior::org_admission::tests::stability_recheck_runs_after_credential_checks' (55052) panicked at src\adapter\net\behavior\org_admission.rs:1705:9:
+assertion `left == right` failed: step 4 runs BEFORE the recheck — a shape refusal wins over an unstable view
+  left: Err(AuthorityChanged)
+ right: Err(ShapeMismatch)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test run failed
+```
+
+The property's own inverse exactly: hoisted, `AuthorityChanged` masks the
+shape refusal the ordering guarantees must win. Restore (both hunks) +
+green.
+
+**R4 — the ruling pin's inverse: `Revoked` mapped to `Unavailable`**
+(`org_admission.rs` `AdmissionDenied::coarse` — the variant moved from the
+`Denied` arm group to the `Unavailable` group, the Stage 0 model's corrected
+ruling inverted; two bounded hunks). Command: `CARGO_INCREMENTAL=0 cargo tfl
+--retries 0
+adapter::net::behavior::org_admission::tests::every_denial_maps_to_a_defined_coarse_reason`.
+**Exit 100.** Verbatim:
+
+```
+thread 'adapter::net::behavior::org_admission::tests::every_denial_maps_to_a_defined_coarse_reason' (169488) panicked at src\adapter\net\behavior\org_admission.rs:1881:13:
+assertion `left == right` failed
+  left: Unavailable
+ right: Denied
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test run failed
+```
+
+The §4.3 ruling (Main, `cddb063a3`) pinned: `Revoked` must share the frozen
+`Denied` coarse byte — the old model mapping reddens the anchor. Restore
+(both hunks) + green.
+
+The two halves MOVED by the split (`malformed_proof_is_refused`,
+`unary_registration_streaming_flags_are_streaming_unsupported`) keep their
+discriminative history: 1.2's receipts B (step-4a removal → the
+`StreamingUnsupported` red) and the malformed decode refusals pinned by
+`stream_decode_rejects_truncation_trailing_bytes_and_unknown_kinds`; the
+1.6 pass moved the assertions without weakening them (four weakenings:
+none).
+
+**Witnesses and counts (executed):** the four named pin operations above, at
+`--retries 0` (unit totals: `behavior/org_admission.rs` tests `19 → 21`,
+`adapter/net/mesh_rpc.rs` tests `52 → 52`):
+
+| Pin | Kind | Proves |
+|---|---|---|
+| `malformed_proof_is_refused` | split part 1 (moved assertion) | garbage proof bytes → `MalformedProof`, never a shape refusal |
+| `unary_registration_streaming_flags_are_streaming_unsupported` | split part 2 — the SURVIVING unary denial invariant, NOT deleted | step 4a's typed `StreamingUnsupported` on a unary registration |
+| `streaming_registration_admits_the_supported_shape` | split part 3 (the new supported-shape positive) | the coherent streaming shape ADMITS: full streaming proof, matching kind, matching session binding, four-party attribution asserted |
+| `stability_recheck_runs_after_credential_checks` | rewritten for the new step-4 shape check (ordering property KEPT + strengthened) | step 4 and credential checks precede the §9.5 recheck; the recheck precedes the replay insert (a stale view consumes no slot) |
+| `every_denial_maps_to_a_defined_coarse_reason` | extended | all 37 variants round-trip their coarse byte; anchors incl. `Revoked` → `Denied` (Main's §4.3 ruling) and `ActiveStreamCapacity`/`ResourceExhausted` → `Unavailable` |
+| `call_streaming_mints_a_stream_proof` | inverted | `call_streaming` + `org_proof_intent` puts a FULL `OrgStreamCallProof` (kind SS + the live session's binding) on the wire; the capability-mismatch half and the CS/DX/service-routed refusals KEPT |
+
+**Green at this head (executed):**
+
+- `cargo t --retries 0 --test org_rpc_streaming` → **27 tests run: 27
+  passed, 0 skipped**, exit 0 (the binary is count-unchanged by 1.6 — its
+  floor stays **27**; the CI pin needs no movement from this slice).
+- Preserved + public-streaming-regression + `subnet_org_boundary` batch,
+  ONE invocation → **89 run / 89 passed / 0 skipped**, exit 0 (the
+  preserved trio inside `nrpc_streaming_gate`).
+- In-source units (`CARGO_INCREMENTAL=0 cargo tfl --retries 0
+  adapter::net::cortex::rpc adapter::net::mesh_rpc org_stream`) → **216
+  run / 216 passed / 5622 skipped**, exit 0 — count-continuous (the 1.6
+  unit deltas live in `behavior::org_admission::`, outside this filter).
+- The 1.6 pin modules, each green post-format:
+  `behavior::org_admission::` → **21 run / 21 passed** (was 19),
+  `adapter::net::mesh_rpc` → **52 run / 52 passed** (unchanged).
+- Scoped rustfmt (`rustfmt --edition 2021 --config skip_children=true`) on
+  the two touched source files; `--check` clean.
+- The renamed unit (`org_proof_intent_rejected_on_streaming_and_capability_mismatch`
+  → `call_streaming_mints_a_stream_proof`) is NOT pinned in `ci.yml`
+  (grep: 0 matches) — no roster movement beyond the report's naming.
+
+**Findings** (state, not decide):
+
+1. **F-S1.6-1 — two pre-existing enumeration gaps closed by the named
+   extension (source-established).** `every_denial_maps_to_a_defined_coarse_reason`
+   claimed to enumerate EVERY variant but omitted
+   `PerOrganizationReplayCapacity` and `ExternalPoolReplayCapacity` (both
+   constructed by `verify_org_admission`'s replay-outcome mapping). The
+   extension made the enumeration complete (counted in the same test's edit).
+2. **F-S1.6-2 — `call_client_stream`/`call_duplex` keep refusing
+   `org_proof_intent` (source-established, ordering).** C11 names all of
+   `call_streaming`/`call_client_stream`/`call_duplex` widening; the named
+   1.6 work inverts only `call_streaming` (the CS/DX protected admission is
+   Stage 2's). Their refusal legs are KEPT inside
+   `call_streaming_mints_a_stream_proof` — a red-at-hand pin for the Stage 2
+   widening to invert.
+3. **F-S1.6-3 — `(:124-135 with 1.5's verbs)` is realized as the core-seam
+   names (interpretation).** The doc's verbs section documents the SDK
+   surface; 1.5 landed CORE seams (`serve_rpc_owner_scoped_streaming` /
+   `serve_rpc_granted_streaming`) while the SDK-level
+   `call_streaming`/`serve_org_streaming` verbs are release-train surface.
+   The new paragraph names the landed seams + the caller-side mint and
+   points the SDK verbs at the release train rather than promising verbs
+   that do not exist yet.
+
+**What never ran (complete):** `cargo fmt -p <crate> -- --check`, the four
+clippy invocations, the five rustdoc lines, `cargo check --workspace
+--all-targets` (Main's stage-end list; the touched files were converged with
+scoped rustfmt); `cargo tl` / `cargo t` full suites; `tests/cross_lang_*`;
+the wire suite; the browser/SDK surfaces; the 1.1/1.1a witnesses
+(S1Session's — re-run at stage end); CI itself (unpushed; nobody pushes but
+Main); CS/DX protected admission and the `call_service_streaming` widening
+(later stages by contract); Windows workstation only — `#[cfg(unix)]` legs
+never compile here, no Linux/macOS execution.
