@@ -1210,3 +1210,460 @@ closes with a green 15/15 run.
   revocation/byte-accounting work; no witness reaches them here.
 - Windows workstation only: `#[cfg(unix)]` legs never compile here; no
   Linux/macOS execution.
+
+### 2.3 Slice 1.4 — registry + revocation
+
+**Landed (executed):** `62f4358bc` — `S1.4: wire the protected-call
+registry, revocation, and byte accounting` (6 files, +4632/−384) on
+`LZL0/org-streaming`; this record rides in the following `S1.4:` commit.
+Base `95845205c` (the S1 CI pin after 1.3). All green claims below are at
+`62f4358bc`'s exact tree (the scoped rustfmt pass is whitespace-only and
+landed inside it; the receipt cycles ran on the pre-format tree — the
+1.1a precedent — with post-format shas recorded below).
+
+**What landed** (source-established; executed via the runs below):
+
+- `cortex/rpc.rs` — **the §3/§2.3/§2.7 production registry**, the
+  production mirror of the Stage 0 model
+  `behavior/org_stream_registry.rs` (whose file is byte-untouched — the
+  "production module(s) the model mirrors" shape of the 1.3 precedent,
+  the model's own doc naming `admit_and_dispatch_protected` as the
+  ordering it models; the dispatch's "your call" clause): `ProtectedCallKey`,
+  `SessionIdentity` (the exact `(peer, session_id, establishment)`
+  triple — production carries the establishment WHOLE, the full Noise
+  handshake hash, where the model abstracts a `u64`),
+  `ViewMovement`/`stamp_movement` (the §2.3 discriminator — generation-
+  only movement requalifies and REFRESHES, it never retires a sibling),
+  `CallLimits`/`ByteLimits` (Q1 defaults 4096/64/512 and 16/64/512 MiB,
+  `validate()` at construction), `ByteBudgets`/`ItemPermit`/`SharedPermit`/
+  `ChargedChunk` (§2.7: call → caller → node check-before-increment with
+  rollback, release-once permits, checked arithmetic — never
+  `fetch_add`-then-check), `ProtectedCallRegistry` (reserve → install →
+  confirm/transfer → begin_commit → retire → release/complete — the two
+  mutually-exclusive incarnation-conditional removal paths of §2.4),
+  `ReservationGuard`/`ProtectedCallLease` (the bridge's rollback owner
+  before transfer; Drop-releases exactly once), `CommitTxn`/`CommitVerdict`
+  (check + enqueue as ONE registry-locked ownership operation), the
+  per-node registry map with the five mesh.rs hook fns
+  (`org_registry_store_installed`, `org_registry_retire_session`,
+  `org_registry_retire_all`, `org_registry_node_dropped`) and the
+  fixtures seams (`set_protected_call_registry_for_node`, tiny-limit
+  constructors). The §2.3 raise feed is the registry's own
+  `RaiseSubscription` (the second `subscribe_floors_raised`), re-created
+  on store/authority replacement with the old guard dropped OUTSIDE the
+  registry lock (its Drop drains in-flight callbacks).
+  **§2.7 at both enqueue boundaries:** `RpcResponseSink` carries
+  `RegistryCallRef` for protected records — `send`/`send_wait` reserve
+  bytes before submission is acknowledged, `send_wait` parks only on
+  satisfiable bounds and is interruptible by retirement, an unsatisfiable
+  item fails promptly and LATCHES `ResourceExhausted` + retires (never a
+  drop-then-success), and the queue admission (reserved `mpsc::Permit`) +
+  the §2.3 check run under one registry lock; the pump and
+  `RequestStream` release each item's permit at publish/yield;
+  `apply_request_chunk_to_senders` accounts `payload.len()` before the
+  queue allocation for charged records (over budget / full mpsc / closed
+  sender ⇒ retire `ResourceExhausted` + zero further delivery).
+  The supervisor's forced branch settles the registry side first
+  (terminal + queued permits + owner signal), and `StreamCallRegistration`
+  completes the registry record at the §2.4 single-removal point.
+- `cortex/rpc.rs` — **contract 5's lease-carrying seam, early** (the
+  F-S1.3-7 shared-helper preference): `apply_inbound_admitted` gains the
+  `Option<ProtectedCallLease>` fourth parameter and TRANSFERS ownership
+  before any fold effect (§3 step 5); `ProtectedStreamCall` routes
+  `retire()` through the registry and observes `retire_reason()` (the
+  synchronous §2.3 boundary — "retirement reached the owner"); the unary
+  fold's `apply_inbound_admitted` takes the lease too, with a
+  `ConfirmedOpening` scope guard completing the record at the spawned
+  task's end (or at an effect-boundary refusal — no orphaned `Running`
+  records), its retire hook cancelling the token and the response
+  override mapping the registry's typed reason through
+  `stream_terminal_payload` (byte-identical for plain `Cancelled`).
+- `mesh_rpc.rs` — **the shared §3 helper** `admit_protected_opening`
+  (+`ProtectedOpeningOutcome`/`OpeningRefusal`): reserve (before decode,
+  before any signature work, on `(resolve_direct_caller`'s entity,
+  `EventMeta`'s `call_id)`) → decode → digest → provider self-verify →
+  `verify_org_admission` with its UNCHANGED step order (the §9.5
+  stability recheck, the replay insert at step 10, the provider policy at
+  step 11 — guard and policy untouched) → rollback-on-`Err` (the
+  reservation guard; the Q4 policy-veto guard slot stays consumed) →
+  install under the registry lock with the §2.3 requalification.
+  `admit_and_dispatch_protected` (the unary protected bridge) consumes it
+  — its previous inline sequence moved verbatim (order preserved,
+  including the §6 throttle's position and disposition) — and slice 1.5's
+  `admit_and_dispatch_protected_stream` consumes the same helper next.
+  `ServeHandle::drop` also settles `retire_registration` for the
+  registry's records (protected unary included).
+- `mesh.rs` — exactly the five authorized sites: the second
+  `subscribe_floors_raised` subscriber at the store install site
+  (`install_org_revocation_store_locked`'s tail — bind +
+  replacement-retire + re-subscribe, before the install returns), the
+  `install_peer_locked` displaced branch, the dead-peer sweep (one
+  `registry_node_id` capture beside the sweep's other handles), and
+  Main's carve — `Adapter::shutdown` + `Drop for MeshNode` retire-all.
+- `tests/org_rpc_streaming.rs` + `tests/org_rpc_streaming/s14.rs` (new) —
+  the nine witnesses below; the fifteen prior witnesses adapted
+  mechanically (the seam's new `None` lease argument, byte-stable
+  assertions).
+- `docs/ORGANIZATIONS.md` — §2.3's explicit limitation documented at the
+  revocation-floors section: floors cover membership certificates only;
+  cross-org capability/dispatcher grant revocation is NOT actively
+  enforced during a call (bounded by grant `not_after` + provider policy).
+
+**Witnesses and counts (executed):** `cargo t --retries 0 --test
+org_rpc_streaming` → `Summary 24 tests run: 24 passed, 0 skipped`,
+**exit 0** — the fifteen prior witnesses still green plus the nine named:
+
+| # | Witness | Property proved |
+|---|---|---|
+| (a) | `floor_raise_retires_blocked_stream_before_publish_returns` | §2.3's quantified raise boundary: a floor raise for the call's member retires its credit-BLOCKED stream BEFORE `apply_bundle` returns (observed at `retire_reason()` captured at the return), one typed `Revoked` terminal after pump stop |
+| (b) | `sibling_stream_of_other_org_sends_next_item_after_publication` | the §2.3 requalification is StampMovement-aware, never whole-stamp equality: a raise for an org-B member (moving EVERY captured generation) leaves the org-A sibling live, its NEXT item commits after the publication, and the commit REFRESHES the captured generation (`CommitVerdict::Proceed` afterwards) |
+| (c) | `poisoned_store_retires_all_protected_streams` | poison fails closed: the active stream's next item is refused at the §2.3 commit boundary (poisoned ⇒ `Unusable`) and retires `AuthorityUnavailable`; the empty-slice authority wake retires ALL streams (idle included) before it returns; recovery does not resume them |
+| (d) | `store_replacement_retires_all_and_resubscribes` | a `(authority_ptr, store_ptr)` replacement retires every record captured under the old pair before the install returns, and the registry RE-SUBSCRIBES (the new store's raises retire; the replaced store's do not) |
+| (e) | `session_replacement_retires_old_call` | the `install_peer_locked` displaced branch retires exactly the replaced establishment (`SessionReplaced` at the transition boundary); the successor — SAME `(caller, call_id)` on the new establishment — is unaffected and completes (the same-id reuse rides the W6 monotonic jump: the guard's retained window refuses same-id reuse inside it with `CallIdCollision`, §3's classification) |
+| (f) | `active_call_id_reuse_after_replay_window_is_refused` | D4: a live call id cannot be reused even after the replay guard's window lapsed (`ActiveCallOwned` from `reserve`, before decode — the guard never consulted), while the identical reuse ADMITS (not `Replay`) once the call is gone — proving the refusal was active ownership. The window lapse rides the documented clock pairing (freshness reads `wall_ns`, retention derives from `monotonic`; `ClockSample{ wall_ns, monotonic + 400 s }` is "after expiry + 300 s") |
+| (g) | `raise_between_reserve_and_install_denies_with_zero_effects` | §3 step 4: a raise landing between `reserve` and `install` denies `Revoked` with ZERO effects (no lease, org quota never charged, record terminal), and the bridge's rollback frees the key (exactly one removal; reusable) |
+| (h) | `queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire` | §2.7 response direction: three in-budget items queue (zero-credit pump keeps every permit charged), the over-budget item PARKS in `send_wait` (satisfiable bound only), and retire WAKES it with the closed-sink refusal |
+| (i) | `node_shutdown_retires_live_protected_streams` | Q3/C9 (Main's carve): node shutdown retires that node's live protected streams with the typed `ServeHandleDropped` before the call returns, and a SIBLING node's streams survive and complete normally |
+
+Green at this head (executed):
+
+- The preserved + public-streaming-regression + `subnet_org_boundary`
+  batch, ONE invocation (`cargo t --retries 0 --test nrpc_streaming_gate
+  --test integration_nrpc_streaming --test
+  integration_nrpc_client_streaming --test integration_nrpc_duplex --test
+  nrpc_registration_order --test integration_nrpc_protected --test
+  org_admission_wire --test subnet_org_boundary`) → **89 run / 89 passed
+  / 0 skipped**, exit 0. The preserved trio
+  (`client_streaming_denies_unauthorized_caller`,
+  `duplex_denies_unauthorized_caller`,
+  `denial_is_not_fanned_out_to_the_reply_roster`) ran inside
+  `nrpc_streaming_gate` (the roster's last PASS names the third).
+- In-source units, ONE invocation (`CARGO_INCREMENTAL=0 cargo tfl
+  adapter::net::cortex::rpc adapter::net::mesh_rpc org_stream`) →
+  **216 run / 216 passed / 5620 skipped** (214 prior + 2 new §2.7
+  units: `byte_reservation_rolls_back_in_order_and_releases_exactly_once`,
+  `request_chunk_accounting_retires_the_call_and_stops_delivery`), the
+  Stage 0 models green and byte-untouched, the preserved in-source bridge
+  trio (`client_stream_bridge_rejects_before_fold_end_to_end`,
+  `duplex_bridge_rejects_before_fold_end_to_end`,
+  `reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads`)
+  inside `adapter::net::mesh_rpc`.
+- Frozen provenance hashes UNCHANGED: `d5faa9fe82f76db3…` (old_org_admission.rs),
+  `0ab7e915e835533c…` (old_org_call.rs), `9c5963e8b14d003a…` (old_serve.rs).
+- The step-10/step-11 ordering is demonstrably untouched: `behavior/org_admission*.rs`
+  and `behavior/org_admission_replay.rs` are byte-unmodified by this
+  slice (git's change set names no file under `behavior/`), the helper
+  calls `verify_org_admission` with the same argument order as the old
+  inline sequence (recheck closure, policy closure last), and the
+  unit-set's `stability_recheck_runs_after_credential_checks` +
+  `every_denial_maps_to_a_defined_coarse_reason` stay green inside
+  `org_stream`.
+- Scoped rustfmt (`rustfmt --edition 2021 --config skip_children=true`)
+  on the five touched files; `mesh.rs` is byte-unchanged by the pass
+  (`a55818907d0bfe52…` both sides); post-format shas:
+  `cortex/rpc.rs` `d43f31815daa1782…` (pre-format `34b54f634801c751…`),
+  `mesh_rpc.rs` `ed3f0d644b4b20e3…` (pre `aca52bcbbae6230a…`),
+  `tests/org_rpc_streaming.rs` `7a9fe57eee0c08ab…` (pre `9a4b7066d32f8336…`),
+  `s14.rs` `328bfada4ba4b530…` (pre `94be50933f3546ff…`).
+
+**Inverse receipts (executed, raw).** Each mutation is a bounded diff at
+the PRODUCTION site; commands run from `net/crates/net/`; restores are
+edits-reversed + sha256-proven byte-identical to the pre-format
+baseline (`cortex/rpc.rs` `34b54f634801c751…`, `mesh.rs`
+`a55818907d0bfe52…`), each closing with a green
+`cargo t --retries 0 --test org_rpc_streaming` → `24 tests run: 24
+passed`, exit 0.
+
+**INV-A — the prescribed inverse: whole-stamp comparison at commit
+points.** Bounded diff at `cortex/rpc.rs` `commit_check_locked`'s
+`GenerationOnly` arm (the floor compare + refresh replaced by a retire):
+the commit point compares the WHOLE stamp. Command:
+`cargo t --retries 0 --test org_rpc_streaming -E
+'test(=sibling_stream_of_other_org_sends_next_item_after_publication)'`.
+**Exit 100.** Verbatim failure:
+
+```
+thread 'sibling_stream_of_other_org_sends_next_item_after_publication' (164876) panicked at tests\org_rpc_streaming.rs:1504:10:
+the sibling stream of another org sends its next item after publication: RpcSinkClosed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Summary [   0.181s] 1 test run: 0 passed, 1 failed, 23 skipped
+```
+
+The prescribed outcome exactly: the sibling of another org is retired at
+its NEXT commit after the publication ("the sibling witness retires the
+wrong call"), its item refused. Restore: diff reversed; `34b54f63…` ==
+baseline. Restored green: 24/24, exit 0.
+
+**INV-B — the prescribed inverse: the raise subscription disconnected.**
+Bounded diff at `cortex/rpc.rs` `bind_store` (the
+`subscribe_floors_raised` guard dropped immediately — the bind survives,
+the raise feed does not). Command: `cargo t --retries 0 --test
+org_rpc_streaming`. **Exit 100.** Verbatim failure (the named witness —
+a bounded-window TIMEOUT, the prescribed shape):
+
+```
+thread 'floor_raise_retires_blocked_stream_before_publish_returns' (51376) panicked at tests\org_rpc_streaming.rs:1342:5:
+the blocked stream must be retired by the raise
+note: run with `RUST_BACKTRACE=1` environment variable to display a back trace
+Summary: FAIL [  30.203s] (24/24) net-mesh::org_rpc_streaming floor_raise_retires_blocked_stream_before_publish_returns
+```
+
+Grouped reds at their own subscription-dependent properties (one
+mutation, one run): (b) `the raised member's stream retires at the
+publication boundary / left: None / right: Some(Revoked)`;
+(c) `the empty-slice wake retires ALL protected streams before it
+returns / left: None / right: Some(AuthorityUnavailable)`;
+(d) `the registry is subscribed to the NEW store / left: None / right:
+Some(Revoked)`; (g) `the notified callback moved the epoch / left: 1 /
+right: 2`. Restore: both shas == baseline. Restored green: 24/24.
+(A first, coarser bounded diff — commenting out the whole site-1 hook —
+is disclosed: it reddened eight witnesses at their ADMISSIONS
+(`ProviderAuthorityUnavailable` — the unbound registry refuses) rather
+than at the raise boundary, so it is not the prescribed inverse; the
+refined diff above is.)
+
+**R1 — `reserve`'s live-key refusal removed** (`if false &&
+contains_key`). Command: `-E
+'test(=active_call_id_reuse_after_replay_window_is_refused)'`. **Exit
+100.** Verbatim: `panicked at tests\org_rpc_streaming.rs:1971:6: an
+ACTIVE call id cannot be reused after the replay window:
+(b"\x10\0\0\0\x11\x11…")` (the `expect_err` received the ADMITTED
+lease). Restore + green 24/24.
+
+**R2 — `install`'s §2.3 requalification neutered** (`if false &&` on
+the movement branch). Command: `-E
+'test(=raise_between_reserve_and_install_denies_with_zero_effects)'`.
+**Exit 100.** Verbatim: `panicked at tests\org_rpc_streaming.rs:2064:10:
+install must deny after the raise: ProtectedCallLease { key:
+ProtectedCallKey { caller: EntityId(58936604abda112b...), call_id: 42 },
+incarnation: 1, registration: 1, session: SessionIdentity { peer: 10,
+session_id: 81, establishment: Some([161 × 32]) } }`. Restore + green.
+
+**R3 — the `install_peer_locked` displaced-branch hook removed.**
+Command: `-E 'test(=session_replacement_retires_old_call)'`. **Exit
+100.** Verbatim: `assertion 'left == right' failed: the displaced
+session's call retires at the replacement boundary / left: None / right:
+Some(SessionReplaced)`. Restore (`mesh.rs` `a5581890…` == baseline) +
+green.
+
+**R4a — the empty-slice retire-all removed** (`if false &&
+raised.is_empty()` in `on_floors_raised`). Command: `-E
+'test(=poisoned_store_retires_all_protected_streams)'`. **Exit 100.**
+Verbatim: `assertion 'left == right' failed: the empty-slice wake
+retires ALL protected streams before it returns / left: None / right:
+Some(AuthorityUnavailable)`. Restore + green.
+
+**R4b — the poison terms dropped from `stamp_movement`** (poison no
+longer makes the view unusable). Same command. **Exit 100.** Verbatim:
+`panicked at tests\org_rpc_streaming.rs:1600:5: a poisoned store refuses
+further items` (the commit-point refusal is gone — the item goes
+through). Restore + green.
+
+**R5 — the replacement's retire-old-pair selection removed** (`&& false`
+in `bind_store`'s victims filter). Command: `-E
+'test(=store_replacement_retires_all_and_resubscribes)'`. **Exit 100.**
+Verbatim: `assertion 'left == right' failed: records captured under the
+old (authority_ptr, store_ptr) retire before the install call returns /
+left: None / right: Some(AuthorityUnavailable)`. Restore + green.
+
+**R6 — the §2.7 wake.** Two bounded diffs, disclosed in order. (1)
+Removing ONLY the terminal wake in `retire_locked` left the witness
+**GREEN** (`Exit 0`, 1/1): retirement also wakes the parked producer
+through the queued permits' `release_charge` notify — the two wake paths
+are redundant for a call with queued items, and the diff is therefore
+**not the property's own inverse** (the F-S1.2-1 classification: none of
+the four weakenings applies — the witness is not weakened; the mutation
+was partial). (2) The property's true inverse — BOTH notifies removed
+(`release_charge`'s and the terminal wake): Command: `-E
+'test(=queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire)'`.
+**Exit 100.** Verbatim: `FAIL [  10.392s]` … `panicked at
+tests\org_rpc_streaming.rs:2163:10: the parked send_wait must wake on
+retire: Elapsed(())` — a wake-on-retire TIMEOUT past its 10 s bound.
+Restore (both hunks) + green.
+
+**R7 — the node-shutdown hook removed (Main's named inverse).** Bounded
+diff at `mesh.rs` `Adapter::shutdown` (the `org_registry_retire_all`
+call commented). Command: `-E
+'test(=node_shutdown_retires_live_protected_streams)'`. **Exit 100.**
+Verbatim: `FAIL [  30.244s]` … `panicked at
+tests\org_rpc_streaming.rs:2268:5: the live protected stream must be
+retired by node shutdown` — the bounded wait elapsed. Restore (`mesh.rs`
+== baseline) + green.
+
+No witness stayed green under its own inverse except R6(1), which is
+analyzed above as a partial (non-)inverse with its true inverse red.
+
+**Findings** (state, not decide):
+
+1. **F-S1.4-1 — the model's `Denial` vocabulary collapses onto C4
+   `AdmissionDenied`, and the two coarse mappings disagree on `Revoked`
+   (source-established).** The production mappings used:
+   model `ActiveCallOwned`/`Replay`/`CallIdCollision`/`PolicyVetoed`
+   stay inside `verify_org_admission` (untouched);
+   `ActiveStreamCapacity(scope)`/`CounterOverflow` →
+   `AdmissionDenied::ActiveStreamCapacity` (the C4 variant is
+   unscoped); `AuthorityUnavailable` → `ProviderAuthorityUnavailable`;
+   `VerificationDeadlineExpired`/`SessionCurrentnessExhausted`/`NotAdmitted`
+   → `AuthorityChanged` (all coarse `Unavailable` as §3 requires);
+   `Revoked` → `AdmissionDenied::Revoked`. The inconsistency: the model's
+   `Denial::coarse()` (`behavior/org_stream_registry.rs`) sends `Revoked`
+   → `Unavailable`, while the C4 pinned mapping sends it → `Denied`
+   (`behavior/org_admission.rs:317-319`, pinned by
+   `every_denial_maps_to_a_defined_coarse_reason`); production follows
+   C4 (`org_admission*.rs` is must-not-touch for this slice). A distinct
+   wire bucket — or the model's alignment — is a ruling.
+2. **F-S1.4-2 — the `SessionCurrentness` generation is unreachable from
+   the admission sites (source-established).** `SessionCurrentness` is
+   `pub(crate)` (`behavior/org_routing_registry.rs:492-537`) behind
+   `mesh.rs`'s private `NodeSessionRouting.currentness` (`mesh.rs:9579`);
+   no `MeshNode` accessor exists. The seam carries the check
+   (`OpeningRequest.session_generation: None` ⇒ refuse
+   `AuthorityChanged`, coarse `Unavailable`, exactly §3's
+   `u64::MAX`-exhausted rule) and the witnesses pass real values, but
+   `admit_and_dispatch_protected` feeds `Some(0)` ("a live,
+   non-exhausted generation") — the refusal is wired and never fed the
+   live generation at the unary site. A `MeshNode` accessor would close
+   it; that is API-addition/ruling territory.
+3. **F-S1.4-3 — §2.3's "Poison: same boundary via the empty-slice
+   notify" is only partly true of the real store
+   (source-established + executed).** The empty-slice wake
+   (`notify_authority_changed`) fires on the production durability-
+   uncertain mark path (`org_revocation.rs:2163-2167`), on
+   `init`/`open_existing` over a poisoned path (`:1572-1575`,
+   `:1628-1631`) and on `apply_bundle` recovery (`:2137-2139`); the
+   fixtures seam `mark_poisoned_for_test` (`:1706-1709`) MARKS without
+   waking. Witness (c) therefore drives the mark boundary through the
+   §2.3 commit point (poisoned ⇒ `Unusable` ⇒ refuse + retire — "further
+   items refused", receipts R4b) and the retire-ALL through the real
+   recovery wake (receipt R4a). A test-only wake-at-mark seam would make
+   the mark boundary directly drivable — stated, not added.
+4. **F-S1.4-4 — `VerifiedFacts.deadline` is `Option` in production where
+   the model requires it (source-established).** The model's
+   `VerifiedFacts.deadline` is mandatory; production carries
+   `Option<ResolvedStreamDeadline>` — `None` for unary records at this
+   slice, because the §2.1 machinery is streaming-scoped (1.3's
+   `StreamCallLifetime`) and enforcing it on unary would change unary
+   behavior ("preserving unary behavior"). Streaming records resolve at
+   the fold as before.
+5. **F-S1.4-5 — the production session identity is more precise than the
+   model's (source-established).** The model's
+   `SessionRef.establishment: u64` abstracts "the exact handshake that
+   produced this session"; production carries it whole
+   (`NetSession::handshake_binding`, the full Noise transcript hash) in
+   `SessionIdentity::establishment: Option<[u8; 32]>`. The semantics the
+   model proves (exact-triple matching; a bare truncated session id
+   never retires a bystander) are preserved verbatim.
+6. **F-S1.4-6 — Main's carve phrasing is realized one layer down
+   (source-established).** The carve named "ONE call to
+   `ProtectedStreamOwners::retire_all`" at each shutdown site; the calls
+   landed are `org_registry_retire_all` / `org_registry_node_dropped`
+   (one call per site). Those fire the SAME `ProtectedStreamCall::retire`
+   signals `ProtectedStreamOwners::retire_all` fires, plus the
+   synchronous registry-record marking the §2.3 commit-point exclusion
+   requires — a bare `retire_all` would leave registry records unmarked
+   until the supervisors' async cleanup, reopening a commit-after-
+   shutdown window. The record's owner hook IS the 1.3
+   `StreamRetireSignal` (same handle `retire_all` drives).
+7. **F-S1.4-7 — §2.7's "unknown sender for an admitted call ⇒ retire" is
+   not attributable from the wire key (source-established).** The
+   request-chunk boundary can retire a call whose sender entry exists
+   (the charge rides the entry: over budget / full mpsc / closed sender
+   all retire `ResourceExhausted` + stop delivery), but a TRULY unknown
+   key drops exactly as the plan's pre-admission rule requires
+   ("Unknown-key CHUNK dropped without allocation") — the frame carries
+   `(origin_hash, call_id)`, not the registry's authenticated
+   `(EntityId, call_id)`, and `origin_hash` is a collidable u64
+   (`origin_hash_to_node` is first-write-wins), so an unknown key cannot
+   be safely attributed to a record. The charged request paths become
+   reachable with Stage 2's protected CS/DX records; until then they are
+   covered by the in-source unit
+   `request_chunk_accounting_retires_the_call_and_stops_delivery`.
+8. **F-S1.4-8 — seam shape (the F-S1.3-7 precedent, stated).** The
+   §3 transaction lives in the shared helper `admit_protected_opening`
+   (the unary bridge consumes it now; 1.5's stream bridge consumes it
+   next) and contract 5's lease-carrying `apply_inbound_admitted` landed
+   early with `Option<ProtectedCallLease>` — `None` preserves the 1.3
+   witnesses' registry-less synthetic idiom, `Some` is the production
+   path.
+9. **F-S1.4-9 — implementation home of the model mirror
+   (source-established).** The registry semantics are implemented in
+   "the production module(s) the model mirrors" (`cortex/rpc.rs` +
+   `mesh_rpc.rs` — the model's own doc names `admit_and_dispatch_protected`
+   as the ordering it models), the 1.3 precedent (lifecycle →
+   `cortex/rpc.rs`); `behavior/org_stream_registry.rs` is byte-untouched,
+   so the frozen model surface needed no Main ruling. The model-mirror
+   operations not yet wired to a production caller (kept as the faithful
+   surface, named in the never-executed list): `reap_expired_openings`,
+   `ItemPermit::transfer`, `cancel_queued`, `queued_items`,
+   `store_poisoned`, `SharedPermit::is_consumed`, `cleanup_owner`.
+10. **F-S1.4-10 — the `Revoked` coarse byte reaches the wire as `Denied`
+    for mid-stream retirement too (source-established).**
+    `stream_terminal_payload` maps `Revoked`/`AuthorityUnavailable` →
+    `AdmissionDenied` + coarse `[0]` (`Denied`) and `ResourceExhausted` →
+    `[2]` (`Unavailable`), consistent with the C4 mapping of F-S1.4-1;
+    the §3 denial text's parenthetical "`Revoked` (`Unavailable`)" (the
+    model's `coarse()`) is the disagreement named there.
+
+**CI pin data for Main (never edited here):** binary
+`org_rpc_streaming`, floor **24** (15 prior + 8 named + 1 from Main's
+shutdown carve — `15+N+1`), REQUIRED names exactly the twenty-four:
+
+`stream_opening_admits_same_org`, `stream_opening_admits_cross_org`,
+`unary_context_proof_is_binding_invalid_on_stream_registration`,
+`stream_proof_on_unary_registration_is_not_supported`,
+`frozen_old_provider_refuses_stream_proof_with_not_supported`,
+`replayed_opening_on_new_session_is_session_binding_mismatch`,
+`late_chunk_from_replaced_session_is_dropped`,
+`omitted_deadline_gets_default_and_expires_idle`,
+`requested_deadline_over_cap_is_refused_with_zero_effects`,
+`requested_deadline_within_cap_is_honoured`,
+`pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal`,
+`serve_handle_drop_retires_live_stream_and_sibling_survives`,
+`credential_clamp_expiry_is_admission_denied_not_timeout`,
+`public_ss_nonzero_deadline_expires_with_typed_timeout`,
+`public_client_stream_deadline_expiry_is_typed_timeout`,
+`floor_raise_retires_blocked_stream_before_publish_returns`,
+`sibling_stream_of_other_org_sends_next_item_after_publication`,
+`poisoned_store_retires_all_protected_streams`,
+`store_replacement_retires_all_and_resubscribes`,
+`session_replacement_retires_old_call`,
+`active_call_id_reuse_after_replay_window_is_refused`,
+`raise_between_reserve_and_install_denies_with_zero_effects`,
+`queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire`,
+`node_shutdown_retires_live_protected_streams`.
+
+(suggested filter-set: the same twenty-four space-separated.)
+
+**What never ran here (complete):**
+
+- `cargo fmt -p <crate> -- --check`, the four clippy invocations, the
+  five rustdoc lines and `cargo check --workspace --all-targets` —
+  Main's stage-end list (mid-flight rule). The five touched files were
+  converged with scoped `rustfmt --config skip_children=true` and the
+  lib/units/integration graphs compile clean on the alias feature sets.
+- `cargo tl` / `cargo t` full suites; `tests/cross_lang_*`; the wire
+  suite; the browser/SDK surfaces — stage-end or other lanes'.
+- CI itself (branch unpushed; nobody pushes but Main).
+- **The request-direction charged paths through a REAL protected CS/DX
+  record** — Stage 2's seam feeds them; at 1.4 they are wired at
+  `apply_request_chunk_to_senders` and covered only by the in-source
+  unit above.
+- **The unary mid-handler retirement's typed terminal** (the registry
+  reason mapped through the unary response override) — constructed per
+  §2.2/§2.3 and reachable (the retire hook cancels the token; the
+  override maps `stream_terminal_payload`), but no NAMED witness drives
+  a unary record's mid-handler revocation.
+- **`session_generation: None`'s refusal** (the `u64::MAX`
+  `SessionCurrentness` exhaustion, F-S1.4-2) — never executed at any
+  seam; `admit_and_dispatch_protected` feeds `Some(0)`.
+- **`reap_expired_openings`** (§3's lost-bridge reaper) — no production
+  caller at 1.4 (every bridge reservation is RAII-released inline);
+  `ItemPermit::transfer`, `cancel_queued`, `queued_items`,
+  `store_poisoned`, `SharedPermit::is_consumed`, `cleanup_owner` — the
+  faithful model surface of F-S1.4-9, compiled, never executed.
+- The `ReservationGuard`/`ProtectedCallLease` double-release panics
+  (the checked-subtraction `expect`s) — by construction unreachable; no
+  witness drives a double release (driving one would be the bug the
+  `expect` exists to catch).
+- Windows workstation only: `#[cfg(unix)]` legs never compile here; no
+  Linux/macOS execution.
