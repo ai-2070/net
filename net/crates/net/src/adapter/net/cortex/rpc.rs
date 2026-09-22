@@ -3116,6 +3116,44 @@ impl StreamCallRecord {
         }
     }
 
+    /// §2.6's initial state for a CLIENT-STREAMING record: both halves
+    /// `Open` (the upload is still arriving; the single response has not
+    /// been produced). Stage 2 slice 2.2.
+    fn new_client_streaming() -> Self {
+        Self {
+            input: StreamCallInput::Open,
+            output: StreamCallOutput::Open,
+            terminal: None,
+        }
+    }
+
+    /// §2.6's initial state for a DUPLEX record: both halves `Open`.
+    /// Stage 2 slice 2.2.
+    fn new_duplex() -> Self {
+        Self {
+            input: StreamCallInput::Open,
+            output: StreamCallOutput::Open,
+            terminal: None,
+        }
+    }
+
+    /// END from the caller ⇒ `input = Ended` ONCE, idempotent, never
+    /// touching `output` (§2.6 — half-close independence protects
+    /// legitimate remaining output from an early END). Returns `true`
+    /// only for the transition that closed the half: a second END, an
+    /// END after the handler returned (`Closed`), or an END on a
+    /// server-streaming record (`Ended` at birth) all return `false` and
+    /// change NOTHING — an END can never reopen a closed/terminal half.
+    /// Stage 2 slice 2.4.
+    fn end_input(&mut self) -> bool {
+        if self.input == StreamCallInput::Open {
+            self.input = StreamCallInput::Ended;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Frames while terminal are dropped, no credit, no delivery (§2.6).
     /// Credit survives the handler's return — it is what lets a drain
     /// finish — and stops once the output half has ended.
@@ -3310,6 +3348,14 @@ impl ProtectedStreamCall {
         self.record.lock().terminal_reason()
     }
 
+    /// Test-only: the §2.6 input half's state — the half-close witnesses'
+    /// "END closes input once / an END can never reopen it" observation
+    /// (Stage 2 slices 2.2/2.4).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn input_half(&self) -> StreamCallInput {
+        self.record.lock().input
+    }
+
     /// The retirement reason the owner has ALREADY been handed (§2.4:
     /// "retirement reached the owner"), if any — observable the instant
     /// the synchronous retirement lands, before the supervisor's async
@@ -3408,19 +3454,32 @@ impl ProtectedStreamOwners {
 struct StreamCallRegistration {
     key: StreamCallKey,
     in_flight: InFlightCalls,
-    flow_control: FlowControlMap,
+    /// `None` on the client-streaming fold: its shape has no response pump
+    /// to credit (a `STREAM_GRANT` there is direction-wrong and no-ops).
+    flow_control: Option<FlowControlMap>,
     protected: ProtectedStreamOwners,
     /// §2.4's single removal point (the model's `complete`): registry-
     /// backed records are removed from the registry here too, after the
-    /// supervisor has disposed of the owned work.
+    /// supervisor has disposed of its owned work.
     registry: Option<RegistryCallRef>,
+    /// The CS/DX request-chunk sender map (Stage 2 slices 2.2/2.4):
+    /// §2.2's "close input admission … through the queue owner" and
+    /// §2.4's single removal both cover it, so a retired call's sender is
+    /// gone at the same boundary as every other per-call map. `None` on
+    /// the server-streaming fold (no request direction).
+    senders: Option<RequestChunkSenders>,
 }
 
 impl StreamCallRegistration {
     fn complete(&self) {
         self.in_flight.lock().remove(&self.key);
-        self.flow_control.lock().remove(&self.key);
+        if let Some(flow_control) = self.flow_control.as_ref() {
+            flow_control.lock().remove(&self.key);
+        }
         self.protected.remove(&self.key);
+        if let Some(senders) = self.senders.as_ref() {
+            senders.lock().remove(&self.key);
+        }
         if let Some(call_ref) = self.registry.as_ref() {
             call_ref
                 .registry
@@ -3436,6 +3495,21 @@ impl StreamCallRegistration {
 /// derives `ServerStreaming` from them.
 fn ss_request_flags_ok(flags: u16) -> bool {
     flags & FLAG_RPC_STREAMING_RESPONSE != 0 && flags & FLAG_RPC_CLIENT_STREAMING_REQUEST == 0
+}
+
+/// Whether a REQUEST's flags claim exactly the CLIENT-STREAMING shape
+/// (Stage 2 slice 2.2 — the CS twin of [`ss_request_flags_ok`]): the
+/// client-streaming flag set and the streaming-response flag clear — i.e.
+/// `RpcCallShape::from_streaming_flags` derives `ClientStreaming`.
+fn cs_request_flags_ok(flags: u16) -> bool {
+    flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0 && flags & FLAG_RPC_STREAMING_RESPONSE == 0
+}
+
+/// Whether a REQUEST's flags claim exactly the DUPLEX shape (Stage 2
+/// slice 2.2): BOTH streaming flags set — `from_streaming_flags` derives
+/// `Duplex`.
+fn dx_request_flags_ok(flags: u16) -> bool {
+    flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0 && flags & FLAG_RPC_STREAMING_RESPONSE != 0
 }
 
 /// The terminal frame one selected reason emits (§2.2's queued-data
@@ -5490,6 +5564,53 @@ struct AdmittedOpening {
     confirmed: Option<ConfirmedOpening>,
 }
 
+use std::future::Future;
+
+/// The handler shape one §2.2-supervised call runs (Stage 2 slice 2.2
+/// extends the seam to duplex). The supervisor owns "the handler future"
+/// (§2.2's table) for every pumping shape alike; only the invocation
+/// differs — server-streaming takes `RpcContext` + sink, duplex takes
+/// `RpcStreamingContext` + request stream + sink. Client-streaming has no
+/// pump (its bounded single-response emission IS the drain-complete
+/// event) and runs [`run_client_stream_call`] instead.
+enum SupervisedHandler {
+    /// Server-streaming: one REQUEST in, many RESPONSE chunks out.
+    ServerStreaming(Arc<dyn RpcStreamingHandler>, RpcContext),
+    /// Duplex: request stream in, RESPONSE chunks out.
+    Duplex(
+        Arc<dyn RpcDuplexHandler>,
+        RpcStreamingContext,
+        RequestStream,
+    ),
+}
+
+impl SupervisedHandler {
+    /// The call's cancellation token (both context shapes carry one).
+    fn cancellation(&self) -> RpcCancellationToken {
+        match self {
+            Self::ServerStreaming(_, ctx) => ctx.cancellation.clone(),
+            Self::Duplex(_, ctx, _) => ctx.cancellation.clone(),
+        }
+    }
+
+    /// Build the owned handler future against the supervisor-built sink.
+    /// The async block OWNS the handler and context so the future is
+    /// self-contained (`async_trait` futures borrow their `&self`).
+    fn into_future(
+        self,
+        sink: RpcResponseSink,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), RpcHandlerError>> + Send>> {
+        match self {
+            Self::ServerStreaming(handler, ctx) => {
+                Box::pin(async move { handler.call(ctx, sink).await })
+            }
+            Self::Duplex(handler, ctx, requests) => {
+                Box::pin(async move { handler.call(ctx, requests, sink).await })
+            }
+        }
+    }
+}
+
 /// Run one server-streaming call to a bounded terminal (§2.2) — the
 /// production shape of the model's `run_supervisor`. The supervisor owns
 /// the handler, the response pump's `JoinHandle`, the flow semaphore and
@@ -5528,8 +5649,7 @@ struct AdmittedOpening {
 )]
 async fn run_stream_call_supervisor(
     record: Arc<Mutex<StreamCallRecord>>,
-    handler: Arc<dyn RpcStreamingHandler>,
-    ctx: RpcContext,
+    handler: SupervisedHandler,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
     flow_sem: Option<Arc<tokio::sync::Semaphore>>,
     gate: Option<Arc<StreamProducerGate>>,
@@ -5547,7 +5667,7 @@ async fn run_stream_call_supervisor(
         m.handler_in_flight.fetch_add(1, Ordering::Relaxed);
     }
     let handler_started = std::time::Instant::now();
-    let cancel_token = ctx.cancellation.clone();
+    let cancel_token = handler.cancellation();
 
     // The sink + pump pair (§2.2). Bounded at
     // STREAMING_PUMP_CAPACITY. The pump pays one flow-control credit
@@ -5616,7 +5736,7 @@ async fn run_stream_call_supervisor(
     // The handler future, panics caught so a misbehaving handler can't
     // take down the runtime — same shape as the unary fold.
     let mut handler_fut = std::pin::pin!(futures::FutureExt::catch_unwind(
-        std::panic::AssertUnwindSafe(handler.call(ctx, sink))
+        std::panic::AssertUnwindSafe(handler.into_future(sink))
     ));
     let mut handler_done = false;
     let mut handler_panicked = false;
@@ -5771,6 +5891,185 @@ async fn run_stream_call_supervisor(
     // seam). Pump stop already ordered this behind every chunk emit.
     let terminal = stream_terminal_payload(&reason);
     tokio::spawn(emit(from_node, caller_origin, call_id, terminal));
+    record
+        .lock()
+        .record_emission(StreamTerminalDisposition::Queued);
+}
+
+/// Run one PROTECTED client-streaming call to its bounded single-response
+/// emission (§2.2: "Client-streaming has a single-response emitter, not an
+/// SS/DX pump: its bounded emission completion supplies the corresponding
+/// drain-complete event"). The supervisor owns the handler future, the
+/// request-chunk queue and the ONE terminal: `select!` over {handler,
+/// `sleep_until` the §2.1 effective end, retire}, then the §2.6 record
+/// drives the transitions — handler return ⇒ `Draining(result)` AND input
+/// `Closed` (the consumer is gone), and the single-response emission is
+/// the drain-complete event ⇒ `pump_exited` ⇒ `Completed(result)`; a
+/// forced exit (deadline / retire) commits the reason FIRST-WRITER-WINS,
+/// cancels the handler token and discards queued input with the dropped
+/// receiver. The handler's own payload is the wire terminal verbatim —
+/// its error is the terminal, never `Ok` (§2.6) — while every retirement
+/// maps through [`stream_terminal_payload`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the §2.2 supervisor-owned pieces are named one-for-one (record, handler, \
+              context, request stream, metrics, retire signal, deadline, emitter, call \
+              identity, registration) and a params struct would only rename them"
+)]
+async fn run_client_stream_call(
+    record: Arc<Mutex<StreamCallRecord>>,
+    handler: Arc<dyn RpcClientStreamingHandler>,
+    ctx: RpcStreamingContext,
+    requests: RequestStream,
+    metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
+    retire: Option<Arc<StreamRetireSignal>>,
+    deadline: Option<(tokio::time::Instant, StreamTerminalReason)>,
+    emit: RpcResponseEmitter,
+    identity: (u64, u64, u64, u64),
+    registration: StreamCallRegistration,
+) {
+    let (from_node, session_id, caller_origin, call_id) = identity;
+
+    if let Some(m) = metrics.as_ref() {
+        m.handler_invocations_total.fetch_add(1, Ordering::Relaxed);
+        m.handler_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+    let handler_started = std::time::Instant::now();
+    let cancel_token = ctx.cancellation.clone();
+    // Panics caught so a misbehaving handler can't take down the runtime —
+    // same shape as the SS supervisor and the public CS fold.
+    let call_fut =
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler.call(ctx, requests)));
+    tokio::pin!(call_fut);
+
+    let sleep = async {
+        match deadline {
+            Some((at, reason)) => {
+                tokio::time::sleep_until(at).await;
+                reason
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(sleep);
+
+    let mut handler_panicked = false;
+    let mut outcome_payload: Option<RpcResponsePayload> = None;
+    let mut forced: Option<StreamTerminalReason> = None;
+    tokio::select! {
+        biased;
+
+        reason = async { match retire.as_ref() { Some(r) => r.wait().await, None => std::future::pending().await } } => {
+            forced = Some(reason);
+        }
+
+        reason = &mut sleep => {
+            forced = Some(reason);
+        }
+
+        result = &mut call_fut => {
+            // §2.6: handler return ⇒ `Draining(result)` with the input
+            // half CLOSED (its consumer is gone) — then the single-response
+            // emission below is the drain-complete event (`pump_exited` ⇒
+            // `Completed(result)`).
+            let (result, payload) = match result {
+                Ok(Ok(payload)) => {
+                    // The handler's OWN response is the terminal, verbatim.
+                    // A non-`Ok` status on it is the handler's error
+                    // terminal (§2.6: "the handler's error is the terminal,
+                    // never `Ok`").
+                    let result = if payload.status.is_ok() {
+                        StreamHandlerResult::Ok
+                    } else {
+                        StreamHandlerResult::Err(
+                            payload.status,
+                            String::from_utf8_lossy(&payload.body).into_owned(),
+                        )
+                    };
+                    (result, payload)
+                }
+                Ok(Err(RpcHandlerError::Application { code, message })) => {
+                    let result = StreamHandlerResult::Err(RpcStatus::Application(code), message);
+                    let payload =
+                        stream_terminal_payload(&StreamTerminalReason::Completed(result.clone()));
+                    (result, payload)
+                }
+                Ok(Err(RpcHandlerError::Internal(message))) => {
+                    let result =
+                        StreamHandlerResult::Err(RpcStatus::Internal, message);
+                    let payload =
+                        stream_terminal_payload(&StreamTerminalReason::Completed(result.clone()));
+                    (result, payload)
+                }
+                Err(panic) => {
+                    handler_panicked = true;
+                    let panic_msg = panic
+                        .downcast_ref::<&'static str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic>".into());
+                    tracing::error!(
+                        caller_origin = format!("{:#x}", caller_origin),
+                        call_id,
+                        panic = %panic_msg,
+                        "rpc client-streaming server handler panicked",
+                    );
+                    let result = StreamHandlerResult::Err(
+                        RpcStatus::Internal,
+                        format!("handler panicked: {panic_msg}"),
+                    );
+                    let payload =
+                        stream_terminal_payload(&StreamTerminalReason::Completed(result.clone()));
+                    (result, payload)
+                }
+            };
+            {
+                let mut rec = record.lock();
+                rec.handler_returned(result);
+                rec.pump_exited();
+            }
+            outcome_payload = Some(payload);
+        }
+    }
+
+    if let Some(m) = metrics.as_ref() {
+        m.handler_in_flight.fetch_sub(1, Ordering::Relaxed);
+        m.record_handler_duration(handler_started.elapsed());
+        if handler_panicked {
+            m.handler_panics_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if let Some(reason) = forced {
+        // §2.2's retirement order: settle the registry side first (terminal
+        // + queued byte permits + owner signal), then the §2.6 record
+        // (first writer wins), then the handler's cancellation token. The
+        // handler future is dropped at scope end; its library-controlled
+        // input half is fenced NOW (the retire-aware `RequestStream` and
+        // the registration's sender removal) and queued input is discarded
+        // with the dropped receiver.
+        if let Some(call_ref) = registration.registry.as_ref() {
+            call_ref
+                .registry
+                .retire(&call_ref.key, call_ref.incarnation, reason.clone());
+        }
+        record.lock().retire(reason);
+        cancel_token.cancel();
+    }
+
+    let reason = record
+        .lock()
+        .terminal_reason()
+        .unwrap_or(StreamTerminalReason::PumpFailed);
+
+    // §2.4's single removal point (the in-flight token, the sender and the
+    // protected record leave together, so a stale CHUNK/END/CANCEL after
+    // this point misses every map).
+    registration.complete();
+
+    // §2.8 — exactly one terminal, after handler/queue ownership ended.
+    let payload = outcome_payload.unwrap_or_else(|| stream_terminal_payload(&reason));
+    emit(from_node, session_id, caller_origin, call_id, payload);
     record
         .lock()
         .record_emission(StreamTerminalDisposition::Queued);
@@ -6041,8 +6340,7 @@ impl RpcServerStreamingFold {
             tokio::time::Instant::from_std(lifetime.clock.monotonic_deadline_for(resolved.end_ns));
         tokio::spawn(run_stream_call_supervisor(
             Arc::clone(&call.record),
-            self.handler.clone(),
-            ctx,
+            SupervisedHandler::ServerStreaming(self.handler.clone(), ctx),
             self.metrics.clone(),
             flow_sem,
             Some(Arc::new(StreamProducerGate::new())),
@@ -6054,9 +6352,10 @@ impl RpcServerStreamingFold {
             StreamCallRegistration {
                 key,
                 in_flight: self.in_flight.clone(),
-                flow_control: self.flow_control.clone(),
+                flow_control: Some(self.flow_control.clone()),
                 protected: self.protected_calls.clone(),
                 registry: call_ref,
+                senders: None,
             },
         ));
         Ok(call)
@@ -6243,8 +6542,7 @@ impl RpcServerStreamingFold {
                 });
                 tokio::spawn(run_stream_call_supervisor(
                     Arc::new(Mutex::new(StreamCallRecord::new_server_streaming())),
-                    handler,
-                    ctx,
+                    SupervisedHandler::ServerStreaming(handler, ctx),
                     metrics,
                     flow_sem,
                     None,
@@ -6256,9 +6554,10 @@ impl RpcServerStreamingFold {
                     StreamCallRegistration {
                         key,
                         in_flight: self.in_flight.clone(),
-                        flow_control: self.flow_control.clone(),
+                        flow_control: Some(self.flow_control.clone()),
                         protected: self.protected_calls.clone(),
                         registry: None,
+                        senders: None,
                     },
                 ));
             }
@@ -6391,6 +6690,65 @@ type RequestChunkSenders = Arc<Mutex<HashMap<StreamCallKey, RequestChunkSender>>
 struct RequestChunkSender {
     tx: tokio::sync::mpsc::Sender<ChargedChunk>,
     charge: Option<RegistryCallRef>,
+    /// §2.6's half-close record (protected CS/DX records only; Stage 2
+    /// slices 2.2/2.4): END closes input ONCE (idempotent, never touching
+    /// `output`), and a chunk is delivered only while the record's input
+    /// half is `Open` and the call is not terminal. `None` on public
+    /// uploads (their documented drop-and-continue contract is unchanged).
+    record: Option<Arc<Mutex<StreamCallRecord>>>,
+}
+
+/// Deliver one request-direction body (the opening's first chunk or any
+/// later REQUEST_CHUNK) into a PROTECTED call's queue under the §2.7 byte
+/// accounting and the §2.3 check-and-commit as ONE ownership operation
+/// (Stage 2 slices 2.2/2.4). Returns `false` when the item could neither
+/// be reserved nor delivered (over budget, full mpsc, or a retired call):
+/// the caller RETIRES the exact call with `ResourceExhausted`
+/// (`RegistryCallRef::latch_exhausted`) and stops all further delivery —
+/// never a silent drop followed by `Ok`.
+fn deliver_protected_body(
+    charge: &RegistryCallRef,
+    tx: &tokio::sync::mpsc::Sender<ChargedChunk>,
+    body: Bytes,
+) -> bool {
+    let body_len = body.len();
+    let permit = match charge.registry.bytes().reserve(
+        charge.key.clone(),
+        charge.incarnation,
+        ByteDirection::Request,
+        body_len,
+    ) {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    // The queue slot is reserved first (a full/closed queue is a delivery
+    // failure, not a wait), then the §2.3 check and the admission run as
+    // ONE ownership operation under the registry lock.
+    let slot = match tx.try_reserve() {
+        Ok(slot) => slot,
+        Err(_) => {
+            permit.release();
+            return false;
+        }
+    };
+    match charge
+        .registry
+        .begin_commit(&charge.key, charge.incarnation)
+    {
+        Ok(txn) => {
+            txn.commit_with(permit, |shared| {
+                slot.send(ChargedChunk {
+                    body,
+                    permit: Some(Arc::clone(shared)),
+                });
+            });
+            true
+        }
+        Err(_) => {
+            permit.release();
+            false
+        }
+    }
 }
 
 /// Shared REQUEST_CHUNK handling used by both
@@ -6456,10 +6814,23 @@ fn apply_request_chunk_to_senders(
         );
         return;
     };
+    // §2.6 (Stage 2 slices 2.2/2.4): a PROTECTED record's shape and
+    // half-state gate delivery BEFORE anything is queued. Frames while the
+    // call is terminal are dropped (no credit, no delivery); once the input
+    // half is not `Open` (the caller's END closed it, or the handler
+    // returned and its consumer is gone) a late chunk is refused/discarded
+    // without replacing the handler's result — and an END can never reopen
+    // the half (the sender is gone after the first END; this is the
+    // record-level belt for a frame that somehow re-arrives).
+    if let Some(record) = sender.record.as_ref() {
+        let rec = record.lock();
+        if rec.terminal.is_some() || rec.input != StreamCallInput::Open {
+            return;
+        }
+    }
     let is_pure_terminator = is_end && payload.body.is_empty();
     if !is_pure_terminator {
         let body = payload.body;
-        let body_len = body.len();
         match sender.charge.as_ref() {
             // PUBLIC uploads keep the drop-and-continue contract (Q3).
             None => {
@@ -6476,61 +6847,29 @@ fn apply_request_chunk_to_senders(
                     );
                 }
             }
-            // §2.7 request direction (protected records): account
-            // `payload.len()` BEFORE the queue/handler allocation. A
-            // chunk that cannot be reserved or delivered — over budget,
-            // full mpsc, or a closed sender for an admitted call —
-            // RETIRES the call with `ResourceExhausted` and stops all
-            // further delivery. Never a silent drop followed by `Ok`.
+            // §2.7 request direction (protected records): account the
+            // body BEFORE the queue/handler allocation (the shared
+            // [`deliver_protected_body`]). A chunk that cannot be
+            // reserved or delivered — over budget, full mpsc, or a closed
+            // sender for an admitted call — RETIRES the call with
+            // `ResourceExhausted` and stops all further delivery. Never a
+            // silent drop followed by `Ok`.
             Some(charge) => {
-                let permit = match charge.registry.bytes().reserve(
-                    charge.key.clone(),
-                    charge.incarnation,
-                    ByteDirection::Request,
-                    body_len,
-                ) {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        charge.latch_exhausted();
-                        senders.lock().remove(&key);
-                        return;
-                    }
-                };
-                // The queue slot is reserved first (a full/closed queue
-                // is a delivery failure, not a wait), then the §2.3
-                // check and the admission run as ONE ownership
-                // operation under the registry lock.
-                let slot = match sender.tx.try_reserve() {
-                    Ok(slot) => slot,
-                    Err(_) => {
-                        permit.release();
-                        charge.latch_exhausted();
-                        senders.lock().remove(&key);
-                        return;
-                    }
-                };
-                match charge
-                    .registry
-                    .begin_commit(&charge.key, charge.incarnation)
-                {
-                    Ok(txn) => {
-                        txn.commit_with(permit, |shared| {
-                            slot.send(ChargedChunk {
-                                body,
-                                permit: Some(Arc::clone(shared)),
-                            });
-                        });
-                    }
-                    Err(_) => {
-                        permit.release();
-                        senders.lock().remove(&key);
-                        return;
-                    }
+                if !deliver_protected_body(charge, &sender.tx, body) {
+                    charge.latch_exhausted();
+                    senders.lock().remove(&key);
+                    return;
                 }
             }
         }
     }
     if is_end {
+        // §2.6: END closes the input half ONCE — idempotent, never
+        // touching `output` (legitimate remaining output completes
+        // unaffected).
+        if let Some(record) = sender.record.as_ref() {
+            record.lock().end_input();
+        }
         // Drop the sender from the map → its clone here goes out
         // of scope at end of function → the receiver in the
         // handler's RequestStream sees EOF on the next poll.
@@ -6568,8 +6907,12 @@ pub struct RpcStreamingRequestFold {
     /// authenticated-peer-scoped (AV-1 item 1).
     in_flight: InFlightCalls,
     senders: RequestChunkSenders,
-    /// Optional per-service metrics handle. Same shape as the
-    /// other folds. Reuses the response-side counters where they
+    /// The registration's live PROTECTED calls (§2.2 — Stage 2 slice 2.2
+    /// extends the seam to this fold). Public calls never enter this set;
+    /// `ServeHandle::drop` retires exactly these (Q3).
+    protected_calls: ProtectedStreamOwners,
+    /// Optional per-service metrics handle. Same shape as
+    /// the other folds. Reuses the response-side counters where they
     /// apply (handler_invocations / handler_panics / etc.) and
     /// would gain request-side counters (e.g.
     /// `streaming_request_chunks_dropped_total`) in a follow-up.
@@ -6592,6 +6935,7 @@ impl RpcStreamingRequestFold {
             grant_emit: None,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             senders: Arc::new(Mutex::new(HashMap::new())),
+            protected_calls: ProtectedStreamOwners::new(),
             metrics: None,
         }
     }
@@ -6632,6 +6976,13 @@ impl RpcStreamingRequestFold {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn sender_keys(&self) -> Vec<StreamCallKey> {
         self.senders.lock().keys().copied().collect()
+    }
+
+    /// The registration-owned live PROTECTED calls (§2.2) — the serve
+    /// seam clones this into its `ServeHandle` so handle drop retires
+    /// exactly these records (Q3).
+    pub fn protected_owners(&self) -> ProtectedStreamOwners {
+        self.protected_calls.clone()
     }
 }
 
@@ -6795,9 +7146,14 @@ impl RpcStreamingRequestFold {
                 // with a trailing REQUEST_CHUNK. Don't even insert
                 // the sender into the map; just drop it here.
                 if !end_on_initial {
-                    self.senders
-                        .lock()
-                        .insert(key, RequestChunkSender { tx, charge: None });
+                    self.senders.lock().insert(
+                        key,
+                        RequestChunkSender {
+                            tx,
+                            charge: None,
+                            record: None,
+                        },
+                    );
                 }
                 // Build the handler's context + stream. Auto-grant
                 // is opted into when the caller set the request
@@ -6987,6 +7343,19 @@ impl RpcStreamingRequestFold {
                 );
             }
             DISPATCH_RPC_CANCEL => {
+                // A PROTECTED record enters retirement through its
+                // supervisor (§2.2/§2.6 — Stage 2 slice 2.2): the signal
+                // reaches the supervisor's `select!`, and terminal
+                // selection + map removal stay that one owner's work
+                // (§2.4's single removal point). The handler still sees
+                // the cancellation token immediately.
+                if let Some(call) = self.protected_calls.get(&key) {
+                    if let Some(token) = self.in_flight.lock().get(&key).cloned() {
+                        token.cancel();
+                    }
+                    call.retire(StreamTerminalReason::Cancelled);
+                    return Ok(());
+                }
                 if let Some(token) = self.in_flight.lock().remove(&key) {
                     token.cancel();
                 }
@@ -7002,6 +7371,235 @@ impl RpcStreamingRequestFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RpcStreamingRequestFold {
+    /// The PROTECTED opening path (contract 4's fold seam — Stage 2 slice
+    /// 2.2 extends it to client-streaming). The transaction shape is the
+    /// SS seam's verbatim: §2.1's deadline resolution BEFORE any handler
+    /// effect, the raw proof header stripped (E1.6), §3 step-5's ownership
+    /// TRANSFER at the effect boundary — then
+    /// [`run_client_stream_call`] owns the handler, the request-chunk
+    /// queue and the ONE single-response terminal (§2.2's bounded
+    /// supervision). Every refusal is one typed
+    /// [`AdmissionDenied`]
+    /// the bridge routes through the unchanged `emit_admission_denial`;
+    /// the fold emits NOTHING on refusal, so a denied opening has exactly
+    /// one bounded denial and zero handler effects.
+    ///
+    /// A non-`DISPATCH_RPC_REQUEST` frame is refused as `NotOrgProtected`
+    /// (control frames for an admitted call ride [`Self::apply_inbound`]
+    /// without re-admission) and is keyed by the authenticated session
+    /// peer + receiving incarnation.
+    pub fn apply_inbound_admitted(
+        &mut self,
+        ev: &RpcInboundEvent,
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+        lifetime: &StreamCallLifetime<'_>,
+        mut lease: Option<ProtectedCallLease>,
+    ) -> Result<
+        Arc<ProtectedStreamCall>,
+        crate::adapter::net::behavior::org_admission::AdmissionDenied,
+    > {
+        use crate::adapter::net::behavior::org_admission::AdmissionDenied;
+
+        self.session_id = ev.session_id;
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        if meta.dispatch != DISPATCH_RPC_REQUEST {
+            return Err(AdmissionDenied::NotOrgProtected);
+        }
+        let key = (
+            ev.from_node,
+            self.session_id,
+            meta.origin_hash,
+            meta.seq_or_ts,
+        );
+        // §3: a duplicate while the key is live is refused as
+        // `ActiveCallOwned` BEFORE the payload decode.
+        if self.in_flight.lock().contains_key(&key) {
+            return Err(AdmissionDenied::ActiveCallOwned);
+        }
+        if ev.payload.len() < RPC_FRAME_BODY_OFFSET {
+            return Err(AdmissionDenied::MalformedProof);
+        }
+        let Ok(mut payload) = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+        else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        // The CS REQUEST flag check (contract 4 / §1.5): flags whose
+        // derived shape is not client-streaming are `ShapeMismatch`, never
+        // admitted.
+        if !cs_request_flags_ok(payload.flags) {
+            return Err(AdmissionDenied::ShapeMismatch);
+        }
+        // §2.1 — resolve before any handler effect (the SS seam's exact
+        // resolution): the default fills only an omitted deadline, an
+        // explicit request over `max_live` is REFUSED (never clamped), and
+        // credential validity clamps with the `Deadline` vs `Credential`
+        // bound recorded. Every refusal here is
+        // `DeadlineExceedsPolicy`.
+        let requested = (payload.deadline_ns != 0).then_some(payload.deadline_ns);
+        let resolved = resolve_stream_deadline(
+            lifetime.clock.wall_ns,
+            requested,
+            lifetime.credential_ends_ns,
+            &lifetime.policy,
+        )
+        .map_err(|refusal| {
+            tracing::warn!(
+                caller_origin = format!("{:#x}", meta.origin_hash),
+                call_id = meta.seq_or_ts,
+                ?refusal,
+                "rpc client-streaming server fold: protected opening refused before handler effects",
+            );
+            AdmissionDenied::DeadlineExceedsPolicy
+        })?;
+        // E1.6: verified attribution in, raw credential material out.
+        payload.headers.retain(|(name, _)| {
+            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+        });
+
+        // §3 step 5 — the registry's ownership TRANSFER before any fold
+        // effect (in-flight insert, sender creation, handler spawn).
+        let retire_signal = Arc::new(StreamRetireSignal::new());
+        let mut call_ref: Option<RegistryCallRef> = None;
+        if let Some(lease) = lease.as_mut() {
+            let registry = Arc::clone(lease.registry());
+            let ref_for_call = RegistryCallRef {
+                registry: Arc::clone(&registry),
+                key: lease.key.clone(),
+                incarnation: lease.incarnation,
+            };
+            registry.confirm(lease, Arc::clone(&retire_signal), None)?;
+            call_ref = Some(ref_for_call);
+        }
+
+        let record = Arc::new(Mutex::new(StreamCallRecord::new_client_streaming()));
+        let cancellation = RpcCancellationToken::new();
+        self.in_flight.lock().insert(key, cancellation.clone());
+        // Per-call request-chunk mpsc (the public arm's shape) with the
+        // §2.7 charge + §2.6 record on the sender for protected uploads.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_REQUEST_PUMP_CAPACITY);
+        let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
+        let is_pure_terminator = end_on_initial && payload.body.is_empty();
+        if !is_pure_terminator {
+            // §2.7 ("refuse the call, never truncate it"): the OPENING
+            // body reserves its bytes and is delivered under the same
+            // check-and-commit as any chunk. A refusal retires the exact
+            // call (`ResourceExhausted`) and refuses the opening with zero
+            // further delivery.
+            match call_ref.as_ref() {
+                Some(charge) => {
+                    if !deliver_protected_body(charge, &tx, payload.body.clone()) {
+                        charge.latch_exhausted();
+                        // Ownership already transferred (§3 step 5) but no
+                        // supervisor exists yet on this path — the FOLD is
+                        // this refusal's cleanup owner (the unary
+                        // `ConfirmedOpening` scope-guard precedent): settle
+                        // the registry record's release-once `complete` and
+                        // every map entry, then refuse with zero further
+                        // delivery (§2.7: "refuse the call, never truncate
+                        // it").
+                        self.in_flight.lock().remove(&key);
+                        charge.registry.complete(&charge.key, charge.incarnation);
+                        return Err(AdmissionDenied::ResourceExhausted);
+                    }
+                }
+                None => {
+                    let _ = tx.try_send(ChargedChunk {
+                        body: payload.body.clone(),
+                        permit: None,
+                    });
+                }
+            }
+        }
+        if end_on_initial {
+            // §2.6: the opening already carried END — the input half is
+            // `Ended` from birth (the SS record's shape).
+            record.lock().end_input();
+        } else {
+            self.senders.lock().insert(
+                key,
+                RequestChunkSender {
+                    tx,
+                    charge: call_ref.clone(),
+                    record: Some(Arc::clone(&record)),
+                },
+            );
+        }
+        // Auto-grant (public arm's shape): opted-in uploads + a wired
+        // emitter.
+        let grant_emitter = if parse_request_window_initial(&payload.headers).is_some() {
+            self.grant_emit.clone()
+        } else {
+            None
+        };
+        let request_stream = RequestStream::new(
+            rx,
+            grant_emitter,
+            ev.from_node,
+            meta.origin_hash,
+            meta.seq_or_ts,
+        );
+        let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+            extract_trace_context(&payload.headers)
+        } else {
+            None
+        };
+        let mut ctx = RpcStreamingContext::new(
+            meta.origin_hash,
+            meta.seq_or_ts,
+            payload.deadline_ns,
+            payload.headers,
+            cancellation.clone(),
+            trace_context,
+        );
+        ctx.org_admission = Some(admitted);
+
+        let call = Arc::new(ProtectedStreamCall {
+            record: Arc::clone(&record),
+            retire: Arc::clone(&retire_signal),
+            deadline: resolved,
+            call_ref: call_ref.clone(),
+        });
+        self.protected_calls.insert(key, call.clone());
+        // The deadline's monotonic end derives from the admission's ONE
+        // clock sample (`monotonic_deadline_for`), so a wall-clock jump
+        // cannot move it.
+        let at =
+            tokio::time::Instant::from_std(lifetime.clock.monotonic_deadline_for(resolved.end_ns));
+        tokio::spawn(run_client_stream_call(
+            record,
+            self.handler.clone(),
+            ctx,
+            request_stream,
+            self.metrics.clone(),
+            Some(retire_signal),
+            Some((at, resolved.expiry_reason())),
+            self.emit.clone(),
+            (
+                ev.from_node,
+                self.session_id,
+                meta.origin_hash,
+                meta.seq_or_ts,
+            ),
+            StreamCallRegistration {
+                key,
+                in_flight: self.in_flight.clone(),
+                flow_control: None,
+                protected: self.protected_calls.clone(),
+                registry: call_ref,
+                senders: Some(self.senders.clone()),
+            },
+        ));
+        Ok(call)
     }
 }
 
@@ -7059,6 +7657,16 @@ pub struct RpcDuplexFold {
     /// cancellation token — session-fenced (AV-1 item 1, C5).
     in_flight: InFlightCalls,
     senders: RequestChunkSenders,
+    /// Stage 2 slices 2.2/2.3 (C8): the response-direction flow-control
+    /// map + `STREAM_GRANT` arm "as SS" — the caller's
+    /// `nrpc-stream-window-initial` header installs a per-call semaphore
+    /// the response pump awaits per chunk, and a `STREAM_GRANT` refills
+    /// it. Absent entry = unbounded credit (back-compat).
+    flow_control: FlowControlMap,
+    /// The registration's live PROTECTED calls (§2.2 — Stage 2 slice 2.2
+    /// extends the seam to this fold). Public calls never enter this set;
+    /// `ServeHandle::drop` retires exactly these (Q3).
+    protected_calls: ProtectedStreamOwners,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
 
@@ -7075,6 +7683,8 @@ impl RpcDuplexFold {
             grant_emit: None,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             senders: Arc::new(Mutex::new(HashMap::new())),
+            flow_control: Arc::new(Mutex::new(HashMap::new())),
+            protected_calls: ProtectedStreamOwners::new(),
             metrics: None,
         }
     }
@@ -7111,6 +7721,24 @@ impl RpcDuplexFold {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn sender_keys(&self) -> Vec<StreamCallKey> {
         self.senders.lock().keys().copied().collect()
+    }
+
+    /// Test-only: available response-direction flow-control permits for a
+    /// call key, or `None` if no per-call semaphore is installed (Stage 2
+    /// slices 2.2/2.3 — the wrong-session GRANT witness's observation).
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn flow_control_permits(&self, key: StreamCallKey) -> Option<usize> {
+        self.flow_control
+            .lock()
+            .get(&key)
+            .map(|s| s.available_permits())
+    }
+
+    /// The registration-owned live PROTECTED calls (§2.2) — the serve
+    /// seam clones this into its `ServeHandle` so handle drop retires
+    /// exactly these records (Q3).
+    pub fn protected_owners(&self) -> ProtectedStreamOwners {
+        self.protected_calls.clone()
     }
 }
 
@@ -7262,6 +7890,7 @@ impl RpcDuplexFold {
                         RequestChunkSender {
                             tx: req_tx,
                             charge: None,
+                            record: None,
                         },
                     );
                 }
@@ -7499,7 +8128,58 @@ impl RpcDuplexFold {
                     "duplex",
                 );
             }
+            DISPATCH_RPC_STREAM_GRANT => {
+                // Response-direction credit (Stage 2 slices 2.2/2.3, C8):
+                // the `flow_control` map + `STREAM_GRANT` arm "as SS". A
+                // grant whose 4-tuple key misses the map is dropped
+                // silently — a forged grant carrying another peer's /
+                // session's coordinates cannot refill this call's window
+                // (AV-1 item 1, C5), and the cross-direction grant kind
+                // (`DISPATCH_RPC_REQUEST_GRANT`, server → caller) never
+                // reaches this arm at all. A PROTECTED record's credit is
+                // checked against its §2.6 state: it survives the
+                // handler's return — it is what lets a drain finish — and
+                // stops once the call is terminal or its output half has
+                // ended.
+                let amount = match decode_stream_grant(&frame[RPC_FRAME_BODY_OFFSET..]) {
+                    Some(n) => n,
+                    None => {
+                        tracing::debug!(
+                            caller_origin = format!("{:#x}", meta.origin_hash),
+                            call_id = meta.seq_or_ts,
+                            "rpc duplex server fold: malformed STREAM_GRANT payload",
+                        );
+                        return Ok(());
+                    }
+                };
+                if amount == 0 {
+                    return Ok(());
+                }
+                if let Some(sem) = self.flow_control.lock().get(&key).cloned() {
+                    if let Some(call) = self.protected_calls.get(&key) {
+                        if !call.record.lock().credit_grantable() {
+                            return Ok(());
+                        }
+                    }
+                    // Tokio's `Semaphore::add_permits` is bounded by
+                    // `MAX_PERMITS`; cap defensively (the SS arm's clause).
+                    let safe = (amount as usize).min(usize::MAX >> 4);
+                    sem.add_permits(safe);
+                }
+            }
             DISPATCH_RPC_CANCEL => {
+                // A PROTECTED record enters retirement through its
+                // supervisor (§2.2/§2.6 — Stage 2 slice 2.2): the signal
+                // reaches the supervisor's `select!`, and terminal
+                // selection + map removal stay that one owner's work
+                // (§2.4's single removal point).
+                if let Some(call) = self.protected_calls.get(&key) {
+                    if let Some(token) = self.in_flight.lock().get(&key).cloned() {
+                        token.cancel();
+                    }
+                    call.retire(StreamTerminalReason::Cancelled);
+                    return Ok(());
+                }
                 if let Some(token) = self.in_flight.lock().remove(&key) {
                     token.cancel();
                 }
@@ -7508,6 +8188,226 @@ impl RpcDuplexFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RpcDuplexFold {
+    /// The PROTECTED opening path (contract 4's fold seam — Stage 2 slice
+    /// 2.2 extends it to duplex). The transaction shape is the SS seam's
+    /// verbatim: §2.1's deadline resolution BEFORE any handler effect, the
+    /// raw proof header stripped (E1.6), §3 step-5's ownership TRANSFER at
+    /// the effect boundary — then the §2.2 supervisor
+    /// ([`run_stream_call_supervisor`] with [`SupervisedHandler::Duplex`])
+    /// owns the handler, the response pump, the flow semaphore and the one
+    /// terminal. Every refusal is one typed
+    /// [`AdmissionDenied`]
+    /// the bridge routes through the unchanged `emit_admission_denial`;
+    /// the fold emits NOTHING on refusal (zero handler effects).
+    ///
+    /// The caller's `nrpc-stream-window-initial` header installs the
+    /// response-direction semaphore here (Stage 2 slices 2.2/2.3, C8) and
+    /// `STREAM_GRANT`s refill it under the §2.6 record's credit rule.
+    pub fn apply_inbound_admitted(
+        &mut self,
+        ev: &RpcInboundEvent,
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+        lifetime: &StreamCallLifetime<'_>,
+        mut lease: Option<ProtectedCallLease>,
+    ) -> Result<
+        Arc<ProtectedStreamCall>,
+        crate::adapter::net::behavior::org_admission::AdmissionDenied,
+    > {
+        use crate::adapter::net::behavior::org_admission::AdmissionDenied;
+
+        self.session_id = ev.session_id;
+        let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
+            EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
+        } else {
+            None
+        }) else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        if meta.dispatch != DISPATCH_RPC_REQUEST {
+            return Err(AdmissionDenied::NotOrgProtected);
+        }
+        let key = (
+            ev.from_node,
+            self.session_id,
+            meta.origin_hash,
+            meta.seq_or_ts,
+        );
+        // §3: a duplicate while the key is live is refused as
+        // `ActiveCallOwned` BEFORE the payload decode.
+        if self.in_flight.lock().contains_key(&key) {
+            return Err(AdmissionDenied::ActiveCallOwned);
+        }
+        if ev.payload.len() < RPC_FRAME_BODY_OFFSET {
+            return Err(AdmissionDenied::MalformedProof);
+        }
+        let Ok(mut payload) = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+        else {
+            return Err(AdmissionDenied::MalformedProof);
+        };
+        // The DX REQUEST flag check (contract 4 / §1.5): flags whose
+        // derived shape is not duplex are `ShapeMismatch`, never admitted.
+        if !dx_request_flags_ok(payload.flags) {
+            return Err(AdmissionDenied::ShapeMismatch);
+        }
+        // §2.1 — resolve before any handler effect (the SS seam's exact
+        // resolution).
+        let requested = (payload.deadline_ns != 0).then_some(payload.deadline_ns);
+        let resolved = resolve_stream_deadline(
+            lifetime.clock.wall_ns,
+            requested,
+            lifetime.credential_ends_ns,
+            &lifetime.policy,
+        )
+        .map_err(|refusal| {
+            tracing::warn!(
+                caller_origin = format!("{:#x}", meta.origin_hash),
+                call_id = meta.seq_or_ts,
+                ?refusal,
+                "rpc duplex server fold: protected opening refused before handler effects",
+            );
+            AdmissionDenied::DeadlineExceedsPolicy
+        })?;
+        // E1.6: verified attribution in, raw credential material out.
+        payload.headers.retain(|(name, _)| {
+            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+        });
+
+        // §3 step 5 — the registry's ownership TRANSFER before any fold
+        // effect (in-flight insert, sender creation, handler spawn).
+        let retire_signal = Arc::new(StreamRetireSignal::new());
+        let mut call_ref: Option<RegistryCallRef> = None;
+        if let Some(lease) = lease.as_mut() {
+            let registry = Arc::clone(lease.registry());
+            let ref_for_call = RegistryCallRef {
+                registry: Arc::clone(&registry),
+                key: lease.key.clone(),
+                incarnation: lease.incarnation,
+            };
+            registry.confirm(lease, Arc::clone(&retire_signal), None)?;
+            call_ref = Some(ref_for_call);
+        }
+
+        let record = Arc::new(Mutex::new(StreamCallRecord::new_duplex()));
+        let cancellation = RpcCancellationToken::new();
+        self.in_flight.lock().insert(key, cancellation.clone());
+        // Response-direction flow control (Stage 2 slices 2.2/2.3, C8):
+        // `Some(sem)` means the supervisor's pump must `acquire().await`
+        // one permit per chunk before emitting; `STREAM_GRANT` events
+        // refill it. Absent entry = unbounded credit.
+        let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
+            let sem = Arc::new(tokio::sync::Semaphore::new(n as usize));
+            self.flow_control.lock().insert(key, sem.clone());
+            sem
+        });
+        // Per-call request-chunk mpsc with the §2.7 charge + §2.6 record
+        // on the sender for protected uploads.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_REQUEST_PUMP_CAPACITY);
+        let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
+        let is_pure_terminator = end_on_initial && payload.body.is_empty();
+        if !is_pure_terminator {
+            // §2.7 ("refuse the call, never truncate it"): the OPENING
+            // body reserves its bytes and is delivered under the same
+            // check-and-commit as any chunk.
+            match call_ref.as_ref() {
+                Some(charge) => {
+                    if !deliver_protected_body(charge, &tx, payload.body.clone()) {
+                        charge.latch_exhausted();
+                        // The CS seam's clause verbatim (Stage 2 §4.2,
+                        // F-S2.2-5): the fold owns this pre-supervisor
+                        // refusal's single removal.
+                        self.in_flight.lock().remove(&key);
+                        self.flow_control.lock().remove(&key);
+                        charge.registry.complete(&charge.key, charge.incarnation);
+                        return Err(AdmissionDenied::ResourceExhausted);
+                    }
+                }
+                None => {
+                    let _ = tx.try_send(ChargedChunk {
+                        body: payload.body.clone(),
+                        permit: None,
+                    });
+                }
+            }
+        }
+        if end_on_initial {
+            // §2.6: the opening already carried END — input starts `Ended`.
+            record.lock().end_input();
+        } else {
+            self.senders.lock().insert(
+                key,
+                RequestChunkSender {
+                    tx,
+                    charge: call_ref.clone(),
+                    record: Some(Arc::clone(&record)),
+                },
+            );
+        }
+        // Auto-grant (public arm's shape): opted-in uploads + a wired
+        // emitter.
+        let grant_emitter = if parse_request_window_initial(&payload.headers).is_some() {
+            self.grant_emit.clone()
+        } else {
+            None
+        };
+        let request_stream = RequestStream::new(
+            rx,
+            grant_emitter,
+            ev.from_node,
+            meta.origin_hash,
+            meta.seq_or_ts,
+        );
+        let trace_context = if payload.flags & FLAG_RPC_PROPAGATE_TRACE != 0 {
+            extract_trace_context(&payload.headers)
+        } else {
+            None
+        };
+        let mut ctx = RpcStreamingContext::new(
+            meta.origin_hash,
+            meta.seq_or_ts,
+            payload.deadline_ns,
+            payload.headers,
+            cancellation.clone(),
+            trace_context,
+        );
+        ctx.org_admission = Some(admitted);
+
+        let call = Arc::new(ProtectedStreamCall {
+            record: Arc::clone(&record),
+            retire: Arc::clone(&retire_signal),
+            deadline: resolved,
+            call_ref: call_ref.clone(),
+        });
+        self.protected_calls.insert(key, call.clone());
+        // The deadline's monotonic end derives from the admission's ONE
+        // clock sample (`monotonic_deadline_for`), so a wall-clock jump
+        // cannot move it.
+        let at =
+            tokio::time::Instant::from_std(lifetime.clock.monotonic_deadline_for(resolved.end_ns));
+        tokio::spawn(run_stream_call_supervisor(
+            record,
+            SupervisedHandler::Duplex(self.handler.clone(), ctx, request_stream),
+            self.metrics.clone(),
+            flow_sem,
+            Some(Arc::new(StreamProducerGate::new())),
+            Some(Arc::clone(&call.retire)),
+            Some((at, resolved.expiry_reason())),
+            false,
+            self.emit.clone(),
+            (ev.from_node, meta.origin_hash, meta.seq_or_ts),
+            StreamCallRegistration {
+                key,
+                in_flight: self.in_flight.clone(),
+                flow_control: Some(self.flow_control.clone()),
+                protected: self.protected_calls.clone(),
+                registry: call_ref,
+                senders: Some(self.senders.clone()),
+            },
+        ));
+        Ok(call)
     }
 }
 
@@ -11956,6 +12856,7 @@ mod tests {
             RequestChunkSender {
                 tx,
                 charge: Some(charge.clone()),
+                record: None,
             },
         )])));
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, 0x1111, 7, 0);

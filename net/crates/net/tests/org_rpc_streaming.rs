@@ -17,6 +17,8 @@ mod s13;
 mod s14;
 #[path = "org_rpc_streaming/s15.rs"]
 mod s15;
+#[path = "org_rpc_streaming/s2.rs"]
+mod s2;
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -3481,4 +3483,979 @@ async fn client_stream_opening_binds_first_chunk() {
             other.map(|_| "Admitted"),
         ),
     }
+}
+
+// ===========================================================================
+// Slice 2.2 — CS/DX admission at the `Proceed` seam (contract 5). Every
+// witness drives the REAL serve bridge (`ServeHandle::inject_inbound_for_
+// test` = the dispatcher's exact hand-off: the §3 admission transaction and
+// the fold drive run in one bridge iteration) with openings minted through
+// the REAL caller-side mint helper, and observes at REAL wire endpoints (the
+// caller's reply-channel recorder).
+// ===========================================================================
+
+use net::adapter::net::cortex::rpc::StreamCallInput;
+
+/// Slice 2.2 — `client_stream_aggregate_with_valid_proof`. A PROTECTED
+/// client-streaming call through the REAL bridge: a VALID owner-delegated
+/// kind-2 opening (the lazy mint's transcript over the first chunk) plus a
+/// continuation chunk and END AGGREGATE into the call's ONE response at the
+/// AUTHENTICATED RECEIVING ENDPOINT — content-joined in order — with the
+/// four-party attribution observed on
+/// `RpcStreamingContext::org_admission` and the raw proof header stripped
+/// (E1.6). The §2.6 single-response rule: exactly one response frame, ever
+/// (client-streaming has no pump).
+#[tokio::test]
+async fn client_stream_aggregate_with_valid_proof() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x92u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2A);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-cs-agg");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_b.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let (saw_adm, attr_ok, stripped) = (
+        probes.saw_admission.clone(),
+        probes.attribution_ok.clone(),
+        probes.proof_stripped.clone(),
+    );
+    let serve = server
+        .serve_rpc_owner_scoped_client_stream(
+            s14::SERVICE,
+            Arc::new(s2::AggregateCS {
+                entries: entries.clone(),
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped client-streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    // The opening's body IS the first chunk (the lazy-opening shape).
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::ClientStreaming,
+        binding,
+        42,
+        caller_origin,
+        &s2::cs_opening(s14::SERVICE, b"AGG-first-7"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the CS opening",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                42,
+                &s13::chunk_payload(42, b"AGG-second-11", false)
+            ),
+        )),
+        "the bridge accepted the continuation chunk",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, b"", true)),
+        )),
+        "the bridge accepted the END",
+    );
+
+    // The aggregate executes: ONE response with the content-joined bodies.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the CS aggregate produced its ONE response",
+    );
+    {
+        let seen = caller_seen.lock();
+        let resp = s15::response_of(&seen[0]);
+        assert_eq!(
+            (resp.status, resp.body.as_ref()),
+            (RpcStatus::Ok, b"AGG-first-7AGG-second-11".as_slice()),
+            "the aggregate response carries the joined bodies in order",
+        );
+    }
+    // §2.6's single-response rule: exactly one frame, ever.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        1,
+        "client-streaming emits exactly one response frame, ever",
+    );
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        1,
+        "the handler ran exactly once",
+    );
+    s2::attribution_ok(&saw_adm, &attr_ok, &stripped, "CS aggregate");
+}
+
+/// Slice 2.2 — `duplex_exchange_with_valid_proof` (the CROSS-ORG authority
+/// shape: `serve_rpc_granted_duplex` + the granted/other-org intent). A
+/// PROTECTED duplex exchange through the REAL bridge: the request bodies
+/// echo to the response side IN ORDER, a content-labelled TAIL completes the
+/// output after input EOF (independent halves under one record), and the
+/// call closes with EXACTLY ONE terminal whose wire content is asserted
+/// (status `Ok` + `nrpc-streaming: end`) at the authenticated receiving
+/// endpoint.
+#[tokio::test]
+async fn duplex_exchange_with_valid_proof() {
+    use net::adapter::net::cortex::rpc::{HEADER_NRPC_STREAMING, HEADER_NRPC_STREAMING_END};
+
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x93u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2B);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-dx-ex");
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_a.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let (saw_adm, attr_ok, stripped) = (
+        probes.saw_admission.clone(),
+        probes.attribution_ok.clone(),
+        probes.proof_stripped.clone(),
+    );
+    let serve = server
+        .serve_rpc_granted_duplex(
+            s14::SERVICE,
+            Arc::new(s2::ExchangeDX {
+                entries: entries.clone(),
+                tail: b"EX-tail-9",
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve granted duplex");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+
+    let intent = fixture::cross_org_intent(
+        caller_kp,
+        &org_a,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        43,
+        caller_origin,
+        &s2::dx_opening(s14::SERVICE, None, b"EX-req-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the cross-org duplex opening",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                43,
+                &s13::chunk_payload(43, b"EX-req-2", false)
+            ),
+        )),
+        "the bridge accepted the continuation chunk",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 43, &s13::chunk_payload(43, b"", true)),
+        )),
+        "the bridge accepted the END",
+    );
+
+    // The exchange executes: echoes in order, the tail, then ONE terminal
+    // with the exact wire content.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 4).await,
+        "the duplex exchange delivered its echoes, tail and terminal",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            seen.len(),
+            4,
+            "exactly two echoes, one tail and ONE terminal"
+        );
+        assert_eq!(
+            (
+                s15::response_of(&seen[0]).body.as_ref(),
+                s15::response_of(&seen[1]).body.as_ref(),
+                s15::response_of(&seen[2]).body.as_ref(),
+            ),
+            (
+                b"EX-req-1".as_slice(),
+                b"EX-req-2".as_slice(),
+                b"EX-tail-9".as_slice(),
+            ),
+            "the echoed bodies publish IN ORDER, then the post-EOF tail",
+        );
+        let terminal = s15::response_of(&seen[3]);
+        assert_eq!(
+            (terminal.status, terminal.headers, terminal.body.as_ref()),
+            (
+                RpcStatus::Ok,
+                vec![(
+                    HEADER_NRPC_STREAMING.to_string(),
+                    HEADER_NRPC_STREAMING_END.to_vec()
+                )],
+                b"".as_slice(),
+            ),
+            "the duplex terminal's exact wire content is status Ok + the \
+             `nrpc-streaming: end` marker",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        4,
+        "exactly one terminal frame, ever"
+    );
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        1,
+        "the handler ran exactly once"
+    );
+    s2::attribution_ok(&saw_adm, &attr_ok, &stripped, "DX exchange");
+}
+
+/// Slice 2.2 — `pre_admission_chunks_are_never_delivered`. REQUEST_CHUNKs
+/// (and an END) for a call that has NO admitted opening yet are NEVER
+/// delivered: the fold creates no call state for them (empty `in_flight` /
+/// `sender` maps, handler dark, endpoint silent across the bounded darkness
+/// window), and when the real opening later arrives, the aggregate is
+/// EXACTLY the post-admission bodies — the pre-admission junk is nowhere.
+#[tokio::test]
+async fn pre_admission_chunks_are_never_delivered() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x94u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2C);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-pre");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_b.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let serve = server
+        .serve_rpc_owner_scoped_client_stream(
+            s14::SERVICE,
+            Arc::new(s2::AggregateCS {
+                entries: entries.clone(),
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped client-streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+
+    // PRE-admission: two chunks and an END for call 42 — no opening exists.
+    for body in [b"pre-junk-1".as_slice(), b"pre-junk-2".as_slice()] {
+        assert!(
+            serve.inject_inbound_for_test(s13::inbound(
+                session_id,
+                caller.node_id(),
+                caller_origin,
+                s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, body, false)),
+            )),
+            "the bridge accepted the pre-admission chunk",
+        );
+    }
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, b"", true)),
+        )),
+        "the bridge accepted the pre-admission END",
+    );
+    fixture::assert_handler_stays_dark(&entries, "pre-admission chunks never reach a handler")
+        .await;
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "pre-admission chunks",
+    )
+    .await;
+    let fold = serve.request_fold_for_test().expect("the CS fold handle");
+    {
+        let fold = fold.lock();
+        assert!(
+            fold.in_flight_keys().is_empty(),
+            "pre-admission chunks create no in-flight state",
+        );
+        assert!(
+            fold.sender_keys().is_empty(),
+            "pre-admission chunks create no request sender",
+        );
+    }
+
+    // The REAL opening (first chunk), a continuation chunk and a fresh END.
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::ClientStreaming,
+        binding,
+        42,
+        caller_origin,
+        &s2::cs_opening(s14::SERVICE, b"OPEN-body-3"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the real opening",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                42,
+                &s13::chunk_payload(42, b"post-body-5", false)
+            ),
+        )),
+        "the bridge accepted the post-admission chunk",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, b"", true)),
+        )),
+        "the bridge accepted the post-admission END",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the aggregate produced its ONE response",
+    );
+    {
+        let seen = caller_seen.lock();
+        let resp = s15::response_of(&seen[0]);
+        assert_eq!(
+            resp.body.as_ref(),
+            b"OPEN-body-3post-body-5".as_slice(),
+            "the aggregate is EXACTLY the post-admission bodies — pre-admission \
+             chunks are never delivered",
+        );
+    }
+}
+
+/// Slice 2.2 — `end_cannot_cancel_another_stream_or_reopen_terminal_half`.
+/// Two live protected client-streaming calls under one registration: an END
+/// for call B closes ONLY B's input half (`input == Ended`) — call A's half
+/// stays `Open` and A keeps receiving ("END cannot cancel another stream");
+/// a SECOND END for B never reopens the closed half (`input` stays `Ended`,
+/// no sender reappears, no second terminal ever) and a late B chunk after
+/// END is discarded ("cannot reopen terminal half"). Both calls' remaining
+/// output completes exactly once.
+#[tokio::test]
+async fn end_cannot_cancel_another_stream_or_reopen_terminal_half() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x95u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2D);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-end");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let collected = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_client_stream(
+            s14::SERVICE,
+            Arc::new(s2::HoldAfterEof {
+                collected: Arc::clone(&collected),
+                entries: entries.clone(),
+                release: Arc::clone(&release),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped client-streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+
+    // Calls A (42) and B (43), one opening each.
+    for (call_id, body) in [(42u64, b"A-1-".as_slice()), (43, b"B-1-".as_slice())] {
+        let frame = s2::mint_opening(
+            &intent,
+            RpcCallShape::ClientStreaming,
+            binding,
+            call_id,
+            caller_origin,
+            &s2::cs_opening(s14::SERVICE, body),
+        );
+        assert!(
+            serve.inject_inbound_for_test(s13::inbound(
+                session_id,
+                caller.node_id(),
+                caller_origin,
+                frame
+            )),
+            "the bridge accepted call {call_id}'s opening",
+        );
+    }
+    for (call_id, body) in [(42u64, b"A-2-".as_slice()), (43, b"B-2-".as_slice())] {
+        assert!(
+            serve.inject_inbound_for_test(s13::inbound(
+                session_id,
+                caller.node_id(),
+                caller_origin,
+                s13::chunk_frame(
+                    caller_origin,
+                    call_id,
+                    &s13::chunk_payload(call_id, body, false)
+                ),
+            )),
+            "the bridge accepted call {call_id}'s chunk",
+        );
+    }
+
+    let fold = serve.request_fold_for_test().expect("the CS fold handle");
+    let owners = fold.lock().protected_owners();
+    let key_a = (caller.node_id(), session_id, caller_origin, 42u64);
+    let key_b = (caller.node_id(), session_id, caller_origin, 43u64);
+
+    // END for B — closes B's input half ONCE; A's half is untouched.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 43, &s13::chunk_payload(43, b"", true)),
+        )),
+        "the bridge accepted B's END",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || owners
+            .get(&key_b)
+            .is_some_and(|c| c.input_half() == StreamCallInput::Ended))
+        .await,
+        "END closes B's input half",
+    );
+    assert_eq!(
+        owners.get(&key_a).expect("A's record is live").input_half(),
+        StreamCallInput::Open,
+        "B's END cannot cancel another stream — A's input half is untouched",
+    );
+
+    // A SECOND END for B must not reopen the closed half and must not mint
+    // any effect: `input` stays `Ended`, no sender reappears.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 43, &s13::chunk_payload(43, b"", true)),
+        )),
+        "the bridge accepted B's second END",
+    );
+    // …and a late B chunk after END is discarded, never delivered.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                43,
+                &s13::chunk_payload(43, b"B-3-LATE", false)
+            ),
+        )),
+        "the bridge accepted B's late chunk",
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        owners
+            .get(&key_b)
+            .expect("B's record is live (its handler parks)")
+            .input_half(),
+        StreamCallInput::Ended,
+        "a second END can never reopen the terminal half",
+    );
+    assert!(
+        !fold.lock().sender_keys().contains(&key_b),
+        "B's request sender is gone after the first END — never reappears",
+    );
+
+    // A keeps receiving after B's END ("cannot cancel another stream") and
+    // then its own END closes its half.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, b"A-3-", false)),
+        )),
+        "the bridge accepted A's post-B-END chunk",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 42, &s13::chunk_payload(42, b"", true)),
+        )),
+        "the bridge accepted A's END",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || owners
+            .get(&key_a)
+            .is_some_and(|c| c.input_half() == StreamCallInput::Ended))
+        .await,
+        "A's END closes A's input half",
+    );
+
+    // Both parked handlers complete: each call's remaining output arrives
+    // EXACTLY once, carrying exactly the bodies its own half delivered.
+    release.add_permits(2);
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 2).await,
+        "both calls' remaining output completes",
+    );
+    let mut bodies: Vec<Vec<u8>> = caller_seen
+        .lock()
+        .iter()
+        .map(|ev| s15::response_of(ev).body.to_vec())
+        .collect();
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        vec![b"A-1-A-2-A-3-".to_vec(), b"B-1-B-2-".to_vec()],
+        "A delivered everything up to its own END; B's aggregate stops at ITS \
+         first END — the late chunk and the second END changed nothing",
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        2,
+        "exactly one response per call, ever — an END never mints a second terminal",
+    );
+}
+
+/// Slice 2.2 — `wrong_session_grant_does_not_release_credit`. A protected
+/// duplex call under a ZERO response-credit window, keyed 4-tuple
+/// (`from_node`, receiving incarnation, origin, call_id). A `STREAM_GRANT`
+/// carrying the SAME wire coordinates but the WRONG receiving session never
+/// releases credit (the window stays at its initial zero — the named
+/// assertion), and a wrong-session REQUEST_CHUNK is never delivered (the
+/// slice's prescribed inverse target: 3-tuple `(node, origin, call_id)`
+/// delivery would deliver it). The exact session's grant DOES release, and
+/// the exchange completes — positive control both ways.
+#[tokio::test]
+async fn wrong_session_grant_does_not_release_credit() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x96u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2E);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-wrong-sess");
+
+    let seen_bodies: Arc<parking_lot::Mutex<Vec<Bytes>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let entries = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            s14::SERVICE,
+            Arc::new(s2::EchoDX {
+                seen: Arc::clone(&seen_bodies),
+                entries: entries.clone(),
+                finished: Arc::clone(&finished),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let wrong_session = 0xDEAD_5E55u64;
+
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    // Zero response credit: the pump parks at its first chunk until a grant.
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        44,
+        caller_origin,
+        &s2::dx_opening(s14::SERVICE, Some(0), b"warm-body-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the zero-credit duplex opening",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || seen_bodies.lock().len() == 1).await,
+        "the opening body was delivered to the handler",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "zero credit publishes nothing before a grant",
+    )
+    .await;
+
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    let key = (caller.node_id(), session_id, caller_origin, 44u64);
+    assert_eq!(
+        fold.lock().flow_control_permits(key),
+        Some(0),
+        "the response window is installed at its initial zero credit",
+    );
+
+    // WRONG-SESSION probes: same wire coordinates, different receiving
+    // incarnation.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            wrong_session,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 44, 5),
+        )),
+        "the bridge accepted the wrong-session STREAM_GRANT",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            wrong_session,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                44,
+                &s13::chunk_payload(44, b"evil-body-9", false)
+            ),
+        )),
+        "the bridge accepted the wrong-session chunk",
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        seen_bodies.lock().len(),
+        1,
+        "a wrong-session REQUEST_CHUNK is never delivered — the opening body \
+         is all the handler ever sees",
+    );
+    assert_eq!(
+        fold.lock().flow_control_permits(key),
+        Some(0),
+        "a wrong-session STREAM_GRANT does not release credit",
+    );
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "the wrong-session probes published nothing",
+    )
+    .await;
+
+    // Positive control: the EXACT session's grant releases the credit and
+    // the exchange completes (echo + terminal).
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 44, 5),
+        )),
+        "the bridge accepted the exact-session STREAM_GRANT",
+    );
+    // The grant releases credit — deterministically at 4, not 5: the pump
+    // was PARKED on `acquire` with the one queued echo in hand and consumes
+    // one permit the instant credit lands (5 granted − 1 consumed).
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || fold
+            .lock()
+            .flow_control_permits(key)
+            == Some(4))
+        .await,
+        "the exact session's grant releases credit",
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(caller_origin, 44, &s13::chunk_payload(44, b"", true)),
+        )),
+        "the bridge accepted the END",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 2).await,
+        "the echo and terminal complete once credit is released",
+    );
+    {
+        let seen = caller_seen.lock();
+        assert_eq!(
+            s15::response_of(&seen[0]).body.as_ref(),
+            b"warm-body-1".as_slice(),
+            "the echo carries the one delivered body",
+        );
+    }
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "the handler completed exactly once",
+    );
+}
+
+/// Slice 2.2 regression (F-S2.2-5's fix): an opening body that cannot
+/// reserve its bytes (over the per-call byte budget — §2.7 "refuse the
+/// call, never truncate it") is refused `ResourceExhausted` (wire: 0x0009 +
+/// the coarse `Unavailable` byte) with ZERO delivery AND the §3 record
+/// COMPLETED. Ownership had already transferred (§3 step 5) before the
+/// delivery attempt and no supervisor exists yet on this path — without
+/// the fold-side release-once `complete`, the terminal record would own its
+/// key forever (`record_count` stuck at 1 and a same-key successor refused
+/// `ActiveCallOwned`).
+#[tokio::test]
+async fn opening_body_budget_refusal_completes_the_record() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x97u8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x2F);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    // The tiny byte set: 24 B per call per direction (the s14-w8 idiom).
+    s14::set_tiny_byte_registry(&server);
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2-budget");
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let probes = s2::AttributionProbes {
+        saw_admission: Arc::new(AtomicBool::new(false)),
+        attribution_ok: Arc::new(AtomicBool::new(false)),
+        proof_stripped: Arc::new(AtomicBool::new(false)),
+        expected_caller: caller.entity_id().clone(),
+        expected_acting_org: org_b.org_id(),
+        expected_provider_org: org_b.org_id(),
+        expected_provider: server.entity_id().clone(),
+        expected_capability: CapabilityAuthorityId::for_tag("nrpc:svc"),
+    };
+    let serve = server
+        .serve_rpc_owner_scoped_client_stream(
+            s14::SERVICE,
+            Arc::new(s2::AggregateCS {
+                entries: entries.clone(),
+                probes,
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped client-streaming");
+
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("{}.replies.{caller_origin:016x}", s14::SERVICE)).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let intent = fixture::owner_delegated_intent(
+        caller_kp,
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+    );
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    // The opening body (its first chunk) is over the 24-byte per-call
+    // budget — it can never reserve and must fail PROMPTLY (§2.7).
+    let oversized: Vec<u8> = vec![b'X'; 64];
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::ClientStreaming,
+        binding,
+        45,
+        caller_origin,
+        &s2::cs_opening(s14::SERVICE, &oversized),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the oversized opening",
+    );
+
+    // ONE denial: AdmissionDenied + the coarse `Unavailable` byte
+    // (`ResourceExhausted`, §4.3's mapping).
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() == 1).await,
+        "the oversized opening is refused with exactly one denial",
+    );
+    assert!(
+        s15::is_denied_byte(&caller_seen.lock()[0], 2),
+        "the denial is AdmissionDenied + the coarse `Unavailable` byte",
+    );
+
+    // ZERO delivery…
+    fixture::assert_handler_stays_dark(&entries, "the refused opening never reaches the handler")
+        .await;
+    let fold = serve.request_fold_for_test().expect("the CS fold handle");
+    {
+        let fold = fold.lock();
+        assert!(
+            fold.in_flight_keys().is_empty(),
+            "the refused opening leaves no in-flight state",
+        );
+        assert!(
+            fold.sender_keys().is_empty(),
+            "the refused opening leaves no request sender",
+        );
+    }
+    // …and the §3 record COMPLETED (the fix): no record survives and no
+    // active-call quota stays charged.
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.record_count(),
+        0,
+        "the pre-supervisor refusal completes the record's single removal",
+    );
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
 }
