@@ -3246,12 +3246,14 @@ async fn deliver_large_response(
     );
     let from_node = transfer.from_node;
     let session_id = transfer.session_id;
-    let refuse = |reason: &'static str| async move {
+    let refuse = |status: RpcStatus, reason: &'static str| async move {
         // Even a saturated sender's diagnostic is direct, session-bound and
         // bounded. It cannot re-enter a shared queue or reflect via a roster.
         let mut frame = meta.to_bytes().to_vec();
         encode_rpc_route(&mut frame, hash);
-        large_response::error(reason).encode_into(&mut frame);
+        let mut payload = large_response::error(reason);
+        payload.status = status;
+        payload.encode_into(&mut frame);
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             mesh.try_publish_to_peer_bound(
@@ -3267,7 +3269,14 @@ async fn deliver_large_response(
     };
     let Ok(_slot) = mesh.rpc_large_response_slots().try_acquire_owned() else {
         drop(transfer.response);
-        refuse("sender capacity exhausted; no fragments sent").await;
+        // Review finding 9: pump exhaustion is a capacity refusal, not a
+        // handler failure — surface `Backpressure` so the caller can tell
+        // the two apart instead of the generic `Internal`.
+        refuse(
+            RpcStatus::Backpressure,
+            "sender capacity exhausted; no fragments sent",
+        )
+        .await;
         return;
     };
     let mut pieces = Vec::new();
@@ -3316,7 +3325,7 @@ async fn deliver_large_response(
         result = send => result,
     };
     if let Err(reason) = result {
-        refuse(reason).await;
+        refuse(RpcStatus::Internal, reason).await;
     }
 }
 

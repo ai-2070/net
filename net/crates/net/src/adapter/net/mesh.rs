@@ -11603,7 +11603,8 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
-    /// Eight node-wide logical response pumps, with no fragment queue.
+    /// Node-wide logical response pumps ([`Self::LARGE_RESPONSE_PUMP_SLOTS`]
+    /// of them), with no fragment queue.
     #[cfg(feature = "cortex")]
     rpc_large_response_slots: Arc<tokio::sync::Semaphore>,
     /// Test-only publish park (review finding 1): when armed for a
@@ -14086,7 +14087,9 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
             #[cfg(feature = "cortex")]
-            rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(
+                Self::LARGE_RESPONSE_PUMP_SLOTS,
+            )),
             #[cfg(test)]
             publish_park: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
@@ -32602,6 +32605,21 @@ impl MeshNode {
         }
     }
 
+    /// Node-wide bound on concurrently admitted large-unary-response
+    /// pumps (review finding 9). Eight is the deliberately small
+    /// backpressure containment: every admitted pump owns one complete
+    /// response and runs its per-fragment sends inline (there is no
+    /// fragment queue), so one slow peer can stall at most this many
+    /// logical responses and the ninth is refused up front — before any
+    /// fragment is emitted — rather than queued behind a stalled
+    /// transfer. Sized in the same order as the node-global reassembly
+    /// budget (`AGGREGATE = 8 * MAX` in `cortex/rpc/large_response`),
+    /// so worst-case in-flight response bytes stay bounded together.
+    /// Not configurable: a larger bound re-opens the stall-all-pumps
+    /// contention the cap exists to contain.
+    #[cfg(feature = "cortex")]
+    pub(crate) const LARGE_RESPONSE_PUMP_SLOTS: usize = 8;
+
     #[cfg(feature = "cortex")]
     pub(super) fn rpc_large_response_slots(&self) -> Arc<tokio::sync::Semaphore> {
         self.rpc_large_response_slots.clone()
@@ -41831,6 +41849,21 @@ impl MeshNode {
         // send doesn't strand credit.
         let needed = wire_bytes_for_payload(payload_bytes);
         let credit_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        // Bounded exponential backoff between credit attempts (review
+        // finding 9). This replaces a 1 ms fixed poll: per fragment that
+        // was up to 1 s of 1 ms wakeups while the caller holds one of the
+        // node-wide [`MeshNode::LARGE_RESPONSE_PUMP_SLOTS`] response
+        // pumps. Real credit-available notification is the review's
+        // preferred closure but needs a wake hook inside `StreamState`'s
+        // credit ledger (`net-mesh-wire`'s `wire/src/session.rs`:
+        // `refund_tx_credit` / `apply_authoritative_grant` /
+        // `refund_control_debit` are the only places credit grows, and
+        // that crate is outside this change's ownership) — recorded as a
+        // named follow-up. The cap keeps worst-case resume latency at one
+        // backoff interval; `fragment_wait_resumes_after_credit_refund`'s
+        // 300 ms bound fails any larger cap.
+        const BACKOFF_CAP: Duration = Duration::from_millis(32);
+        let mut credit_backoff = Duration::from_millis(1);
         let (guard, seq) = loop {
             if fragment_session.is_some_and(|expected| {
                 session.session_id() != expected
@@ -41847,7 +41880,8 @@ impl MeshNode {
                     if fragment_session.is_some()
                         && tokio::time::Instant::now() < credit_deadline =>
                 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::time::sleep(credit_backoff).await;
+                    credit_backoff = (credit_backoff * 2).min(BACKOFF_CAP);
                 }
                 TxAdmit::WindowFull => {
                     return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(

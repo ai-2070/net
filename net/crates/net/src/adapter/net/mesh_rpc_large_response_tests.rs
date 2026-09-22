@@ -549,7 +549,7 @@ async fn large_sender_capacity_refuses_whole_response_without_blocking_small_rep
     let held = server
         .rpc_large_response_slots
         .clone()
-        .try_acquire_many_owned(8)
+        .try_acquire_many_owned(MeshNode::LARGE_RESPONSE_PUMP_SLOTS as u32)
         .unwrap();
     for service in ["capacity_a", "capacity_b"] {
         let result = caller
@@ -564,10 +564,19 @@ async fn large_sender_capacity_refuses_whole_response_without_blocking_small_rep
             )
             .await
             .unwrap_err();
-        assert!(
-            matches!(result, RpcError::ServerError { status, ref message, .. }
-            if status == RpcStatus::Internal.to_wire() && message.contains("sender capacity exhausted"))
+        let RpcError::ServerError {
+            status, message, ..
+        } = result
+        else {
+            panic!("pump exhaustion must surface as ServerError");
+        };
+        assert_eq!(
+            status,
+            RpcStatus::Backpressure.to_wire(),
+            "pump exhaustion must surface as Backpressure so the caller can \
+             tell a capacity refusal from a handler failure (Internal)"
         );
+        assert!(message.contains("sender capacity exhausted"));
         assert_eq!(caller.rpc_client_pending_arc().retained_for_test(), (0, 0));
     }
     let small = caller

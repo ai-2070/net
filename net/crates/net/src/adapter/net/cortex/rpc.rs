@@ -310,7 +310,9 @@ pub enum RpcStatus {
     /// [`DISPATCH_RPC_DEADLINE_EXCEEDED`].)
     /// gRPC equivalent: `DEADLINE_EXCEEDED` (4).
     Timeout = 0x0003,
-    /// Server's per-service queue is at `max_in_flight` capacity.
+    /// Server's per-service queue is at `max_in_flight` capacity, or
+    /// another node-wide capacity bound refused the call (e.g. the
+    /// large-response pump budget, review finding 9).
     /// gRPC equivalent: `RESOURCE_EXHAUSTED` (8).
     Backpressure = 0x0004,
     /// Caller emitted `DISPATCH_RPC_CANCEL` before the server
