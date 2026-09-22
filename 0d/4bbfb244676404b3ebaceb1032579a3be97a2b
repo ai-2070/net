@@ -1,0 +1,20 @@
+net/crates/net/docs/TRANSPORT.md
+  h_64425bc75e3f3d 56-58,62-63,81,86-87,89-91,96
+net/crates/net/src/adapter/net/mesh.rs
+  h_64425bc75e3f3d 19627-19638
+net/crates/net/wire/src/crypto.rs
+  h_64425bc75e3f3d 283-294,341-343,345-352,428-453
+net/crates/net/wire/src/session.rs
+  h_64425bc75e3f3d 69-75,225-230,254,280-302,455-463,3382,3402-3489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0d4bbfb244676404b3ebaceb1032579a3be97a2b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
