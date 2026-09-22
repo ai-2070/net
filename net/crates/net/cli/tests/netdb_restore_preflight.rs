@@ -498,6 +498,9 @@ fn force_without_clear_preserves_merge_semantics() {
             .unwrap(),
     );
     assert_eq!(f.ids(&dest, "memories", "17"), [3]);
+    // Both sides of the task merge: the snapshot's task 2 arrives AND the
+    // destination's task 1 survives the forced restore.
+    assert_eq!(f.ids(&dest, "tasks", "17"), [1, 2]);
 }
 
 #[test]
