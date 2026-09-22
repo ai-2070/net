@@ -4164,11 +4164,30 @@ impl RpcClientPending {
         }
     }
 
-    /// Register a oneshot for a unary `call_id`. Returns the
-    /// receiver the caller awaits. The caller MUST publish the
-    /// REQUEST after registration (and not before) so the
-    /// matching RESPONSE can't arrive while the pending entry is
-    /// missing.
+    /// Register a oneshot for a unary `call_id` — the LEGACY-WAITER
+    /// registration (review finding 11). Returns the receiver the
+    /// caller awaits. The caller MUST publish the REQUEST after
+    /// registration (and not before) so the matching RESPONSE can't
+    /// arrive while the pending entry is missing.
+    ///
+    /// A `register` entry is a `PendingEntry::Unary` with
+    /// `session: None`, which `deliver_session` treats as a waiter
+    /// that predates fragment reassembly: an unsolicited response
+    /// fragment is rejected with `Internal` and ZERO charge against
+    /// the node-global reassembly budget. That is deliberate legacy
+    /// behavior, not an oversight — contrast `register_large`, whose
+    /// `session: Some(..)` entries accept fragments and reserve
+    /// budget.
+    ///
+    /// REACH: test-only. The production unary path
+    /// (`mesh_rpc::Mesh::call`) always registers through
+    /// `register_large`; the streaming paths use
+    /// `register_streaming` / `register_client_streaming` /
+    /// `register_duplex`. `register` remains for the `#[cfg(test)]`
+    /// fold units in this module and for the integration harnesses
+    /// (`tests/integration_nrpc_loopback.rs`,
+    /// `tests/integration_nrpc_cross_lang.rs`) that drive fold /
+    /// loopback responses without a wire session.
     ///
     /// `target_node` is the wire-session peer the request will
     /// be sent to; `deliver` rejects RESPONSE frames whose
