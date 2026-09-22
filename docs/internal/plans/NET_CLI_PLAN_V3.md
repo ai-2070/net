@@ -999,11 +999,7 @@ override to the mapped external address. V3 work:
   override and no routable bind, the token carries no direct path.
 - The bundle's contact reuses the address that reached enrollment (same port
   number for TCP and UDP), so the node need not know its address for bundles.
-- Auto-provisioning for minimal config is proposed but **not yet accepted**:
-  first `up --enroll` would create the issuer identity (or reuse the node
-  identity), the ledger and a persisted port. This changes the earlier rule that
-  `--enroll` refuses without an issuer identity and ledger store and needs an
-  explicit decision.
+- Auto-provisioning for minimal config: accepted (decision 3 below).
 
 **Relay fallback.** Design constraints discovered so far (to verify before
 freezing): a Net relay today is an ordinary mesh node that forwards routed
@@ -1016,13 +1012,27 @@ end-to-end), plus the device keeping an outbound registration with the relay.
 The token would carry direct and relay locators under the same issuer
 signature.
 
-**Open decisions before relay work:** (1) who runs the relay — project-provided
-default, user-provided (e.g. their VPS or the agent's cloud side), or both with
-a configurable default (a project-run default is a scope change from the
-no-hosted-service non-goal); (2) whether the relay may be a trust-domain member
-holding the PSK, or must be a blind forwarder that never holds it (the latter
-needs relay work below the mesh session layer); (3) acceptance of the
-auto-provisioning change above.
+**Decisions (user, 2026-09-23):**
+
+1. **Relay hosting: both, with a configurable default.** A project-run default
+   relay makes the fallback zero-config; operators can point at their own relay
+   instead (e.g. a VPS or the agent's cloud side). This is an explicit scope
+   change from the plan's no-hosted-service non-goal, limited to a blind relay:
+   no registry, roster, control plane or account system comes with it.
+2. **Relay trust: blind forwarder.** The relay never holds the trust-domain PSK,
+   the issuer key or any mesh credential; it only forwards encrypted traffic it
+   cannot read, and it cannot join the mesh. Today's in-mesh relaying (a
+   PSK-holding node) therefore does not satisfy the fallback; relaying must sit
+   below the mesh session layer for both the PSK-free enrollment session and
+   the subsequent mesh session. The relay must also not become an oracle or
+   amplifier: registrations are authenticated by the device, forwarding is
+   bounded, and relay state is not authority.
+3. **Minimal config: auto-create on first `up --enroll`.** Missing issuer
+   identity, ledger and fixed port are created durably on first run and reported;
+   explicit flags still override. This replaces the earlier rule that `--enroll`
+   refuses without an issuer identity and ledger store: they now exist because
+   they were created, never because a refusal was skipped. Corrupt or foreign
+   existing state still refuses rather than being replaced.
 
 **Evidence plan.** Loopback cannot prove either path. Extend `natsim` (Linux
 network namespaces with real nftables NAT, CI-only) with a port-mapping gateway
