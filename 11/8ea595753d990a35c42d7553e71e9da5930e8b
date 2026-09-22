@@ -1,0 +1,14 @@
+net/crates/net/cli/src/commands/aggregator.rs
+  h_64425bc75e3f3d 420-422,428
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "118ea595753d990a35c42d7553e71e9da5930e8b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
