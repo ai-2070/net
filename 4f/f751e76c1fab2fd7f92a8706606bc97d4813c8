@@ -1,0 +1,14 @@
+net/crates/net/docs/cli/TYPEGEN.md
+  h_64425bc75e3f3d 148-152,160,162,167-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4ff751e76c1fab2fd7f92a8706606bc97d4813c8",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
