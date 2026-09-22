@@ -205,7 +205,7 @@ Selectors match ANY within tags and ANY within tool IDs, but both groups must ma
 Output is one module per tool. The tool's JSON Schema lowers to TypeScript interfaces (for `ts`) or Pydantic v2 models (for `python`); each module also exports:
 
 - A typed call helper: `callAcmeWebSearch(mesh, request)` for TS, `call_acme_web_search(mesh, request)` for Python.
-- A `…Meta` constant carrying the descriptor metadata: tool id, version, description, streaming flag, stateless flag, estimated time, tags.
+- A `…Meta` constant carrying the descriptor metadata: tool id, version, description, streaming flag, stateless flag, estimated time, tags. TypeScript only — generated Python exports no `…Meta` constant (its per-tool `__init__.py` exports the models, `call_*`, `TOOL_ID`, `VERSION`); its metadata surface is the package's `_meta.json`.
 
 TypeScript output includes per-tool `.ts` modules, an index, and `meta.json`; its call helpers use a structural client interface, without importing a runtime SDK package. Python output includes models, `.pyi` stubs, call helpers, package initializers, and `_meta.json`; models require Pydantic v2 and helpers accept a structural client protocol.
 
@@ -281,11 +281,11 @@ Issue a capability grant: "org A holds these rights on this capability over this
 
 ```
 net-mesh org grant-capability --org-key <PATH> --grantee-org <HEX> --capability <TAG> --out <PATH>
-                              [--invoke] [--discover --audience-out <PATH>]
+                              (--invoke | --discover --audience-out <PATH>)
                               (--target-node <HEX> | --target-any-owned-by <HEX>) [--ttl-secs <N>]
 ```
 
-`--discover` mints a fresh audience secret and **requires** `--audience-out`; only the secret's 32-byte commitment rides inside the signed grant, so the raw discovery key never touches the wire.
+`--discover` mints a fresh audience secret and **requires** `--audience-out`; only the secret's 32-byte commitment rides inside the signed grant, so the raw discovery key never touches the wire. At least one of `--invoke` or `--discover` is required (the parenthesized group marks it); both may be granted together.
 
 Both grant commands default to a 7-day TTL, hard-capped at 30 days and rejected at issue and at every verifier.
 
