@@ -1,0 +1,16 @@
+.claude/skills/net-event-bus/dataforts.md
+  h_64425bc75e3f3d 218
+.github/scripts/check-skill-ffi-constants.py
+  h_64425bc75e3f3d 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "87c58f38eb55e3fada9ec9d9a4f80cdf7664d88c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
