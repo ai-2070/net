@@ -66,6 +66,13 @@ use crate::identity::{EntityId, Identity, TokenError, TOKEN_CLOCK_SKEW_SECS_RECO
 /// Does not change the legacy delegation-based enrollment APIs in this module.
 pub mod policy;
 
+// Signed membership invite (`net-join:`) and canonical redemption intent.
+pub mod invite;
+
+// Durable, issuer-bound invitation ledger for the same V3 path; not a verifier.
+// (Outer `///` docs here would resolve the module's intra-doc links in this scope.)
+pub mod store;
+
 // Re-export the anchor type so `net_sdk::enrollment` is a complete surface.
 pub use crate::delegation::RevocationRegistry;
 
