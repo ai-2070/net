@@ -1,0 +1,18 @@
+net/crates/net/docs/ORGANIZATIONS.md
+  h_64425bc75e3f3d 70-76,146-156
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  h_64425bc75e3f3d 947-1026,1165-1167,1169,1184,1186-1193,1196,1203-1234,1686-1690,1694-1706,1708-1758,1823-1829,1852-1853,1864,1874-1877,1886-1893
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  h_64425bc75e3f3d 6002,6009-6082,9833-9845,9847,9849-9851,9853-9858,9860-9936,9940,9945,9950-9951,9964-9965
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c245a29f009119badefaab4aaaa0bbac224c2c3b",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
