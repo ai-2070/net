@@ -215,7 +215,7 @@ Each binding lets you write adapters in the host language:
 
 - **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
-- **C / cgo** — no host-language adapter registration is exposed. The C headers (`include/net.h`, `include/net_transport.h`) and `go/` reach only the substrate-owned adapter over the opaque `net_mesh_blob_adapter_t` (`net_mesh_blob_adapter_new/store/publish/fetch/exists`, plus `net_blob_ref_hash` and the transfer surface in `net_transport.h`). The vtable registration — `net_blob_register_adapter` with `NetBlobAdapterVtable`, per-field null-check at registration, partial vtables returning `NET_ERR_BLOB_BACKEND` — is **Rust FFI only** (`src/ffi/blob.rs`) and is declared in no C header.
+- **C / cgo** — no host-language adapter registration is exposed. The C headers (`include/net.h`, `include/net_transport.h`) and `go/` reach only the substrate-owned adapter over the opaque `net_mesh_blob_adapter_t` (`net_mesh_blob_adapter_new/store/publish/fetch/exists`, plus `net_blob_ref_hash` and the transfer surface in `net_transport.h`). The vtable registration — `net_blob_register_callback_adapter` with `NetBlobAdapterVtable`, per-field null-check at registration, partial vtables returning `NET_ERR_BLOB_BACKEND` — is **Rust FFI only** (`src/ffi/blob.rs`) and is declared in no C header.
 
 ---
 

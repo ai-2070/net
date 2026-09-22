@@ -179,7 +179,7 @@ Adapters can be written in the host language across every binding:
 
 - **Python** — `PyBlobAdapter` with sync + `async def` method support. Async adapters run on a binding-owned event loop on a dedicated thread (one loop per process); calling thread sharing is via `asyncio.run_coroutine_threadsafe`. An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe — the binding never spins up a fresh `asyncio.run` per call (D-4).
 - **Node** — `NodeBlobAdapter` (sync TSFN bridge) + `NodeAsyncBlobAdapter` (Promise-returning TSFN bridge).
-- **C / cgo** — the `net_mesh_blob_adapter_*` surface (`net_mesh_blob_adapter_t` handle: `new`/`store`/`publish`/`fetch`/`exists`, plus `net_blob_ref_hash`) with per-field null-check at registration; partial vtables fail with the blob-backend error rather than crashing on first dispatch (D-22). (`NetBlobAdapterVtable`, `net_blob_register_adapter` and `NET_ERR_BLOB_BACKEND` are the Rust-FFI layer beneath it.)
+- **C / cgo** — the `net_mesh_blob_adapter_*` surface (`net_mesh_blob_adapter_t` handle: `new`/`store`/`publish`/`fetch`/`exists`, plus `net_blob_ref_hash`) with per-field null-check at registration; partial vtables fail with the blob-backend error rather than crashing on first dispatch (D-22). (`NetBlobAdapterVtable`, `net_blob_register_callback_adapter` and `NET_ERR_BLOB_BACKEND` are the Rust-FFI layer beneath it.)
 
 `BlobError::NotFound(uri)` sanitizes the URI before including it in the error string — control chars escape as `\xNN`, length caps at 256 bytes — so a binding logging the error can't be log-injected by an attacker who controls the URI (D-31).
 
