@@ -5603,6 +5603,62 @@ struct AdmittedOpening {
     confirmed: Option<ConfirmedOpening>,
 }
 
+/// The post-transfer state of a PROTECTED client-streaming/duplex opening
+/// (S2R — F-S2R-2): the unary [`ConfirmedOpening`] scope-guard precedent
+/// applied to the CS/DX `apply_inbound_admitted` windows, completed to the
+/// §2.4 single removal point. Its Drop runs
+/// [`StreamCallRegistration::complete`] — the record's release-once
+/// `complete` and every map entry (in-flight, sender, flow window,
+/// protected ownership) — so ANY exit after `registry.confirm` (a delivery
+/// refusal, a scheduling/installation failure, or a panic) settles instead
+/// of orphaning a `Running` record: the unary guard's own promise ("this
+/// scope guard stands in for it so no `Running` record is ever orphaned"),
+/// scoped to the pre-supervisor window. The `tokio::spawn` transfer
+/// defuses it — from there the supervisor's own registration is the single
+/// removal point, exactly as before.
+struct ConfirmedStreamOpening {
+    registration: StreamCallRegistration,
+    armed: bool,
+}
+
+impl ConfirmedStreamOpening {
+    /// Ownership moved to the spawned supervisor's registration (the §2.4
+    /// single removal point now lives there).
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConfirmedStreamOpening {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registration.complete();
+        }
+    }
+}
+
+// S2R probe seam (test builds only) — the one-shot synthetic installation
+// failure `post_transfer_scope_guard_never_orphans_a_running_record` arms
+// at the CS/DX post-transfer window point (the S2 review's §6.5 probe
+// shape, made reproducible without a per-run source mutation).
+// Thread-local and one-shot so nothing outside the arming test can observe
+// it; production builds compile neither the flag nor its checks.
+#[cfg(test)]
+thread_local! {
+    static PROBE_FAIL_POST_TRANSFER_INSTALL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn probe_arm_post_transfer_installation_failure() {
+    PROBE_FAIL_POST_TRANSFER_INSTALL.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn probe_fail_post_transfer_install() -> bool {
+    PROBE_FAIL_POST_TRANSFER_INSTALL.with(|flag| flag.replace(false))
+}
+
 use std::future::Future;
 
 /// The handler shape one §2.2-supervised call runs (Stage 2 slice 2.2
@@ -7509,6 +7565,13 @@ impl RpcStreamingRequestFold {
         // effect (in-flight insert, sender creation, handler spawn).
         let retire_signal = Arc::new(StreamRetireSignal::new());
         let mut call_ref: Option<RegistryCallRef> = None;
+        // S2R (F-S2R-2) — the unary `ConfirmedOpening` scope-guard shape
+        // over the §2.4 single removal point: armed at the transfer, so ANY
+        // exit from this post-transfer window (a delivery refusal, a
+        // scheduling/installation failure, or a panic) settles the record's
+        // release-once `complete` and every map entry instead of orphaning
+        // a `Running` record.
+        let mut transfer_guard: Option<ConfirmedStreamOpening> = None;
         if let Some(lease) = lease.as_mut() {
             let registry = Arc::clone(lease.registry());
             let ref_for_call = RegistryCallRef {
@@ -7517,6 +7580,17 @@ impl RpcStreamingRequestFold {
                 incarnation: lease.incarnation,
             };
             registry.confirm(lease, Arc::clone(&retire_signal), None)?;
+            transfer_guard = Some(ConfirmedStreamOpening {
+                registration: StreamCallRegistration {
+                    key,
+                    in_flight: self.in_flight.clone(),
+                    flow_control: None,
+                    protected: self.protected_calls.clone(),
+                    registry: Some(ref_for_call.clone()),
+                    senders: Some(self.senders.clone()),
+                },
+                armed: true,
+            });
             call_ref = Some(ref_for_call);
         }
 
@@ -7539,15 +7613,14 @@ impl RpcStreamingRequestFold {
                     if !deliver_protected_body(charge, &tx, payload.body.clone()) {
                         charge.latch_exhausted();
                         // Ownership already transferred (§3 step 5) but no
-                        // supervisor exists yet on this path — the FOLD is
-                        // this refusal's cleanup owner (the unary
-                        // `ConfirmedOpening` scope-guard precedent): settle
+                        // supervisor exists yet on this path — S2R (F-S2R-2)
+                        // FOLDS the F-S2.2-5 settlement into the
+                        // `ConfirmedStreamOpening` guard: its Drop settles
                         // the registry record's release-once `complete` and
-                        // every map entry, then refuse with zero further
-                        // delivery (§2.7: "refuse the call, never truncate
-                        // it").
-                        self.in_flight.lock().remove(&key);
-                        charge.registry.complete(&charge.key, charge.incarnation);
+                        // every map entry at the §2.4 single removal point
+                        // on this return, and the opening is refused with
+                        // zero further delivery (§2.7: "refuse the call,
+                        // never truncate it").
                         return Err(AdmissionDenied::ResourceExhausted);
                     }
                 }
@@ -7558,6 +7631,13 @@ impl RpcStreamingRequestFold {
                     });
                 }
             }
+        }
+        // S2R probe seam (test builds only): the F-S2R-2 probe-witness's
+        // synthetic installation failure lands at THIS post-transfer window
+        // point (the S2 review's §6.5 probe shape).
+        #[cfg(test)]
+        if probe_fail_post_transfer_install() {
+            return Err(AdmissionDenied::ShapeMismatch);
         }
         if end_on_initial {
             // §2.6: the opening already carried END — the input half is
@@ -7639,6 +7719,11 @@ impl RpcStreamingRequestFold {
                 senders: Some(self.senders.clone()),
             },
         ));
+        // S2R (F-S2R-2): ownership transferred to the supervisor — its
+        // registration is the §2.4 single removal point from here.
+        if let Some(guard) = transfer_guard.as_mut() {
+            guard.defuse();
+        }
         Ok(call)
     }
 }
@@ -8349,6 +8434,12 @@ impl RpcDuplexFold {
         // effect (in-flight insert, sender creation, handler spawn).
         let retire_signal = Arc::new(StreamRetireSignal::new());
         let mut call_ref: Option<RegistryCallRef> = None;
+        // S2R (F-S2R-2) — the CS seam's guard clause verbatim (the unary
+        // `ConfirmedOpening` scope-guard shape over the §2.4 single removal
+        // point): ANY exit from this post-transfer window settles the
+        // record's release-once `complete` and every map entry instead of
+        // orphaning a `Running` record.
+        let mut transfer_guard: Option<ConfirmedStreamOpening> = None;
         if let Some(lease) = lease.as_mut() {
             let registry = Arc::clone(lease.registry());
             let ref_for_call = RegistryCallRef {
@@ -8357,6 +8448,17 @@ impl RpcDuplexFold {
                 incarnation: lease.incarnation,
             };
             registry.confirm(lease, Arc::clone(&retire_signal), None)?;
+            transfer_guard = Some(ConfirmedStreamOpening {
+                registration: StreamCallRegistration {
+                    key,
+                    in_flight: self.in_flight.clone(),
+                    flow_control: Some(self.flow_control.clone()),
+                    protected: self.protected_calls.clone(),
+                    registry: Some(ref_for_call.clone()),
+                    senders: Some(self.senders.clone()),
+                },
+                armed: true,
+            });
             call_ref = Some(ref_for_call);
         }
 
@@ -8386,11 +8488,9 @@ impl RpcDuplexFold {
                     if !deliver_protected_body(charge, &tx, payload.body.clone()) {
                         charge.latch_exhausted();
                         // The CS seam's clause verbatim (Stage 2 §4.2,
-                        // F-S2.2-5): the fold owns this pre-supervisor
-                        // refusal's single removal.
-                        self.in_flight.lock().remove(&key);
-                        self.flow_control.lock().remove(&key);
-                        charge.registry.complete(&charge.key, charge.incarnation);
+                        // F-S2.2-5, folded into the `ConfirmedStreamOpening`
+                        // guard by S2R/F-S2R-2): the guard's Drop owns this
+                        // pre-supervisor refusal's single removal.
                         return Err(AdmissionDenied::ResourceExhausted);
                     }
                 }
@@ -8401,6 +8501,13 @@ impl RpcDuplexFold {
                     });
                 }
             }
+        }
+        // S2R probe seam (test builds only): the F-S2R-2 probe-witness's
+        // synthetic installation failure lands at THIS post-transfer window
+        // point (the S2 review's §6.5 probe shape).
+        #[cfg(test)]
+        if probe_fail_post_transfer_install() {
+            return Err(AdmissionDenied::ShapeMismatch);
         }
         if end_on_initial {
             // §2.6: the opening already carried END — input starts `Ended`.
@@ -8477,6 +8584,11 @@ impl RpcDuplexFold {
                 senders: Some(self.senders.clone()),
             },
         ));
+        // S2R (F-S2R-2): ownership transferred to the supervisor — its
+        // registration is the §2.4 single removal point from here.
+        if let Some(guard) = transfer_guard.as_mut() {
+            guard.defuse();
+        }
         Ok(call)
     }
 }
@@ -13152,5 +13264,222 @@ mod tests {
         assert!(registry.retire(&key, second_incarnation, StreamTerminalReason::Timeout));
         assert!(registry.complete(&key, second_incarnation));
         assert_eq!(registry.removals(&key, second_incarnation), 1);
+    }
+
+    // --------------------------------------------------------------------
+    // S2R (F-S2R-2) — the post-transfer scope guard (probe-witness).
+    // --------------------------------------------------------------------
+
+    /// S2R (F-S2R-2) — `post_transfer_scope_guard_never_orphans_a_running_record`.
+    /// The S2 review's §6.5 probe, permanent: a synthetic installation
+    /// failure at the CS/DX `apply_inbound_admitted` post-transfer window
+    /// point (the probe seam) must settle the record's release-once
+    /// `complete` and every map entry through the `ConfirmedStreamOpening`
+    /// scope guard — `record_count() == 0` (the named orphan assertion), an
+    /// empty `in_flight_keys()`, and exactly one removal. Fails (orphans)
+    /// without the guard — `record_count` left 1, the key pinned as
+    /// `ActiveCallOwned` forever and one active-call quota slot leaked —
+    /// and passes with it, on BOTH seams.
+    #[test]
+    fn post_transfer_scope_guard_never_orphans_a_running_record() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_admission::Admitted;
+        use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
+
+        struct ProbeInstallNeverCs;
+        #[async_trait::async_trait]
+        impl RpcClientStreamingHandler for ProbeInstallNeverCs {
+            async fn call(
+                &self,
+                _ctx: RpcStreamingContext,
+                _requests: RequestStream,
+            ) -> Result<RpcResponsePayload, RpcHandlerError> {
+                unreachable!(
+                    "the probe's synthetic installation failure precedes handler installation"
+                );
+            }
+        }
+        struct ProbeInstallNeverDx;
+        #[async_trait::async_trait]
+        impl RpcDuplexHandler for ProbeInstallNeverDx {
+            async fn call(
+                &self,
+                _ctx: RpcStreamingContext,
+                _requests: RequestStream,
+                _responses: RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                unreachable!(
+                    "the probe's synthetic installation failure precedes handler installation"
+                );
+            }
+        }
+
+        // A real store gives the registry its live view (the model's
+        // abstract authority); AV-9: the scratch dir is left behind.
+        let dir = std::env::temp_dir().join(format!(
+            "net-s2r-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+            &dir,
+            crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("real store");
+        let registry = ProtectedCallRegistry::with_q1_defaults().expect("limits validate");
+        registry.bind_store(None, Arc::new(store));
+
+        let admitted = Admitted {
+            caller: EntityId::from_bytes([0x24u8; 32]),
+            acting_org: OrgKeypair::from_bytes([0x77u8; 32]).org_id(),
+            provider_org: OrgKeypair::from_bytes([0x42u8; 32]).org_id(),
+            provider: EntityId::from_bytes([0x99u8; 32]),
+            capability: CapabilityAuthorityId::for_tag("nrpc:probe"),
+        };
+        let lifetime = StreamCallLifetime {
+            policy: StreamLifetimePolicy::q1_defaults(),
+            credential_ends_ns: &[],
+            clock: crate::adapter::net::behavior::admission_clock::ClockSample::now(),
+        };
+        let facts = || VerifiedCallFacts {
+            acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+            member: EntityId::from_bytes([0x24u8; 32]),
+            member_generation: 1,
+            deadline: None,
+        };
+
+        // ---- the CS seam ----
+        let cs_key = ProtectedCallKey {
+            caller: EntityId::from_bytes([0x24u8; 32]),
+            call_id: 21,
+        };
+        let mut cs_reservation = registry
+            .reserve(OpeningRequest {
+                key: cs_key.clone(),
+                session: SessionIdentity {
+                    peer: 2,
+                    session_id: 3,
+                    establishment: Some([4u8; 32]),
+                },
+                session_generation: Some(1),
+                registration: 1,
+                shape: RpcCallShape::ClientStreaming,
+                now_ns: 0,
+            })
+            .expect("the CS probe reserves");
+        let cs_incarnation = cs_reservation.incarnation;
+        let cs_lease = registry
+            .install(&mut cs_reservation, facts(), 0)
+            .expect("the CS probe installs");
+        let (cs_emit, _cs_captured) = capturing_emitter();
+        let mut cs_fold = RpcStreamingRequestFold::new(Arc::new(ProbeInstallNeverCs), cs_emit);
+        let cs_frame = rpc_request_event(
+            0x2222,
+            21,
+            RpcRequestPayload {
+                service: "probe".to_string(),
+                deadline_ns: 0,
+                flags: FLAG_RPC_CLIENT_STREAMING_REQUEST,
+                headers: vec![],
+                body: Bytes::from_static(b"probe-body"),
+            },
+        )
+        .payload;
+        probe_arm_post_transfer_installation_failure();
+        let cs_refused = cs_fold.apply_inbound_admitted(
+            &inbound(0x61, cs_frame),
+            admitted.clone(),
+            &lifetime,
+            Some(cs_lease),
+        );
+        assert!(
+            matches!(cs_refused, Err(AdmissionDenied::ShapeMismatch)),
+            "the synthetic installation failure refuses the CS opening at the window point",
+        );
+        assert_eq!(
+            registry.record_count(),
+            0,
+            "a post-transfer installation failure must not orphan the Running record (the \
+             ConfirmedOpening scope-guard precedent)",
+        );
+        assert!(
+            cs_fold.in_flight_keys().is_empty(),
+            "the guard settles every map entry — the CS in-flight map is empty",
+        );
+        assert_eq!(
+            registry.removals(&cs_key, cs_incarnation),
+            1,
+            "exactly one removal",
+        );
+
+        // ---- the DX seam (with a flow-window entry at the failure point) ----
+        let dx_key = ProtectedCallKey {
+            caller: EntityId::from_bytes([0x24u8; 32]),
+            call_id: 22,
+        };
+        let mut dx_reservation = registry
+            .reserve(OpeningRequest {
+                key: dx_key.clone(),
+                session: SessionIdentity {
+                    peer: 2,
+                    session_id: 3,
+                    establishment: Some([4u8; 32]),
+                },
+                session_generation: Some(1),
+                registration: 1,
+                shape: RpcCallShape::Duplex,
+                now_ns: 0,
+            })
+            .expect("the DX probe reserves");
+        let dx_incarnation = dx_reservation.incarnation;
+        let dx_lease = registry
+            .install(&mut dx_reservation, facts(), 0)
+            .expect("the DX probe installs");
+        let (dx_emit, _dx_captured) = capturing_async_emitter();
+        let mut dx_fold = RpcDuplexFold::new(Arc::new(ProbeInstallNeverDx), dx_emit);
+        let dx_frame = rpc_request_event(
+            0x3333,
+            22,
+            RpcRequestPayload {
+                service: "probe".to_string(),
+                deadline_ns: 0,
+                flags: FLAG_RPC_CLIENT_STREAMING_REQUEST | FLAG_RPC_STREAMING_RESPONSE,
+                headers: vec![header(HEADER_NRPC_STREAM_WINDOW_INITIAL, b"0")],
+                body: Bytes::from_static(b"probe-body"),
+            },
+        )
+        .payload;
+        probe_arm_post_transfer_installation_failure();
+        let dx_refused = dx_fold.apply_inbound_admitted(
+            &inbound(0x61, dx_frame),
+            admitted.clone(),
+            &lifetime,
+            Some(dx_lease),
+        );
+        assert!(
+            matches!(dx_refused, Err(AdmissionDenied::ShapeMismatch)),
+            "the synthetic installation failure refuses the DX opening at the window point",
+        );
+        assert_eq!(
+            registry.record_count(),
+            0,
+            "a post-transfer installation failure must not orphan the Running record (the \
+             ConfirmedOpening scope-guard precedent)",
+        );
+        assert!(
+            dx_fold.in_flight_keys().is_empty(),
+            "the guard settles every map entry — the DX in-flight map is empty",
+        );
+        assert_eq!(
+            dx_fold.flow_control_permits((0x61, 0, 0x3333, 22)),
+            None,
+            "the guard settles the flow-window entry",
+        );
+        assert_eq!(
+            registry.removals(&dx_key, dx_incarnation),
+            1,
+            "exactly one removal",
+        );
     }
 }

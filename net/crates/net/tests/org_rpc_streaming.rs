@@ -5254,3 +5254,224 @@ async fn retire_unblocks_both_directions() {
          resurrects the stopped pump",
     );
 }
+
+// ===========================================================================
+// S2R (F-S2R-1) — the §2.6 late-input disposition after an EARLY handler
+// return (the S2 review §7 closure property's named witness).
+// ===========================================================================
+
+/// S2R (F-S2R-1) — `early_handler_return_refuses_late_input_without_resource_exhausted`.
+/// A PROTECTED duplex handler returns EARLY (before the caller's END — none
+/// is ever sent) with its input half still `Open`; a request chunk then
+/// arrives for the call. Observed: the chunk is refused/discarded — never
+/// delivered, never retained — no `ResourceExhausted` is latched (the named
+/// assertion), the handler's own result remains the terminal (exact wire
+/// content), and the record completes exactly once.
+///
+/// REQUIRED INVERSE PAIR, each reddening at the named no-latch assertion:
+/// (a) the `handler_returned` input-`Closed` assignment removed
+/// (`cortex/rpc.rs`); (b) the chunk-path record gate neutralized
+/// (`apply_request_chunk_to_senders`). Without either rule the late chunk
+/// reaches delivery, whose failure at the dropped receiver latches
+/// `ResourceExhausted` and replaces the handler's result — the exact
+/// resource-overflow failure §2.6 forbids.
+#[tokio::test]
+async fn early_handler_return_refuses_late_input_without_resource_exhausted() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x9Cu8; 32])).await;
+    let caller_kp = s15::caller_keypair(0x34);
+    let caller = fixture::build_node_with(caller_kp.clone()).await;
+    fixture::bring_up(&caller, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s2r-early");
+
+    let seen: Arc<parking_lot::Mutex<Vec<Bytes>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = Arc::new(AtomicUsize::new(0));
+    let serve = server
+        .serve_rpc_owner_scoped_duplex(
+            "svc-early",
+            Arc::new(s2::EarlyReturnDX {
+                seen: Arc::clone(&seen),
+                returned: Arc::clone(&returned),
+            }),
+            Arc::new(|_| true),
+        )
+        .expect("serve owner-scoped duplex");
+    let caller_origin = caller.origin_hash();
+    let reply_channel =
+        ChannelName::new(&format!("svc-early.replies.{caller_origin:016x}")).unwrap();
+    let (caller_disp, caller_seen) = s15::recorder();
+    assert!(caller
+        .register_rpc_inbound(reply_channel.hash(), caller_disp)
+        .is_some());
+    let session_id = server
+        .peer_session_id(caller.node_id())
+        .expect("the live session id");
+    let binding = server
+        .peer_session_binding(caller.node_id())
+        .expect("the live session carries its binding (1.1a)");
+    let intent =
+        fixture::owner_delegated_intent(caller_kp, &org_b, server.entity_id().clone(), "svc-early");
+    // Zero response credit: the queued echo parks the pump, so the call
+    // stays LIVE (its §2.4 single removal has not run) across the late
+    // input probe.
+    let frame = s2::mint_opening(
+        &intent,
+        RpcCallShape::Duplex,
+        binding,
+        52,
+        caller_origin,
+        &s2::dx_opening("svc-early", Some(0), b"ER-req-1"),
+    );
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            frame
+        )),
+        "the bridge accepted the zero-credit duplex opening",
+    );
+
+    // The handler returns EARLY — before the caller's END, with its input
+    // half still `Open` at return (its typed error is the result).
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || returned.load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler returned early (its typed error result), before the caller's END",
+    );
+    let fold = serve
+        .duplex_fold_for_test()
+        .expect("the duplex fold handle");
+    let owners = fold.lock().protected_owners();
+    let key = (caller.node_id(), session_id, caller_origin, 52u64);
+    // Belt discipline: the sender entry is STILL ADMITTED at this moment —
+    // the §2.4 single removal (`complete`'s sender-map removal) has not run
+    // and cannot be what refuses the late chunk below.
+    assert!(
+        fold.lock().sender_keys().contains(&key),
+        "the request sender is still admitted — the record gate, not the \
+         sender-map removal, refuses the late chunk",
+    );
+
+    // The late request chunk for the call.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::chunk_frame(
+                caller_origin,
+                52,
+                &s13::chunk_payload(52, b"ER-LATE-7", false)
+            ),
+        )),
+        "the bridge accepted the late request chunk",
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // THE named observation (the red target under both PAIR mutations):
+    // the refused/discarded chunk latches NOTHING — in particular no
+    // `ResourceExhausted`. Map-form: under either mutation the latch
+    // retires the call and the forced path's single removal erases the
+    // record, so the observation collapses to `None` (or
+    // `Some((true, Some(ResourceExhausted)))` if still erasing) and THIS
+    // named assertion is the red.
+    assert_eq!(
+        owners
+            .get(&key)
+            .map(|call| (call.is_live(), call.terminal())),
+        Some((true, None)),
+        "no `ResourceExhausted` is latched — a late request chunk after an early \
+         handler return is refused/discarded without replacing the handler's result",
+    );
+    // §2.6's rule at the record: the open input half became `Closed` at
+    // handler return (its consumer is gone).
+    assert_eq!(
+        owners.get(&key).map(|call| call.input_half()),
+        Some(StreamCallInput::Closed),
+        "handler return closes the open input half (§2.6)",
+    );
+    // Never delivered, never retained: the handler's aggregate is exactly
+    // the opening body — the late chunk is nowhere.
+    let seen_bodies = seen.lock();
+    let delivered: Vec<&[u8]> = seen_bodies.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(
+        delivered,
+        vec![b"ER-req-1".as_slice()],
+        "the late chunk is refused/discarded — never delivered, never retained",
+    );
+    drop(seen_bodies);
+    s15::assert_stays_empty(
+        &caller_seen,
+        Duration::from_millis(200),
+        "the refused late chunk produces no wire effect before the handler's terminal",
+    )
+    .await;
+
+    // Release the credit-parked output: the queued echo publishes and the
+    // handler's own result is the terminal.
+    assert!(
+        serve.inject_inbound_for_test(s13::inbound(
+            session_id,
+            caller.node_id(),
+            caller_origin,
+            s13::grant_frame(caller_origin, 52, 1),
+        )),
+        "the bridge accepted the STREAM_GRANT for the parked output",
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || caller_seen.lock().len() >= 2).await,
+        "the grant releases the parked output — echo + the handler's terminal complete",
+    );
+    {
+        let seen_frames = caller_seen.lock();
+        assert_eq!(
+            s15::response_of(&seen_frames[0]).body.as_ref(),
+            b"ER-echo-1".as_slice(),
+            "the queued echo publishes first",
+        );
+        let terminal = s15::response_of(&seen_frames[1]);
+        assert_eq!(
+            (
+                terminal.status,
+                terminal.headers.clone(),
+                terminal.body.as_ref(),
+            ),
+            (
+                RpcStatus::Application(0x007E),
+                vec![],
+                b"ER-early-9".as_slice(),
+            ),
+            "the handler's own result remains the terminal (exact wire content) — no \
+             `ResourceExhausted`/`Unavailable` replaced it",
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        caller_seen.lock().len(),
+        2,
+        "exactly one terminal, ever — the refused late chunk never mints a second one",
+    );
+
+    // The record completes exactly once (§2.4's single removal), with no
+    // map entry and no active-call quota left behind.
+    let registry = s14::registry_of(&server);
+    assert_eq!(
+        registry.removals(&s14::call_key(caller.entity_id(), 52), 1),
+        1,
+        "the record completes exactly once",
+    );
+    assert_eq!(registry.record_count(), 0, "no registry record survives");
+    assert_eq!(registry.active_node(), 0, "no active-call quota charged");
+    {
+        let fold = fold.lock();
+        assert!(
+            fold.in_flight_keys().is_empty(),
+            "no in-flight state survives the single removal",
+        );
+        assert!(
+            fold.sender_keys().is_empty(),
+            "no request sender survives the single removal",
+        );
+    }
+}

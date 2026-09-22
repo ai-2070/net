@@ -299,3 +299,35 @@ impl RpcDuplexHandler for ExchangeDX {
         Ok(())
     }
 }
+
+/// A duplex handler that returns EARLY — §2.6's early-handler-return shape
+/// (S2R, F-S2R-1): it reads the OPENING body only (the caller's END never
+/// comes), records what it saw, queues ONE response item (the zero-credit
+/// window's parked pump holds it), and returns a TYPED error WITHOUT
+/// draining its input — so at return the input half is still `Open` and its
+/// consumer is gone. The typed error is the handler's own result: its exact
+/// wire content must remain the terminal.
+pub(crate) struct EarlyReturnDX {
+    pub(crate) seen: Arc<Mutex<Vec<Bytes>>>,
+    pub(crate) returned: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for EarlyReturnDX {
+    async fn call(
+        &self,
+        _ctx: RpcStreamingContext,
+        mut requests: RequestStream,
+        responses: RpcResponseSink,
+    ) -> Result<(), RpcHandlerError> {
+        if let Some(chunk) = requests.next().await {
+            self.seen.lock().push(chunk);
+        }
+        responses.send(Bytes::from_static(b"ER-echo-1"));
+        self.returned.fetch_add(1, Ordering::SeqCst);
+        Err(RpcHandlerError::Application {
+            code: 0x007E,
+            message: "ER-early-9".to_string(),
+        })
+    }
+}
