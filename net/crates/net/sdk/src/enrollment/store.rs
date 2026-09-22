@@ -454,6 +454,20 @@ impl EnrollmentLedger {
         Ok(self.records[self.by_invitation(invitation)?].invite_digest)
     }
 
+    /// The claim awaiting approval on `offer`, if any, so an operator can
+    /// approve or deny exactly that claim. Claims are immutable once committed.
+    pub fn pending_claim(&self, offer: &OfferId) -> Result<Option<Claimant>, LedgerError> {
+        self.fence()?;
+        Ok(match &self.records[self.by_offer(offer)?].state {
+            State::Claimed {
+                claim,
+                ready: false,
+                ..
+            } => Some(claim.clone()),
+            _ => None,
+        })
+    }
+
     /// Record a new invitation. Refuses duplicates, expired policy and capacity.
     pub fn offer(&mut self, spec: OfferSpec, now: u64) -> Result<OfferId, LedgerError> {
         self.fence()?;

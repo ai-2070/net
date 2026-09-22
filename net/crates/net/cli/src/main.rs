@@ -151,6 +151,14 @@ enum Command {
 
     /// Ask this profile's running node to drain and stop, and verify it did.
     Down(commands::lifecycle::DownArgs),
+
+    /// Enrollment ledger setup for `up --enroll`.
+    #[command(subcommand)]
+    Enrollment(commands::enrollment::EnrollmentCommand),
+
+    /// Create, inspect and manage join tokens on the running `up --enroll` node.
+    #[command(subcommand)]
+    Invite(commands::enrollment::InviteCommand),
     /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
@@ -357,6 +365,10 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
             .await
         }
         Command::Down(args) => commands::lifecycle::run_down(args, output, profile).await,
+        Command::Enrollment(cmd) => {
+            commands::enrollment::run_enrollment(cmd, output, profile).await
+        }
+        Command::Invite(cmd) => commands::enrollment::run_invite(cmd, output, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,

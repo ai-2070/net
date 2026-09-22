@@ -26,9 +26,10 @@
 //! owner-only control file. Both sides prove knowledge of it with keyed BLAKE3
 //! over fresh nonces from each side; the secret never crosses the socket, and a
 //! process squatting the port cannot pass as the node. Each subsequent message
-//! carries a keyed MAC under a session key derived from both nonces. Messages
-//! are not encrypted: loopback traffic is not readable by other unprivileged
-//! local users, and no secret is sent over it in this slice.
+//! is encrypted with a keyed-BLAKE3 keystream and authenticated with a keyed
+//! MAC over the ciphertext (direction and sequence bound), both under keys
+//! derived from the secret and both nonces: `invite create` returns a bearer
+//! join token over this channel.
 //!
 //! # Secrets
 //!
@@ -58,7 +59,7 @@ use crate::error::{connection_failure, generic, invalid_args, timeout, CliError}
 use crate::prelude::{emit_stream_row, emit_value, OutputFormat};
 use crate::secret::{zeroize_slice, ScrubbedBytes};
 
-const NODE_SUBDIR: &str = "node";
+pub(crate) const NODE_SUBDIR: &str = "node";
 const LOCK_FILE: &str = "up.lock";
 const CONTROL_FILE: &str = "control.json";
 const SECRETS_MAGIC: [u8; 4] = *b"NMUP";
@@ -93,6 +94,32 @@ pub struct UpArgs {
     /// generated on first start and kept in the state directory.
     #[arg(long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
+
+    /// Make this node the enrollment owner: serve join-token redemption and
+    /// accept `net-mesh invite` operations. Requires `--public-addr`,
+    /// `--issuer-identity`, a fixed `--bind` port and an initialized ledger
+    /// (`net-mesh enrollment init`); refuses before binding without them.
+    #[arg(long)]
+    pub enroll: bool,
+
+    /// Address joiners reach this node at (`host:port`), signed into every
+    /// join token. The same port number must reach the node over TCP
+    /// (enrollment) and UDP (mesh).
+    #[arg(long, value_name = "HOST:PORT", requires = "enroll")]
+    pub public_addr: Option<String>,
+
+    /// Issuer identity file that signs invitations and membership receipts.
+    #[arg(long, value_name = "PATH", requires = "enroll")]
+    pub issuer_identity: Option<PathBuf>,
+
+    /// Enrollment ledger directory. Defaults to `<state-dir>/ledger`.
+    #[arg(long, value_name = "DIR", requires = "enroll")]
+    pub ledger: Option<PathBuf>,
+
+    /// Trust-domain label shown to joiners (`[A-Za-z0-9._-]`, at most 64).
+    /// Defaults to the profile name.
+    #[arg(long, value_name = "NAME", requires = "enroll")]
+    pub domain_name: Option<String>,
 }
 
 /// `net-mesh down` arguments.
@@ -116,7 +143,7 @@ pub struct StatusArgs {
     pub state_dir: Option<PathBuf>,
 }
 
-fn state_dir(explicit: Option<PathBuf>, profile: &str) -> Result<PathBuf, CliError> {
+pub(crate) fn state_dir(explicit: Option<PathBuf>, profile: &str) -> Result<PathBuf, CliError> {
     if let Some(dir) = explicit {
         return Ok(dir);
     }
@@ -135,7 +162,7 @@ fn state_dir(explicit: Option<PathBuf>, profile: &str) -> Result<PathBuf, CliErr
         .ok_or_else(|| invalid_args("no platform data directory is available; pass --state-dir"))
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -412,9 +439,9 @@ async fn read_psk_stdin() -> Result<[u8; 32], CliError> {
 // ---- control file ------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
-struct ControlFile {
+pub(crate) struct ControlFile {
     version: u32,
-    incarnation: String,
+    pub(crate) incarnation: String,
     port: u16,
     secret: String,
     pid: u32,
@@ -447,24 +474,61 @@ fn tags_equal(a: [u8; 32], b: [u8; 32]) -> bool {
     blake3::Hash::from(a) == blake3::Hash::from(b)
 }
 
+/// Per-session keys: `mac` authenticates ciphertext, `enc` drives the keystream.
+struct SessionKeys {
+    mac: [u8; 32],
+    enc: [u8; 32],
+}
+
+impl SessionKeys {
+    fn derive(secret: &[u8; 32], node_nonce: &[u8], client_nonce: &[u8]) -> Self {
+        Self {
+            mac: keyed(secret, b"session", node_nonce, client_nonce),
+            enc: keyed(secret, b"encrypt", node_nonce, client_nonce),
+        }
+    }
+
+    /// XOR `data` with the keyed-BLAKE3 keystream for (direction, seq).
+    fn apply_keystream(&self, direction: u8, seq: u64, data: &mut [u8]) {
+        let mut h = blake3::Hasher::new_keyed(&self.enc);
+        h.update(&[direction]);
+        h.update(&seq.to_le_bytes());
+        let mut stream = vec![0u8; data.len()];
+        h.finalize_xof().fill(&mut stream);
+        for (d, k) in data.iter_mut().zip(stream.iter()) {
+            *d ^= k;
+        }
+        zeroize_slice(&mut stream);
+    }
+}
+
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        zeroize_slice(&mut self.mac);
+        zeroize_slice(&mut self.enc);
+    }
+}
+
 async fn write_msg(
     s: &mut TcpStream,
-    key: &[u8; 32],
+    keys: &SessionKeys,
     direction: u8,
     seq: u64,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    let tag = keyed(key, &[direction], &seq.to_le_bytes(), payload);
-    let len = u32::try_from(payload.len() + 32).map_err(std::io::Error::other)?;
+    let mut sealed = payload.to_vec();
+    keys.apply_keystream(direction, seq, &mut sealed);
+    let tag = keyed(&keys.mac, &[direction], &seq.to_le_bytes(), &sealed);
+    let len = u32::try_from(sealed.len() + 32).map_err(std::io::Error::other)?;
     s.write_all(&len.to_be_bytes()).await?;
-    s.write_all(payload).await?;
+    s.write_all(&sealed).await?;
     s.write_all(&tag).await?;
     s.flush().await
 }
 
 async fn read_msg(
     s: &mut TcpStream,
-    key: &[u8; 32],
+    keys: &SessionKeys,
     direction: u8,
     seq: u64,
 ) -> std::io::Result<Vec<u8>> {
@@ -481,9 +545,13 @@ async fn read_msg(
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&body[payload_len..]);
     body.truncate(payload_len);
-    if !tags_equal(tag, keyed(key, &[direction], &seq.to_le_bytes(), &body)) {
+    if !tags_equal(
+        tag,
+        keyed(&keys.mac, &[direction], &seq.to_le_bytes(), &body),
+    ) {
         return Err(bad());
     }
+    keys.apply_keystream(direction, seq, &mut body);
     Ok(body)
 }
 
@@ -502,16 +570,14 @@ struct NodeReport {
     psk_source: String,
     trust_domain: String,
     started_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrollment: Option<super::enrollment::EnrollmentReport>,
 }
 
 struct ControlState {
     report: NodeReport,
     draining: AtomicBool,
-}
-
-#[derive(Deserialize)]
-struct ControlRequest {
-    op: String,
+    enroll: Option<Arc<super::enrollment::EnrollContext>>,
 }
 
 async fn serve_control(
@@ -562,14 +628,27 @@ async fn control_session(
     }
     s.write_all(&keyed(&secret, b"server", &server_nonce, client_nonce))
         .await?;
-    let key = keyed(&secret, b"session", &server_nonce, client_nonce);
+    let keys = SessionKeys::derive(&secret, &server_nonce, client_nonce);
 
-    let request = read_msg(&mut s, &key, TO_NODE, 0).await?;
-    let op = serde_json::from_slice::<ControlRequest>(&request)
-        .map(|r| r.op)
-        .unwrap_or_default();
+    let request = crate::secret::ScrubbedBytes::new(read_msg(&mut s, &keys, TO_NODE, 0).await?);
+    let request: serde_json::Value = serde_json::from_slice(request.as_slice()).unwrap_or_default();
+    let op = request["op"].as_str().unwrap_or_default().to_string();
     let draining = state.draining.load(Ordering::SeqCst);
     let reply = match op.as_str() {
+        _ if op.starts_with("invite_") => match (&state.enroll, draining) {
+            (_, true) => serde_json::json!({ "error": "node is draining" }),
+            (None, false) => {
+                serde_json::json!({ "error": "enrollment is not enabled on this node (start it with `up --enroll`)" })
+            }
+            (Some(ctx), false) => {
+                let ctx = ctx.clone();
+                tokio::task::spawn_blocking(move || ctx.handle(&op_owned(&request), &request))
+                    .await
+                    .unwrap_or_else(
+                        |_| serde_json::json!({ "error": "enrollment operation failed" }),
+                    )
+            }
+        },
         "status" => serde_json::json!({
             "state": if draining { "draining" } else { "ready" },
             "node": state.report,
@@ -580,16 +659,22 @@ async fn control_session(
         }
         _ => serde_json::json!({ "error": "unknown control operation" }),
     };
-    let bytes = serde_json::to_vec(&reply).map_err(std::io::Error::other)?;
-    write_msg(&mut s, &key, FROM_NODE, 0, &bytes).await?;
+    let bytes = crate::secret::ScrubbedBytes::new(
+        serde_json::to_vec(&reply).map_err(std::io::Error::other)?,
+    );
+    write_msg(&mut s, &keys, FROM_NODE, 0, bytes.as_slice()).await?;
     if op == "shutdown" {
         let _ = stop.try_send(());
     }
     Ok(())
 }
 
+fn op_owned(request: &serde_json::Value) -> String {
+    request["op"].as_str().unwrap_or_default().to_string()
+}
+
 #[derive(Debug)]
-enum ControlError {
+pub(crate) enum ControlError {
     /// No readable control file.
     NoControlFile,
     /// Could not connect to the recorded port.
@@ -600,10 +685,21 @@ enum ControlError {
     Protocol,
 }
 
-/// Authenticate to the node recorded in `dir` and perform one operation.
-async fn control_call(
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoControlFile => "no running node found for this state directory",
+            Self::Unreachable => "the node's control endpoint is unreachable",
+            Self::Unauthenticated => "the node's control endpoint did not authenticate",
+            Self::Protocol => "the control exchange failed",
+        })
+    }
+}
+
+/// Authenticate to the node recorded in `dir` and perform one request.
+pub(crate) async fn control_call(
     dir: &Path,
-    op: &str,
+    request: serde_json::Value,
 ) -> Result<(ControlFile, serde_json::Value), ControlError> {
     let control = read_control_file(dir).ok_or(ControlError::NoControlFile)?;
     let mut secret = [0u8; 32];
@@ -641,16 +737,17 @@ async fn control_call(
         ) {
             return Err(ControlError::Unauthenticated);
         }
-        let key = keyed(&secret, b"session", server_nonce, &client_nonce);
-        let request = serde_json::to_vec(&serde_json::json!({ "op": op }))
-            .map_err(|_| ControlError::Protocol)?;
-        write_msg(&mut s, &key, TO_NODE, 0, &request)
+        let keys = SessionKeys::derive(&secret, server_nonce, &client_nonce);
+        let request = serde_json::to_vec(&request).map_err(|_| ControlError::Protocol)?;
+        write_msg(&mut s, &keys, TO_NODE, 0, &request)
             .await
             .map_err(|_| ControlError::Protocol)?;
-        let reply = read_msg(&mut s, &key, FROM_NODE, 0)
-            .await
-            .map_err(|_| ControlError::Protocol)?;
-        serde_json::from_slice(&reply).map_err(|_| ControlError::Protocol)
+        let reply = crate::secret::ScrubbedBytes::new(
+            read_msg(&mut s, &keys, FROM_NODE, 0)
+                .await
+                .map_err(|_| ControlError::Protocol)?,
+        );
+        serde_json::from_slice(reply.as_slice()).map_err(|_| ControlError::Protocol)
     })
     .await;
     zeroize_slice(&mut secret);
@@ -686,6 +783,19 @@ pub async fn run_up(
     let bind = crate::context::parse_bind_literal(&bind_raw)?;
     let identity_path = args.identity.or_else(|| profile.identity.clone());
     let fmt = OutputFormat::resolve_stream(output);
+    let enroll_plan = if args.enroll {
+        Some(super::enrollment::EnrollPlan::validate(
+            args.public_addr,
+            args.issuer_identity,
+            args.ledger,
+            args.domain_name,
+            bind,
+            &state,
+            profile_name,
+        )?)
+    } else {
+        None
+    };
     // A supplied PSK is read and validated before any filesystem effect, so a
     // refused source leaves no state behind.
     let supplied = match &source {
@@ -703,6 +813,11 @@ pub async fn run_up(
         .await
         .map_err(|e| generic(format!("node state task failed: {e}")))??;
     let lifetime_lock = hold_lifetime_lock(&dir)?;
+    // Enrollment ownership (issuer + ledger lock) is taken before any bind.
+    let enroll_owner = match enroll_plan {
+        Some(plan) => Some(plan.open().await?),
+        None => None,
+    };
 
     let mut psk = match supplied {
         Some(psk) => psk,
@@ -719,7 +834,8 @@ pub async fn run_up(
             }
         },
     };
-    let trust_domain = Psk::new(psk).trust_domain().to_string();
+    let psk_value = Psk::new(psk);
+    let trust_domain = psk_value.trust_domain().to_string();
     let identity = match &identity_path {
         Some(path) => crate::context::load_operator_identity(path).await?,
         None => Identity::from_seed(secrets.seed),
@@ -735,6 +851,11 @@ pub async fn run_up(
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     mesh.start();
+
+    let enrollment = match enroll_owner {
+        Some(owner) => Some(owner.start(&mesh, psk_value).await?),
+        None => None,
+    };
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -755,6 +876,7 @@ pub async fn run_up(
         psk_source: source.kind().to_string(),
         trust_domain,
         started_at: now_unix(),
+        enrollment: enrollment.as_ref().map(|e| e.report()),
     };
     let control = ControlFile {
         version: 1,
@@ -779,6 +901,7 @@ pub async fn run_up(
     let state_ctl = Arc::new(ControlState {
         report: report.clone(),
         draining: AtomicBool::new(false),
+        enroll: enrollment.as_ref().map(|e| e.context()),
     });
     let (stop_tx, mut stop_rx) = mpsc::channel(1);
     let server = tokio::spawn(serve_control(listener, secret, state_ctl.clone(), stop_tx));
@@ -803,6 +926,9 @@ pub async fn run_up(
     // endpoint and release the lifetime lock. Identity, PSK and state persist.
     state_ctl.draining.store(true, Ordering::SeqCst);
     server.abort();
+    if let Some(enrollment) = enrollment {
+        enrollment.shutdown().await;
+    }
     let stopped = tokio::time::timeout(MESH_SHUTDOWN_TIMEOUT, mesh.shutdown()).await;
     let _ = std::fs::remove_file(&control_path);
     drop(lifetime_lock);
@@ -855,7 +981,7 @@ async fn observe(state: &Path) -> Result<StatusView, CliError> {
             Some("a control file remains but no process holds the lifetime lock"),
         ),
         Liveness::Free => view("stopped", None, None),
-        Liveness::Held => match control_call(&dir, "status").await {
+        Liveness::Held => match control_call(&dir, serde_json::json!({ "op": "status" })).await {
             Ok((_, reply)) => {
                 let node = serde_json::from_value::<NodeReport>(reply["node"].clone()).ok();
                 let s = reply["state"].as_str().unwrap_or("unknown").to_string();
@@ -918,7 +1044,7 @@ pub async fn run_down(
             stale_metadata: dir.join(CONTROL_FILE).exists(),
         });
     }
-    let (control, reply) = control_call(&dir, "shutdown").await.map_err(|e| {
+    let (control, reply) = control_call(&dir, serde_json::json!({ "op": "shutdown" })).await.map_err(|e| {
         connection_failure(format!(
             "the node holds its lifetime lock but its control endpoint failed ({e:?}); it was not stopped"
         ))
@@ -946,4 +1072,44 @@ pub async fn run_down(
         "node incarnation {} accepted shutdown but still holds its lifetime lock after {:?}; state is running or unknown",
         control.incarnation, args.wait
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_messages_are_encrypted_and_bound_to_direction_and_sequence() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut node, _) = listener.accept().await.unwrap();
+        let keys = SessionKeys::derive(&[7; 32], &[1; 32], &[2; 32]);
+        let secret = b"netmesh-join_SECRET-TOKEN-MARKER";
+
+        // The bytes on the socket never contain the plaintext.
+        write_msg(&mut client, &keys, TO_NODE, 0, secret)
+            .await
+            .unwrap();
+        let mut len = [0u8; 4];
+        node.read_exact(&mut len).await.unwrap();
+        let mut raw = vec![0u8; u32::from_be_bytes(len) as usize];
+        node.read_exact(&mut raw).await.unwrap();
+        assert!(!raw.windows(secret.len()).any(|w| w == secret));
+
+        // Round trip with the right keys, direction and sequence.
+        write_msg(&mut client, &keys, TO_NODE, 1, secret)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_msg(&mut node, &keys, TO_NODE, 1).await.unwrap(),
+            secret
+        );
+        // A replayed or reordered frame fails authentication.
+        write_msg(&mut client, &keys, TO_NODE, 2, secret)
+            .await
+            .unwrap();
+        assert!(read_msg(&mut node, &keys, TO_NODE, 3).await.is_err());
+    }
 }
