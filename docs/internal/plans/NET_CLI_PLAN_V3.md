@@ -326,46 +326,54 @@ The standard journey is **create → send → confirm issuer/scope → redeem �
 invite and stored by its owner. It adds a pending decision; it is not the default.
 Creation requires existing local operator authority in either mode.
 
-**Proposed V3-1 adapter boundary:** one native HTTPS redemption listener owned
-by `enrollment serve`, separate from the mesh UDP listener and local management
-IPC. Reuse the workspace's rustls/Tokio/HTTP dependency versions and explicit
-crypto-provider construction, not the browser RTC offer/trickle service.
-Initially use operator-provisioned TLS certificates with normal certificate,
-validity and hostname verification plus the endpoint-key pin bound into the
-signed invite. No plaintext fallback, redirects, certificate-ignore switch,
-WebRTC prerequisite, ACME automation or public management routes are added.
-Local CI uses a disposable test CA trusted only by the fixture client; never
-modify the workstation trust store. Certificate/pin rotation invalidates old
-unredeemed links unless a later explicit rotation contract is accepted.
+**Adapter decision — PSK-free Noise enrollment listener (user-selected
+2026-09-22, superseding the earlier HTTPS proposal):** redemption cannot ride the
+existing mesh listener, because its Noise NKpsk0 handshake mixes the PSK into the
+first message and a clean device has none. It also does not add a pre-PSK
+handshake type to the mesh socket, which would widen the core admission path
+every peer runs. Instead `enrollment serve` owns one separate UDP enrollment
+listener, distinct from the mesh socket and local management IPC. The device
+runs a PSK-free Noise handshake that authenticates the responder by the X25519
+static key signed into the invite (`EnrollmentKey`), then performs challenge →
+signed request → bundle inside that session. It reuses the workspace Noise stack:
+no TLS certificates to provision, no HTTP/TLS/WebRTC dependency and no
+`rtc-bootstrap` coupling. The exact Noise pattern, prologue/protocol-name domain
+separation from mesh NKpsk0 (and whether the key is the node's mesh static key
+or a dedicated enrollment key), reliable delivery of a bounded bundle over UDP,
+retransmission, anti-amplification (response no larger than the unauthenticated
+request until the handshake completes), per-source rate limits and challenge
+capacity are the next slice's design items and require witnesses before the
+listener is exposed. No plaintext fallback, PSK-bearing mode or public management
+operation is added. Rotating the enrollment key invalidates unredeemed links
+unless a later rotation contract is accepted.
 
-Dependency placement is an explicit review item: propose a separate optional
-SDK/CLI `enrollment-bootstrap` feature for native HTTP/TLS, independent of
-`rtc-bootstrap`. Offline inspect and typed receipt/store mechanisms must not
-need the listener feature. A build lacking it must refuse live enrollment
-before effects with a precise feature diagnostic, not fall back to a permissive
-transport. Decide release-binary inclusion and add a real feature-enabled CI job
-before claiming the advertised join journey is available in shipped binaries.
-This proposal does not change current Cargo features.
+Feature placement: because no new dependencies are expected, the listener is
+proposed to build under the existing SDK `net` feature. If the implementation
+does need a new dependency, stop and put it behind a separately reviewed feature.
+Offline inspect and the typed receipt/store mechanisms must never need the
+listener. Release-binary inclusion and a CI job exercising the live listener are
+still required before claiming the shipped join journey.
 
 **Invite/request/response contract (semantic, not allocated wire bytes):**
 
 1. The versioned issuer-signed invite binds full issuer identity, named trust
-   domain, HTTPS endpoint and transport key pin, random invitation identifier,
+   domain, UDP enrollment endpoint and its Noise static key, random invitation identifier,
    expiry, exact authorized relations, optional intended full device identity
    and approval policy. The link contains no standing PSK, root key or audience
    secret, but **is still sensitive bearer authorization** when subject-unbound.
    Signature verification preserves the supplied issuer binding; the recipient
    must confirm that this is the intended issuer, not trust any self-signed root.
 2. Offline inspect verifies what it can and performs no network request or claim.
-   Redemption/receipt recovery use POST bodies, never secret query parameters.
-   GET/HEAD cannot reserve, approve, issue or return a credential bundle. Redact
+   Only an authenticated enrollment session can reserve, approve, issue or return
+   a credential bundle; no unauthenticated probe or preview has effects. Redact
    invitation identifiers/proofs/bearer material from diagnostics; return only
    non-secret operation identifiers by default.
 3. Before redeeming, the device persists its identity and canonical request intent.
-   Over verified TLS it requests a fresh, bounded, short-lived server challenge.
+   Inside a Noise session that proved the pinned enrollment key, it requests a
+   fresh, bounded, short-lived server challenge.
    The device signs a domain-separated transcript binding that challenge, the
    signed invite digest, full subject and complete intent digest. The challenge
-   is bound to this live TLS connection and consumed once; a captured signature
+   is bound to this live session (its handshake hash) and consumed once; a captured signature
    cannot obtain the secret response on another connection. Capacity limits,
    expiry and refusal paths must be tested before exposing the listener.
 4. The owner verifies the invite against its durable record, proof, subject,
@@ -609,6 +617,94 @@ restoring old disk images remain outside this storage boundary.
 and its claim/approval/receipt transitions above. Bootstrap feature/release
 inclusion, final recovery/retention bounds, lifecycle fencing, selective subnet
 semantics and V2 exact-head acceptance remain open; V3-0 is not complete.
+
+**SDK ledger implementation (2026-09-22, uncommitted working tree):** final path
+`sdk/src/enrollment/store.rs` (child of the existing `enrollment` owner, beside
+`policy.rs`, reusing its private bounded `Reader`) rather than the proposed
+top-level `enrollment_store.rs`; witnesses `sdk/tests/enrollment_store.rs`.
+`EnrollmentLedger` wraps core `EnrollmentStorage` with a versioned (`NMEL` v1),
+issuer-bound, blake3-checksummed snapshot and implements the transition table
+above: offer → claim (preauthorized ready / pending) → approve exact claim →
+issue once → same-claimant byte-identical recovery; revoke/deny terminal before
+issue; issued offers report `AlreadyIssued`, never reissue. Operator-facing
+calls take a non-secret `OfferId`; device-facing calls take the redacted
+`InvitationId`. Refusals never mutate; mutations persist before publishing in
+memory; storage `Uncertain` fences every call until reopen. The decoder rejects
+bad magic/checksum/trailing bytes, unknown tags/bools, duplicate offer/invitation/
+digest/receipt IDs, out-of-window claim/issue times, pending preauthorized claims,
+denied preauthorized offers, intended-subject mismatches and any recovery deadline
+other than exactly issuance + 24 h. `InvitationPolicy::from_stored` (crate-private)
+rebuilds persisted policy. Limits (default 4,096 records / 64 KiB payload / 16 MiB
+snapshot; hard 65,536 / 1 MiB / 64 MiB) gate new mutations only. `compact` drops
+payloads at the recovery deadline and removes records only once the invitation
+has expired and nothing is recoverable. Recovery window is the proposed fixed
+24 h; it remains an engineering choice, not a user decision.
+
+Still **not a verifier**: signatures, device proofs, intent, current authority
+and revocation are the future redemption owner's checks; inputs in tests are
+trusted fixtures. No wire invite format, listener, CLI command, control IPC or
+feature change. Ledger-level post-rename fencing and crash barriers are not
+witnessed (the storage layer's are, above; the ledger has no injection seam yet),
+nor are real two-process races beyond same-process lock refusal.
+
+Windows/Rust 1.98 validation: `cargo nextest run -p net-mesh-sdk --test
+enrollment_store --test enrollment_policy --no-tests=fail --retries 0` passed
+**19** (12 new); SDK lib `test(enrollment::) + test(operator::)` passed **42**;
+`cargo clippy -p net-mesh-sdk --lib -- -D warnings` and `--all-targets` (CI `-A`
+flags) clean; `RUSTDOCFLAGS="-D warnings" cargo doc -p net-mesh-sdk --no-deps
+--features full` clean; touched-file rustfmt clean (`cargo fmt --all` hits the
+Windows command-length limit). Tests were written with the code; no pre-existing
+RED is claimed. **Inverses** (in place, each restored byte-identically from a
+backup): disabling the intended-subject check, the issue-time expiry recheck, the
+snapshot checksum, the claim-conflict check, allowing reissue of an issued offer,
+and making the recovery deadline inclusive each failed exactly its named witness.
+Exact-head CI and Unix execution are unverified. SDK CI auto-discovers the new
+binary; no new root pin is needed.
+
+**Signed membership invite and intent (2026-09-22, uncommitted working tree):**
+`sdk/src/enrollment/invite.rs`, witnesses `sdk/tests/enrollment_invite.rs`.
+`MembershipInvite` (`NMM1`, signature domain `net-mesh membership invite v1`,
+link prefix `net-join:`, ≤1 KiB) signs over the full issuer `EntityId`, a
+trust-domain label (`[A-Za-z0-9._-]`, 1..=64) plus the existing public
+`TrustDomainId`, a strict UDP `host:port` enrollment endpoint (DNS name, IPv4 or
+bracketed IPv6; port required; no scheme/path/userinfo/whitespace), the
+enrollment responder's X25519 Noise static key (`EnrollmentKey`),
+a CSPRNG `InvitationId`, the `InvitationPolicy`, an optional intended subject and
+a canonical relation set. v1 defines only `Relation::Mesh` (membership-only);
+unknown tags, empty/duplicate/unordered sets refuse, and organization/channel/
+subnet relations get their own tags and verifiers in V3-2/2A. Decoding bounds
+input before base64, rejects trailing bytes and verifies the signature against
+the **embedded** issuer — integrity only; the human still confirms the issuer
+fingerprint. No PSK/root key/secret is carried, but a bearer link is still
+secret; `Debug` redacts the identifier and link. `digest()` covers the complete
+signed bytes, `scope_digest()` covers issuer + trust domain + relations, and
+`offer_spec()` produces the ledger record. `check_trust_domain` lets a device
+refuse a delivered PSK from another domain. `RedemptionIntent` (`NMN1`) binds the
+invite digest, full subject and exact relations; `check_against` is the owner's
+recheck and `claimant()` yields the ledger `Claimant`. Added public
+`TrustDomainId::from_bytes` (decode only; equality with `of_psk` remains the
+check). Legacy `NMI1`/`NMJ1`/`NMO1`, `net-invite:` and delegation enrollment are
+unchanged; a legacy link is refused by the new decoder.
+
+Not included: the connection-bound challenge/proof of key possession, the
+receipt/bundle format, enrollment listener, CLI and any cross-language codec. This
+format is SDK-internal until those exist; it is not a published wire contract.
+
+Validation (Windows): new binary **10/10**; with ledger and policy binaries
+**29/29**; SDK lib `enrollment:: + operator:: + bootstrap_credential::` **55/55**;
+SDK clippy lib/all-targets, full-feature rustdoc, touched-file rustfmt and
+`git diff --check` clean. **Inverses** (restored byte-identically): ignoring the
+signature result, allowing duplicate relations, accepting `http://`, skipping
+the intent subject check, skipping the intent digest check, accepting any trust
+domain, and printing the invitation id in `Debug` each failed their named
+witnesses (every-byte tamper sweep, foreign-issuer splice, etc.).
+
+**Next:** the redemption owner — connection-bound challenge and signed
+transcript over (challenge, invite digest, subject, intent digest), the
+membership-only receipt/bundle format, and the service that verifies both
+before calling the ledger, over the PSK-free Noise enrollment listener selected
+above. Lifecycle fencing, selective subnet semantics and V2 exact-head
+acceptance remain open.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
