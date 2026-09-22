@@ -218,7 +218,16 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       }
       upstream = open;
       return open;
-    });
+    })
+      .catch(error => {
+        // The success path above is what clears the cached open; without
+        // this, a REJECTED one is kept and every later `send`/`act` is
+        // answered from it with the same stale error until the caller
+        // happens to call `reconnect()`. A transient failure is a retry,
+        // not a verdict on the peer.
+        opening = null;
+        throw error;
+      });
     return opening;
   }
 
