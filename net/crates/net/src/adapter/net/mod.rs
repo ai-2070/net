@@ -816,7 +816,7 @@ impl NetAdapter {
     async fn perform_handshake(
         &self,
         socket: &Socket,
-    ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32], std::net::SocketAddr), AdapterError> {
         let mut attempt = 0;
         let max_attempts = self.config.handshake_retries;
 
@@ -886,10 +886,11 @@ impl NetAdapter {
                     .await
                 {
                     Ok(()) => {
-                        let keys = handshake.into_session_keys().map_err(|e| {
-                            AdapterError::Fatal(format!("key extraction failed: {}", e))
-                        })?;
-                        return Ok((keys, self.config.peer_addr));
+                        let (keys, handshake_hash) =
+                            handshake.into_session_keys_with_binding().map_err(|e| {
+                                AdapterError::Fatal(format!("key extraction failed: {}", e))
+                            })?;
+                        return Ok((keys, handshake_hash, self.config.peer_addr));
                     }
                     Err(e) if attempt < max_attempts => backoff(attempt, &e).await,
                     Err(e) => return Err(e),
@@ -1030,7 +1031,7 @@ impl NetAdapter {
         socket: &Socket,
         last_decrypt_reject: &mut Option<String>,
         last_paced_source: &mut Option<std::net::SocketAddr>,
-    ) -> Result<(SessionKeys, std::net::SocketAddr), AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32], std::net::SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = socket.socket_arc();
 
@@ -1148,10 +1149,10 @@ impl NetAdapter {
             .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
         // Extract session keys and use the actual source address as peer
-        let keys = handshake
-            .into_session_keys()
+        let (keys, handshake_hash) = handshake
+            .into_session_keys_with_binding()
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
-        Ok((keys, source))
+        Ok((keys, handshake_hash, source))
     }
 
     /// Process a single received packet: parse, decrypt, and queue events.
@@ -1451,13 +1452,14 @@ impl Adapter for NetAdapter {
         self.socket = Some(socket.clone());
 
         // Perform handshake — actual_peer is the real address from the wire
-        let (keys, actual_peer) = self.perform_handshake(&socket).await?;
+        let (keys, handshake_hash, actual_peer) = self.perform_handshake(&socket).await?;
 
         // Create packet pool with TX key
         // Create session with the actual peer address (not the configured one,
         // which may be stale or pre-NAT)
-        let session = Arc::new(NetSession::new(
+        let session = Arc::new(NetSession::with_binding(
             keys,
+            handshake_hash,
             PeerAddr::Udp(actual_peer),
             self.config.packet_pool_size,
             self.config.default_reliability.is_reliable(),

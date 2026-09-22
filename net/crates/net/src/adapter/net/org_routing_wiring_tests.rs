@@ -7038,6 +7038,88 @@ fn seed_peer(node: &MeshNode, node_id: u64, direct: bool) -> u64 {
     session_id
 }
 
+/// (S1.1a, contract 1) A REAL completed handshake — the production routed
+/// responder (`handle_routed_handshake` Case 2) driven with real Noise
+/// bytes — stores its binding on the installed session, and
+/// `MeshNode::peer_session_binding` returns the FULL handshake hash of
+/// that establishment.
+///
+/// The expected value is captured independently: the test's manual
+/// initiator receives the production `msg2`, finishes its own Noise state,
+/// and reads the final transcript hash from it — never through the
+/// production finalization under test. The `msg2` send succeeding also
+/// disarms the install's rollback guard, so the registration is durable
+/// rather than raced. The manual initiator mirrors `try_connect_via_once`
+/// exactly (prologue convention, msg1 payload, packet wrapping).
+#[tokio::test]
+async fn a_real_completed_handshake_stores_its_binding_and_peer_session_binding_returns_it() {
+    let node = node().await;
+    let initiator_node_id = 0x0000_0002_A11C_E001u64;
+
+    // Test-owned UDP endpoint — the routed responder sends msg2 back to
+    // the source it saw.
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind test socket");
+    let source_addr = sock.local_addr().expect("test socket addr");
+    let source = PeerAddr::Udp(source_addr);
+
+    let prologue = handshake_prologue(routing_id(initiator_node_id), routing_id(node.node_id));
+    let mut noise = NoiseHandshake::initiator_with_prologue(
+        &node.config.psk,
+        &node.static_keypair.public,
+        &prologue,
+    )
+    .expect("noise initiator");
+    let msg1 = noise
+        .write_message(&initiator_node_id.to_le_bytes())
+        .expect("msg1");
+    let inner = {
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        builder.build_handshake(&msg1)
+    };
+    let parsed =
+        ParsedPacket::parse(bytes::Bytes::copy_from_slice(&inner), source).expect("parse msg1");
+    let routing = RoutingHeader::new(
+        node.node_id,
+        initiator_node_id as u32,
+        DEFAULT_HANDSHAKE_TTL,
+    );
+
+    // Production responder half — Case 2: real msg1 in, msg2 out; the
+    // session is installed synchronously before the reply send is spawned.
+    MeshNode::handle_routed_handshake(&parsed, &routing, source, &node.dispatch_ctx());
+
+    // Receive the production msg2 and finish the initiator's transcript.
+    let mut buf = [0u8; 2048];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("msg2 must arrive")
+        .expect("recv msg2");
+    assert_eq!(
+        from,
+        node.local_addr(),
+        "msg2 comes from the node's own socket"
+    );
+    let reply = ParsedPacket::parse(
+        bytes::Bytes::copy_from_slice(&buf[ROUTING_HEADER_SIZE..n]),
+        source,
+    )
+    .expect("parse msg2");
+    noise.read_message(&reply.payload).expect("read msg2");
+
+    // Independent capture of the establishment's binding: the initiator's
+    // FINAL transcript hash, read from its own finished Noise state.
+    let captured = noise.handshake_hash().expect("finished transcript hash");
+
+    assert_eq!(
+        node.peer_session_binding(initiator_node_id),
+        Some(captured),
+        "the installed session must carry the full handshake hash of the \
+         establishment that created it, and peer_session_binding must return it"
+    );
+}
+
 /// The eligibility the production projection currently reports for `entity`.
 fn eligibility_of(
     node: &MeshNode,
@@ -7523,7 +7605,7 @@ async fn a_lost_peer_install_publishes_no_session_generation() {
     // The control, first: a transition that DOES own its peer record
     // republishes exactly once. Without it, "never republish" passes.
     let before = node.org_routing_session_publications();
-    let installed = node.install_direct(0x8001, addr, fresh_session_keys(), None);
+    let installed = node.install_direct(0x8001, addr, fresh_session_keys(), None, None);
     assert!(
         installed.owned,
         "precondition: this transition owned the peer"
@@ -7543,6 +7625,7 @@ async fn a_lost_peer_install_publishes_no_session_generation() {
         0x8001,
         other,
         fresh_session_keys(),
+        None,
         Some(0xdead_beef_dead_beef),
     );
     assert!(!lost.owned, "precondition: the compare-and-swap must lose");
@@ -8179,7 +8262,7 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
     // Seeded through the REAL installer, so the state under test was published
     // by the production transition rather than written past it.
     assert!(
-        node.install_direct(N, addr, fresh_session_keys(), None)
+        node.install_direct(N, addr, fresh_session_keys(), None, None)
             .owned,
         "precondition: the seed install owned the peer"
     );
@@ -8232,7 +8315,7 @@ async fn a_peer_replaced_after_revalidation_cannot_publish_its_old_session() {
                 let node_for_thread = node_for_hook.clone();
                 let handle = std::thread::spawn(move || {
                     node_for_thread
-                        .install_direct(N, replacement_addr, fresh_session_keys(), None)
+                        .install_direct(N, replacement_addr, fresh_session_keys(), None, None)
                         .owned
                 });
                 // THE ACK. Until this returns, "not finished" would be

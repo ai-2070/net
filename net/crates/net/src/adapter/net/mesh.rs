@@ -3884,7 +3884,7 @@ impl PeerInfo {
 /// look up by that. The full `u64` is stored here for peer registration.
 struct PendingHandshake {
     noise: NoiseHandshake,
-    tx: oneshot::Sender<Result<SessionKeys, CryptoError>>,
+    tx: oneshot::Sender<Result<(SessionKeys, [u8; 32]), CryptoError>>,
 }
 
 /// 32-bit "routing identity" projection of a `u64` node_id, used as the
@@ -23205,7 +23205,7 @@ impl MeshNode {
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
-        let keys = self
+        let (keys, handshake_hash) = self
             .handshake_initiator(PeerAddr::Udp(peer_addr), peer_pubkey, peer_node_id)
             .await?;
 
@@ -23214,7 +23214,7 @@ impl MeshNode {
         // `peer_addr` itself, so the address is its own and the
         // session is an authenticated adjacency.
         let peer_addr = PeerAddr::Udp(peer_addr);
-        self.install_direct(peer_node_id, peer_addr, keys, None);
+        self.install_direct(peer_node_id, peer_addr, keys, Some(handshake_hash), None);
 
         // Direct-handshake-only post-install wiring. Routed
         // handshakes (`connect_via`) intentionally skip these:
@@ -23280,14 +23280,21 @@ impl MeshNode {
         // its notification consumed; the claim taken here is what
         // the commit re-validates.
         let fence = self.rtc_install_fence(peer, plan.require_quiescent)?;
-        let keys = self
+        let (keys, handshake_hash) = self
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
         // H2: a pausable completed exchange — the witnesses need the
         // gap between "Noise finished" and "install commits" to be an
         // observable point rather than a timing accident.
         self.rtc_install_pause_point().await;
-        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
+        let outcome = self.install_direct_fenced(
+            peer_node_id,
+            peer_addr,
+            keys,
+            Some(handshake_hash),
+            prior,
+            &fence,
+        );
         if !outcome.owned {
             return Err(AdapterError::Connection(
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
@@ -23398,13 +23405,20 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("send failed: {e}")))?;
 
-        let keys = handshake
-            .into_session_keys()
+        let (keys, handshake_hash) = handshake
+            .into_session_keys_with_binding()
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {e}")))?;
         // H2, responder half: the same pause seam; the fence was
         // taken before the wait, and the commit re-validates it.
         self.rtc_install_pause_point().await;
-        let outcome = self.install_direct_fenced(peer_node_id, peer_addr, keys, prior, &fence);
+        let outcome = self.install_direct_fenced(
+            peer_node_id,
+            peer_addr,
+            keys,
+            Some(handshake_hash),
+            prior,
+            &fence,
+        );
         if !outcome.owned {
             return Err(AdapterError::Connection(
                 "rtc install lost the compare-and-swap: a newer incarnation won".into(),
@@ -23691,6 +23705,7 @@ impl MeshNode {
         peer_node_id: u64,
         owned_addr: PeerAddr,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expectation: PriorSession,
         fence: &RtcInstallFence,
     ) -> PeerTransitionOutcome {
@@ -23698,6 +23713,7 @@ impl MeshNode {
             peer_node_id,
             PeerTransport::Direct { owned: owned_addr },
             keys,
+            handshake_hash,
             expectation,
             Some(fence),
         )
@@ -23717,12 +23733,14 @@ impl MeshNode {
         peer_node_id: u64,
         owned_addr: PeerAddr,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
         self.install_peer_transition(
             peer_node_id,
             PeerTransport::Direct { owned: owned_addr },
             keys,
+            handshake_hash,
             PriorSession::from_option(expected_prior_session_id),
         )
     }
@@ -23735,6 +23753,7 @@ impl MeshNode {
         peer_node_id: u64,
         relay_addr: PeerAddr,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expected_prior_session_id: Option<u64>,
     ) -> PeerTransitionOutcome {
         // Attribute the relay only when a DIRECT session already owns
@@ -23755,6 +23774,7 @@ impl MeshNode {
                 adjacent_relay_identity,
             },
             keys,
+            handshake_hash,
             PriorSession::from_option(expected_prior_session_id),
         )
     }
@@ -23778,12 +23798,14 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expectation: PriorSession,
     ) -> PeerTransitionOutcome {
         self.install_peer_transition_inner(
             peer_node_id,
             transport,
             keys,
+            handshake_hash,
             expectation,
             #[cfg(feature = "webrtc")]
             None,
@@ -23795,6 +23817,7 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expectation: PriorSession,
         #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
@@ -23811,6 +23834,7 @@ impl MeshNode {
                     peer_node_id,
                     transport,
                     keys,
+                    handshake_hash,
                     expectation,
                     #[cfg(feature = "webrtc")]
                     fence,
@@ -23851,6 +23875,7 @@ impl MeshNode {
         peer_node_id: u64,
         transport: PeerTransport,
         keys: SessionKeys,
+        handshake_hash: Option<[u8; 32]>,
         expectation: PriorSession,
         #[cfg(feature = "webrtc")] fence: Option<&RtcInstallFence>,
     ) -> PeerTransitionOutcome {
@@ -23878,12 +23903,21 @@ impl MeshNode {
 
         let peer_addr = transport.send_addr();
         let remote_static_pub = keys.remote_static_pub;
-        let session = Arc::new(NetSession::new(
-            keys,
-            peer_addr,
-            self.config.packet_pool_size,
-            self.config.default_reliable,
-        ));
+        let session = Arc::new(match handshake_hash {
+            Some(hash) => NetSession::with_binding(
+                keys,
+                hash,
+                peer_addr,
+                self.config.packet_pool_size,
+                self.config.default_reliable,
+            ),
+            None => NetSession::new(
+                keys,
+                peer_addr,
+                self.config.packet_pool_size,
+                self.config.default_reliable,
+            ),
+        });
         // Capture session_id before the session is moved into
         // PeerInfo so we can populate the reverse index
         // (PERF_AUDIT §2.4).
@@ -24179,7 +24213,7 @@ impl MeshNode {
         // `accept_in_flight` (so `start()` refuses) for that whole
         // time. See `try_handshake_responder`'s doc for why that is
         // the right trade and what to tune.
-        let (keys, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
+        let (keys, handshake_hash, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
 
         // The responder side of a handshake is the SAME lifecycle
         // operation as the initiator side, so it runs through the same
@@ -24204,7 +24238,13 @@ impl MeshNode {
             .udp()
             .ok_or_else(|| AdapterError::Connection("accept: peer is not a UDP endpoint".into()))?;
         let session_id = self
-            .install_direct(peer_node_id, peer_endpoint, keys, None)
+            .install_direct(
+                peer_node_id,
+                peer_endpoint,
+                keys,
+                Some(handshake_hash),
+                None,
+            )
             .session_id
             .unwrap_or_default();
 
@@ -28342,9 +28382,9 @@ impl MeshNode {
         // by routing id (that's how it was keyed on insert).
         if let Some((_, pending)) = ctx.pending_handshakes.remove(&peer_routing_id) {
             let PendingHandshake { mut noise, tx } = pending;
-            let result = (|| -> Result<SessionKeys, CryptoError> {
+            let result = (|| -> Result<(SessionKeys, [u8; 32]), CryptoError> {
                 noise.read_message(&parsed.payload)?;
-                noise.into_session_keys()
+                noise.into_session_keys_with_binding()
             })();
             let _ = tx.send(result);
             return;
@@ -28424,7 +28464,7 @@ impl MeshNode {
                 return;
             }
         };
-        let keys = match noise.into_session_keys() {
+        let (keys, handshake_hash) = match noise.into_session_keys_with_binding() {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(error = %e, "routed handshake: key extraction failed");
@@ -28601,8 +28641,9 @@ impl MeshNode {
                                         &ctx.rtc_reassembly,
                                         &displaced,
                                     );
-                                    let session = Arc::new(NetSession::new(
+                                    let session = Arc::new(NetSession::with_binding(
                                         keys,
+                                        handshake_hash,
                                         source,
                                         ctx.packet_pool_size,
                                         ctx.default_reliable,
@@ -28644,8 +28685,9 @@ impl MeshNode {
                             }
                         }
                         dashmap::mapref::entry::Entry::Vacant(vac) => {
-                            let session = Arc::new(NetSession::new(
+                            let session = Arc::new(NetSession::with_binding(
                                 keys,
+                                handshake_hash,
                                 source,
                                 ctx.packet_pool_size,
                                 ctx.default_reliable,
@@ -46780,7 +46822,7 @@ impl MeshNode {
         relay_addr: PeerAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
-    ) -> Result<SessionKeys, AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32]), AdapterError> {
         // Build msg1. Prologue uses *routing-identity* (32-bit) versions
         // of (self, dest) — that's what a malicious relay could see and
         // rewrite in the routing header, so binding those bits into the
@@ -46833,7 +46875,7 @@ impl MeshNode {
         }
 
         // Wait for the dispatch loop to complete msg2.
-        let keys = match tokio::time::timeout(self.config.handshake_timeout, rx).await {
+        let established = match tokio::time::timeout(self.config.handshake_timeout, rx).await {
             Ok(Ok(Ok(k))) => k,
             Ok(Ok(Err(e))) => {
                 self.pending_handshakes.remove(&pending_key);
@@ -46848,7 +46890,7 @@ impl MeshNode {
                 return Err(AdapterError::Connection("handshake timeout".into()));
             }
         };
-        Ok(keys)
+        Ok(established)
     }
 
     /// Connect to `dest_node_id` via a routed handshake through
@@ -46891,13 +46933,13 @@ impl MeshNode {
         // `accept()`, which stops listening after its first success, so
         // there a fresh `msg1` asks a question nobody will answer.
         let mut attempt = 0;
-        let keys = loop {
+        let (keys, handshake_hash) = loop {
             attempt += 1;
             match self
                 .try_connect_via_once(PeerAddr::Udp(relay_addr), dest_pubkey, dest_node_id)
                 .await
             {
-                Ok(keys) => break keys,
+                Ok(established) => break established,
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(
                         attempt,
@@ -46916,7 +46958,13 @@ impl MeshNode {
         // intentionally skip the post-install pingwave /
         // failure_detector / announcement push — see `connect`'s wiring
         // for the direct-handshake-only bookkeeping.
-        self.install_routed(dest_node_id, PeerAddr::Udp(relay_addr), keys, None);
+        self.install_routed(
+            dest_node_id,
+            PeerAddr::Udp(relay_addr),
+            keys,
+            Some(handshake_hash),
+            None,
+        );
 
         Ok(dest_node_id)
     }
@@ -46947,13 +46995,13 @@ impl MeshNode {
         direct: bool,
     ) -> Result<bool, AdapterError> {
         let mut attempt = 0;
-        let keys = loop {
+        let (keys, handshake_hash) = loop {
             attempt += 1;
             match self
                 .try_connect_via_once(PeerAddr::Udp(target_addr), dest_pubkey, dest_node_id)
                 .await
             {
-                Ok(keys) => break keys,
+                Ok(established) => break established,
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::debug!(attempt, error = %e, "upgrade handshake retry");
                     tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
@@ -46963,9 +47011,21 @@ impl MeshNode {
         };
         let expected = Some(expected_prior_session_id);
         let outcome = if direct {
-            self.install_direct(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
+            self.install_direct(
+                dest_node_id,
+                PeerAddr::Udp(target_addr),
+                keys,
+                Some(handshake_hash),
+                expected,
+            )
         } else {
-            self.install_routed(dest_node_id, PeerAddr::Udp(target_addr), keys, expected)
+            self.install_routed(
+                dest_node_id,
+                PeerAddr::Udp(target_addr),
+                keys,
+                Some(handshake_hash),
+                expected,
+            )
         };
         Ok(outcome.owned)
     }
@@ -47540,7 +47600,7 @@ impl MeshNode {
         peer_addr: PeerAddr,
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
-    ) -> Result<SessionKeys, AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32]), AdapterError> {
         // Prologue uses the 32-bit `routing_id` projection of the node
         // ids — the same projection routed handshakes use, so the two
         // paths share one prologue convention. Direct handshakes don't
@@ -47569,7 +47629,7 @@ impl MeshNode {
             {
                 Ok(()) => {
                     return handshake
-                        .into_session_keys()
+                        .into_session_keys_with_binding()
                         .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))
                 }
                 Err(e) if attempt < self.config.handshake_retries => {
@@ -47795,7 +47855,7 @@ impl MeshNode {
     async fn handshake_responder(
         &self,
         peer_node_id: u64,
-    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32], PeerAddr), AdapterError> {
         // Rejection state for the WHOLE accept, not for one attempt.
         // The case that matters is a genuine key mismatch whose `msg1`
         // lands during an early attempt: the initiator's budget is not
@@ -47909,7 +47969,7 @@ impl MeshNode {
         peer_node_id: u64,
         last_decrypt_reject: &mut Option<String>,
         last_paced_source: &mut Option<PeerAddr>,
-    ) -> Result<(SessionKeys, PeerAddr), AdapterError> {
+    ) -> Result<(SessionKeys, [u8; 32], PeerAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
@@ -48062,11 +48122,11 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-        let keys = handshake
-            .into_session_keys()
+        let (keys, handshake_hash) = handshake
+            .into_session_keys_with_binding()
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
 
-        Ok((keys, source))
+        Ok((keys, handshake_hash, source))
     }
 
     // ── NAT traversal ──────────────────────────────────────────────────
@@ -51156,7 +51216,7 @@ mod heartbeat_aead_tests {
 
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
-        node.install_direct(peer_id, peer_addr, first_keys, None);
+        node.install_direct(peer_id, peer_addr, first_keys, None, None);
         assert_eq!(
             node.session_id_to_node.get(&first_session_id).map(|e| *e),
             Some(peer_id),
@@ -51171,7 +51231,7 @@ mod heartbeat_aead_tests {
             first_session_id, second_session_id,
             "fresh handshake must derive a distinct session_id"
         );
-        node.install_direct(peer_id, peer_addr, second_keys, None);
+        node.install_direct(peer_id, peer_addr, second_keys, None, None);
 
         assert_eq!(
             node.session_id_to_node.get(&second_session_id).map(|e| *e),
@@ -51207,21 +51267,27 @@ mod heartbeat_aead_tests {
         let relay_addr: PeerAddr = PeerAddr::Udp("10.9.9.9:9100".parse().unwrap());
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
-        node.install_routed(peer_id, relay_addr, relay_keys, None);
+        node.install_routed(peer_id, relay_addr, relay_keys, None, None);
 
         // A racing rotation installs a DIFFERENT session for the peer
         // (simulated by a plain install). The upgrade below still holds
         // the OLD session_id as its expectation.
         let (raced_keys, _) = make_session_keys();
         let raced_session_id = raced_keys.session_id;
-        node.install_routed(peer_id, relay_addr, raced_keys, None);
+        node.install_routed(peer_id, relay_addr, raced_keys, None, None);
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
         let punched_addr: PeerAddr = PeerAddr::Udp("10.1.1.1:7000".parse().unwrap());
         let (punch_keys, _) = make_session_keys();
         let installed = node
-            .install_direct(peer_id, punched_addr, punch_keys, Some(relay_session_id))
+            .install_direct(
+                peer_id,
+                punched_addr,
+                punch_keys,
+                None,
+                Some(relay_session_id),
+            )
             .owned;
         assert!(!installed, "CAS must refuse when the session_id changed");
         // The raced session survives untouched.
@@ -51256,7 +51322,7 @@ mod heartbeat_aead_tests {
         let old_addr: PeerAddr = PeerAddr::Udp("10.5.5.5:9100".parse().unwrap());
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
-        node.install_direct(peer_id, old_addr, first_keys, None);
+        node.install_direct(peer_id, old_addr, first_keys, None, None);
         assert_eq!(
             node.addr_to_node.get(&old_addr).map(|e| *e),
             Some(peer_id),
@@ -51267,7 +51333,7 @@ mod heartbeat_aead_tests {
         let (punch_keys, _) = make_session_keys();
         let punch_session_id = punch_keys.session_id;
         let installed = node
-            .install_direct(peer_id, new_addr, punch_keys, Some(first_session_id))
+            .install_direct(peer_id, new_addr, punch_keys, None, Some(first_session_id))
             .owned;
         assert!(installed, "CAS must install when the session_id matches");
         assert_eq!(
@@ -51321,10 +51387,10 @@ mod heartbeat_aead_tests {
             let n1 = node.clone();
             let n2 = node.clone();
             let t1 = std::thread::spawn(move || {
-                n1.install_direct(peer_id, addr_b, keys_b, None);
+                n1.install_direct(peer_id, addr_b, keys_b, None, None);
             });
             let t2 = std::thread::spawn(move || {
-                n2.install_direct(peer_id, addr_c, keys_c, None);
+                n2.install_direct(peer_id, addr_c, keys_c, None, None);
             });
             t1.join().expect("installer B");
             t2.join().expect("installer C");
@@ -51394,7 +51460,7 @@ mod heartbeat_aead_tests {
         let dest_id = 0x0DE5_7000u64;
         let relay_addr: PeerAddr = PeerAddr::Udp("10.8.8.8:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
-        node.install_routed(dest_id, relay_addr, keys, None);
+        node.install_routed(dest_id, relay_addr, keys, None, None);
 
         assert_eq!(
             node.router.routing_table().lookup(dest_id),
@@ -51412,7 +51478,7 @@ mod heartbeat_aead_tests {
         let direct_id = 0x0D12_EC70u64;
         let direct_addr: PeerAddr = PeerAddr::Udp("10.8.8.9:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
-        node.install_direct(direct_id, direct_addr, keys, None);
+        node.install_direct(direct_id, direct_addr, keys, None, None);
         assert_eq!(
             node.router.routing_table().lookup_authenticated(direct_id),
             Some((direct_id, direct_addr)),
@@ -51437,7 +51503,7 @@ mod heartbeat_aead_tests {
         let moved_tuple: SocketAddr = "10.7.7.7:7100".parse().unwrap();
         let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
-        node.install_direct(peer_id, home, keys, None);
+        node.install_direct(peer_id, home, keys, None, None);
 
         let assert_untouched = |case: &str| {
             assert_eq!(
@@ -51512,7 +51578,7 @@ mod heartbeat_aead_tests {
         let moved_tuple: SocketAddr = "10.7.7.8:7100".parse().unwrap();
         let moved = PeerAddr::Udp(moved_tuple);
         let (keys, _) = make_session_keys();
-        node.install_direct(peer_id, home, keys, None);
+        node.install_direct(peer_id, home, keys, None, None);
 
         // Concurrent reuse: another peer now owns the home address in
         // the reverse index.
@@ -51588,7 +51654,7 @@ mod heartbeat_aead_tests {
         // First incarnation: the peer's sending side is the far half of
         // the same handshake, so its envelope verifies on our session.
         let (far_keys, near_keys) = make_session_keys();
-        node.install_direct(peer_id, peer_addr, near_keys, None);
+        node.install_direct(peer_id, peer_addr, near_keys, None, None);
         let far = NetSession::new(far_keys, peer_addr, 4, false);
         let env = far.seal_route_hop(&header, b"first-incarnation");
         assert!(
@@ -51602,7 +51668,7 @@ mod heartbeat_aead_tests {
 
         // Re-handshake through the production installer.
         let (far_keys, near_keys) = make_session_keys();
-        node.install_direct(peer_id, peer_addr, near_keys, None);
+        node.install_direct(peer_id, peer_addr, near_keys, None, None);
         let far = NetSession::new(far_keys, peer_addr, 4, false);
         let env = far.seal_route_hop(&header, b"second-incarnation");
         assert!(
@@ -51663,7 +51729,7 @@ mod heartbeat_aead_tests {
         let peer_id = 0xCAFE_D00Du64;
         let peer_addr: PeerAddr = PeerAddr::Udp("10.3.3.3:9100".parse().unwrap());
         let (keys, _) = make_session_keys();
-        node.install_direct(peer_id, peer_addr, keys, None);
+        node.install_direct(peer_id, peer_addr, keys, None, None);
         let session = node
             .peers
             .get(&peer_id)
@@ -51703,7 +51769,7 @@ mod heartbeat_aead_tests {
         // for the dead session the resolution returns None instead
         // of misrouting a grant to the replacement session.
         let (new_keys, _) = make_session_keys();
-        node.install_direct(peer_id, peer_addr, new_keys, None);
+        node.install_direct(peer_id, peer_addr, new_keys, None, None);
         assert!(
             MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session).is_none(),
             "stale session must not resolve to the replacement peer entry"
