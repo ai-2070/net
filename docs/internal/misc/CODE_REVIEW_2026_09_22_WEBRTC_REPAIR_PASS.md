@@ -91,6 +91,12 @@ in the code and was not driven. These are never blurred. Confidence is stated pe
 | 43 | Both release-note copies retain stale claims and phantom names | Low | mixed | Open |
 | 44 | The rewritten store design doc declares an option that does not exist | Low | mixed | Open |
 | 45 | The kyra suites' "landed VERBATIM" headers are now false | Low | tests | Open |
+| 46 | `act` sends its request frame before its `capacity` refusal is observed — a budget-refused act still reaches the owner (surfaced during the repair pass) | Medium | store | Open |
+| 47 | `setAudience` mutates `#desired` and clears the view before `encodeMessage` can throw (surfaced during the repair pass) | Low | store | Open |
+| 48 | `cancelWaiter`'s fence fires only in state `installing`; a last cancellation during `joining` does not fence (surfaced during the repair pass) | Low | store | Open |
+| 49 | A refused provisional stream allocation strands that stream id — the next frame parks behind a sequence that never comes (surfaced during the repair pass) | Medium | anchor | Open |
+| 50 | Gate 4 keys on the ADJACENT sender, not the announcement's ORIGIN — a provisional peer's announcement relayed by an admitted third party is ingested (surfaced during the repair pass; owner adjudication) | Medium | anchor | Open |
+| 51 | A send half that gives up in two waves reports its death twice — duplicate reset, retire and count (surfaced during verification) | Medium | leaf | Closed |
 
 ### Claims of the repair pass, contradicted
 
@@ -694,6 +700,83 @@ assertion or message changed"). The provenance claim these files use as their au
 is falsified. *Required:* each header's provenance claims match the file's actual
 authorship state, via declared exceptions in the established style.
 
+### Surfaced during the repair pass
+
+Five pre-existing defects the repair lanes found while fixing #1–#45. They are
+outside the original review's file sets and were not adjudicated in it; each is
+recorded here with the evidence its finder produced.
+
+**#46 — `act` sends its request frame before its `capacity` refusal is
+observed.** `net/crates/net/browser-ts/src/store/join.ts` (`act`).
+Source-established (0.65; surfaced by the store lane). `await send([frame])`
+runs before the `correlate` rejection is observed, so a budget-refused `act`
+still reaches the owner while the caller receives `capacity` — an action can
+execute remotely whose acceptance was refused locally. *Impact boundary:* the
+ordering is read at source; the owner-side execution consequence was not driven
+here. *Required:* `act` observes its correlation verdict before sending (a
+refused act never reaches the owner), or the intended semantics is documented
+and the owner's execution of unaccepted acts is adjudicated.
+
+**#47 — `setAudience` mutates `#desired` and clears the view before
+`encodeMessage` can throw.** `net/crates/net/browser-ts/src/store/join.ts`
+(`StoreReplica.setAudience`). Source-established (0.6; store lane). The
+mutation precedes the encode that may refuse — the #15 typed-refusal path is
+reachable precisely because of this order — while the clear-the-view-immediately
+doctrine (§1.7) makes part of the ordering deliberate. *Required:* the mutation
+follows the encode (with §1.7 restated), or the doctrine names the
+mutation-on-refusal consequence.
+
+**#48 — `cancelWaiter`'s fence fires only in state `installing`.**
+`net/crates/net/browser-ts/src/store/replica.ts:363-368`. Source-established
+(0.7; store lane). The last cancellation during `joining` does not fence. The
+witnessed `#abandon → #resync → man` loop lives in `installing`, where the fence
+does fire. *Required:* the fence covers `joining` too, or the claim names the
+state scope.
+
+**#49 — A refused provisional stream allocation strands that stream id.**
+`net/crates/net/src/adapter/net/mesh.rs:30980-30982`
+(`account_inbound_stream_packet`). Source-established (0.6; net lane; observed
+in-run for ≥ 10 s). A new stream from a provisional sender refused at the R3
+allocation (`MAX_PROVISIONAL_STREAMS = 2`) never consumes the sender's sequence
+for that stream id at the receiver; the next frame on the same id parks in
+`hold_inbound_in_order` behind a sequence that will never come — persisting even
+after the sender is promoted. *Required:* the refused allocation consumes or
+advances the receive frontier (or records the refusal) so a later frame on that
+id is not parked behind a ghost sequence, witnessed by a
+provisional-refusal-then-promotion witness.
+
+**#50 — Gate 4 keys on the ADJACENT sender, not the announcement's ORIGIN.**
+`net/crates/net/src/adapter/net/mesh.rs` (gate 4 / announcement ingest).
+Source-established + in-run proof (0.7; net lane). A provisional peer's signed
+announcement relayed (hop > 0) by an admitted third party IS ingested by the
+anchor, installing its announced Noise key and TOFU pin (it poisoned §12
+witness leg (a)'s ingest negative in-run until the third party moved to leg
+(d)). Whether §12's "a provisional peer's announcement is neither ingested nor
+flooded" should veto ingest by ORIGIN provisional-ness is an owner adjudication.
+*Impact boundary:* ingest proven through the relayed hop>0 path; no pin-abuse
+exploit driven. *Required:* the ingest rule names its keying (adjacent vs
+origin) and a witness pins whichever behavior is adjudicated.
+
+**#51 — A send half that gives up in two waves reports its death twice.**
+`net/crates/net/leaf/src/node.rs` (`drive_reliability`'s send-half terminal; the
+wire's take-and-clear `failed` flag at `wire/src/reliability.rs:1353-1354`).
+Source-established + executed (0.85; surfaced by the integrated-tree verification
+run, fixed by the leaf-core lane in `ba7b0aef9`). The terminal had no latch: one
+`StreamFailed { RetransmitsExhausted }` per give-up pass, and the wire's flag is
+re-set by every later give-up — so a stream whose descriptors are born over a span
+wider than one sweep cadence (routine under CPU load) splits its retry ladder and
+exhausts in two waves, producing a duplicate terminal event, a duplicate
+`StreamReset`, a duplicate `retire_stream_stamps` and a duplicate count (executed:
+the consumer received 9 terminal reports over 8 owners, failing
+`an_exhausted_stream_returns_its_stamps_so_a_fresh_id_is_admitted`'s precondition
+intermittently). *Impact boundary:* the duplicate reporting is executed; the
+pre-fix failure reproduced under load and once in the integrated run. *Required —*
+met: the first flag declares the terminal once (reset, retire, count and event
+exactly once; later waves are stragglers), witnessed by
+`a_send_half_that_gives_up_in_two_waves_is_reported_once` with a constructed
+two-wave split (inverse: unlatched red `left: 2, right: 1` on "the consumer is
+told the send half died ONCE"; restored green).
+
 ---
 
 ## Preserved credits
@@ -863,15 +946,117 @@ proven byte-identical (clean `git diff` + clean `git status --porcelain`).
 
 ---
 
+## Resolution status
+
+**The repair pass landed as twelve commits (`552a24bb7` … `e3128fbce`)** and this
+record. Local verification is green across every affected surface, so the HOLD's
+production criteria are cleared in the tree; merge stays gated on the `ci.yml` run
+at the merged head.
+
+| findings | commit | closed by |
+|---|---|---|
+| #1, #2, #7, #8, #10, #11, #20, #21 | `552a24bb7` | the §12 gate-1 conversions with per-family unresolvable counters; one-lock dialog restore (+ `retire_displaced_attempt` at the other call sites); the duplicate-Offer reservation release; `accept_rtc`'s detector arming with a per-endpoint-class inactivity budget; resolvable-sender harnesses + the entry-less-refusal witness; per-leg negative observables over real dispatch; completion-bounded loopback drain |
+| #3, #4, #22, #23, #24, #25, #51 | `ba7b0aef9` | `AdoptRefusal::dispose` (the duplicate wrapper discarded, never closed); the `channel_claims` nonce stamp gating rollback; the shared-state spy oracle (one declared inversion); the pre-deadline sweep control; the foreign-nonce/wrong-peer Ack controls; the typed unknown-subprotocol pin; the send-half "told once" latch |
+| #9, #12, #18, #19, #32, #33 | `7c1e6faa1` | channel-identified loss reports (`IceLoss = (NodeId, u64)` + `InstalledChannel`); the pure `PendingHandshake::respond` probe; `sdp_bytes` in `OfferAccepted`'s Debug; the post-hoc frozen-tab fence row with a writer-side control; per-drop overflow-warn attribution; the production-shaped fixture sink + mid-borrow witness |
+| #26, #45 | `1623cb8c4` | type-normalized tripwire scans (aliases, renames, wrappers, byte-buffer shapes, TOML quotes, recursive floored walk with one fenced exemption) + the kyra header exceptions |
+| #5, #6, #15, #16, #17, #27, #28 | `7910a04b5` | transaction-staged request-side writes with deferred emission; `TRANSITION_DEADLINE_MS` + per-call deadline/`cancelWaiter` with slot release; typed aud-encode refusals; the pre-stringify admissible scan; supersession rejects its callers; the three missing witnesses; the non-f64 dialog fixture |
+| #13, #14 | `68430d777` | the WHATWG host matcher in the SDK gate + the 33-row attack table; redacting `InviteToken`/`Attempts` Debug + the no-bearer-secret witness |
+| #31, #34, #35, #36, #37, #38 | `95ee65677` | run-record pin anchors + the 25-row must-fail matrix; the signature-span extern-C trigger; the extern-C-only self-test case; the `.github/scripts/**` watch; named-only `--min`; the deck floor at the measured 33 |
+| #30 | `c0bfa84d0` | the displaced-session construction from Go and the −117 terminal driven through both retry wrappers |
+| #29, #39, #40, #41, #42, #43, #44 | `d1f3ee81e` | the ledger reconciliation (128 + 1 + 1 = 130, frozen bodies byte-identical); every coordinate re-counted; the reason-label and C/cgo corrections; the release-note pair in lockstep; the shipped store option |
+| (comment) | `e3128fbce` | `BandwidthExhausted`'s doc names the `bandwidth` counter the runtime bumps |
+
+Plus `cd4d9d5e6` (the MR#126 two-directional enroll fixture pin — closing the
+merge review's "Noted" gap as real test work) and `ded4c8d25` (a rustfmt sweep of
+four files no repair touched).
+
+**Per-finding notes worth the record.**
+
+- **#7's root cause (executed).** Three layers: the closer's `RtcSignal::Close`
+  drops its `str0m::Rtc` without a wire teardown (no SCTP/DTLS close reaches the
+  peer, so `Event::ChannelClose` never fires there); ICE disconnection is mapped
+  away by `drain_session`'s catch-all while `reap`'s liveness filter cannot see it
+  (str0m 0.23's `is_alive()` is `state != Closed`, and ICE disconnection never sets
+  `Closed`); and the documented fallback was doubly dead — `accept_rtc` omitted the
+  `failure_detector.heartbeat_for_incarnation` arming every sibling install arm
+  runs, and the sweep's inactivity gate was `session_timeout × 30` (150 s in the
+  §9 harness). Fixed at the mesh layer (detector armed; `PeerAddr::Rtc` budget =
+  `session_timeout × miss_threshold`); the section-9 sequence passes end to end and
+  the far-side cleanup is pinned by `a_forced_direct_loss_is_cleaned_up_on_the_far_side_too`.
+- **#5's mechanism, corrected.** The finding's literal trace (in-handler
+  `host.setState`) did not reproduce at the repair head — `commit`'s
+  `Object.is(previous, current)` short-circuit made that path accidentally safe.
+  The Required property was violated through the input-PARSE seam (application
+  parse code ran outside `core.transact`, so its `commit` shipped beside the
+  action), and the repair makes the deferral structural for every case.
+- **#28's fixture, corrected.** The Required line's suggested
+  `'0011223344556677'` is itself f64-exact (`int(float(v)) == v`) and proves
+  nothing; the repair uses `'0123456789abcdef'`, which `as f64 as u64` rounds to
+  `…896` (re-spelling the dialog to `…abcdf0`) so the verbatim assertion genuinely
+  fails on a numeric re-encode. The Required property is what stands.
+- **#8's owner question — resolved** by the narrow gate contract: the state is the
+  documented eviction race; both witnesses' harnesses now model resolvable
+  senders with their assertions byte-identical, and a new witness pins the
+  entry-less refusal (counted, never rostered, never charged) against a
+  resolvable-sender positive control.
+- **#7's owner question — resolved on this host**: the far-side cleanup fires
+  within the failure budget (executed, §9 green end to end); the Linux/CI leg is
+  exercised by CI's section-9 pin at the merged head.
+
+**Residuals named, not hidden.**
+
+1. `net/crates/net/src/adapter/net/rtc/driver.rs`'s event-driven far-side close is
+   the root completion for #7 and is NOT applied (unowned file; the Required
+   property is satisfied by the documented timeout). Proposed arm: map ICE
+   terminality to `session.closed = true` in `drain_session`'s event match —
+   keying on `Failed`/`Closed` only, since ICE `Disconnected` is recoverable and
+   must not tear down on transient blips.
+2. #11's counters live in mesh.rs; their `RtcStats` promotion (three fields +
+   `counter!` rows in `rtc/stats.rs`, three names + inapplicable rows in
+   `leaf/src/counters.rs`) is specified and not applied.
+3. The §12 witness's (c) delivery-positive is scope-stated: the short-form sibling
+   test carries the invocation observable, while the long-harness streaming bridge
+   timing is unattributed (`bridge_preflight`'s captured-service/origin binding is
+   the named candidate). Five experiment classes eliminated before the scope note.
+
+**Open, needing owner adjudication:** #46 (`act` ordering — whether a
+capacity-refused act may still execute at the owner), #47, #48, #49, and #50
+(gate-4 keying: adjacent sender vs announcement origin). #46–#50's Required lines
+above are the work items; #51 is closed here.
+
+**Verified after the pass** (executed, this Windows host): browser-ts `tsc` clean
++ **722/722** vitest; RTC family **208/208** (the section-9 sequence end to end);
+net `--lib` **5719/5719** (the two membership witnesses green); sdk lib
+**335/335**; sdk integration **31/31** (enroll parity 3/3); leaf **337/337** across
+16 suites + wasm32 targets compile clean; the Go suite green (with the rebuilt
+cdylib); both checker self-tests green (16 + 24 predicates); rustfmt clean across
+all 16 net packages and the leaf crate; clippy clean in four configurations
+including `--all-targets`; rustdoc clean (root, sdk, payments, wire). Witness
+discrimination: ~36 lane inverse probes with four receipts each, plus a parent
+spot re-proof (#4's rollback gate — red for its own stated reason, restored
+green).
+
+---
+
 ## Open owner questions
 
-1. **#8's gate contract** — are membership messages from session peers with no
-   `ctx.peers` entry legitimate in production (session-only/routed shapes), or is that
-   state exclusively the documented eviction race? Recommendation: the narrow reading —
-   update both witnesses' harnesses to model resolvable peers and keep their claims;
-   record the contract change either way.
-2. **#7's platform split** — does B's direct-loss cleanup settle on Linux, where CI runs
-   the §9 sequence? If it is green there, the residue is a cross-platform teardown
-   divergence the repair comment's event-driven premise says cannot happen.
-   Recommendation: treat it as a production lifecycle defect regardless of platform;
-   this host is a supported development platform.
+1. **(asked at review time — #8's gate contract; RESOLVED in `552a24bb7`)** The
+   narrow reading was adopted: the state is the documented eviction race. Both
+   witnesses' harnesses model resolvable senders with their assertions unchanged,
+   and a new witness pins the entry-less refusal against a resolvable-sender
+   positive control. No further adjudication needed.
+2. **(asked at review time — #7's platform split; RESOLVED on this host in
+   `552a24bb7`)** The far-side cleanup now fires within the failure budget
+   (executed here; the section-9 sequence green end to end). CI's section-9 pin
+   exercises the Linux leg at the merged head; if it diverges there, #7's body
+   platform note is the starting point.
+3. **#46's `act` ordering — open.** May a `capacity`-refused `act` still execute
+   at the owner? Recommendation: no — observe the correlation verdict before
+   sending, and witness the refusal-with-no-frame; if executing unaccepted acts is
+   deliberate, document it at the call site.
+4. **#50's ingest keying — open.** Should §12 gate 4 veto announcement ingest by
+   the ORIGIN's provisional-ness rather than the adjacent sender's? Recommendation:
+   adjudicate against the §12 text ("a provisional peer's announcement is neither
+   ingested nor flooded") and pin whichever behavior stands — today the relayed
+   hop>0 path ingests and installs the TOFU pin (#50's body carries the in-run
+   proof).
