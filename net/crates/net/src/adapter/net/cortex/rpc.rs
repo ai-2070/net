@@ -7419,7 +7419,7 @@ impl RpcStreamingRequestFold {
     /// SS seam's verbatim: §2.1's deadline resolution BEFORE any handler
     /// effect, the raw proof header stripped (E1.6), §3 step-5's ownership
     /// TRANSFER at the effect boundary — then
-    /// [`run_client_stream_call`] owns the handler, the request-chunk
+    /// `run_client_stream_call` owns the handler, the request-chunk
     /// queue and the ONE single-response terminal (§2.2's bounded
     /// supervision). Every refusal is one typed
     /// [`AdmissionDenied`]
@@ -8266,7 +8266,7 @@ impl RpcDuplexFold {
     /// verbatim: §2.1's deadline resolution BEFORE any handler effect, the
     /// raw proof header stripped (E1.6), §3 step-5's ownership TRANSFER at
     /// the effect boundary — then the §2.2 supervisor
-    /// ([`run_stream_call_supervisor`] with [`SupervisedHandler::Duplex`])
+    /// (`run_stream_call_supervisor` with `SupervisedHandler::Duplex`)
     /// owns the handler, the response pump, the flow semaphore and the one
     /// terminal. Every refusal is one typed
     /// [`AdmissionDenied`]

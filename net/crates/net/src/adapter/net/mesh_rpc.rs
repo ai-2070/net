@@ -10772,7 +10772,7 @@ mod roster_fallback_tests {
         );
 
         // ---- the DX positive: the lazy mint's kind 3 rides the first send. ----
-        let mut dx = caller
+        let dx = caller
             .call_duplex(
                 provider_node.node_id(),
                 "svc",

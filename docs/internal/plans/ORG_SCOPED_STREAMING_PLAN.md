@@ -1376,3 +1376,44 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   stays named as never-executed. Stage 2 proceeds as written (rows 2.1–2.4 +
   row 5); any closure requiring the rider is a finding to state, never to
   build.
+
+- 2026-09-22, **Stage 2 executed** (branch `LZL0/org-streaming`, pinned
+  brief `spikes/org-streaming/S2_BRIEF.md` @`87f89c8da`; one lane `S2Core`):
+  slices 2.1–2.5 landed over ten commits (`16cd67e85`…`98df0bb0b`,
+  `S1_REPORT.md` §4). Landed: the lazy-opening mint binding the FIRST CHUNK
+  (`OrgStreamCallProof` kinds 2/3 over the finalized initial REQUEST —
+  `client_stream_opening_binds_first_chunk`), CS/DX admission at the frozen
+  `Proceed` seam with shape-and-direction checks (aggregate + exchange
+  witnesses with valid proofs; pre-admission chunks never delivered;
+  END half-close discipline; wrong-session grants never credit), the C8
+  duplex response window honoured on public and protected folds
+  (`duplex_response_window_blocks_until_grant`,
+  `cross_direction_grant_is_ignored`), §2.6 half-close + both-direction
+  retirement (`upload_end_then_remaining_output_completes`,
+  `retire_unblocks_both_directions`), and row 5's CS/DX intent-pin inversion
+  (`client_stream_and_duplex_mint_their_stream_proofs`, the 1.6 mirror with
+  its kept refusal legs). **A real defect found and fixed (F-S2.2-5):** a
+  pre-supervisor opening-body budget refusal leaked the §3 record (the
+  transfer precedes the supervisor); fixed in the CS/DX seams with the
+  unary `ConfirmedOpening` scope-guard precedent, witnessed by
+  `opening_body_budget_refusal_completes_the_record` which FAILS pre-fix
+  under receipt R-S2.2c. Ten inverse receipt cycles (R-S2.1, R-S2.2a/b/c,
+  R-S2.3a/b, R-S2.4a/b/c-v2, R-S2.5), all red at their own named
+  assertions, sha-proven restored, closed green; coordinator spot-checks
+  reproduced R-S2.2c and R-S2.1 independently. Disclosures accepted:
+  F-S2.1-3 (the S2.1/S2.2 commit boundary is RECONSTRUCTED — one lane
+  implemented both before committing, each reconstructed tree probe-run
+  green in the named probe worktree) and F-S2.4-1
+  (`retire_unblocks_both_directions` green under the single-layer inverse
+  because doubly defended — the TRUE two-layer inverse R-S2.4c-v2 reds at
+  the named assertion). The owner-declined F-S1R-2 rider was needed by no
+  closure. Estate at head: `org_rpc_streaming` **41/41** (CI floor 41 at
+  `d214adc56`, roster-validated), in-source 220/220 three-module,
+  preserved + controls 134/134, cross-lang 32/32, Stage 0 models untouched
+  at 76/76. Stage-end validation: chain A green (fmt ×3, `check
+  --all-targets`, clippy basic ×2, wire 278, probe exact commands, `cargo
+  `tl`, `cargo t` **7089/7089**); chain B green after its fix set — one
+  `unused_mut` at `mesh_rpc.rs:10775` and three rustdoc links in
+  `apply_inbound_admitted`'s doc (the code-span remedy), all Stage-2 test/doc
+  code, all clippy all-features ×2 + rustdoc ×5 green at re-run
+  (`S2_VALIDATION_B_OK`). Stage 2 proceeds to independent review.
