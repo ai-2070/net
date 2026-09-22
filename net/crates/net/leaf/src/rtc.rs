@@ -225,7 +225,7 @@ pub type InboundSink = Rc<dyn Fn(NodeId, Bytes)>;
 /// and a peer id cannot express which one: across a re-attempt there
 /// are two, and the predecessor's report can arrive after the
 /// successor's handshake installed. Whoever drains these
-/// ([`crate::wasm::Inner::harvest_ice_failures`]) must fence the
+/// (`crate::wasm::Inner::harvest_ice_failures`) must fence the
 /// report on the channel that made it, or a predecessor's dying words
 /// remove a successor's live session.
 pub type IceLoss = (NodeId, u64);
