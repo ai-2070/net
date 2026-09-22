@@ -296,6 +296,20 @@ pub type BackendFactory = Rc<dyn Fn(JsValue, EventSink, GenerationLease) -> Back
 /// Where a leader's node events go.
 pub type EventSink = Rc<dyn Fn(&str)>;
 
+/// The fence that superseded a session's generation: which one this
+/// tab presented, and which one displaced it.
+///
+/// Mirrors [`LeafError::NotLeader`]'s fields because it is exactly
+/// that refusal, held ready for every operation still to come — see
+/// [`SessionState::superseded`].
+#[derive(Debug, Clone, Copy)]
+struct Supersession {
+    /// The generation this tab was presenting when it was displaced.
+    presented: u64,
+    /// The generation that displaced it.
+    current: u64,
+}
+
 struct SessionState {
     role: Role,
     generation: u64,
@@ -321,6 +335,13 @@ struct SessionState {
     restored: Vec<String>,
     listeners: Vec<Function>,
     lock: Option<WebLock>,
+    /// Set while this session's generation is superseded: the fence
+    /// [`stand_down`] raised, naming what this tab presented and what
+    /// displaced it. Every [`Lifecycle::request`] refuses while it is
+    /// set, and only a promotion that installs a **new** generation
+    /// clears it — a superseded session is never served again on the
+    /// old basis.
+    superseded: Option<Supersession>,
     interruption_ms: Option<f64>,
     closed: bool,
 }
@@ -476,6 +497,7 @@ impl Lifecycle {
                 restored: Vec::new(),
                 listeners: Vec::new(),
                 lock: None,
+                superseded: None,
                 interruption_ms: None,
                 closed: false,
             }),
@@ -571,6 +593,20 @@ impl Lifecycle {
             return Err(ProxyFailure::Typed(LeafError::Session(
                 "the session is closed".into(),
             )));
+        }
+        // **A superseded session refuses everything** — by the fence
+        // that stood it down, not by a closed guard. Its generation
+        // was displaced, so anything served now would be served
+        // through the successor: a fenced holder presenting the
+        // identity alongside it. The refusal carries both numbers the
+        // fence carried — the generation this session presented and
+        // the one that displaced it — and nothing is dispatched while
+        // refusing.
+        if let Some(supersession) = self.shared.state.borrow().superseded {
+            return Err(ProxyFailure::Typed(LeafError::NotLeader {
+                presented: supersession.presented,
+                current: Some(supersession.current),
+            }));
         }
         // Read before the request is moved: a follower arms its own
         // clock over the caller's deadline.
@@ -1038,21 +1074,20 @@ fn fall_back_to_follower(
     resume_as_follower(shared, previous)
 }
 
-/// Become a functioning follower again after losing the leader's
-/// role, and queue for the lock so this tab can be promoted again.
+/// Settle what the old leader owed this tab and attach to the
+/// current one.
 ///
-/// ONE helper for both recovery paths — [`fall_back_to_follower`]
-/// and [`stand_down`] — because two copies drift, and this one did:
-/// `stand_down` reset the role and never re-attached, while
-/// `attach_as_follower` is the only place `shared.client` is ever
-/// set. After a stand-down — the frozen-tab scenario `guard_lease`
-/// exists for — every `Lifecycle::request` therefore took the
-/// client-less arm and failed `NotLeader` for the rest of the tab's
-/// life, `dispatch` piled inbound messages into `shared.queued` for
-/// a `take_leadership` that would never run, and no
-/// `await_promotion` waiter existed to win the lock when the
-/// successor closed. The tab was a permanent zombie.
-fn resume_as_follower(shared: &Rc<Shared>, lost: u64) -> Result<()> {
+/// Shared by [`fall_back_to_follower`] and [`stand_down`], because
+/// the things a tab needs after leaving the leader's seat are the
+/// same either way and a second copy is the one that gets forgotten:
+/// the old leader's debts settled typed and named, no stale client
+/// left to answer for it (`attach_as_follower` is the only place
+/// `shared.client` is ever set), and a fresh attach so the tab is a
+/// functioning follower — the client-less arm it used to be stranded
+/// in took every `Lifecycle::request` to a `NotLeader` for the rest
+/// of the tab's life while `dispatch` piled inbound messages into
+/// `shared.queued` for a `take_leadership` that would never run.
+fn reattach(shared: &Rc<Shared>, lost: u64) -> Result<()> {
     if shared.state.borrow().closed {
         return Ok(());
     }
@@ -1066,7 +1101,21 @@ fn resume_as_follower(shared: &Rc<Shared>, lost: u64) -> Result<()> {
         })));
     }
     *shared.client.borrow_mut() = None;
-    attach_as_follower(shared)?;
+    attach_as_follower(shared)
+}
+
+/// Become a functioning follower again after a promotion that could
+/// not finish, and queue for the lock so this tab can be promoted
+/// again.
+///
+/// The acquisition is queued **here** and deliberately not in
+/// [`reattach`], which [`stand_down`] also uses: a failed promotion
+/// leaves the origin with no node and somebody has to bring one up,
+/// while a stand-down means a successor has just taken one up — see
+/// [`stand_down`] for why a stood-down tab queues only after meeting
+/// that successor.
+fn resume_as_follower(shared: &Rc<Shared>, lost: u64) -> Result<()> {
+    reattach(shared, lost)?;
     // Queued again, after a pause. Queued because the origin now has
     // no node and somebody has to bring one up. After a pause because
     // this tab has just released the only lock there is, so an
@@ -1187,6 +1236,9 @@ async fn take_leadership(shared: &Rc<Shared>, previous: Option<u64>) -> Result<(
         let mut state = shared.state.borrow_mut();
         state.role = Role::Leader;
         state.generation = generation;
+        // A new generation is a new basis: whatever fence stood this
+        // tab down spoke of the old one, so the session serves again.
+        state.superseded = None;
         state.lock = claim_bootstrap_lock(shared);
         state.subscribed.clear();
         state.announced.clear();
@@ -1589,8 +1641,28 @@ fn dispatch(shared: &Rc<Shared>, text: &str) {
 /// Act on what the follower half learned.
 fn handle_follower_event(shared: &Rc<Shared>, event: FollowerEvent) {
     match event {
-        FollowerEvent::Leader { generation, .. } => {
+        FollowerEvent::Leader {
+            generation,
+            previous,
+            ..
+        } => {
             shared.state.borrow_mut().generation = generation;
+            // A superseded tab queues for the lock **now** — having
+            // met the successor it stood down for — and not at
+            // stand-down: what it may replace is a successor it has
+            // actually followed, and `await_promotion`'s blocking
+            // request is what notices that successor going away
+            // (closed or crashed) and hands the node on. `previous ==
+            // 0` is this client's first leader, so exactly one
+            // acquisition is queued per attach.
+            if previous == 0 && shared.state.borrow().superseded.is_some() {
+                let waiting = Lifecycle {
+                    shared: shared.clone(),
+                };
+                spawn_local(async move {
+                    waiting.await_promotion().await;
+                });
+            }
             emit(
                 shared,
                 &format!("{{\"type\":\"leader_changed\",\"generation\":\"{generation}\"}}"),
@@ -1672,6 +1744,13 @@ fn stand_down(shared: &Rc<Shared>, successor: u64) {
     {
         let mut state = shared.state.borrow_mut();
         state.role = Role::Follower;
+        // The fence stays raised for this session: its generation is
+        // superseded, so every operation is refused with these two
+        // numbers until a promotion installs a new generation.
+        state.superseded = Some(Supersession {
+            presented: ours,
+            current: successor,
+        });
         state.subscribed.clear();
         state.announced.clear();
         // Last, as always.
@@ -1683,16 +1762,23 @@ fn stand_down(shared: &Rc<Shared>, successor: u64) {
             "{{\"type\":\"not_leader\",\"presented\":\"{ours}\",\"current\":\"{successor}\"}}"
         ),
     );
-    // **And then the same recovery `fall_back_to_follower` performs**
-    // — one helper for both, because this path never re-attached:
-    // `attach_as_follower` is the only setter of `shared.client`, so
-    // a stood-down tab took `request`'s client-less arm (`NotLeader`,
-    // for ever), queued every inbound message for a
-    // `take_leadership` that would never run, and had no
-    // `await_promotion` waiter to win the lock when the successor
-    // closed. A permanent zombie, in exactly the frozen-tab scenario
-    // `guard_lease` stands this tab down for.
-    if let Err(error) = resume_as_follower(shared, ours) {
+    // **Re-attach, and do not queue for the lock.** The tab becomes
+    // a functioning follower — `reattach` is the same recovery
+    // `fall_back_to_follower` performs, and for the same reason: a
+    // stood-down tab left client-less queued every inbound message
+    // for a `take_leadership` that would never run. But the
+    // acquisition `resume_as_follower` queues belongs to a *failed*
+    // promotion, where the origin has no node and somebody has to
+    // bring one up. Here the origin has one — the store's move is the
+    // successor's acquisition — and a tab that re-claimed the lock
+    // would bring up a second node presenting this identity beside
+    // it: the very supersession the fence exists to prevent. What
+    // this tab may replace is a successor it has actually met and
+    // then lost, so the acquisition is queued when its attach is
+    // answered (`handle_follower_event`), and the blocking lock
+    // request is what notices that successor going away — closed or
+    // crashed — and hands the node on.
+    if let Err(error) = reattach(shared, ours) {
         report(&format!(
             "re-attaching as a follower after stand-down: {error}"
         ));
