@@ -11,7 +11,7 @@ fn config(path: &Path, text: &str) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
-fn run(path: &Path, args: &[&str]) -> std::process::Output {
+fn run(path: &Path, args: &[&str], child: &Path, marker: &Path) -> std::process::Output {
     Command::cargo_bin("net-mesh")
         .unwrap()
         .timeout(Duration::from_secs(5))
@@ -21,13 +21,34 @@ fn run(path: &Path, args: &[&str]) -> std::process::Output {
         .arg(path)
         .args(["--output", "json", "wrap", "fixture", "--listen"])
         .args(args)
-        .args(["--", "nonexistent-listener-test-child"])
+        .args(["--"])
+        .arg(child)
+        .arg(marker)
         .output()
         .unwrap()
+}
+
+/// Compile the marker-child fixture into `dir`; returns the child binary path.
+fn marker_child(dir: &Path) -> std::path::PathBuf {
+    let child = dir.join(format!("marker-child{}", std::env::consts::EXE_SUFFIX));
+    let status = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/marker_child.rs"
+        ))
+        .arg("-o")
+        .arg(&child)
+        .status()
+        .expect("compile marker_child fixture");
+    assert!(status.success());
+    child
 }
 #[test]
 fn listener_inspection_uses_profile_psk_and_bind_without_binding_or_starting_child() {
     let dir = tempfile::tempdir().unwrap();
+    let child = marker_child(dir.path());
+    let marker = dir.path().join("child-started.marker");
     let path = dir.path().join("config.toml");
     let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let bind = held.local_addr().unwrap().to_string();
@@ -36,7 +57,7 @@ fn listener_inspection_uses_profile_psk_and_bind_without_binding_or_starting_chi
         &path,
         &format!("[default]\npsk_hex = '{psk}'\nbind = '{bind}'\n"),
     );
-    let result = run(&path, &["--inspect-target"]);
+    let result = run(&path, &["--inspect-target"], &child, &marker);
     assert!(
         result.status.success(),
         "{}",
@@ -61,6 +82,8 @@ fn listener_inspection_uses_profile_psk_and_bind_without_binding_or_starting_chi
             "--psk-hex",
             &override_psk,
         ],
+        &child,
+        &marker,
     );
     assert!(
         result.status.success(),
@@ -71,12 +94,18 @@ fn listener_inspection_uses_profile_psk_and_bind_without_binding_or_starting_chi
     assert_eq!(view["bind"], "127.0.0.1:0");
     assert_eq!(view["provenance"]["bind"], "flag");
     assert_eq!(view["provenance"]["psk"], "flag");
+    assert!(
+        !marker.exists(),
+        "listener inspection started the wrapped child"
+    );
 }
 #[test]
 fn listener_requires_valid_psk_and_refuses_ambiguous_targets_before_execution() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let psk = "42".repeat(32);
+    let child = marker_child(dir.path());
+    let marker = dir.path().join("child-started.marker");
     for (profile, args, diagnostic) in [
         (String::new(), vec![], "requires --psk-hex"),
         (
@@ -116,7 +145,11 @@ fn listener_requires_valid_psk_and_refuses_ambiguous_targets_before_execution() 
         ),
     ] {
         config(&path, &profile);
-        let result = run(&path, &args);
+        let result = run(&path, &args, &child, &marker);
+        assert!(
+            !marker.exists(),
+            "{args:?}: the wrapped child started before validation refused"
+        );
         assert!(!result.status.success());
         assert!(result.stdout.is_empty());
         let error = String::from_utf8_lossy(&result.stderr);

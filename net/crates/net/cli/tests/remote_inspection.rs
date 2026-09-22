@@ -151,6 +151,23 @@ fn config(dir: &tempfile::TempDir, addr: &str, bind: Option<&str>) -> std::path:
     path
 }
 
+/// Compile the marker-child fixture into `dir`; returns the child binary path.
+fn marker_child(dir: &std::path::Path) -> std::path::PathBuf {
+    let child = dir.join(format!("marker-child{}", std::env::consts::EXE_SUFFIX));
+    let status = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/marker_child.rs"
+        ))
+        .arg("-o")
+        .arg(&child)
+        .status()
+        .expect("compile marker_child fixture");
+    assert!(status.success());
+    child
+}
+
 fn run(path: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::cargo_bin("net-mesh")
         .unwrap()
@@ -170,6 +187,9 @@ fn remote_inspection_matrix_has_no_network_files_or_child_process() {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
     let path = config(&dir, &socket.local_addr().unwrap().to_string(), None);
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let child = marker_child(fixture_dir.path());
+    let marker = fixture_dir.path().join("child-started.marker");
     let destination = dir.path().join("must-not-be-created");
     let dest = destination.to_str().unwrap();
     let commands: Vec<Vec<&str>> = vec![
@@ -241,12 +261,17 @@ fn remote_inspection_matrix_has_no_network_files_or_child_process() {
             "test",
             "--inspect-target",
             "--",
-            "this-program-must-not-be-started",
+            child.to_str().unwrap(),
+            marker.to_str().unwrap(),
         ],
         vec!["mcp", "serve", "--inspect-target"],
     ];
     for args in commands {
         let out = run(&path, &args);
+        assert!(
+            !marker.exists(),
+            "{args:?}: the wrapped child started during remote inspection"
+        );
         assert!(
             out.status.success(),
             "{args:?}: {}",

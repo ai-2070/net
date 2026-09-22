@@ -37,6 +37,24 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 
+/// Compile the marker-child fixture (one new fixture source, shared by the
+/// wrap non-spawn witnesses) into `dir`; returns the child binary path.
+fn marker_child(dir: &Path) -> std::path::PathBuf {
+    let child = dir.join(format!("marker-child{}", std::env::consts::EXE_SUFFIX));
+    let status = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/marker_child.rs"
+        ))
+        .arg("-o")
+        .arg(&child)
+        .status()
+        .expect("compile marker_child fixture");
+    assert!(status.success());
+    child
+}
+
 fn ice_args(identity: &Path) -> Vec<&str> {
     vec![
         "ice",
@@ -436,6 +454,18 @@ fn wrap_attachment_expiry_precedes_child_spawn() {
     let addr = socket.local_addr().unwrap().to_string();
     let key = "42".repeat(32);
     let identity = dir.path().join("operator.toml");
+    let child_bin = marker_child(dir.path());
+    let marker = dir.path().join("child-started.marker");
+    // Instrument check: the fixture really writes its marker when run at all.
+    assert!(std::process::Command::new(&child_bin)
+        .arg(&marker)
+        .status()
+        .unwrap()
+        .success());
+    assert!(marker.exists(), "marker fixture did not write its marker");
+    std::fs::remove_file(&marker).unwrap();
+    let child = child_bin.to_str().unwrap();
+    let marker_path = marker.to_str().unwrap();
     for budget in ["0s", "200ms"] {
         let out = run(
             dir.path(),
@@ -457,8 +487,13 @@ fn wrap_attachment_expiry_precedes_child_spawn() {
                 "--timeout",
                 budget,
                 "--",
-                "nonexistent-child-must-not-spawn",
+                child,
+                marker_path,
             ],
+        );
+        assert!(
+            !marker.exists(),
+            "{budget}: the wrapped child started despite the expired attachment deadline"
         );
         assert_eq!(
             out.status.code(),
@@ -484,8 +519,13 @@ fn wrap_attachment_expiry_precedes_child_spawn() {
             "--timeout",
             "1s",
             "--",
-            "nonexistent-child-must-not-spawn",
+            child,
+            marker_path,
         ],
+    );
+    assert!(
+        !marker.exists(),
+        "the wrapped child started despite the --timeout refusal"
     );
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
