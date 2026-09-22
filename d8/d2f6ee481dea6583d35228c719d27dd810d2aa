@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/enrollment_storage.rs
+  s_38828de26a56bb::t_b39787a324059e 14,185-190,192-214,371-479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d8d2f6ee481dea6583d35228c719d27dd810d2aa",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
