@@ -341,6 +341,30 @@ exit 100 with the same assertion (`Completed(Ok)` vs `ResourceExhausted`, line
   post-write state (30/30 green sweep) and completed unaffected. Stage 1 lanes
   touching shared files keep the same discipline: hash at start, tag every run.
 
+Lane-process findings (F12–F14) and the two below are recorded because the
+receipt discipline is part of the stage's evidence: each was caught by a hash
+gate or a checklist the stage had adopted before the incident.
+
+- **F15 — the pre-push clippy matrix catches what the test runs cannot
+  (executed).** Adding the §2.8 control path as `run_supervisor`'s ninth
+  argument crossed clippy's arity threshold: `clippy --all-features
+  --all-targets` with CI's flag set (the only leg that compiles lib-test under
+  clippy) failed with `too_many_arguments` while every witness run stayed
+  green. Fixed with a targeted `#[expect(clippy::too_many_arguments, reason =
+  …)]` following the repo's established convention (`mesh.rs` has the exact
+  precedent — "pushed it one over the arg-count lint"; `rtc/driver.rs` the
+  expect-with-reason form). 76/76 re-verified green after the change.
+- **F16 — an out-of-space write truncated a source file; hash discipline
+  recovered it (executed).** A write during the arity fix hit `ENOSPC` and
+  truncated `org_stream_lifecycle.rs` to 0 bytes (empty-file sha `e3b0c44…`)
+  while the VCS showed an ordinary modification — the exact failure mode the
+  harness warns about. Recovery: `git restore` from the immediately preceding
+  commit (the file had no uncommitted changes), verified byte-exact by sha256
+  (`b2dce203…`) and line count (2045), then the fix re-applied and re-verified
+  (2052 lines, `45aef9d6…`). Cause: the build-artifact cache had grown to
+  29 GB and both local volumes were at 100%. Rule carried to Stage 1 lanes:
+  while free space is under a few GB, verify size and hash after every write.
+
 ## 8. What never ran
 
 - No Linux or macOS leg (Windows 11 workstation); `#[cfg(unix)]` code is not
