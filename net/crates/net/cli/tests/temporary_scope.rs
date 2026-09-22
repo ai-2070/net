@@ -274,10 +274,30 @@ fn generated_man_and_completion_include_local_scope() {
     let dir = config();
     let man = run(&["man"], dir.path());
     assert!(man.status.success());
-    let text = String::from_utf8_lossy(&man.stdout);
-    assert!(text.contains("Temporary") || text.contains("temporary"));
+    let text = String::from_utf8_lossy(&man.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains(SCOPE),
+        "man page lost the scope sentence: {text}"
+    );
     let completion = run(&["completion", "bash"], dir.path());
     assert!(completion.status.success());
     let text = String::from_utf8_lossy(&completion.stdout);
-    assert!(text.contains("--local"));
+    // Scope the check to one sample leaf's own completion entry (the opts
+    // arm for `cap show`), not the whole script.
+    let arm = "net__subcmd__mesh__subcmd__cap__subcmd__show)";
+    let rest = text
+        .split_once(arm)
+        .unwrap_or_else(|| panic!("sample leaf completion entry not found: {arm}"))
+        .1;
+    let entry = rest
+        .lines()
+        .find(|line| line.trim_start().starts_with("opts="))
+        .expect("sample leaf completion entry carries an opts line");
+    assert!(
+        entry.contains("--local"),
+        "sample leaf completion entry lost --local: {entry}"
+    );
 }
