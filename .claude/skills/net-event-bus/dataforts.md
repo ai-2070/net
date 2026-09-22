@@ -161,7 +161,7 @@ Content-addressed reference whose bytes live in the caller's existing storage (S
 
 ```text
 [0xB0, 0xB1, 0xB2, 0xB3]  // 4-byte magic
-version: u8               // currently 1
+version: u8               // 0x01 V1, 0x02 V2_MANIFEST, 0x03 V3_TREE; chunked send-blob / send-dir refs encode 2
 hash:    [u8; 32]         // BLAKE3
 size:    u64              // bytes; bounded by BLOB_REF_MAX_SIZE = 16 GiB
 uri:     [u8]             // to end of ref; adapter dispatch key
@@ -173,7 +173,7 @@ Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter
 
 - **Hash-verify on store.** `FileSystemAdapter::store(blob_ref, &bytes)` BLAKE3-hashes the supplied bytes and rejects mismatch.
 - **`fsync` of temp + parent dir** lands in the FS store path. Power loss between rename and OS flush doesn't leave zero-length files in the addressable space.
-- **Unique tmp suffixes.** `<hash>.<pid>.<atomic>.<nanos>.tmp` — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
+- **Unique tmp suffixes.** `.{pid}-{counter}-{nanos}.tmp` appended to the hash filename — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
 - **Streaming hooks.** `fetch_stream` / `store_stream` ship as required methods on `BlobAdapter` with default implementations that route through `fetch` / `store`; adapters wanting real streaming override. FS adapter chunks at 256 KiB.
 - **`BLOB_REF_MAX_SIZE = 16 GiB` cap** (a free constant in `blob_ref.rs`, not an associated const on `BlobRef`). Decode rejects larger sizes. There is **no config knob that lifts it** — a site needing more validates on construction and reaches for the `BlobAdapter` streaming hooks instead.
 - **Per-channel registry override.** `RedexFileConfig::with_blob_adapter_registry(Some(arc))` for multi-tenant isolation; default-tenant path uses the global singleton.
@@ -242,9 +242,9 @@ This composes with `BlobRef`: `store_dir` writes chunks **into** a `BlobAdapter`
 | store a dir → manifest ref | `store_dir(adapter, &root) -> BlobRef` | `mesh.storeDir(adapter, root) -> BlobRef` | `store_dir(mesh, adapter, root) -> BlobRef` |
 | fetch a dir | `fetch_dir(&mesh, source, &ref, dest, concurrency) -> DirStats` | `mesh.fetchDir(sourceId, ref, dest) -> {files, bytes}` | `fetch_dir(mesh, source_id, ref, dest) -> (files, bytes)` |
 
-`DirStats { files: usize, bytes: u64 }`. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
+Rust `DirStats` is `{ files: usize, dirs: usize, symlinks: usize, bytes: u64 }` — the Node `{files, bytes}` / Python `(files, bytes)` rows above project to those two fields. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
 
-**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. Note: they are **not declared in `include/net.h`** — a C consumer declares the prototypes against the exported symbols directly. The ergonomic wrappers are Rust / Node / Python, with the C ABI present but the header not yet regenerated.
+**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. C consumers: `#include <net_transport.h>` — the prototypes and the `NET_TRANSPORT_OK` / `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` codes are declared there; do not hand-declare them. The ergonomic wrappers are Rust / Node / Python.
 
 ### Rust
 
@@ -355,7 +355,7 @@ if err := tasks.WaitForSeq(seq, 250*time.Millisecond); err != nil { /* … */ }
 ## Common gotchas
 
 - **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built artifacts ship with the feature enabled.
-- **Greedy admission rejection has five reasons** (`AdmitRejectReason::{Scope, Intent, Colocation, Capacity, Bandwidth}`) — there is no `Proximity` variant. Each has its own Prometheus counter — disambiguate "why isn't this chain being cached?" by checking which counter bumped.
+- **Greedy admission rejection has five reasons** (`AdmitRejectReason::{Scope, Intent, Colocation, Capacity, Bandwidth}`) — there is no `Proximity` variant. All five bump ONE Prometheus counter with a `reason` label (`dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity|bandwidth"}`), not one counter per reason — disambiguate "why isn't this chain being cached?" by reading the `reason` label.
 - **Gravity without greedy is allowed.** A node with `enable_gravity_for_greedy` but no `enable_greedy_dataforts` is the "drift-only" quadrant — already-placed replicas emit heat, but the node doesn't speculatively cache.
 - **`Redex::greedy_cache_for(channel) -> Option<RedexFile>`** returns the cache file if greedy admitted that chain; the caller falls back to a network fetch / substrate read path on `None`. The substrate doesn't auto-route reads through the cache — it's an explicit lookup.
 - **Blob refs aren't transactionally tied to the bus.** A `BlobRef` riding on a published event references bytes that the adapter must have stored *before* the event was published; if the consumer reads the event before the adapter persists the bytes, `blob_resolve` fails until the persist completes.
