@@ -329,7 +329,6 @@ impl RxStream {
             return Vec::new();
         }
         let conceded = boundary - self.next_expected;
-        self.next_expected = boundary;
         // Records held below the new boundary arrived under
         // fire-and-forget, and their sequence space is now conceded.
         // They are bytes this consumer HAS: withholding them to
@@ -337,14 +336,36 @@ impl RxStream {
         // invented by the repair, and fire-and-forget promises no
         // order to violate. Released in sequence order, ahead of
         // whatever the boundary itself unblocks.
-        let above = self.held.split_off(&self.next_expected);
-        let mut out: Vec<StreamRecord> = core::mem::replace(&mut self.held, above)
+        //
+        // **The handoff is span-aware.** A record's `span` can be
+        // more than one — a reassembled group consumes the sequences
+        // its fragments arrived on — so a record held below the
+        // boundary can *straddle* it. It is still released whole (the
+        // message is one message and the bytes are here), but its
+        // span is split at the boundary: the below half is what the
+        // release delivers and is all the concession may count as
+        // covered, and the above half is coverage the cursor has to
+        // carry. A cursor parked at the boundary — inside the
+        // straddler's coverage — makes `drain` wait for a sequence
+        // the released record already filled (a permanent stall) and
+        // drops the covered tail out of `already_owned`'s protection,
+        // so a retransmitted fragment delivers it a second time.
+        let above = self.held.split_off(&boundary);
+        let released: Vec<StreamRecord> = core::mem::replace(&mut self.held, above)
             .into_values()
             .collect();
-        counters.drop_n(
-            DropReason::FireAndForgetGap,
-            conceded.saturating_sub(out.len() as u64),
-        );
+        let mut covered = 0u64;
+        let mut next = boundary;
+        for record in &released {
+            covered += record.span.max(1).min(boundary.saturating_sub(record.seq));
+            next = next.max(record.seq.saturating_add(record.span.max(1)));
+        }
+        self.next_expected = next;
+        // The concession is the sequences no released record covers,
+        // counted in one arithmetic step: subtracting the record
+        // COUNT over-counted the gap by `sum(span - 1)`.
+        counters.drop_n(DropReason::FireAndForgetGap, conceded.saturating_sub(covered));
+        let mut out = released;
         out.extend(self.drain());
         out
     }
@@ -652,5 +673,65 @@ mod tests {
             "the derivation must be stable — both ends derive it independently"
         );
         assert_ne!(id, stream_id_from_label("app/other"));
+    }
+
+    /// The same record with an explicit span — a reassembled group
+    /// consumes the sequences its fragments arrived on.
+    fn span_rec(seq: u64, span: u64, tag: u8) -> StreamRecord {
+        StreamRecord { span, ..rec(seq, tag) }
+    }
+
+    /// The boundary handoff, where a held record's span STRADDLES the
+    /// boundary.
+    ///
+    /// The one path the file's other witnesses do not cover: the
+    /// concession releases the records held below the boundary, and a
+    /// record whose coverage crosses it must be released whole (the
+    /// message is one message) while the cursor carries its whole
+    /// span. A cursor parked at the boundary waits for a sequence the
+    /// released record already filled — the stream stalls — and the
+    /// covered tail stops being `already_owned`, so a retransmitted
+    /// copy delivers it twice.
+    #[test]
+    fn a_span_straddling_the_promotion_boundary_is_released_whole_and_carries_the_cursor() {
+        let c = LeafCounters::new();
+        let mut s = RxStream::new(Reliability::Reliable);
+        // A group at 4..7 — its span straddles the boundary at 6 —
+        // and one ordinary record at 7, both held behind the head gap
+        // at 0..4.
+        ok(s.accept(span_rec(4, 3, 44), &c));
+        ok(s.accept(rec(7, 7), &c));
+        assert_eq!(s.held(), 2);
+        assert_eq!(s.next_expected(), 0);
+
+        let released = s.promote(Some(6), &c);
+        assert_eq!(
+            tags(&released),
+            vec![44, 7],
+            "the straddler is released whole and the record it unblocks follows"
+        );
+        assert_eq!(
+            s.next_expected(),
+            8,
+            "the cursor must carry the straddler's coverage (4..7), not stop at the \
+             boundary inside it"
+        );
+        assert_eq!(s.held(), 0, "nothing is left behind the moved cursor");
+        assert_eq!(
+            c.drops(DropReason::FireAndForgetGap),
+            4,
+            "the concession is exactly the uncovered sequences 0..3 — 4..6 are covered \
+             by the released group and must not be counted as loss"
+        );
+        assert_eq!(c.total_drops(), 4);
+
+        // A retransmitted copy of the released group's tail is a
+        // duplicate, not a second delivery.
+        assert!(ok(s.accept(span_rec(4, 3, 44), &c)).is_empty());
+        assert_eq!(c.drops(DropReason::DuplicateSequence), 1);
+
+        // And the stream goes on delivering: no stall at the old
+        // boundary.
+        assert_eq!(tags(&ok(s.accept(rec(8, 8), &c))), vec![8]);
     }
 }

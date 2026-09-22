@@ -23,7 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// The identity a backend resolves from the stream it opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolvedIdentity {
     /// The wire stream id, which two peers may share.
     pub wire_id: u64,
@@ -117,6 +117,36 @@ pub trait StreamBackend {
     fn close(&self, stream: Self::Stream);
 }
 
+/// Why [`StreamOwnership::adopt`] refused a stream — with the stream
+/// itself handed back in every case, for the caller to close.
+///
+/// Three refusals, three dispositions on the reply: "your open did
+/// not resolve", "this identity is already open" and "the handle
+/// space is done" send an operator to different places, so one
+/// message for all three would be a lie for two of them.
+#[derive(Debug)]
+pub enum AdoptRefusal<T> {
+    /// The stream did not report a readable identity.
+    Unreadable(T),
+    /// A live open already holds this identity — see
+    /// [`StreamOwnership::adopt`].
+    Duplicate(ResolvedIdentity, T),
+    /// The handle space is exhausted: every value has been issued
+    /// exactly once and none will be reissued.
+    Exhausted(T),
+}
+
+impl<T> AdoptRefusal<T> {
+    /// The refused stream, for the caller to close.
+    pub fn into_stream(self) -> T {
+        match self {
+            Self::Unreadable(stream)
+            | Self::Duplicate(_, stream)
+            | Self::Exhausted(stream) => stream,
+        }
+    }
+}
+
 /// Answer one stream request, for either backend.
 ///
 /// Every decision is here: the handle an operation addresses, the
@@ -135,7 +165,10 @@ pub fn answer_stream_request<B: StreamBackend>(
     backend: &B,
     request: crate::leader::LeaderRequest,
     reply: crate::leader::Replier,
-) -> Option<(crate::leader::LeaderRequest, crate::leader::Replier)> {
+) -> Option<(crate::leader::LeaderRequest, crate::leader::Replier)>
+where
+    B::Stream: Clone,
+{
     use crate::error::LeafError;
     use crate::leader::{LeaderRequest, ProxyFailure};
 
@@ -160,14 +193,30 @@ pub fn answer_stream_request<B: StreamBackend>(
                     Ok((handle, id)) => {
                         reply.stream(handle, id.wire_id, id.peer, id.incarnation);
                     }
-                    Err(stream) => {
-                        // Fail closed: a stream whose identity cannot
-                        // be read is given back to be closed, not
-                        // handed over with an unknown peer.
-                        backend.close(stream);
-                        reply.fail(ProxyFailure::Typed(LeafError::Session(
-                            "opened stream did not report a readable identity".into(),
-                        )));
+                    Err(refusal) => {
+                        // Fail closed either way: a refused stream is
+                        // given back to be closed, never handed over
+                        // half-identified or left aliasing a live open.
+                        // Each refusal says which it was — "your open
+                        // did not resolve", "this identity is already
+                        // open" and "the handle space is done" are
+                        // three different things to act on.
+                        let message = match &refusal {
+                            AdoptRefusal::Unreadable(_) => {
+                                "opened stream did not report a readable identity".to_string()
+                            }
+                            AdoptRefusal::Duplicate(identity, _) => format!(
+                                "a stream with identity (wire {}, peer {}, incarnation {}) is \
+                                 already open: one (wire id, peer, incarnation) is one open, \
+                                 and a second would alias it",
+                                identity.wire_id, identity.peer, identity.incarnation
+                            ),
+                            AdoptRefusal::Exhausted(_) => {
+                                "the stream handle space is exhausted".to_string()
+                            }
+                        };
+                        backend.close(refusal.into_stream());
+                        reply.fail(ProxyFailure::Typed(LeafError::Session(message)));
                     }
                 },
                 Err(failure) => reply.fail(failure),
@@ -201,6 +250,9 @@ pub fn answer_stream_request<B: StreamBackend>(
 /// The streams one backend owns, addressed by handle.
 pub struct StreamOwnership<T> {
     streams: RefCell<HashMap<u64, T>>,
+    /// The identities the opens above resolve to, so one identity is
+    /// one open. See [`StreamOwnership::adopt`].
+    identities: RefCell<HashMap<ResolvedIdentity, u64>>,
     next: Cell<u64>,
 }
 
@@ -208,6 +260,7 @@ impl<T> Default for StreamOwnership<T> {
     fn default() -> Self {
         Self {
             streams: RefCell::new(HashMap::new()),
+            identities: RefCell::new(HashMap::new()),
             next: Cell::new(0),
         }
     }
@@ -218,11 +271,20 @@ impl<T> StreamOwnership<T> {
     ///
     /// The handle is fresh even when another open already has this
     /// stream's wire id, which is the entire point.
-    pub fn insert(&self, stream: T) -> u64 {
-        let handle = self.next.get().saturating_add(1);
+    ///
+    /// **A checked increment, refusing at the counter's end.** A
+    /// saturating one reissued `u64::MAX` forever and the `insert`
+    /// below overwrote the live entry under it — the one way to break
+    /// "a handle is never reused", which is what stops a retained
+    /// caller addressing a later open. The refused stream is handed
+    /// back for the caller to close.
+    pub fn insert(&self, stream: T) -> Result<u64, T> {
+        let Some(handle) = self.next.get().checked_add(1) else {
+            return Err(stream);
+        };
         self.next.set(handle);
         self.streams.borrow_mut().insert(handle, stream);
-        handle
+        Ok(handle)
     }
 
     /// Take ownership of an opened stream **and its own identity**.
@@ -232,15 +294,30 @@ impl<T> StreamOwnership<T> {
     /// reply both come from here, so no backend can answer with the
     /// peer the caller requested instead of the one it got. An
     /// unreadable identity is refused and the stream handed back, for
-    /// the caller to close.
-    pub fn adopt(&self, stream: T) -> Result<(u64, ResolvedIdentity), T>
+    /// the caller to close — and so is a **duplicate** one.
+    ///
+    /// **One identity is one open.** Two opens sharing `(wire_id,
+    /// peer, incarnation)` are two handles over ONE node stream: both
+    /// consumers receive every payload of the one wire stream, and
+    /// closing either one kills the survivor's receive half — the
+    /// node's `stream_kinds` and `rx_closed` are keyed on the shared
+    /// `(peer, stream_id)`. The second open is refused and handed
+    /// back to be closed; the survivor is untouched. The identity is
+    /// released when the handle is, so an open-close-open sequence of
+    /// the same stream is two opens, as it should be.
+    pub fn adopt(&self, stream: T) -> Result<(u64, ResolvedIdentity), AdoptRefusal<T>>
     where
         T: StreamIdentity,
     {
-        match stream.identity() {
-            Some(identity) => Ok((self.insert(stream), identity)),
-            None => Err(stream),
+        let Some(identity) = stream.identity() else {
+            return Err(AdoptRefusal::Unreadable(stream));
+        };
+        if self.identities.borrow().contains_key(&identity) {
+            return Err(AdoptRefusal::Duplicate(identity, stream));
         }
+        let handle = self.insert(stream).map_err(AdoptRefusal::Exhausted)?;
+        self.identities.borrow_mut().insert(identity, handle);
+        Ok((handle, identity))
     }
 
     /// Do something with the stream this handle owns.
@@ -248,18 +325,37 @@ impl<T> StreamOwnership<T> {
     /// `None` when the handle owns nothing — which is "your stream is
     /// closed", never "some other peer's stream under the same wire
     /// id".
-    pub fn with<R>(&self, handle: u64, action: impl FnOnce(&T) -> R) -> Option<R> {
-        let streams = self.streams.borrow();
-        streams.get(&handle).map(action)
+    ///
+    /// **The borrow is released before the action runs.** The action
+    /// is application code — `answer_stream_request`'s send arm runs
+    /// `dispatch_events`, whose JS listeners are documented to call
+    /// straight back in — so holding the map borrow across it trapped
+    /// "already borrowed" on any re-entry (an `open` or a `close`
+    /// arriving inside a `send`) and killed the request mid-flight.
+    /// `T` is handle-like, so acting on a clone addresses the same
+    /// open and the map is free for the whole of the action.
+    pub fn with<R>(&self, handle: u64, action: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: Clone,
+    {
+        let stream = self.streams.borrow().get(&handle).cloned();
+        stream.as_ref().map(action)
     }
 
     /// Give up the stream this handle owns, if it still owns one.
     pub fn remove(&self, handle: u64) -> Option<T> {
-        self.streams.borrow_mut().remove(&handle)
+        let stream = self.streams.borrow_mut().remove(&handle)?;
+        // By handle value rather than through the stream's identity:
+        // the identity map is a veto on ADOPTION, so a value inserted
+        // without one (`insert`) has nothing to clear and must not
+        // need a bound this method does not otherwise want.
+        self.identities.borrow_mut().retain(|_, owner| *owner != handle);
+        Some(stream)
     }
 
     /// Take every stream, for a backend that is shutting down.
     pub fn drain(&self) -> Vec<T> {
+        self.identities.borrow_mut().clear();
         self.streams.borrow_mut().drain().map(|(_, s)| s).collect()
     }
 
@@ -277,6 +373,7 @@ impl<T> StreamOwnership<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     /// Two opens sharing a wire id are two opens.
     ///
@@ -289,8 +386,8 @@ mod tests {
     fn two_streams_with_one_wire_id_get_distinct_handles() {
         let owned: StreamOwnership<(&str, u64)> = StreamOwnership::default();
         // Same wire id (9), different peers.
-        let a = owned.insert(("peer-a", 9));
-        let b = owned.insert(("peer-b", 9));
+        let a = owned.insert(("peer-a", 9)).expect("handles remain");
+        let b = owned.insert(("peer-b", 9)).expect("handles remain");
 
         assert_ne!(a, b, "two opens must not share a handle");
         assert_eq!(
@@ -305,8 +402,8 @@ mod tests {
     #[test]
     fn removing_one_leaves_the_other() {
         let owned: StreamOwnership<(&str, u64)> = StreamOwnership::default();
-        let a = owned.insert(("peer-a", 9));
-        let b = owned.insert(("peer-b", 9));
+        let a = owned.insert(("peer-a", 9)).expect("handles remain");
+        let b = owned.insert(("peer-b", 9)).expect("handles remain");
 
         assert_eq!(owned.remove(a).map(|s| s.0), Some("peer-a"));
 
@@ -321,9 +418,9 @@ mod tests {
     #[test]
     fn a_handle_is_never_reused() {
         let owned: StreamOwnership<u64> = StreamOwnership::default();
-        let first = owned.insert(1);
+        let first = owned.insert(1).expect("handles remain");
         owned.remove(first);
-        let second = owned.insert(2);
+        let second = owned.insert(2).expect("handles remain");
 
         // A reused handle would let a retained caller address a later
         // open — the defect this type exists to prevent, one level
@@ -335,7 +432,7 @@ mod tests {
     #[test]
     fn an_unknown_handle_owns_nothing() {
         let owned: StreamOwnership<u64> = StreamOwnership::default();
-        let handle = owned.insert(7);
+        let handle = owned.insert(7).expect("handles remain");
 
         assert_eq!(owned.with(handle.wrapping_add(1), |s| *s), None);
         assert_eq!(owned.with(0, |s| *s), None);
@@ -430,17 +527,30 @@ mod tests {
         resolvable: bool,
         closed: Cell<usize>,
         sent: RefCell<Vec<Vec<u8>>>,
+        /// The wire id the next open resolves to: identity is
+        /// `(wire_id, peer, incarnation)`, so distinct opens need
+        /// distinct values here, and rewinding it mints a duplicate
+        /// identity on purpose.
+        next_wire: Cell<u64>,
+        /// A call-back `send` performs, standing in for the
+        /// `dispatch_events` listeners that are documented to call
+        /// straight back in: `(the table to re-enter, the handle to
+        /// close)`.
+        reenter: RefCell<Option<(Rc<StreamOwnership<SpyStream>>, u64)>>,
     }
 
-    /// A stream that can be made unresolvable.
+    /// A stream that can be made unresolvable, over an identity the
+    /// backend mints per open.
+    #[derive(Clone)]
     struct SpyStream {
         resolvable: bool,
+        wire_id: u64,
     }
 
     impl StreamIdentity for SpyStream {
         fn identity(&self) -> Option<ResolvedIdentity> {
             self.resolvable.then_some(ResolvedIdentity {
-                wire_id: 9,
+                wire_id: self.wire_id,
                 peer: 0xaa,
                 incarnation: 1,
             })
@@ -458,8 +568,11 @@ mod tests {
             _channel_hash: Option<u16>,
             _peer: Option<u64>,
         ) -> Result<Self::Stream, crate::leader::ProxyFailure> {
+            let wire_id = self.next_wire.get();
+            self.next_wire.set(wire_id.wrapping_add(1));
             Ok(SpyStream {
                 resolvable: self.resolvable,
+                wire_id,
             })
         }
 
@@ -469,6 +582,18 @@ mod tests {
             payload: &[u8],
         ) -> Result<(), crate::leader::ProxyFailure> {
             self.sent.borrow_mut().push(payload.to_vec());
+            // The documented re-entry: a `send` runs `dispatch_events`
+            // into JS listeners that may call straight back in.
+            if let Some((owned, handle)) = self.reenter.borrow_mut().take() {
+                let (reply, _answers) = crate::leader::Replier::local_for_test(1);
+                let unhandled = answer_stream_request(
+                    &owned,
+                    self,
+                    crate::leader::LeaderRequest::StreamClose { handle },
+                    reply,
+                );
+                assert!(unhandled.is_none(), "the stream arms prefilter");
+            }
             Ok(())
         }
 
@@ -482,6 +607,8 @@ mod tests {
             resolvable,
             closed: Cell::new(0),
             sent: RefCell::new(Vec::new()),
+            next_wire: Cell::new(9),
+            reenter: RefCell::new(None),
         }
     }
 
@@ -515,8 +642,10 @@ mod tests {
         // The request names a DIFFERENT peer from the one the stream
         // resolves to, which is the case that separates "resolved"
         // from "echoed". An unnamed-peer open is the same case with
-        // `None`.
-        for requested in [None, Some(0xbbbb)] {
+        // `None`. Each open mints its own wire id — one identity is
+        // one open now — so the reply's id tracks the mint while the
+        // RESOLVED peer and incarnation stay the stream's own.
+        for (opened, requested) in [None, Some(0xbbbb)].into_iter().enumerate() {
             let outcome = answer(&owned, &backend, open_request(requested));
             match outcome.expect("opened") {
                 crate::leader::ProxyValue::Stream {
@@ -526,7 +655,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(peer, 0xaa, "the reply must carry the resolved peer");
-                    assert_eq!(stream_id, 9);
+                    assert_eq!(stream_id, 9 + opened as u64, "and the id it resolved to");
                     assert_eq!(incarnation, 1);
                 }
                 other => panic!("expected a stream answer, got {other:?}"),
@@ -643,13 +772,128 @@ mod tests {
     #[test]
     fn draining_gives_up_everything() {
         let owned: StreamOwnership<u64> = StreamOwnership::default();
-        owned.insert(1);
-        owned.insert(2);
+        owned.insert(1).expect("handles remain");
+        owned.insert(2).expect("handles remain");
 
         let mut taken = owned.drain();
         taken.sort_unstable();
 
         assert_eq!(taken, vec![1, 2]);
         assert!(owned.is_empty(), "a shut-down backend holds nothing");
+    }
+
+    /// One identity is one open: a second open of a live `(wire_id,
+    /// peer, incarnation)` is refused.
+    ///
+    /// Two opens sharing all three were two handles over ONE node
+    /// stream — both consumers received every payload of the one wire
+    /// stream, and closing either one removed the shared
+    /// `(peer, stream_id)` state out from under the survivor's
+    /// receive half.
+    #[test]
+    fn a_second_open_of_one_identity_is_refused_and_the_survivor_is_untouched() {
+        let owned = StreamOwnership::default();
+        let backend = spy(true);
+        let first = match answer(&owned, &backend, open_request(None)).expect("the first open") {
+            crate::leader::ProxyValue::Stream { handle, .. } => handle,
+            other => panic!("{other:?}"),
+        };
+
+        // The same identity again: the same wire stream, opened twice.
+        backend.next_wire.set(9);
+        answer(&owned, &backend, open_request(Some(0xbbbb)))
+            .expect_err("a duplicate identity must be refused");
+        assert_eq!(
+            backend.closed.get(),
+            1,
+            "the refused stream is given back and closed, not leaked open"
+        );
+        assert_eq!(
+            owned.with(first, |s| s.wire_id),
+            Some(9),
+            "the survivor is untouched"
+        );
+        assert_eq!(owned.len(), 1, "the duplicate took no slot");
+
+        // The identity is released with its handle: after the survivor        // closes, the same identity is openable again.
+        assert!(
+            answer(
+                &owned,
+                &backend,
+                crate::leader::LeaderRequest::StreamClose { handle: first }
+            )
+            .is_ok()
+        );
+        backend.next_wire.set(9);
+        answer(&owned, &backend, open_request(None))
+            .expect("a closed identity may be opened again");
+    }
+
+    /// A send whose dispatch calls straight back in may close another
+    /// open mid-flight.
+    ///
+    /// The re-entry `LeafStream::on_message` documents ("the callback
+    /// runs with no borrow of the node held, so it may call straight
+    /// back in") reaches this table too, and `with` used to hold the
+    /// map borrow across the action: a listener closing another open
+    /// trapped `already borrowed` and killed the request mid-flight.
+    #[test]
+    fn a_send_that_is_called_back_into_can_close_another_open() {
+        let owned: Rc<StreamOwnership<SpyStream>> = Rc::new(StreamOwnership::default());
+        let backend = spy(true);
+        let first = match answer(&owned, &backend, open_request(None)).expect("open") {
+            crate::leader::ProxyValue::Stream { handle, .. } => handle,
+            other => panic!("{other:?}"),
+        };
+        let second = match answer(&owned, &backend, open_request(None)).expect("open") {
+            crate::leader::ProxyValue::Stream { handle, .. } => handle,
+            other => panic!("{other:?}"),
+        };
+        backend
+            .reenter
+            .borrow_mut()
+            .replace((Rc::clone(&owned), first));
+
+        assert!(
+            answer(
+                &owned,
+                &backend,
+                crate::leader::LeaderRequest::StreamSend {
+                    handle: second,
+                    payload: bytes::Bytes::from_static(b"two"),
+                }
+            )
+            .is_ok(),
+            "the re-entrant close must not kill the send that called it"
+        );
+        assert_eq!(backend.closed.get(), 1, "the callback's close ran");
+        assert_eq!(
+            owned.with(first, |s| s.wire_id),
+            None,
+            "and the closed open is gone"
+        );
+        assert!(
+            owned.with(second, |s| s.wire_id).is_some(),
+            "the sending open is untouched"
+        );
+        assert_eq!(backend.sent.borrow().len(), 1);
+    }
+
+    /// The counter's end refuses rather than reissuing.
+    ///
+    /// A `saturating_add(1)` reissued `u64::MAX` forever and the map
+    /// insert overwrote the live entry under it — the one way to break
+    /// "a handle is never reused", which is what stops a retained
+    /// caller addressing a later open.
+    #[test]
+    fn the_terminal_handle_is_refused_rather_than_reissued() {
+        let owned: StreamOwnership<u64> = StreamOwnership::default();
+        owned.next.set(u64::MAX);
+
+        assert!(
+            owned.insert(1).is_err(),
+            "the counter's end must refuse, not wrap"
+        );
+        assert!(owned.is_empty(), "a refusal must not overwrite a live entry");
     }
 }

@@ -286,9 +286,24 @@ impl Drop for PeerLink {
             self.retained.clear();
             self.retained_bytes = 0;
         }
+        // **Detach before the fields drop.** The handler `Closure`s
+        // below die with this struct, and an event task already
+        // queued against the channel or the connection would then
+        // dispatch into a dropped closure: wasm-bindgen throws
+        // "closure invoked recursively or after being dropped" as an
+        // uncaught handler error on every link replacement and close,
+        // and the payload the handler carried is lost with it.
+        // Clearing the slots first means a late event finds no
+        // handler to call. Order matters within each half: detach,
+        // then close.
         if let Some(channel) = &self.channel {
+            channel.set_onmessage(None);
+            channel.set_onbufferedamountlow(None);
             channel.close();
         }
+        self.connection.set_onicecandidate(None);
+        self.connection.set_oniceconnectionstatechange(None);
+        self.connection.set_ondatachannel(None);
         self.connection.close();
     }
 }

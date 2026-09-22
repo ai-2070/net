@@ -1028,16 +1028,6 @@ fn fall_back_to_follower(
     if shared.state.borrow().closed {
         return Ok(());
     }
-    // Whatever the old leader owed this tab is owed by nobody now.
-    // Typed and named, not dropped: a sender that merely went away
-    // settles as `SessionLost`, which is a weaker answer to "which
-    // leader did I lose" than the one this path knows.
-    if let Some(client) = shared.client.borrow_mut().as_mut() {
-        client.fail_pending(ProxyFailure::Typed(LeafError::Rpc(RpcError::LeaderLost {
-            generation: previous,
-        })));
-    }
-    *shared.client.borrow_mut() = None;
     emit(
         shared,
         &format!(
@@ -1045,6 +1035,37 @@ fn fall_back_to_follower(
             json_string(&error.to_string())
         ),
     );
+    resume_as_follower(shared, previous)
+}
+
+/// Become a functioning follower again after losing the leader's
+/// role, and queue for the lock so this tab can be promoted again.
+///
+/// ONE helper for both recovery paths — [`fall_back_to_follower`]
+/// and [`stand_down`] — because two copies drift, and this one did:
+/// `stand_down` reset the role and never re-attached, while
+/// `attach_as_follower` is the only place `shared.client` is ever
+/// set. After a stand-down — the frozen-tab scenario `guard_lease`
+/// exists for — every `Lifecycle::request` therefore took the
+/// client-less arm and failed `NotLeader` for the rest of the tab's
+/// life, `dispatch` piled inbound messages into `shared.queued` for
+/// a `take_leadership` that would never run, and no
+/// `await_promotion` waiter existed to win the lock when the
+/// successor closed. The tab was a permanent zombie.
+fn resume_as_follower(shared: &Rc<Shared>, lost: u64) -> Result<()> {
+    if shared.state.borrow().closed {
+        return Ok(());
+    }
+    // Whatever the old leader owed this tab is owed by nobody now.
+    // Typed and named, not dropped: a sender that merely went away
+    // settles as `SessionLost`, which is a weaker answer to "which
+    // leader did I lose" than the one this path knows.
+    if let Some(client) = shared.client.borrow_mut().as_mut() {
+        client.fail_pending(ProxyFailure::Typed(LeafError::Rpc(RpcError::LeaderLost {
+            generation: lost,
+        })));
+    }
+    *shared.client.borrow_mut() = None;
     attach_as_follower(shared)?;
     // Queued again, after a pause. Queued because the origin now has
     // no node and somebody has to bring one up. After a pause because
@@ -1662,6 +1683,18 @@ fn stand_down(shared: &Rc<Shared>, successor: u64) {
             "{{\"type\":\"not_leader\",\"presented\":\"{ours}\",\"current\":\"{successor}\"}}"
         ),
     );
+    // **And then the same recovery `fall_back_to_follower` performs**
+    // — one helper for both, because this path never re-attached:
+    // `attach_as_follower` is the only setter of `shared.client`, so
+    // a stood-down tab took `request`'s client-less arm (`NotLeader`,
+    // for ever), queued every inbound message for a
+    // `take_leadership` that would never run, and had no
+    // `await_promotion` waiter to win the lock when the successor
+    // closed. A permanent zombie, in exactly the frozen-tab scenario
+    // `guard_lease` stands this tab down for.
+    if let Err(error) = resume_as_follower(shared, ours) {
+        report(&format!("re-attaching as a follower after stand-down: {error}"));
+    }
 }
 
 /// The sink a leader's node hands every event to.
@@ -1967,11 +2000,15 @@ impl LeaderBackend for NodeBackend {
                 kind,
                 payload,
             } => spawn_fenced(&lease, &ops, async move {
+                // The dialog travels as 16 hex digits, the exact
+                // spelling `LeafNode::signal` parses: it was carried
+                // through here as `f64`, and `dialog as f64` ROUNDS —
+                // ~511 of every 512 minted `u64` dialogs came back
+                // naming no attempt at all.
                 match node
                     .signal(
                         format!("{peer:016x}"),
-                        #[allow(clippy::cast_precision_loss)]
-                        (dialog as f64),
+                        format!("{dialog:016x}"),
                         kind,
                         Uint8Array::from(&payload[..]),
                     )
@@ -2410,7 +2447,7 @@ impl MeshSession {
     pub async fn signal(
         &self,
         peer_hex: String,
-        dialog: f64,
+        dialog_hex: String,
         kind: String,
         payload: Uint8Array,
     ) -> Result<(), JsError> {
@@ -2425,11 +2462,17 @@ impl MeshSession {
         // canonical 16-hex on the way to
         // [`crate::wasm::LeafNode::signal`], which read DECIMAL.
         let peer = crate::wasm::parse_peer_id(&peer_hex)?;
+        // **The dialog too is the 16-hex spelling the boundary hands
+        // out**, parsed to the exact `u64` here and never carried as
+        // `f64`: `dialog.max(0.0) as u64` ROUNDED, so ~511 of every
+        // 512 minted dialogs were signed for a number naming no
+        // attempt (`channelHash` broke the same way twice before that
+        // class was named).
+        let dialog = crate::wasm::parse_dialog_id(&dialog_hex)?;
         self.lifecycle
             .request(LeaderRequest::Signal {
                 peer,
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                dialog: dialog.max(0.0) as u64,
+                dialog,
                 kind,
                 payload: Bytes::from(payload.to_vec()),
             })
