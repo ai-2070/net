@@ -5110,10 +5110,33 @@ jobs:
       #     pinned to a step" guard in the integration job exists to prevent.
       #     That guard was never applied to its own neighbour. `--no-tests=fail`
       #     closes it natively: an empty filterset is an error, not a pass.
-      - name: Org + authority + enrollment storage unit tests
+      # `enrollment_storage` is split into its own step below instead of riding
+      # as a third arm of this union. `--no-tests=fail` fires only when the
+      # WHOLE filter selects nothing, so a rename or feature-gating of
+      # `enrollment_storage` alone dropped that arm to zero while these two
+      # surfaces still matched and the step stayed green — the exact
+      # silent-shrink failure the note above cites the guard for. These two
+      # arms are the pre-existing org surfaces and stay together; the
+      # patch-introduced arm is isolated so its disappearance is loud.
+      - name: Org + authority unit tests
         run: >
           cargo nextest run --features net --lib --no-tests=fail
-          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/) + test(/^adapter::net::behavior::enrollment_storage::/)'
+          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
+
+      # Enrollment storage: the protected snapshot owner's type boundary
+      # (private fields, non-Clone, `&mut self` writes, `Busy` on second
+      # ownership) and FS boundary (`ensure_secure_authority_dir`,
+      # uid/mode/nlink/ACL checks, `open_regular_nofollow`, atomic publish
+      # with `Uncertain` fencing on post-rename failure).
+      # `.config/nextest.toml` already pins these `retries = 0` as
+      # security-critical; a SOLO `--no-tests=fail` filter is what turns a
+      # module rename or a silent gating-out into a red step rather than a
+      # green no-op. No count floor needed — an empty filterset is the error.
+      - name: Enrollment storage unit tests
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(/^adapter::net::behavior::enrollment_storage::/)'
 
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
