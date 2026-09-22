@@ -3261,3 +3261,142 @@ the recorded state (missing upload ENDs in the new witnesses — test-side
 construction, caught by the witnesses' own timeouts, fixed before any
 receipt ran; and one fuzzy-edit corruption of the DX seam's `impl` header
 — repaired, compile-caught, never committed).
+
+### 4.4 Slice 2.4 — half-close + both-direction retirement
+
+**Landed (executed):** `S2.4: half-close discipline and both-direction
+retirement` (3 files) on base `98d5ddfd4`. `cortex/rpc.rs` receipt
+baseline for this slice:
+`d3da02cfcec9198f67ad5444a6adaafe16539c1149c5c84ab4fd1c8ee372e6ee`.
+
+**What landed (source-established):** the §2.6 table's production delta
+completes with `RequestStream`'s retire-awareness (§2.2's
+request-chunk-queue row: a PROTECTED `poll_next` honors the RETIRED call
+BEFORE yielding — buffered items discarded through the queue owner;
+`RequestStream::new_protected` wires the retire signal at the CS/DX
+admitted seams; public uploads unchanged) — the rest of the slice's named
+change (END closes input ONCE; retire closes both halves; independent
+halves under one record) rode 2.2's record machinery (`end_input`, the
+record gates in `apply_request_chunk_to_senders`, the supervisors' forced
+paths) and is BOUND here by its named witnesses (F-S2.4-2).
+
+**Witnesses + counts (executed):** `org_rpc_streaming` binary **39 → 41**.
+
+| Witness | Asserted observation | Named inverse |
+|---|---|---|
+| `upload_end_then_remaining_output_completes` | the §2.6 half-close independence under one record: the upload END closes input ONCE (`input_half() == Ended`, observed on the LIVE record held by its credit-parked output) and a second END / late post-END chunk change nothing (never reopens, never delivered); the handler's REMAINING OUTPUT — echoes IN ORDER then the post-EOF tail — and ONE terminal (exact wire content: `Ok` + `nrpc-streaming: end`) complete after the early END | R-S2.4a (END retires both halves instead of half-closing) |
+| `retire_unblocks_both_directions` | a retire closes BOTH halves: the INPUT-side waiter (the handler parked on request reads) is released — its owned future drops (§2.2's "cancellation signaled and the owned future dropped", `DropFlag`) — and the input admission is closed through the queue owner (`sender_keys()` empty); the OUTPUT-side waiter (the credit-parked pump holding a queued echo) is stopped: exactly ONE `Cancelled` terminal, and a LATE `STREAM_GRANT` after the terminal never resurrects the pump ("no chunk is published after the terminal" — §2.2's abort+join invariant) | R-S2.4b (the input admission not closed) + R-S2.4c-v2 (the true two-layer output inverse) |
+
+Green (executed, exit-captured): `cargo fmt -p net-mesh -- --check` →
+exit 0; `cargo tf --retries 0 --test org_rpc_streaming` → **41 run / 41
+passed / 0 skipped**, exit 0.
+
+**Inverse receipts (executed, raw).** Command shape: `cargo tf --retries 0
+--test org_rpc_streaming -E 'test(=<witness>)'`.
+
+**R-S2.4a — END retires both halves instead of half-closing
+(`cortex/rpc.rs`, `apply_request_chunk_to_senders`' END path):**
+
+```diff
+         if let Some(record) = sender.record.as_ref() {
+-            record.lock().end_input();
++            record.lock().retire(StreamTerminalReason::Cancelled); // R-S2.4a MUTATION: END retires both halves
+         }
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'upload_end_then_remaining_output_completes' (184712) panicked at tests\org_rpc_streaming.rs:5012:5:
+the upload END closes the input half
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The input half never reports its one-time close (the mutation's retire
+touches no input state). Restore: edit-reversed; sha256
+`d3da02cfcec9198f67ad5444a6adaafe16539c1149c5c84ab4fd1c8ee372e6ee`
+== baseline. Restored green: exit 0, 1/1.
+
+**R-S2.4b — the input admission is not closed through the queue owner
+(`cortex/rpc.rs`, `StreamCallRegistration::complete`):**
+
+```diff
+-        if let Some(senders) = self.senders.as_ref() {
+-            senders.lock().remove(&self.key);
+-        }
++        // R-S2.4b MUTATION: the input admission is not closed (senders kept)
++        let _ = &self.senders;
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'retire_unblocks_both_directions' (189580) panicked at tests\org_rpc_streaming.rs:5203:5:
+the retire closed the input admission through the queue owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Restore: edit-reversed; same sha == baseline. Restored green: exit 0, 1/1.
+
+**R-S2.4c-v2 — the true two-layer output inverse (the pump never stopped
+AND the window entry kept live).** Layer 1 = the forced path's
+`sem.close()` + abort/join removed; layer 2 = `complete()`'s
+`flow_control` removal removed:
+
+```diff
+-        if let Some(sem) = flow_sem.as_ref() {
+-            sem.close();
+-        }
+-        if !pump_done {
+-            pump_task.as_mut().abort();
+-            let _ = pump_task.as_mut().await;
+-        }
++        // R-S2.4c-v2 MUTATION (layer 1): the pump is never stopped
+```
+```diff
+-        if let Some(flow_control) = self.flow_control.as_ref() {
+-            flow_control.lock().remove(&self.key);
+-        }
++        // R-S2.4c-v2 MUTATION (layer 2): the window entry is kept live
+```
+
+**exit 100.** Verbatim:
+
+```
+thread 'retire_unblocks_both_directions' (175592) panicked at tests\org_rpc_streaming.rs:5250:5:
+assertion `left == right` failed: no chunk is published after the terminal — the late grant never resurrects the stopped pump
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+The late grant resurrected the unstopped pump and the queued echo
+published AFTER the terminal (`left: 2`). Restore: edit-reversed (both
+layers); same sha == baseline. Restored green: exit 0, 1/1.
+
+**Findings (stated, not decided):**
+
+1. **F-S2.4-1 — `retire_unblocks_both_directions` is GREEN under the
+   SINGLE-layer pump-stop inverse (disclosed; four weakenings: NONE apply
+   to the witness — its assertions are exact and unmoved).** Removing only
+   the forced path's `sem.close()` + abort leaves the witness green: the
+   late `STREAM_GRANT` cannot reach the parked pump because
+   `StreamCallRegistration::complete()`'s `flow_control` removal is an
+   INDEPENDENT second defense (the grant's map lookup misses). The
+   named property ("no chunk is published after the terminal") holds via
+   the layered defenses; its true inverse removes BOTH output-side layers
+   (R-S2.4c-v2, red at the witness's own named assertion). Recorded
+   because the brief's inverse-column discipline would otherwise read the
+   single-layer cycle as a non-discriminating witness; it is not — the
+   single-layer mutation is not the property's inverse.
+2. **F-S2.4-2 — most of slice 2.4's named change rode 2.2's record
+   machinery (stated).** The plan's rows overlap here exactly as in
+   F-S2.2-1: `end_input` (END-once), the record gates (late input
+   refused) and the supervisors' forced paths (retire closes both halves)
+   landed at 2.2 because its own witnesses bind them
+   (`end_cannot_cancel_another_stream_or_reopen_terminal_half`); this
+   slice adds the §2.2 queue-owner row's `poll_next` retire-awareness and
+   binds the full §2.6 table with its named pair.
+
+**What never ran at 4.4 (complete):** the §4.1 list unchanged (the fmt
+gate IS executed — exit 0).
