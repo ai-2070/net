@@ -1138,9 +1138,84 @@ re-handshake rule defers rotation of a live, busy session (`DeferBusy`,
 retry. This is deliberate core safety behavior; a clean close of `join`'s
 attach probe would avoid it and is a candidate follow-up.
 
-**Next (R1c):** the natsim direct-path row — device `up --enroll` behind a
-port-mapping gateway (no manual configuration), agent `join` + `up` on the WAN,
-no relay node in the topology — then R2 (blind relay and the fallback rows).
+#### R1c — natsim direct-path row (`14e524808`, CI pending)
+
+`tests/natsim/setup.sh --nat-a upnp` adds a gateway that only masquerades
+outbound and forwards nothing by itself. `tests/natsim/enroll/run_enroll_direct.sh`
+starts `miniupnpd` (NAT-PMP / PCP / UPnP, nftables backend) in that gateway,
+runs `net-mesh up --enroll` with defaults on the device, and has a public agent
+run `join` and `up`, with **no relay or helper process in the topology**. It
+requires the mapping to be active and signed into the token, join and joined
+`up` to attach, the bundle contact to be the mapped UDP address, conntrack to
+show the agent's TCP and UDP flows DNAT'd straight to the device's private
+address, a negative control (`--no-port-mapping`, public address forced into the
+token) to fail to join, and the mappings to be removed after shutdown. The new
+`natsim-enroll` workflow runs only this row. Written on Windows and not yet run:
+the first CI result decides whether the miniupnpd nftables integration needs
+iteration.
+
+#### R2 — blind relay fallback: design (user-approved 2026-09-23)
+
+**Choice: a native blind UDP relay in the core transport**, not a TCP
+splice/tunnel. Rationale for the primary use case (devices such as robot arms,
+sensors and cameras talking to a cloud agent):
+
+1. The traffic is latency-sensitive and loss-tolerant. Net's lossy streams and
+   its own reliable-stream recovery assume UDP; tunnelling over TCP turns lossy
+   into "reliable but late", adds head-of-line blocking, and stacks TCP
+   retransmission under Net's own — worst exactly on the lossy CGNAT/mobile
+   paths where the relay is used.
+2. A relayed session that is a real mesh session over UDP can later move to a
+   direct path through the existing hole-punch / direct-path upgrade machinery;
+   a TCP tunnel is invisible to it and stays relayed.
+3. A shared default relay must be cheap per packet: forwarding opaque datagrams
+   by a small channel header scales better than per-pair TCP streams.
+4. It stays blind: the relay forwards NKpsk0 ciphertext by channel number, never
+   holds the PSK, issuer key or any mesh credential, and cannot join the mesh.
+
+**Shape.**
+
+- **Device registration:** the device keeps an authenticated UDP registration
+  with the relay (registration id derived from the device's relay key, so only
+  that key can claim it); its keepalives also hold the device's NAT mapping
+  open, so every joiner reaches the device through that one relay port and
+  mapping without punching.
+- **Relayed peer transport (core):** a new relayed peer-address kind; datagrams
+  to and from a relayed peer carry a small channel header, and the relay maps
+  channels to endpoints. Mesh handshakes and data are unchanged end-to-end.
+- **Enrollment through the relay:** enrollment stays PSK-free Noise NK over a
+  byte stream; the relay offers a small blind TCP splice between the joiner and
+  a fresh outbound stream from the device. No reliability layer is built for
+  enrollment over UDP.
+- **Tokens and bundles** carry the direct address (if any) plus a relay locator
+  (relay address and registration id). `join` and joined `up` try direct first
+  and fall back automatically; relay availability never blocks a viable direct
+  path.
+- **Relay hosting:** `net-mesh relay serve` for user-run relays; a project-run
+  default endpoint is configuration (the address is not invented before a
+  relay is actually deployed). Relays bound registrations, channels, splices and
+  per-registration rates, time out idle state, and never amplify.
+- **Not covered:** networks that block UDP entirely. A TCP/443 tunnel mode can be
+  added later as a last-resort path alongside this design.
+
+**Phases, each proven before the next:**
+
+1. Relay server (`net-mesh relay serve`) and the core relayed-peer transport,
+   with unit and loopback witnesses.
+2. Enrollment splice through the relay.
+3. Token and bundle relay locators; direct-first, relay-fallback in `join` and
+   joined `up`.
+4. natsim rows: direct forced to fail (mapping off / CGNAT-style gateway) with a
+   relay present → joins relayed, evidence identifying the relayed path; relay
+   down with mapping working → joins directly.
+5. Later: relayed-to-direct upgrade using the existing hole-punch machinery.
+
+The core transport is hardened code with a large test surface; each phase runs
+its focused witnesses plus the full relevant CI families, with inverse
+mutations for every authority or path claim.
+
+**Next:** R1c CI result, then R2 phase 1 (relay server + core relayed-peer
+transport).
 Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
 remain open.
 
