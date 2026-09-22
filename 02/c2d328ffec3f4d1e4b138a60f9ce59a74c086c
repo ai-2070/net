@@ -1,0 +1,14 @@
+.claude/skills/net-event-bus/dataforts.md
+  h_64425bc75e3f3d 167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "02c2d328ffec3f4d1e4b138a60f9ce59a74c086c",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
