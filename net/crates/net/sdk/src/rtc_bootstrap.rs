@@ -521,9 +521,28 @@ struct Attempt {
 }
 
 /// The live attempts, keyed by token.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Attempts {
     by_token: Mutex<HashMap<String, Attempt>>,
+}
+
+/// Redacting `Debug` (MR#16's class): the map keys **are** the live
+/// attempt tokens (R1) — whoever holds one can trickle into that
+/// attempt or retire it — so the derived `Debug` over this
+/// token-keyed map handed out pending-attempt control from any log
+/// line, panic message or `tracing` field that formatted the state.
+/// It is not the domain PSK, and no production logging call is known
+/// to print it; it is redacted anyway (the same treatment
+/// [`OfferResponse`] gives `attempt_token`). The attempts' own
+/// fields — which dialog, whose node, which socket generation — stay
+/// visible for diagnosis.
+impl fmt::Debug for Attempts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guard = self.by_token.lock();
+        f.debug_map()
+            .entries(guard.iter().map(|(_, attempt)| ("<redacted>", attempt)))
+            .finish()
+    }
 }
 
 impl Attempts {
@@ -1530,6 +1549,121 @@ mod tests {
         );
         state.clear_challenge("tok");
         assert_eq!(state.key_authorization("tok"), None);
+    }
+
+    /// `Attempts`' keys are hex; the decimal-spelling checks below
+    /// need the raw bytes back.
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Review #14's witness: a no-bearer-secret print over the SDK
+    /// types that carry one. `BrowserBootstrapCredential`'s
+    /// hand-written `Debug` redacts the PSK one field above `invite`,
+    /// so the invite's derived `Debug` used to print the
+    /// proof-of-invite nonce straight through the redaction (MR#16's
+    /// shape) — and `Attempts`' derived `Debug` printed its live
+    /// attempt tokens as map keys. Every secret is checked in BOTH
+    /// spellings a formatter can produce (the decimal `{:?}` of its
+    /// raw bytes and its lowercase hex) against `{:?}` of the
+    /// credential, its invite, its PSK, a response carrying an
+    /// attempt token, and the live attempt table. The positive
+    /// control — root, bootstrap_url and dialog still print — proves
+    /// the rendering reached the very fields the secrets sit beside,
+    /// so a silent over-redaction cannot pass as a fix.
+    #[test]
+    fn the_invite_nonce_psk_bearer_and_attempt_tokens_never_appear_in_debug() {
+        use crate::enrollment::InviteToken;
+        use crate::identity::Identity;
+        use std::time::Duration;
+
+        const NOW: u64 = 1_700_000_000;
+        let issuer = Identity::from_seed([0x2Au8; 32]);
+        let root = Identity::from_seed([0x2Bu8; 32]).entity_id().clone();
+        let invite = InviteToken::mint_at(
+            &root,
+            "rendezvous.example:8443",
+            Duration::from_secs(600),
+            NOW,
+        );
+        let credential = BrowserBootstrapCredential::mint_at(
+            &issuer,
+            invite,
+            [7u8; 32],
+            Psk::new([0xA5u8; 32]),
+            "https://anchor.example/rtc",
+            Duration::from_secs(30 * 86_400),
+            NOW,
+        );
+        let attempts = Attempts::default();
+        let (token, _budget) = attempts.mint(42, 4_242_424_242, 3).expect("mint");
+        let response = OfferResponse {
+            attempt_token: token.clone(),
+            dialog: 4_242_424_242,
+            sdp: "v=0".to_string(),
+            candidate: "candidate:1".to_string(),
+        };
+        let rendered = [
+            format!("{credential:?}"),
+            format!("{:?}", credential.invite),
+            format!("{:?}", credential.psk),
+            format!("{response:?}"),
+            format!("{attempts:?}"),
+        ];
+        let all = rendered.join("\n");
+
+        let nonce = credential.invite.nonce;
+        let psk = *credential.psk.expose_bytes();
+        let token_raw = hex_to_bytes(&token);
+        for (what, bytes, hex) in [
+            ("invite nonce", nonce.as_slice(), hex_of(&nonce)),
+            ("PSK", psk.as_slice(), hex_of(&psk)),
+            ("attempt token", token_raw.as_slice(), token.clone()),
+        ] {
+            assert!(!all.contains(&hex), "the {what} leaked into Debug as hex");
+            assert!(
+                !all.contains(&format!("{bytes:?}")),
+                "the {what} leaked into Debug in its decimal `{{:?}}` spelling"
+            );
+        }
+        // …and the whole encoded bearer credential, prefix and body.
+        let bearer = credential.encode();
+        assert!(
+            !all.contains(&bearer),
+            "the encoded bearer leaked into Debug"
+        );
+        let (_, body) = bearer.split_once(':').expect("prefixed bearer");
+        assert!(
+            !all.contains(body),
+            "the encoded bearer body leaked into Debug"
+        );
+
+        // Positive control: the same renderings still name the public
+        // fields the secrets sit beside. The dialog assertions also
+        // prove the attempt map's entry was rendered at all — without
+        // that, the token's absence above would prove nothing.
+        assert!(
+            rendered[0].contains(&hex_of(root.as_bytes())),
+            "root is no longer diagnosable through the credential"
+        );
+        assert!(
+            rendered[1].contains(&hex_of(root.as_bytes())),
+            "root is no longer diagnosable through the invite"
+        );
+        assert!(
+            rendered[0].contains("https://anchor.example/rtc"),
+            "bootstrap_url is no longer diagnosable"
+        );
+        assert!(
+            rendered[3].contains("4242424242"),
+            "dialog is no longer diagnosable through the response"
+        );
+        assert!(
+            rendered[4].contains("4242424242"),
+            "dialog is no longer diagnosable through the attempt table"
+        );
     }
 }
 

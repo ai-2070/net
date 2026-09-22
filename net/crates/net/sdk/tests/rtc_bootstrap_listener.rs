@@ -688,10 +688,7 @@ fn ws_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     const MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
     let mut frame = vec![0x80 | opcode];
     let len = payload.len();
-    assert!(
-        len < 65_536,
-        "the probe frames fit the 16-bit length form"
-    );
+    assert!(len < 65_536, "the probe frames fit the 16-bit length form");
     if len < 126 {
         frame.push(0x80 | len as u8);
     } else {
