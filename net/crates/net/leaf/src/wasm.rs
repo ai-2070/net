@@ -1567,12 +1567,28 @@ impl Inner {
         // relayed proof still lands. `retire_provisional` DESTROYS
         // the unproven attempt: it drops the `LeafSession` holding
         // this establishment's only copy of its keys, so afterwards a
-        // proof for it cannot be opened, let alone promoted. A proven
-        // session for the peer is untouched — that is `drop_session`'s
-        // job, and a `Direct` term is the promotion, not a
-        // retirement.
+        // proof for it cannot be opened, let alone promoted.
+        //
+        // **And the session it was replacing goes with it.** A direct
+        // message 1 is §9 step 4 beginning: the direct session
+        // displaces the routed one ("what step 4 replaces"), and its
+        // admission is what makes the pair's session table entry this
+        // establishment's to replace or remove. An attempt that dies
+        // unproven therefore completes the displacement in the
+        // destructive direction: the routed session is gone with the
+        // only establishment that was replacing it, and a queued
+        // proof installs nothing — the retired establishment's keys
+        // are already destroyed and the session table is empty
+        // (`a_promotion_whose_attempt_was_superseded_is_credited_to_
+        // nobody` reads exactly this off `has_session`). A proven
+        // session for the peer is untouched by the PROVISIONAL
+        // retirement above, and a `Direct` term is the promotion, not
+        // a retirement: `pump` takes the attribution before it
+        // settles `Direct`, so this branch never sees a promotion.
         if self.admissions.get(&attempt.peer) == Some(&attempt) {
             self.admissions.remove(&attempt.peer);
+            self.node
+                .drop_session(attempt.peer, "the establishment's attempt was retired");
         }
         if term != IceTerm::Direct {
             self.node.retire_provisional(attempt.peer);
@@ -2323,17 +2339,44 @@ impl LeafNode {
 
         let mut guard = self.inner.borrow_mut();
         guard.admit().map_err(js)?;
+        // **"Absent means the anchor", and the open is legal.** This
+        // is the surface's own rule, read off the RESOLVED peer of a
+        // real page-surface handle
+        // (`an_unnamed_open_resolves_to_the_anchor_not_peer_zero`):
+        // an open that named no peer resolves to the anchor and
+        // reports it, never peer 0 — a handle that repeated the
+        // request's options back would read zero and its filter would
+        // match nothing while looking filled in. The open is legal
+        // even where no session exists yet (a page may name its
+        // streams before connecting); the handle stamps incarnation
+        // zero and addresses no session's stream table, so every send
+        // on it is refused typed by `check_handle` exactly as a
+        // replaced handle's is. A NAMED open with no session is still
+        // `LeafNode::open_stream`'s refusal, which
+        // `establishment_identity` pins.
         let peer = options.peer.unwrap_or(guard.anchor);
-        let handle = guard
-            .node
-            .open_stream(
+        let handle = if options.peer.is_none() && !guard.node.has_session(peer) {
+            crate::node::StreamHandle {
                 peer,
-                &options.label,
-                options.reliability,
-                options.stream_id,
-                options.channel_hash,
-            )
-            .map_err(js)?;
+                incarnation: 0,
+                stream_id: options
+                    .stream_id
+                    .unwrap_or_else(|| crate::stream::stream_id_from_label(&options.label)),
+                channel_hash: options.channel_hash.unwrap_or(0),
+                reliability: options.reliability,
+            }
+        } else {
+            guard
+                .node
+                .open_stream(
+                    peer,
+                    &options.label,
+                    options.reliability,
+                    options.stream_id,
+                    options.channel_hash,
+                )
+                .map_err(js)?
+        };
         Ok(LeafStream {
             inner: Rc::clone(&self.inner),
             handle,
@@ -2773,11 +2816,16 @@ impl LeafNode {
         // ever to open — must go through the relay. Set before the
         // replacement, not after: the session is the same session,
         // only its addressing changes (§9 step 4, read backwards).
-        let anchor = with_node(&self.inner, |guard| {
-            let anchor = guard.anchor;
-            guard.node.set_peer_relay(peer, anchor);
-            anchor
-        });
+        //
+        // Set **after the supersession below**, though, and on purpose:
+        // the supersession retires the predecessor's admitted
+        // establishment, and that teardown removes the displaced
+        // session's addressing with it (`LeafNode::drop_session`'s
+        // relay half). This entry is the NEW attempt's — "the
+        // successor is still answering over the relay" is what says
+        // nothing promoted it — so it goes in once the predecessor's
+        // teardown has run and cannot be swept away with it.
+        let anchor = self.inner.borrow().anchor;
         debug_assert_ne!(anchor, peer);
 
         let attempt = Attempt { peer, dialog };
@@ -2797,6 +2845,7 @@ impl LeafNode {
             guard.admit()?;
             guard.harvest_candidates();
             guard.supersede(peer);
+            guard.node.set_peer_relay(peer, anchor);
             guard.peers.insert(
                 peer,
                 PeerDialog {
@@ -2871,15 +2920,50 @@ impl LeafNode {
                 guard
                     .node
                     .sign_signal(peer, dialog, SignalKind::Answer, answer.0.into_bytes());
-            guard.node.send_signal_frame(peer, &envelope)?;
+            // **The envelope's carrier has two homes and a floor.**
+            // §9 step 3 rides the A↔B session
+            // (`send_signal_frame`); a peer with no session is
+            // [`crate::control_plane::ControlPlane::signal`]'s job —
+            // `send_signal_frame`'s own boundary says so — which is
+            // the case this call's own supersession creates: the
+            // retired establishment takes the session it was
+            // replacing with it, and the answer to the NEXT offer is
+            // then a peer-with-no-session envelope. An envelope
+            // neither carrier can take is **dropped and logged**,
+            // exactly as production drops one when a channel is not
+            // there: it never fails the operation it was carrying.
+            match guard.node.send_signal_frame(peer, &envelope) {
+                Ok(()) => {}
+                Err(_) if !guard.node.has_session(peer) => {
+                    // Hoisted below the borrow: the control-plane
+                    // carrier is async.
+                    guard.pump();
+                    return Ok(Some(envelope));
+                }
+                Err(error) => {
+                    web_sys::console::warn_1(
+                        &format!("net-mesh-leaf: signalling envelope dropped: {error}").into(),
+                    );
+                }
+            }
             guard.pump();
-            Ok::<_, LeafError>(())
+            Ok::<_, LeafError>(None)
         });
-        if let Err(e) = sent {
-            with_node(&self.inner, |guard| {
-                guard.settle(attempt, IceTerm::Failed, "failed");
-            });
-            return Err(js(e));
+        let for_control = match sent {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                with_node(&self.inner, |guard| {
+                    guard.settle(attempt, IceTerm::Failed, "failed");
+                });
+                return Err(js(e));
+            }
+        };
+        if let Some(envelope) = for_control {
+            if let Err(error) = self.inner.borrow().control.signal(envelope).await {
+                web_sys::console::warn_1(
+                    &format!("net-mesh-leaf: signalling envelope dropped: {error}").into(),
+                );
+            }
         }
         // What was deferred goes in now — after the answer is sent,
         // so the send is never parked behind a batch of
@@ -3981,12 +4065,20 @@ impl LeafNode {
             return state;
         }
         with_node(&self.inner, |guard| {
+            // Refused, and two causes with two answers. A terminal on
+            // the named dialog is what won across the probe and what
+            // the reading must report. A named dialog that is gone
+            // was superseded while the probe was in flight: nothing
+            // won across it, nothing is charged, and **the probe's
+            // own disposition is unchanged** by the supersession —
+            // `failed` here once reported a plain failure for a
+            // settlement whose evidence said `iceTimeout`.
             guard
                 .peers
                 .get(&attempt.peer)
                 .filter(|dialog| dialog.dialog == attempt.dialog)
                 .and_then(|dialog| dialog.terminal)
-                .map_or("failed", |(_, state)| state)
+                .map_or(state, |(_, state)| state)
         })
     }
 
