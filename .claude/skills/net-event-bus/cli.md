@@ -115,7 +115,7 @@ Reported fields: `mode` (`offline` / `persistent_store` / `temporary_supervisor`
 
 - Flags override the corresponding profile field; partial target tuples fail; a complete profile target selects remote execution just as explicit flags do. **Connection failure never falls back to a local snapshot.**
 - For mixed-mode `aggregator ls`, a complete profile target selects remote RPC without `--remote`; `--local` may select a temporary supervisor despite profile defaults and discloses that, but conflicts with explicit remote targeting.
-- `--bind <IP:PORT>` overrides profile `bind`, then the per-surface default applies: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. Loopback-to-non-loopback attachment, mixed address families, multicast binds, and unspecified/multicast/zero-port peers are rejected **before** network or storage effects. IPv6 peers need an IPv6 bind (`[::]:0`). A valid bind does **not** prove firewall/NAT reachability or authorization.
+- `--bind <IP:PORT>` overrides profile `bind`, then the per-surface default applies: `127.0.0.1:0` for short-lived clients, `0.0.0.0:0` for `wrap`/`mcp serve`. Loopback-to-non-loopback attachment, mixed address families, multicast and broadcast binds, and unspecified/multicast/zero-port peers are rejected **before** network or storage effects. IPv6 peers need an IPv6 bind (`[::]:0`). A valid bind does **not** prove firewall/NAT reachability or authorization.
 
 ## Deadlines (`--timeout`)
 
@@ -260,7 +260,7 @@ Offline authoring against an **org root key**. These are *ceremonies over files*
 
 | Command | Produces |
 |---|---|
-| `org keygen --out <path> [--note <s>] [--force]` | a fresh org root keypair. Default `$XDG_CONFIG_HOME/net-mesh/orgs/org-<id>.toml`. |
+| `org keygen [--out <path>] [--note <s>] [--force]` | a fresh org root keypair. Default `$XDG_CONFIG_HOME/net-mesh/orgs/org-<id>.toml`. |
 | `org issue-cert --org-key <path> --member <hex> [--generation N] [--ttl-secs N] --out <path>` | a membership cert. TTL defaults ~1 year, hard-capped at 2. |
 | `org issue-floors --org-key <path> --floor <MEMBER=GEN> [--floor …] --out <path>` | a signed revocation-floor bundle (monotonic; a lower floor never rolls back). |
 | `org grant-dispatcher --org-key <path> --dispatcher <hex> (--capability <tag> \| --any-capability) [--ttl-secs N] --out <path>` | "entity X may act **for** this org." A→S. |
@@ -286,9 +286,9 @@ Two deliberately distinct groups under one noun (topology is not authority):
 
 | Command | Produces |
 |---|---|
-| `subnet keygen --out <path> [--note <s>] [--force]` | a subnet authority keypair — authority root **or** delegated issuer. Refuses to overwrite a different kind of secret (org key, operator identity). |
-| `subnet issue-direct --root-key <path> --authority <hex> --subject <hex> --scope <path\|global> --rights attach,route,export --topology-epoch N --generation N --out <path>` | one DIRECT credential set (root → subject). |
-| `subnet issue-issuer --root-key <path> --authority <hex> --issuer <hex> --scope <ceiling> --max-rights <r,…> --topology-epoch N --out <path>` | one bounded ISSUER grant (root → delegated issuer). One-hop depth is structural. |
+| `subnet keygen [--out <path>] [--note <s>] [--force]` | a subnet authority keypair — authority root **or** delegated issuer. Refuses to overwrite a different kind of secret (org key, operator identity). |
+| `subnet issue-direct --root-key <path> --authority <hex> --subject <hex> --scope <path\|global> --rights attach,route,export [--topology-epoch N] [--generation N] --out <path>` | one DIRECT credential set (root → subject). |
+| `subnet issue-issuer --root-key <path> --authority <hex> --issuer <hex> --scope <ceiling> --max-rights <r,…> [--topology-epoch N] --out <path>` | one bounded ISSUER grant (root → delegated issuer). One-hop depth is structural. |
 | `subnet issue-delegated --issuer-grant <path> --issuer-key <path> --subject <hex> --scope <path> --rights <r,…> --out <path>` | one DELEGATED set — leaf framed *together with* its issuer grant. |
 | `subnet issue-control-fact (descriptor\|gateway-advertisement\|export-policy\|revocation-floor) --root-key <path> --authority <hex> --scope <path\|global> --topology-epoch N --revision N --out <path> [kind-specific args]` | one signed control fact. |
 | `subnet inspect <file>` | decode + summary of any subnet artifact, **without private material**; exits non-zero on malformed/non-canonical bytes. **Decode-only — it does not verify signatures.** |
