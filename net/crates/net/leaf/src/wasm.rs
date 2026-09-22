@@ -5078,3 +5078,151 @@ fn parse_u64(raw: &str) -> Result<u64, JsError> {
 #[cfg(test)]
 #[path = "wasm_witnesses.rs"]
 mod witnesses;
+
+// ─────────────────── the id-seam parse readers ──────────────────────
+
+/// `parse_peer_id` / `parse_dialog_id` are the seam every page-facing
+/// id argument crosses (`LeafNode::signal`, the leader-proxied
+/// `MeshSession::signal`, the four §9 methods), and these hold their
+/// half of the #52 contract where the wasm runner can execute it: the
+/// five node-id spellings read one way — two parse to the same id,
+/// three are refused BY NAME — and no input of any shape panics where
+/// a named refusal belongs.
+///
+/// The failure #52 recorded was one layer up: the page passed a JS
+/// NUMBER for `dialog_hex`, and `wasm-bindgen`'s `passStringToWasm0`
+/// corrupts on a non-string (`assert!(old_size > 0)` panics in
+/// `__wbindgen_realloc`), so the call died in the argument marshaling
+/// before either reader ran — for every peer spelling alike. That
+/// side is the bindings' to hold; this module's contract is that once
+/// a string ARRIVES, whatever it is, the reader answers with its
+/// named text and never a panic.
+#[cfg(test)]
+mod id_parse_witnesses {
+    use super::{parse_dialog_id, parse_peer_id};
+    use wasm_bindgen::{JsError, JsValue};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// The five spellings the browser witness drives
+    /// (`stage6_one_node_id_spelling_across_both_signalling_surfaces`):
+    /// the 16 hex digits `node_id_hex()` emits, the same id in its
+    /// `0x` form, a DECIMAL id, a short hex id and a non-hex string.
+    const SPELLINGS: [&str; 5] = ["00366d403ce19dac", "0x00366d403ce19dac", "2", "0x9", "nine"];
+
+    /// The message the page classifies a refusal by — the text must
+    /// survive the `JsError` hop or the classifier reads the refusal
+    /// as a parse.
+    fn message(error: JsError) -> String {
+        let value: JsValue = error.into();
+        js_sys::Reflect::get(&value, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|message| message.as_string())
+            .unwrap_or_default()
+    }
+
+    /// Two spellings parse to the SAME id; three are refused "is not a
+    /// peer id" / "is not a dialog id" — by BOTH readers, because one
+    /// contract covers every id argument here.
+    #[wasm_bindgen_test]
+    fn five_node_id_spellings_read_one_way_through_both_id_readers() {
+        let peer = parse_peer_id(SPELLINGS[0]).ok().expect("the 16 hex digits parse");
+        assert_eq!(
+            peer,
+            parse_peer_id(SPELLINGS[1]).ok().expect("the 0x form parses to the same id")
+        );
+        assert_eq!(peer, 0x0036_6d40_3ce1_9dac);
+        let dialog = parse_dialog_id(SPELLINGS[0]).ok().expect("the 16 hex digits parse");
+        assert_eq!(
+            dialog,
+            parse_dialog_id(SPELLINGS[1]).ok().expect("the 0x form parses to the same id")
+        );
+
+        for spelling in &SPELLINGS[2..] {
+            let peer_refusal = message(
+                parse_peer_id(spelling)
+                    .err()
+                    .expect("a decimal id, a short hex id and a non-hex string are refused"),
+            );
+            assert!(
+                peer_refusal.contains("is not a peer id"),
+                "{spelling:?} refused without the parser's name: {peer_refusal:?}"
+            );
+            let dialog_refusal = message(
+                parse_dialog_id(spelling)
+                    .err()
+                    .expect("a decimal id, a short hex id and a non-hex string are refused"),
+            );
+            assert!(
+                dialog_refusal.contains("is not a dialog id"),
+                "{spelling:?} refused without the parser's name: {dialog_refusal:?}"
+            );
+        }
+    }
+
+    /// Panic-bait: every malformed shape answers with the named
+    /// refusal. The assertion only runs if the call RETURNS — a
+    /// slicing or indexing panic here is the defect, red on its own
+    /// stack rather than on an assertion.
+    #[wasm_bindgen_test]
+    fn a_malformed_id_returns_the_named_refusal_and_never_a_panic() {
+        for bait in [
+            "",                                                     // empty
+            " ",                                                    // blank
+            "0x",                                                   // lone prefix
+            "0X",                                                   // lone prefix, upper
+            "0123456789abcde",                                      // one short
+            "0123456789abcdefg",                                    // one overlong
+            "0123456789abcdef0123456789abcdef",                     // twice overlong
+            "0123456789abcdeZ",                                     // 16 bytes, one non-hex
+            "\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}",     // 8 chars = 16 BYTES
+            "0x\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}",   // prefixed non-ASCII
+            "00366d403ce19da\u{e4}",                                // 16 bytes with a 2-byte tail
+            " 0x9 ",                                                // padded short hex
+        ] {
+            let peer_refusal = message(
+                parse_peer_id(bait)
+                    .err()
+                    .expect("a malformed id is refused, never a panic"),
+            );
+            assert!(
+                peer_refusal.contains("is not a peer id"),
+                "{bait:?} refused without the parser's name: {peer_refusal:?}"
+            );
+            let dialog_refusal = message(
+                parse_dialog_id(bait)
+                    .err()
+                    .expect("a malformed id is refused, never a panic"),
+            );
+            assert!(
+                dialog_refusal.contains("is not a dialog id"),
+                "{bait:?} refused without the parser's name: {dialog_refusal:?}"
+            );
+        }
+    }
+
+    /// The dialog seam is 16 hex strings because a u64 dialog cannot
+    /// cross as a JS number (`as f64 as u64` re-spells 511 of every
+    /// 512 minted ids) — so the readers keep every bit, including the
+    /// reserved dialog 0, which spells as 16 zeros and parses to 0.
+    #[wasm_bindgen_test]
+    fn a_dialog_id_keeps_every_u64_bit_and_the_reserved_zero() {
+        assert_eq!(
+            parse_dialog_id("0000000000000000")
+                .ok()
+                .expect("the reserved dialog 0 spells as 16 zeros"),
+            0
+        );
+        let exact = parse_dialog_id("0123456789abcdef")
+            .ok()
+            .expect("the 16 hex digits parse");
+        assert_eq!(exact, 0x0123_4567_89ab_cdef);
+        // …and not the `as f64 as u64` rounding of the same input.
+        assert_ne!(exact, 0x0123_4567_89ab_cdf0);
+        assert_eq!(
+            parse_peer_id("ffffffffffffffff")
+                .ok()
+                .expect("the 16 hex digits parse"),
+            u64::MAX
+        );
+    }
+}

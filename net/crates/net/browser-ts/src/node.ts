@@ -34,6 +34,7 @@ import {
   type StunProbeOutcome,
 } from './udp-probe.js';
 import {
+  idArg,
   loadLeafWasm,
   type LeafWasmConnectOptions,
   type LeafWasmNode,
@@ -465,7 +466,12 @@ export class BrowserNode {
    */
   async signal(peerHex: string, dialogHex: string, kind: string, payload: Uint8Array): Promise<void> {
     try {
-      await this.inner.signal(peerHex, dialogHex, kind, payload);
+      // Both ids cross as strings, verbatim, and a non-string is
+      // refused "is not a peer id" / "is not a dialog id" — peer
+      // first, the order `LeafNode::signal` parses in — before the
+      // wasm seam, whose String marshaling corrupts on a number
+      // (finding #52).
+      await this.inner.signal(idArg(peerHex, 'peer'), idArg(dialogHex, 'dialog'), kind, payload);
     } catch (error) {
       throw fromWasmError(error);
     }

@@ -16,6 +16,7 @@
  */
 
 import { streamDataEvent } from './leaf-abi.js';
+import { seamId } from './fake-wasm.js';
 import type {
   LeafWasmStreamOptions,
   LeafWasmProxyStream,
@@ -248,8 +249,24 @@ export class FakeSession implements LeafWasmSession {
     return this.behaviour.enrolled ?? true;
   }
 
+  /**
+   * What each `signal` call's two ids parsed to — the fixture is the
+   * seam's parse, so "the two spellings name the same id" is an
+   * observation and not an inference.
+   */
+  readonly parsedSignals: Array<{ peer: bigint; dialog: bigint }> = [];
+
+  /**
+   * The `String` seam exactly, the same model `FakeNode.signal`
+   * keeps: a non-string dies in the marshaling the way the real glue
+   * does (finding #52's repro), a string is parsed and refused by
+   * name on any other shape, and what parses is recorded verbatim.
+   */
   async signal(peer_hex: string, dialog: string, kind: string, _payload: Uint8Array): Promise<void> {
+    const peer = seamId(peer_hex, 'peer');
+    const dialogId = seamId(dialog, 'dialog');
     this.signalled.push({ peerHex: peer_hex, dialog, kind });
+    this.parsedSignals.push({ peer, dialog: dialogId });
   }
 
   async open_stream(options: LeafWasmStreamOptions): Promise<LeafWasmProxyStream> {
