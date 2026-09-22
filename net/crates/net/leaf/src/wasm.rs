@@ -5125,31 +5125,22 @@ mod id_parse_witnesses {
     /// contract covers every id argument here.
     #[wasm_bindgen_test]
     fn five_node_id_spellings_read_one_way_through_both_id_readers() {
-        let peer = parse_peer_id(SPELLINGS[0])
-            .ok()
-            .expect("the 16 hex digits parse");
+        let peer = parse_peer_id(SPELLINGS[0]).expect("the 16 hex digits parse");
         assert_eq!(
             peer,
-            parse_peer_id(SPELLINGS[1])
-                .ok()
-                .expect("the 0x form parses to the same id")
+            parse_peer_id(SPELLINGS[1]).expect("the 0x form parses to the same id")
         );
         assert_eq!(peer, 0x0036_6d40_3ce1_9dac);
-        let dialog = parse_dialog_id(SPELLINGS[0])
-            .ok()
-            .expect("the 16 hex digits parse");
+        let dialog = parse_dialog_id(SPELLINGS[0]).expect("the 16 hex digits parse");
         assert_eq!(
             dialog,
-            parse_dialog_id(SPELLINGS[1])
-                .ok()
-                .expect("the 0x form parses to the same id")
+            parse_dialog_id(SPELLINGS[1]).expect("the 0x form parses to the same id")
         );
 
         for spelling in &SPELLINGS[2..] {
             let peer_refusal = message(
                 parse_peer_id(spelling)
-                    .err()
-                    .expect("a decimal id, a short hex id and a non-hex string are refused"),
+                    .expect_err("a decimal id, a short hex id and a non-hex string are refused"),
             );
             assert!(
                 peer_refusal.contains("is not a peer id"),
@@ -5157,8 +5148,7 @@ mod id_parse_witnesses {
             );
             let dialog_refusal = message(
                 parse_dialog_id(spelling)
-                    .err()
-                    .expect("a decimal id, a short hex id and a non-hex string are refused"),
+                    .expect_err("a decimal id, a short hex id and a non-hex string are refused"),
             );
             assert!(
                 dialog_refusal.contains("is not a dialog id"),
@@ -5187,19 +5177,14 @@ mod id_parse_witnesses {
             "00366d403ce19da\u{e4}",                              // 16 bytes with a 2-byte tail
             " 0x9 ",                                              // padded short hex
         ] {
-            let peer_refusal = message(
-                parse_peer_id(bait)
-                    .err()
-                    .expect("a malformed id is refused, never a panic"),
-            );
+            let peer_refusal =
+                message(parse_peer_id(bait).expect_err("a malformed id is refused, never a panic"));
             assert!(
                 peer_refusal.contains("is not a peer id"),
                 "{bait:?} refused without the parser's name: {peer_refusal:?}"
             );
             let dialog_refusal = message(
-                parse_dialog_id(bait)
-                    .err()
-                    .expect("a malformed id is refused, never a panic"),
+                parse_dialog_id(bait).expect_err("a malformed id is refused, never a panic"),
             );
             assert!(
                 dialog_refusal.contains("is not a dialog id"),
@@ -5215,21 +5200,15 @@ mod id_parse_witnesses {
     #[wasm_bindgen_test]
     fn a_dialog_id_keeps_every_u64_bit_and_the_reserved_zero() {
         assert_eq!(
-            parse_dialog_id("0000000000000000")
-                .ok()
-                .expect("the reserved dialog 0 spells as 16 zeros"),
+            parse_dialog_id("0000000000000000").expect("the reserved dialog 0 spells as 16 zeros"),
             0
         );
-        let exact = parse_dialog_id("0123456789abcdef")
-            .ok()
-            .expect("the 16 hex digits parse");
+        let exact = parse_dialog_id("0123456789abcdef").expect("the 16 hex digits parse");
         assert_eq!(exact, 0x0123_4567_89ab_cdef);
         // …and not the `as f64 as u64` rounding of the same input.
         assert_ne!(exact, 0x0123_4567_89ab_cdf0);
         assert_eq!(
-            parse_peer_id("ffffffffffffffff")
-                .ok()
-                .expect("the 16 hex digits parse"),
+            parse_peer_id("ffffffffffffffff").expect("the 16 hex digits parse"),
             u64::MAX
         );
     }
