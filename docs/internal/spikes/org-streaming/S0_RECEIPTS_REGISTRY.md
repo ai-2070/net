@@ -1191,3 +1191,164 @@ EXIT_CODE=0
   on this host, plus the pre-mutation baseline sweep (30/30 green) and the
   `cargo nextest list` name enumeration. No leg was inferred; every PASS and
   FAIL line above was observed.
+
+---
+
+# Addendum — independent-review follow-up (receipts 25–27)
+
+Appended on Main's request after the independent review found three witnesses
+without inverse receipts (obligation's node-level rollback half and two
+budget-boundary checks). Same discipline as above — production-site mutations
+in `org_stream_registry.rs` only, reverse-anchored restores, sha gate — with
+two operational differences for this addendum: **no `CARGO_TARGET_DIR`** (the
+default `net/crates/net/target` is the sanctioned build dir for housekeeping
+reasons; `Blocking waiting for file lock on build directory` was normal
+queuing behind two concurrent validation builds), and every document write
+verified by size + hash (ENOSPC precaution).
+
+**Baseline sweep for these three witnesses (never run before this addendum),
+registry `348fc6f4…`, lifecycle `45aef9d6…`:**
+`Summary [   0.034s] 3 tests run: 3 passed, 5828 skipped` / `EXIT_CODE=0`.
+
+**Finding F5 (F1 continued).** `org_stream_lifecycle.rs` moved again after the
+24-receipt campaign: `45aef9d63455856ab9617b3c85b293857a772ec329942bb82dabe9e25161c165`
+now (was `b2dce203…` throughout the campaign; `7e7fbfcc…`/`f7b21825…` before
+it). The three witnesses here are byte-accounting and reserve-quota
+properties with no runtime dependency on lifecycle behaviour, and the
+baseline sweep above pins them green in the `45aef9d6…` state; every red run
+below printed that digest in its leading tag.
+
+**Finding F6 (model fidelity note, receipt 27).** `OpeningRequest` carries no
+explicit claimed-org field (by design: `reserve` must not need org facts), so
+the "reserve also charges the unverified org quota" inverse charges the
+unverified org slot from the opening request's pre-decode datum
+(`session_generation`), which the harness carries as the claimed org id `7`.
+The production failure mode is the one the `reserve` doc comment names —
+charging `OrgProofIntent`'s claimed org before verification, letting a forged
+label exhaust a real organization's quota — and the witness discriminates
+exactly that: green = reserve charges no org slot at all.
+
+### 25. node-scope refusal fails to roll back the acquired call and caller reservations (obligation node-level half)
+witness: `adapter::net::behavior::org_stream_registry::tests::node_refusal_rolls_back_call_and_caller_reservations`
+
+```diff
+@@ ByteBudgets::reserve — step 3, node scope @@
+             Some(next) if next <= self.limits.per_node => next,
+             Some(_) => {
+-                state.per_caller.insert(key.caller, caller_cur);
+-                state.per_call.insert(call_slot, call_cur);
+                 return Err(ByteRefusal::NodeBudgetFull);
+             }
+```
+
+Command (red):
+
+```
+sha256sum src/adapter/net/behavior/org_stream_lifecycle.rs && cargo nextest run --lib --no-tests=fail --retries 0 --features "net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex" -E 'test(=adapter::net::behavior::org_stream_registry::tests::node_refusal_rolls_back_call_and_caller_reservations)' ; echo "EXIT_CODE=$?"
+```
+
+Exit code: **100**. Failure output (verbatim):
+
+```
+thread 'adapter::net::behavior::org_stream_registry::tests::node_refusal_rolls_back_call_and_caller_reservations' (162240) panicked at src\adapter\net\behavior\org_stream_registry.rs:3418:9:
+assertion `left == right` failed: the call counter was rolled back
+  left: 600
+ right: 400
+```
+
+Restore proof: sha256 before `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b` == after `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b`. Restored run (verbatim):
+
+```
+        PASS [   0.008s] (1/1) net-mesh adapter::net::behavior::org_stream_registry::tests::node_refusal_rolls_back_call_and_caller_reservations
+     Summary [   0.029s] 1 test run: 1 passed, 5830 skipped
+EXIT_CODE=0
+```
+
+### 26. `q1_default_byte_ceilings_bound_call_caller_and_node` — the byte ceiling admits one item past the bound
+witness: `adapter::net::behavior::org_stream_registry::tests::q1_default_byte_ceilings_bound_call_caller_and_node`
+
+Inverse — the per-call ceiling checks the pre-increment total (bound + one
+item admitted).
+
+```diff
+@@ ByteBudgets::reserve — step 1, per-call bound @@
+         let call_next = call_cur.checked_add(len).ok_or(ByteRefusal::Overflow)?;
+-        if call_next > self.limits.per_call {
++        if call_cur > self.limits.per_call {
+             return Err(ByteRefusal::CallBudgetFull);
+         }
+```
+
+Command (red):
+
+```
+sha256sum src/adapter/net/behavior/org_stream_lifecycle.rs && cargo nextest run --lib --no-tests=fail --retries 0 --features "net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex" -E 'test(=adapter::net::behavior::org_stream_registry::tests::q1_default_byte_ceilings_bound_call_caller_and_node)' ; echo "EXIT_CODE=$?"
+```
+
+Exit code: **100**. Failure output (verbatim — the witness's `expect_err`;
+the fifth 4 MiB item was admitted past the 16 MiB per-call bound):
+
+```
+thread 'adapter::net::behavior::org_stream_registry::tests::q1_default_byte_ceilings_bound_call_caller_and_node' (137364) panicked at src\adapter\net\behavior\org_stream_registry.rs:3596:18:
+fifth item: ItemPermit { charge: ByteCharge { key: CallKey { caller: 0, call_id: 0 }, incarnation: 1, direction: Response, len: 4194304 }, settled: false }
+```
+
+Restore proof: `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b` == `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b`. Restored run (verbatim):
+
+```
+        PASS [   0.009s] (1/1) net-mesh adapter::net::behavior::org_stream_registry::tests::q1_default_byte_ceilings_bound_call_caller_and_node
+     Summary [   0.029s] 1 test run: 1 passed, 5830 skipped
+EXIT_CODE=0
+```
+
+### 27. `provisional_charge_is_caller_and_node_only_until_verification` — reserve also charges the unverified org quota
+witness: `adapter::net::behavior::org_stream_registry::tests::provisional_charge_is_caller_and_node_only_until_verification`
+
+Inverse — `reserve` charges an acting-org quota slot from unverified opening
+data before verification (see finding F6 for the claimed-org datum).
+
+```diff
+@@ ProtectedCallRegistry::reserve — provisional charges @@
+         inner.active_node = node_next;
+         inner.active_per_caller.insert(req.key.caller, caller_next);
++        *inner
++            .active_per_org
++            .entry(req.session_generation.unwrap_or_default())
++            .or_insert(0) += 1;
+```
+
+Command (red):
+
+```
+sha256sum src/adapter/net/behavior/org_stream_lifecycle.rs && cargo nextest run --lib --no-tests=fail --retries 0 --features "net,redex,redex-disk,cortex,netdb,meshdb,meshos,dataforts,nat-traversal,port-mapping,tool,batched-ingress,cli,regex" -E 'test(=adapter::net::behavior::org_stream_registry::tests::provisional_charge_is_caller_and_node_only_until_verification)' ; echo "EXIT_CODE=$?"
+```
+
+Exit code: **100**. Failure output (verbatim):
+
+```
+thread 'adapter::net::behavior::org_stream_registry::tests::provisional_charge_is_caller_and_node_only_until_verification' (164428) panicked at src\adapter\net\behavior\org_stream_registry.rs:3026:9:
+assertion `left == right` failed: an unverified proof's claimed org is never charged
+  left: 1
+ right: 0
+```
+
+Restore proof: `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b` == `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b`. Restored run (verbatim):
+
+```
+        PASS [   0.008s] (1/1) net-mesh adapter::net::behavior::org_stream_registry::tests::provisional_charge_is_caller_and_node_only_until_verification
+     Summary [   0.028s] 1 test run: 1 passed, 5830 skipped
+EXIT_CODE=0
+```
+
+### Addendum closing
+
+- All three witnesses went red under their inverse (running total: 27
+  receipts, 33 witnesses, zero green-under-inverse, nothing weakened or
+  re-pinned). 27 red legs + 27 restored legs + 2 baseline sweeps were
+  executed; nothing inferred.
+- `net/crates/net/src/adapter/net/behavior/org_stream_registry.rs` again ends
+  byte-identical to its starting state: final measurement after receipt 27's
+  restore equals the campaign-start measurement
+  `348fc6f40beb015c770bb0cfc18c66a7882070725c3d5643ce4f0968e3e77c8b`
+  (also equal at every one of the 27 per-restore gates). Restores were
+  reverse-anchored Edits; no whole-file writes, `cp`, or `git checkout --`.

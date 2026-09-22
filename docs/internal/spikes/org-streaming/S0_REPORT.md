@@ -213,7 +213,8 @@ whole-file writes, no `cp`, no `git checkout`):
   its discriminating replacement (d)-3b) is receipted alongside it, and the
   non-discriminating run is kept as executed evidence. (l) is classified
   plumbing (F7) with no inverse credit claimed.
-- **`S0_RECEIPTS_REGISTRY.md`** (sha256 `c60f77c0…`) — the 24 items covering
+- **`S0_RECEIPTS_REGISTRY.md`** (sha256 `62c66232…` after the addendum below;
+  `c60f77c0…` at the reviewed head) — the 24 items covering
   the §4 schedules, the registry-side composition checks, byte-permit,
   quota and incarnation behaviour. 30 witnesses across 24 receipts (grouped
   where one mutation covers several); **all 30 red under their assigned
@@ -228,13 +229,36 @@ whole-file writes, no `cp`, no `git checkout`):
   byte-identical against `348fc6f4…` after all 24 cycles (a self-caught
   restore defect along the way — finding F12).
 
+  **Addendum — receipts 25–27 (closing review finding F-3).** The node-level
+  rollback half of obligation (n) is now receipted: removing the node-scope
+  refusal's call+caller rollback inserts in `ByteBudgets::reserve` reddens
+  `node_refusal_rolls_back_call_and_caller_reservations` (`left: 600 /
+  right: 400` — "the call counter was rolled back", `org_stream_registry.rs:3418`).
+  Also receipted: `q1_default_byte_ceilings_bound_call_caller_and_node`
+  (ceiling admits one item past the bound) and
+  `provisional_charge_is_caller_and_node_only_until_verification` (reserve
+  charging the unverified org quota — "an unverified proof's claimed org is
+  never charged"). Campaign totals: **27 receipts, 33 witnesses, zero
+  green-under-inverse**. Receipt 27 carries a fidelity note: the model's
+  `OpeningRequest` has no claimed-org field by design, so its mutant charges
+  the harness-carried pre-decode datum; the witness still discriminates the
+  intended property (green ⟺ reserve charges no org slot).
+
 **Coordinator spot-checks** — one receipt per lane reproduced independently
 before acceptance, verbatim matching the lane's recorded red:
 
 | Spot-check | Mutation | Red (exit 100) | Restore |
 |---|---|---|---|
-| lifecycle comp-3 `protected_output_refusal_cannot_complete_ok` | drop `output_admission_failed()` at `sink_send`'s `len > budget` refusal | `Completed(Ok)` vs `ResourceExhausted`, `org_stream_lifecycle.rs:1810` | green |
-| registry receipt 1 `retire_between_confirm_check_and_owner_transfer` | `ConfirmTxn` re-locking pre-fix shape | `Applied(true)` vs `Blocked`, `org_stream_registry.rs:2585` | sha `348fc6f4…`, green |
+| lifecycle comp-3 `protected_output_refusal_cannot_complete_ok` | drop `output_admission_failed()` at `sink_send`'s `len > budget` refusal | `Completed(Ok)` vs `ResourceExhausted`, `org_stream_lifecycle.rs:1811` at the reviewed head (`:1810` as observed under the inverse, which deletes one line above the assertion) | green |
+| registry receipt 1 `retire_between_confirm_check_and_owner_transfer` | `ConfirmTxn` re-locking pre-fix shape | `Applied(true)` vs `Blocked`, `org_stream_registry.rs:2593` (pristine — the receipt's own citation; `:2585` as observed under the inverse, which shortens the confirm-transaction comments by eight lines) | sha `348fc6f4…`, green |
+
+Line-number convention (review finding F-1, corrected here): this table
+initially cited the mutated-tree numbering of each panic. Citations are
+pristine at the reviewed head `736469448`; the receipted mutations shorten
+the file above their assertions, so the verbatim panic quotes inside the
+receipt documents carry the mutated-tree numbering. Both forms are given
+above. (After the F15 fix added 7 lines at `org_stream_lifecycle.rs:707`, the
+same assertion lives at `:1818` in the current tree.)
 
 Post-lane coordinator delta (disclosed to the lifecycle lane via forensics,
 recorded here): the queued rustfmt hunk in `terminal_queue_refusal_is_not_peer_receipt`
@@ -265,21 +289,26 @@ lane cycle was hash-proven against its own baseline before any of these writes.
   (`terminal_queue_refusal_is_not_peer_receipt`), `Sent` is the transport-accept
   seam Stage 1 fills. Never upgraded to executed.
 - **F4 — pull-driver transient saturation is a caller-visible refusal, not a
-  wait.** The async sink waits on satisfiable bounds (§2.7 `send_wait`); the
-  runtime-free sync driver cannot wait, so `PullCall::submit` refuses without
-  latching when the item fits the configured budget but not current capacity,
-  and latches only for unsatisfiable/non-deliverable items. Documented at the
-  method; Stage 1's production sink must implement the wait, not this
-  approximation.
-- **F5 — the confirm-transaction fix.** The `23f33bf98`-era `ConfirmTxn`
+  wait** *(source-established design boundary; its latch half is executed in
+  receipt (m))*. The async sink waits on satisfiable bounds (§2.7 `send_wait`);
+  the runtime-free sync driver cannot wait, so `PullCall::submit` refuses
+  without latching when the item fits the configured budget but not current
+  capacity, and latches only for unsatisfiable/non-deliverable items.
+  Documented at the method; Stage 1's production sink must implement the wait,
+  not this approximation.
+- **F5 — the confirm-transaction fix** *(defect source-established on
+  inspection of the working diff; fix inverse executed — Registry receipt 1
+  plus the §6 spot-check)*. The `23f33bf98`-era `ConfirmTxn`
   re-acquired the registry lock in `transfer`, reopening the exact check→transfer
   window the transaction exists to close (a retire could win the terminal and
   `transfer` would then resurrect the record over an unarmed owner). Fixed by
-  carrying the `MutexGuard` through the transaction; the inverse receipt is
-  Registry item 1 in §6.
+  carrying the `MutexGuard` through the transaction.
 - **F6 — naming drift against the plan's check table** (two rows) resolved by
-  rename (§2); no behaviour change.
-- **F7 — `two_calls_are_independent` is plumbing at model level.** Two records
+  rename (§2); no behaviour change *(executed — the renamed witnesses appear
+  green in every 76/76 sweep)*.
+- **F7 — `two_calls_are_independent` is plumbing at model level**
+  *(classification source-established: by-construction argument; the baseline
+  runs executing it are in the receipts' pre-mutation sweeps)*. Two records
   with distinct incarnations cannot interfere in a value-semantic model; no
   production-code inverse exists that this witness can see. Classified per
   witness discipline and kept out of the inverse roster (the real
@@ -288,9 +317,10 @@ lane cycle was hash-proven against its own baseline before any of these writes.
   `serve_handle_drop_retires_only_its_own_registration` and
   `requalify_keeps_the_unaffected_sibling_and_retires_the_affected_call`, which
   do have inverses).
-- **F8 — `an_oversized_item_never_waits_for_permits_it_cannot_get` (lifecycle)**
-  describes an output item but drives the input-side latch
-  (`input_admission_failed`). Kept as the §2.7 request-direction witness and
+- **F8 — `an_oversized_item_never_waits_for_impossible_permits` (lifecycle)
+  describes an output item but drives the input-side latch**
+  *(source-established: test-body reading; the latch behaviour it exercises is
+  executed under receipt (m))*. Kept as the §2.7 request-direction witness and
   re-described in §1.0.3's map under (m); the output-direction counterpart is
   `protected_output_refusal_cannot_complete_ok`.
 - **F9 — retirement of a credit-parked pump is overdetermined (executed).**
@@ -366,6 +396,18 @@ gate or a checklist the stage had adopted before the incident.
   while free space is under a few GB, verify size and hash after every write.
 
 ## 8. What never ran
+
+**Pre-push validation (local), 2026-09-22, after the F15 fix — all green:**
+`cargo fmt --check` (net-mesh, net-mesh-sdk, probe workspace) ·
+`cargo check --workspace --all-targets` · clippy `-D warnings` in all four
+invocations (`--lib --bins` under default, no-default-features and all-features
+sets; `--all-features --all-targets` under CI's `-A` flag set) ·
+`RUSTDOCFLAGS="-D warnings" cargo doc` for the root and the four per-crate
+lines (net-mesh-sdk `full`, net-payments `--all-features`, net-mesh-wire
+`json`, net-python's hand-maintained set) · `cargo tl` (5831 unit tests) ·
+`cargo t` (**7037 run, 7037 passed**, 10 skipped). The FFI export checker and
+witness floors are not owed (no `bindings/**`, no floor-gated binary, no
+`tests/*.rs` changed).
 
 - No Linux or macOS leg (Windows 11 workstation); `#[cfg(unix)]` code is not
   compiled here. Nothing in Stage 0 is platform-gated, but that is a
