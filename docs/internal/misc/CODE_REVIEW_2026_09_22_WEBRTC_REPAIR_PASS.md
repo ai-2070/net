@@ -100,7 +100,8 @@ in the code and was not driven. These are never blurred. Confidence is stated pe
 | 52 | The browser node-id-spelling witness failed at the engine-marshaling layer on both engines — root cause: a stale JS-number dialog literal in the harness page panics wasm-bindgen's string marshaling before any parser runs (surfaced at the merge gate) | Medium | tests | Closed |
 | 53 | The Windows security step ran under pwsh with bash syntax — it failed before executing a single test (surfaced at the merge gate) | Medium | ci | Closed |
 | 54 | Two leader-supersession witnesses failed in the wasm runner — root cause: `stand_down` recycled the failed-promotion recovery, re-attaching the supersession away and re-taking the lock (surfaced at the merge gate) | High | leaf | Closed |
-| 55 | Three wasm-lib witnesses fail on this host's runner — invariant under every fix of this pass (control-proven); candidates: engine ICE-classification divergence (`failed` vs `iceTimeout`) or harness timing (surfaced during the #54 round) | Medium | leaf | Open |
+| 55 | Three wasm-lib witnesses fail on this host's runner — invariant under every fix of this pass (control-proven) — adjudicated at `8dfcf1d56` as three real production defects in the attempt/establishment/session lifecycle (the ICE-classification and harness-timing candidates were eliminated when the trio also failed on Linux, 20/23 identical) (surfaced during the #54 round) | Medium | leaf | Closed |
+| 56 | The §12 leg-(a) positive control sampled the TOFU pin at a fixed instant after the send while the announcement ingest installs key and pin through its own async transition — a witness that cannot fail reliably (green at `68e2c19b0`, red at `5e0e69cdf`, zero net-crate changes between) | Medium | tests | Closed |
 
 ### Claims of the repair pass, contradicted
 
@@ -870,6 +871,16 @@ there, record them as Windows-runner divergence with a skipped-with-reason
 marker or a widened classification assertion that names both engine outcomes; if
 they fail there too, they are regressions needing their own repair round.
 
+**#56 — A positive control that cannot fail reliably.** The §12
+leg-(a) positive control
+(`every_denied_action_is_refused_at_its_named_gate_and_counted`) sampled the
+TOFU pin at a fixed instant after the promote+send, while the announcement
+ingest installs the announced key and the pin through its own async
+transition: the code polled the key and then read the pin. Under CI load the
+pin read raced its install — green at `68e2c19b0`, red at `5e0e69cdf`, zero
+net-crate changes between the heads (208/208 locally on this host). A
+witness whose green depends on a timing window is not a witness.
+
 ---
 
 ## Preserved credits
@@ -1215,6 +1226,70 @@ Post-round verification (executed, this host): browser-ts `tsc` clean + **726/72
 leaf host **337/337**; `wasm_leader` **29/29** (both `#54` witnesses named green);
 `wasm_leaf` **16/16**; the wasm lib **20/23** with exactly the `#55` trio red and
 all three `id_parse_witnesses` green.
+
+**The `#55` round and #56.** The Leaf chain's wasm test runner reached the
+wasm lib for the first time at `8dfcf1d56` and classified the trio
+immediately: `test result: FAILED. 20 passed; 3 failed` on Linux headless
+Chromium too, 20/23 identical to this host. Both environmental candidates
+died with that line — the trio is three real production defects in the
+attempt/establishment/session lifecycle, root-caused and fixed in
+`ec514cbef` (wasm.rs only; `node.rs` restored byte-identical; **all
+witnesses byte-identical**):
+
+- **The unnamed-open rule was unreadable.** The anchor resolution
+  (`options.peer.unwrap_or(guard.anchor)`) was already correct, but
+  `node::open_stream`'s no-session incarnation gate refused the open before
+  any handle existed. The page surface now mints the unnamed handle itself
+  (resolved peer, zero incarnation) and the gate stays byte-identical under
+  its named-refusal pins — a wrong-site cut through the gate red-discriminated
+  against itself at `establishment_identity.rs:154`, which is what moved the
+  fix to the page surface.
+- **A deadline settlement kept the wrong cause.** A settlement for a
+  superseded dialog reported a bare `failed` (the terminal entry is gone,
+  because `supersede` removes it) instead of the probe's own disposition; the
+  refused arm now reports the disposition and charges nothing.
+- **A retired establishment installs nothing — and its displaced session goes
+  with it.** The §9-step-4 displacement now completes destructively (the
+  entry the admitting direct establishment was replacing is torn down with
+  it), the answer falls back to `ControlPlane::signal` with the fixture's
+  drop-and-log floor when the session carrier cannot take it, and the
+  successor's relay addressing is installed *after* the supersession so the
+  predecessor's teardown cannot sweep it. Three independent inverse receipts
+  pin the pieces: removing the carrier fallback reds `wasm_witnesses.rs:443`;
+  removing the relay move reds `wasm_witnesses.rs:1554`; removing the
+  displacement teardown reds `wasm_witnesses.rs:1571`'s `!has_session`.
+
+Green at the round's end: wasm lib **23/23**, wasm_leader **29/29**,
+wasm_leaf **16/16**, host **337** (lib 256 + `establishment_identity` 11
+under its named-refusal pins). One behavior change named for the record: the
+sibling witness `a_retired_attempt_admits_no_late_establishment` now also
+loses the displaced session at its explicit `settle(Failed)` — unconstrained
+by its oracles, but a change its text does not assert.
+
+**#56** was root-caused in the same window: the leg-(a) positive polled the
+announced key and then read the TOFU pin at a fixed instant, though both
+install through the ingest's async transition. The read now polls *both*
+observables in a bounded `wait_for` before the named asserts — no window
+widened, negatives untouched, 3/3 consecutive integration runs (49/49 each)
+plus the mesh-lib filter (421/421) (`8dfcf1d56`). The same-class audit over
+the #20/#21 additions found every other read-after-async-effect already
+wait-based: the (b) leg strictly sequenced, the (d) leg wait/join-based end
+to end, and #21's drain loop itself completion-bounded.
+
+**The gate's last unpeeling (merge-fix ledger).** Each step masked the next,
+three CI rounds of them: `a156dcd83` formatted the #52/#54 fix files (the
+Formatting step was failing before anything behind it ran); `48ede0446`
+rewrote the parse witnesses' eleven `ok_expect`/`err_expect` forms to
+`expect`/`expect_err` (wasm-target clippy; semantics identical); `ec514cbef`
+is the `#55` round above; and `17f7325db` fixed the trio fix's own
+`await_holding_refcell_ref` — its no-session carrier fallback held
+`self.inner.borrow()` across `control.signal(...).await`, a real re-entrancy
+hazard (the future yields back into page callbacks that borrow `inner`); the
+cheap `AnchorControlPlane` handle now clones out under the borrow, the guard
+drops, then the future is polled — the `offer_peer` pattern. Verified at
+`17f7325db` across the full gate set locally: fmt, both CI-shape clippys,
+host lib 256/256, wasm lib 23/23 (including the fallback's own witness and
+the parse trio). The merge is the owner's to make.
 
 ---
 
