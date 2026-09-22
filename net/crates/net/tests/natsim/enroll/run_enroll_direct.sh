@@ -4,7 +4,8 @@
 #
 #   nsim_wan (10.99.0.0/24)            .12 = the cloud agent (public)
 #        |                             .10 / .11 exist as addresses only:
-#   nsim_gwa .2  (upnp mode + miniupnpd)   NO relay or helper process runs
+#   nsim_gwa .2 / public 11.99.0.2  (upnp mode + miniupnpd)
+#                                       NO relay or helper process runs
 #        |
 #   nsim_a 192.168.101.2               the device (`up --enroll`)
 #
@@ -30,7 +31,8 @@ MINIUPNPD="${MINIUPNPD_BIN:-$(command -v miniupnpd || echo /usr/sbin/miniupnpd)}
 STATE="$(mktemp -d /tmp/natsim-enroll.XXXXXX)"
 DEVICE_BIND=192.168.101.2:7001
 AGENT_BIND=10.99.0.12:7002
-PUBLIC_A=10.99.0.2
+# The upnp router's public alias (setup.sh): miniupnpd refuses RFC1918 ext_ip.
+PUBLIC_A=11.99.0.2
 PIDS=()
 
 log() { echo "[enroll] $*" | tee -a "$STATE/scenario.log" >&2; }
