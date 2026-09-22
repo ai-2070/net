@@ -99,6 +99,7 @@ in the code and was not driven. These are never blurred. Confidence is stated pe
 | 51 | A send half that gives up in two waves reports its death twice — duplicate reset, retire and count (surfaced during verification) | Medium | leaf | Closed |
 | 52 | The browser node-id-spelling witness fails at the engine-marshaling layer on both engines — `"index out of bounds"` (Firefox) and silent `false` (Chromium) (surfaced at the merge gate; pre-existing, outside the repair's files) | Medium | tests | Open |
 | 53 | The Windows security step ran under pwsh with bash syntax — it failed before executing a single test (surfaced at the merge gate) | Medium | ci | Closed |
+| 54 | Two leader-supersession witnesses fail in the wasm runner — a superseded session's proxied send succeeds where it must refuse, and a stood-down leader still reads Leader (surfaced at the merge gate; in the repair's own leader-lifecycle area, masked until the fmt fix unmasked the step) | High | leaf | Open |
 
 ### Claims of the repair pass, contradicted
 
@@ -812,6 +813,41 @@ tests it wraps are healthy: the same two nextest invocations pass locally on thi
 Windows host (467 + 9, all green, `--features net --lib`). *Required —* met: the
 step declares `shell: bash` (this pass), and the two nextest invocations run.
 
+**#54 — Two leader-supersession witnesses fail in the wasm runner.**
+`net/crates/net/leaf/tests/wasm_leader.rs:1508` and `:1956`, over
+`leader_session`'s supersession semantics. **Executed** (CI's "wasm test runner
+(headless Chromium)" step at `68e2c19b0`: 27 passed, 2 failed; surfaced at the
+merge gate — this step never ran earlier in the branch's life because the Leaf
+job's `Formatting` step failed first, so the failures were masked until the fmt
+sweep unmasked the step chain). Both are pinned roster witnesses (the
+`LEADER_WITNESSES` names, predating this repair):
+
+1. `a_superseded_session_is_refused_by_the_leader_and_by_storage` —
+   `expect_err` on the proxied send of a superseded session received
+   `Text("[]")` (a successful round trip) instead of the required refusal
+   ("a superseded session must refuse").
+2. `a_leader_revalidates_its_generation_against_the_store_and_stands_down` —
+   after the run's own logs ("the store records generation 2; this tab holds 1",
+   "generation 1 was superseded by 2; standing down", "generation 1 was fenced"),
+   `role()` still reads `Leader` where the witness requires `Follower`
+   ("a leader whose recorded generation moved is not the leader").
+
+Both sit in the leader-lifecycle surface the repair's `stand_down` →
+`resume_as_follower` rework (67c32d25c) changed. That rework's credited
+property — no zombie tab after `stand_down` — stands (the zombie witnesses pass
+both host-side and in this run), but these two show the rework also altered
+supersession semantics the pre-existing witnesses pin: this **qualifies the
+`stand_down` credit above**. Whether the two failures are deterministic
+regressions from the rework or racy under the headless runner cannot be settled
+on the reviewing host — the wasm runner needs a browser and is unavailable here —
+and `cargo test` carries no retry, so no flake absorption hides either way.
+*Impact boundary:* two executed failures with their assertions quoted; the
+regression-vs-race classification and the fix both need one round in the wasm
+lane. *Required:* a superseded session's proxied send fails typed (its storage
+write refused too), and a leader whose recorded generation moved reports
+`Follower` after stand-down — both green in the wasm runner, with the
+stand_down credit restated for whichever semantics is adjudicated.
+
 ---
 
 ## Preserved credits
@@ -1083,6 +1119,22 @@ declaration plus three clippy lints in wasm-only code (`unnecessary_map_or`,
 target, where those test modules actually compile). The single red left at the
 gate is **#52**, pre-existing and outside this repair's files; its witness failure
 is executed in CI's browser matrix and recorded above with the required closure.
+
+**Endgame at `68e2c19b0`.** The gate unpeeled in layers — each fix exposing the
+next step's latent failure (fmt had been failing first all along): the phantom
+symbol (`0b817cee9`), the pwsh/bash step + three wasm-target clippy lints
+(`b184e9720`), and the private-link doc fix (`68e2c19b0`). The run at `68e2c19b0`
+is green in **every** job except two steps in the browser-execution lane: the
+Browser matrix (`#52`, pre-existing) and the wasm test runner (`#54`, two
+leader-supersession witnesses — executed, and latent in the repair's own leader
+rework). Everything else — the 58-job roster including Unit tests with the Deck
+floor, the WebRTC feature job's Documentation/Unit-tests/RTC-harnesses/RTC-
+witness-inventory steps, the sensing S1/OA-6 steps, the Windows org tests, Format,
+Clippy, Documentation, Go, Python wheel and the SDK suites — is green at this
+head. **Merge recommendation: hold** until `#54` is adjudicated and fixed in the
+wasm lane (it is production supersession semantics), with `#52` and the two
+owner-adjudication items (`#46`, `#50`) tracked alongside; the review's original
+findings `#1`–`#51` are fixed and witnessed in this tree.
 
 ---
 
