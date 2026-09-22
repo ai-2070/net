@@ -417,17 +417,15 @@ async fn run_ls(
             )
             .await;
         }
-        let mode = if remote.is_some() {
-            "remote"
-        } else {
-            "temporary_supervisor"
-        };
+        // `remote` is `Some` here: the `remote.is_none()` branch above already
+        // returned through `scope::inspect_temporary`, which is the sole
+        // emitter of `"mode": "temporary_supervisor"` for this verb.
         let mut view = crate::target::inspect(
             &profile,
             &args.attach,
             args.identity.as_deref(),
             remote.as_ref(),
-            mode,
+            "remote",
         )
         .await?;
         if args.remote {
