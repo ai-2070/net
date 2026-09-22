@@ -1099,11 +1099,50 @@ ignored, wildcard bind claimed as an address — all caught.
 touched). That is R1c: a natsim row with a port-mapping gateway (e.g.
 `miniupnpd`) and no relay in the topology, CI-only.
 
-**Next:** the device-side `net-mesh join <TOKEN|->` over `DeviceJoin` (show the
-inspection summary and require confirmation or `--yes`, persist before
-redeeming, install, then prove live attach), and `up` running as a joined node
-from that installed bundle. Lifecycle fencing, selective subnet semantics and
-V2 exact-head acceptance remain open.
+**`net-mesh join` and joined `up` (`e876785c1`):** `cli/src/commands/enrollment.rs`
+(+ `lifecycle.rs`), witnesses `cli/tests/join_lifecycle.rs`. The joiner is the
+cloud agent in the primary use case.
+
+- `join <TOKEN|->` decodes the token and prints the issuer fingerprint,
+  enrollment address, domain, trust-domain id, expiry and bearer/bound status to
+  stderr, then requires confirmation: `--yes` for scripts and agent tool use;
+  non-interactive without `--yes` exits 8 before any effect; a stdin token (`-`)
+  always needs `--yes`. It persists identity and intent (`<state>/join`,
+  `DeviceJoin`) before redeeming, installs the verified bundle, then proves live
+  admission with a real attach. Installed-but-unattached exits 6 and keeps the
+  credentials; pending approval is a reported state (exit 0). Re-running the same
+  join is idempotent (no second issuance); a state dir holding one join refuses a
+  different token.
+- `up` in a state dir with an installed join runs as that device: enrolled
+  identity and delivered PSK (`psk_source: "joined"`), attaches to the issuer's
+  node and reports `joined.attached` (and `detail` on failure). It refuses a
+  pending join, `--enroll` (would hand another operator's PSK to others),
+  `--psk-from` and `--identity`.
+
+Validation (Windows): `join_lifecycle` 4/4 — CLI-only journey (refusals without
+`--yes`, summary names the issuer, joined + attached, idempotent re-join, second
+agent refused, joined `up` with the operator's trust domain and attached, joined
+node refuses `--enroll`); require-approval via CLI; different-token refusal;
+installed vs attached (operator down → re-join exits 6 "credentials are
+installed", joined `up` reports `attached: false`). Full `net-cli` 339/339;
+clippy/rustfmt clean. Inverses: confirmation skipped, different token reusing a
+state dir, attach failure ignored, joined node allowed to `--enroll`, pending join
+allowed to start — each failed its witness (the attach inverse was first written
+as a panic, which proves nothing, and redone as a genuine ignore).
+
+**Measured behavior to track:** a second attach with the same node identity
+while the operator still holds the earlier session (the re-join, or `up` right
+after `join`) takes about 5.2 s instead of ~0.1 s. The operator's routed
+re-handshake rule defers rotation of a live, busy session (`DeferBusy`,
+`mesh.rs` `routed_rotation_outcome`) and the joiner succeeds on its handshake
+retry. This is deliberate core safety behavior; a clean close of `join`'s
+attach probe would avoid it and is a candidate follow-up.
+
+**Next (R1c):** the natsim direct-path row — device `up --enroll` behind a
+port-mapping gateway (no manual configuration), agent `join` + `up` on the WAN,
+no relay node in the topology — then R2 (blind relay and the fallback rows).
+Lifecycle fencing, selective subnet semantics and V2 exact-head acceptance
+remain open.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
