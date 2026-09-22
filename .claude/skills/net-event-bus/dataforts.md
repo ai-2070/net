@@ -215,7 +215,7 @@ Each binding lets you write adapters in the host language:
 
 - **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
-- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_VTABLE_INVALID`.
+- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_BACKEND`.
 
 ---
 
