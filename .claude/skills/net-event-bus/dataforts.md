@@ -164,7 +164,7 @@ Content-addressed reference whose bytes live in the caller's existing storage (S
 version: u8               // currently 1
 hash:    [u8; 32]         // BLAKE3
 size:    u64              // bytes; bounded by BLOB_REF_MAX_SIZE = 16 GiB
-uri:     [u8]             // length-prefixed; adapter dispatch key
+uri:     [u8]             // to end of ref; adapter dispatch key
 ```
 
 Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter::accepted_schemes() -> &[&str]` declares which URI schemes an adapter handles (`["s3", "s3+https"]`, `["file"]`, etc.); the registry routes by scheme. Because the channel config does not select the adapter, an attacker who can write to a channel can't route their `BlobRef` URI through an arbitrary registered adapter.
