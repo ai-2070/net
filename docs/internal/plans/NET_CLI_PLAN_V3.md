@@ -813,11 +813,78 @@ Not included: CLI `up --enroll` / `invite` / `join`, the local control endpoint,
 profile integration, standing-PSK rotation and membership revocation, Unix
 execution and CI. Loopback single-process evidence only.
 
-**Next (V3-1 CLI):** the `up`-owned node and its owner-only local control
-endpoint, then `up --enroll` hosting `EnrollmentService` + `MembershipIssuer`
-over the node's own PSK and contact, `invite create/revoke/status` through that
-endpoint, and `join` over `DeviceJoin`. Lifecycle fencing, selective subnet
-semantics and V2 exact-head acceptance remain open.
+**Control endpoint decision (user, 2026-09-23):** loopback TCP plus an
+owner-only per-run secret file with mutual keyed-BLAKE3 authentication, instead
+of the Unix-socket / Windows-named-pipe proposal above. One portable
+implementation, testable on every platform; its security rests on the same
+owner-only state-directory protection the ledger already relies on.
+
+**`up` / `down` / `node status` (2026-09-23, `86c9e6207`):**
+`cli/src/commands/lifecycle.rs`, witnesses `cli/tests/node_lifecycle.rs`.
+
+- **State directory:** `--state-dir`, default `<data dir>/net-mesh/nodes/<profile>`
+  (profile names outside `[A-Za-z0-9._-]` must pass `--state-dir`). Its `node/`
+  subdirectory is a core `EnrollmentStorage` (owner-only directory, atomic
+  durable replacement, exclusive store lock) holding the generated identity
+  seed and generated PSK (`NMUP` v1, checksummed); plus `up.lock` and
+  `control.json`.
+- **Ownership and liveness:** the running `up` holds the store lock and a
+  lifetime lock (`up.lock`). Liveness is that lock, never a PID or file
+  presence. A second `up` refuses, naming the live incarnation and pid.
+- **PSK:** omitted → a CSPRNG PSK committed in the first snapshot before bind
+  and reused on restart (witnessed: same trust-domain id across restart);
+  `file:<path>` → 32 raw bytes or 64 hex through the core secret-file gate;
+  `stdin` → piped only (a terminal is refused: echo cannot be disabled);
+  `kms:` and argv literals refused; all-zero refused. Supplied sources are read
+  and validated before any state is created. Output shows only the public
+  `TrustDomainId`. Identity: `--identity` / profile identity, else the generated
+  seed.
+- **Control endpoint:** loopback `127.0.0.1:<random>`; `control.json` (written
+  atomically into the protected directory) holds port, incarnation, pid and a
+  fresh 32-byte secret. Handshake: node nonce → client nonce + keyed tag →
+  node tag; session key from both nonces; every message carries a keyed MAC
+  with direction and sequence. Messages are not encrypted (no secret crosses
+  it yet); bounded to 8 concurrent sessions of 5 s. Operations: `status`,
+  `shutdown`.
+- **Readiness:** the `ready` row (stream output: ndjson when piped) is emitted
+  only after the mesh is built and started, the control endpoint is bound and
+  the control file is published. `stopped` follows a drain.
+- **`down`:** no-op success when not running (reporting stale metadata);
+  otherwise authenticate, require the acknowledged shutdown to name the
+  recorded incarnation, then succeed only once the lifetime lock is released
+  (`--wait`, default 15 s; timeout exits 7 "running or unknown"). An endpoint
+  that fails authentication is exit 6 and nothing is claimed.
+- **`node status`:** `stopped` / `stale_metadata` (control file, lock free) /
+  `starting` (lock held, no endpoint yet) / `ready` / `draining` / `unknown`
+  (endpoint unreachable or unauthenticated).
+
+Validation (Windows): `node_lifecycle` **6/6** subprocess witnesses — start,
+status, duplicate refusal, down, restart with same identity and trust domain,
+idempotent down; kill → stale metadata → clean restart; file and stdin sources
+give the exact trust domain, and a peer with that PSK attaches to the reported
+address/key/node id while a wrong PSK is refused; invalid sources (kms:, argv
+hex, all-zero, short) exit 2 with no stdout and no state directory; a client
+without the secret gets no answer; a port squatter that also holds the lifetime
+lock is reported `unknown` and `down` refuses to claim a stop. Full `net-cli`
+suite **326/326** (1 pre-existing skip); CLI clippy (bin strict, all-targets
+with CI allows), rustfmt and `git diff --check` clean. **Inverses** (restored
+byte-identically): node skips the client proof; status relabels stale
+metadata as ready; `down` returns before the lock is released; readiness
+without `mesh.start()`; `up` without the lifetime lock — each failed its named
+witness. Client-side node authentication is two layers (node proof, message
+MACs): with a forged well-formed reply, removing either alone still refuses the
+squatter, removing both fails the witness.
+
+Not included: `--detach`, `kms:` adapters, `--enroll`, invite/join commands,
+public docs (`cli/README.md`, web reference) and Unix execution. The default
+bind is `0.0.0.0:0`, so the mesh port changes per restart until an operator
+pins `--bind`; enrollment will need a stable one.
+
+**Next:** `up --enroll` (issuer identity + ledger store, refusing without them)
+hosting `EnrollmentService` + `MembershipIssuer` over the node's own PSK and
+contact; `invite create/revoke/status` as control operations; then `join` over
+`DeviceJoin`. Lifecycle fencing, selective subnet semantics and V2 exact-head
+acceptance remain open.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
