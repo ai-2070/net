@@ -109,6 +109,14 @@ The fix is deliberately minimal: one small atomic local file of merged maxima
 (`revocation-state.json`), not the deferred WAL/replication system. Types:
 `OrgRevocationStore`, `OrgRevocationState`, `OrgRevocationError`.
 
+**Explicit limitation (grant revocation).** Floors cover **membership
+certificates only**. Cross-org capability grants and dispatcher grants have no
+floor mechanism, so their revocation is **not** actively enforced while a call
+runs: what bounds a granted call is the grant's `not_after` (clamped into the
+call's effective deadline) and the provider policy at opening. A grant revoked
+mid-call therefore stops at its validity end or the next opening — never in
+flight. This is a documented limitation, not continuous enforcement.
+
 ## Routing
 
 `org_routing.rs` is the sole consumer of the **global** private-discovery

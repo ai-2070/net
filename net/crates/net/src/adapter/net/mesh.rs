@@ -20609,6 +20609,18 @@ impl MeshNode {
             );
         }
         // A visible store publication occurred (None→store or A→B).
+        // §2.3 (org-streaming slice 1.4): the protected-call registry's
+        // SECOND `subscribe_floors_raised` subscriber lives at this same
+        // install site (re-created whenever the store is (re)installed).
+        // On a changed `(authority_ptr, store_ptr)` pair the registry
+        // retires every record captured under the old pair — before this
+        // returns — and re-subscribes to the new store.
+        #[cfg(feature = "cortex")]
+        super::cortex::rpc::org_registry_store_installed(
+            self.node_id(),
+            self.node_authority(),
+            store.clone(),
+        );
         Ok(true)
     }
 
@@ -24004,6 +24016,18 @@ impl MeshNode {
         // even in the (cryptographically improbable) case where
         // the new handshake derived the same session_id.
         if let Some(old) = &displaced {
+            // §2.3 (org-streaming slice 1.4): a REPLACEMENT retires the
+            // displaced session's protected calls — pushed here, before
+            // this peer transition returns. Exact `(peer, session_id,
+            // establishment)` matching: the successor call and unrelated
+            // peers survive.
+            #[cfg(feature = "cortex")]
+            super::cortex::rpc::org_registry_retire_session(
+                self.node_id(),
+                peer_node_id,
+                old.session.session_id(),
+                old.session.handshake_binding(),
+            );
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
             // X10: a REPLACEMENT is a lifetime end like any other,
@@ -31427,6 +31451,11 @@ impl MeshNode {
         // Eviction is a peer-state transition like any other and runs
         // through the same handle as the installers.
         let peer_transitions_evict = self.peer_transitions.clone();
+        // §2.3 (org-streaming slice 1.4): the dead-peer sweep retires the
+        // departed session's protected calls through the node's registry —
+        // the local node id rides here like the other sweep handles.
+        #[cfg(feature = "cortex")]
+        let registry_node_id = self.node_id();
         // OLB-2B.3c step 2: an eviction moves the session/direct-state
         // projection, so the sweep republishes it and retires the pools that
         // movement supersedes.
@@ -32167,6 +32196,19 @@ impl MeshNode {
                                     return false;
                                 };
                                 let old_session_id = old_info.session.session_id();
+                                // §2.3 (org-streaming slice 1.4): a dead
+                                // peer's protected calls retire with its
+                                // exact session — the registry matches the
+                                // full `(peer, session_id, establishment)`
+                                // triple, so a successor session and
+                                // unrelated peers are untouched.
+                                #[cfg(feature = "cortex")]
+                                super::cortex::rpc::org_registry_retire_session(
+                                    registry_node_id,
+                                    node_id,
+                                    old_info.session.session_id(),
+                                    old_info.session.handshake_binding(),
+                                );
                                 // Only an OWNED address was ever
                                 // published as this peer's; a routed
                                 // session's relay address belongs to
@@ -48890,6 +48932,11 @@ impl Adapter for MeshNode {
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
         self.shutdown.store(true, Ordering::Release);
+        // Q3/C9 (org-streaming slice 1.4): node shutdown retires every
+        // live protected call of this node — typed
+        // `ServeHandleDropped` — before the task drain.
+        #[cfg(feature = "cortex")]
+        super::cortex::rpc::org_registry_retire_all(self.node_id());
         self.shutdown_notify.notify_waiters();
         self.router.stop();
 
@@ -49060,6 +49107,12 @@ impl Adapter for MeshNode {
 impl Drop for MeshNode {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // Q3/C9 (org-streaming slice 1.4): the destructor's best-effort
+        // half retires this node's protected calls and DISENGAGES its
+        // registry (dropping the raise subscription) so a reused node id
+        // inherits nothing.
+        #[cfg(feature = "cortex")]
+        super::cortex::rpc::org_registry_node_dropped(self.node_id());
         self.shutdown_notify.notify_waiters();
         self.router.stop();
         // OLB-2B-E3c: `shutdown().await` is the deterministic JOINED teardown.

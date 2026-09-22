@@ -13,6 +13,8 @@ mod fixture;
 mod frozen_85ecc77c9;
 #[path = "org_rpc_streaming/s13.rs"]
 mod s13;
+#[path = "org_rpc_streaming/s14.rs"]
+mod s14;
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -674,6 +676,7 @@ async fn omitted_deadline_gets_default_and_expires_idle() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("an omitted deadline is filled by the default, never refused");
     assert_eq!(
@@ -705,6 +708,7 @@ async fn omitted_deadline_gets_default_and_expires_idle() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admits");
     assert!(
@@ -764,6 +768,7 @@ async fn requested_deadline_over_cap_is_refused_with_zero_effects() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .err()
         .expect("an explicit deadline over the provider cap must be refused");
@@ -812,6 +817,7 @@ async fn requested_deadline_within_cap_is_honoured() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("a within-cap explicit deadline must be admitted");
     assert_eq!(
@@ -858,6 +864,7 @@ async fn pump_parked_on_zero_credit_is_retired_at_deadline_with_one_terminal() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admits");
 
@@ -957,6 +964,7 @@ async fn serve_handle_drop_retires_live_stream_and_sibling_survives() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open_a)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admitted a");
     let open_b = s13::ss_request("svc.b", 0, b"open");
@@ -966,6 +974,7 @@ async fn serve_handle_drop_retires_live_stream_and_sibling_survives() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open_b)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admitted b");
     assert!(call_a.is_live() && call_b.is_live());
@@ -1070,6 +1079,7 @@ async fn credential_clamp_expiry_is_admission_denied_not_timeout() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 42, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admits (the clamp is not a refusal)");
     assert_eq!(
@@ -1125,6 +1135,7 @@ async fn credential_clamp_expiry_is_admission_denied_not_timeout() {
             &s13::inbound(0x51, 0xA, 0x1111, s13::request_frame(0x1111, 43, &open)),
             s13::synthetic_admitted(),
             &lifetime,
+            None,
         )
         .expect("admits");
     assert_eq!(
@@ -1246,4 +1257,1088 @@ async fn public_client_stream_deadline_expiry_is_typed_timeout() {
         .await,
         "the handler future was stopped at the deadline",
     );
+}
+
+// ============================================================================
+// Slice 1.4 — registry + revocation (contract 3, §2.3/§2.7/§3, ledger Q1/Q4).
+// The nine NAMED witnesses drive the PRODUCTION seams — the shared §3
+// helper (`admit_protected_opening`), the registry's reserve/install where
+// the interleaving is the property, and the lease-carrying fold seam —
+// against REAL `OrgRevocationStore` fixtures (AV-9: scratch dirs left
+// behind). Retirement is observed at `retire_reason()` (the synchronous
+// §2.3 boundary) and at the supervisor's `terminal()`.
+// ============================================================================
+
+use bytes::Bytes;
+use net::adapter::net::behavior::org::OrgRevocationBundle;
+use net::adapter::net::cortex::rpc::{
+    CommitVerdict, OpeningRequest, RegistryPhase, SessionIdentity, VerifiedCallFacts,
+};
+use net::adapter::net::mesh_rpc::OpeningRefusal;
+use std::collections::BTreeMap;
+
+/// §2.3's quantified floor-raise boundary + the generation-only
+/// requalification's victim: a raise for THIS member retires its blocked
+/// stream BEFORE `apply_bundle` returns to its caller, with one typed
+/// `Revoked` terminal.
+#[tokio::test]
+async fn floor_raise_retires_blocked_stream_before_publish_returns() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x61u8; 32])).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w1");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock = ClockSample::now();
+    let (frame, admitted, lease) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        Some(0), // zero initial credit — the pump parks: a BLOCKED stream
+        b"open",
+    )
+    .expect("the opening admits");
+
+    let returned = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (emit, captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(
+        Arc::new(s14::QueueChunksAndReturn {
+            chunks: vec![b"a", b"b"],
+            returned: Arc::clone(&returned),
+            dropped: Arc::clone(&dropped),
+        }),
+        emit,
+    );
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let call = s14::open_ss_call(
+        &mut fold, &frame, admitted, lease, &session, 0x1111, &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || returned
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler must queue its chunks",
+    );
+    assert!(
+        call.is_live(),
+        "the credit-blocked drain is owned, not abandoned (§2.2)",
+    );
+
+    // The floor for THIS member (generation 1 → floor 2) publishes through
+    // the REAL store — every subscriber runs synchronously inside
+    // `apply_bundle`, before it returns.
+    s14::raise_floor(
+        &server.org_revocation_store().expect("installed store"),
+        &org_b,
+        caller_kp.entity_id().clone(),
+        2,
+    );
+    let retired_at_publish_return = call.retire_reason();
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || call.retire_reason().is_some()).await,
+        "the blocked stream must be retired by the raise",
+    );
+    assert_eq!(
+        retired_at_publish_return,
+        Some(StreamTerminalReason::Revoked),
+        "the retirement landed BEFORE the publication returned to its caller",
+    );
+    s14::assert_terminal(&call, StreamTerminalReason::Revoked, "floor raise").await;
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || {
+            call.emission().is_some() && captured.lock().len() == 1
+        })
+        .await,
+        "exactly one terminal after pump stop",
+    );
+    {
+        let frames = captured.lock().clone();
+        assert_eq!(frames.len(), 1, "exactly one terminal frame");
+        assert_eq!(
+            frames[0].status,
+            RpcStatus::AdmissionDenied,
+            "a Revoked stream emits AdmissionDenied",
+        );
+        assert_eq!(
+            frames[0].body.as_ref(),
+            [0u8].as_slice(),
+            "the frozen coarse byte set: 0 = Denied",
+        );
+    }
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || dropped
+            .load(std::sync::atomic::Ordering::SeqCst))
+        .await,
+        "retirement dropped the handler future",
+    );
+    assert!(fold.in_flight_keys().is_empty(), "ownership released");
+}
+
+/// §2.3's requalification (never whole-stamp equality): a floor raise for
+/// one member moves EVERY captured stamp's generation, and a SIBLING
+/// stream of ANOTHER org survives it — its next item commits after the
+/// publication, with its captured generation refreshed.
+#[tokio::test]
+async fn sibling_stream_of_other_org_sends_next_item_after_publication() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x62u8; 32])).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w2");
+    let org_a = net::adapter::net::behavior::org::OrgKeypair::from_bytes([0x7Au8; 32]);
+    let provider = server.entity_id().clone();
+    // The raised victim: an org-B member (generation 1).
+    let caller_b = EntityKeypair::from_bytes([0x25u8; 32]);
+    let intent_b = fixture::owner_delegated_intent_gen(
+        caller_b.clone(),
+        &org_b,
+        provider.clone(),
+        s14::SERVICE,
+        1,
+    );
+    // The sibling of ANOTHER org: an org-A member with a B→A INVOKE grant.
+    let caller_a = EntityKeypair::from_bytes([0x26u8; 32]);
+    let intent_a = fixture::cross_org_intent(
+        caller_a.clone(),
+        &org_a,
+        &org_b,
+        provider.clone(),
+        s14::SERVICE,
+    );
+    let reg_b = s14::owner_reg(1);
+    let reg_a = s14::granted_reg(2);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock = ClockSample::now();
+
+    let (frame_b, admitted_b, lease_b) = s14::admit_ss(
+        &server,
+        &intent_b,
+        &reg_b,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the org-B opening admits");
+    let (frame_a, admitted_a, lease_a) = s14::admit_ss(
+        &server,
+        &intent_a,
+        &reg_a,
+        &replay,
+        clock,
+        43,
+        0x1112,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the cross-org opening admits");
+    let key_a = s14::call_key(caller_a.entity_id(), 43);
+    let incarnation_a = lease_a.incarnation;
+    let registry = s14::registry_of(&server);
+
+    let holder_b = Arc::new(s14::SinkHolder::new());
+    let holder_a = Arc::new(s14::SinkHolder::new());
+    let (emit_b, _cap_b) = s13::capturing_async_emitter();
+    let (emit_a, captured_a) = s13::capturing_async_emitter();
+    let mut fold_b = RpcServerStreamingFold::new(holder_b.clone(), emit_b);
+    let mut fold_a = RpcServerStreamingFold::new(holder_a.clone(), emit_a);
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let call_b = s14::open_ss_call(
+        &mut fold_b,
+        &frame_b,
+        admitted_b,
+        lease_b,
+        &session,
+        0x1111,
+        &lifetime,
+    );
+    let call_a = s14::open_ss_call(
+        &mut fold_a,
+        &frame_a,
+        admitted_a,
+        lease_a,
+        &session,
+        0x1112,
+        &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || holder_a
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1
+            && holder_b.started.load(std::sync::atomic::Ordering::SeqCst) == 1)
+        .await,
+        "both handlers entered",
+    );
+    let sink_a = holder_a.sink.lock().take().expect("the sibling's sink");
+    sink_a
+        .send_wait(Bytes::from_static(b"one"))
+        .await
+        .expect("item 1 queues before the publication");
+    let stamp_before = registry
+        .captured_view(&key_a)
+        .expect("the sibling's captured view");
+
+    // The raise for (org_b, caller_b): BOTH captured stamps' generation
+    // moves — only the victim may retire.
+    s14::raise_floor(
+        &server.org_revocation_store().expect("installed store"),
+        &org_b,
+        caller_b.entity_id().clone(),
+        2,
+    );
+    assert_eq!(
+        call_b.retire_reason(),
+        Some(StreamTerminalReason::Revoked),
+        "the raised member's stream retires at the publication boundary",
+    );
+    assert!(
+        call_a.retire_reason().is_none(),
+        "the SIBLING of another org must NOT retire on a foreign raise",
+    );
+
+    // …and the sibling SENDS ITS NEXT ITEM after the publication: the
+    // commit-point requalification refreshes its captured generation
+    // instead of retiring it.
+    sink_a
+        .send_wait(Bytes::from_static(b"two"))
+        .await
+        .expect("the sibling stream of another org sends its next item after publication");
+    let stamp_after = registry
+        .captured_view(&key_a)
+        .expect("the sibling's refreshed view");
+    assert_ne!(
+        stamp_before.store_generation, stamp_after.store_generation,
+        "the commit refreshed the captured generation (GenerationOnly requalification)",
+    );
+    assert_eq!(
+        registry.commit_check(&key_a, incarnation_a),
+        CommitVerdict::Proceed,
+        "after the refresh the sibling's view is current again",
+    );
+    assert!(call_a.is_live(), "the sibling is untouched");
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || call_b.terminal().is_some()).await,
+        "the victim's terminal lands",
+    );
+    s14::assert_terminal(&call_b, StreamTerminalReason::Revoked, "victim").await;
+    let _ = sink_a;
+    call_a.retire(StreamTerminalReason::Cancelled);
+    drop(holder_a);
+    drop(holder_b);
+    let _ = captured_a;
+}
+
+/// §2.3/§D3 — a poisoned store fails closed: further items are refused
+/// and the affected call retires (`AuthorityUnavailable`), and the
+/// empty-slice authority wake retires ALL protected streams. Recovery
+/// does not resume them.
+#[tokio::test]
+async fn poisoned_store_retires_all_protected_streams() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x63u8; 32])).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w3");
+    let store = server.org_revocation_store().expect("installed store");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+
+    // Two live protected streams: one actively sending, one idle.
+    let mut calls = Vec::new();
+    let mut sinks = Vec::new();
+    for (call_id, origin) in [(42u64, 0x1111u64), (43, 0x1112)] {
+        let (frame, admitted, lease) = s14::admit_ss(
+            &server,
+            &intent,
+            &reg,
+            &replay,
+            clock,
+            call_id,
+            origin,
+            &session,
+            [0xA1u8; 32],
+            None,
+            b"open",
+        )
+        .expect("the opening admits");
+        let holder = Arc::new(s14::SinkHolder::new());
+        let (emit, _captured) = s13::capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(holder.clone(), emit);
+        let call = s14::open_ss_call(
+            &mut fold, &frame, admitted, lease, &session, origin, &lifetime,
+        );
+        assert!(
+            s13::wait_for(Duration::from_secs(10), || holder
+                .started
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1)
+            .await,
+            "the handler entered",
+        );
+        sinks.push(holder.sink.lock().take().expect("sink"));
+        calls.push((call, fold));
+    }
+    let call_active = calls[0].0.clone();
+    let call_idle = calls[1].0.clone();
+
+    store.mark_poisoned_for_test();
+    assert!(store.is_poisoned(), "the store is poisoned");
+
+    // (a) the ACTIVE stream's next item is refused at the §2.3 commit
+    // boundary (poisoned ⇒ `Unusable`) and its call retires — "further
+    // items refused, terminal emitted".
+    let refused = sinks[0].send_wait(Bytes::from_static(b"x")).await;
+    assert!(refused.is_err(), "a poisoned store refuses further items");
+    assert_eq!(
+        call_active.retire_reason(),
+        Some(StreamTerminalReason::AuthorityUnavailable),
+        "the affected call retires fail-closed",
+    );
+
+    // (b) the empty-slice authority wake (the recovery notify — the real
+    // store's `mark_poisoned_for_test` marks without waking; see finding
+    // F-S1.4-3) retires ALL protected streams — the idle one included —
+    // before the call returns.
+    let empty = OrgRevocationBundle::try_issue(&org_b, &BTreeMap::new()).expect("empty bundle");
+    store.apply_bundle(&empty).expect("recovery wake");
+    let idle_at_wake_return = call_idle.retire_reason();
+    assert_eq!(
+        idle_at_wake_return,
+        Some(StreamTerminalReason::AuthorityUnavailable),
+        "the empty-slice wake retires ALL protected streams before it returns",
+    );
+    s14::assert_terminal(
+        &call_idle,
+        StreamTerminalReason::AuthorityUnavailable,
+        "idle stream",
+    )
+    .await;
+    s14::assert_terminal(
+        &call_active,
+        StreamTerminalReason::AuthorityUnavailable,
+        "active stream",
+    )
+    .await;
+
+    // Recovery does not resume them: every later send is refused and the
+    // records stay terminal.
+    assert!(sinks[1].send_wait(Bytes::from_static(b"y")).await.is_err());
+    assert!(!call_idle.is_live() && !call_active.is_live());
+}
+
+/// §2.3's store/authority replacement path: a replacement retires every
+/// record captured under the old `(authority_ptr, store_ptr)` BEFORE the
+/// install returns, and the registry RE-SUBSCRIBES to the new store (its
+/// raises still retire; the old store's do not).
+#[tokio::test]
+async fn store_replacement_retires_all_and_resubscribes() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x64u8; 32])).await;
+    let (org_b, auth1, _dir1) = s14::install_authority_owned(&server, "s14-w4a");
+    let store1 = auth1.revocation.clone();
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+
+    let open = |call_id: u64, origin: u64| {
+        let (frame, admitted, lease) = s14::admit_ss(
+            &server,
+            &intent,
+            &reg,
+            &replay,
+            clock,
+            call_id,
+            origin,
+            &session,
+            [0xA1u8; 32],
+            None,
+            b"open",
+        )
+        .expect("the opening admits");
+        let holder = Arc::new(s14::SinkHolder::new());
+        let (emit, _captured) = s13::capturing_async_emitter();
+        let mut fold = RpcServerStreamingFold::new(holder.clone(), emit);
+        let call = s14::open_ss_call(
+            &mut fold, &frame, admitted, lease, &session, origin, &lifetime,
+        );
+        (call, fold, holder)
+    };
+    let (call1, _fold1, _holder1) = open(42, 0x1111);
+
+    // REPLACE the authority (same owner org, fresh store on disk): the
+    // mesh.rs install-site hook rebinds the registry — records captured
+    // under the OLD pair retire before this returns.
+    let (_org, auth2, _dir2) = s14::install_authority_owned(&server, "s14-w4b");
+    let store2 = auth2.revocation.clone();
+    assert_eq!(
+        call1.retire_reason(),
+        Some(StreamTerminalReason::AuthorityUnavailable),
+        "records captured under the old (authority_ptr, store_ptr) retire \
+         before the install call returns",
+    );
+    s14::assert_terminal(
+        &call1,
+        StreamTerminalReason::AuthorityUnavailable,
+        "replaced-store record",
+    )
+    .await;
+
+    // RESUBSCRIBED: a raise on the NEW store still retires.
+    let (call2, _fold2, _holder2) = open(43, 0x1112);
+    s14::raise_floor(&store2, &org_b, caller_kp.entity_id().clone(), 2);
+    assert_eq!(
+        call2.retire_reason(),
+        Some(StreamTerminalReason::Revoked),
+        "the registry is subscribed to the NEW store",
+    );
+
+    // …and the OLD store's raises no longer reach the registry at all.
+    let caller2 = EntityKeypair::from_bytes([0x27u8; 32]);
+    let intent2 = fixture::owner_delegated_intent_gen(
+        caller2.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let (frame3, admitted3, lease3) = s14::admit_ss(
+        &server,
+        &intent2,
+        &reg,
+        &replay,
+        clock,
+        44,
+        0x1113,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the post-replacement opening admits");
+    let holder3 = Arc::new(s14::SinkHolder::new());
+    let (emit3, _captured3) = s13::capturing_async_emitter();
+    let mut fold3 = RpcServerStreamingFold::new(holder3.clone(), emit3);
+    let call3 = s14::open_ss_call(
+        &mut fold3, &frame3, admitted3, lease3, &session, 0x1113, &lifetime,
+    );
+    s14::raise_floor(&store1, &org_b, caller2.entity_id().clone(), 2);
+    assert!(
+        call3.retire_reason().is_none(),
+        "the REPLACED store's raises no longer reach the registry (its \
+         subscription died with the replacement)",
+    );
+    call3.retire(StreamTerminalReason::Cancelled);
+    drop(holder3);
+}
+
+/// §2.4 session retirement — the `install_peer_locked` displaced branch
+/// retires EXACTLY the replaced session's calls; a successor call on the
+/// new establishment — even reusing the same `(caller, call_id)` — is
+/// unaffected.
+#[tokio::test]
+async fn session_replacement_retires_old_call() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x65u8; 32])).await;
+    let caller_node = fixture::build_node_with(EntityKeypair::from_bytes([0x07u8; 32])).await;
+    // A QUIESCENT pair (no announcements, no dispatch loops): a
+    // same-static re-handshake rotates immediately — the rotation gate
+    // defers only a live-and-BUSY session (open streams / unacked data).
+    fixture::connect_no_start(&caller_node, &server).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w5");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+
+    // The record binds the REAL session identity: the exact establishment
+    // (full handshake hash) the displaced branch will name.
+    let session = SessionIdentity {
+        peer: caller_node.node_id(),
+        session_id: server
+            .peer_session_id(caller_node.node_id())
+            .expect("live session"),
+        establishment: server.peer_session_binding(caller_node.node_id()),
+    };
+    let (frame, admitted, lease) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        session
+            .establishment
+            .expect("a real session carries its binding"),
+        None,
+        b"open",
+    )
+    .expect("the opening admits");
+    let holder = Arc::new(s14::SinkHolder::new());
+    let (emit, _captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(holder.clone(), emit);
+    let call = s14::open_ss_call(
+        &mut fold, &frame, admitted, lease, &session, 0x1111, &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || holder
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler entered before the replacement",
+    );
+
+    // RE-HANDSHAKE: the displaced branch retires the old session's calls
+    // before the transition returns.
+    fixture::connect_no_start(&caller_node, &server).await;
+    assert_eq!(
+        call.retire_reason(),
+        Some(StreamTerminalReason::SessionReplaced),
+        "the displaced session's call retires at the replacement boundary",
+    );
+    s14::assert_terminal(&call, StreamTerminalReason::SessionReplaced, "old call").await;
+
+    // The SUCCESSOR call — same `(caller, call_id)` on the NEW
+    // establishment — is unaffected and completes normally.
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || s14::registry_of(&server)
+            .record_count()
+            == 0)
+        .await,
+        "the retired call's record is reclaimed before the key is reused",
+    );
+    let session2 = SessionIdentity {
+        peer: caller_node.node_id(),
+        session_id: server
+            .peer_session_id(caller_node.node_id())
+            .expect("live session"),
+        establishment: server.peer_session_binding(caller_node.node_id()),
+    };
+    assert_ne!(
+        session2.session_id, session.session_id,
+        "a re-handshake is a new establishment",
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dropped2 = Arc::new(AtomicBool::new(false));
+    let ran2 = Arc::new(AtomicUsize::new(0));
+    // The SAME call id is reused — outside the replay guard's window
+    // (the monotonic jump of W6's trick), so the guard cannot be what
+    // decides this: the successor exists and the old call's late cleanup
+    // cannot touch it.
+    let clock_late = ClockSample {
+        wall_ns: clock.wall_ns,
+        monotonic: clock.monotonic + Duration::from_secs(400),
+    };
+    let (frame2, admitted2, lease2) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock_late,
+        42, // the SAME call id
+        0x1111,
+        &session2,
+        session2.establishment.expect("binding"),
+        None,
+        b"open",
+    )
+    .expect("the successor opening admits on the new session");
+    let (emit2, captured2) = s13::capturing_async_emitter();
+    let mut fold2 = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkUntilReleased {
+            release: Arc::clone(&release),
+            dropped: Arc::clone(&dropped2),
+            ran: Arc::clone(&ran2),
+        }),
+        emit2,
+    );
+    let call2 = s14::open_ss_call(
+        &mut fold2, &frame2, admitted2, lease2, &session2, 0x1111, &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || ran2
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1)
+        .await,
+        "the successor's handler entered",
+    );
+    assert!(call2.is_live(), "the successor call is unaffected");
+    release.notify_one();
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || matches!(
+            call2.terminal(),
+            Some(StreamTerminalReason::Completed(_))
+        ))
+        .await,
+        "the successor completes normally",
+    );
+    assert_eq!(
+        captured2.lock().len(),
+        2,
+        "the successor's own chunk + its own terminal",
+    );
+}
+
+/// §3/D4 — a live call id cannot be reused even AFTER the replay guard's
+/// window has lapsed for it: `reserve` refuses `ActiveCallOwned` before
+/// decode (the guard is never consulted), and the same reuse reaches
+/// ADMITTED — not `Replay` — once the call is gone, proving the refusal
+/// was active ownership, not replay retention.
+#[tokio::test]
+async fn active_call_id_reuse_after_replay_window_is_refused() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x66u8; 32])).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w6");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock0 = ClockSample::now();
+    // The documented clock pairing (admission_clock.rs): freshness reads
+    // `wall_ns`, replay RETENTION derives from `monotonic`. A monotonic
+    // jump past `proof_expiry + 300 s` is exactly "after the replay
+    // window" while the wall-clock freshness checks stay satisfied.
+    let clock_late = ClockSample {
+        wall_ns: clock0.wall_ns,
+        monotonic: clock0.monotonic + Duration::from_secs(400),
+    };
+
+    // #1 — the call admits and STAYS LIVE (its lease is held).
+    let (_frame, _admitted, lease1) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock0,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the first opening admits");
+    assert_eq!(replay.len(), 1, "one guard entry — the first proof's");
+
+    // #2 — the SAME `(caller, call_id)` arriving after the replay window
+    // (monotonic +400 s > expiry + 300 s) is REFUSED while the call is
+    // live — `ActiveCallOwned` from `reserve`, before decode, with the
+    // guard never consulted.
+    let refused = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock_late,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect_err("an ACTIVE call id cannot be reused after the replay window");
+    assert!(
+        matches!(
+            refused,
+            OpeningRefusal::Denied(AdmissionDenied::ActiveCallOwned)
+        ),
+        "the reuse is refused as ActiveCallOwned, before decode — got {refused:?}",
+    );
+    assert_eq!(
+        replay.len(),
+        1,
+        "the refused reuse never reached the replay guard",
+    );
+
+    // #3 — the positive control: the same reuse, the same lapsed window,
+    // once the call is GONE, ADMITS (the guard's expired entry is
+    // overwritten — not `Replay`): the #2 refusal was purely active
+    // ownership.
+    drop(lease1);
+    let (_frame, _admitted, lease3) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock_late,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the same reuse admits once the call is gone — the replay window had lapsed");
+    drop(lease3);
+}
+
+/// §3 step 4 — a raise landing between `reserve` and `install` denies the
+/// install (`Revoked`) with ZERO effects: the acting-org quota is never
+/// charged, no fold effect happens, and the bridge's rollback frees
+/// the key for reuse.
+#[tokio::test]
+async fn raise_between_reserve_and_install_denies_with_zero_effects() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x67u8; 32])).await;
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w7");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let registry = s14::registry_of(&server);
+    let session = s14::synthetic_session();
+    let key = s14::call_key(caller_kp.entity_id(), 42);
+    let clock = ClockSample::now();
+
+    // Reserve (the model's `raise_between_reserve_and_install_denies_with_zero_effects`).
+    let mut reservation = registry
+        .reserve(OpeningRequest {
+            key: key.clone(),
+            session: session.clone(),
+            session_generation: Some(1),
+            registration: 1,
+            shape: RpcCallShape::ServerStreaming,
+            now_ns: clock.wall_ns,
+        })
+        .expect("reserve");
+    assert_eq!(registry.active_node(), 1, "the provisional slot is held");
+    assert_eq!(
+        registry.authority_epoch(),
+        reservation.epoch_at_reserve,
+        "no notification yet",
+    );
+
+    // The raise lands BETWEEN reserve and install — through the real
+    // store's publish and the mesh.rs-installed raise subscription.
+    s14::raise_floor(
+        &server.org_revocation_store().expect("installed store"),
+        &org_b,
+        caller_kp.entity_id().clone(),
+        2,
+    );
+    assert_eq!(
+        registry.authority_epoch(),
+        reservation.epoch_at_reserve + 1,
+        "the notified callback moved the epoch",
+    );
+
+    let denied = registry
+        .install(
+            &mut reservation,
+            VerifiedCallFacts {
+                acting_org: org_b.org_id(),
+                member: caller_kp.entity_id().clone(),
+                member_generation: 1,
+                deadline: None,
+            },
+            clock.wall_ns,
+        )
+        .expect_err("install must deny after the raise");
+    assert_eq!(
+        denied,
+        AdmissionDenied::Revoked,
+        "the §2.3 requalification refuses this member",
+    );
+    // ZERO effects: no fold effects are possible (no lease exists), the
+    // org quota is never charged, and the record is terminal.
+    assert_eq!(
+        registry.active_for_org(&org_b.org_id()),
+        0,
+        "org quota never charged"
+    );
+    assert_eq!(registry.phase(&key), Some(RegistryPhase::Terminal));
+
+    // The bridge's reservation guard owns the rollback; the key frees.
+    drop(reservation);
+    assert_eq!(registry.active_node(), 0);
+    assert_eq!(registry.removals(&key, 1), 1, "exactly one removal");
+    assert!(registry.record_count() == 0);
+    let second = registry.reserve(OpeningRequest {
+        key,
+        session,
+        session_generation: Some(1),
+        registration: 1,
+        shape: RpcCallShape::ServerStreaming,
+        now_ns: clock.wall_ns,
+    });
+    assert!(second.is_ok(), "the key is reusable after the rollback");
+}
+
+/// §2.7 — queued bytes over the per-call budget park `send_wait` (only on
+/// satisfiable bounds) and retirement WAKES it with the closed-sink
+/// refusal: the wait is interruptible by retire, exactly once.
+#[tokio::test]
+async fn queued_bytes_over_call_budget_park_send_wait_and_wake_on_retire() {
+    let server = fixture::build_node_with(EntityKeypair::from_bytes([0x68u8; 32])).await;
+    // TINY byte budgets (the Q1 defaults are provider-configurable
+    // engineering defaults — the accounting semantics are what is under
+    // test): 24 B per call per direction.
+    s14::set_tiny_byte_registry(&server);
+    let (org_b, _auth, _dir) = s14::install_authority_owned(&server, "s14-w8");
+    let caller_kp = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent = fixture::owner_delegated_intent_gen(
+        caller_kp.clone(),
+        &org_b,
+        server.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+    let clock = ClockSample::now();
+    let (frame, admitted, lease) = s14::admit_ss(
+        &server,
+        &intent,
+        &reg,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        Some(0), // zero credit: the pump never releases queued bytes
+        b"open",
+    )
+    .expect("the opening admits");
+    let holder = Arc::new(s14::SinkHolder::new());
+    let (emit, _captured) = s13::capturing_async_emitter();
+    let mut fold = RpcServerStreamingFold::new(holder.clone(), emit);
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let call = s14::open_ss_call(
+        &mut fold, &frame, admitted, lease, &session, 0x1111, &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || holder
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1)
+        .await,
+        "the handler entered",
+    );
+    let sink = holder.sink.lock().take().expect("sink");
+
+    // Three 8 B items fill the 24 B call budget (the zero-credit pump
+    // keeps every permit charged).
+    for _ in 0..3 {
+        sink.send_wait(Bytes::from_static(b"12345678"))
+            .await
+            .expect("an in-budget item queues");
+    }
+    // The fourth PARKS on the full call budget — a satisfiable bound.
+    let parked = tokio::spawn(async move { sink.send_wait(Bytes::from_static(b"12345678")).await });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !parked.is_finished(),
+        "the item over the call budget must PARK in send_wait",
+    );
+
+    // Retire wakes it — interruptible by retirement is the §2.7 contract.
+    call.retire(StreamTerminalReason::Cancelled);
+    let woke = tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("the parked send_wait must wake on retire")
+        .expect("join");
+    assert!(
+        woke.is_err(),
+        "the woken send_wait reports the closed sink (the chunk was not sent)",
+    );
+    s14::assert_terminal(&call, StreamTerminalReason::Cancelled, "retired call").await;
+}
+
+/// Q3/C9 (Main's carve) — node shutdown retires every live protected
+/// stream of THAT node with its typed terminal, and a SIBLING node's
+/// streams survive and complete normally.
+#[tokio::test]
+async fn node_shutdown_retires_live_protected_streams() {
+    use net::adapter::Adapter as _;
+
+    let node_a = fixture::build_node_with(EntityKeypair::from_bytes([0x69u8; 32])).await;
+    let node_b = fixture::build_node_with(EntityKeypair::from_bytes([0x6Au8; 32])).await;
+    let clock = ClockSample::now();
+    let lifetime = s13::lifetime(StreamLifetimePolicy::q1_defaults(), &[], clock);
+    let replay = AdmissionReplayGuard::with_defaults();
+    let session = s14::synthetic_session();
+
+    // Node A: a live protected stream under its own authority/store.
+    let (org_a, _auth_a, _dir_a) = s14::install_authority_owned(&node_a, "s14-w9a");
+    let caller_a = EntityKeypair::from_bytes([0x24u8; 32]);
+    let intent_a = fixture::owner_delegated_intent_gen(
+        caller_a.clone(),
+        &org_a,
+        node_a.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let reg = s14::owner_reg(1);
+    let (frame_a, admitted_a, lease_a) = s14::admit_ss(
+        &node_a,
+        &intent_a,
+        &reg,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the opening admits on A");
+    let holder_a = Arc::new(s14::SinkHolder::new());
+    let (emit_a, _captured_a) = s13::capturing_async_emitter();
+    let mut fold_a = RpcServerStreamingFold::new(holder_a.clone(), emit_a);
+    let call_a = s14::open_ss_call(
+        &mut fold_a,
+        &frame_a,
+        admitted_a,
+        lease_a,
+        &session,
+        0x1111,
+        &lifetime,
+    );
+
+    // Node B: the SIBLING node's live protected stream (its own
+    // authority/store and registry).
+    let (org_b, _auth_b, _dir_b) = s14::install_authority_owned(&node_b, "s14-w9b");
+    let caller_b = EntityKeypair::from_bytes([0x25u8; 32]);
+    let intent_b = fixture::owner_delegated_intent_gen(
+        caller_b.clone(),
+        &org_b,
+        node_b.entity_id().clone(),
+        s14::SERVICE,
+        1,
+    );
+    let (frame_b, admitted_b, lease_b) = s14::admit_ss(
+        &node_b,
+        &intent_b,
+        &reg,
+        &replay,
+        clock,
+        42,
+        0x1111,
+        &session,
+        [0xA1u8; 32],
+        None,
+        b"open",
+    )
+    .expect("the opening admits on B");
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let dropped_b = Arc::new(AtomicBool::new(false));
+    let ran_b = Arc::new(AtomicUsize::new(0));
+    let (emit_b, captured_b) = s13::capturing_async_emitter();
+    let mut fold_b = RpcServerStreamingFold::new(
+        Arc::new(s13::ParkUntilReleased {
+            release: Arc::clone(&release_b),
+            dropped: Arc::clone(&dropped_b),
+            ran: Arc::clone(&ran_b),
+        }),
+        emit_b,
+    );
+    let call_b = s14::open_ss_call(
+        &mut fold_b,
+        &frame_b,
+        admitted_b,
+        lease_b,
+        &session,
+        0x1111,
+        &lifetime,
+    );
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || holder_a
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1
+            && ran_b.load(std::sync::atomic::Ordering::SeqCst) == 1)
+        .await,
+        "both handlers entered before the shutdown",
+    );
+
+    // Node A shuts down (the `Adapter::shutdown` hook): its live
+    // protected streams reach their typed terminal.
+    node_a.shutdown().await.expect("shutdown");
+    let retired_at_shutdown_return = call_a.retire_reason();
+    assert!(
+        s13::wait_for(Duration::from_secs(30), || call_a.retire_reason().is_some()).await,
+        "the live protected stream must be retired by node shutdown",
+    );
+    assert_eq!(
+        retired_at_shutdown_return,
+        Some(StreamTerminalReason::ServeHandleDropped),
+        "the retirement landed before the shutdown call returned",
+    );
+    s14::assert_terminal(
+        &call_a,
+        StreamTerminalReason::ServeHandleDropped,
+        "shutdown-retired stream",
+    )
+    .await;
+
+    // The SIBLING node's stream survives and completes normally.
+    assert!(call_b.is_live(), "the sibling node's stream survives");
+    release_b.notify_one();
+    assert!(
+        s13::wait_for(Duration::from_secs(10), || matches!(
+            call_b.terminal(),
+            Some(StreamTerminalReason::Completed(_))
+        ))
+        .await,
+        "the sibling node's stream completes normally",
+    );
+    assert_eq!(
+        captured_b.lock().len(),
+        2,
+        "the sibling's own chunk + its own terminal",
+    );
+    drop(fold_a);
+    drop(fold_b);
 }

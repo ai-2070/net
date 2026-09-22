@@ -486,6 +486,17 @@ impl Drop for ServeHandle {
                 );
             }
         }
+        // §2.3/§2.4 (slice 1.4): the registry's `retire_registration` is
+        // the model's entry point for handle drop — it settles the
+        // registry records' terminals and queued byte permits for THIS
+        // registration (protected unary records included), synchronously,
+        // before this returns. Idempotent with the `retire_all` above
+        // (first writer wins on each record).
+        crate::adapter::net::cortex::rpc::protected_call_registry_for(self.mesh.node_id())
+            .retire_registration(
+                self.registration_id,
+                StreamTerminalReason::ServeHandleDropped,
+            );
     }
 }
 
@@ -1043,6 +1054,246 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
 /// `AdmissionDenied` (0x0009 with a coarse reason) to the authenticated peer and
 /// the handler NEVER runs. A non-REQUEST frame (a CANCEL for an already-admitted
 /// call) passes to the fold unchanged — no re-admission.
+/// §3's admission transaction (slice 1.4) — the SHARED helper the unary
+/// protected bridge ([`admit_and_dispatch_protected`]) consumes now and
+/// `admit_and_dispatch_protected_stream` (slice 1.5) consumes next (the
+/// F-S1.3-7 shared-helper preference). One exact-incarnation transaction
+/// around the shape-aware verifier, replay/policy ordering UNCHANGED
+/// (the §9.5 stability recheck, the replay insert at step 10, the
+/// provider policy at step 11 — guard and policy untouched):
+///
+/// 1. **Reserve** on `(caller, call_id)` before decode and before any
+///    signature work (both key halves come from `resolve_direct_caller` +
+///    `EventMeta`). A duplicate while the key is LIVE is refused here as
+///    `ActiveCallOwned` — §3's replay classification: the guard's
+///    `Replay`/`CallIdCollision` remain observed only for a not-live key
+///    inside the retained window.
+/// 2. Decode → digest → provider self-verify → `verify_org_admission`.
+/// 3. **Rollback on every `Err`** — the reservation guard releases
+///    (§2.4's bridge-side cleanup owner); the Q4 policy-veto guard slot
+///    stays consumed (verify's own semantics, untouched).
+/// 4. **Install** under the registry lock with the §2.3 requalification
+///    on authority movement — a generation-only move requalifies against
+///    `floor_for(acting_org, member)` and REFRESHES the captured
+///    generation (a sibling's raise never retires the wrong call); a
+///    raise past this member denies `Revoked`; an unusable view denies
+///    fail-closed. Returns contract 5's lease for the fold's transfer.
+pub enum ProtectedOpeningOutcome {
+    /// The full §3 transaction succeeded: verified facts + the installed
+    /// lease (contract 5's seam input).
+    Admitted {
+        /// The verified four-party attribution.
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+        /// The installed lease (the fold's transfer target).
+        lease: crate::adapter::net::cortex::rpc::ProtectedCallLease,
+    },
+    /// Review-7 RED negative-control seam ONLY (its `#[cfg(test)]` caller
+    /// is compiled out of production): dispatched WITHOUT the
+    /// org-admission engine, with synthetic attribution and no registry
+    /// record.
+    #[cfg(test)]
+    EngineBypassed {
+        /// Synthetic attribution — deliberately not a verified `Admitted`.
+        admitted: crate::adapter::net::behavior::org_admission::Admitted,
+    },
+}
+
+/// Why an opening was refused before the fold.
+#[derive(Debug)]
+pub enum OpeningRefusal {
+    /// A caller-facing admission denial. The bridge charges the §6
+    /// failure budget for these (except `AuthorityChanged`, D7).
+    Denied(crate::adapter::net::behavior::org_admission::AdmissionDenied),
+    /// The §6 failed-admission throttle refused this peer — already
+    /// charged by the limiter itself, so the bridge emits `Unavailable`
+    /// WITHOUT a second `on_failure` charge (preserving the unary path's
+    /// exact disposition).
+    Throttled,
+}
+
+impl From<crate::adapter::net::behavior::org_admission::AdmissionDenied> for OpeningRefusal {
+    fn from(denied: crate::adapter::net::behavior::org_admission::AdmissionDenied) -> Self {
+        OpeningRefusal::Denied(denied)
+    }
+}
+
+/// Run one §3 admission transaction for a protected opening — the shared
+/// helper the unary protected bridge consumes now and the streaming bridge
+/// (slice 1.5) consumes next. See [`ProtectedOpeningOutcome`] and
+/// [`OpeningRefusal`] for the two refusal classes.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_protected_opening(
+    mesh: &Arc<MeshNode>,
+    inbound: &RpcInboundEvent,
+    call_id: u64,
+    caller: &crate::adapter::net::identity::EntityId,
+    tag: &str,
+    reg: &crate::adapter::net::org_admission_gate::RegisteredRpcService,
+    replay: &crate::adapter::net::behavior::org_admission_replay::AdmissionReplayGuard,
+    clock: crate::adapter::net::behavior::admission_clock::ClockSample,
+    registered_shape: crate::adapter::net::behavior::org_call::RpcCallShape,
+    session_binding: Option<[u8; 32]>,
+    session: crate::adapter::net::cortex::rpc::SessionIdentity,
+    session_generation: Option<u64>,
+) -> Result<ProtectedOpeningOutcome, OpeningRefusal> {
+    use crate::adapter::net::behavior::org_admission::{AdmissionContext, AdmissionDenied};
+    use crate::adapter::net::behavior::org_call::RpcCallShape;
+    use crate::adapter::net::cortex::rpc as fold;
+    use crate::adapter::net::org_admission_gate as gate;
+
+    // §3 step 1 — RESERVE. The reservation guard owns the rollback for
+    // every early return below (§2.4: pre-transfer, the bridge's guard is
+    // the ONE cleanup owner).
+    let registry = fold::protected_call_registry_for(mesh.node_id());
+    let mut reservation = registry.reserve(fold::OpeningRequest {
+        key: fold::ProtectedCallKey {
+            caller: caller.clone(),
+            call_id,
+        },
+        session,
+        session_generation,
+        registration: reg.registration_id(),
+        shape: registered_shape,
+        now_ns: clock.wall_ns,
+    })?;
+
+    // Decode the finalized request for the digest + admission header(s).
+    let Ok(payload) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..))
+    else {
+        return Err(AdmissionDenied::MalformedProof.into());
+    };
+    let Ok(request_digest) = gate::org_request_digest(&payload) else {
+        return Err(AdmissionDenied::MalformedProof.into());
+    };
+    let admission_headers: Vec<&[u8]> = payload
+        .headers
+        .iter()
+        .filter(|(n, _)| n == crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER)
+        .map(|(_, v)| v.as_slice())
+        .collect();
+    // Shape term (C3, §1.5 step 4): derived from (registration shape,
+    // payload flags).
+    let shape = RpcCallShape::from_streaming_flags(
+        payload.flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0,
+        payload.flags & FLAG_RPC_STREAMING_RESPONSE != 0,
+    );
+
+    // D7 — the subnet-export binding, revalidated against LIVE state on
+    // every call, for a subnet-exported registration only. Runs BEFORE
+    // the expensive org-admission signature work … (the unary path's
+    // order, preserved verbatim). The coarse reason deliberately does
+    // not disclose WHICH term failed.
+    let subnet_export_facts = match reg.subnet_export() {
+        Some(binding) => match gate::verify_subnet_export(mesh, binding, &clock) {
+            Ok(facts) => Some(facts),
+            Err(denied) => return Err(denied.into()),
+        },
+        None => None,
+    };
+
+    let facts = gate::verify_provider_authority(mesh, &clock)?;
+    let invoked_capability =
+        crate::adapter::net::behavior::org_grant::CapabilityAuthorityId::for_tag(tag);
+    let ctx = AdmissionContext {
+        mode: reg.admission(),
+        authenticated_caller: caller,
+        provider: &facts.provider,
+        provider_owner_org: facts.provider_owner_org,
+        invoked_capability,
+        call_id,
+        request_digest,
+        shape,
+        registered_shape,
+        // Unary wire semantics are unchanged: the unary proof carries no
+        // session binding and none is checked (§1.3 is streaming-only).
+        session_binding,
+        floors: facts.floors.as_ref(),
+        skew_secs: facts.skew_secs,
+    };
+    let captured_stamp = facts.stamp;
+
+    // Review-7 RED negative-control seam — registration-local,
+    // #[cfg(test)] ONLY, compiled out of production: bypass ONLY the
+    // org-admission engine and dispatch with synthetic attribution (no
+    // registry record — the point is execution WITHOUT a verified
+    // `Admitted`). Every provider/transport precondition above is still
+    // enforced.
+    #[cfg(test)]
+    if reg.red_witness_admission_disabled() {
+        let admitted = crate::adapter::net::behavior::org_admission::Admitted {
+            caller: caller.clone(),
+            acting_org: facts.provider_owner_org,
+            provider_org: facts.provider_owner_org,
+            provider: facts.provider.clone(),
+            capability: invoked_capability,
+        };
+        return Ok(ProtectedOpeningOutcome::EngineBypassed { admitted });
+    }
+
+    // §6 — throttle BEFORE the signature work, not after.
+    if !mesh
+        .admission_rate_limiter()
+        .may_attempt(inbound.from_node, clock.monotonic)
+    {
+        return Err(OpeningRefusal::Throttled);
+    }
+
+    let outcome = crate::adapter::net::behavior::org_admission::verify_org_admission(
+        &ctx,
+        &admission_headers,
+        replay,
+        clock,
+        // §9.5 stability: the view captured before verification must
+        // still be live at the replay insert, or the stale decision is
+        // denied without consuming a slot. For a subnet-exported
+        // registration BOTH stamps must hold.
+        || {
+            captured_stamp.is_current(&gate::capture_admission_stamp(mesh))
+                && subnet_export_facts
+                    .as_ref()
+                    .is_none_or(|facts| facts.is_current(mesh))
+        },
+        |proof| (reg.provider_policy())(proof),
+    );
+    let admitted = outcome?;
+
+    // §3 step 4 — INSTALL under the registry lock with the §2.3
+    // requalification. The member generation comes from the decoded
+    // proof's membership certificate (the floor comparison term).
+    let member_generation = match registered_shape {
+        RpcCallShape::Unary => crate::adapter::net::behavior::org_call::OrgCallProof::decode(
+            admission_headers.first().copied().unwrap_or(&[]),
+        )
+        .map(|proof| proof.caller_membership.generation),
+        _ => crate::adapter::net::behavior::org_call::OrgStreamCallProof::decode(
+            admission_headers.first().copied().unwrap_or(&[]),
+        )
+        .map(|proof| proof.caller_membership.generation),
+    }
+    .map_err(|_| AdmissionDenied::MalformedProof)?;
+    let lease = registry.install(
+        &mut reservation,
+        fold::VerifiedCallFacts {
+            acting_org: admitted.acting_org.clone(),
+            member: admitted.caller.clone(),
+            member_generation,
+            // The §2.1 deadline lives at the fold (`StreamCallLifetime`);
+            // unary records carry none (enforcing §2.1 on unary would
+            // change unary behavior).
+            deadline: None,
+        },
+        clock.wall_ns,
+    )?;
+    Ok(ProtectedOpeningOutcome::Admitted { admitted, lease })
+}
+
+/// §3's exact-incarnation admission/retirement transaction around the
+/// shape-aware verifier (slice 1.4) — reserve → verify → rollback →
+/// install → fold-apply, preserving unary behavior and the replay/policy
+/// ordering (guard step 10, policy step 11 untouched). The registry's
+/// transfer happens at the fold's effect boundary
+/// (`RpcServerFold::apply_inbound_admitted`), and its single removal at
+/// the spawned task's end.
 #[allow(clippy::too_many_arguments)]
 async fn admit_and_dispatch_protected(
     mesh: &Arc<MeshNode>,
@@ -1058,8 +1309,7 @@ async fn admit_and_dispatch_protected(
     // published inline, so the single bridge task never awaits a socket write.
     resp_tx: &mpsc::Sender<RpcResponseJob>,
 ) {
-    use crate::adapter::net::behavior::org_admission::{AdmissionContext, CoarseAdmissionReason};
-    use crate::adapter::net::org_admission_gate as gate;
+    use crate::adapter::net::behavior::org_admission::CoarseAdmissionReason;
 
     let Some(meta) = bridge_origin_check(inbound, service, tag, metrics) else {
         return;
@@ -1135,63 +1385,56 @@ async fn admit_and_dispatch_protected(
         return;
     }
 
-    // Decode the finalized request for the digest + admission header(s).
-    let Ok(payload) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..))
-    else {
-        emit_admission_denial(
-            mesh,
-            resp_tx,
-            service,
-            claimed_origin,
-            call_id,
-            from_node,
-            CoarseAdmissionReason::Denied,
-        );
-        return;
-    };
-    let Ok(request_digest) = gate::org_request_digest(&payload) else {
-        emit_admission_denial(
-            mesh,
-            resp_tx,
-            service,
-            claimed_origin,
-            call_id,
-            from_node,
-            CoarseAdmissionReason::Denied,
-        );
-        return;
-    };
-    let admission_headers: Vec<&[u8]> = payload
-        .headers
-        .iter()
-        .filter(|(n, _)| n == crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER)
-        .map(|(_, v)| v.as_slice())
-        .collect();
-    // Shape term (C3, §1.5 step 4): derived from (registration shape,
-    // payload flags). This seam serves UNARY registrations, and a
-    // streaming flag on one is a distinct "not supported" denial, never
-    // admitted under a unary binding (E1.8 preserved).
-    let shape = crate::adapter::net::behavior::org_call::RpcCallShape::from_streaming_flags(
-        payload.flags & FLAG_RPC_CLIENT_STREAMING_REQUEST != 0,
-        payload.flags & FLAG_RPC_STREAMING_RESPONSE != 0,
-    );
-
-    // Provider self-verify (E1.3) against ONE clock sample.
+    // §3 (slice 1.4) — ONE exact-incarnation admission transaction
+    // around the shape-aware verifier: reserve (before decode, before any
+    // signature work) → decode/verify with the replay insert at step 10
+    // and the provider policy at step 11 UNCHANGED → rollback-on-Err
+    // (the reservation guard; the Q4 policy-veto guard slot stays
+    // consumed) → install under the registry lock (§2.3 requalification).
+    // The fold seam then TRANSFERS the lease at its effect boundary.
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
-
-    // D7 — the subnet-export binding, revalidated against LIVE state on
-    // every call, for a subnet-exported registration only. Runs BEFORE
-    // the expensive org-admission signature work (it is two binary
-    // probes and four integer compares) and BEFORE the failed-admission
-    // throttle: a denial here is provider-side authority movement
-    // (credentials or boundaries replaced, floor raised, epoch
-    // advanced, expiry), never caller proof abuse, so it is not charged
-    // against the caller's budget. The coarse reason deliberately does
-    // not disclose WHICH term failed.
-    let subnet_export_facts = match reg.subnet_export() {
-        Some(binding) => match gate::verify_subnet_export(mesh, binding, &clock) {
-            Ok(facts) => Some(facts),
-            Err(denied) => {
+    let session = crate::adapter::net::cortex::rpc::SessionIdentity {
+        peer: from_node,
+        session_id: inbound.session_id,
+        establishment: mesh.peer_session_binding(from_node),
+    };
+    // `SessionCurrentness`'s live generation is not reachable from this
+    // module (finding F-S1.4-2): `Some(0)` records "a live, non-exhausted
+    // generation", keeping the seam's `u64::MAX` refusal armed for the
+    // callers that can resolve it.
+    let session_generation = Some(0);
+    let opening = admit_protected_opening(
+        mesh,
+        inbound,
+        call_id,
+        &caller,
+        tag,
+        reg,
+        replay,
+        clock,
+        crate::adapter::net::behavior::org_call::RpcCallShape::Unary,
+        None,
+        session,
+        session_generation,
+    );
+    match opening {
+        Ok(ProtectedOpeningOutcome::Admitted { admitted, lease }) => {
+            // Cache the authenticated response route (as the public accept path
+            // does), then hand the fold the admitted REQUEST — the handler runs
+            // with `RpcContext::org_admission = Some(admitted)` and the raw proof
+            // header stripped.
+            cache_authenticated_response_destination(mesh, cache, inbound);
+            if let Err(denied) = fold
+                .lock()
+                .apply_inbound_admitted(inbound, admitted, Some(lease))
+            {
+                tracing::warn!(
+                    service = service,
+                    reason = ?denied,
+                    "rpc serve_rpc_protected: fold refused the admitted opening",
+                );
+                // §3 step 5: the bridge owns exactly one bounded opening
+                // refusal when routable (the fold emitted nothing).
                 emit_admission_denial(
                     mesh,
                     resp_tx,
@@ -1201,15 +1444,24 @@ async fn admit_and_dispatch_protected(
                     from_node,
                     denied.coarse(),
                 );
-                return;
             }
-        },
-        None => None,
-    };
-
-    let facts = match gate::verify_provider_authority(mesh, &clock) {
-        Ok(f) => f,
-        Err(d) => {
+        }
+        #[cfg(test)]
+        Ok(ProtectedOpeningOutcome::EngineBypassed { admitted }) => {
+            cache_authenticated_response_destination(mesh, cache, inbound);
+            if let Err(e) = fold.lock().apply_inbound_admitted(inbound, admitted, None) {
+                tracing::warn!(reason = ?e, "rpc serve_rpc_protected: fold apply error");
+            }
+        }
+        Err(OpeningRefusal::Throttled) => {
+            tracing::warn!(
+                service = service,
+                from_node = format!("{:#x}", from_node),
+                "nrpc: org admission throttled — peer exhausted its failed-admission budget",
+            );
+            metrics
+                .capability_denied_total
+                .fetch_add(1, Ordering::Relaxed);
             emit_admission_denial(
                 mesh,
                 resp_tx,
@@ -1217,129 +1469,10 @@ async fn admit_and_dispatch_protected(
                 claimed_origin,
                 call_id,
                 from_node,
-                d.coarse(),
+                CoarseAdmissionReason::Unavailable,
             );
-            return;
         }
-    };
-    let invoked_capability =
-        crate::adapter::net::behavior::org_grant::CapabilityAuthorityId::for_tag(tag);
-    let ctx = AdmissionContext {
-        mode: reg.admission(),
-        authenticated_caller: &caller,
-        provider: &facts.provider,
-        provider_owner_org: facts.provider_owner_org,
-        invoked_capability,
-        call_id,
-        request_digest,
-        shape,
-        registered_shape: crate::adapter::net::behavior::org_call::RpcCallShape::Unary,
-        // Unary wire semantics are unchanged: the unary proof carries no
-        // session binding and none is checked (§1.3 is streaming-only).
-        session_binding: None,
-        floors: facts.floors.as_ref(),
-        skew_secs: facts.skew_secs,
-    };
-    let captured_stamp = facts.stamp;
-
-    // Review-7 RED negative-control seam — registration-local, #[cfg(test)] ONLY,
-    // compiled out of production. If this registration was built with the disabled
-    // mode (unreachable from any production constructor), bypass ONLY the
-    // org-admission engine and dispatch the handler. Every provider/transport
-    // precondition above is still enforced: the bridge origin bind, the
-    // authenticated-caller resolution, the local-capability possession check, the
-    // provider self-verification, and the request decode/digest. Removing ONLY
-    // organization admission lets an unauthorized protected call run — the proof
-    // that `verify_org_admission` is load-bearing, independent of any legacy
-    // `may_execute` verdict. The synthetic attribution below is deliberately not a
-    // verified `Admitted`; the point is that execution proceeds WITHOUT one.
-    #[cfg(test)]
-    if reg.red_witness_admission_disabled() {
-        cache_authenticated_response_destination(mesh, cache, inbound);
-        let admitted = crate::adapter::net::behavior::org_admission::Admitted {
-            caller: caller.clone(),
-            acting_org: facts.provider_owner_org,
-            provider_org: facts.provider_owner_org,
-            provider: facts.provider.clone(),
-            capability: invoked_capability,
-        };
-        if let Err(e) = fold.lock().apply_inbound_admitted(inbound, admitted) {
-            tracing::warn!(error = %e, "rpc serve_rpc_protected: fold apply error");
-        }
-        return;
-    }
-
-    // §6 — throttle BEFORE the signature work, not after.
-    //
-    // Everything below this point costs up to three `ed25519 verify_strict`
-    // operations, and reaching it requires NO org credentials: a TOFU-pinned
-    // peer self-mints an `OrgKeypair`, issues itself a valid membership cert
-    // and dispatcher grant under it, and attaches a garbage capability grant
-    // naming this provider's public owner org. Every cheap plaintext check
-    // passes. Failed admissions deliberately consume no replay slot, so the
-    // replay ceilings — including the §5 partition — never see this traffic.
-    //
-    // The budget is charged on FAILURE only (see `AdmissionFailureLimiter`), so
-    // an honest caller whose admissions succeed is entirely unaffected however
-    // fast it calls. A peer that has spent its allowance is denied here,
-    // cheaply, without the verification it was trying to compel.
-    if !mesh
-        .admission_rate_limiter()
-        .may_attempt(from_node, clock.monotonic)
-    {
-        tracing::warn!(
-            service = service,
-            from_node = format!("{:#x}", from_node),
-            "nrpc: org admission throttled — peer exhausted its failed-admission budget",
-        );
-        metrics
-            .capability_denied_total
-            .fetch_add(1, Ordering::Relaxed);
-        emit_admission_denial(
-            mesh,
-            resp_tx,
-            service,
-            claimed_origin,
-            call_id,
-            from_node,
-            CoarseAdmissionReason::Unavailable,
-        );
-        return;
-    }
-
-    let outcome = crate::adapter::net::behavior::org_admission::verify_org_admission(
-        &ctx,
-        &admission_headers,
-        replay,
-        clock,
-        // §9.5 stability: the view captured before verification must still be
-        // live at the replay insert, or the stale decision is denied without
-        // consuming a slot. For a subnet-exported registration BOTH stamps
-        // must hold — the org security view AND the subnet-export view
-        // (gateway/boundary snapshot identity + both epochs) — so a
-        // wholesale credential or boundary replacement, a floor, or an
-        // epoch advance landing mid-verification denies rather than
-        // admitting against a dead view.
-        || {
-            captured_stamp.is_current(&gate::capture_admission_stamp(mesh))
-                && subnet_export_facts
-                    .as_ref()
-                    .is_none_or(|facts| facts.is_current(mesh))
-        },
-        |proof| (reg.provider_policy())(proof),
-    );
-    match outcome {
-        Ok(admitted) => {
-            // Cache the authenticated response route (as the public accept path
-            // does), then hand the fold the admitted REQUEST — the handler runs
-            // with `RpcContext::org_admission = Some(admitted)` and the raw proof
-            // header stripped.
-            cache_authenticated_response_destination(mesh, cache, inbound);
-            if let Err(e) = fold.lock().apply_inbound_admitted(inbound, admitted) {
-                tracing::warn!(error = %e, "rpc serve_rpc_protected: fold apply error");
-            }
-        }
-        Err(denied) => {
+        Err(OpeningRefusal::Denied(denied)) => {
             // §6 — charge the failure. A denial is what an attacker produces;
             // a legitimate caller's admissions succeed and cost nothing.
             //

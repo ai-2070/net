@@ -1844,26 +1844,59 @@ impl RpcServerFold {
     /// fold also STRIPS every `net-org-admission` header from the payload
     /// so the handler never sees the raw proof. Unary-only — the
     /// streaming/duplex folds have no admitted entry point (E1.8).
+    ///
+    /// With a registry lease (slice 1.4, contract 5's lease-carrying
+    /// seam) the fold TRANSFERS ownership before any effect (§3 step 5);
+    /// a transfer failure is the typed refusal the bridge routes through
+    /// `emit_admission_denial`, and the lease's own Drop releases the
+    /// reservation.
     pub fn apply_inbound_admitted(
         &mut self,
         ev: &RpcInboundEvent,
         admitted: crate::adapter::net::behavior::org_admission::Admitted,
-    ) -> Result<(), RedexError> {
+        mut lease: Option<ProtectedCallLease>,
+    ) -> Result<(), crate::adapter::net::behavior::org_admission::AdmissionDenied> {
         self.session_id = ev.session_id;
-        self.apply_frame(ev.from_node, &ev.payload, Some(admitted))
+        let mut opening = AdmittedOpening {
+            admitted,
+            confirmed: None,
+        };
+        if let Some(lease) = lease.as_mut() {
+            let registry = Arc::clone(lease.registry());
+            let cancellation = RpcCancellationToken::new();
+            let retire_signal = Arc::new(StreamRetireSignal::new());
+            let call_ref = RegistryCallRef {
+                registry: Arc::clone(&registry),
+                key: lease.key.clone(),
+                incarnation: lease.incarnation,
+            };
+            let hook_token = cancellation.clone();
+            let on_retire: Arc<dyn Fn(StreamTerminalReason) + Send + Sync> =
+                Arc::new(move |_reason| hook_token.cancel());
+            registry.confirm(lease, retire_signal, Some(on_retire))?;
+            opening.confirmed = Some(ConfirmedOpening {
+                call_ref,
+                cancellation,
+            });
+        }
+        self.apply_frame(ev.from_node, &ev.payload, Some(opening))
+            .map_err(|_| {
+                crate::adapter::net::behavior::org_admission::AdmissionDenied::MalformedProof
+            })
     }
 
     /// Core frame application shared by [`Self::apply_inbound`] (real
     /// authenticated `from_node`) and the [`RedexFold`] loopback shim
     /// (`from_node = 0`, test / loopback paths with no session peer).
     /// `org_admission` is `Some` only on the initial REQUEST of an
-    /// admitted protected call; it is placed into the handler's
-    /// `RpcContext` and its presence triggers the proof-header strip.
+    /// admitted protected call; its attribution is placed into the
+    /// handler's `RpcContext` and its presence triggers the proof-header
+    /// strip.
     fn apply_frame(
         &mut self,
         from_node: u64,
         frame: &Bytes,
-        org_admission: Option<crate::adapter::net::behavior::org_admission::Admitted>,
+        org_admission: Option<AdmittedOpening>,
     ) -> Result<(), RedexError> {
         // Decode the meta header. A garbled meta means the event
         // doesn't even claim to be an RPC packet — log and skip
@@ -1982,7 +2015,19 @@ impl RpcServerFold {
                         return Ok(());
                     }
                 }
-                let cancellation = RpcCancellationToken::new();
+                // §3/§2.4 (slice 1.4): split the verified attribution
+                // (→ `RpcContext`) from the transfer's completion guard
+                // (→ the spawned task's scope). The guard completes the
+                // registry record whenever this opening stops — task end
+                // or an effect-boundary refusal after transfer.
+                let (org_admission, confirmed) = match org_admission {
+                    Some(opening) => (Some(opening.admitted), opening.confirmed),
+                    None => (None, None),
+                };
+                let cancellation = confirmed
+                    .as_ref()
+                    .map(|c| c.cancellation.clone())
+                    .unwrap_or_else(RpcCancellationToken::new);
                 self.in_flight.lock().insert(key, cancellation.clone());
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
@@ -2091,13 +2136,16 @@ impl RpcServerFold {
                     // handler that ignored cancellation and ran to
                     // completion — the caller's view is uniform.
                     let resp = if cancel_probe.is_cancelled() {
-                        RpcResponsePayload {
-                            status: RpcStatus::Cancelled,
-                            headers: vec![],
-                            body: Bytes::from_static(
-                                b"server observed CANCEL during handler execution",
-                            ),
-                        }
+                        // A registry-driven retirement (revocation /
+                        // session replacement / shutdown) carries its
+                        // typed reason into the terminal; a plain CANCEL
+                        // keeps the documented Cancelled framing (the
+                        // mapping is byte-identical for `Cancelled`).
+                        let reason = confirmed
+                            .as_ref()
+                            .and_then(|c| c.call_ref.registry.terminal_reason(&c.call_ref.key))
+                            .unwrap_or(StreamTerminalReason::Cancelled);
+                        stream_terminal_payload(&reason)
                     } else {
                         match outcome {
                             Ok(Ok(payload)) => payload,
@@ -2192,7 +2240,7 @@ impl RedexFold<()> for RpcServerFold {
 /// `CallOptions::stream_window_initial` is the right way to
 /// throttle a fast handler against a slow consumer.
 pub struct RpcResponseSink {
-    inner: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    inner: tokio::sync::mpsc::Sender<ChargedChunk>,
     /// Optional metrics handle so a dropped-on-full chunk bumps the
     /// `streaming_chunks_dropped_total` counter. `None` for unit-
     /// test folds that construct without metrics.
@@ -2204,6 +2252,13 @@ pub struct RpcResponseSink {
     /// producer. `None` on public calls: their deliberately lossy sink
     /// contract is unchanged (Q3).
     gate: Option<Arc<StreamProducerGate>>,
+    /// §2.7 response-direction accounting (protected records only). When
+    /// present, every item reserves its bytes before submission is
+    /// acknowledged and a refused item LATCHES `ResourceExhausted` and
+    /// retires the call — it is never merely dropped and counted. `None`
+    /// on public calls: their deliberately lossy sink contract is
+    /// unchanged (Q3).
+    byte_charge: Option<RegistryCallRef>,
 }
 
 impl RpcResponseSink {
@@ -2212,14 +2267,76 @@ impl RpcResponseSink {
     /// overflow OR receiver-closed, the chunk is dropped and (when
     /// metrics are wired) `streaming_chunks_dropped_total` is
     /// incremented for the service.
+    ///
+    /// For a PROTECTED record the §2.7 rule supersedes the lossy
+    /// contract: a refused item latches `ResourceExhausted` and retires
+    /// the call.
     pub fn send(&self, body: impl Into<bytes::Bytes>) {
         if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
             return;
         }
-        if self.inner.try_send(body.into()).is_err() {
-            if let Some(m) = self.metrics.as_ref() {
-                m.streaming_chunks_dropped_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let body = body.into();
+        let Some(charge) = self.byte_charge.as_ref() else {
+            if self
+                .inner
+                .try_send(ChargedChunk { body, permit: None })
+                .is_err()
+            {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.streaming_chunks_dropped_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            return;
+        };
+        self.send_charged(charge, body);
+    }
+
+    /// The protected (void) send: reserve bytes + queue capacity without
+    /// ever parking; any refusal latches `ResourceExhausted` and retires
+    /// (§2.7 — "it cannot drop an item and subsequently report complete
+    /// success").
+    fn send_charged(&self, charge: &RegistryCallRef, body: bytes::Bytes) {
+        let len = body.len();
+        if charge.registry.bytes().validate_item(len).is_err() {
+            charge.latch_exhausted();
+            return;
+        }
+        let permit = match charge.registry.bytes().reserve(
+            charge.key.clone(),
+            charge.incarnation,
+            ByteDirection::Response,
+            len,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                // A full budget cannot be waited out from a void send —
+                // the item is refused, so the call latches.
+                charge.latch_exhausted();
+                return;
+            }
+        };
+        let Ok(slot) = self.inner.try_reserve() else {
+            permit.release();
+            charge.latch_exhausted();
+            return;
+        };
+        match charge
+            .registry
+            .begin_commit(&charge.key, charge.incarnation)
+        {
+            Ok(txn) => {
+                txn.commit_with(permit, |shared| {
+                    slot.send(ChargedChunk {
+                        body,
+                        permit: Some(Arc::clone(shared)),
+                    });
+                });
+            }
+            Err(_) => {
+                // Already terminal / gone: the item is refused by the
+                // call's own disposition (first writer wins at `retire`).
+                permit.release();
             }
         }
     }
@@ -2240,14 +2357,111 @@ impl RpcResponseSink {
     /// whose overflow contract requires an explicit resync frame
     /// instead of a drop); keep [`Self::send`] for streams where
     /// dropping under backpressure is acceptable.
+    ///
+    /// For a PROTECTED record the wait is bounded twice over (§2.7):
+    /// `send_wait` waits only on satisfiable byte/queue bounds — an
+    /// item that can never fit fails promptly, latching
+    /// `ResourceExhausted` — and every wait is interruptible by the
+    /// call's retirement, which wakes parked producers with
+    /// [`RpcSinkClosed`].
     pub async fn send_wait(&self, body: impl Into<bytes::Bytes>) -> Result<(), RpcSinkClosed> {
         if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
             return Err(RpcSinkClosed);
         }
-        self.inner
-            .send(body.into())
-            .await
-            .map_err(|_| RpcSinkClosed)
+        let body = body.into();
+        let Some(charge) = self.byte_charge.as_ref() else {
+            return self
+                .inner
+                .send(ChargedChunk { body, permit: None })
+                .await
+                .map_err(|_| RpcSinkClosed);
+        };
+        self.send_wait_charged(charge, body).await
+    }
+
+    /// The protected `send_wait`: reserve the item's bytes (parking only
+    /// on satisfiable, releasable bounds), reserve a pump-queue slot, then
+    /// perform the §2.3 check and the queue admission as ONE
+    /// registry-locked ownership operation.
+    async fn send_wait_charged(
+        &self,
+        charge: &RegistryCallRef,
+        body: bytes::Bytes,
+    ) -> Result<(), RpcSinkClosed> {
+        let len = body.len();
+        // §2.7: validate against the RPC item cap and the configured
+        // per-call budget BEFORE waiting — an item larger than either can
+        // never acquire enough capacity and must fail promptly.
+        if charge.registry.bytes().validate_item(len).is_err() {
+            charge.latch_exhausted();
+            return Err(RpcSinkClosed);
+        }
+        loop {
+            // Producer-gate closed mid-wait (§2.2): refused WITHOUT
+            // latching — a retained clone cannot change the result the
+            // call already holds.
+            if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
+                return Err(RpcSinkClosed);
+            }
+            // 1 — byte reservation, call → caller → node.
+            let permit = match charge.registry.bytes().reserve(
+                charge.key.clone(),
+                charge.incarnation,
+                ByteDirection::Response,
+                len,
+            ) {
+                Ok(permit) => permit,
+                Err(refusal) if refusal.is_satisfiable_by_waiting() => {
+                    // Park until a release makes room — or until the
+                    // call retires (register-before-recheck, so a
+                    // concurrent wake cannot be missed).
+                    let notified = charge.registry.bytes().released.notified();
+                    if charge.registry.terminal_reason(&charge.key).is_some() {
+                        return Err(RpcSinkClosed);
+                    }
+                    notified.await;
+                    continue;
+                }
+                Err(_) => {
+                    charge.latch_exhausted();
+                    return Err(RpcSinkClosed);
+                }
+            };
+            // 2 — pump-queue capacity. A dead pump wakes this with a
+            // closed receiver (retirement drops the receiver after
+            // consuming the queue's permits).
+            let slot = match self.inner.reserve().await {
+                Ok(slot) => slot,
+                Err(_) => {
+                    permit.release();
+                    return Err(RpcSinkClosed);
+                }
+            };
+            // 3 — the §2.3 check and the queue admission as ONE
+            // ownership operation: the registry lock is held across
+            // `commit_with`'s admission, so a retirement cannot land
+            // between the verdict and the enqueue.
+            match charge
+                .registry
+                .begin_commit(&charge.key, charge.incarnation)
+            {
+                Ok(txn) => {
+                    txn.commit_with(permit, |shared| {
+                        slot.send(ChargedChunk {
+                            body,
+                            permit: Some(Arc::clone(shared)),
+                        });
+                    });
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Retired / gone: roll the reservation back and let
+                    // the call's own terminal stand (first writer wins).
+                    permit.release();
+                    return Err(RpcSinkClosed);
+                }
+            }
+        }
     }
 }
 
@@ -2432,7 +2646,7 @@ pub type RpcRequestGrantEmitter = Arc<dyn Fn(u64, u64, u64, u32) + Send + Sync +
 ///
 /// Bidi streaming plan (Phase B).
 pub struct RequestStream {
-    inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    inner: tokio::sync::mpsc::Receiver<ChargedChunk>,
     grant_emitter: Option<RpcRequestGrantEmitter>,
     /// AEAD-authenticated session that issued this call (R3-1) — the
     /// grant identity, so a grant refills only THIS call's semaphore.
@@ -2448,7 +2662,7 @@ impl RequestStream {
     /// flow control; `Some(...)` when they did. `from_node` is the
     /// authenticated session the fold bound the call to (R3-1).
     pub(crate) fn new(
-        inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        inner: tokio::sync::mpsc::Receiver<ChargedChunk>,
         grant_emitter: Option<RpcRequestGrantEmitter>,
         from_node: u64,
         caller_origin: u64,
@@ -2472,7 +2686,10 @@ impl futures::Stream for RequestStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.inner.poll_recv(cx) {
-            std::task::Poll::Ready(Some(bytes)) => {
+            std::task::Poll::Ready(Some(chunk)) => {
+                // §2.7: the item's byte reservation releases when the
+                // handler's `RequestStream` yields the chunk.
+                release_chunk_permit(&chunk);
                 // Auto-grant fires on every successful pull when
                 // flow control was opted into. Cheap and
                 // fire-and-forget; missed grants are recovered
@@ -2480,9 +2697,10 @@ impl futures::Stream for RequestStream {
                 if let Some(emit) = self.grant_emitter.as_ref() {
                     emit(self.from_node, self.caller_origin, self.call_id, 1);
                 }
-                std::task::Poll::Ready(Some(bytes))
+                std::task::Poll::Ready(Some(chunk.body))
             }
-            other => other,
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -2877,7 +3095,6 @@ struct StreamTerminal {
     /// supervisor after the pump stopped.
     emission: Option<StreamTerminalDisposition>,
 }
-
 /// One call's lifecycle state (§2.6) — the production mirror of the
 /// model's `CallLifecycle`. The input half starts `Ended` for
 /// server-streaming (the model's `CallLifecycle::new`: the single
@@ -3064,6 +3281,11 @@ pub struct ProtectedStreamCall {
     record: Arc<Mutex<StreamCallRecord>>,
     retire: Arc<StreamRetireSignal>,
     deadline: ResolvedStreamDeadline,
+    /// §2.4 registry linkage (slice 1.4). `Some` for registry-backed
+    /// records: [`Self::retire`] goes through the registry so the record's
+    /// terminal, its queued byte permits and the owner signal are settled
+    /// synchronously in one first-writer-wins operation.
+    call_ref: Option<RegistryCallRef>,
 }
 
 impl ProtectedStreamCall {
@@ -3088,6 +3310,14 @@ impl ProtectedStreamCall {
         self.record.lock().terminal_reason()
     }
 
+    /// The retirement reason the owner has ALREADY been handed (§2.4:
+    /// "retirement reached the owner"), if any — observable the instant
+    /// the synchronous retirement lands, before the supervisor's async
+    /// cleanup commits the terminal.
+    pub fn retire_reason(&self) -> Option<StreamTerminalReason> {
+        self.retire.taken()
+    }
+
     /// The control-path disposition recorded for the terminal (§2.8),
     /// exactly once.
     pub fn emission(&self) -> Option<StreamTerminalDisposition> {
@@ -3095,8 +3325,16 @@ impl ProtectedStreamCall {
     }
 
     /// Retire this exact call (§2.2/§2.4). Idempotent: the first reason
-    /// wins at the supervisor.
+    /// wins at the supervisor. Registry-backed records settle the
+    /// registry side (terminal + byte permits) first, so no item can
+    /// commit after the retirement lands.
     pub fn retire(&self, reason: StreamTerminalReason) {
+        if let Some(call_ref) = self.call_ref.as_ref() {
+            call_ref
+                .registry
+                .retire(&call_ref.key, call_ref.incarnation, reason);
+            return;
+        }
         self.retire.fire(reason);
     }
 }
@@ -3172,6 +3410,10 @@ struct StreamCallRegistration {
     in_flight: InFlightCalls,
     flow_control: FlowControlMap,
     protected: ProtectedStreamOwners,
+    /// §2.4's single removal point (the model's `complete`): registry-
+    /// backed records are removed from the registry here too, after the
+    /// supervisor has disposed of the owned work.
+    registry: Option<RegistryCallRef>,
 }
 
 impl StreamCallRegistration {
@@ -3179,6 +3421,11 @@ impl StreamCallRegistration {
         self.in_flight.lock().remove(&self.key);
         self.flow_control.lock().remove(&self.key);
         self.protected.remove(&self.key);
+        if let Some(call_ref) = self.registry.as_ref() {
+            call_ref
+                .registry
+                .complete(&call_ref.key, call_ref.incarnation);
+        }
     }
 }
 
@@ -3261,6 +3508,1973 @@ fn stream_terminal_payload(reason: &StreamTerminalReason) -> RpcResponsePayload 
     }
 }
 
+// ============================================================================
+// Slice 1.4 — the §3 exact-incarnation protected-call registry, the §2.3
+// revocation requalification, and the §2.7 byte accounting.
+//
+// This is the PRODUCTION mirror of the Stage 0 model
+// `behavior/org_stream_registry.rs` (whose surface is frozen): the same
+// reserve → verify → rollback → install → transfer → complete transaction,
+// the same StampMovement-aware commit-point requalification, the same
+// call → caller → node byte reservation order with release-once permits.
+// Deviations from the model's abstract types are named inline:
+//
+// - the model's `SessionRef.establishment: u64` is the exact handshake that
+//   produced the session; production carries it whole
+//   (`NetSession::handshake_binding`, the full Noise transcript hash) in
+//   `SessionIdentity::establishment` — strictly more precise than a u64, and
+//   matching is still the exact triple (bare truncated ids never match);
+// - the model's `Denial` vocabulary collapses onto the C4 `AdmissionDenied`
+//   set (the report's finding F-S1.4-1 names every mapping);
+// - the model's `SupervisorOwner` is realized as the call's
+//   `StreamRetireSignal` plus an optional `on_retire` hook (the unary fold's
+//   cancellation), so retirement reaches the owner before its task runs.
+//
+// The registry is one per `MeshNode`, resolved by node id (mesh.rs cannot
+// hold it — its five authorized hook sites are call lines only). It holds
+// its own `RaiseSubscription` (§2.3's second `subscribe_floors_raised`
+// subscriber) and is bound to the installed `(NodeAuthority,
+// OrgRevocationStore)` pair by the store-install hook; records captured
+// under a replaced pair are retired before the install returns.
+// ============================================================================
+
+use dashmap::DashMap;
+use parking_lot::MutexGuard;
+
+use crate::adapter::net::behavior::org::OrgId;
+use crate::adapter::net::behavior::org_admission::AdmissionDenied;
+use crate::adapter::net::behavior::org_authority::NodeAuthority;
+use crate::adapter::net::behavior::org_call::RpcCallShape;
+use crate::adapter::net::behavior::org_revocation::{
+    OrgRevocationState, OrgRevocationStore, RaiseSubscription, RaisedFloor,
+};
+use crate::adapter::net::identity::EntityId;
+use crate::adapter::net::org_admission_gate::AdmissionStamp;
+
+/// The nRPC correlation identity a protected admission is keyed on — the
+/// replay guard's `(caller, call_id)` (§3), where `caller` is the
+/// TOFU-authenticated direct-session entity, never a request field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProtectedCallKey {
+    /// The authenticated caller entity.
+    pub caller: EntityId,
+    /// `EventMeta::seq_or_ts`.
+    pub call_id: u64,
+}
+
+/// The exact originating session (§3 step 4) — the production form of the
+/// model's `SessionRef`. `establishment` is the full Noise handshake hash
+/// the session was established with (`NetSession::handshake_binding`);
+/// `None` for hand-built sessions (which can never admit a protected call).
+/// Retirement matches the EXACT triple: the truncated wire id alone is
+/// shared across unrelated peers and must never retire a bystander.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionIdentity {
+    /// The authenticated peer node.
+    pub peer: u64,
+    /// The truncated 8-byte wire session id.
+    pub session_id: u64,
+    /// The exact handshake that produced this session.
+    pub establishment: Option<[u8; 32]>,
+}
+
+/// How a captured [`AdmissionStamp`] relates to the live one — the §2.3
+/// discriminator (the model's `AuthorityStamp::movement`). The unary gate
+/// only needs `is_current` because a stale view means "do not admit"; a
+/// LIVE call must distinguish "the store moved (fail closed)" from "a floor
+/// was published (requalify)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMovement {
+    /// Same store, same generation: proceed.
+    Unchanged,
+    /// Same store, a floor was published: requalify against the floors,
+    /// refreshing the captured generation on success.
+    GenerationOnly,
+    /// The authority/store moved, the store is poisoned, or a generation is
+    /// exhausted: fail closed — there is nothing left to requalify against.
+    Unusable,
+}
+
+/// Classify the movement between a record's captured security view and the
+/// live one. Exactly the model's `movement()`: whole-stamp identity for the
+/// fast path, with the poison/exhaustion failures falling to `Unusable`.
+pub fn stamp_movement(captured: &AdmissionStamp, live: &AdmissionStamp) -> ViewMovement {
+    if captured.store_generation.is_none()
+        || live.store_generation.is_none()
+        || captured.poisoned
+        || live.poisoned
+    {
+        return ViewMovement::Unusable;
+    }
+    if captured.authority_ptr != live.authority_ptr || captured.store_ptr != live.store_ptr {
+        return ViewMovement::Unusable;
+    }
+    if captured.store_generation == live.store_generation {
+        ViewMovement::Unchanged
+    } else {
+        ViewMovement::GenerationOnly
+    }
+}
+
+/// §2.7 — why an item cannot be queued (the model's `ByteRefusal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRefusal {
+    /// Larger than the RPC item cap: no amount of waiting helps.
+    ItemTooLarge,
+    /// Larger than the *entire* per-call budget: likewise impossible.
+    ExceedsCallBudget,
+    /// The per-call budget for this direction is currently full.
+    CallBudgetFull,
+    /// The caller's combined budget is currently full.
+    CallerBudgetFull,
+    /// The node's aggregate budget is currently full.
+    NodeBudgetFull,
+    /// Checked arithmetic overflowed.
+    Overflow,
+}
+
+impl ByteRefusal {
+    /// Whether waiting could ever satisfy this request. `false` means the
+    /// item must fail promptly rather than park on permits that can never
+    /// be granted (§2.7).
+    pub fn is_satisfiable_by_waiting(&self) -> bool {
+        matches!(
+            self,
+            ByteRefusal::CallBudgetFull
+                | ByteRefusal::CallerBudgetFull
+                | ByteRefusal::NodeBudgetFull
+        )
+    }
+}
+
+/// Which queue an item entered (the model's `Direction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ByteDirection {
+    /// Caller → provider (`apply_request_chunk_to_senders`).
+    Request,
+    /// Provider → caller (`RpcResponseSink::send_wait`).
+    Response,
+}
+
+/// The Q1 queued-byte ceilings (§2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteLimits {
+    /// Queued bytes per call **per direction**.
+    pub per_call: usize,
+    /// Queued bytes per caller, combined directions and calls.
+    pub per_caller: usize,
+    /// Queued bytes per node, combined everything.
+    pub per_node: usize,
+}
+
+impl ByteLimits {
+    /// Q1: 16 MiB per call per direction, 64 MiB per caller, 512 MiB per node.
+    pub const fn q1_defaults() -> Self {
+        Self {
+            per_call: 16 * 1024 * 1024,
+            per_caller: 64 * 1024 * 1024,
+            per_node: 512 * 1024 * 1024,
+        }
+    }
+
+    /// Positive, and each scope inside the next (Q1 validation).
+    pub fn validate(&self) -> Result<(), LimitsError> {
+        if self.per_call == 0 || self.per_caller == 0 || self.per_node == 0 {
+            return Err(LimitsError::NotPositive);
+        }
+        if self.per_call > self.per_caller {
+            return Err(LimitsError::BytePerCallAboveCaller);
+        }
+        if self.per_caller > self.per_node {
+            return Err(LimitsError::BytePerCallerAboveNode);
+        }
+        Ok(())
+    }
+}
+
+/// The Q1 active-call ceilings (§3/Q1). The model's `CallLimits` folds the
+/// §2.1 lifetime policy in as well; production keeps the lifetime at the
+/// fold (`StreamLifetimePolicy`), so only the quota half lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallLimits {
+    /// Active protected calls per node, including `Opening` reservations
+    /// and terminal records not yet reclaimed.
+    pub max_active_node: usize,
+    /// Active calls per authenticated caller, across its sessions.
+    pub max_active_per_caller: usize,
+    /// Active calls per external acting org, across its member identities.
+    pub max_active_per_org: usize,
+    /// How long an `Opening` reservation may wait for verification before
+    /// it is reaped. Finite by requirement: a lost bridge must not pin a
+    /// slot.
+    pub verification_deadline_ns: u64,
+}
+
+impl CallLimits {
+    /// Q1 initial defaults: 4096 / 64 / 512, 30 s verification deadline.
+    pub const fn q1_defaults() -> Self {
+        Self {
+            max_active_node: 4096,
+            max_active_per_caller: 64,
+            max_active_per_org: 512,
+            verification_deadline_ns: 30 * 1_000_000_000,
+        }
+    }
+
+    /// Startup validation (Q1): positive values and caller/org ceilings
+    /// inside the node ceiling.
+    pub fn validate(&self) -> Result<(), LimitsError> {
+        if self.max_active_node == 0
+            || self.max_active_per_caller == 0
+            || self.max_active_per_org == 0
+            || self.verification_deadline_ns == 0
+        {
+            return Err(LimitsError::NotPositive);
+        }
+        if self.max_active_per_caller > self.max_active_node {
+            return Err(LimitsError::PerCallerAboveNode);
+        }
+        if self.max_active_per_org > self.max_active_node {
+            return Err(LimitsError::PerOrgAboveNode);
+        }
+        Ok(())
+    }
+}
+
+/// Why a limit set is unusable at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitsError {
+    /// A zero ceiling: nothing could ever be admitted.
+    NotPositive,
+    /// `max_active_per_caller > max_active_node`.
+    PerCallerAboveNode,
+    /// `max_active_per_org > max_active_node`.
+    PerOrgAboveNode,
+    /// `per_call > per_caller`.
+    BytePerCallAboveCaller,
+    /// `per_caller > per_node`.
+    BytePerCallerAboveNode,
+}
+
+impl std::fmt::Display for LimitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LimitsError::NotPositive => write!(f, "protected-call limits must be positive"),
+            LimitsError::PerCallerAboveNode => {
+                write!(f, "per-caller active-call limit exceeds the node limit")
+            }
+            LimitsError::PerOrgAboveNode => {
+                write!(f, "per-org active-call limit exceeds the node limit")
+            }
+            LimitsError::BytePerCallAboveCaller => {
+                write!(f, "per-call byte budget exceeds the caller budget")
+            }
+            LimitsError::BytePerCallerAboveNode => {
+                write!(f, "per-caller byte budget exceeds the node budget")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LimitsError {}
+
+/// The existing RPC item cap (`MAX_RPC_BODY_LEN`). Queue budgets do not
+/// raise it (Q1), and it bounds a single item, never an aggregate.
+pub const MAX_RPC_ITEM_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct ByteState {
+    per_call: HashMap<(ProtectedCallKey, u64, ByteDirection), usize>,
+    per_caller: HashMap<EntityId, usize>,
+    node: usize,
+}
+
+/// The three-level byte budget of §2.7 (the model's `ByteBudgets`).
+///
+/// Reservation is a short locked reservation that checks before it
+/// increments, in the documented order call → caller → node, rolling back
+/// everything it already acquired on a later refusal. `fetch_add` followed
+/// by a check is explicitly not a hard bound: two racing producers would
+/// both observe an under-limit total after both had already published
+/// their increments.
+pub struct ByteBudgets {
+    limits: ByteLimits,
+    state: Mutex<ByteState>,
+    /// Wakes producers parked in `send_wait` on a full budget: any release
+    /// (or the owning call's retirement) makes them retry.
+    released: Notify,
+    unsettled_drops: std::sync::atomic::AtomicUsize,
+}
+
+impl ByteBudgets {
+    /// Validate and build.
+    pub fn new(limits: ByteLimits) -> Result<Arc<Self>, LimitsError> {
+        limits.validate()?;
+        Ok(Arc::new(Self {
+            limits,
+            state: Mutex::new(ByteState::default()),
+            released: Notify::new(),
+            unsettled_drops: std::sync::atomic::AtomicUsize::new(0),
+        }))
+    }
+
+    /// The configured ceilings.
+    pub fn limits(&self) -> ByteLimits {
+        self.limits
+    }
+
+    /// Validate an item against the RPC item cap and the configured
+    /// per-call budget **before any wait** (§2.7: an oversized item can
+    /// never acquire enough capacity and must fail promptly).
+    pub fn validate_item(&self, len: usize) -> Result<(), ByteRefusal> {
+        if len > MAX_RPC_ITEM_BYTES {
+            return Err(ByteRefusal::ItemTooLarge);
+        }
+        if len > self.limits.per_call {
+            return Err(ByteRefusal::ExceedsCallBudget);
+        }
+        Ok(())
+    }
+
+    /// Reserve `len` bytes for one item. Order: call → caller → node, each
+    /// level checked before it is incremented, each acquired level rolled
+    /// back if a later one refuses.
+    pub fn reserve(
+        self: &Arc<Self>,
+        key: ProtectedCallKey,
+        incarnation: u64,
+        direction: ByteDirection,
+        len: usize,
+    ) -> Result<ItemPermit, ByteRefusal> {
+        self.validate_item(len)?;
+        let mut state = self.state.lock();
+
+        // 1 — per call, per direction.
+        let call_slot = (key.clone(), incarnation, direction);
+        let call_cur = state.per_call.get(&call_slot).copied().unwrap_or(0);
+        let call_next = call_cur.checked_add(len).ok_or(ByteRefusal::Overflow)?;
+        if call_next > self.limits.per_call {
+            return Err(ByteRefusal::CallBudgetFull);
+        }
+        state.per_call.insert(call_slot, call_next);
+
+        // 2 — per caller. On refusal, undo (1).
+        let caller_cur = state.per_caller.get(&key.caller).copied().unwrap_or(0);
+        let caller_next = match caller_cur.checked_add(len) {
+            Some(next) if next <= self.limits.per_caller => next,
+            Some(_) => {
+                state
+                    .per_call
+                    .insert((key.clone(), incarnation, direction), call_cur);
+                return Err(ByteRefusal::CallerBudgetFull);
+            }
+            None => {
+                state
+                    .per_call
+                    .insert((key.clone(), incarnation, direction), call_cur);
+                return Err(ByteRefusal::Overflow);
+            }
+        };
+        state.per_caller.insert(key.caller.clone(), caller_next);
+
+        // 3 — per node. On refusal, undo (2) and (1).
+        let node_next = match state.node.checked_add(len) {
+            Some(next) if next <= self.limits.per_node => next,
+            Some(_) => {
+                state.per_caller.insert(key.caller.clone(), caller_cur);
+                state
+                    .per_call
+                    .insert((key.clone(), incarnation, direction), call_cur);
+                return Err(ByteRefusal::NodeBudgetFull);
+            }
+            None => {
+                state.per_caller.insert(key.caller.clone(), caller_cur);
+                state
+                    .per_call
+                    .insert((key.clone(), incarnation, direction), call_cur);
+                return Err(ByteRefusal::Overflow);
+            }
+        };
+        state.node = node_next;
+        drop(state);
+
+        Ok(ItemPermit {
+            budgets: Arc::clone(self),
+            charge: ByteCharge {
+                key,
+                incarnation,
+                direction,
+                len,
+            },
+            settled: false,
+        })
+    }
+
+    /// Aggregate bytes charged to the node.
+    pub fn node_bytes(&self) -> usize {
+        self.state.lock().node
+    }
+
+    /// Bytes charged to one caller.
+    pub fn caller_bytes(&self, caller: &EntityId) -> usize {
+        self.state
+            .lock()
+            .per_caller
+            .get(caller)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bytes charged to one call incarnation in one direction.
+    pub fn call_bytes(
+        &self,
+        key: &ProtectedCallKey,
+        incarnation: u64,
+        direction: ByteDirection,
+    ) -> usize {
+        self.state
+            .lock()
+            .per_call
+            .get(&(key.clone(), incarnation, direction))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many permits were dropped without being released or
+    /// transferred. A correct flow leaves this at zero; a nonzero value is
+    /// an ownership bug the accounting would otherwise hide.
+    pub fn unsettled_drops(&self) -> usize {
+        self.unsettled_drops.load(Ordering::Relaxed)
+    }
+
+    fn release_charge(&self, charge: ByteCharge) {
+        let mut state = self.state.lock();
+        let call_slot = (charge.key.clone(), charge.incarnation, charge.direction);
+        // CHECKED, never saturating: saturating subtraction is exactly how
+        // a double release or a refund of another call's bytes stays
+        // invisible.
+        let call_cur = state.per_call.get(&call_slot).copied().unwrap_or(0);
+        let call_next = call_cur
+            .checked_sub(charge.len)
+            .expect("byte permit released twice, or against the wrong call");
+        if call_next == 0 {
+            state.per_call.remove(&call_slot);
+        } else {
+            state.per_call.insert(call_slot, call_next);
+        }
+        let caller_cur = state
+            .per_caller
+            .get(&charge.key.caller)
+            .copied()
+            .unwrap_or(0);
+        let caller_next = caller_cur
+            .checked_sub(charge.len)
+            .expect("byte permit released twice, or against the wrong caller");
+        if caller_next == 0 {
+            state.per_caller.remove(&charge.key.caller);
+        } else {
+            state
+                .per_caller
+                .insert(charge.key.caller.clone(), caller_next);
+        }
+        state.node = state
+            .node
+            .checked_sub(charge.len)
+            .expect("byte permit released twice against the node budget");
+        drop(state);
+        // A released reservation may satisfy a parked `send_wait`.
+        self.released.notify_waiters();
+    }
+}
+
+/// One item's byte charge, tied to the exact call incarnation so a refund
+/// can never land on a successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteCharge {
+    /// The charged call.
+    pub key: ProtectedCallKey,
+    /// The exact incarnation.
+    pub incarnation: u64,
+    /// Which direction's per-call budget was charged.
+    pub direction: ByteDirection,
+    /// Bytes reserved.
+    pub len: usize,
+}
+
+/// One admitted item's release-once permit bundle, tied to the call
+/// incarnation (the model's `ItemPermit`). Not `Clone`: ownership is the
+/// mechanism — dequeue, cancellation and queue discard compete to consume
+/// this, rather than each subtracting a guessed byte count.
+#[must_use = "a byte permit must be released or transferred exactly once"]
+pub struct ItemPermit {
+    budgets: Arc<ByteBudgets>,
+    charge: ByteCharge,
+    settled: bool,
+}
+
+impl ItemPermit {
+    /// What this permit holds.
+    pub fn charge(&self) -> &ByteCharge {
+        &self.charge
+    }
+
+    /// Actual release: the bytes leave the three counters.
+    pub fn release(mut self) {
+        self.settle();
+    }
+
+    /// Hand the *same* charge to another bounded queue. The bytes stay
+    /// charged — handoff is not memory reclamation — and exactly one live
+    /// permit continues to own them.
+    pub fn transfer(mut self) -> ItemPermit {
+        self.settled = true;
+        ItemPermit {
+            budgets: Arc::clone(&self.budgets),
+            charge: self.charge.clone(),
+            settled: false,
+        }
+    }
+
+    fn settle(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            self.budgets.release_charge(self.charge.clone());
+        }
+    }
+}
+
+impl std::fmt::Debug for ItemPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ItemPermit")
+            .field("charge", &self.charge)
+            .field("settled", &self.settled)
+            .finish()
+    }
+}
+
+impl Drop for ItemPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.budgets.unsettled_drops.fetch_add(1, Ordering::Relaxed);
+            self.settle();
+        }
+    }
+}
+
+/// A queued item whose permit several parties race to consume: the pump
+/// (or `RequestStream`) yielding it, retirement cancelling it, and the
+/// queue discarding it. Exactly one [`SharedPermit::take`] wins (the
+/// model's `SharedPermit`).
+pub struct SharedPermit {
+    slot: Mutex<Option<ItemPermit>>,
+}
+
+impl SharedPermit {
+    /// Wrap a permit for contended consumption.
+    pub fn new(permit: ItemPermit) -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(Some(permit)),
+        })
+    }
+
+    /// Consume the permit. Exactly one caller ever gets `Some`.
+    pub fn take(&self) -> Option<ItemPermit> {
+        self.slot.lock().take()
+    }
+
+    /// Whether some party has already consumed it.
+    pub fn is_consumed(&self) -> bool {
+        self.slot.lock().is_none()
+    }
+}
+
+impl std::fmt::Debug for SharedPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPermit")
+            .field("consumed", &self.is_consumed())
+            .finish()
+    }
+}
+
+/// A queued chunk riding its byte permit. The permit is consumed by
+/// whichever party wins — the consumer yielding the body, or retirement /
+/// queue discard releasing it.
+#[derive(Debug)]
+pub struct ChargedChunk {
+    /// The chunk body.
+    pub body: bytes::Bytes,
+    /// The item's byte reservation (release-once).
+    pub permit: Option<Arc<SharedPermit>>,
+}
+
+/// Release a chunk's permit at the moment its bytes leave the queue
+/// accounting (emit / yield). Items without protected accounting carry
+/// `None` and cost one branch.
+fn release_chunk_permit(chunk: &ChargedChunk) {
+    if let Some(shared) = chunk.permit.as_ref() {
+        if let Some(permit) = shared.take() {
+            permit.release();
+        }
+    }
+}
+
+/// Verified member facts, known only after the proof is checked (the
+/// model's `VerifiedFacts`).
+#[derive(Debug, Clone)]
+pub struct VerifiedCallFacts {
+    /// The org the caller is verified to be acting for.
+    pub acting_org: OrgId,
+    /// The verified member identity.
+    pub member: EntityId,
+    /// That member's certificate generation (the floor comparison term).
+    pub member_generation: u32,
+    /// The §2.1 effective deadline, when this shape resolves one
+    /// (`None` for unary records at slice 1.4 — the §2.1 machinery is
+    /// streaming-scoped, and enforcing it on unary would change unary
+    /// behavior).
+    pub deadline: Option<ResolvedStreamDeadline>,
+}
+
+/// Everything `reserve` can know before decode (the model's
+/// `OpeningRequest`).
+#[derive(Debug, Clone)]
+pub struct OpeningRequest {
+    /// `(caller, call_id)`.
+    pub key: ProtectedCallKey,
+    /// The exact originating session.
+    pub session: SessionIdentity,
+    /// The routing registry's session generation; `None` models the
+    /// `u64::MAX` terminal marker (`SessionCurrentness` exhaustion).
+    pub session_generation: Option<u64>,
+    /// The protected registration this opening targets.
+    pub registration: u64,
+    /// The streaming shape of the call (shape-aware; `Unary` for the
+    /// protected unary path).
+    pub shape: RpcCallShape,
+    /// Wall-clock now, nanoseconds (the admission's one clock sample).
+    pub now_ns: u64,
+}
+
+/// A held `Opening` slot (the model's `Reservation`) with the bridge's
+/// reservation-guard ownership (§2.4): dropping it untransferred releases
+/// the slot exactly once.
+#[must_use = "an opening reservation must be installed or released"]
+pub struct ReservationGuard {
+    registry: Arc<ProtectedCallRegistry>,
+    /// The reserved key.
+    pub key: ProtectedCallKey,
+    /// The exact incarnation every later operation is conditional on.
+    pub incarnation: u64,
+    /// The registry's authority epoch at reserve time.
+    pub epoch_at_reserve: u64,
+    /// When this reservation is reaped if verification has not completed.
+    pub verify_by_ns: u64,
+    armed: bool,
+}
+
+impl std::fmt::Debug for ReservationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReservationGuard")
+            .field("key", &self.key)
+            .field("incarnation", &self.incarnation)
+            .field("epoch_at_reserve", &self.epoch_at_reserve)
+            .finish()
+    }
+}
+
+impl ReservationGuard {
+    /// Disarm the bridge-side rollback — used when ownership moves into a
+    /// [`ProtectedCallLease`] at install.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.release(&self.key, self.incarnation);
+        }
+    }
+}
+
+/// An installed record, ready for the fold's confirm — contract 5's
+/// lease-carrying seam. Dropping it untransferred releases the record
+/// (bridge ownership, §2.4); a successful transfer disarms it so only the
+/// supervisor completes the record.
+#[must_use = "an admission lease must be transferred to a supervisor"]
+pub struct ProtectedCallLease {
+    registry: Arc<ProtectedCallRegistry>,
+    /// The admitted key.
+    pub key: ProtectedCallKey,
+    /// The exact incarnation.
+    pub incarnation: u64,
+    /// The record's registration.
+    pub registration: u64,
+    /// The record's exact session binding.
+    pub session: SessionIdentity,
+    armed: bool,
+}
+
+impl std::fmt::Debug for ProtectedCallLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedCallLease")
+            .field("key", &self.key)
+            .field("incarnation", &self.incarnation)
+            .field("registration", &self.registration)
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+impl ProtectedCallLease {
+    /// The registry this lease belongs to (the fold's transfer target).
+    pub fn registry(&self) -> &Arc<ProtectedCallRegistry> {
+        &self.registry
+    }
+
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProtectedCallLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.release(&self.key, self.incarnation);
+        }
+    }
+}
+
+/// Where a record sits in the admission transaction (the model's `Phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryPhase {
+    /// Reserved, not yet verified. No member facts.
+    Opening,
+    /// Installed with verified facts; the fold has not taken ownership.
+    Admitted,
+    /// Ownership transferred to a supervisor. `Draining` lives inside the
+    /// call record under this phase — it is still live.
+    Running,
+    /// A terminal has been selected. The record still owns its key and its
+    /// quota slots until its one cleanup owner removes it.
+    Terminal,
+}
+
+/// Which side owns the single conditional removal (§2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOwner {
+    /// Before transfer: the bridge's reservation guard.
+    Bridge,
+    /// After transfer: the supervisor, after disposing of its work.
+    Supervisor,
+}
+
+struct RegistryRecord {
+    incarnation: u64,
+    phase: RegistryPhase,
+    session: SessionIdentity,
+    registration: u64,
+    shape: RpcCallShape,
+    verify_by_ns: u64,
+    captured: AdmissionStamp,
+    facts: Option<VerifiedCallFacts>,
+    charged_org: Option<OrgId>,
+    cleanup: CleanupOwner,
+    terminal: Option<StreamTerminalReason>,
+    /// The registered owner hook (the model's `SupervisorOwner`): the
+    /// call's retire signal plus an optional synchronous side effect (the
+    /// unary fold's cancellation).
+    signal: Arc<StreamRetireSignal>,
+    on_retire: Option<Arc<dyn Fn(StreamTerminalReason) + Send + Sync>>,
+    /// Queued items whose byte permits this record still tracks (§2.7 —
+    /// retirement consumes whatever has not been taken by a consumer).
+    queued: Vec<Arc<SharedPermit>>,
+}
+
+/// The per-item §2.3 verdict (the model's `CommitVerdict`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitVerdict {
+    /// The captured view is still live.
+    Proceed,
+    /// The generation moved, the floor still permits this member, and the
+    /// captured generation was refreshed.
+    Requalified,
+    /// The call is retired with this reason.
+    Retired(StreamTerminalReason),
+    /// No record with that exact incarnation.
+    Unknown,
+}
+
+struct RegistryInner {
+    /// The bound `(authority, store)` pair the live views sample.
+    authority: Option<Arc<NodeAuthority>>,
+    store: Option<Arc<OrgRevocationStore>>,
+    authority_epoch: u64,
+    next_incarnation: u64,
+    records: HashMap<ProtectedCallKey, RegistryRecord>,
+    active_node: usize,
+    active_per_caller: HashMap<EntityId, usize>,
+    active_per_org: HashMap<OrgId, usize>,
+}
+
+/// One per `MeshNode`: the exact-incarnation admission/retirement
+/// transaction of §3 (the model's `ProtectedCallRegistry`, wired to the
+/// real `OrgRevocationStore`/`NodeAuthority`).
+pub struct ProtectedCallRegistry {
+    inner: Mutex<RegistryInner>,
+    limits: CallLimits,
+    bytes: Arc<ByteBudgets>,
+    /// §2.3's raise feed — the second `subscribe_floors_raised`
+    /// subscriber, owned here so replacement can drop it outside the
+    /// registry lock (a subscription drop drains in-flight callbacks).
+    subscription: Mutex<Option<RaiseSubscription>>,
+    removals: Mutex<HashMap<(ProtectedCallKey, u64), usize>>,
+}
+
+impl ProtectedCallRegistry {
+    /// Validate the Q1 limits and build an unbound registry. The store
+    /// binding (and its raise subscription) arrives through
+    /// [`Self::bind_store`] at the node's store-install site.
+    pub fn with_limits(
+        limits: CallLimits,
+        byte_limits: ByteLimits,
+    ) -> Result<Arc<Self>, LimitsError> {
+        limits.validate()?;
+        let bytes = ByteBudgets::new(byte_limits)?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(RegistryInner {
+                authority: None,
+                store: None,
+                authority_epoch: 0,
+                next_incarnation: 1,
+                records: HashMap::new(),
+                active_node: 0,
+                active_per_caller: HashMap::new(),
+                active_per_org: HashMap::new(),
+            }),
+            limits,
+            bytes,
+            subscription: Mutex::new(None),
+            removals: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// A registry with the Q1 defaults (validated at construction).
+    pub fn with_q1_defaults() -> Result<Arc<Self>, LimitsError> {
+        Self::with_limits(CallLimits::q1_defaults(), ByteLimits::q1_defaults())
+    }
+
+    /// The configured active-call ceilings.
+    pub fn limits(&self) -> CallLimits {
+        self.limits
+    }
+
+    /// The §2.7 byte budgets.
+    pub fn bytes(&self) -> &Arc<ByteBudgets> {
+        &self.bytes
+    }
+
+    /// The registry's authority epoch. Only a *notified* raise moves it,
+    /// which is precisely why it cannot be the sole basis for an install
+    /// or commit decision (publication lands before notification).
+    pub fn authority_epoch(&self) -> u64 {
+        self.inner.lock().authority_epoch
+    }
+
+    /// How many records exist, in any phase.
+    pub fn record_count(&self) -> usize {
+        self.inner.lock().records.len()
+    }
+
+    /// Active calls charged to the node.
+    pub fn active_node(&self) -> usize {
+        self.inner.lock().active_node
+    }
+
+    /// Active calls charged to one caller.
+    pub fn active_for_caller(&self, caller: &EntityId) -> usize {
+        self.inner
+            .lock()
+            .active_per_caller
+            .get(caller)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Active calls charged to one verified acting org.
+    pub fn active_for_org(&self, org: &OrgId) -> usize {
+        self.inner
+            .lock()
+            .active_per_org
+            .get(org)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The phase of a record, if it exists.
+    pub fn phase(&self, key: &ProtectedCallKey) -> Option<RegistryPhase> {
+        self.inner.lock().records.get(key).map(|r| r.phase)
+    }
+
+    /// The admitted shape of a record (the registry is shape-aware).
+    pub fn shape(&self, key: &ProtectedCallKey) -> Option<RpcCallShape> {
+        self.inner.lock().records.get(key).map(|r| r.shape)
+    }
+
+    /// The selected terminal, if any.
+    pub fn terminal_reason(&self, key: &ProtectedCallKey) -> Option<StreamTerminalReason> {
+        self.inner
+            .lock()
+            .records
+            .get(key)
+            .and_then(|r| r.terminal.clone())
+    }
+
+    /// Which side currently owns the single removal.
+    pub fn cleanup_owner(&self, key: &ProtectedCallKey) -> Option<CleanupOwner> {
+        self.inner.lock().records.get(key).map(|r| r.cleanup)
+    }
+
+    /// The captured security view of a record, refreshed by
+    /// requalification.
+    pub fn captured_view(&self, key: &ProtectedCallKey) -> Option<AdmissionStamp> {
+        self.inner.lock().records.get(key).map(|r| r.captured)
+    }
+
+    /// How many times `(key, incarnation)` has been removed. Exactly-once
+    /// removal is the property; a ledger makes "exactly once" observable
+    /// rather than inferred from a boolean.
+    pub fn removals(&self, key: &ProtectedCallKey, incarnation: u64) -> usize {
+        self.removals
+            .lock()
+            .get(&(key.clone(), incarnation))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------------
+    // §2.3 — the real-store binding and raise feed
+    // ----------------------------------------------------------------
+
+    /// The store's poison flag through the bound handle (None when
+    /// unbound).
+    pub fn store_poisoned(&self) -> Option<bool> {
+        let inner = self.inner.lock();
+        inner.store.as_ref().map(|s| s.is_poisoned())
+    }
+
+    /// Bind (or REBIND) the registry to the installed `(authority, store)`
+    /// pair — §2.3's store/authority replacement path. On a changed pair:
+    /// every record captured under the old `(authority_ptr, store_ptr)` is
+    /// retired (`AuthorityUnavailable`) BEFORE this returns, and the raise
+    /// subscription moves to the new store (created if absent). The old
+    /// `RaiseSubscription` is dropped OUTSIDE the registry lock: dropping
+    /// it drains in-flight callbacks, and a callback takes this lock.
+    pub fn bind_store(
+        self: &Arc<Self>,
+        authority: Option<Arc<NodeAuthority>>,
+        store: Arc<OrgRevocationStore>,
+    ) {
+        let new_authority_ptr = authority
+            .as_ref()
+            .map_or(0, |a| Arc::as_ptr(a) as *const () as usize);
+        let new_store_ptr = Arc::as_ptr(&store) as *const () as usize;
+        {
+            let mut inner = self.inner.lock();
+            let same_pair = inner.store.as_ref().is_some_and(|s| {
+                Arc::as_ptr(s) as *const () as usize == new_store_ptr
+                    && inner
+                        .authority
+                        .as_ref()
+                        .map_or(0, |a| Arc::as_ptr(a) as *const () as usize)
+                        == new_authority_ptr
+            });
+            if same_pair {
+                return;
+            }
+            inner.authority_epoch = inner.authority_epoch.wrapping_add(1);
+            let victims: Vec<(ProtectedCallKey, u64)> = inner
+                .records
+                .iter()
+                .filter(|(_, record)| {
+                    record.phase != RegistryPhase::Terminal
+                        && (record.captured.authority_ptr != new_authority_ptr
+                            || record.captured.store_ptr != new_store_ptr)
+                })
+                .map(|(key, record)| (key.clone(), record.incarnation))
+                .collect();
+            for (key, incarnation) in victims {
+                self.retire_locked(
+                    &mut inner,
+                    &key,
+                    incarnation,
+                    StreamTerminalReason::AuthorityUnavailable,
+                );
+            }
+            inner.authority = authority;
+            inner.store = Some(Arc::clone(&store));
+        }
+        // §2.3: the registry re-subscribes to the new store so it never
+        // sits without a raise feed. The outgoing guard drops HERE, outside
+        // the registry lock (its Drop drains in-flight callbacks).
+        let weak = Arc::downgrade(self);
+        let subscription = store.subscribe_floors_raised(move |raised: &[RaisedFloor]| {
+            // A detached store's late raises must not mutate a node it no
+            // longer speaks for (the same store-identity gate the existing
+            // fold/routing subscriber applies).
+            let Some(registry) = weak.upgrade() else {
+                return;
+            };
+            let still_bound = {
+                let inner = registry.inner.lock();
+                inner
+                    .store
+                    .as_ref()
+                    .is_some_and(|s| Arc::as_ptr(s) as *const () as usize == new_store_ptr)
+            };
+            if !still_bound {
+                return;
+            }
+            registry.on_floors_raised(raised);
+        });
+        let old_subscription = self.subscription.lock().replace(subscription);
+        drop(old_subscription);
+    }
+
+    /// Selective raise callback (§2.3). Bumps the epoch, then retires
+    /// every record whose `(acting_org, member)` generation is below a
+    /// raised floor. An empty slice is the authority-changed wake
+    /// (`notify_authority_changed`: authority moved or poison recovery)
+    /// and retires everything, including `Opening` reservations that have
+    /// no facts to compare.
+    pub fn on_floors_raised(&self, raised: &[RaisedFloor]) {
+        let mut inner = self.inner.lock();
+        inner.authority_epoch = inner.authority_epoch.wrapping_add(1);
+        let victims: Vec<(ProtectedCallKey, u64, StreamTerminalReason)> = inner
+            .records
+            .iter()
+            .filter_map(|(key, record)| {
+                if record.phase == RegistryPhase::Terminal {
+                    return None;
+                }
+                if raised.is_empty() {
+                    return Some((
+                        key.clone(),
+                        record.incarnation,
+                        StreamTerminalReason::AuthorityUnavailable,
+                    ));
+                }
+                let facts = record.facts.as_ref()?;
+                raised
+                    .iter()
+                    .any(|(org, member, floor)| {
+                        *org == facts.acting_org
+                            && *member == facts.member
+                            && *floor > facts.member_generation
+                    })
+                    .then_some((
+                        key.clone(),
+                        record.incarnation,
+                        StreamTerminalReason::Revoked,
+                    ))
+            })
+            .collect();
+        for (key, incarnation, reason) in victims {
+            self.retire_locked(&mut inner, &key, incarnation, reason);
+        }
+    }
+
+    /// The authority moved or poison recovered with no floor raised:
+    /// retire all.
+    pub fn on_authority_changed(&self) {
+        self.on_floors_raised(&[]);
+    }
+
+    /// Session replacement or a dead-peer sweep (§2.3's quantified
+    /// boundary: before `install_peer_locked`/the sweep returns). Matches
+    /// the EXACT `(peer, session_id, establishment)` triple — a bare
+    /// truncated session id is shared across unrelated peers, so matching
+    /// on it alone would retire a bystander's call.
+    pub fn retire_session(&self, session: &SessionIdentity, reason: StreamTerminalReason) -> usize {
+        let mut inner = self.inner.lock();
+        let victims: Vec<(ProtectedCallKey, u64)> = inner
+            .records
+            .iter()
+            .filter(|(_, r)| r.phase != RegistryPhase::Terminal && r.session == *session)
+            .map(|(key, r)| (key.clone(), r.incarnation))
+            .collect();
+        let mut retired = 0;
+        for (key, incarnation) in victims {
+            if self.retire_locked(&mut inner, &key, incarnation, reason.clone()) {
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    /// `ServeHandle::drop` for one protected registration.
+    pub fn retire_registration(&self, registration: u64, reason: StreamTerminalReason) -> usize {
+        self.retire_where(reason, |r| r.registration == registration)
+    }
+
+    /// Node shutdown: every live record of this node retires (Q3/C9 — the
+    /// `ProtectedStreamOwners::retire_all` discipline at node scope).
+    pub fn retire_all(&self, reason: StreamTerminalReason) -> usize {
+        self.retire_where(reason, |_| true)
+    }
+
+    fn retire_where(
+        &self,
+        reason: StreamTerminalReason,
+        pred: impl Fn(&RegistryRecord) -> bool,
+    ) -> usize {
+        let mut inner = self.inner.lock();
+        let victims: Vec<(ProtectedCallKey, u64)> = inner
+            .records
+            .iter()
+            .filter(|(_, r)| r.phase != RegistryPhase::Terminal && pred(r))
+            .map(|(key, r)| (key.clone(), r.incarnation))
+            .collect();
+        let mut retired = 0;
+        for (key, incarnation) in victims {
+            if self.retire_locked(&mut inner, &key, incarnation, reason.clone()) {
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    // ----------------------------------------------------------------
+    // §3 step 1 — reserve
+    // ----------------------------------------------------------------
+
+    /// Take an `Opening` slot before any signature work (the model's
+    /// `reserve`). Charges the authenticated caller and the node only:
+    /// the acting org is whatever an *unverified* proof claims at this
+    /// point, so charging it would let a forged label exhaust a real
+    /// organization's quota.
+    pub fn reserve(
+        self: &Arc<Self>,
+        req: OpeningRequest,
+    ) -> Result<ReservationGuard, AdmissionDenied> {
+        if req.session_generation.is_none() {
+            // `SessionCurrentness` generation `u64::MAX` (§3): refuse
+            // admission. No C4 variant names it (finding F-S1.4-1).
+            return Err(AdmissionDenied::AuthorityChanged);
+        }
+        let mut inner = self.inner.lock();
+
+        // The key check comes first: it is the one refusal that must land
+        // before decode, and it costs a hash lookup.
+        if inner.records.contains_key(&req.key) {
+            return Err(AdmissionDenied::ActiveCallOwned);
+        }
+        if inner.active_node >= self.limits.max_active_node {
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        }
+        let caller_active = inner
+            .active_per_caller
+            .get(&req.key.caller)
+            .copied()
+            .unwrap_or(0);
+        if caller_active >= self.limits.max_active_per_caller {
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        }
+        let (Some(node_next), Some(caller_next)) = (
+            inner.active_node.checked_add(1),
+            caller_active.checked_add(1),
+        ) else {
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        };
+        let Some(verify_by_ns) = req.now_ns.checked_add(self.limits.verification_deadline_ns)
+        else {
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        };
+
+        let Some((captured, _)) = self.live_view_locked(&inner) else {
+            return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+        };
+        if captured.store_generation.is_none() || captured.poisoned {
+            return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+        }
+
+        let incarnation = inner.next_incarnation;
+        inner.next_incarnation += 1;
+        inner.active_node = node_next;
+        inner
+            .active_per_caller
+            .insert(req.key.caller.clone(), caller_next);
+        inner.records.insert(
+            req.key.clone(),
+            RegistryRecord {
+                incarnation,
+                phase: RegistryPhase::Opening,
+                session: req.session,
+                registration: req.registration,
+                shape: req.shape,
+                verify_by_ns,
+                captured,
+                facts: None,
+                charged_org: None,
+                cleanup: CleanupOwner::Bridge,
+                terminal: None,
+                signal: Arc::new(StreamRetireSignal::new()),
+                on_retire: None,
+                queued: Vec::new(),
+            },
+        );
+        let epoch_at_reserve = inner.authority_epoch;
+        drop(inner);
+        Ok(ReservationGuard {
+            registry: Arc::clone(self),
+            key: req.key,
+            incarnation,
+            epoch_at_reserve,
+            verify_by_ns,
+            armed: true,
+        })
+    }
+
+    fn live_view_locked(
+        &self,
+        inner: &RegistryInner,
+    ) -> Option<(AdmissionStamp, Arc<OrgRevocationState>)> {
+        let store = inner.store.as_ref()?;
+        let authority_ptr = inner
+            .authority
+            .as_ref()
+            .map_or(0, |a| Arc::as_ptr(a) as *const () as usize);
+        let store_ptr = Arc::as_ptr(store) as *const () as usize;
+        let (floors, generation) = store.snapshot_with_generation().ok()?;
+        let stamp = AdmissionStamp {
+            authority_ptr,
+            store_ptr,
+            store_generation: Some(generation),
+            poisoned: store.is_poisoned(),
+        };
+        Some((stamp, floors))
+    }
+
+    // ----------------------------------------------------------------
+    // §3 step 4 — install
+    // ----------------------------------------------------------------
+
+    /// Fill the verified facts and transition `Opening → Admitted`, under
+    /// the registry lock (the model's `install`). Three refusals, in
+    /// order: the reservation was retired/lost meanwhile (`AuthorityChanged`);
+    /// the security view moved ⇒ requalify per §2.3 (store moved / poison /
+    /// exhausted generation is `ProviderAuthorityUnavailable`; a
+    /// generation-only move compares `floor_for(acting_org, member)`
+    /// against THIS record's member generation and refreshes the captured
+    /// generation on success); the now-verified acting-org quota is
+    /// reserved atomically with the transition, rolling back on refusal.
+    pub fn install(
+        self: &Arc<Self>,
+        reservation: &mut ReservationGuard,
+        facts: VerifiedCallFacts,
+        now_ns: u64,
+    ) -> Result<ProtectedCallLease, AdmissionDenied> {
+        let mut inner = self.inner.lock();
+        let Some((live, floors)) = self.live_view_locked(&inner) else {
+            return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+        };
+        let epoch_now = inner.authority_epoch;
+
+        let Some(record) = inner.records.get(&reservation.key) else {
+            // Reclaimed by its cleanup owner while we verified.
+            reservation.defuse();
+            return Err(AdmissionDenied::AuthorityChanged);
+        };
+        if record.incarnation != reservation.incarnation {
+            reservation.defuse();
+            return Err(AdmissionDenied::AuthorityChanged);
+        }
+        match record.phase {
+            RegistryPhase::Opening => {}
+            RegistryPhase::Terminal => {
+                reservation.defuse();
+                return Err(AdmissionDenied::AuthorityChanged);
+            }
+            RegistryPhase::Admitted | RegistryPhase::Running => {
+                return Err(AdmissionDenied::AuthorityChanged);
+            }
+        }
+        let captured = record.captured;
+        let verify_by_ns = record.verify_by_ns;
+
+        if now_ns > verify_by_ns {
+            self.retire_locked(
+                &mut inner,
+                &reservation.key,
+                reservation.incarnation,
+                StreamTerminalReason::AuthorityUnavailable,
+            );
+            return Err(AdmissionDenied::AuthorityChanged);
+        }
+
+        if epoch_now != reservation.epoch_at_reserve || !is_current(&captured, &live) {
+            match stamp_movement(&captured, &live) {
+                ViewMovement::Unusable => {
+                    self.retire_locked(
+                        &mut inner,
+                        &reservation.key,
+                        reservation.incarnation,
+                        StreamTerminalReason::AuthorityUnavailable,
+                    );
+                    return Err(AdmissionDenied::ProviderAuthorityUnavailable);
+                }
+                ViewMovement::Unchanged | ViewMovement::GenerationOnly => {
+                    if floors.floor_for(&facts.acting_org, &facts.member) > facts.member_generation
+                    {
+                        self.retire_locked(
+                            &mut inner,
+                            &reservation.key,
+                            reservation.incarnation,
+                            StreamTerminalReason::Revoked,
+                        );
+                        return Err(AdmissionDenied::Revoked);
+                    }
+                }
+            }
+        }
+
+        // The acting org is verified only now, so this is the first moment
+        // its quota may legitimately be charged.
+        let org_active = inner
+            .active_per_org
+            .get(&facts.acting_org)
+            .copied()
+            .unwrap_or(0);
+        if org_active >= self.limits.max_active_per_org {
+            self.retire_locked(
+                &mut inner,
+                &reservation.key,
+                reservation.incarnation,
+                StreamTerminalReason::ResourceExhausted,
+            );
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        }
+        let Some(org_next) = org_active.checked_add(1) else {
+            self.retire_locked(
+                &mut inner,
+                &reservation.key,
+                reservation.incarnation,
+                StreamTerminalReason::ResourceExhausted,
+            );
+            return Err(AdmissionDenied::ActiveStreamCapacity);
+        };
+        inner
+            .active_per_org
+            .insert(facts.acting_org.clone(), org_next);
+
+        let record = inner
+            .records
+            .get_mut(&reservation.key)
+            .expect("record presence checked under this same lock");
+        record.captured = live;
+        record.facts = Some(facts);
+        record.charged_org = Some(
+            record
+                .facts
+                .as_ref()
+                .expect("just filled")
+                .acting_org
+                .clone(),
+        );
+        record.phase = RegistryPhase::Admitted;
+        let registration = record.registration;
+        let session = record.session.clone();
+        drop(inner);
+        reservation.defuse();
+        Ok(ProtectedCallLease {
+            registry: Arc::clone(self),
+            key: reservation.key.clone(),
+            incarnation: reservation.incarnation,
+            registration,
+            session,
+            armed: true,
+        })
+    }
+
+    // ----------------------------------------------------------------
+    // §3 step 5 — confirm, as an ownership transfer
+    // ----------------------------------------------------------------
+
+    /// Atomically register the cancellation-ready owner and mark `Running`
+    /// (the model's `confirm` — one lock-held operation, so a retire
+    /// cannot land between the check and the transfer). The owner (the
+    /// call's retire signal + optional hook) exists before its task is
+    /// scheduled: a retire arriving immediately after this returns still
+    /// reaches something.
+    pub fn confirm(
+        &self,
+        lease: &mut ProtectedCallLease,
+        signal: Arc<StreamRetireSignal>,
+        on_retire: Option<Arc<dyn Fn(StreamTerminalReason) + Send + Sync>>,
+    ) -> Result<(), AdmissionDenied> {
+        let mut inner = self.inner.lock();
+        let Some(record) = inner.records.get_mut(&lease.key) else {
+            return Err(AdmissionDenied::AuthorityChanged);
+        };
+        if record.incarnation != lease.incarnation {
+            return Err(AdmissionDenied::AuthorityChanged);
+        }
+        match record.phase {
+            RegistryPhase::Admitted => {}
+            RegistryPhase::Terminal => return Err(AdmissionDenied::AuthorityChanged),
+            RegistryPhase::Opening | RegistryPhase::Running => {
+                return Err(AdmissionDenied::AuthorityChanged)
+            }
+        }
+        record.phase = RegistryPhase::Running;
+        record.cleanup = CleanupOwner::Supervisor;
+        record.signal = signal;
+        record.on_retire = on_retire;
+        drop(inner);
+        lease.defuse();
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // §2.3 — the per-item commit boundary
+    // ----------------------------------------------------------------
+
+    /// The per-item check of §2.3 WITHOUT committing anything (the model's
+    /// `commit_check`) — exposed because production has this boundary, but
+    /// it is not a licence to enqueue afterwards. [`Self::begin_commit`]
+    /// is the ownership-preserving form.
+    pub fn commit_check(&self, key: &ProtectedCallKey, incarnation: u64) -> CommitVerdict {
+        let mut inner = self.inner.lock();
+        self.commit_check_locked(&mut inner, key, incarnation)
+    }
+
+    /// Check and hold: the verdict and the enqueue are one ownership
+    /// operation (the model's `begin_commit`). Holding the returned
+    /// transaction holds the registry lock, so retirement cannot land
+    /// between the verdict and the enqueue.
+    pub fn begin_commit(
+        &self,
+        key: &ProtectedCallKey,
+        incarnation: u64,
+    ) -> Result<CommitTxn<'_>, CommitVerdict> {
+        let mut inner = self.inner.lock();
+        let verdict = self.commit_check_locked(&mut inner, key, incarnation);
+        match verdict {
+            CommitVerdict::Proceed | CommitVerdict::Requalified => Ok(CommitTxn {
+                inner,
+                key: key.clone(),
+                incarnation,
+                verdict,
+            }),
+            other => Err(other),
+        }
+    }
+
+    fn commit_check_locked(
+        &self,
+        inner: &mut RegistryInner,
+        key: &ProtectedCallKey,
+        incarnation: u64,
+    ) -> CommitVerdict {
+        let Some((live, floors)) = self.live_view_locked(inner) else {
+            // The bound store vanished under us: fail closed for the
+            // record that is trying to commit.
+            let Some(record) = inner.records.get(key) else {
+                return CommitVerdict::Unknown;
+            };
+            if record.incarnation != incarnation {
+                return CommitVerdict::Unknown;
+            }
+            self.retire_locked(
+                inner,
+                key,
+                incarnation,
+                StreamTerminalReason::AuthorityUnavailable,
+            );
+            return CommitVerdict::Retired(StreamTerminalReason::AuthorityUnavailable);
+        };
+        let Some(record) = inner.records.get(key) else {
+            return CommitVerdict::Unknown;
+        };
+        if record.incarnation != incarnation {
+            return CommitVerdict::Unknown;
+        }
+        // "token.is_cancelled() → retired" is the first test, before any
+        // stamp work: a cancelled call has already selected its outcome.
+        if record.phase == RegistryPhase::Terminal {
+            return CommitVerdict::Retired(
+                record
+                    .terminal
+                    .clone()
+                    .unwrap_or(StreamTerminalReason::Cancelled),
+            );
+        }
+        let captured = record.captured;
+        if is_current(&captured, &live) {
+            return CommitVerdict::Proceed;
+        }
+        let Some(facts) = record.facts.clone() else {
+            // No verified facts: there is nothing to requalify against.
+            self.retire_locked(
+                inner,
+                key,
+                incarnation,
+                StreamTerminalReason::AuthorityUnavailable,
+            );
+            return CommitVerdict::Retired(StreamTerminalReason::AuthorityUnavailable);
+        };
+        match stamp_movement(&captured, &live) {
+            ViewMovement::Unusable => {
+                self.retire_locked(
+                    inner,
+                    key,
+                    incarnation,
+                    StreamTerminalReason::AuthorityUnavailable,
+                );
+                CommitVerdict::Retired(StreamTerminalReason::AuthorityUnavailable)
+            }
+            ViewMovement::Unchanged => CommitVerdict::Proceed,
+            ViewMovement::GenerationOnly => {
+                if floors.floor_for(&facts.acting_org, &facts.member) > facts.member_generation {
+                    self.retire_locked(inner, key, incarnation, StreamTerminalReason::Revoked);
+                    CommitVerdict::Retired(StreamTerminalReason::Revoked)
+                } else {
+                    let record = inner
+                        .records
+                        .get_mut(key)
+                        .expect("record presence checked under this same lock");
+                    record.captured = live;
+                    CommitVerdict::Requalified
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // §2.4 — retirement and the two removal paths
+    // ----------------------------------------------------------------
+
+    /// Mark a record terminal, conditional on the exact incarnation, and
+    /// signal the registered owner. First writer wins; a late retire
+    /// against a reused key is a no-op. **Never removes** — removal
+    /// belongs to the record's one cleanup owner. Retirement also consumes
+    /// every queued byte permit the call still owns (§2.7: cancellation
+    /// and queue discard compete for the item's ownership, exactly once)
+    /// and wakes producers parked in `send_wait` on a full budget.
+    pub fn retire(
+        &self,
+        key: &ProtectedCallKey,
+        incarnation: u64,
+        reason: StreamTerminalReason,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        self.retire_locked(&mut inner, key, incarnation, reason)
+    }
+
+    fn retire_locked(
+        &self,
+        inner: &mut RegistryInner,
+        key: &ProtectedCallKey,
+        incarnation: u64,
+        reason: StreamTerminalReason,
+    ) -> bool {
+        let Some(record) = inner.records.get_mut(key) else {
+            return false;
+        };
+        if record.incarnation != incarnation || record.phase == RegistryPhase::Terminal {
+            return false;
+        }
+        record.phase = RegistryPhase::Terminal;
+        record.terminal = Some(reason.clone());
+        let queued = std::mem::take(&mut record.queued);
+        let signal = Arc::clone(&record.signal);
+        let on_retire = record.on_retire.clone();
+        // Explicit releases, not guessed subtraction: each queued item's
+        // permit is consumed here unless a consumer already took it.
+        for item in queued {
+            if let Some(permit) = item.take() {
+                permit.release();
+            }
+        }
+        // Wake `send_wait` producers parked on a full budget — retirement
+        // is the interruption §2.7 requires of every satisfiable wait.
+        self.bytes.released.notify_waiters();
+        signal.fire(reason.clone());
+        if let Some(hook) = on_retire {
+            hook(reason);
+        }
+        true
+    }
+
+    /// Pre-transfer rollback, owned by the bridge's reservation guard.
+    /// Refuses once ownership has moved to a supervisor.
+    pub fn release(&self, key: &ProtectedCallKey, incarnation: u64) -> bool {
+        self.remove(key, incarnation, CleanupOwner::Bridge)
+    }
+
+    /// Post-transfer removal, owned by the supervisor after it has
+    /// disposed of its work. Refuses before ownership transferred.
+    pub fn complete(&self, key: &ProtectedCallKey, incarnation: u64) -> bool {
+        self.remove(key, incarnation, CleanupOwner::Supervisor)
+    }
+
+    fn remove(&self, key: &ProtectedCallKey, incarnation: u64, expected: CleanupOwner) -> bool {
+        let mut inner = self.inner.lock();
+        let matches = inner
+            .records
+            .get(key)
+            .is_some_and(|r| r.incarnation == incarnation && r.cleanup == expected);
+        if !matches {
+            return false;
+        }
+        let record = inner
+            .records
+            .remove(key)
+            .expect("presence checked under this same lock");
+        inner.active_node = inner
+            .active_node
+            .checked_sub(1)
+            .expect("node active-call counter released twice");
+        let caller_slot = inner
+            .active_per_caller
+            .get_mut(&key.caller)
+            .expect("caller active-call counter released twice");
+        *caller_slot = caller_slot
+            .checked_sub(1)
+            .expect("caller active-call counter released twice");
+        if *caller_slot == 0 {
+            inner.active_per_caller.remove(&key.caller);
+        }
+        if let Some(org) = record.charged_org {
+            let org_slot = inner
+                .active_per_org
+                .get_mut(&org)
+                .expect("org active-call counter released twice");
+            *org_slot = org_slot
+                .checked_sub(1)
+                .expect("org active-call counter released twice");
+            if *org_slot == 0 {
+                inner.active_per_org.remove(&org);
+            }
+        }
+        // Queued items the removed call still owned: their permits are
+        // consumed here, not guessed at.
+        for item in &record.queued {
+            if let Some(permit) = item.take() {
+                permit.release();
+            }
+        }
+        drop(inner);
+        *self
+            .removals
+            .lock()
+            .entry((key.clone(), incarnation))
+            .or_insert(0) += 1;
+        true
+    }
+
+    /// Reap `Opening` reservations whose verification deadline passed —
+    /// the lost-bridge path. An opening retired before transfer must not
+    /// wait for a supervisor that was never created, so this both retires
+    /// and removes under the bridge's ownership.
+    pub fn reap_expired_openings(&self, now_ns: u64) -> usize {
+        let expired: Vec<(ProtectedCallKey, u64)> = {
+            let inner = self.inner.lock();
+            inner
+                .records
+                .iter()
+                .filter(|(_, r)| r.phase == RegistryPhase::Opening && r.verify_by_ns < now_ns)
+                .map(|(k, r)| (k.clone(), r.incarnation))
+                .collect()
+        };
+        let mut reaped = 0;
+        for (key, incarnation) in expired {
+            self.retire(&key, incarnation, StreamTerminalReason::Timeout);
+            if self.release(&key, incarnation) {
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    // ----------------------------------------------------------------
+    // §2.7 — queue ownership
+    // ----------------------------------------------------------------
+
+    /// How many items the call still owns.
+    pub fn queued_items(&self, key: &ProtectedCallKey) -> usize {
+        self.inner
+            .lock()
+            .records
+            .get(key)
+            .map_or(0, |r| r.queued.len())
+    }
+
+    /// Retirement/removal consumes every item the call still owns.
+    /// Returns how many permits this call actually won — items another
+    /// party already consumed are not double counted, and no other call's
+    /// bytes are touched.
+    pub fn cancel_queued(&self, key: &ProtectedCallKey, incarnation: u64) -> usize {
+        let mut inner = self.inner.lock();
+        let Some(record) = inner.records.get_mut(key) else {
+            return 0;
+        };
+        if record.incarnation != incarnation {
+            return 0;
+        }
+        let items = std::mem::take(&mut record.queued);
+        drop(inner);
+        let mut released = 0;
+        for item in items {
+            if let Some(permit) = item.take() {
+                permit.release();
+                released += 1;
+            }
+        }
+        released
+    }
+}
+
+/// `AdmissionStamp::is_current` (`org_admission_gate.rs`) as a free
+/// function — whole-stamp identity plus both generations usable and the
+/// live view unpoisoned. The FAST PATH of the commit check uses this; the
+/// fallback discriminates the movement (never retire a sibling for
+/// another member's floor raise).
+fn is_current(captured: &AdmissionStamp, live: &AdmissionStamp) -> bool {
+    captured.is_current(live)
+}
+
+/// Check and commit as one ownership operation (the model's `CommitTxn`).
+/// Holding this holds the registry lock, so retirement cannot land between
+/// the verdict and the enqueue.
+pub struct CommitTxn<'a> {
+    inner: MutexGuard<'a, RegistryInner>,
+    key: ProtectedCallKey,
+    incarnation: u64,
+    verdict: CommitVerdict,
+}
+
+impl CommitTxn<'_> {
+    /// The verdict this transaction opened on.
+    pub fn verdict(&self) -> &CommitVerdict {
+        &self.verdict
+    }
+
+    /// Enqueue the item, handing its permit to the call's queue, and run
+    /// the caller's queue-admission closure WHILE this transaction still
+    /// holds the registry lock — so the §2.3 check and the enqueue are
+    /// one ownership operation.
+    pub fn commit_with(
+        mut self,
+        permit: ItemPermit,
+        admit: impl FnOnce(&Arc<SharedPermit>),
+    ) -> Arc<SharedPermit> {
+        let shared = SharedPermit::new(permit);
+        {
+            let record = self
+                .inner
+                .records
+                .get_mut(&self.key)
+                .expect("presence validated when this transaction opened");
+            debug_assert_eq!(record.incarnation, self.incarnation);
+            record.queued.push(Arc::clone(&shared));
+        }
+        admit(&shared);
+        shared
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-node registry resolution + the mesh.rs hook surface
+// ---------------------------------------------------------------------
+
+static PROTECTED_CALL_REGISTRIES: std::sync::LazyLock<DashMap<u64, Arc<ProtectedCallRegistry>>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+/// The node's protected-call registry, created on first use with the Q1
+/// defaults (validated at construction).
+pub fn protected_call_registry_for(node_id: u64) -> Arc<ProtectedCallRegistry> {
+    if let Some(existing) = PROTECTED_CALL_REGISTRIES.get(&node_id) {
+        return existing.value().clone();
+    }
+    let registry = ProtectedCallRegistry::with_q1_defaults()
+        .expect("the Q1 protected-call limits validate by construction");
+    PROTECTED_CALL_REGISTRIES
+        .entry(node_id)
+        .or_insert_with(|| Arc::clone(&registry))
+        .value()
+        .clone()
+}
+
+/// Test/fixture seam: install a registry with explicit limits as THE
+/// registry for `node_id` (replacing any current one — the replacement is
+/// dropped, which drops its raise subscription). Used to drive the §2.7
+/// byte witnesses with small budgets; production always uses the Q1
+/// defaults.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn set_protected_call_registry_for_node(
+    node_id: u64,
+    limits: CallLimits,
+    byte_limits: ByteLimits,
+) -> Result<Arc<ProtectedCallRegistry>, LimitsError> {
+    let registry = ProtectedCallRegistry::with_limits(limits, byte_limits)?;
+    PROTECTED_CALL_REGISTRIES.insert(node_id, Arc::clone(&registry));
+    Ok(registry)
+}
+
+/// Test/fixture seam: the current registry for `node_id`, if any.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn existing_protected_call_registry(node_id: u64) -> Option<Arc<ProtectedCallRegistry>> {
+    PROTECTED_CALL_REGISTRIES
+        .get(&node_id)
+        .map(|r| r.value().clone())
+}
+
+/// The registry's Q1 call ceilings with TINY byte budgets (24 B per call
+/// per direction) — the §2.7 accounting semantics run identically at
+/// small numbers, and the byte witnesses park in bounded time.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn tiny_byte_call_limits() -> CallLimits {
+    CallLimits {
+        max_active_node: 8,
+        max_active_per_caller: 8,
+        max_active_per_org: 8,
+        verification_deadline_ns: 30 * 1_000_000_000,
+    }
+}
+
+/// Test/fixture seam: tiny byte budgets for the §2.7 witnesses.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn tiny_byte_byte_limits() -> ByteLimits {
+    ByteLimits {
+        per_call: 24,
+        per_caller: 32,
+        per_node: 64,
+    }
+}
+
+/// mesh.rs hook — the store/authority install site (`install_org_revocation_store_locked`):
+/// §2.3's second `subscribe_floors_raised` subscriber plus the
+/// replacement semantics (retire every record captured under the old
+/// `(authority_ptr, store_ptr)`; re-subscribe to the new store).
+pub fn org_registry_store_installed(
+    node_id: u64,
+    authority: Option<Arc<NodeAuthority>>,
+    store: Arc<OrgRevocationStore>,
+) {
+    let registry = protected_call_registry_for(node_id);
+    registry.bind_store(authority, store);
+}
+
+/// mesh.rs hook — `install_peer_locked`'s displaced branch and the
+/// dead-peer sweep: retire exactly the displaced session's records
+/// (session replacement / disconnect).
+pub fn org_registry_retire_session(
+    node_id: u64,
+    peer: u64,
+    session_id: u64,
+    establishment: Option<[u8; 32]>,
+) {
+    let Some(registry) = PROTECTED_CALL_REGISTRIES
+        .get(&node_id)
+        .map(|r| r.value().clone())
+    else {
+        return;
+    };
+    let session = SessionIdentity {
+        peer,
+        session_id,
+        establishment,
+    };
+    registry.retire_session(&session, StreamTerminalReason::SessionReplaced);
+}
+
+/// mesh.rs hook — node shutdown (`Adapter::shutdown`): retire every live
+/// protected record of this node. Q3/C9: node shutdown retires all
+/// node-owned calls.
+pub fn org_registry_retire_all(node_id: u64) {
+    let Some(registry) = PROTECTED_CALL_REGISTRIES
+        .get(&node_id)
+        .map(|r| r.value().clone())
+    else {
+        return;
+    };
+    registry.retire_all(StreamTerminalReason::ServeHandleDropped);
+}
+
+/// mesh.rs hook — `Drop for MeshNode`: retire (best-effort, idempotent)
+/// and DISENGAGE the node's registry so its raise subscription dies with
+/// the node and a reused node id cannot inherit stale records.
+pub fn org_registry_node_dropped(node_id: u64) {
+    if let Some((_, registry)) = PROTECTED_CALL_REGISTRIES.remove(&node_id) {
+        registry.retire_all(StreamTerminalReason::ServeHandleDropped);
+    }
+}
+
+/// The §2.7/§2.4 registry linkage one protected call carries (the sink's
+/// byte-accounting handle and the retire/complete identity — the same
+/// `(registry, key, incarnation)` triple everywhere an exact-incarnation
+/// operation is required).
+#[derive(Clone)]
+pub struct RegistryCallRef {
+    /// The owning registry (byte budgets + commit boundary + records).
+    pub registry: Arc<ProtectedCallRegistry>,
+    /// The charged call.
+    pub key: ProtectedCallKey,
+    /// The exact incarnation.
+    pub incarnation: u64,
+}
+
+impl std::fmt::Debug for RegistryCallRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCallRef")
+            .field("key", &self.key)
+            .field("incarnation", &self.incarnation)
+            .finish()
+    }
+}
+
+impl RegistryCallRef {
+    /// Latch `ResourceExhausted` and retire the call (§2.7: a refused
+    /// protected item can never be dropped and then report success).
+    fn latch_exhausted(&self) {
+        self.registry.retire(
+            &self.key,
+            self.incarnation,
+            StreamTerminalReason::ResourceExhausted,
+        );
+    }
+}
+
+/// The post-transfer state of a unary protected opening (slice 1.4). It
+/// carries the cancellation token the retire hook fires and completes the
+/// registry record on drop — §2.4's single removal, owned post-transfer by
+/// the supervisor ("after disposition of owned work"). For a unary record
+/// that supervisor is the spawned handler task; if the opening is refused
+/// at the effect boundary after the transfer, this scope guard stands in
+/// for it so no `Running` record is ever orphaned.
+struct ConfirmedOpening {
+    call_ref: RegistryCallRef,
+    cancellation: RpcCancellationToken,
+}
+
+impl Drop for ConfirmedOpening {
+    fn drop(&mut self) {
+        self.call_ref
+            .registry
+            .complete(&self.call_ref.key, self.call_ref.incarnation);
+    }
+}
+
+/// The unary fold's admitted-opening carrier (`apply_frame`'s
+/// `org_admission` slot): the verified attribution plus, when a registry
+/// lease rode in, the post-transfer confirmation.
+struct AdmittedOpening {
+    admitted: crate::adapter::net::behavior::org_admission::Admitted,
+    confirmed: Option<ConfirmedOpening>,
+}
+
 /// Run one server-streaming call to a bounded terminal (§2.2) — the
 /// production shape of the model's `run_supervisor`. The supervisor owns
 /// the handler, the response pump's `JoinHandle`, the flow semaphore and
@@ -3324,11 +5538,12 @@ async fn run_stream_call_supervisor(
     // STREAMING_PUMP_CAPACITY. The pump pays one flow-control credit
     // per chunk when the caller opted in; a CLOSED semaphore (retirement)
     // unparks it (`Err(_) => break`).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_PUMP_CAPACITY);
     let sink = RpcResponseSink {
         inner: tx,
         metrics: metrics.clone(),
         gate: gate.clone(),
+        byte_charge: registration.registry.clone(),
     };
     let pump_emit = emit.clone();
     let pump_metrics = metrics.clone();
@@ -3366,11 +5581,19 @@ async fn run_stream_call_supervisor(
                     HEADER_NRPC_STREAMING.to_string(),
                     HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
                 )],
-                body: chunk,
+                body: chunk.body,
             };
+            let chunk_permit = chunk.permit;
             // Await per-chunk publish so chunks for one call_id reach
             // the network in send order.
             pump_emit(from_node, caller_origin, call_id, resp).await;
+            // §2.7: publishing releases the item's byte reservation —
+            // the bytes left the queue, they were not merely counted.
+            if let Some(shared) = chunk_permit {
+                if let Some(permit) = shared.take() {
+                    permit.release();
+                }
+            }
         }
     });
     tokio::pin!(pump_task);
@@ -3480,6 +5703,14 @@ async fn run_stream_call_supervisor(
     // after the terminal", not the abort call. The owned handler future
     // drops at scope end.
     if let Some(reason) = forced {
+        // §2.4: settle the registry side first (terminal + queued byte
+        // permits + owner signal), so no item can commit after the
+        // retirement lands — then the §2.6 record.
+        if let Some(call_ref) = registration.registry.as_ref() {
+            call_ref
+                .registry
+                .retire(&call_ref.key, call_ref.incarnation, reason.clone());
+        }
         record.lock().retire(reason);
         cancel_token.cancel();
         if let Some(sem) = flow_sem.as_ref() {
@@ -3673,6 +5904,7 @@ impl RpcServerStreamingFold {
         ev: &RpcInboundEvent,
         admitted: crate::adapter::net::behavior::org_admission::Admitted,
         lifetime: &StreamCallLifetime<'_>,
+        mut lease: Option<ProtectedCallLease>,
     ) -> Result<
         Arc<ProtectedStreamCall>,
         crate::adapter::net::behavior::org_admission::AdmissionDenied,
@@ -3739,6 +5971,26 @@ impl RpcServerStreamingFold {
             name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
         });
 
+        // §3 step 5 — the registry's ownership TRANSFER (slice 1.4),
+        // before any fold effect (in-flight insert, sender creation,
+        // handler spawn). `confirm` is the transfer, not a boolean check
+        // followed by a spawn: a retire that wins before it prevents
+        // every effect and the lease's Drop releases the reservation;
+        // one that wins after reaches the registered signal even before
+        // the supervisor task has been scheduled.
+        let retire_signal = Arc::new(StreamRetireSignal::new());
+        let mut call_ref: Option<RegistryCallRef> = None;
+        if let Some(lease) = lease.as_mut() {
+            let registry = Arc::clone(lease.registry());
+            let ref_for_call = RegistryCallRef {
+                registry: Arc::clone(&registry),
+                key: lease.key.clone(),
+                incarnation: lease.incarnation,
+            };
+            registry.confirm(lease, Arc::clone(&retire_signal), None)?;
+            call_ref = Some(ref_for_call);
+        }
+
         let cancellation = RpcCancellationToken::new();
         self.in_flight.lock().insert(key, cancellation.clone());
         let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
@@ -3762,8 +6014,9 @@ impl RpcServerStreamingFold {
         };
         let call = Arc::new(ProtectedStreamCall {
             record: Arc::new(Mutex::new(StreamCallRecord::new_server_streaming())),
-            retire: Arc::new(StreamRetireSignal::new()),
+            retire: retire_signal,
             deadline: resolved,
+            call_ref: call_ref.clone(),
         });
         self.protected_calls.insert(key, call.clone());
         // The deadline's monotonic end derives from the admission's ONE
@@ -3788,6 +6041,7 @@ impl RpcServerStreamingFold {
                 in_flight: self.in_flight.clone(),
                 flow_control: self.flow_control.clone(),
                 protected: self.protected_calls.clone(),
+                registry: call_ref,
             },
         ));
         Ok(call)
@@ -3989,6 +6243,7 @@ impl RpcServerStreamingFold {
                         in_flight: self.in_flight.clone(),
                         flow_control: self.flow_control.clone(),
                         protected: self.protected_calls.clone(),
+                        registry: None,
                     },
                 ));
             }
@@ -4110,8 +6365,18 @@ impl RedexFold<()> for RpcServerStreamingFold {
 /// `apply_frame()` pushes REQUEST_CHUNK bodies into. The matching
 /// receiver lives inside the handler's [`RequestStream`]; dropping the
 /// sender (on REQUEST_END or CANCEL) closes the stream.
-type RequestChunkSenders =
-    Arc<Mutex<HashMap<StreamCallKey, tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+type RequestChunkSenders = Arc<Mutex<HashMap<StreamCallKey, RequestChunkSender>>>;
+
+/// One per-call request-chunk sender plus its optional §2.7
+/// request-direction byte accounting (the charge rides the entry so a
+/// non-deliverable chunk can retire the EXACT call). Protected CS/DX
+/// records (Stage 2) insert `Some`; public uploads keep `None` and the
+/// drop-and-continue contract.
+#[derive(Clone)]
+struct RequestChunkSender {
+    tx: tokio::sync::mpsc::Sender<ChargedChunk>,
+    charge: Option<RegistryCallRef>,
+}
 
 /// Shared REQUEST_CHUNK handling used by both
 /// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
@@ -4177,13 +6442,78 @@ fn apply_request_chunk_to_senders(
         return;
     };
     let is_pure_terminator = is_end && payload.body.is_empty();
-    if !is_pure_terminator && sender.try_send(payload.body).is_err() {
-        tracing::debug!(
-            caller_origin = format!("{:#x}", meta.origin_hash),
-            call_id = meta.seq_or_ts,
-            tag = diag_tag,
-            "rpc server fold: request-chunk mpsc full or closed; dropping",
-        );
+    if !is_pure_terminator {
+        let body = payload.body;
+        let body_len = body.len();
+        match sender.charge.as_ref() {
+            // PUBLIC uploads keep the drop-and-continue contract (Q3).
+            None => {
+                if sender
+                    .tx
+                    .try_send(ChargedChunk { body, permit: None })
+                    .is_err()
+                {
+                    tracing::debug!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        tag = diag_tag,
+                        "rpc server fold: request-chunk mpsc full or closed; dropping",
+                    );
+                }
+            }
+            // §2.7 request direction (protected records): account
+            // `payload.len()` BEFORE the queue/handler allocation. A
+            // chunk that cannot be reserved or delivered — over budget,
+            // full mpsc, or a closed sender for an admitted call —
+            // RETIRES the call with `ResourceExhausted` and stops all
+            // further delivery. Never a silent drop followed by `Ok`.
+            Some(charge) => {
+                let permit = match charge.registry.bytes().reserve(
+                    charge.key.clone(),
+                    charge.incarnation,
+                    ByteDirection::Request,
+                    body_len,
+                ) {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        charge.latch_exhausted();
+                        senders.lock().remove(&key);
+                        return;
+                    }
+                };
+                // The queue slot is reserved first (a full/closed queue
+                // is a delivery failure, not a wait), then the §2.3
+                // check and the admission run as ONE ownership
+                // operation under the registry lock.
+                let slot = match sender.tx.try_reserve() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        permit.release();
+                        charge.latch_exhausted();
+                        senders.lock().remove(&key);
+                        return;
+                    }
+                };
+                match charge
+                    .registry
+                    .begin_commit(&charge.key, charge.incarnation)
+                {
+                    Ok(txn) => {
+                        txn.commit_with(permit, |shared| {
+                            slot.send(ChargedChunk {
+                                body,
+                                permit: Some(Arc::clone(shared)),
+                            });
+                        });
+                    }
+                    Err(_) => {
+                        permit.release();
+                        senders.lock().remove(&key);
+                        return;
+                    }
+                }
+            }
+        }
     }
     if is_end {
         // Drop the sender from the map → its clone here goes out
@@ -4408,7 +6738,7 @@ impl RpcStreamingRequestFold {
                 // wired, will naturally not push past the credit
                 // window).
                 let (tx, rx) =
-                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
+                    tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_REQUEST_PUMP_CAPACITY);
                 // Terminator-semantics rule: an empty body
                 // combined with FLAG_REQUEST_END is a pure
                 // terminator — the caller's `finish()` emits it
@@ -4426,7 +6756,13 @@ impl RpcStreamingRequestFold {
                     // debug_assert surfaces the invariant break in
                     // tests; release logs at error level rather than
                     // silently swallowing the first request body.
-                    if tx.try_send(payload.body).is_err() {
+                    if tx
+                        .try_send(ChargedChunk {
+                            body: payload.body,
+                            permit: None,
+                        })
+                        .is_err()
+                    {
                         debug_assert!(
                             false,
                             "fresh client-streaming request mpsc rejected initial body"
@@ -4444,7 +6780,9 @@ impl RpcStreamingRequestFold {
                 // with a trailing REQUEST_CHUNK. Don't even insert
                 // the sender into the map; just drop it here.
                 if !end_on_initial {
-                    self.senders.lock().insert(key, tx);
+                    self.senders
+                        .lock()
+                        .insert(key, RequestChunkSender { tx, charge: None });
                 }
                 // Build the handler's context + stream. Auto-grant
                 // is opted into when the caller set the request
@@ -4881,14 +7219,20 @@ impl RpcDuplexFold {
                 // Build per-call request-side mpsc (Phase B
                 // pattern).
                 let (req_tx, req_rx) =
-                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_REQUEST_PUMP_CAPACITY);
+                    tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_REQUEST_PUMP_CAPACITY);
                 let end_on_initial = payload.flags & FLAG_RPC_REQUEST_END != 0;
                 let is_pure_terminator = end_on_initial && payload.body.is_empty();
                 if !is_pure_terminator {
                     // Same invariant as the client-streaming fold:
                     // fresh bounded mpsc with a live receiver cannot
                     // reject the first send.
-                    if req_tx.try_send(payload.body).is_err() {
+                    if req_tx
+                        .try_send(ChargedChunk {
+                            body: payload.body,
+                            permit: None,
+                        })
+                        .is_err()
+                    {
                         debug_assert!(false, "fresh duplex request mpsc rejected initial body");
                         tracing::error!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
@@ -4898,7 +7242,13 @@ impl RpcDuplexFold {
                     }
                 }
                 if !end_on_initial {
-                    self.senders.lock().insert(key, req_tx);
+                    self.senders.lock().insert(
+                        key,
+                        RequestChunkSender {
+                            tx: req_tx,
+                            charge: None,
+                        },
+                    );
                 }
                 // Hand the handler an auto-granting RequestStream
                 // when the caller opted into request-direction
@@ -4922,10 +7272,11 @@ impl RpcDuplexFold {
                 // writes chunks to the sink; the pump task drains
                 // the receiver and publishes RESPONSE events.
                 let (resp_tx, mut resp_rx) =
-                    tokio::sync::mpsc::channel::<bytes::Bytes>(STREAMING_PUMP_CAPACITY);
+                    tokio::sync::mpsc::channel::<ChargedChunk>(STREAMING_PUMP_CAPACITY);
                 let response_sink = RpcResponseSink {
                     inner: resp_tx,
                     metrics: self.metrics.clone(),
+                    byte_charge: None,
                     gate: None,
                 };
 
@@ -4969,9 +7320,18 @@ impl RpcDuplexFold {
                                 HEADER_NRPC_STREAMING.to_string(),
                                 HEADER_NRPC_STREAMING_CONTINUE.to_vec(),
                             )],
-                            body: chunk.clone(),
+                            body: chunk.body,
                         };
+                        let chunk_permit = chunk.permit;
                         pump_emit(from_node, caller_origin, call_id, resp).await;
+                        // §2.7: publishing releases the item's byte
+                        // reservation (none today — the duplex response
+                        // sink is public — but the discipline is shared).
+                        if let Some(shared) = chunk_permit {
+                            if let Some(permit) = shared.take() {
+                                permit.release();
+                            }
+                        }
                     }
                 });
 
@@ -6163,10 +8523,13 @@ mod tests {
         // Drive one poll of a RequestStream bound to `node`, over the same
         // ORIGIN + CALL, and return the grant it fired.
         async fn one_grant(node: u64, emit: RpcRequestGrantEmitter) {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
-            tx.send(Bytes::from_static(b"chunk"))
-                .await
-                .expect("queue chunk");
+            let (tx, rx) = tokio::sync::mpsc::channel::<ChargedChunk>(4);
+            tx.send(ChargedChunk {
+                body: Bytes::from_static(b"chunk"),
+                permit: None,
+            })
+            .await
+            .expect("queue chunk");
             drop(tx);
             let mut stream = RequestStream::new(rx, Some(emit), node, ORIGIN, CALL);
             assert_eq!(
@@ -6921,7 +9284,7 @@ mod tests {
             body: Bytes::from_static(b"hi"),
         };
         let frame = rpc_request_event(0xCAFE, 7, req).payload;
-        fold.apply_inbound_admitted(&inbound(0x61, frame), admitted.clone())
+        fold.apply_inbound_admitted(&inbound(0x61, frame), admitted.clone(), None)
             .unwrap();
 
         assert!(
@@ -8801,12 +11164,13 @@ mod tests {
     async fn streaming_sink_drops_on_full_and_increments_metric() {
         use crate::adapter::net::mesh_rpc_metrics::{RpcMetricsRegistry, ServiceMetricsAtomic};
         // Tiny channel to make overflow easy to observe.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ChargedChunk>(2);
         let registry = RpcMetricsRegistry::new();
         let metrics: Arc<ServiceMetricsAtomic> = registry.for_service("drop_test");
         let sink = RpcResponseSink {
             inner: tx,
             metrics: Some(metrics.clone()),
+            byte_charge: None,
             gate: None,
         };
         // 5 sends; first 2 buffer, next 3 drop.
@@ -9283,5 +11647,236 @@ mod tests {
             1,
             "duplicate REQUEST must NOT spawn a second handler",
         );
+    }
+    // =================================================================
+    // Slice 1.4 — the §2.7 byte-accounting port (the production shape of
+    // the Stage 0 `ByteBudgets`/`ItemPermit`/`SharedPermit` model) and
+    // the request-direction charge at `apply_request_chunk_to_senders`.
+    // =================================================================
+
+    #[test]
+    fn byte_reservation_rolls_back_in_order_and_releases_exactly_once() {
+        let budgets = ByteBudgets::new(ByteLimits {
+            per_call: 4,
+            per_caller: 6,
+            per_node: 8,
+        })
+        .expect("valid limits");
+        let key1 = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 1,
+        };
+        let key2 = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 2,
+        };
+        let key3 = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 3,
+        };
+
+        // Unsatisfiable items fail PROMPTLY (§2.7: no waiting on permits
+        // that can never exist).
+        assert_eq!(
+            budgets.validate_item(MAX_RPC_ITEM_BYTES + 1),
+            Err(ByteRefusal::ItemTooLarge),
+        );
+        assert_eq!(
+            budgets.validate_item(5),
+            Err(ByteRefusal::ExceedsCallBudget),
+        );
+        assert!(!ByteRefusal::ItemTooLarge.is_satisfiable_by_waiting());
+        assert!(ByteRefusal::CallerBudgetFull.is_satisfiable_by_waiting());
+
+        // Order call → caller → node with rollback: the third item fits
+        // its CALL budget but not the CALLER's — its per-call increment
+        // must be rolled back, invisible in every counter.
+        let p1 = budgets
+            .reserve(key1.clone(), 1, ByteDirection::Response, 3)
+            .expect("item 1 reserves");
+        let p2 = budgets
+            .reserve(key2.clone(), 1, ByteDirection::Response, 3)
+            .expect("item 2 reserves");
+        assert_eq!(
+            budgets
+                .reserve(key3.clone(), 1, ByteDirection::Response, 3)
+                .expect_err("the caller budget is full"),
+            ByteRefusal::CallerBudgetFull,
+        );
+        assert_eq!(
+            budgets.call_bytes(&key3, 1, ByteDirection::Response),
+            0,
+            "the refused item's per-call increment is rolled back",
+        );
+        assert_eq!(
+            budgets
+                .reserve(key1.clone(), 1, ByteDirection::Response, 2)
+                .expect_err("the call budget is full"),
+            ByteRefusal::CallBudgetFull,
+        );
+        assert_eq!(budgets.call_bytes(&key1, 1, ByteDirection::Response), 3);
+        assert_eq!(budgets.caller_bytes(&key1.caller), 6);
+        assert_eq!(budgets.node_bytes(), 6);
+
+        // Release-once: the shared permit is consumed exactly once.
+        let shared = SharedPermit::new(p1);
+        let first = shared.take().expect("the first take wins");
+        assert!(shared.take().is_none(), "the second take gets nothing");
+        first.release();
+        assert_eq!(budgets.call_bytes(&key1, 1, ByteDirection::Response), 0);
+        assert_eq!(budgets.caller_bytes(&key1.caller), 3);
+        assert_eq!(budgets.node_bytes(), 3);
+        p2.release();
+        assert_eq!(budgets.caller_bytes(&key1.caller), 0);
+        assert_eq!(budgets.node_bytes(), 0);
+        assert_eq!(budgets.unsettled_drops(), 0);
+
+        // A dropped, never-released permit settles exactly once and is
+        // COUNTED as an ownership bug — the accounting never hides it.
+        drop(
+            budgets
+                .reserve(key3.clone(), 1, ByteDirection::Response, 2)
+                .expect("item reserves"),
+        );
+        assert_eq!(budgets.unsettled_drops(), 1);
+        assert_eq!(budgets.node_bytes(), 0, "the drop still settles the charge");
+    }
+
+    #[test]
+    fn request_chunk_accounting_retires_the_call_and_stops_delivery() {
+        // A real store gives the registry its live view (the model's
+        // abstract authority); AV-9: the scratch dir is left behind.
+        let dir = std::env::temp_dir().join(format!(
+            "net-s14-unit-req-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+            &dir,
+            crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("real store");
+        let registry =
+            ProtectedCallRegistry::with_limits(tiny_byte_call_limits(), tiny_byte_byte_limits())
+                .expect("limits");
+        registry.bind_store(None, Arc::new(store));
+        let key = ProtectedCallKey {
+            caller: EntityId::from_bytes([1u8; 32]),
+            call_id: 7,
+        };
+        let mut reservation = registry
+            .reserve(OpeningRequest {
+                key: key.clone(),
+                session: SessionIdentity {
+                    peer: 2,
+                    session_id: 3,
+                    establishment: Some([4u8; 32]),
+                },
+                session_generation: Some(1),
+                registration: 1,
+                shape: RpcCallShape::ClientStreaming,
+                now_ns: 0,
+            })
+            .expect("reserve");
+        let lease = registry
+            .install(
+                &mut reservation,
+                VerifiedCallFacts {
+                    acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+                    member: EntityId::from_bytes([1u8; 32]),
+                    member_generation: 1,
+                    deadline: None,
+                },
+                0,
+            )
+            .expect("install");
+        let charge = RegistryCallRef {
+            registry: Arc::clone(&registry),
+            key: key.clone(),
+            incarnation: lease.incarnation,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChargedChunk>(4);
+        let senders: RequestChunkSenders = Arc::new(Mutex::new(HashMap::from([(
+            (2u64, 3u64, 0x1111u64, 7u64),
+            RequestChunkSender {
+                tx,
+                charge: Some(charge.clone()),
+            },
+        )])));
+        let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, 0x1111, 7, 0);
+
+        // The happy path: a 4-byte chunk reserves, delivers, and its
+        // permit releases at the yield (RequestStream hands the body on).
+        let mut small = Vec::new();
+        RpcRequestChunkPayload {
+            call_id: 7,
+            flags: 0,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"1234"),
+        }
+        .encode_into(&mut small);
+        apply_request_chunk_to_senders(2, 3, Bytes::from(small), &meta, &senders, "unit");
+        {
+            let mut rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let chunk = rx.recv().await.expect("the chunk delivers");
+                assert_eq!(chunk.body.as_ref(), b"1234".as_slice());
+                release_chunk_permit(&chunk);
+            });
+        }
+        assert_eq!(
+            registry
+                .bytes()
+                .call_bytes(&key, lease.incarnation, ByteDirection::Request),
+            0,
+            "the yield releases the reservation",
+        );
+
+        // A chunk over the tiny per-call budget retires the call with
+        // `ResourceExhausted` and STOPS all further delivery (§2.7: never
+        // a silent drop followed by `Ok`).
+        let mut big = Vec::new();
+        RpcRequestChunkPayload {
+            call_id: 7,
+            flags: 0,
+            headers: vec![],
+            body: bytes::Bytes::from(vec![0u8; 32]),
+        }
+        .encode_into(&mut big);
+        apply_request_chunk_to_senders(2, 3, Bytes::from(big), &meta, &senders, "unit");
+        assert_eq!(
+            registry.terminal_reason(&key),
+            Some(StreamTerminalReason::ResourceExhausted),
+            "an undeliverable chunk latches ResourceExhausted and retires the call",
+        );
+        assert!(
+            senders.lock().is_empty(),
+            "the sender is removed — zero further delivery",
+        );
+        // …and nothing more is delivered.
+        let mut small2 = Vec::new();
+        RpcRequestChunkPayload {
+            call_id: 7,
+            flags: 0,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"5678"),
+        }
+        .encode_into(&mut small2);
+        apply_request_chunk_to_senders(2, 3, Bytes::from(small2), &meta, &senders, "unit");
+        {
+            let mut rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                assert!(
+                    rx.try_recv().is_err(),
+                    "no further delivery after the retire"
+                );
+            });
+        }
+        drop(lease);
     }
 }
