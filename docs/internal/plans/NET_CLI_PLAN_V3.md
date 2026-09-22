@@ -666,7 +666,7 @@ binary; no new root pin is needed.
 **Signed membership invite and intent (2026-09-22, uncommitted working tree):**
 `sdk/src/enrollment/invite.rs`, witnesses `sdk/tests/enrollment_invite.rs`.
 `MembershipInvite` (`NMM1`, signature domain `net-mesh membership invite v1`,
-link prefix `net-join:`, ≤1 KiB) signs over the full issuer `EntityId`, a
+join link `net-mesh://<host:port>/join/<base64url>` — see the link-format decision below, ≤1 KiB) signs over the full issuer `EntityId`, a
 trust-domain label (`[A-Za-z0-9._-]`, 1..=64) plus the existing public
 `TrustDomainId`, a strict UDP `host:port` enrollment endpoint (DNS name, IPv4 or
 bracketed IPv6; port required; no scheme/path/userinfo/whitespace), the
@@ -812,6 +812,22 @@ close that gap.
 Not included: CLI `up --enroll` / `invite` / `join`, the local control endpoint,
 profile integration, standing-PSK rotation and membership revocation, Unix
 execution and CI. Loopback single-process evidence only.
+
+**Join link format decision (user, 2026-09-23):** `invite create` returns
+`net-mesh://<host:port>/join/<base64url of the signed NMM1 invite>`. The
+visible address is only for human readability: `MembershipInvite::decode`
+verifies the signature and then requires the visible `host:port` to equal the
+signed endpoint byte-for-byte (`InviteError::AddressMismatch` otherwise), and
+clients connect only to the signed endpoint. The earlier `net-join:` form is
+dropped (never published). A custom scheme is not fetched by HTTP link
+previewers; OS URL-handler registration stays deferred, so the link is passed
+to `net-mesh join`. The link remains bearer material unless subject-bound.
+Witnesses: `the_visible_address_must_be_the_signed_endpoint` (forged host,
+port and case refused; inverse removing the equality check fails it) and the
+extended malformed-link table (legacy `net-join:`/`net-invite:`, `https://`,
+missing `/join/`, query suffix, oversize). Because the link carries the
+operator's address, `up --enroll` must advertise a reachable public address
+(`--public-addr`) and a fixed port; see the NAT scope note in the next slice.
 
 **Control endpoint decision (user, 2026-09-23):** loopback TCP plus an
 owner-only per-run secret file with mutual keyed-BLAKE3 authentication, instead
