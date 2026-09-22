@@ -25,40 +25,40 @@ It is nonetheless **incorrect as merged**. Three classes of defect run through i
 
 | # | Finding | Severity | Area | Status |
 |---|---|---|---|---|
-| 1 | Lost owner-initiated MANIFEST wedges a replica that reports `ready` | High | store | Open |
-| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | High | store | Open |
-| 3 | Read revocation never reaches the delta feed | High | store | Open |
-| 4 | A failed reply-stream open is cached as a permanent rejection | High | store | Open |
-| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | High | anchor | Open |
-| 6 | The `§12` provisional-signalling witness cannot fail | High | anchor | Open |
-| 7 | Ownership-charge refusal drops acknowledged fragment bytes | High | rtc | Open |
-| 8 | A pending handshake is destroyed before msg2 validates | High | leaf | Open |
-| 9 | Pending handshakes have no deadline and no release on retirement | High | leaf | Open |
-| 10 | A registered call is leaked on the request-encode error path | High | leaf | Open |
-| 11 | `unsubscribe` destroys the nRPC plane's membership it does not own | High | leaf | Open |
-| 12 | The reply-carrier fence covers Stream owners but not Channel owners | High | leaf | Open |
-| 13 | Peer sessions are never released when their transport dies | High | leaf | Open |
-| 14 | The membership Ack is decoded and discarded | High | leaf | Open |
-| 15 | The credential's `http://localhost` exception is a prefix match | High | leaf | Open |
-| 16 | The redacting `Credential` Debug prints the invite nonce | High | leaf | Open |
-| 17 | Buffered trickle frames flush with no dialog fence | High | leaf | Open |
-| 18 | The inbound sink drops the datagram on borrow conflict | High | leaf | Open |
-| 19 | An inbound message 1 destroys our own pending handshake | High | leaf | Open |
-| 20 | A post-`close()` attempt registration leaves an orphan ICE agent | High | leaf | Open |
-| 21 | `mark_remote_ready` strands the answerer's deferred candidates | High | leaf | Open |
-| 22 | The Reject handler tears down a Direct-terminal attempt | High | leaf | Open |
-| 23 | `settle_peer_deadline` publishes `iceTimeout` over an installed attempt | High | leaf | Open |
-| 24 | `RxStream::promote`'s span-blind handoff stalls a reliable stream | High | leaf | Open |
-| 25 | Two opens of one identity alias one node stream | High | leaf | Open |
-| 26 | The signal dialog is carried as `f64`, corrupting ~511/512 of minted dialogs | High | leaf | Open |
-| 27 | `stand_down` never re-attaches; the tab becomes a permanent zombie | High | leaf | Open |
-| 28 | The per-source-order witness never asserts order | High | tests | Open |
-| 29–60 | Robustness, lifecycle and contract-drift defects (32) | Medium | mixed | Open |
-| 61–91 | Witness non-discrimination (31) | Medium | tests | Open |
-| 92–96 | Bindings, ABI and documentation contracts (5) | Medium | mixed | Open |
-| 97–119 | Accounting, allocation, stale-doc and nit defects (23) | Low | mixed | Open |
-| 120–121 | CI floors and witness pins (2) | High | ci | Open |
-| 122–130 | CI selection, checkers and fixture contracts (9) | Medium/Low | ci | Open |
+| 1 | Lost owner-initiated MANIFEST wedges a replica that reports `ready` | High | store | Closed |
+| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | High | store | Closed |
+| 3 | Read revocation never reaches the delta feed | High | store | Closed |
+| 4 | A failed reply-stream open is cached as a permanent rejection | High | store | Closed |
+| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | High | anchor | Closed |
+| 6 | The `§12` provisional-signalling witness cannot fail | High | anchor | Closed |
+| 7 | Ownership-charge refusal drops acknowledged fragment bytes | High | rtc | Closed |
+| 8 | A pending handshake is destroyed before msg2 validates | High | leaf | Closed |
+| 9 | Pending handshakes have no deadline and no release on retirement | High | leaf | Closed |
+| 10 | A registered call is leaked on the request-encode error path | High | leaf | Closed |
+| 11 | `unsubscribe` destroys the nRPC plane's membership it does not own | High | leaf | Closed |
+| 12 | The reply-carrier fence covers Stream owners but not Channel owners | High | leaf | Closed |
+| 13 | Peer sessions are never released when their transport dies | High | leaf | Closed |
+| 14 | The membership Ack is decoded and discarded | High | leaf | Closed |
+| 15 | The credential's `http://localhost` exception is a prefix match | High | leaf | Closed |
+| 16 | The redacting `Credential` Debug prints the invite nonce | High | leaf | Closed |
+| 17 | Buffered trickle frames flush with no dialog fence | High | leaf | Closed |
+| 18 | The inbound sink drops the datagram on borrow conflict | High | leaf | Closed |
+| 19 | An inbound message 1 destroys our own pending handshake | High | leaf | Closed |
+| 20 | A post-`close()` attempt registration leaves an orphan ICE agent | High | leaf | Closed |
+| 21 | `mark_remote_ready` strands the answerer's deferred candidates | High | leaf | Closed |
+| 22 | The Reject handler tears down a Direct-terminal attempt | High | leaf | Closed |
+| 23 | `settle_peer_deadline` publishes `iceTimeout` over an installed attempt | High | leaf | Closed |
+| 24 | `RxStream::promote`'s span-blind handoff stalls a reliable stream | High | leaf | Closed |
+| 25 | Two opens of one identity alias one node stream | High | leaf | Closed |
+| 26 | The signal dialog is carried as `f64`, corrupting ~511/512 of minted dialogs | High | leaf | Closed |
+| 27 | `stand_down` never re-attaches; the tab becomes a permanent zombie | High | leaf | Closed |
+| 28 | The per-source-order witness never asserts order | High | tests | Closed |
+| 29–60 | Robustness, lifecycle and contract-drift defects (32) | Medium | mixed | Closed |
+| 61–91 | Witness non-discrimination (31) | Medium | tests | Closed |
+| 92–96 | Bindings, ABI and documentation contracts (5) | Medium | mixed | Closed |
+| 97–119 | Accounting, allocation, stale-doc and nit defects (23) | Low | mixed | Closed |
+| 120–121 | CI floors and witness pins (2) | High | ci | Closed |
+| 122–130 | CI selection, checkers and fixture contracts (9) | Medium/Low | ci | Closed |
 
 **Severity.** *High* = a shipped contract breaks, a security boundary fails open, or a security gate's witness cannot fail. *Medium* = robustness and lifecycle defects, contract drift, and witnesses that cannot discriminate their claimed outcome. *Low* = accounting, allocation, stale-doc and wording defects.
 
