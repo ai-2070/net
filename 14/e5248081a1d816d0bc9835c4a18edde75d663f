@@ -1,0 +1,23 @@
+.github/workflows/natsim-enroll.yml
+  s_3f3d4c91f992be::t_f7551cd434e8b6 1-94
+net/crates/net/tests/natsim/enroll/run_enroll_direct.sh
+  s_3f3d4c91f992be::t_06e8a6ce712705 1-215
+net/crates/net/tests/natsim/setup.sh
+  s_3f3d4c91f992be::t_3d74cf14f8fcec 49-54,109,112,311-325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "14e5248081a1d816d0bc9835c4a18edde75d663f",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
