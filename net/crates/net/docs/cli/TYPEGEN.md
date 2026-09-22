@@ -145,6 +145,11 @@ cleanly in source control. Commit them alongside the code that depends on
 the generated types; regenerate from the committed snapshot in CI so the
 build output doesn't drift with the live mesh population.
 
+For example, given `old.snapshot` advertising `vendor/search` v1.2.0
+with an optional `input.max_results`, and `new.snapshot` advertising
+`vendor/new_tool` v1.0.0 plus `vendor/search` v1.3.0 (`input.filter`
+added as optional, `input.max_results` made required):
+
 ```sh
 $ net-mesh typegen diff --from old.snapshot --to new.snapshot
 Added tools (1):
@@ -152,11 +157,19 @@ Added tools (1):
 
 Schema changes (1):
   vendor/search v1.2.0 → v1.3.0
-    - input.max_results: optional → required          [BREAKING]
+    - version: 1.2.0 → 1.3.0
     - input.filter: added (optional)
+    - input.max_results: optional → required          [BREAKING]
 
 1 changed tool(s), 1 marked BREAKING.
 ```
+
+*(Transcript `source-established, not executed` — derived from the
+renderer rather than captured from a live run: `typegen/diff.rs`
+`changes_between` emits the `version` line first whenever versions
+differ, `diff_objects` walks field names in `BTreeMap` order (so
+`input.filter` precedes `input.max_results`), and `render_text`
+produces the section headers, `[BREAKING]` flag and summary line.)*
 
 `diff` emits the structured report under `--output json` / `yaml`. Pass
 `--exit-code` to make `diff` exit non-zero (code **14**) when any BREAKING
