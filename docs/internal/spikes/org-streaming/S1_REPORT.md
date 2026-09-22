@@ -1704,7 +1704,13 @@ shutdown carve — `15+N+1`), REQUIRED names exactly the twenty-four:
 **Landed (executed):** `444a4aab9` — `S1.5: wire protected streaming
 admission into the serve bridges` (4 files, +1483/−91) on
 `LZL0/org-streaming`; this record rides in the following `S1.5:` commit.
-Base `8ad588171` (the S1 CI pin after 1.4). All green claims below are at
+Base `cddb063a3` (Main's `Correct model Revoked coarse mapping per plan
+4.3 (F-S1.4-1)` + its §0 record — landed in the shared tree at 11:16:53,
+BEFORE this slice's first compile; the `org_stream_registry` model file is
+byte-untouched BY this slice and every green claim below includes Main's
+alignment). The §2.4 unit counts were re-verified at the exact head
+(`9e4642e0b`'s tree): 216/216 + 19/19 unchanged. All green claims below
+are at
 `444a4aab9`'s exact tree (the scoped rustfmt pass is whitespace-only and
 landed inside it; the receipt cycles ran on the pre-format tree — the
 1.1a/1.4 precedent — with post-format shas recorded below).
@@ -1808,7 +1814,7 @@ Green at this head (executed):
   `duplex_bridge_rejects_before_fold_end_to_end`,
   `reject_relayed_flow_controlled_request_rejects_only_relayed_flow_controlled_uploads`)
   inside `adapter::net::mesh_rpc`, and the Stage 0 models
-  (`org_stream_lifecycle` / `org_stream_registry`) green and byte-untouched.
+  (`org_stream_lifecycle` / `org_stream_registry`) green and byte-untouched BY THIS SLICE (the registry model carries Main's `cddb063a3` ruling alignment).
 - The admission unit pins (`cargo tfl behavior::org_admission::`) →
   **19 run / 19 passed / 5817 skipped** (incl. the 1.6 pin-region units
   `malformed_and_streaming_are_distinct`,
