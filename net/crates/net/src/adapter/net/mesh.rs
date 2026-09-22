@@ -52424,41 +52424,112 @@ mod heartbeat_aead_tests {
         );
     }
 
-    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
-    /// `publish_to_peer` was the only sender call site that
-    /// hard-coded `PacketFlags::NONE` instead of computing
-    /// `if reliable { PacketFlags::RELIABLE } else { PacketFlags::NONE }`.
-    /// Today the dispatch path doesn't consult `is_reliable()` (per-
-    /// stream reliability is set at open), so the inconsistency is
-    /// latent — but receiver-side code already consults the packet
-    /// flag for `is_priority` / `is_control`, and `is_reliable` is
-    /// the obvious next addition. This source-level pin ensures the
-    /// fix doesn't get reverted before the dispatch path catches up.
-    ///
-    /// R2-6 moved the packet-build body into the atomic
-    /// [`MeshNode::try_publish_to_peer_bound`] delegate (`publish_to_peer` is
-    /// now a thin `Result`-flattening wrapper), so the pin scans there —
-    /// that is where the wire packet, and thus the `reliable` flag, is
-    /// built.
-    #[test]
-    fn publish_to_peer_propagates_reliable_to_packet_flags() {
-        let src = include_str!("mesh.rs");
-        let start = src
-            .find("async fn try_publish_to_peer_bound(")
-            .expect("try_publish_to_peer_bound must exist");
-        // Scan the actual method, not a fixed byte window that silently
-        // stops before packet construction when admission logic grows.
-        let tail = &src[start..];
-        let end = tail.find("\n    }").expect("method must end");
-        let body = &tail[..end];
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7, behavioral form
+    /// (review finding 18): the `reliable` flag handed to the publish
+    /// path must reach the wire packet's flags — asserted at the
+    /// RECEIVING session, where a `PacketFlags::RELIABLE` packet is what
+    /// makes the receive-side stream reliable (the session's
+    /// `default_reliable` is false for this config, and the second
+    /// assertion proves it). Pre-fix `publish_to_peer` hard-coded
+    /// `PacketFlags::NONE`; the source-text scan this replaces could not
+    /// distinguish dead code or a computed-and-dropped flag from real
+    /// propagation.
+    #[tokio::test]
+    async fn publish_to_peer_propagates_reliable_to_packet_flags() {
+        async fn node() -> Arc<MeshNode> {
+            Arc::new(
+                MeshNode::new(
+                    EntityKeypair::generate(),
+                    MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x24; 32]),
+                )
+                .await
+                .unwrap(),
+            )
+        }
+        let sender = node().await;
+        let receiver = node().await;
+        let accept = {
+            let receiver = receiver.clone();
+            let sender_id = sender.node_id();
+            tokio::spawn(async move { receiver.accept(sender_id).await.unwrap() })
+        };
+        sender
+            .connect(
+                receiver.local_addr(),
+                receiver.public_key(),
+                receiver.node_id(),
+            )
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        sender.start();
+        receiver.start();
+
+        const RELIABLE_STREAM: u64 = 0xE1;
+        const UNRELIABLE_STREAM: u64 = 0xE0;
+        let event = Bytes::from_static(b"reliable-flag-probe");
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xA11CE,
+                    RELIABLE_STREAM,
+                    /* reliable */ true,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "reliable probe must publish"
+        );
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xB0B,
+                    UNRELIABLE_STREAM,
+                    /* reliable */ false,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "unreliable probe must publish"
+        );
+
+        // Both packets must land on the receiving session before the
+        // stream-mode asserts read it — the awaits above return at the
+        // SENDER's socket, not at the receiver's dispatch.
+        let session = receiver
+            .peers
+            .get(&sender.node_id())
+            .unwrap()
+            .session
+            .clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.try_stream(RELIABLE_STREAM).is_some()
+                    && session.try_stream(UNRELIABLE_STREAM).is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both probe packets must reach the receiving session");
 
         assert!(
-            body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
-            "regression: publish_to_peer must thread `reliable` into the packet \
-             header — pre-fix it hard-coded PacketFlags::NONE while only \
-             feeding `reliable` into open_stream_with, leaving every other \
-             sender call site (send_to_peer, send_routed, send_on_stream) \
-             inconsistent."
+            session.try_stream(RELIABLE_STREAM).unwrap().reliable_mode(),
+            "a reliable publish must arrive RELIABLE-flagged: the receiving \
+             stream becomes reliable only from the packet flag"
+        );
+        assert!(
+            !session
+                .try_stream(UNRELIABLE_STREAM)
+                .unwrap()
+                .reliable_mode(),
+            "an unreliable publish must arrive unflagged — and proves the \
+             receiving session's default_reliable is false, so the assert \
+             above can discriminate the flag"
         );
     }
 
