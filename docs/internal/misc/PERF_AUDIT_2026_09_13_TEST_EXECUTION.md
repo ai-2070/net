@@ -163,20 +163,25 @@ edge in `ci.yml`, so wall clock is simply the slowest job.
 | Unit tests | 8.0 m | lib suite 3.32 m; doctests 1.40 m; deck 1.80 m; witness step 0.58 m |
 | Documentation | 7.5 m | 11 rustdoc passes, 0.57–1.53 m each |
 
-### 5.1 Named-witness re-run fan-out (removed 2026-09-13)
+### 5.1 Named-witness re-run fan-out (removed 2026-09-13 except `rust-sdk-tests`'s per-name loops)
 
 Counted before removal: 58 exact `cargo test` re-runs in `unit-tests`
 (`ci.yml:757`), 27 + 22 + 5 nextest re-runs in `rust-sdk-tests`, ~64 in
 `integration-cortex`, and 100 `cargo nextest list` calls in `webrtc-feature`
 (12 floors + 87 pinned names + 1 probe). Their measured cost was **not**
 uniform: 0.58 m in `unit-tests` and 0.82 m in `webrtc-feature`, but **7.3 m in
-`rust-sdk-tests`**, which is the critical path.
+`rust-sdk-tests`**, which is the critical path. Not all of it went:
+`rust-sdk-tests` still runs **16** per-name `cargo nextest run -E
+"test(=$required)"` loops (`ci.yml:2554-2558` and 15 identical shapes) over
+the payments/A2A witnesses, and those cannot observe retries the way the
+JUnit check can.
 
 ### 5.2 Feature-graph fragmentation
 
 28 distinct root-crate feature graphs across the workflow. Within the
 integration families, 12 declared graphs collapsed to **6 effective** ones and
-now to **4** (one per family), because no family step passes
+now to **5** (one per family; five integration families exist — `ci.yml:1211`,
+1363, 1450, 1812, 1991), because no family step passes
 `--no-default-features` — every "narrow" set was `default` plus a delta, and
 `dataforts` already implies `redex-disk` (`Cargo.toml:205-207`). The only real
 distinguishers were `port-mapping` and `batched-ingress`, both two-level gated
@@ -272,7 +277,8 @@ anything. Fixed in `a70b33f17`; the four targets run green (17 tests).
 - `[profile.dev] debug = "line-tables-only"` (§2).
 - `[profile.default.junit]` in `.config/nextest.toml` plus
   `.github/scripts/check-witness-results.py`: one verified result set replaces
-  the per-name re-run fan-out (§5.1). The check is stricter than what it
+  most of the per-name re-run fan-out (§5.1 — `rust-sdk-tests`'s 16 per-name
+  loops survive). The check is stricter than what it
   replaced — it rejects a `<flakyFailure>`, i.e. a witness that only passed on
   a retry, which a per-name re-run could not observe.
 - One feature graph per integration family, plus the `narrow-feature-check`

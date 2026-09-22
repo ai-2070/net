@@ -47,6 +47,7 @@ asserted.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -206,6 +207,28 @@ def parse_floors(spec: list[str]) -> dict[str, int]:
     return floors
 
 
+def run_marker_failures(junit: Path, run_marker: str | None) -> list[str]:
+    """Freshness verdict for one artifact; empty means "this run's result set".
+
+    Shared by `check()` and `check_multi()` — the marker used to be consulted
+    only in the single-suite path, so `--multi --run-marker X` performed NO
+    freshness check while the caller believed the artifact was bound to this
+    run. This is the checker's only freshness mechanism; both entry points
+    enforce it.
+    """
+    if not run_marker:
+        return []
+    marker = Path(run_marker)
+    if not marker.is_file():
+        return [f"run marker {marker} is missing — cannot prove the artifact is fresh"]
+    if junit.stat().st_mtime < marker.stat().st_mtime:
+        return [
+            f"{junit} is older than {marker} — this is a stale artifact "
+            "from an earlier step, not this run's result set"
+        ]
+    return []
+
+
 def check_multi(args: argparse.Namespace) -> int:
     """Verify MANY suites from one run's result set.
 
@@ -230,6 +253,11 @@ def check_multi(args: argparse.Namespace) -> int:
         root = ET.parse(junit).getroot()
     except ET.ParseError as exc:
         _error(f"could not parse {junit}: {exc}")
+        return 1
+
+    marker_failures = run_marker_failures(junit, args.run_marker)
+    if marker_failures:
+        _error(*marker_failures)
         return 1
 
     suites: dict[str, ET.Element] = {}
@@ -287,17 +315,10 @@ def check(args: argparse.Namespace) -> int:
         _error(str(exc.args[0]), *exc.args[1:])
         return 1
 
-    if args.run_marker:
-        marker = Path(args.run_marker)
-        if not marker.is_file():
-            _error(f"run marker {marker} is missing — cannot prove the artifact is fresh")
-            return 1
-        if Path(args.junit).stat().st_mtime < marker.stat().st_mtime:
-            _error(
-                f"{args.junit} is older than {marker} — this is a stale artifact "
-                "from an earlier step, not this run's result set"
-            )
-            return 1
+    marker_failures = run_marker_failures(Path(args.junit), args.run_marker)
+    if marker_failures:
+        _error(*marker_failures)
+        return 1
 
     failures = verify(suite_el, required, args.min, args.allow_flaky)
     if failures:
@@ -457,10 +478,21 @@ def self_test() -> int:
 </testsuites>
 """
 
-    def run_multi(entries: list[str], floors: list[str]) -> int:
+    def run_multi(entries: list[str], floors: list[str], marker: str = "none") -> int:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "junit.xml"
             path.write_text(multi_xml, encoding="utf-8")
+            run_marker = None
+            if marker in ("stale", "fresh"):
+                m = Path(tmp) / "marker"
+                m.write_text("x", encoding="utf-8")
+                # Deterministic mtimes: the marker is either strictly newer
+                # than the artifact (stale artifact) or strictly older (fresh).
+                offset = 10.0 if marker == "stale" else -10.0
+                os.utime(m, (path.stat().st_mtime + offset,) * 2)
+                run_marker = str(m)
+            elif marker == "missing":
+                run_marker = str(Path(tmp) / "nope")
             return check_multi(
                 argparse.Namespace(
                     junit=str(path),
@@ -468,6 +500,7 @@ def self_test() -> int:
                     required_file=None,
                     floor=floors,
                     allow_flaky=False,
+                    run_marker=run_marker,
                 )
             )
 
@@ -499,6 +532,37 @@ def self_test() -> int:
         run_multi(["rtc_classifier:pingwave_is_denied_while_heartbeat_is_permitted"], [])
         == 1,
     )
+    expect(
+        "multi: --run-marker is enforced — a stale artifact is rejected",
+        run_multi([], [], marker="stale") == 1,
+    )
+    expect(
+        "multi: a missing run marker is rejected",
+        run_multi([], [], marker="missing") == 1,
+    )
+    expect(
+        "multi: a fresh artifact with its run marker still verifies",
+        run_multi([], [], marker="fresh") == 0,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "junit.xml"
+        path.write_text(_PASS_XML, encoding="utf-8")
+        marker = Path(tmp) / "marker"
+        marker.write_text("x", encoding="utf-8")
+        os.utime(marker, (path.stat().st_mtime + 10.0,) * 2)
+        rc = check(
+            argparse.Namespace(
+                junit=str(path),
+                suite="sensing_consumer",
+                min=0,
+                required_file=None,
+                allow_flaky=False,
+                run_marker=str(marker),
+                name=[],
+            )
+        )
+    expect("single: --run-marker is enforced there too (stale artifact rejected)", rc == 1)
 
     if bad:
         _error(f"self-test failed: {len(bad)} predicate(s) wrong", *bad)

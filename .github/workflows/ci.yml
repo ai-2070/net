@@ -28,6 +28,12 @@ on:
       # `web/src/content/docs/`) are covered by the copies in `web.yml`.
       - ".github/scripts/check-one-library-docs.py"
       - ".github/scripts/check-header-count.py"
+      # The same rule for the checkers the test jobs ride on: editing one
+      # of these must re-run the workflow it gates, or a loosened predicate
+      # lands green.
+      - ".github/scripts/check-witness-results.py"
+      - ".github/scripts/check-roster.py"
+      - ".github/scripts/check-abi-commit.py"
 
 env:
   CARGO_TERM_COLOR: always
@@ -601,7 +607,7 @@ jobs:
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
-      #     + 3 (release-through-fence, rollback plane, provenance ordering)
+      #     + 2 (release-through-fence, provenance ordering)
       #     + 3 (acquisition transaction: partitioned-tightening restoration,
       #     the partition-to-restoration authority race, the refused
       #     remote-provider inverse)
@@ -613,9 +619,12 @@ jobs:
       #     + 1 (exact-head THIRD-review repair: post-abort cancellation
       #     recovered and retired exactly once, split off the drain-cancellation
       #     leg it used to share)
-      #     net of 3 retired: the two manual-wrapper guard witnesses replaced by
-      #     production-observed ones, and the cached-floor "rollback plane"
-      #     witness replaced by the two destructive-partition witnesses above
+      #     The three RETIRED witnesses are already netted out of the groups
+      #     above: the two manual-wrapper guard witnesses (replaced by the
+      #     production-observed ones) and the cached-floor "rollback plane"
+      #     witness (replaced by the two destructive-partition witnesses in the
+      #     acquisition-transaction line). The groups sum to 67 = MESH_MIN; keep
+      #     it that way when editing.
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
@@ -2271,7 +2280,7 @@ jobs:
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
       #   - org_exact_sensing       — OA-6 production organization
-      #     exact-sensing call edge (14 tests). Needs the SDK's own
+      #     exact-sensing call edge (22 tests). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
@@ -2491,8 +2500,8 @@ jobs:
       # Same discipline as the two steps above, same reason: the
       # auto-discovery run has already executed this binary, so this step
       # exists to keep the roster from shrinking silently. The floor is the
-      # count the binary reports (`cargo nextest list` said 41 when it
-      # landed), and the pinned names are the ones carrying a financial or
+      # count the binary reports (`cargo nextest list` lists 43; the floor
+      # below is `>= 43`), and the pinned names carry a financial or
       # once-only property outright — cardinality cannot say WHICH witness
       # vanished.
       #
@@ -3924,6 +3933,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history: the ABI-commit guard below diffs every commit of
+          # the pushed range (`github.event.before..github.sha`), which a
+          # depth-1 clone does not contain.
+          fetch-depth: 0
 
       # The text half of "Assert the Go binding links exactly one net::ffi"
       # below. That step guards the CODE — no sibling cdylib, no second `-l`
@@ -3949,6 +3963,21 @@ jobs:
           python3 .github/scripts/check-one-library-docs.py --self-test
           python3 .github/scripts/check-header-count.py
           python3 .github/scripts/check-header-count.py --self-test
+
+      # The one-commit ABI rule, enforced over THIS push's commits. A `NET_*`
+      # constant or `extern "C"` change landing without its Rust + both
+      # headers + a Go ABI test in the SAME commit is how -117 straddled
+      # three commits (3c9fa8bde -> 70b008909 -> 0aa63e69f): `header_parity_test.go`
+      # was red in between and a bisect inside the window yields a header
+      # pair that silently drifts. Text and git only, so it runs before the
+      # toolchains like its neighbours above.
+      - name: Guard — ABI changes land atomically
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: |
+          python3 .github/scripts/check-abi-commit.py --self-test
+          python3 .github/scripts/check-abi-commit.py --range "$BASE_SHA..$GITHUB_SHA"
 
       # Also pure text, also before the toolchains. A `libc::free` on a
       # Go-allocated callback buffer is a wrong-heap free on Windows —
@@ -4013,9 +4042,10 @@ jobs:
 
       # The cdylib's exported C-ABI symbol set is pinned, name for name.
       #
-      # Every Go, Python and C consumer links this one artifact, so a symbol
-      # that appears or disappears breaks all of them at once — and until this
-      # step nothing compared the export table against anything, so the
+      # Every Go and C consumer links this one artifact (the Python and Node
+      # bindings compile the `net` crate in-process and never load it), so a
+      # symbol that appears or disappears breaks them all at once — and until
+      # this step nothing compared the export table against anything, so the
       # browser-native WebRTC plan's Stage 1 guarantee ("default build's
       # exported symbol set unchanged" across a ~50-site endpoint refactor)
       # was unfalsifiable. The baseline is pinned to the pre-refactor head in
@@ -4149,7 +4179,19 @@ jobs:
         working-directory: go
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
-        run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
+        run: |
+          set -o pipefail
+          go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./... \
+            2>&1 | tee /tmp/abi_stability_cgo.log
+          # `-run` exits 0 when the filter matches NOTHING ("no tests to
+          # run"), so the test's own PASS line must appear in the output —
+          # the silent-skip shape this repo has been bitten by twice. The
+          # trailing space keeps `<name>Extended` or a subtest of it from
+          # satisfying the grep.
+          grep -q -- '^--- PASS: TestABIStabilityU64FFIRoundTrip ' /tmp/abi_stability_cgo.log || {
+            echo "::error::TestABIStabilityU64FFIRoundTrip did not run and pass — the -run filter matched nothing"
+            exit 1
+          }
 
       # With CGO_ENABLED=0 — the default on a Go install with no C compiler
       # on PATH — the toolchain drops every cgo file in this package and
@@ -5098,10 +5140,17 @@ jobs:
       #     pinned to a step" guard in the integration job exists to prevent.
       #     That guard was never applied to its own neighbour. `--no-tests=fail`
       #     closes it natively: an empty filterset is an error, not a pass.
+      #     It is RUN-WIDE, though, so the two surfaces below run as TWO
+      #     invocations — a union would hide one arm's empty filterset behind
+      #     the other arm's tests, which is exactly how `org_admission_gate`
+      #     got silently excluded in the first place.
       - name: Org + authority unit tests
-        run: >
-          cargo nextest run --features net --lib --no-tests=fail
-          -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
+        run: |
+          set -euo pipefail
+          cargo nextest run --features net --lib --no-tests=fail \
+            -E 'test(/^adapter::net::behavior::org/)'
+          cargo nextest run --features net --lib --no-tests=fail \
+            -E 'test(/^adapter::net::org_admission_gate/)'
 
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
@@ -6126,7 +6175,7 @@ jobs:
               exit 1
             }
           done
-          echo "leader lifecycle: 27 witnesses executed in headless Chromium"
+          echo "leader lifecycle: 29 witnesses executed in headless Chromium"
 
       # Exit criterion: the shipped bundle stays under 1.5 MB gzipped.
       - name: Bundle size
@@ -6295,7 +6344,14 @@ jobs:
     # deployment can rely on.
     name: Browser matrix (Chromium + Firefox)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The job budget is the SUM of its steps, not less. The four engine legs
+    # carry 20+20+20+15 = 75 minutes of step caps on top of the
+    # browser/toolchain/build preamble and the evidence steps; at 45 one slow
+    # (or hung, running out its step cap) engine pushed the cumulative over
+    # the job cap and the VM died with the completed engines' logs still
+    # un-uploaded — the evidence loss this job exists to prevent. 75 + ~25
+    # preamble + the evidence tail = 105.
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@v7
 
@@ -6477,7 +6533,10 @@ jobs:
       # changed output format reads as "fix the parser", never as
       # "all clear" or "the witnesses are gone".
       - name: Browser witness inventory (both gate engines)
-        if: ${{ !cancelled() }}
+        # Unconditional on purpose: a cancelled or timed-out run still
+        # verifies whatever evidence exists and NAMES what is missing —
+        # `!cancelled()` let a dying job skip its own floor check.
+        if: ${{ always() }}
         run: |
           set -euo pipefail
           REQUIRED="
@@ -6605,7 +6664,7 @@ jobs:
             done
             # Chromium also carries the Stage 7 store witnesses;
             # Firefox does not gate them (see the harness step).
-            echo "[$engine] inventory complete: 12 Stage 4b + 14 Stage 5 + 15 Stage 6 \
+            echo "[$engine] inventory complete: 12 Stage 4b + 20 Stage 5 + 15 Stage 6 \
           (+ 11 Stage 7 on chromium)"
           done
 
@@ -6672,7 +6731,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload harness logs (every engine, gating or not)
-        if: ${{ !cancelled() }}
+        # Unconditional on purpose: the logs of the engines that DID finish
+        # are the evidence for a run that died later, and a cancelled job
+        # must not take them with it.
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: rtc-browser-harness-log

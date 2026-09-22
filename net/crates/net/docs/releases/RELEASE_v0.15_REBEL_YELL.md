@@ -175,7 +175,7 @@ Adapters can be written in the host language across every binding:
 
 - **Python** — `PyBlobAdapter` with sync + `async def` method support. Async adapters run on a binding-owned event loop on a dedicated thread (one loop per process); calling thread sharing is via `asyncio.run_coroutine_threadsafe`. An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe — the binding never spins up a fresh `asyncio.run` per call (D-4).
 - **Node** — `NodeBlobAdapter` (sync TSFN bridge) + `NodeAsyncBlobAdapter` (Promise-returning TSFN bridge).
-- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_VTABLE_INVALID` rather than crashing on first dispatch (D-22).
+- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_BACKEND` rather than crashing on first dispatch (D-22).
 
 `BlobError::NotFound(uri)` sanitizes the URI before including it in the error string — control chars escape as `\xNN`, length caps at 256 bytes — so a binding logging the error can't be log-injected by an attacker who controls the URI (D-31).
 

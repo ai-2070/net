@@ -10,7 +10,9 @@ Stage 0 / S0c of
 headless Chromium over a real DataChannel, costs:
 
 - **+3.5 µs per packet** at 1 KiB (4.5–5.0 µs with AEAD vs 1.0 µs
-  without) — **+0.21 ms of main-thread time per second** at 60 Hz;
+  without) — but the once-per-frame main-thread cost of the same
+  workload is **+0.6 to +1.7 ms per second** at 60 Hz (§3's number for
+  a frame budget), of which only ~0.2 ms/s is the cipher itself;
 - **+3.0 ms per MB** sending in bulk, **+4.5 ms per MB** receiving;
 - nothing at all in throughput terms: the browser sustained **1 MB/s
   with zero admission refusals and zero `Ok(false)`**, and its unpaced
@@ -218,8 +220,8 @@ Measured against them:
   1 MB/s workload exactly (0.999 MB/s, the offered rate) in all three
   runs with zero refusals, and its unpaced ceiling is 6.3–7.4 MB/s.
 - **Threshold 1 — crossed on the literal reading, and the shortcut
-  does not clear it.** A's inline main-thread cost is 1.72 / 1.72 /
-  2.74 ms/s — above 1 ms/s in every run. But **B, the shortcut itself,
+  does not clear it.** A's inline main-thread cost is 1.911 / 1.721 /
+  2.744 ms/s — above 1 ms/s in every run. But **B, the shortcut itself,
   measures 1.02–1.27 ms/s and is also above the threshold in all three
   runs.** The cost is dominated by the per-packet `dc.send` and the
   wasm/JS crossing, which the exporter shortcut still pays; the AEAD's

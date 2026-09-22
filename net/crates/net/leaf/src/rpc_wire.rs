@@ -33,7 +33,7 @@
 //! core's `cross_lang_wire` test decodes it with the production
 //! `RpcRequestPayload::decode`, re-encodes it, and asserts the bytes
 //! are identical — so a drift on either side reddens the other
-//! side's suite. `tests/nrpc_frame_parity.rs` is this side of the
+//! side's suite. `tests/fixture_parity.rs` is this side of the
 //! same fixture.
 //!
 //! Everything below is little-endian, which is the whole file's only

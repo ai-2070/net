@@ -136,10 +136,13 @@ debugging that.
 
 Every nextest run writes a JUnit result set to
 `target/nextest/default/junit.xml` (`[profile.default.junit]` in
-`.config/nextest.toml`). CI's named-witness gates read that artifact via
-`.github/scripts/check-witness-results.py` rather than re-running each pinned
-test by name: one run, then a per-name verdict that a witness ran, passed, and
-did not need a retry to do so.
+`.config/nextest.toml`). Most of CI's named-witness gates read that artifact
+via `.github/scripts/check-witness-results.py` rather than re-running each
+pinned test by name: one run, then a per-name verdict that a witness ran,
+passed, and did not need a retry to do so. The exception is `rust-sdk-tests`,
+where 16 per-name `cargo nextest run -E "test(=$required)"` loops
+(`ci.yml:2554-2558` and 15 identical shapes) still gate the payments/A2A
+witnesses — those cannot observe retries the way the checker can.
 
 If you add, rename or retire a pinned witness, update the roster in the CI
 step that pins it in the same commit. The checker fails on a name that did not

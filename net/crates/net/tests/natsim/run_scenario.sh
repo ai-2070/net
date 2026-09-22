@@ -447,7 +447,10 @@ OUTCOME="$STATE/${OUTCOME_NODE}_outcome.json"
 for _ in $(seq 1 240); do
   [[ -s "$OUTCOME" ]] && break
   if [[ "$MODE" == browser ]] && ! kill -0 "$RUNNER_PID" 2>/dev/null; then
-    wait "$RUNNER_PID" 2>/dev/null; rc=$?
+    # errexit-safe status capture: a bare `wait; rc=$?` let the non-zero
+    # wait terminate THIS script before the diagnostic below ran — the
+    # same "fails naming nothing" outcome this block exists to prevent.
+    rc=0; wait "$RUNNER_PID" 2>/dev/null || rc=$?
     echo "natsim: the browser runner exited with status $rc before writing a \
 verdict; its log follows:" >&2
     tail -n 60 "$STATE/runner.log" >&2 || true
