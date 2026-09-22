@@ -103,6 +103,12 @@ indicatif = "0.18"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1"
 
+# `net-mesh up` local control: keyed-BLAKE3 mutual authentication of the
+# per-run control secret, and CSPRNG for that secret, the run incarnation and
+# a generated trust-domain PSK. Both versions are already in the workspace.
+blake3 = "1"
+getrandom = "0.4"
+
 # XDG paths + TOML for the config + identity stores.
 dirs = "7"
 toml = "1.0"

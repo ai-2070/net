@@ -145,6 +145,12 @@ enum Command {
     /// Operator identity authoring + inspection.
     #[command(subcommand)]
     Identity(commands::identity::IdentityCommand),
+
+    /// Start one long-lived production node for this profile (foreground).
+    Up(commands::lifecycle::UpArgs),
+
+    /// Ask this profile's running node to drain and stop, and verify it did.
+    Down(commands::lifecycle::DownArgs),
     /// Offline previews or temporary-supervisor admin commits (--local).
     #[command(subcommand)]
     Admin(commands::admin::AdminCommand),
@@ -341,6 +347,16 @@ async fn dispatch_inner(cli: Cli, deadline: Option<deadline::Deadline>) -> Resul
     match cli.command {
         Command::Version => commands::version::run(output).await,
         Command::Identity(cmd) => commands::identity::run(cmd, output, config_path, profile).await,
+        Command::Up(args) => {
+            Box::pin(commands::lifecycle::run_up(
+                args,
+                output,
+                config_path,
+                profile,
+            ))
+            .await
+        }
+        Command::Down(args) => commands::lifecycle::run_down(args, output, profile).await,
         Command::Admin(cmd) => commands::admin::run(cmd, output, config_path, profile).await,
         Command::Ice(cmd) => commands::ice::run(cmd, output, config_path, profile).await,
         Command::Snapshot(cmd) => commands::snapshot::run(cmd, output, config_path, profile).await,

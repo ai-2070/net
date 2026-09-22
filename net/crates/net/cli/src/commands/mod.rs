@@ -24,6 +24,7 @@ pub mod forwarding;
 pub mod gateway;
 pub mod ice;
 pub mod identity;
+pub mod lifecycle;
 pub mod logs;
 pub mod man;
 pub mod mcp;

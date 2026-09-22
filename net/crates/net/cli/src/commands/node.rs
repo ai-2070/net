@@ -37,6 +37,10 @@ use crate::prelude::{emit_value, OutputFormat};
 pub enum NodeCommand {
     /// Adopt this node into an organization (install ownership).
     Adopt(AdoptArgs),
+
+    /// Report the state of this profile's `net-mesh up` node, verified
+    /// through its lifetime lock and authenticated control endpoint.
+    Status(crate::commands::lifecycle::StatusArgs),
 }
 
 #[derive(Args, Debug)]
@@ -93,6 +97,9 @@ pub async fn run(
 ) -> Result<(), CliError> {
     match cmd {
         NodeCommand::Adopt(args) => run_adopt(args, output, config_path, profile_name).await,
+        NodeCommand::Status(args) => {
+            crate::commands::lifecycle::run_status(args, output, profile_name).await
+        }
     }
 }
 
