@@ -6,14 +6,15 @@
 brief. **Stage 2 as written in the plan (rows 2.1–2.4) — nothing more.**
 Explicitly NOT this stage: facade/SDK verbs, bindings, payments, serverless,
 browser/leaf work, replay-guard semantic changes, resume/migration, Stage 3+.
-**OWNER-PENDING question (stated, do NOT decide):** the F-S1R-2 rider —
-whether the "post-replacement terminal that cannot be silently dropped"
-enhancement (a terminal-retarget design composed with the
+**OWNER RULING (2026-09-22, supersedes the owner-pending note):** the
+F-S1R-2 rider — the "post-replacement terminal that cannot be silently
+dropped" enhancement (terminal-retarget composed with the
 receiving-incarnation fence and the exactly-one-terminal rule), the
-caller-side last mile (the caller fold's local termination after its OWN
-session replacement) and the delivery-exactly-once composition note join
-Stage 2. **The rider is NOT in scope unless the owner rules it in.** If a
-closure here would require it, state that as a finding — do not build it.
+caller-side last mile and the delivery-exactly-once composition note — is
+**NOT included; the plan-as-written governs.** The documented limitation
+stands as recorded in `S1_REVIEW_PACKET_2.md` §3.1. If any closure here
+would require the rider, that is a finding ("state, do not decide") — the
+owner has declined it and it is out of scope.
 
 ## Source of truth — read first, in this order
 

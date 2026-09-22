@@ -24,9 +24,10 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 ## Status
 
 **STAGE 1 ACCEPTED 2026-09-22 (independent review round 2.1 at `cc15f4d66`);
-STAGE 2 DISPATCH AUTHORIZED AS WRITTEN ON ITS PINNED BRIEF, with one
-OWNER-PENDING question recorded (the F-S1R-2 terminal-retarget rider — see
-the Review log; a reviewer surfaced it, no ruling implies inclusion);
+STAGE 2 DISPATCHED AS WRITTEN ON ITS PINNED BRIEF — the F-S1R-2
+terminal-retarget rider was surfaced to the owner and RULED (2026-09-22):
+not included, the plan-as-written governs; the documented limitation
+stands as recorded;
 STAGE 0 ACCEPTED 2026-09-22 (branch `LZL0/org-streaming`); Q1–Q7 RESOLVED;
 STAGE 1 DISPATCH AUTHORIZED ON THAT ACCEPTANCE AND ITS PINNED BRIEF — source
 specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`),
@@ -1360,3 +1361,18 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   the packet's `a1c518dd…`); the record is accurate. Stage 2 dispatch
   authorized as written on its pinned brief; merge is not authorized by any
   of this.
+
+- 2026-09-22, **owner ruling on the F-S1R-2 terminal-retarget rider:** the
+  rider (the "post-replacement terminal that cannot be silently dropped"
+  enhancement — a terminal-retarget design composed with the
+  receiving-incarnation fence and the exactly-one-terminal rule — plus the
+  caller-side last mile and the delivery-exactly-once composition note) is
+  **NOT included; the plan-as-written governs.** The reviewer surfaced it
+  without ruling (as its role requires); the owner declined its inclusion
+  when asked. The documented limitation stands exactly as recorded in
+  `S1_REVIEW_PACKET_2.md` §3.1 (a displaced protected call's
+  `SessionReplaced` terminal is emitted but not delivered across a session
+  replacement — design-blessed by §2.8), and the never-executed last mile
+  stays named as never-executed. Stage 2 proceeds as written (rows 2.1–2.4 +
+  row 5); any closure requiring the rider is a finding to state, never to
+  build.
