@@ -310,13 +310,47 @@ describe('D — the replica', () => {
     deliver(store.receive(gap.out[0]!.frame, PEER).out);
     expect(replica.state).toBe('ready');
 
-    const late = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'closed' }));
+    // A REQUEST refusal answers a question, so one arriving for a request
+    // already finished is news about nothing: tearing down a healthy view
+    // on it would discard an installed document, the watermark and the
+    // handle. (`closed` is deliberately not this case — see below.)
+    const late = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'forbidden' }));
 
-    // A refusal of an abandoned request is not news about the handle.
     expect(late.dropped).toBe('stale-correlation');
     expect(replica.handle).toBe(h);
     expect(replica.retired).not.toBe('0');
     expect(core.getState()).toEqual({ tick: 1 });
+  });
+
+  it('treats a correlated `no {closed}` as handle death', () => {
+    // `closed` is terminal for the HANDLE and for any action in flight on
+    // it (errors.ts), and `receive`'s foreign-handle gate has already
+    // discarded any `closed` naming a different handle — so one reaching
+    // the refusal dispatch is news about THIS handle whatever `q` it
+    // carries. Every owner-side handle-death answer is correlated to the
+    // request that provoked it (`no {q: <an alive's q>, h, closed}`), so
+    // reading that as "answered a dead question" held a dead handle for
+    // ever: every later `alive` was answered the same way and counted the
+    // same way, the view stayed published as `ready`, and no rejoin ran.
+    const { store, core, replica, joined, deliver } = pair();
+    joined();
+    const h = replica.handle as Hex;
+
+    const gap = replica.receive(encodeMessage({ k: 'delta', h, g: '1', base: '5', r: '6', ops: [] }));
+    const staleQ = gap.out[0]!.q;
+    deliver(store.receive(gap.out[0]!.frame, PEER).out);
+    expect(replica.state).toBe('ready');
+
+    const death = replica.receive(encodeMessage({ k: 'no', q: staleQ, h, code: 'closed' }));
+
+    expect(death.dropped).toBe('closed');
+    expect(death.out).toHaveLength(1);
+    expect(replica.handle).toBe(null);
+    expect(replica.retired).toBe('0');
+    expect(replica.state).toBe('joining');
+    // The view is cleared to the definition's EMPTY document — the world
+    // this replica had is gone with the handle that carried it.
+    expect(core.getState()).toEqual({ tick: 0 });
   });
 
   it('keeps a cancellation cancelled when the owner answers anyway', () => {

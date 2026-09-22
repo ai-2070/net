@@ -382,15 +382,47 @@ describe('deltas apply on their base, or provoke recovery', () => {
     expect(core.getState().crew).toEqual({ ada: { hp: 10 } });
   });
 
-  it('drops a delta for a generation other than the installed one', () => {
+  it('drops a delta for a generation the replica has already passed', () => {
     const { core, replica, joined } = pair();
     joined();
     const h = replica.handle as Hex;
 
-    const stale = replica.receive(delta(h, '2', '1', '2', [{ o: 'r', p: ['tick'], val: 99 }]));
+    // Generation 1 is installed; a frame for generation 0 is a
+    // retransmission of a document this replica has moved past. It is
+    // news about nothing and must not disturb the view.
+    const stale = replica.receive(delta(h, '0', '1', '2', [{ o: 'r', p: ['tick'], val: 99 }]));
 
     expect(stale.dropped).toBe('stale-generation');
     expect(stale.out).toEqual([]);
+    expect(core.getState().tick).toBe(1);
+  });
+
+  it('asks to resynchronize when the owner is ahead and the manifest never arrived', () => {
+    // §1.8's lost-datagram case. The owner allocates an unsolicited
+    // generation exactly when a delta overflows the message budget, and
+    // that one `man` frame is far too small to survive anything the
+    // multi-kilobyte chunks do. Every later delta carries the new `g`, so
+    // dropping them left this replica at generation 1 for good while
+    // `getStatus()` kept reporting `ready` — `tick`'s ladder runs only in
+    // `joining`/`installing`, and the generation check fired before the
+    // `base` gap check that would otherwise have asked.
+    const { core, replica, joined } = pair();
+    joined();
+    const h = replica.handle as Hex;
+
+    const ahead = replica.receive(delta(h, '2', '1', '2', [{ o: 'r', p: ['tick'], val: 99 }]));
+
+    expect(ahead.dropped).toBe('generation-ahead');
+    expect(ahead.out.map((r) => r.kind)).toEqual(['resync']);
+    // Nothing was applied: this delta's base is a document the replica
+    // has never held.
+    expect(core.getState().tick).toBe(1);
+
+    // The recovery is coalesced — further deltas for that generation ask
+    // once, not once each.
+    const again = replica.receive(delta(h, '2', '1', '2', [{ o: 'r', p: ['tick'], val: 99 }]));
+    expect(again.dropped).toBe('not-ready');
+    expect(again.out).toEqual([]);
     expect(core.getState().tick).toBe(1);
   });
 
