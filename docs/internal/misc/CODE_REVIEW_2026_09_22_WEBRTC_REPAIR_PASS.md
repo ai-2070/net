@@ -97,6 +97,8 @@ in the code and was not driven. These are never blurred. Confidence is stated pe
 | 49 | A refused provisional stream allocation strands that stream id — the next frame parks behind a sequence that never comes (surfaced during the repair pass) | Medium | anchor | Open |
 | 50 | Gate 4 keys on the ADJACENT sender, not the announcement's ORIGIN — a provisional peer's announcement relayed by an admitted third party is ingested (surfaced during the repair pass; owner adjudication) | Medium | anchor | Open |
 | 51 | A send half that gives up in two waves reports its death twice — duplicate reset, retire and count (surfaced during verification) | Medium | leaf | Closed |
+| 52 | The browser node-id-spelling witness fails at the engine-marshaling layer on both engines — `"index out of bounds"` (Firefox) and silent `false` (Chromium) (surfaced at the merge gate; pre-existing, outside the repair's files) | Medium | tests | Open |
+| 53 | The Windows security step ran under pwsh with bash syntax — it failed before executing a single test (surfaced at the merge gate) | Medium | ci | Closed |
 
 ### Claims of the repair pass, contradicted
 
@@ -777,6 +779,39 @@ exactly once; later waves are stragglers), witnessed by
 two-wave split (inverse: unlatched red `left: 2, right: 1` on "the consumer is
 told the send half died ONCE"; restored green).
 
+**#52 — The browser node-id-spelling witness fails at the engine-marshaling
+layer on both engines.**
+`net/crates/net/tests/rtc_browser/runner/src/stage6.rs`
+(`stage6_one_node_id_spelling_across_both_signalling_surfaces`), over the
+page-facing `node.signal(peer, …)` surfaces. Source-established + CI-executed
+(surfaced at the merge gate; pre-existing — the same three browser steps failed
+at `91ae3747`, and the witness and its `parse_peer_id` fix live outside this
+repair's files). The witness drives five node-id spellings and expects two to
+parse and three to be refused "by name"; observed instead: on Firefox every
+spelling — including `"nine"` — reports `index out of bounds` (the call dies in
+the wasm/JS argument marshaling before any parser runs), and on Chromium every
+spelling returns a silent `false` with empty reason. Two engines, two symptoms,
+one fact: the string never reaches `parse_peer_id`. The witness's own text
+records that both surfaces were moved onto `parse_peer_id` to close a
+pre-existing spelling split — the fix evidently does not reach the boundary
+layer where the argument is marshaled. *Impact boundary:* the failure is
+executed in CI's browser matrix only (the harness needs real engines); no claim
+about which side of the boundary is at fault. *Required:* node-id strings reach
+`parse_peer_id` intact on both `LeafNode.signal` and the leader-proxied
+`MeshSession.signal` in both engines (marshal the peer id as a string or
+BigInt-safe type end to end), with the five-spelling witness green on Chromium
+and Firefox.
+
+**#53 — The Windows security step ran under pwsh with bash syntax.**
+`.github/workflows/ci.yml:5184` ("Org + authority unit tests"). Source-established
++ CI-executed (surfaced at the merge gate; pre-existing wiring). The step's `run:`
+block opens with `set -euo pipefail`, but a Windows `run:` defaults to pwsh, which
+parses that as `Set-Variable -euo …` — "A parameter cannot be found that matches
+parameter name 'euo'" — so the step exited 1 before executing a single test. The
+tests it wraps are healthy: the same two nextest invocations pass locally on this
+Windows host (467 + 9, all green, `--features net --lib`). *Required —* met: the
+step declares `shell: bash` (this pass), and the two nextest invocations run.
+
 ---
 
 ## Preserved credits
@@ -1035,6 +1070,19 @@ including `--all-targets`; rustdoc clean (root, sdk, payments, wire). Witness
 discrimination: ~36 lane inverse probes with four receipts each, plus a parent
 spot re-proof (#4's rollback gate — red for its own stated reason, restored
 green).
+
+**Merge-gate fixes (`0b817cee9`, `b184e9720`).** CI at the repair head went from
+nine red jobs to three: the pass turned Unit tests (the deck floor), the Python
+wheel suite, the Rust SDK tests, all four WebRTC-feature steps, Format and
+Documentation green. The gate then surfaced two more defects, both fixed here:
+the Skills drift checker caught the phantom symbol the C/cgo relabel had
+introduced (`net_blob_register_adapter` is `net_blob_register_callback_adapter` —
+`0b817cee9`, all three documents), and `b184e9720` covers **#53**'s `shell: bash`
+declaration plus three clippy lints in wasm-only code (`unnecessary_map_or`,
+`unnecessary_get_then_check`, `useless_format` — visible only on the wasm32
+target, where those test modules actually compile). The single red left at the
+gate is **#52**, pre-existing and outside this repair's files; its witness failure
+is executed in CI's browser matrix and recorded above with the required closure.
 
 ---
 
