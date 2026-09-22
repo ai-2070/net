@@ -100,6 +100,12 @@ pub struct DropReplicasArgs {
 
 #[derive(Args, Debug)]
 pub struct CommonAdminArgs {
+    /// Inspect context selection without committing or generating an identity.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub inspect_target: bool,
+    #[command(flatten)]
+    pub scope: super::scope::LocalScope,
+
     /// Build the envelope, print it, do NOT commit.
     #[arg(long)]
     pub dry_run: bool,
@@ -253,6 +259,17 @@ where
     F: FnOnce(std::sync::Arc<net_sdk::deck::DeckClient>, u64) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<ChainCommit, net_sdk::deck::AdminError>>,
 {
+    if common.inspect_target {
+        super::scope::validate_local(common.scope.local, "admin")?;
+        let profile = resolve_profile(config_path, profile_name).await?;
+        return super::scope::inspect_temporary_write(
+            &profile,
+            common.identity.as_deref(),
+            common.supervisor_node,
+            output,
+        )
+        .await;
+    }
     if common.dry_run {
         let preview = DryRunPreview {
             dry_run: true,
@@ -263,6 +280,7 @@ where
         return Ok(());
     }
 
+    super::scope::require_local(common.scope.local, "admin")?;
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(
         &profile,

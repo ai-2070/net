@@ -102,9 +102,99 @@ fn code_8_on_ice_confirmation_refused_non_tty() {
     // keeps the test legible.
     Command::cargo_bin("net-mesh")
         .unwrap()
-        .args(["ice", "freeze-cluster", "--ttl", "5m", "--identity"])
+        .args([
+            "ice",
+            "freeze-cluster",
+            "--local",
+            "--ttl",
+            "5m",
+            "--identity",
+        ])
         .arg(&identity)
         .stdin(Stdio::null())
         .assert()
         .code(8);
+}
+
+#[test]
+fn code_2_on_malformed_bind_literal_for_listen_and_attach() {
+    // Review finding 7: one malformed bind literal must be ONE exit-code
+    // class on every verb. `255.255.255.255:0` (broadcast) used to exit 2
+    // (usage error) on `wrap --listen` but slip past the attach-side
+    // bind validation and die later as exit 6 (connection failure). Both
+    // verbs must now reject it as InvalidArgs during argument resolution,
+    // before any connection.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let psk = "42".repeat(32);
+    let key = "01".repeat(32);
+
+    let listen_out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "wrap",
+            "fixture",
+            "--listen",
+            "--psk-hex",
+            &psk,
+            "--bind",
+            "255.255.255.255:0",
+            "--inspect-target",
+            "--",
+            "child-must-not-run",
+        ])
+        .output()
+        .unwrap();
+
+    let attach_out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "wrap",
+            "fixture",
+            "--node-addr",
+            "127.0.0.1:9",
+            "--node-pubkey",
+            &key,
+            "--node-id",
+            "1",
+            "--psk-hex",
+            &psk,
+            "--bind",
+            "255.255.255.255:0",
+            "--inspect-target",
+            "--",
+            "child-must-not-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        listen_out.status.code(),
+        Some(2),
+        "wrap --listen must reject a malformed bind literal as a usage error"
+    );
+    assert_eq!(
+        attach_out.status.code(),
+        Some(2),
+        "the attach verb must reject the same literal as the same usage-error class"
+    );
+    assert_eq!(
+        listen_out.status.code(),
+        attach_out.status.code(),
+        "one malformed bind literal must yield one exit-code class on both verbs"
+    );
 }

@@ -354,9 +354,32 @@ impl ControlPlane for AnchorControlPlane {
             return Ok(());
         }
         self.state.dialog.set(None);
-        if let Some(socket) = self.state.trickle.borrow_mut().take() {
+        self.state.pending_flush.borrow_mut().clear();
+        let socket = self.state.trickle.borrow_mut().take();
+        if let Some(socket) = socket {
+            // Closing CONNECTING aborts the upgrade: the anchor never gets
+            // a socket whose close can retire the accepted offer. Firefox
+            // can delay upgrades after earlier aborted connections, so even
+            // a seconds-long failed connect can still be in this state.
+            // Keep the handback alive for a bounded establishment window;
+            // RTC resources have already been closed by the caller.
+            for _ in 0..150 {
+                if socket.ready_state() != WebSocket::CONNECTING {
+                    break;
+                }
+                if crate::bootstrap::gloo_timer_sleep(100).await.is_err() {
+                    break;
+                }
+            }
+            let established = socket.ready_state() == WebSocket::OPEN;
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
             socket.set_onclose(None);
             let _ = socket.close();
+            self.state.handlers.borrow_mut().clear();
+            if !established {
+                return Err(refused("the trickle socket did not open before attempt handback; the anchor must expire the dialog"));
+            }
         }
         Ok(())
     }

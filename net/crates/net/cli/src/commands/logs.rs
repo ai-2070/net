@@ -18,6 +18,9 @@ use crate::prelude::{emit_stream_row, OutputFormat};
 
 #[derive(Args, Debug)]
 pub struct LogTailArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     /// Accepted for symmetry with `tail -f`; this command always
     /// follows the stream regardless of whether `--follow` is
     /// passed (there is no one-shot mode).
@@ -70,7 +73,18 @@ pub async fn run_log_tail(
         None => None,
     };
 
+    super::scope::validate_local(args.scope.local, "log tail")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "log tail")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let mut filter = LogFilter::new();
@@ -130,6 +144,9 @@ fn parse_log_level(s: &str) -> Result<CoreLogLevel, CliError> {
 
 #[derive(Args, Debug)]
 pub struct FailuresTailArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     /// Watermark — emit only records with seq > this value.
     #[arg(long, default_value_t = 0)]
     pub since_seq: u64,
@@ -147,7 +164,18 @@ pub async fn run_failures_tail(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "failures tail")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "failures tail")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
 
     let mut stream = ctx.deck().subscribe_failures(args.since_seq);

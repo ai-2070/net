@@ -31,6 +31,11 @@ retries = 2
 # over loopback UDP under an oversubscribed CI CPU.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Enrollment storage checks ownership and durability; never retry into green.
+[[profile.default.overrides]]
+filter = 'test(/^adapter::net::behavior::enrollment_storage::/)'
+retries = 0
+
 # Security-critical suites get NO retries.
 #
 # The blanket `retries = 2` above is right for transport saturation noise, but

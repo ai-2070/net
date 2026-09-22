@@ -224,6 +224,19 @@ do
 done
 [ "$fail" -eq "$before" ] && ok "all documented symbols resolve"
 
+# Constants the skills name as caller contract (`NET_ERR_*`, `NET_SUCCESS`, the
+# `NET_*` handle bands). Unlike the fns above, a constant name in prose is never
+# compiled, so a typo is invisible to every other gate: `dataforts.md` documented
+# `NET_ERR_BLOB_VTABLE_INVALID`, which has never existed — the partial-vtable
+# null check returns `NET_ERR_BLOB_BACKEND` — and a C or cgo consumer matching on
+# the documented name has a branch that can never fire. Env vars and the
+# `NET_*_BUILT` test gates are allowlisted in the checker (they are not
+# constants); wildcards such as `NET_ERR_*` name no single constant.
+echo "==> FFI constants named in the skills"
+before=$fail
+run_checker check-skill-ffi-constants.py
+[ "$fail" -eq "$before" ] && ok "every named NET_* constant is defined in src/ffi or include"
+
 # ------------------------------------------------- enum variants + identifiers
 # Both checks come from one read of the source tree; see the script's docstring
 # for what each catches and why symbol-existence alone was not enough.

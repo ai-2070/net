@@ -25,6 +25,9 @@ use tokio::sync::Notify;
 use super::super::redex::{RedexError, RedexEvent, RedexFold};
 use super::meta::{EventMeta, EVENT_META_SIZE};
 
+#[path = "rpc_large_response.rs"]
+pub(crate) mod large_response;
+
 // ============================================================================
 // `EventMeta::dispatch` byte assignments for nRPC.
 //
@@ -275,7 +278,8 @@ pub const FLAG_RPC_CLIENT_STREAMING_REQUEST: u16 = 1 << 4;
 /// Bidi streaming plan (Phase A).
 pub const FLAG_RPC_REQUEST_END: u16 = 1 << 5;
 
-// Bits `6..=15` reserved; producers MUST write zero, consumers MUST
+// Bit 6 opts unary callers into bounded response fragmentation (see
+// `large_response`). Bits `7..=15` reserved; producers MUST write zero, consumers MUST
 // ignore unknown bits (forward-compat with future flags).
 
 // ============================================================================
@@ -306,7 +310,9 @@ pub enum RpcStatus {
     /// [`DISPATCH_RPC_DEADLINE_EXCEEDED`].)
     /// gRPC equivalent: `DEADLINE_EXCEEDED` (4).
     Timeout = 0x0003,
-    /// Server's per-service queue is at `max_in_flight` capacity.
+    /// Server's per-service queue is at `max_in_flight` capacity, or
+    /// another node-wide capacity bound refused the call (e.g. the
+    /// large-response pump budget, review finding 9).
     /// gRPC equivalent: `RESOURCE_EXHAUSTED` (8).
     Backpressure = 0x0004,
     /// Caller emitted `DISPATCH_RPC_CANCEL` before the server
@@ -1661,9 +1667,9 @@ pub type RpcResponseEmitter =
 /// The streaming pump awaits each emit before reading the next
 /// chunk from the sink — this guarantees that chunks for one
 /// `call_id` reach the network publish path in the order the
-/// handler emitted them. (The unary fold has no such requirement
-/// — it emits exactly one RESPONSE per call — so it sticks with
-/// the simpler sync `RpcResponseEmitter`.)
+/// handler emitted them. The unary fold emits one logical response;
+/// negotiated fragments may arrive in any order and are assembled before
+/// completion, so it retains the synchronous `RpcResponseEmitter`.
 pub type RpcAsyncResponseEmitter = Arc<
     dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
         + Send
@@ -1704,6 +1710,7 @@ type UnaryInFlightCalls = Arc<Mutex<HashMap<(u64, u64, u64, u64), RpcCancellatio
 pub struct RpcServerFold {
     handler: Arc<dyn RpcHandler>,
     emit: RpcResponseEmitter,
+    large_emit: Option<large_response::Emitter>,
     /// The **receiving incarnation** of the frame currently being
     /// applied (R2-A), set by `apply_inbound*` from the event and
     /// handed to the emitter with the response. `0` on
@@ -1746,12 +1753,18 @@ impl RpcServerFold {
         Self {
             handler,
             emit,
+            large_emit: None,
             session_id: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
         }
+    }
+
+    pub(crate) fn with_large_response_emitter(mut self, emit: large_response::Emitter) -> Self {
+        self.large_emit = Some(emit);
+        self
     }
 
     /// Attach a per-service metrics handle. Hooks the spawned
@@ -1981,6 +1994,8 @@ impl RpcServerFold {
                 self.in_flight.lock().insert(key, cancellation.clone());
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
+                let large_emit = self.large_emit.clone();
+                let deadline_ns = payload.deadline_ns;
                 let in_flight = self.in_flight.clone();
                 // R2-A: the receiving incarnation rides into the
                 // spawned handler task with the rest of the call's
@@ -2004,6 +2019,7 @@ impl RpcServerFold {
                 // a CANCEL that fired during handler execution and
                 // override its response with `RpcStatus::Cancelled`.
                 let cancel_probe = cancellation.clone();
+                let large_response_enabled = payload.flags & large_response::FLAG != 0;
                 // One task per call. The fold does not block on the
                 // handler and does not order handlers against each
                 // other — see `RpcHandler::call`'s ordering note.
@@ -2128,8 +2144,33 @@ impl RpcServerFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
-                    emit(from_node, session_id, caller_origin, call_id, resp);
+                    if let Some(delivery) = large_emit
+                        .filter(|_| large_response_enabled && large_response::needs_transfer(&resp))
+                    {
+                        delivery(large_response::Transfer {
+                            from_node,
+                            session_id,
+                            caller_origin,
+                            call_id,
+                            deadline_ns,
+                            cancellation: cancel_probe.clone(),
+                            response: resp,
+                        })
+                        .await;
+                    } else {
+                        large_response::emit(resp, large_response_enabled, |part| {
+                            emit(from_node, session_id, caller_origin, call_id, part);
+                        });
+                    }
+                    // CANCEL may have removed this entry and a new request
+                    // reused the key while delivery was unwinding.
+                    let mut calls = in_flight.lock();
+                    if calls
+                        .get(&key)
+                        .is_some_and(|token| Arc::ptr_eq(&token.inner, &cancel_probe.inner))
+                    {
+                        calls.remove(&key);
+                    }
                 });
             }
             DISPATCH_RPC_CANCEL => {
@@ -3997,9 +4038,13 @@ impl RedexFold<()> for RpcDuplexFold {
 /// mpsc). The fold dispatches to the right variant based on
 /// what's registered for the `call_id`.
 enum PendingEntry {
-    /// Unary call — exactly one RESPONSE expected. Completes the
-    /// oneshot with the decoded payload.
-    Unary(tokio::sync::oneshot::Sender<RpcResponsePayload>),
+    /// Unary call — one logical response, optionally assembled from bounded
+    /// fragments. Completes the oneshot with the decoded payload.
+    Unary {
+        tx: tokio::sync::oneshot::Sender<RpcResponsePayload>,
+        session: Option<u64>,
+        assembly: Option<large_response::Assembly>,
+    },
     /// Server-streaming call — multiple non-terminal `Continue`
     /// chunks followed by one terminal frame. Each non-terminal
     /// chunk pushes a `StreamItem::Chunk(body)` onto the mpsc;
@@ -4080,21 +4125,69 @@ pub struct RpcClientPending {
     /// `expected_target == 0` entry opts out of the binding
     /// (loopback tests + paths with no session).
     senders: dashmap::DashMap<u64, (super::super::behavior::placement::NodeId, PendingEntry)>,
+    fragment_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Cap on entries inspected per [`RpcClientPending::sweep_stranded_unary`].
+/// Registration is per-call work, so the scan must stay O(1)-ish even for a
+/// pathological map; repeated registrations walk the whole map over time.
+const STRANDED_UNARY_SWEEP_MAX: usize = 64;
 
 impl RpcClientPending {
     /// Construct an empty pending-call store.
     pub fn new() -> Self {
         Self {
             senders: dashmap::DashMap::new(),
+            fragment_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    /// Register a oneshot for a unary `call_id`. Returns the
-    /// receiver the caller awaits. The caller MUST publish the
-    /// REQUEST after registration (and not before) so the
-    /// matching RESPONSE can't arrive while the pending entry is
-    /// missing.
+    /// Bounded sweep for stranded unary entries: a `Unary` entry whose
+    /// receiver is gone can never complete a call, yet — with
+    /// `session: Some(..)` — still grows fragment assembly charged to the
+    /// node-global budget. Removing it releases both the entry and any
+    /// assembly reservation, so no single missed cleanup path can exhaust
+    /// `fragment_bytes` for the node's lifetime (review finding 1).
+    /// At most [`STRANDED_UNARY_SWEEP_MAX`] entries are inspected per call.
+    fn sweep_stranded_unary(&self, max: usize) {
+        let stranded: Vec<u64> = self
+            .senders
+            .iter()
+            .take(max)
+            .filter_map(|entry| match entry.value() {
+                (_, PendingEntry::Unary { tx, .. }) if tx.is_closed() => Some(*entry.key()),
+                _ => None,
+            })
+            .collect();
+        for call_id in stranded {
+            self.senders.remove(&call_id);
+        }
+    }
+
+    /// Register a oneshot for a unary `call_id` — the LEGACY-WAITER
+    /// registration (review finding 11). Returns the receiver the
+    /// caller awaits. The caller MUST publish the REQUEST after
+    /// registration (and not before) so the matching RESPONSE can't
+    /// arrive while the pending entry is missing.
+    ///
+    /// A `register` entry is a `PendingEntry::Unary` with
+    /// `session: None`, which `deliver_session` treats as a waiter
+    /// that predates fragment reassembly: an unsolicited response
+    /// fragment is rejected with `Internal` and ZERO charge against
+    /// the node-global reassembly budget. That is deliberate legacy
+    /// behavior, not an oversight — contrast `register_large`, whose
+    /// `session: Some(..)` entries accept fragments and reserve
+    /// budget.
+    ///
+    /// REACH: test-only. The production unary path
+    /// (`mesh_rpc::Mesh::call`) always registers through
+    /// `register_large`; the streaming paths use
+    /// `register_streaming` / `register_client_streaming` /
+    /// `register_duplex`. `register` remains for the `#[cfg(test)]`
+    /// fold units in this module and for the integration harnesses
+    /// (`tests/integration_nrpc_loopback.rs`,
+    /// `tests/integration_nrpc_cross_lang.rs`) that drive fold /
+    /// loopback responses without a wire session.
     ///
     /// `target_node` is the wire-session peer the request will
     /// be sent to; `deliver` rejects RESPONSE frames whose
@@ -4112,8 +4205,42 @@ impl RpcClientPending {
         target_node: super::super::behavior::placement::NodeId,
     ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.senders
-            .insert(call_id, (target_node, PendingEntry::Unary(tx)));
+        self.senders.insert(
+            call_id,
+            (
+                target_node,
+                PendingEntry::Unary {
+                    tx,
+                    session: None,
+                    assembly: None,
+                },
+            ),
+        );
+        rx
+    }
+
+    pub(crate) fn register_large(
+        &self,
+        call_id: u64,
+        target: u64,
+        session: u64,
+    ) -> tokio::sync::oneshot::Receiver<RpcResponsePayload> {
+        // Heal-before-grow: free any entry whose receiver is gone BEFORE
+        // this call can need the fragment budget its late fragments would
+        // otherwise hold.
+        self.sweep_stranded_unary(STRANDED_UNARY_SWEEP_MAX);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.senders.insert(
+            call_id,
+            (
+                target,
+                PendingEntry::Unary {
+                    tx,
+                    session: Some(session),
+                    assembly: None,
+                },
+            ),
+        );
         rx
     }
 
@@ -4213,6 +4340,29 @@ impl RpcClientPending {
         self.senders.remove(&call_id);
     }
 
+    /// Test-only observation of actual pending ownership, not a second counter.
+    #[cfg(test)]
+    pub(crate) fn retained_for_test(&self) -> (usize, usize) {
+        (
+            self.senders.len(),
+            self.fragment_bytes.load(Ordering::Acquire),
+        )
+    }
+
+    /// Test-only observation of the unary call ids currently registered —
+    /// lets a test address a call whose REQUEST was never published (so no
+    /// handler ever reported its id).
+    #[cfg(test)]
+    pub(crate) fn unary_call_ids_for_test(&self) -> Vec<u64> {
+        self.senders
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                (_, PendingEntry::Unary { .. }) => Some(*entry.key()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Deliver `resp` to the waiter for `call_id`, if any.
     ///
     /// `from_node` is the wire-session peer of the inbound
@@ -4239,18 +4389,29 @@ impl RpcClientPending {
         from_node: super::super::behavior::placement::NodeId,
         resp: RpcResponsePayload,
     ) {
+        self.deliver_session(call_id, from_node, 0, resp);
+    }
+
+    fn deliver_session(
+        &self,
+        call_id: u64,
+        from_node: u64,
+        session_id: u64,
+        resp: RpcResponsePayload,
+    ) {
         // Look up the entry — but DON'T remove it yet, because for
         // streaming we may want to keep it for non-terminal chunks.
         // The remove decision is per-variant.
-        let entry = self.senders.get(&call_id);
-        let Some(entry) = entry else { return };
+        let dashmap::mapref::entry::Entry::Occupied(mut entry) = self.senders.entry(call_id) else {
+            return;
+        };
         // S-4 part 2 gate. The pending registry binds each call
         // to the AEAD-verified `target_node` the request was
         // dispatched to; any other session peer publishing on the
         // shared reply channel with a guessed call_id is dropped
         // here without touching the waiter. `0` opts out — used
         // by loopback paths that have no session peer.
-        let (target_node, _entry_value) = entry.value();
+        let (target_node, _entry_value) = entry.get();
         if *target_node != 0 && *target_node != from_node {
             tracing::trace!(
                 call_id,
@@ -4260,10 +4421,32 @@ impl RpcClientPending {
             );
             return;
         }
-        match entry.value() {
-            (_, PendingEntry::Unary(_)) => {
-                drop(entry);
-                if let Some((_, (_, PendingEntry::Unary(tx)))) = self.senders.remove(&call_id) {
+        match entry.get_mut() {
+            (
+                _,
+                PendingEntry::Unary {
+                    session, assembly, ..
+                },
+            ) => {
+                if session.is_some_and(|expected| expected != session_id) {
+                    return;
+                }
+                let resp = if session.is_some() {
+                    match large_response::Assembly::accept(assembly, &self.fragment_bytes, resp) {
+                        Ok(None) => return,
+                        Ok(Some(response)) => response,
+                        Err(message) => large_response::error(message),
+                    }
+                } else if resp
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == large_response::HEADER)
+                {
+                    large_response::error("unsolicited response fragment")
+                } else {
+                    resp
+                };
+                if let (_, PendingEntry::Unary { tx, .. }) = entry.remove() {
                     let _ = tx.send(resp);
                 }
             }
@@ -4448,7 +4631,12 @@ impl RpcClientFold {
         match meta.dispatch {
             DISPATCH_RPC_RESPONSE => {
                 match RpcResponsePayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..)) {
-                    Ok(resp) => self.pending.deliver(meta.seq_or_ts, ev.from_node, resp),
+                    Ok(resp) => self.pending.deliver_session(
+                        meta.seq_or_ts,
+                        ev.from_node,
+                        ev.session_id,
+                        resp,
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -5353,6 +5541,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         pred()
+    }
+
+    #[tokio::test]
+    async fn old_large_delivery_cannot_remove_reused_call_cancellation_entry() {
+        let (emit, _) = capturing_emitter();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished = Arc::new(Notify::new());
+        let large_emit: large_response::Emitter = {
+            let finished = finished.clone();
+            Arc::new(move |transfer| {
+                let tx = tx.clone();
+                let finished = finished.clone();
+                Box::pin(async move {
+                    let (release, wait) = tokio::sync::oneshot::channel();
+                    tx.send((transfer.cancellation, release)).unwrap();
+                    let _ = wait.await;
+                    finished.notify_one();
+                })
+            })
+        };
+        let mut fold =
+            RpcServerFold::new(Arc::new(EchoHandler), emit).with_large_response_emitter(large_emit);
+        let event = rpc_request_event(
+            42,
+            7,
+            RpcRequestPayload {
+                service: "echo".into(),
+                deadline_ns: 0,
+                flags: large_response::FLAG,
+                headers: vec![],
+                body: Bytes::from(vec![b'x'; 22_000]),
+            },
+        );
+        fold.apply(&event, &mut ()).unwrap();
+        let (first, release_first) = rx.recv().await.unwrap();
+        fold.apply(&rpc_cancel_event(42, 7), &mut ()).unwrap();
+        assert!(first.is_cancelled());
+        fold.apply(&event, &mut ()).unwrap();
+        let (second, release_second) = rx.recv().await.unwrap();
+        assert!(!second.is_cancelled());
+        release_first.send(()).unwrap();
+        // On this current-thread runtime the old task finishes its synchronous
+        // map cleanup before the notified test can resume.
+        finished.notified().await;
+        assert_eq!(fold.in_flight_keys(), vec![(0, 0, 42, 7)]);
+        fold.apply(&rpc_cancel_event(42, 7), &mut ()).unwrap();
+        assert!(
+            second.is_cancelled(),
+            "new call still owns its cancellation entry"
+        );
+        release_second.send(()).unwrap();
+        finished.notified().await;
+        assert!(fold.in_flight_keys().is_empty());
     }
 
     /// Happy path: a REQUEST event triggers the handler; the fold
@@ -7017,6 +7258,51 @@ mod tests {
         let inner = result.expect("must complete within 1s");
         assert!(inner.is_err(), "re-register must close prior receiver");
         assert_eq!(pending.pending_count(), 1);
+    }
+
+    /// A pending entry whose receiver is gone can never complete, yet a
+    /// fragment-owning one keeps charging the node-global reassembly
+    /// budget until something removes it. `register_large` sweeps exactly
+    /// such entries (review finding 1, closure (b)): no single missed
+    /// cleanup path can exhaust `fragment_bytes` for the node's lifetime.
+    #[tokio::test]
+    async fn client_pending_sweep_releases_stranded_unary_storage() {
+        let pending = RpcClientPending::new();
+        let rx = pending.register_large(0x5EED, 0x42, 7);
+        let mut first = None;
+        super::large_response::emit(
+            RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from(vec![b'x'; 22_000]),
+            },
+            true,
+            |piece| {
+                if first.is_none() {
+                    first = Some(piece);
+                }
+            },
+        );
+        pending.deliver_session(0x5EED, 0x42, 7, first.unwrap());
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 22_007),
+            "fragment state hangs off the live entry"
+        );
+        // The cleanup path was missed: the receiver is gone and the entry
+        // strands with its reservation.
+        drop(rx);
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 22_007),
+            "the stranded entry holds its reservation until swept"
+        );
+        let _next = pending.register_large(0xBEEF, 0x42, 7);
+        assert_eq!(
+            pending.retained_for_test(),
+            (1, 0),
+            "the next registration sweeps the stranded entry and releases its budget"
+        );
     }
 
     /// S-4 part 2 regression: a RESPONSE whose wire `from_node`

@@ -81,6 +81,9 @@ pub enum OrgCommand {
 
 #[derive(Args, Debug)]
 pub struct KeygenArgs {
+    /// Inspect output selection without generating an org key.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Output path. Defaults to
     /// `$XDG_CONFIG_HOME/net-mesh/orgs/org-<id>.toml`.
     #[arg(long)]
@@ -111,6 +114,9 @@ pub struct KeygenArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueCertArgs {
+    /// Inspect signer and output selection without signing.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the org root key file (from `net-mesh org keygen`).
     #[arg(long = "org-key", value_name = "PATH")]
     pub org_key: PathBuf,
@@ -148,6 +154,9 @@ pub struct IssueCertArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueFloorsArgs {
+    /// Inspect signer and output selection without signing.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the org root key file (from `net-mesh org keygen`).
     #[arg(long = "org-key", value_name = "PATH")]
     pub org_key: PathBuf,
@@ -173,6 +182,9 @@ pub struct IssueFloorsArgs {
 
 #[derive(Args, Debug)]
 pub struct GrantDispatcherArgs {
+    /// Inspect signer and output selection without signing.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the org root key file for the org the dispatcher acts
     /// FOR — the grant is signed by THIS org.
     #[arg(long = "org-key", value_name = "PATH")]
@@ -216,6 +228,9 @@ pub struct GrantDispatcherArgs {
 
 #[derive(Args, Debug)]
 pub struct GrantCapabilityArgs {
+    /// Inspect signer and output selection without signing or minting secrets.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the org root key file for the ISSUING (provider) org B
     /// — the grant is signed by THIS org.
     #[arg(long = "org-key", value_name = "PATH")]
@@ -294,13 +309,105 @@ pub struct GrantCapabilityArgs {
     pub accept_windows_dacl: bool,
 }
 
-pub async fn run(cmd: OrgCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+pub async fn run(
+    cmd: OrgCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let selection = match &cmd {
+        OrgCommand::Keygen(args) if args.inspect_target => {
+            let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+            let mut view = crate::target::TargetInspection::local(&profile, "offline");
+            view.unavailable_identity(
+                "execution generates a new org root key; its public identity is not yet available",
+            );
+            view.provenance("identity", "runtime");
+            if let Some(path) = &args.out {
+                view.destination = Some(path.clone());
+                view.provenance("destination", "flag");
+            } else {
+                view.destination_pattern = Some(
+                    default_org_key_dir()
+                        .ok_or_else(|| {
+                            invalid_args("cannot resolve the platform config directory; pass --out")
+                        })?
+                        .join("org-<generated-org-id-prefix>.toml"),
+                );
+                view.provenance("destination", "runtime");
+            }
+            return view.emit(output);
+        }
+        OrgCommand::IssueCert(a) if a.inspect_target => {
+            Some((&a.org_key, a.insecure_permissions, &a.out, None))
+        }
+        OrgCommand::IssueFloors(a) if a.inspect_target => {
+            Some((&a.org_key, a.insecure_permissions, &a.out, None))
+        }
+        OrgCommand::GrantDispatcher(a) if a.inspect_target => {
+            refuse_force(a.force)?;
+            Some((&a.org_key, a.insecure_permissions, &a.out, None))
+        }
+        OrgCommand::GrantCapability(a) if a.inspect_target => {
+            refuse_force(a.force)?;
+            validate_audience_output(a.discover, a.audience_out.as_deref())?;
+            Some((
+                &a.org_key,
+                a.insecure_permissions,
+                &a.out,
+                a.audience_out.as_ref(),
+            ))
+        }
+        _ => None,
+    };
+    if let Some((key, insecure, destination, audience_destination)) = selection {
+        let signer = load_org_key(key, insecure).await?;
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut target = crate::target::TargetInspection::local(&profile, "offline");
+        target.configured_identity(signer.org_id().as_bytes());
+        target.source = Some(key.clone());
+        target.destination = Some(destination.clone());
+        for field in ["identity", "source", "destination"] {
+            target.provenance(field, "flag");
+        }
+        if audience_destination.is_some() {
+            target.provenance("audience_destination", "flag");
+        }
+        return emit_value(
+            OutputFormat::resolve_oneshot(output),
+            &OrgInspection {
+                target,
+                audience_destination,
+            },
+        )
+        .map_err(|e| generic(format!("write inspection: {e}")));
+    }
     match cmd {
         OrgCommand::Keygen(args) => run_keygen(args, output).await,
         OrgCommand::IssueCert(args) => run_issue_cert(args, output).await,
         OrgCommand::IssueFloors(args) => run_issue_floors(args, output).await,
         OrgCommand::GrantDispatcher(args) => run_grant_dispatcher(args, output).await,
         OrgCommand::GrantCapability(args) => run_grant_capability(args, output).await,
+    }
+}
+
+#[derive(Serialize)]
+struct OrgInspection<'a> {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audience_destination: Option<&'a PathBuf>,
+}
+
+fn validate_audience_output(discover: bool, output: Option<&Path>) -> Result<(), CliError> {
+    match (discover, output) {
+        (true, None) => Err(invalid_args(
+            "--discover requires --audience-out <PATH> (where to write the minted audience secret)",
+        )),
+        (false, Some(_)) => Err(invalid_args(
+            "--audience-out is only valid with --discover (no secret is minted otherwise)",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -568,17 +675,7 @@ async fn run_grant_capability(
 
     // Audience-secret discipline: an audience file is minted iff
     // --discover, so require --audience-out exactly then.
-    match (args.discover, &args.audience_out) {
-        (true, None) => return Err(invalid_args(
-            "--discover requires --audience-out <PATH> (where to write the minted audience secret)",
-        )),
-        (false, Some(_)) => {
-            return Err(invalid_args(
-                "--audience-out is only valid with --discover (no secret is minted otherwise)",
-            ))
-        }
-        _ => {}
-    }
+    validate_audience_output(args.discover, args.audience_out.as_deref())?;
 
     // Aliased paths would clobber the org key or collide the two output
     // artifacts (Kyra OA2-F).
@@ -1337,10 +1434,9 @@ pub(crate) async fn publish_staged_replace(tmp: &Path, final_path: &Path) -> Res
 /// `owner-audience.key`; the org root is strictly more sensitive and kept it.
 fn default_org_key_path(org_id_hex: &str) -> Option<PathBuf> {
     let short = &org_id_hex[..org_id_hex.len().min(16)];
-    Some(
-        dirs::config_dir()?
-            .join("net-mesh")
-            .join("orgs")
-            .join(format!("org-{short}.toml")),
-    )
+    Some(default_org_key_dir()?.join(format!("org-{short}.toml")))
+}
+
+fn default_org_key_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("net-mesh").join("orgs"))
 }

@@ -33,6 +33,10 @@ use crate::error::{connection_failure, invalid_args, sdk, CliError};
 use crate::parsers::{hex_decode_32, parse_u64_flexible};
 use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 
+/// Current short-lived client bind, shared with target inspection.
+pub(crate) const DEFAULT_CLIENT_BIND: &str = "127.0.0.1:0";
+pub(crate) const DEFAULT_SERVICE_BIND: &str = "0.0.0.0:0";
+
 /// Resolved remote-attach target. Built from subcommand flags +
 /// profile fallbacks via [`resolve_remote_attach`]. Carrying it
 /// as a typed struct (rather than three optional strings) makes
@@ -40,10 +44,25 @@ use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
 /// resolve time.
 #[derive(Debug, Clone)]
 pub struct RemoteAttach {
+    pub bind: SocketAddr,
     pub addr: SocketAddr,
     pub public_key: [u8; 32],
     pub node_id: u64,
     pub psk: [u8; 32],
+}
+
+pub(crate) fn validate_endpoint(profile: &Profile) -> Result<(), CliError> {
+    if profile
+        .endpoint
+        .as_deref()
+        .is_some_and(|value| value != "in-process")
+    {
+        return Err(invalid_args(
+            "profile endpoint is unsupported; use `in-process` for the local supervisor \
+             and node_addr/node_pubkey/node_id/psk_hex for mesh attachment",
+        ));
+    }
+    Ok(())
 }
 
 /// Live substrate context wrapping the SDK + DeckClient.
@@ -169,16 +188,7 @@ impl CliContext {
         require_identity: bool,
         remote: Option<RemoteAttach>,
     ) -> Result<Self, CliError> {
-        // Endpoint check — Phase 1 supports only in-process.
-        if let Some(endpoint) = profile.endpoint.as_deref() {
-            if endpoint != "in-process" {
-                return Err(invalid_args(format!(
-                    "endpoint `{endpoint}` is not supported in this build; \
-                     only `in-process` is available until the substrate \
-                     remote-attach surface lands"
-                )));
-            }
-        }
+        validate_endpoint(profile)?;
 
         // Identity resolution. Generates an ephemeral one as a
         // last resort so read-only subcommands work without
@@ -296,22 +306,22 @@ async fn build_remote_mesh(
     remote: RemoteAttach,
     identity: Option<net_sdk::identity::Identity>,
 ) -> Result<net_sdk::Mesh, CliError> {
-    // Loopback bind; identity per the caller.
-    build_attached_mesh("127.0.0.1:0", identity, &remote).await
+    // Bind and identity have already been resolved for this invocation.
+    build_attached_mesh(identity, &remote).await
 }
 
-/// Build a local mesh bound to `bind`, optionally under an operator
+/// Build a local mesh bound to `remote.bind`, optionally under an operator
 /// `identity`, and join `remote` via the routed handshake. The single
 /// implementation behind the in-process attach ([`build_remote_mesh`],
-/// anonymous + loopback) and the `net-mesh wrap` / `net-mesh mcp serve` shims (which pass
-/// their operator identity and bind `0.0.0.0:0` so the served / consumed
-/// capabilities carry a stable, owner-scoped origin reachable by the peer).
+/// client path) and the `net-mesh wrap` / `net-mesh mcp serve` shims. Clients
+/// default to loopback and services to wildcard; explicit/profile overrides
+/// are resolved and validated before either inspection or execution.
 pub(crate) async fn build_attached_mesh(
-    bind: &str,
     identity: Option<net_sdk::identity::Identity>,
     remote: &RemoteAttach,
 ) -> Result<net_sdk::Mesh, CliError> {
-    let mut builder = net_sdk::MeshBuilder::new(bind, &remote.psk)
+    validate_bind(remote.bind, remote.addr)?;
+    let mut builder = net_sdk::MeshBuilder::new(&remote.bind.to_string(), &remote.psk)
         .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?;
     if let Some(id) = identity {
         builder = builder.identity(id);
@@ -385,9 +395,10 @@ pub fn resolve_remote_attach(
         hex_decode_32(pubkey_str).map_err(|e| invalid_args(format!("--node-pubkey: {e}")))?;
     let node_id =
         parse_u64_flexible(node_id_str).map_err(|e| invalid_args(format!("--node-id: {e}")))?;
-    let psk = hex_decode_32(psk_str).map_err(|e| invalid_args(format!("--psk-hex: {e}")))?;
+    let psk = parse_psk_hex(psk_str)?;
 
     Ok(Some(RemoteAttach {
+        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         addr,
         public_key,
         node_id,
@@ -405,14 +416,101 @@ pub fn require_remote_attach(
     args: &crate::commands::aggregator::RemoteAttachArgs,
     missing: impl FnOnce() -> CliError,
 ) -> Result<RemoteAttach, CliError> {
-    resolve_remote_attach(
+    require_remote_attach_with_bind(profile, args, DEFAULT_CLIENT_BIND, missing)
+}
+
+pub(crate) fn require_remote_attach_with_bind(
+    profile: &Profile,
+    args: &crate::commands::aggregator::RemoteAttachArgs,
+    default_bind: &str,
+    missing: impl FnOnce() -> CliError,
+) -> Result<RemoteAttach, CliError> {
+    resolve_attach_args(profile, args, default_bind)?.ok_or_else(missing)
+}
+
+pub(crate) fn resolve_attach_args(
+    profile: &Profile,
+    args: &crate::commands::aggregator::RemoteAttachArgs,
+    default_bind: &str,
+) -> Result<Option<RemoteAttach>, CliError> {
+    validate_endpoint(profile)?;
+    let mut remote = resolve_remote_attach(
         profile,
         args.node_addr.as_deref(),
         args.node_pubkey.as_deref(),
         args.remote_node_id.as_deref(),
         args.psk_hex.as_deref(),
-    )?
-    .ok_or_else(missing)
+    )?;
+    if let Some(remote) = &mut remote {
+        remote.bind = parse_bind_literal(
+            args.bind
+                .as_deref()
+                .or(profile.bind.as_deref())
+                .unwrap_or(default_bind),
+        )?;
+        validate_bind(remote.bind, remote.addr)?;
+    } else if args.bind.is_some() {
+        return Err(invalid_args("--bind requires a complete remote target"));
+    }
+    Ok(remote)
+}
+
+fn validate_bind(bind: SocketAddr, target: SocketAddr) -> Result<(), CliError> {
+    if target.ip().is_unspecified() || target.ip().is_multicast() || target.port() == 0 {
+        return Err(invalid_args(
+            "remote target must be a unicast peer IP with a nonzero port",
+        ));
+    }
+    if bind.is_ipv4() != target.is_ipv4() {
+        return Err(invalid_args(
+            "--bind and remote target must use the same IP address family",
+        ));
+    }
+    validate_bind_literal(bind)?;
+    if bind.ip().is_loopback() && !target.ip().is_loopback() {
+        return Err(invalid_args(
+            "loopback bind cannot reach a non-loopback peer; set --bind to a reachable local \
+             interface or wildcard (IPv4: 0.0.0.0:0; IPv6: [::]:0)",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a `--bind` / profile-`bind` literal and validate its address
+/// class. THE single bind-literal implementation behind
+/// [`resolve_attach_args`] (attach verbs) and `wrap --listen`'s
+/// `resolve_listener` — they used to carry a copy each, and the copies had
+/// drifted (the listener copy refused broadcast, the attach copy did not),
+/// so one malformed literal produced two exit-code classes (review
+/// finding 7).
+pub(crate) fn parse_bind_literal(raw: &str) -> Result<SocketAddr, CliError> {
+    let bind: SocketAddr = raw
+        .parse()
+        .map_err(|_| invalid_args("--bind/profile bind must be an IP:port literal"))?;
+    validate_bind_literal(bind)?;
+    Ok(bind)
+}
+
+/// Address-class gate for a bind literal: a local interface or wildcard
+/// only. Multicast and broadcast are refused on every verb, at argument
+/// resolution, before any socket or mesh effect. The one implementation,
+/// reached from [`parse_bind_literal`] and [`validate_bind`].
+pub(crate) fn validate_bind_literal(bind: SocketAddr) -> Result<(), CliError> {
+    if bind.ip().is_multicast() || bind.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+    {
+        return Err(invalid_args(
+            "--bind must be a local interface or wildcard, not multicast or broadcast",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a `--psk-hex` / profile-`psk_hex` literal. The one implementation
+/// behind the attach path and `wrap --listen`, so a malformed PSK surfaces
+/// the parse cause identically on every verb (review finding 7).
+pub(crate) fn parse_psk_hex(raw: &str) -> Result<[u8; 32], CliError> {
+    crate::parsers::hex_decode_32(raw)
+        .map_err(|e| invalid_args(format!("--psk-hex must be exactly 32 bytes of hex: {e}")))
 }
 
 pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {
@@ -522,7 +620,8 @@ pub async fn resolve_profile(
     let file = crate::config::ConfigFile::load(config_path)
         .await
         .map_err(|e| sdk(format!("config load: {e}")))?;
-    Ok(file.profile(profile_name))
+    file.profile(profile_name)
+        .ok_or_else(|| invalid_args(format!("unknown profile `{profile_name}`")))
 }
 
 #[allow(dead_code)]

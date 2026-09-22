@@ -23,12 +23,24 @@ use crate::error::{self, CliError};
 
 pub fn run<C: CommandFactory>() -> Result<(), CliError> {
     let cmd = C::command();
-    let man = clap_mangen::Man::new(cmd);
     let mut buf = Vec::new();
-    man.render(&mut buf)
-        .map_err(|e| error::generic(format!("render man page: {e}")))?;
+    render_pages(&cmd, &mut buf)?;
     std::io::stdout()
         .write_all(&buf)
         .map_err(|e| error::generic(format!("write stdout: {e}")))?;
+    Ok(())
+}
+
+/// Render the root page followed by every subcommand's own page, depth
+/// first, into the one output stream. `clap_mangen` renders one `Command`
+/// per page, so the tree walk above `Man::new` is what carries each
+/// subcommand's flags + descriptions into the reference.
+fn render_pages(cmd: &clap::Command, buf: &mut Vec<u8>) -> Result<(), CliError> {
+    clap_mangen::Man::new(cmd.clone())
+        .render(buf)
+        .map_err(|e| error::generic(format!("render man page: {e}")))?;
+    for sub in cmd.get_subcommands() {
+        render_pages(sub, buf)?;
+    }
     Ok(())
 }

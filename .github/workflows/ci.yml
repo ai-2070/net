@@ -1086,11 +1086,13 @@ jobs:
                 function crate_of_dir(dir) {
                   if (dir == "net/crates/net") return "root"
                   if (dir == "net/crates/net/sdk") return "sdk"
+                  if (dir == "net/crates/net/cli") return "cli"
                   return "dir:" (dir == "" ? "<repo root>" : dir)
                 }
                 function crate_of_pkg(pkg) {
                   if (pkg == "net-mesh") return "root"
                   if (pkg == "net-mesh-sdk") return "sdk"
+                  if (pkg == "net-cli") return "cli"
                   return "pkg:" pkg
                 }
                 function package_on(line) {
@@ -1153,17 +1155,24 @@ jobs:
             | sort -u > /tmp/pinned_root.txt
           awk -F'\t' '$1 == "sdk" { print $2 }' /tmp/pinned_by_crate.txt \
             | sort -u > /tmp/pinned_sdk.txt
-          awk -F'\t' '$1 != "root" && $1 != "sdk" { print $1 ": " $2 }' \
+          awk -F'\t' '$1 == "cli" { print $2 }' /tmp/pinned_by_crate.txt \
+            | sort -u > /tmp/pinned_cli.txt
+          awk -F'\t' '$1 != "root" && $1 != "sdk" && $1 != "cli" { print $1 ": " $2 }' \
             /tmp/pinned_by_crate.txt | sort -u > /tmp/pinned_foreign.txt
           printf '%s\n' "$UNPINNED_OK" | awk '{print $1}' | grep -v '^$' | sort -u > /tmp/allowed.txt
           # One inventory per crate. The root crate's `tests/` are the ones
-          # that MUST be pinned (the `integration-*` jobs pin explicitly); the
-          # SDK's `tests/` are auto-discovered by `rust-sdk-tests`, so they are
-          # NOT required to appear here — but an SDK pin still has to name a
-          # real SDK test, which is what stops this guard from failing on an
-          # SDK test that exists and runs.
+          # that MUST be pinned (the `integration-*` jobs pin explicitly). The
+          # SDK's `tests/` (`rust-sdk-tests`) and net-cli's (`cli-tests`) are
+          # auto-discovered whole-crate, so they are NOT required to appear
+          # here — but a pin against either must still name a real test of
+          # that crate. That is what lets a scoped run like the keychain
+          # step's `--test local_target_inspection` exist without leaving a
+          # silent hole behind it: rename that binary and this guard names
+          # the break instead of cargo. The next crate that needs a scoped
+          # pin joins here and in the two crate maps above.
           ls tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort -u > /tmp/present_root.txt
           ls sdk/tests/*.rs | sed 's|sdk/tests/||; s|\.rs$||' | sort -u > /tmp/present_sdk.txt
+          ls cli/tests/*.rs | sed 's|cli/tests/||; s|\.rs$||' | sort -u > /tmp/present_cli.txt
           # UNATTRIBUTABLE pins first, because they are the CAUSE of any
           # inventory verdict below: a pin this read cannot resolve to a crate
           # covers nothing, so the tests it was meant to cover would otherwise
@@ -1198,6 +1207,7 @@ jobs:
           stale=$(
             comm -13 /tmp/present_root.txt /tmp/pinned_root.txt | sed 's/^/root: /'
             comm -13 /tmp/present_sdk.txt /tmp/pinned_sdk.txt | sed 's/^/sdk: /'
+            comm -13 /tmp/present_cli.txt /tmp/pinned_cli.txt | sed 's/^/cli: /'
             cat /tmp/pinned_foreign.txt
           )
           if [ -n "$stale" ]; then
@@ -1205,7 +1215,7 @@ jobs:
             printf '%s\n' "$stale" | sed 's/^/  /'
             exit 1
           fi
-          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s), each attributed to its own crate."
+          echo "OK: $(wc -l < /tmp/present_root.txt) root + $(wc -l < /tmp/present_sdk.txt) sdk + $(wc -l < /tmp/present_cli.txt) cli test files; $(wc -l < /tmp/pinned_root.txt) root pin(s) + $(wc -l < /tmp/pinned_sdk.txt) sdk pin(s) + $(wc -l < /tmp/pinned_cli.txt) cli pin(s), each attributed to its own crate."
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
@@ -2302,13 +2312,20 @@ jobs:
           JUNIT="$(cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/nextest/default/junit.xml"
           rm -f "$JUNIT"
+          st=0
           cargo nextest run --no-fail-fast --no-tests=fail \
             --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures" \
-            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)'
-          st=$?
+            -E 'not test(=review_aborted_startup_writer_cannot_outlive_its_owner)' \
+            || st=$?
           # PRESERVE this run's result set before any later step's run
           # overwrites it. The named-witness steps below verify against this
           # artifact instead of re-executing each witness by name.
+          #
+          # `|| st=$?`, never a bare invocation followed by `st=$?`: this
+          # block runs under the runner's `bash -e`, which ABORTS at the
+          # failing run and skips this copy entirely — a red run then reads
+          # downstream as "no JUnit artifact ... the run did not produce
+          # results" instead of as the result set it actually produced.
           cp "$JUNIT" "$RUNNER_TEMP/sdk-suite-junit.xml"
           exit "$st"
 
@@ -3773,7 +3790,7 @@ jobs:
         working-directory: net/crates/net
         run: |
           # `--tests`, not `--test review_python_seed`: the integration-test
-          # pin guard inventories only the root and SDK crates, so a
+          # pin guard inventories only the root, SDK and net-cli crates, so a
           # `--test <name>` naming a payments target is a pin it cannot
           # attribute and refuses to guess at. Selecting the executable out
           # of cargo's JSON by target name does the same job without
@@ -4911,10 +4928,22 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install mypy + pydantic
-        run: python -m pip install --upgrade mypy pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
 
       - name: Run net-cli tests
-        run: cargo test -p net-cli
+        run: |
+          set -o pipefail
+          cargo test -p net-cli 2>&1 | tee /tmp/cli_default.log
+          # MCP uses two CLI mesh nodes; the native leg uses SDK nodes and a
+          # sequential capture CLI. Neither is two-computer evidence. Pin
+          # authorization + contract witnesses so they cannot silently vanish.
+          for t in two_node_mcp_consent_then_authorized_invocation \
+                   two_node_mcp_pin_does_not_override_provider_owner_scope \
+                   native_typed_call_and_generated_consumer_reuse_captured_contract_offline \
+                   two_node_protected_native_denial_then_authorized_typed_call; do
+            grep -q "test $t ... ok" /tmp/cli_default.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
 
       # `cargo test -p net-cli` above builds default features, so the
       # anchor-directory witness (`#![cfg(feature = "rtc-bootstrap")]`)
@@ -4922,7 +4951,7 @@ jobs:
       # feature, and name the two tests: a filter that matches nothing
       # still exits 0, which is the silent-skip hazard this repo has
       # been bitten by twice. No `--test` pin — the integration-test
-      # guard inventories the root crate's `tests/`, and `net-cli` is
+      # guard requires pins only for the root crate's `tests/`, and `net-cli` is
       # auto-discovered by design.
       - name: Run net-cli tests with rtc-bootstrap
         run: |
@@ -4931,6 +4960,53 @@ jobs:
           for t in anchor_ls_lists_a_live_announcing_anchor_and_not_a_plain_peer \
                    anchor_ls_without_a_daemon_refuses_rather_than_printing_nothing; do
             grep -q "test $t ... ok" /tmp/cli_rtc.log || {
+              echo "::error::$t did not run"; exit 1; }
+          done
+
+      # `keychain` (the OS-keychain secret value store) is explicitly
+      # non-default — `cli/Cargo.toml`: "NOT a default: it pulls the `keyring`
+      # dependency" — and it CHANGES THE ARGUMENT SURFACE: `forwarding
+      # set-value --inspect-target` exists only under
+      # `#[cfg(feature = "keychain")]`. So `if cfg!(feature = "keychain")` in
+      # `policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct`
+      # is never true in either step above, its `else` branch is all that ever
+      # executes, and half the witness is silently dropped on every run: wrong
+      # `keychain_service` / `keychain_account`, wrong stdin provenance, a
+      # flipped `ignored_profile_remote_defaults`, or `forwarding set-value`
+      # accepting an invalid keychain account all pass today. This step runs the
+      # gated branch; the default run above covers the `else` branch, so both
+      # halves execute.
+      #
+      # Scoped to `--test local_target_inspection` — the binary that owns the
+      # gated branch — rather than a whole-crate sweep like the `rtc-bootstrap`
+      # step above. Deliberate and narrower, not an oversight. Checked and NOT
+      # the reason: a whole-crate run would very likely stay green —
+      # `readme_commands` extracts only fenced commands (README's keychain
+      # example is prose) and `help_is_self_contained` asserts repo-file and
+      # installed-binary-name hygiene, not flag sets. The real grounds are cost
+      # and verifiability: cargo fingerprints per feature set, so this is a full
+      # rebuild either way, but an unscoped `cargo test -p net-cli` additionally
+      # LINKS every integration-test binary — ~40 large executables plus PDBs —
+      # which produced `LNK1180: insufficient disk space to complete link` on a
+      # workstation and is a material extra cost inside this job's 20-minute
+      # budget. Raise the scope only together with the job timeout.
+      #
+      # The name pin is the same silent-skip guard used for the four journey
+      # witnesses above: `cargo test -- <filter>` exits 0 when it matches
+      # nothing, so a rename would turn an unpinned run into a green no-op.
+      #
+      # Headless-safe: `forwarding set-value --inspect-target` returns before
+      # any `KeychainSecretBackend` is built (`cli/src/commands/forwarding.rs`),
+      # so it is inspect-only and never opens a keyring. `net-mesh-mcp`'s
+      # `keychain` path is pure Rust on Linux (kernel keyutils; no libdbus), so
+      # no system library is needed here.
+      - name: Run net-cli keychain inspection branch
+        run: |
+          set -o pipefail
+          cargo test -p net-cli --features keychain --test local_target_inspection \
+            2>&1 | tee /tmp/cli_keychain.log
+          for t in policy_and_pin_execution_use_inspected_paths_and_defaults_stay_distinct; do
+            grep -q "test $t ... ok" /tmp/cli_keychain.log || {
               echo "::error::$t did not run"; exit 1; }
           done
 
@@ -5098,15 +5174,53 @@ jobs:
       #     pinned to a step" guard in the integration job exists to prevent.
       #     That guard was never applied to its own neighbour. `--no-tests=fail`
       #     closes it natively: an empty filterset is an error, not a pass.
+      # `enrollment_storage` is split into its own step below instead of riding
+      # as a third arm of this union. `--no-tests=fail` fires only when the
+      # WHOLE filter selects nothing, so a rename or feature-gating of
+      # `enrollment_storage` alone dropped that arm to zero while these two
+      # surfaces still matched and the step stayed green — the exact
+      # silent-shrink failure the note above cites the guard for. These two
+      # arms are the pre-existing org surfaces and stay together; the
+      # patch-introduced arm is isolated so its disappearance is loud.
       - name: Org + authority unit tests
         run: >
           cargo nextest run --features net --lib --no-tests=fail
           -E 'test(/^adapter::net::behavior::org/) + test(/^adapter::net::org_admission_gate/)'
 
+      # Enrollment storage: the protected snapshot owner's type boundary
+      # (private fields, non-Clone, `&mut self` writes, `Busy` on second
+      # ownership) and FS boundary (`ensure_secure_authority_dir`,
+      # uid/mode/nlink/ACL checks, `open_regular_nofollow`, atomic publish
+      # with `Uncertain` fencing on post-rename failure).
+      # `.config/nextest.toml` already pins these `retries = 0` as
+      # security-critical; a SOLO `--no-tests=fail` filter is what turns a
+      # module rename or a silent gating-out into a red step rather than a
+      # green no-op. No count floor needed — an empty filterset is the error.
+      - name: Enrollment storage unit tests
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(/^adapter::net::behavior::enrollment_storage::/)'
+
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact
       # aliasing the lexical guard cannot catch).
+      # This full-crate run includes the journey witnesses, and two of them
+      # REQUIRE Python + Pydantic v2 on PATH rather than skipping when it is
+      # missing: `native_contract_workflow` and `protected_native_workflow`
+      # assert `import pydantic; major == 2` before doing anything. The ubuntu
+      # `cli-tests` job installs both; windows-latest's preinstalled Python
+      # does not carry pydantic, so without this step the Windows run is red.
+      # mypy additionally stops `typegen_downstream_python` from silently
+      # self-skipping here.
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install mypy + pydantic
+        run: python -m pip install --upgrade mypy "pydantic>=2,<3"
+
       - name: Net CLI tests
         run: cargo nextest run -p net-cli --no-tests=fail
 
@@ -5922,7 +6036,7 @@ jobs:
             --source tests/establishment_identity.rs \
             $REQUIRED
           # No `--test` form: the integration-test pin guard
-          # inventories the root crate's `tests/`, and the leaf is
+          # inventories only the root, SDK and net-cli crates, and the leaf is
           # its own workspace, so a `--test kyra_review` pin reads to
           # that guard as a pin naming a crate it cannot attribute.
           # Running the whole crate covers the same binary, and the

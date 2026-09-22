@@ -18,6 +18,7 @@
 //! disk.
 
 mod diff;
+mod live;
 mod python;
 mod schema;
 mod ts;
@@ -174,13 +175,14 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     match cmd {
         TypegenCommand::Generate(args) => {
-            run_generate(args, output, config_path, profile_name).await
+            run_generate(args, output, config_path, profile_name, deadline).await
         }
         TypegenCommand::Snapshot(args) => {
-            run_snapshot(args, output, config_path, profile_name).await
+            run_snapshot(args, output, config_path, profile_name, deadline).await
         }
         TypegenCommand::Diff(args) => run_diff(args, output).await,
     }
@@ -193,33 +195,60 @@ async fn run_generate(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     let (descriptors, meta) = match &args.from_snapshot {
-        Some(path) => load_snapshot_source(path, &args.tags, &args.tools)?,
+        Some(path) => {
+            if args.attach.has_target_flags() {
+                return Err(invalid_args("remote target/bind flags are for live typegen; remove them when using --from-snapshot"));
+            }
+            if args.attach.inspect_target {
+                let profile = resolve_profile(config_path, profile_name).await?;
+                let mut view = crate::target::TargetInspection::local(&profile, "offline");
+                view.source = Some(path.clone());
+                view.destination = Some(args.out.clone());
+                view.provenance("mode", "flag");
+                view.provenance("source", "flag");
+                view.provenance("destination", "flag");
+                return view.emit(output);
+            }
+            load_snapshot_source(path, &args.tags, &args.tools)?
+        }
         None => {
-            fetch_live_source(
-                &args.tags,
-                &args.tools,
-                &args.attach,
-                args.identity.as_deref(),
-                args.node,
-                config_path,
-                profile_name,
+            let Some(ctx) = crate::deadline::run_optional(
+                deadline,
+                prepare_live_context(
+                    &args.attach,
+                    args.identity.as_deref(),
+                    args.node,
+                    config_path,
+                    profile_name,
+                    output,
+                    &args.out,
+                ),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            crate::deadline::run_optional(
+                deadline,
+                fetch_live_source(&args.tags, &args.tools, ctx, deadline),
             )
             .await?
         }
     };
 
-    // Tools without an inline input schema can't generate input types
-    // (schema exceeded the fold's per-entry budget). Skip with a warning.
+    // Legacy offline snapshots keep their skip behavior. Live acquisition
+    // has already required a usable input schema for every selected tool.
     let mut skipped: Vec<String> = Vec::new();
     let usable: Vec<ToolDescriptor> = descriptors
         .into_iter()
         .filter(|d| {
             if d.input_schema.is_none() {
                 eprintln!(
-                    "warning: tool `{}` has no inline input schema (size > fold budget); \
-                     binding skipped. Re-run after `tool.metadata.fetch` ships.",
+                    "warning: tool `{}` has no input schema in the saved snapshot; \
+                     binding skipped. Capture a new live snapshot to fetch metadata.",
                     d.tool_id
                 );
                 skipped.push(d.tool_id.clone());
@@ -269,6 +298,13 @@ async fn run_generate(
         Language::Python => python::generate(&usable, &meta, &mut skipped)?,
     };
 
+    if args.from_snapshot.is_none() && !skipped.is_empty() {
+        return Err(invalid_args(format!(
+            "live typegen cannot render selected tools: {}; no output was written",
+            skipped.join(", ")
+        )));
+    }
+
     let written = write_generated(&args.out, &files).await?;
 
     let view = GenerateView {
@@ -290,15 +326,27 @@ async fn run_snapshot(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let (descriptors, _meta) = fetch_live_source(
-        &args.tags,
-        &args.tools,
-        &args.attach,
-        args.identity.as_deref(),
-        args.node,
-        config_path,
-        profile_name,
+    let Some(ctx) = crate::deadline::run_optional(
+        deadline,
+        prepare_live_context(
+            &args.attach,
+            args.identity.as_deref(),
+            args.node,
+            config_path,
+            profile_name,
+            output,
+            &args.out,
+        ),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let (descriptors, _meta) = crate::deadline::run_optional(
+        deadline,
+        fetch_live_source(&args.tags, &args.tools, ctx, deadline),
     )
     .await?;
 
@@ -414,17 +462,16 @@ fn read_snapshot(path: &Path) -> Result<TypegenSnapshot, CliError> {
     Ok(snapshot)
 }
 
-/// Discover descriptors live: remote-attach, let the fold populate, then
-/// `list_tools`, filtered by `--tag` / `--tool`.
-async fn fetch_live_source(
-    tags: &[String],
-    tools: &[String],
+/// Resolve once, then either emit inspection or attach for live discovery.
+async fn prepare_live_context(
     attach: &RemoteAttachArgs,
     identity: Option<&Path>,
     node: u64,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
-) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
+    output: Option<OutputFormat>,
+    destination: &Path,
+) -> Result<Option<CliContext>, CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, attach, || {
         invalid_args(
@@ -433,23 +480,34 @@ async fn fetch_live_source(
              profile), or use --from-snapshot for offline generation.",
         )
     })?;
-    let ctx = CliContext::build_with_remote(&profile, identity, node, false, remote).await?;
-    let mesh = ctx.require_mesh()?;
+    if attach.inspect_target {
+        let mut view =
+            crate::target::inspect(&profile, attach, identity, Some(&remote), "remote").await?;
+        view.destination = Some(destination.to_path_buf());
+        view.emit(output)?;
+        return Ok(None);
+    }
+    CliContext::build_with_remote(&profile, identity, node, false, remote)
+        .await
+        .map(Some)
+}
 
-    // The fold populates asynchronously after attach. Poll until it
-    // reports tools or the budget elapses, so a single-shot CLI doesn't
-    // race discovery and emit an empty result.
-    let raw = discover_with_timeout(mesh, Duration::from_secs(5)).await;
-    // An empty result here means the poll budget elapsed before any tool
-    // appeared (the only way the loop returns empty). Treating that as a clean
-    // empty set would silently emit nothing, so flag it.
-    if raw.is_empty() {
+async fn fetch_live_source(
+    tags: &[String],
+    tools: &[String],
+    ctx: CliContext,
+    deadline: Option<crate::deadline::Deadline>,
+) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
+    let mesh = ctx.require_mesh()?;
+    let descriptors = Box::pin(live::acquire(mesh, tags, tools, deadline)).await?;
+    // Broad observation may legitimately end empty, but must not imply that
+    // the entire mesh has no tools (or that a requested ID was satisfied).
+    if descriptors.is_empty() {
         eprintln!(
             "warning: live discovery found no tools within 5s — the capability fold may still \
              be populating, or this node advertises none; proceeding with an empty set."
         );
     }
-    let descriptors = filter_descriptors(raw, tags, tools);
 
     let meta = GenMeta {
         source_label: "live discovery".to_string(),
@@ -459,16 +517,42 @@ async fn fetch_live_source(
     Ok((descriptors, meta))
 }
 
-/// Poll `list_tools` until it returns at least one descriptor or `budget`
-/// elapses (the fold populates asynchronously after attach).
-async fn discover_with_timeout(mesh: &net_sdk::Mesh, budget: Duration) -> Vec<ToolDescriptor> {
-    let started = std::time::Instant::now();
+/// Await every explicitly requested ID after both filters. Without IDs,
+/// observe the whole bounded window; this is not a complete mesh inventory.
+/// The caller's absolute CLI deadline can interrupt this observation.
+async fn discover_with_timeout(
+    mut observe: impl FnMut() -> Vec<ToolDescriptor>,
+    tags: &[String],
+    requested: &[String],
+    budget: Duration,
+) -> Result<Vec<ToolDescriptor>, CliError> {
+    let end = tokio::time::Instant::now() + budget;
     loop {
-        let tools = mesh.list_tools(None);
-        if !tools.is_empty() || started.elapsed() >= budget {
-            return tools;
+        let selected = filter_descriptors(observe(), tags, requested);
+        let missing: std::collections::BTreeSet<&str> = requested
+            .iter()
+            .filter(|id| !selected.iter().any(|d| d.tool_id == **id))
+            .map(String::as_str)
+            .collect();
+        if !requested.is_empty() && missing.is_empty() {
+            return Ok(selected);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if tokio::time::Instant::now() >= end {
+            if !missing.is_empty() {
+                return Err(CliError::new(
+                    crate::error::ExitCodeKind::Timeout,
+                    format!(
+                        "live discovery budget elapsed; requested tools not observed after filters: {}. This does not prove mesh-wide absence; no output was written.",
+                        missing.into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+            return Ok(selected);
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(200)).min(end),
+        )
+        .await;
     }
 }
 
@@ -667,7 +751,7 @@ mod tests {
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
     }
 
-    fn desc(tool_id: &str) -> ToolDescriptor {
+    pub(super) fn desc(tool_id: &str) -> ToolDescriptor {
         ToolDescriptor {
             tool_id: tool_id.into(),
             name: tool_id.into(),
@@ -683,6 +767,62 @@ mod tests {
             pricing_terms: None,
             node_count: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_waits_for_all_requested_ids_after_tag_filtering() {
+        let mut observations = 0;
+        let result = discover_with_timeout(
+            || {
+                observations += 1;
+                let mut wanted = desc("wanted");
+                if observations > 1 {
+                    wanted.tags.push("selected".into());
+                }
+                vec![desc("unrelated"), wanted, desc("second")]
+            },
+            &["selected".into()],
+            &["wanted".into()],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_id, "wanted");
+    }
+
+    #[tokio::test]
+    async fn discovery_missing_ids_fail_and_broad_selection_observes_full_window() {
+        let error = discover_with_timeout(
+            || vec![desc("present")],
+            &[],
+            &["present".into(), "missing".into(), "missing".into()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requested tools not observed after filters: missing."));
+        let mut observations = 0;
+        let result = discover_with_timeout(
+            || {
+                observations += 1;
+                if observations == 1 {
+                    vec![desc("early")]
+                } else {
+                    vec![desc("early"), desc("late")]
+                }
+            },
+            &[],
+            &[],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

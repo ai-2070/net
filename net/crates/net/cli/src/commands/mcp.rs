@@ -35,7 +35,7 @@ use tokio::io::BufReader;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{
-    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+    build_attached_mesh, load_operator_identity, require_remote_attach_with_bind, resolve_profile,
 };
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -62,6 +62,9 @@ pub enum PinCommand {
 
 #[derive(Args, Debug)]
 pub struct PinIdArgs {
+    /// Report the pin-store path without reading or changing consent state.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// The capability id, as `provider/capability` (from a search result).
     pub cap_id: String,
 
@@ -72,6 +75,9 @@ pub struct PinIdArgs {
 
 #[derive(Args, Debug)]
 pub struct PinListArgs {
+    /// Report the pin-store path without reading its contents.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Pin-store file. Defaults to the per-user store `net-mesh mcp serve` reads.
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
@@ -115,60 +121,88 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
     match cmd {
-        // `serve` ignores `output` — stdout is the MCP JSON-RPC transport (see
-        // the module docs); emitting through the output pipeline would corrupt
-        // it. The `pin` verbs are ordinary one-shot commands and do use it.
-        McpCommand::Serve(args) => run_serve(args, config_path, profile_name).await,
-        McpCommand::Pin(cmd) => run_pin(cmd, output).await,
+        // Ordinary `serve` ignores `output`: stdout is MCP JSON-RPC traffic.
+        // Explicit inspection exits before protocol startup and, like `pin`,
+        // uses the ordinary one-shot output pipeline.
+        McpCommand::Serve(args) => {
+            run_serve(args, output, config_path, profile_name, deadline).await
+        }
+        McpCommand::Pin(cmd) => run_pin(cmd, output, config_path, profile_name).await,
     }
 }
 
 async fn run_serve(
     args: ServeArgs,
+    output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
+    deadline: Option<crate::deadline::Deadline>,
 ) -> Result<(), CliError> {
-    let profile = resolve_profile(config_path, profile_name).await?;
+    let profile =
+        crate::deadline::run_optional(deadline, resolve_profile(config_path, profile_name)).await?;
 
     // A mesh peer to join — the running node this shim reads capabilities from
     // and routes invocations through. Without one there is nothing to serve.
-    let remote = require_remote_attach(&profile, &args.remote, || generic(MSG_NO_DAEMON))?;
+    let remote = require_remote_attach_with_bind(
+        &profile,
+        &args.remote,
+        crate::context::DEFAULT_SERVICE_BIND,
+        || generic(MSG_NO_DAEMON),
+    )?;
+    if args.remote.inspect_target {
+        return crate::target::inspect(
+            &profile,
+            &args.remote,
+            args.identity.as_deref(),
+            Some(&remote),
+            "hosted_service",
+        )
+        .await?
+        .emit(output);
+    }
 
-    // Operator identity — the shim's origin (and thus which owner-scoped tools
-    // admit it) derives from it.
-    let identity_path = args
-        .identity
-        .as_deref()
-        .or(profile.identity.as_deref())
-        .ok_or_else(|| {
-            invalid_args(
-                "net-mesh mcp serve needs an operator identity: pass --identity <PATH> or set \
+    let (mesh, shim) = crate::deadline::run_optional(deadline, async {
+        // Operator identity — the shim's origin (and thus which owner-scoped tools
+        // admit it) derives from it.
+        let identity_path = args
+            .identity
+            .as_deref()
+            .or(profile.identity.as_deref())
+            .ok_or_else(|| {
+                invalid_args(
+                    "net-mesh mcp serve needs an operator identity: pass --identity <PATH> or set \
                  `identity = \"...\"` in your profile. Wrapped tools admit callers by origin, \
                  so use the same identity as your `net-mesh wrap` side (or have it `--allow` this \
                  shim's origin).",
-            )
-        })?;
-    let identity = load_operator_identity(identity_path).await?;
+                )
+            })?;
+        let identity = load_operator_identity(identity_path).await?;
 
-    let mesh = build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?;
-    let mesh = Arc::new(mesh);
+        let mesh = build_attached_mesh(Some(identity), &remote).await?;
+        let mesh = Arc::new(mesh);
 
-    // Seed the shim consent allowlist from `--allow-capability`.
-    let mut consent = ConsentPolicy::new();
-    for raw in &args.allow_capability {
-        let id = CapabilityId::parse(raw)
-            .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
-        consent.allow(id);
-    }
+        // Seed the shim consent allowlist from `--allow-capability`.
+        let mut consent = ConsentPolicy::new();
+        for raw in &args.allow_capability {
+            let id = CapabilityId::parse(raw)
+                .map_err(|e| invalid_args(format!("--allow-capability {raw:?}: {e}")))?;
+            consent.allow(id);
+        }
 
-    let gateway = MeshGateway::new(Arc::clone(&mesh))
-        .trust_equivalent_providers(args.trust_equivalent_providers);
-    let shim = Shim::new(gateway)
-        .with_consent(consent)
-        .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
+        let gateway = MeshGateway::new(Arc::clone(&mesh))
+            .trust_equivalent_providers(args.trust_equivalent_providers);
+        let shim = Shim::new(gateway)
+            .with_consent(consent)
+            .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
+        Ok((mesh, shim))
+    })
+    .await?;
 
+    // Startup budget ends here. Protocol input and service lifetime are not
+    // bounded by --timeout; an idle host must not lose its running listener.
     // Serve until the host closes stdin (EOF) or the operator hits Ctrl-C.
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
@@ -225,7 +259,28 @@ struct PinRow {
     state: &'static str,
 }
 
-async fn run_pin(cmd: PinCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+async fn run_pin(
+    mut cmd: PinCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let (store, inspect) = match &mut cmd {
+        PinCommand::Approve(args) | PinCommand::Reject(args) => {
+            (&mut args.pin_store, args.inspect_target)
+        }
+        PinCommand::List(args) => (&mut args.pin_store, args.inspect_target),
+    };
+    let source = if store.is_some() { "flag" } else { "default" };
+    let path = resolve_pin_store(store.as_deref())?;
+    if inspect {
+        let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+        let mut view = crate::target::TargetInspection::local(&profile, "persistent_store");
+        view.store = Some(path);
+        view.provenance("store", source);
+        return view.emit(output);
+    }
+    *store = Some(path);
     match cmd {
         PinCommand::Approve(args) => pin_mutate(args, output, "approved").await,
         PinCommand::Reject(args) => pin_mutate(args, output, "rejected").await,

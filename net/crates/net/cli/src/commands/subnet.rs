@@ -74,6 +74,9 @@ pub enum SubnetCommand {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -83,6 +86,9 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct LsArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -92,6 +98,9 @@ pub struct LsArgs {
 
 #[derive(Args, Debug)]
 pub struct TreeArgs {
+    #[command(flatten)]
+    pub scope: super::scope::InspectableLocalScope,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -105,6 +114,9 @@ pub async fn run(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    if inspect_offline_target(&cmd, output, config_path, profile_name).await? {
+        return Ok(());
+    }
     match cmd {
         SubnetCommand::Show(args) => run_show(args, output, config_path, profile_name).await,
         SubnetCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
@@ -119,13 +131,129 @@ pub async fn run(
     }
 }
 
+/// Resolve only offline artifact selections; never decode grants or sign facts.
+async fn inspect_offline_target(
+    cmd: &SubnetCommand,
+    output: Option<OutputFormat>,
+    config_path: Option<&Path>,
+    profile_name: &str,
+) -> Result<bool, CliError> {
+    let selection = match cmd {
+        SubnetCommand::Keygen(a) if a.inspect_target => {
+            let profile = resolve_profile(config_path, profile_name).await?;
+            let mut view = crate::target::TargetInspection::local(&profile, "offline");
+            view.unavailable_identity(
+                "execution generates a new subnet key; its public identity is not yet available",
+            );
+            view.provenance("identity", "runtime");
+            if let Some(path) = &a.out {
+                view.destination = Some(path.clone());
+                view.provenance("destination", "flag");
+            } else {
+                view.destination_pattern = Some(
+                    default_subnet_key_dir()
+                        .ok_or_else(|| {
+                            invalid_args("cannot resolve the platform config directory; pass --out")
+                        })?
+                        .join("subnet-<generated-entity-id-prefix>.toml"),
+                );
+                view.provenance("destination", "runtime");
+            }
+            view.emit(output)?;
+            return Ok(true);
+        }
+        SubnetCommand::Inspect(a) if a.inspect_target => {
+            let profile = resolve_profile(config_path, profile_name).await?;
+            let mut view = crate::target::TargetInspection::local(&profile, "offline");
+            view.source = Some(a.file.clone());
+            view.provenance("source", "argument");
+            view.emit(output)?;
+            return Ok(true);
+        }
+        SubnetCommand::IssueDirect(a) if a.inspect_target => {
+            Some((&a.root_key, a.insecure_permissions, &a.out, None))
+        }
+        SubnetCommand::IssueIssuer(a) if a.inspect_target => {
+            Some((&a.root_key, a.insecure_permissions, &a.out, None))
+        }
+        SubnetCommand::IssueDelegated(a) if a.inspect_target => Some((
+            &a.issuer_key,
+            a.insecure_permissions,
+            &a.out,
+            Some(&a.issuer_grant),
+        )),
+        SubnetCommand::IssueControlFact(a) => {
+            let common = match &a.kind {
+                ControlFactKindCommand::Descriptor(a) => &a.common,
+                ControlFactKindCommand::GatewayAdvertisement(a) => &a.common,
+                ControlFactKindCommand::ExportPolicy(a) => &a.common,
+                ControlFactKindCommand::RevocationFloor(a) => &a.common,
+            };
+            if common.inspect_target {
+                Some((
+                    &common.root_key,
+                    common.insecure_permissions,
+                    &common.out,
+                    None,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let Some((key, insecure, destination, issuer_grant_source)) = selection else {
+        return Ok(false);
+    };
+    let signer = load_subnet_key(key, insecure).await?;
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let mut target = crate::target::TargetInspection::local(&profile, "offline");
+    target.configured_identity(signer.entity_id().as_bytes());
+    target.source = Some(key.clone());
+    target.destination = Some(destination.clone());
+    for field in ["identity", "source", "destination"] {
+        target.provenance(field, "flag");
+    }
+    if issuer_grant_source.is_some() {
+        target.provenance("issuer_grant_source", "flag");
+    }
+    emit_value(
+        OutputFormat::resolve_oneshot(output),
+        &SubnetInspection {
+            target,
+            issuer_grant_source,
+        },
+    )
+    .map_err(|e| generic(format!("write inspection: {e}")))?;
+    Ok(true)
+}
+
+#[derive(Serialize)]
+struct SubnetInspection<'a> {
+    #[serde(flatten)]
+    target: crate::target::TargetInspection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer_grant_source: Option<&'a PathBuf>,
+}
+
 async fn run_show(
     args: ShowArgs,
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "subnet show")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet show")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let view = ShowView {
@@ -144,7 +272,18 @@ async fn run_ls(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "subnet ls")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet ls")?;
     let local_node_id = args.node;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), local_node_id, false).await?;
     let deck = ctx.deck();
@@ -173,7 +312,18 @@ async fn run_tree(
     config_path: Option<&std::path::Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
+    super::scope::validate_local(args.scope.local, "subnet tree")?;
     let profile = resolve_profile(config_path, profile_name).await?;
+    if args.scope.inspect_target {
+        return super::scope::inspect_temporary(
+            &profile,
+            args.identity.as_deref(),
+            args.node,
+            output,
+        )
+        .await;
+    }
+    super::scope::require_local(args.scope.local, "subnet tree")?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let mut all_subnets: BTreeSet<u32> = BTreeSet::new();
@@ -293,6 +443,9 @@ const NOT_BEFORE_HEADROOM_SECS: u64 = 60;
 
 #[derive(Args, Debug)]
 pub struct SubnetKeygenArgs {
+    /// Inspect output selection without generating a key.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Output path. Defaults to
     /// `$XDG_CONFIG_HOME/net-mesh/subnets/subnet-<id>.toml`.
     #[arg(long)]
@@ -317,6 +470,9 @@ pub struct SubnetKeygenArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueDirectArgs {
+    /// Inspect signer and artifact paths without issuing a credential.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the AUTHORITY ROOT key file (from `subnet keygen`).
     #[arg(long = "root-key", value_name = "PATH")]
     pub root_key: PathBuf,
@@ -376,6 +532,9 @@ pub struct IssueDirectArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueIssuerArgs {
+    /// Inspect signer and artifact paths without issuing a credential.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the AUTHORITY ROOT key file (from `subnet keygen`).
     #[arg(long = "root-key", value_name = "PATH")]
     pub root_key: PathBuf,
@@ -429,6 +588,9 @@ pub struct IssueIssuerArgs {
 
 #[derive(Args, Debug)]
 pub struct IssueDelegatedArgs {
+    /// Inspect signer and paths without reading the issuer grant or signing.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the issuer-grant wire bytes (from `issue-issuer`).
     #[arg(long = "issuer-grant", value_name = "PATH")]
     pub issuer_grant: PathBuf,
@@ -500,6 +662,9 @@ pub enum ControlFactKindCommand {
 
 #[derive(Args, Debug)]
 pub struct FactCommonArgs {
+    /// Inspect signer and artifact paths without signing a control fact.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to the AUTHORITY ROOT key file.
     #[arg(long = "root-key", value_name = "PATH")]
     pub root_key: PathBuf,
@@ -596,6 +761,9 @@ pub struct FactFloorArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    /// Inspect the source path without reading or decoding the artifact.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Path to a subnet artifact file (credential set, issuer grant,
     /// or control fact wire bytes).
     pub file: PathBuf,
@@ -1135,12 +1303,11 @@ struct IssueFactOutput {
 
 fn default_subnet_key_path(entity_id_hex: &str) -> Option<PathBuf> {
     let short = &entity_id_hex[..entity_id_hex.len().min(16)];
-    Some(
-        dirs::config_dir()?
-            .join("net-mesh")
-            .join("subnets")
-            .join(format!("subnet-{short}.toml")),
-    )
+    Some(default_subnet_key_dir()?.join(format!("subnet-{short}.toml")))
+}
+
+fn default_subnet_key_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("net-mesh").join("subnets"))
 }
 
 /// Load + parse a subnet authority key file, honoring the ssh-style

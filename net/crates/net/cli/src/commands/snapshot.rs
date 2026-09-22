@@ -33,7 +33,7 @@ use net_sdk::deck::{MeshOsSnapshot, StatusSummary};
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
-use crate::error::{generic, invalid_args, CliError};
+use crate::error::{generic, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -47,6 +47,9 @@ pub enum SnapshotCommand {
 
 #[derive(Args, Debug)]
 pub struct GetArgs {
+    /// Inspect context selection without starting a supervisor.
+    #[arg(long)]
+    pub inspect_target: bool,
     /// Operator identity file. Overrides the profile's
     /// `identity` setting.
     #[arg(long)]
@@ -56,57 +59,23 @@ pub struct GetArgs {
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 
-    /// Report the in-process supervisor this command starts, rather than a
-    /// running deployment.
-    ///
-    /// Required, because that is the only thing this command can read. The
-    /// result is a fresh, empty snapshot — useful for checking the output
-    /// shape or in tests, and not a picture of any cluster.
-    #[arg(long)]
+    #[arg(long, help = super::scope::NOTICE)]
     pub local: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
+    /// Inspect context selection without starting a supervisor.
+    #[arg(long)]
+    pub inspect_target: bool,
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
 
-    /// Report the in-process supervisor this command starts, rather than a
-    /// running deployment. See `net-mesh snapshot get --help`.
-    #[arg(long)]
+    #[arg(long, help = super::scope::NOTICE)]
     pub local: bool,
-}
-
-/// Refuse to present a freshly created runtime as a deployment read.
-///
-/// Returns exit code 2 (invalid args), because this is a usage problem: the
-/// operator asked a question this command cannot answer, and the honest
-/// answer is to say so rather than to serialize an empty struct.
-fn require_explicit_local(local: bool, verb: &str) -> Result<(), CliError> {
-    if local {
-        // Still say it, so a `--local` result piped into a report is not
-        // mistaken later for a cluster observation.
-        tracing::warn!(
-            "--local: reporting the in-process supervisor started by this \
-             command. It has no peers, daemons or replicas because it was \
-             created a moment ago; this is not a view of a running deployment."
-        );
-        return Ok(());
-    }
-
-    Err(invalid_args(format!(
-        "`snapshot {verb}` cannot read a running deployment. The Deck client \
-         is built from an in-process supervisor started by this command, so \
-         the only snapshot it can produce is of a runtime created moments \
-         ago — empty by construction, and indistinguishable from a healthy \
-         idle cluster. Pass --local to inspect that fresh runtime on purpose \
-         (output shape, smoke tests). To observe a real node, use a surface \
-         that attaches to one: `net-mesh aggregator`, `net-mesh peer`, or \
-         net-deck."
-    )))
 }
 
 pub async fn run(
@@ -117,8 +86,18 @@ pub async fn run(
 ) -> Result<(), CliError> {
     match cmd {
         SnapshotCommand::Get(args) => {
-            require_explicit_local(args.local, "get")?;
+            super::scope::validate_local(args.local, "snapshot get")?;
             let profile = resolve_profile(config_path, profile_name).await?;
+            if args.inspect_target {
+                return super::scope::inspect_temporary(
+                    &profile,
+                    args.identity.as_deref(),
+                    args.node,
+                    output,
+                )
+                .await;
+            }
+            super::scope::require_local(args.local, "snapshot get")?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let snapshot: MeshOsSnapshot = ctx.deck().status();
@@ -126,8 +105,18 @@ pub async fn run(
                 .map_err(|e| generic(format!("write snapshot: {e}")))?;
         }
         SnapshotCommand::Status(args) => {
-            require_explicit_local(args.local, "status")?;
+            super::scope::validate_local(args.local, "snapshot status")?;
             let profile = resolve_profile(config_path, profile_name).await?;
+            if args.inspect_target {
+                return super::scope::inspect_temporary(
+                    &profile,
+                    args.identity.as_deref(),
+                    args.node,
+                    output,
+                )
+                .await;
+            }
+            super::scope::require_local(args.local, "snapshot status")?;
             let ctx =
                 CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
             let summary: StatusSummary = ctx.deck().status_summary();

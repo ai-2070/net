@@ -33,6 +33,7 @@ pub mod org;
 pub mod peer;
 pub mod port;
 pub mod rpc;
+pub(crate) mod scope;
 pub mod snapshot;
 pub mod subnet;
 pub mod transfer;

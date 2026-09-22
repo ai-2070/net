@@ -11603,6 +11603,18 @@ pub struct MeshNode {
     /// awaiting future.
     #[cfg(feature = "cortex")]
     rpc_client_pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
+    /// Node-wide logical response pumps ([`Self::LARGE_RESPONSE_PUMP_SLOTS`]
+    /// of them), with no fragment queue.
+    #[cfg(feature = "cortex")]
+    rpc_large_response_slots: Arc<tokio::sync::Semaphore>,
+    /// Test-only publish park (review finding 1): when armed for a
+    /// `stream_id`, `publish_to_peer` signals `arrived` and parks forever,
+    /// so a test can deterministically drop a call future INSIDE its
+    /// request-publish await — the gap between `RpcClientPending::
+    /// register_large` and the `UnaryCallGuard` cleanup. Production builds
+    /// carry no field and no check (`#[cfg(test)]`).
+    #[cfg(test)]
+    publish_park: parking_lot::Mutex<Option<(u64, Arc<tokio::sync::Notify>)>>,
     /// Independent fetch_add counter used by `RoutingPolicy::
     /// RoundRobin` and `Random` to pick the next target node.
     /// Sequential is correct here — the cursor is local-only and
@@ -14074,6 +14086,12 @@ impl MeshNode {
             rpc_registration_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_client_pending: Arc::new(crate::adapter::net::cortex::RpcClientPending::new()),
+            #[cfg(feature = "cortex")]
+            rpc_large_response_slots: Arc::new(tokio::sync::Semaphore::new(
+                Self::LARGE_RESPONSE_PUMP_SLOTS,
+            )),
+            #[cfg(test)]
+            publish_park: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
@@ -19622,6 +19640,17 @@ impl MeshNode {
     /// proofs by construction.
     pub fn peer_session_id(&self, node_id: u64) -> Option<u64> {
         self.peers.get(&node_id).map(|p| p.session.session_id())
+    }
+
+    /// A pending unary call must not outlive its receive incarnation. The
+    /// table can retain a retired session (notably on shutdown), so identity
+    /// alone is insufficient. Advisory inactivity is deliberately not a fence.
+    pub(super) fn rpc_session_is_live(&self, node_id: u64, session_id: u64) -> bool {
+        !self.is_shutdown()
+            && self.peers.get(&node_id).is_some_and(|peer| {
+                peer.session.session_id() == session_id
+                    && !peer.session.is_receive_lifetime_retired()
+            })
     }
 
     /// Topology epoch this node evaluates subnet authority against.
@@ -32576,6 +32605,42 @@ impl MeshNode {
         }
     }
 
+    /// Node-wide bound on concurrently admitted large-unary-response
+    /// pumps (review finding 9). Eight is the deliberately small
+    /// backpressure containment: every admitted pump owns one complete
+    /// response and runs its per-fragment sends inline (there is no
+    /// fragment queue), so one slow peer can stall at most this many
+    /// logical responses and the ninth is refused up front — before any
+    /// fragment is emitted — rather than queued behind a stalled
+    /// transfer. Sized in the same order as the node-global reassembly
+    /// budget (`AGGREGATE = 8 * MAX` in `cortex/rpc/large_response`),
+    /// so worst-case in-flight response bytes stay bounded together.
+    /// Not configurable: a larger bound re-opens the stall-all-pumps
+    /// contention the cap exists to contain.
+    #[cfg(feature = "cortex")]
+    pub(crate) const LARGE_RESPONSE_PUMP_SLOTS: usize = 8;
+
+    #[cfg(feature = "cortex")]
+    pub(super) fn rpc_large_response_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.rpc_large_response_slots.clone()
+    }
+
+    /// Test seam for the drop-during-publish case: park `publish_to_peer`
+    /// for `stream_id` and hand back the arrival signal to await on.
+    #[cfg(test)]
+    pub(crate) fn arm_publish_park(&self, stream_id: u64) -> Arc<tokio::sync::Notify> {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        *self.publish_park.lock() = Some((stream_id, Arc::clone(&arrived)));
+        arrived
+    }
+
+    /// Release the publish park so later publishes — including the
+    /// `UnaryCallGuard` Drop's CANCEL — flow again.
+    #[cfg(test)]
+    pub(crate) fn disarm_publish_park(&self) {
+        *self.publish_park.lock() = None;
+    }
+
     /// Per-Mesh shared `RpcClientPending` — accessor for the
     /// `mesh_rpc::Mesh::call` glue. Pending oneshots awaiting
     /// RESPONSE events live here.
@@ -41682,6 +41747,18 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> Result<(), AdapterError> {
+        // Test-only park point (see `arm_publish_park`): this await is the
+        // gap the `register_large` cleanup guard must survive.
+        #[cfg(test)]
+        {
+            let parked = self.publish_park.lock().clone();
+            if let Some((park_stream, arrived)) = parked {
+                if park_stream == stream_id {
+                    arrived.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
         match self
             .try_publish_to_peer(peer_node_id, channel_hash, stream_id, reliable, events)
             .await
@@ -41715,10 +41792,43 @@ impl MeshNode {
         reliable: bool,
         events: &[Bytes],
     ) -> PeerPublishOutcome {
+        self.try_publish_to_peer_bound(
+            peer_node_id,
+            channel_hash,
+            stream_id,
+            reliable,
+            events,
+            None,
+        )
+        .await
+    }
+
+    /// Fragment sends may wait for credit, but must stay on the request's session.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_publish_to_peer_bound(
+        &self,
+        peer_node_id: u64,
+        channel_hash: ChannelHash,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+        fragment_session: Option<u64>,
+    ) -> PeerPublishOutcome {
         let (dest_addr, session) = match self.peers.get(&peer_node_id) {
             Some(p) => (p.value().addr(), p.value().session.clone()),
             None => return PeerPublishOutcome::NoSession,
         };
+
+        // This path builds ONE packet, unlike the batching/fragmenting stream
+        // sender. Refuse before opening a stream or charging credit: otherwise
+        // the socket can report success for a datagram the peer cannot receive.
+        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
+        if payload_bytes > protocol::MAX_PAYLOAD_SIZE {
+            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                "publish payload of {payload_bytes} bytes exceeds the {}-byte single-packet limit; nothing was sent",
+                protocol::MAX_PAYLOAD_SIZE,
+            )));
+        }
 
         if self.partition_filter.contains(&dest_addr) {
             return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
@@ -41737,32 +41847,65 @@ impl MeshNode {
         // about to build. The `TxSlotGuard` refunds on Drop unless
         // we `commit()` after a successful socket send, so a failed
         // send doesn't strand credit.
-        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
         let needed = wire_bytes_for_payload(payload_bytes);
-        let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
-            TxAdmit::Acquired { guard, seq } => (guard, seq),
-            TxAdmit::WindowFull => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} backpressured",
-                    stream_id
-                )));
+        let credit_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        // Bounded exponential backoff between credit attempts (review
+        // finding 9). This replaces a 1 ms fixed poll: per fragment that
+        // was up to 1 s of 1 ms wakeups while the caller holds one of the
+        // node-wide [`MeshNode::LARGE_RESPONSE_PUMP_SLOTS`] response
+        // pumps. Real credit-available notification is the review's
+        // preferred closure but needs a wake hook inside `StreamState`'s
+        // credit ledger (`net-mesh-wire`'s `wire/src/session.rs`:
+        // `refund_tx_credit` / `apply_authoritative_grant` /
+        // `refund_control_debit` are the only places credit grows, and
+        // that crate is outside this change's ownership) — recorded as a
+        // named follow-up. The cap keeps worst-case resume latency at one
+        // backoff interval; `fragment_wait_resumes_after_credit_refund`'s
+        // 300 ms bound fails any larger cap.
+        const BACKOFF_CAP: Duration = Duration::from_millis(32);
+        let mut credit_backoff = Duration::from_millis(1);
+        let (guard, seq) = loop {
+            if fragment_session.is_some_and(|expected| {
+                session.session_id() != expected
+                    || session.is_receive_lifetime_retired()
+                    || !self.rpc_session_is_live(peer_node_id, expected)
+            }) {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(
+                    "RPC response session retired".into(),
+                ));
             }
-            TxAdmit::StreamClosed => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} closed",
-                    stream_id
-                )));
-            }
-            // `try_acquire_tx_credit_guard` carries no handle and so
-            // no incarnation to mismatch: the publish path resolved
-            // this `session` itself moments ago. Unreachable, and
-            // reported as the closed stream it effectively is rather
-            // than silently treated as success.
-            TxAdmit::SessionSuperseded => {
-                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                    "publish: stream {:#x} belongs to a superseded session",
-                    stream_id
-                )));
+            match session.try_acquire_tx_credit_guard(stream_id, needed) {
+                TxAdmit::Acquired { guard, seq } => break (guard, seq),
+                TxAdmit::WindowFull
+                    if fragment_session.is_some()
+                        && tokio::time::Instant::now() < credit_deadline =>
+                {
+                    tokio::time::sleep(credit_backoff).await;
+                    credit_backoff = (credit_backoff * 2).min(BACKOFF_CAP);
+                }
+                TxAdmit::WindowFull => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} backpressured",
+                        stream_id
+                    )));
+                }
+                TxAdmit::StreamClosed => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} closed",
+                        stream_id
+                    )));
+                }
+                // `try_acquire_tx_credit_guard` carries no handle and so
+                // no incarnation to mismatch: the publish path resolved
+                // this `session` itself moments ago. Unreachable, and
+                // reported as the closed stream it effectively is rather
+                // than silently treated as success.
+                TxAdmit::SessionSuperseded => {
+                    return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                        "publish: stream {:#x} belongs to a superseded session",
+                        stream_id
+                    )));
+                }
             }
         };
 
@@ -52281,45 +52424,112 @@ mod heartbeat_aead_tests {
         );
     }
 
-    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7:
-    /// `publish_to_peer` was the only sender call site that
-    /// hard-coded `PacketFlags::NONE` instead of computing
-    /// `if reliable { PacketFlags::RELIABLE } else { PacketFlags::NONE }`.
-    /// Today the dispatch path doesn't consult `is_reliable()` (per-
-    /// stream reliability is set at open), so the inconsistency is
-    /// latent — but receiver-side code already consults the packet
-    /// flag for `is_priority` / `is_control`, and `is_reliable` is
-    /// the obvious next addition. This source-level pin ensures the
-    /// fix doesn't get reverted before the dispatch path catches up.
-    ///
-    /// R2-6 moved the packet-build body into the atomic
-    /// [`MeshNode::try_publish_to_peer`] delegate (`publish_to_peer` is
-    /// now a thin `Result`-flattening wrapper), so the pin scans there —
-    /// that is where the wire packet, and thus the `reliable` flag, is
-    /// built.
-    #[test]
-    fn publish_to_peer_propagates_reliable_to_packet_flags() {
-        let src = include_str!("mesh.rs");
-        let start = src
-            .find("async fn try_publish_to_peer(")
-            .expect("try_publish_to_peer must exist");
-        // Round down to a char boundary — the source has multibyte
-        // box-drawing characters in doc comments, and a fixed-byte
-        // window can land mid-UTF-8 sequence after edits to the
-        // surrounding code shift offsets.
-        let mut scan_end = (start + 6000).min(src.len());
-        while scan_end < src.len() && !src.is_char_boundary(scan_end) {
-            scan_end += 1;
+    /// Regression for `BUG_AUDIT_2026_05_03_MESH.md` #7, behavioral form
+    /// (review finding 18): the `reliable` flag handed to the publish
+    /// path must reach the wire packet's flags — asserted at the
+    /// RECEIVING session, where a `PacketFlags::RELIABLE` packet is what
+    /// makes the receive-side stream reliable (the session's
+    /// `default_reliable` is false for this config, and the second
+    /// assertion proves it). Pre-fix `publish_to_peer` hard-coded
+    /// `PacketFlags::NONE`; the source-text scan this replaces could not
+    /// distinguish dead code or a computed-and-dropped flag from real
+    /// propagation.
+    #[tokio::test]
+    async fn publish_to_peer_propagates_reliable_to_packet_flags() {
+        async fn node() -> Arc<MeshNode> {
+            Arc::new(
+                MeshNode::new(
+                    EntityKeypair::generate(),
+                    MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x24; 32]),
+                )
+                .await
+                .unwrap(),
+            )
         }
-        let body = &src[start..scan_end];
+        let sender = node().await;
+        let receiver = node().await;
+        let accept = {
+            let receiver = receiver.clone();
+            let sender_id = sender.node_id();
+            tokio::spawn(async move { receiver.accept(sender_id).await.unwrap() })
+        };
+        sender
+            .connect(
+                receiver.local_addr(),
+                receiver.public_key(),
+                receiver.node_id(),
+            )
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        sender.start();
+        receiver.start();
+
+        const RELIABLE_STREAM: u64 = 0xE1;
+        const UNRELIABLE_STREAM: u64 = 0xE0;
+        let event = Bytes::from_static(b"reliable-flag-probe");
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xA11CE,
+                    RELIABLE_STREAM,
+                    /* reliable */ true,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "reliable probe must publish"
+        );
+        assert!(
+            sender
+                .publish_to_peer(
+                    receiver.node_id(),
+                    0xB0B,
+                    UNRELIABLE_STREAM,
+                    /* reliable */ false,
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .is_ok(),
+            "unreliable probe must publish"
+        );
+
+        // Both packets must land on the receiving session before the
+        // stream-mode asserts read it — the awaits above return at the
+        // SENDER's socket, not at the receiver's dispatch.
+        let session = receiver
+            .peers
+            .get(&sender.node_id())
+            .unwrap()
+            .session
+            .clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.try_stream(RELIABLE_STREAM).is_some()
+                    && session.try_stream(UNRELIABLE_STREAM).is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both probe packets must reach the receiving session");
 
         assert!(
-            body.contains("if reliable") && body.contains("PacketFlags::RELIABLE"),
-            "regression: publish_to_peer must thread `reliable` into the packet \
-             header — pre-fix it hard-coded PacketFlags::NONE while only \
-             feeding `reliable` into open_stream_with, leaving every other \
-             sender call site (send_to_peer, send_routed, send_on_stream) \
-             inconsistent."
+            session.try_stream(RELIABLE_STREAM).unwrap().reliable_mode(),
+            "a reliable publish must arrive RELIABLE-flagged: the receiving \
+             stream becomes reliable only from the packet flag"
+        );
+        assert!(
+            !session
+                .try_stream(UNRELIABLE_STREAM)
+                .unwrap()
+                .reliable_mode(),
+            "an unreliable publish must arrive unflagged — and proves the \
+             receiving session's default_reliable is false, so the assert \
+             above can discriminate the flag"
         );
     }
 
@@ -60485,6 +60695,10 @@ mod exported_discovery_pin_coherence_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "cortex"))]
+#[path = "mesh_rpc_large_response_tests.rs"]
+mod rpc_large_response_lifecycle_tests;
 
 /// R1 (Kyra's HOLD on `b6e522bb5`): the `Stream` handle's config and
 /// the session's retransmit bookkeeping cannot disagree.
