@@ -10673,6 +10673,180 @@ mod roster_fallback_tests {
         ));
     }
 
+    /// Stage 2 row 5 — `client_stream_and_duplex_mint_their_stream_proofs`:
+    /// the S2.1 delete-and-replace's REPLACEMENT witness for the CS/DX
+    /// intent-refusal legs (F-S1.6-2's inversion). `call_client_stream` AND
+    /// `call_duplex` now ACCEPT an `org_proof_intent` and MINT their own
+    /// full streaming call proofs — observed at the provider's request
+    /// dispatcher as the decoded `net-org-admission` header: kind =
+    /// client-streaming (2) / duplex (3) and `session_binding` = the exact
+    /// live session's Noise handshake hash (§1.3), each minted LAZILY over
+    /// the finalized initial REQUEST at the first `send` (contract 2). The
+    /// capability-mismatch half and the service-routed refusal leg are
+    /// KEPT — this mirrors `call_streaming_mints_a_stream_proof` exactly.
+    #[tokio::test]
+    async fn client_stream_and_duplex_mint_their_stream_proofs() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_call::{
+            OrgStreamCallProof, STREAM_CALL_KIND_CLIENT_STREAMING, STREAM_CALL_KIND_DUPLEX,
+        };
+        const TARGET: u64 = 0xDEAD_BEEF;
+
+        let caller = build_server().await;
+        let provider_node = build_server().await;
+        let provider_entity = provider_node.entity_id().clone();
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        // Direct handshake so BOTH sides hold the session's binding.
+        let caller_id = caller.node_id();
+        let p_pub = *provider_node.public_key();
+        let p_addr = provider_node.local_addr();
+        let p_clone = Arc::clone(&provider_node);
+        let accept = tokio::spawn(async move { p_clone.accept(caller_id).await });
+        caller
+            .connect(p_addr, &p_pub, provider_node.node_id())
+            .await
+            .expect("connect");
+        accept
+            .await
+            .expect("accept task")
+            .expect("accept handshake");
+        caller.start();
+        provider_node.start();
+        let binding = caller
+            .peer_session_binding(provider_node.node_id())
+            .expect("the live session carries its binding (1.1a)");
+        caller.test_pin_peer_entity(provider_node.node_id(), provider_entity.clone());
+
+        // The provider's request channel with a capture dispatcher (the
+        // mint is the property — no admission is run).
+        let req_channel = ChannelName::new("svc.requests").expect("channel name");
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<RpcInboundEvent>();
+        let capture: RpcInboundDispatcher = Arc::new(move |ev| {
+            let _ = cap_tx.send(ev);
+        });
+        assert!(
+            provider_node
+                .register_rpc_inbound(ChannelId::new(req_channel.clone()).hash(), capture)
+                .is_some(),
+            "the provider captures its request channel",
+        );
+
+        // ---- the CS positive: the lazy mint's kind 2 rides the first send. ----
+        let intent =
+            owner_delegated_intent(EntityKeypair::generate(), &org_b, provider_entity.clone());
+        let mut cs = caller
+            .call_client_stream(
+                provider_node.node_id(),
+                "svc",
+                CallOptions {
+                    org_proof_intent: Some(intent.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call_client_stream accepts the intent and mints");
+        cs.send(Bytes::from_static(b"cs-first"))
+            .await
+            .expect("the first send publishes the signed opening");
+        let ev = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+            .await
+            .expect("the CS-minted REQUEST reaches the provider")
+            .expect("capture channel open");
+        let req = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+            .expect("the REQUEST payload decodes");
+        let proof_bytes = req
+            .headers
+            .iter()
+            .find(|(name, _)| name == ORG_ADMISSION_HEADER)
+            .map(|(_, value)| value.clone())
+            .expect("the minted proof rides as the single admission header");
+        let proof = OrgStreamCallProof::decode(&proof_bytes)
+            .expect("the minted bytes are a FULL streaming proof (strict decode)");
+        assert_eq!(
+            proof.kind, STREAM_CALL_KIND_CLIENT_STREAMING,
+            "the CS mint's kind is client-streaming (2)",
+        );
+        assert_eq!(
+            proof.session_binding, binding,
+            "the CS mint binds the exact live session's Noise handshake hash (§1.3)",
+        );
+
+        // ---- the DX positive: the lazy mint's kind 3 rides the first send. ----
+        let mut dx = caller
+            .call_duplex(
+                provider_node.node_id(),
+                "svc",
+                CallOptions {
+                    org_proof_intent: Some(intent.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call_duplex accepts the intent and mints");
+        let (mut dx_sink, _dx_stream) = dx.into_split();
+        dx_sink
+            .send(Bytes::from_static(b"dx-first"))
+            .await
+            .expect("the first send publishes the signed opening");
+        let ev = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+            .await
+            .expect("the DX-minted REQUEST reaches the provider")
+            .expect("capture channel open");
+        let req = RpcRequestPayload::decode(ev.payload.slice(RPC_FRAME_BODY_OFFSET..))
+            .expect("the REQUEST payload decodes");
+        let proof_bytes = req
+            .headers
+            .iter()
+            .find(|(name, _)| name == ORG_ADMISSION_HEADER)
+            .map(|(_, value)| value.clone())
+            .expect("the minted proof rides as the single admission header");
+        let proof = OrgStreamCallProof::decode(&proof_bytes)
+            .expect("the minted bytes are a FULL streaming proof (strict decode)");
+        assert_eq!(
+            proof.kind, STREAM_CALL_KIND_DUPLEX,
+            "the DX mint's kind is duplex (3)",
+        );
+        assert_eq!(
+            proof.session_binding, binding,
+            "the DX mint binds the exact live session's Noise handshake hash (§1.3)",
+        );
+
+        // ---- the kept halves: local refusals unchanged (the mirror). ----
+        let server = build_server().await;
+        server.test_pin_peer_entity(TARGET, provider_entity.clone());
+        let intent_opts = || CallOptions {
+            org_proof_intent: Some(owner_delegated_intent(
+                EntityKeypair::generate(),
+                &org_b,
+                provider_entity.clone(),
+            )),
+            ..Default::default()
+        };
+
+        // Service-routed streaming rejects the intent at the TOP, before
+        // discovery (the kept service-routed refusal leg).
+        assert!(matches!(
+            server
+                .call_service_streaming("svc", Bytes::new(), intent_opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
+
+        // The intent's capability is `nrpc:svc`; invoking a DIFFERENT
+        // service is a local capability mismatch — for BOTH widened verbs
+        // (the kept capability-mismatch half).
+        assert!(matches!(
+            server
+                .call_client_stream(TARGET, "other", intent_opts())
+                .await,
+            Err(RpcError::Codec { .. })
+        ));
+        assert!(matches!(
+            server.call_duplex(TARGET, "other", intent_opts()).await,
+            Err(RpcError::Codec { .. })
+        ));
+    }
+
     /// A protected call measures the **finalized** envelope — the signed
     /// admission proof included — against one packet, and refuses it
     /// locally before the pending oneshot is registered.
