@@ -699,11 +699,72 @@ the intent subject check, skipping the intent digest check, accepting any trust
 domain, and printing the invitation id in `Debug` each failed their named
 witnesses (every-byte tamper sweep, foreign-issuer splice, etc.).
 
-**Next:** the redemption owner — connection-bound challenge and signed
-transcript over (challenge, invite digest, subject, intent digest), the
-membership-only receipt/bundle format, and the service that verifies both
-before calling the ledger, over the PSK-free Noise enrollment listener selected
-above. Lifecycle fencing, selective subnet semantics and V2 exact-head
+**PSK-free Noise enrollment session (2026-09-22):** `sdk/src/enrollment/redeem.rs`
+(protocol, responder key, client `redeem`) and `sdk/src/enrollment/service.rs`
+(`EnrollmentService` over a `SharedLedger`); witnesses
+`sdk/tests/enrollment_redeem.rs` over real loopback TCP.
+
+Resolved design items from the adapter decision above:
+
+- **TCP, not UDP**, on its own port. The TCP handshake removes the
+  retransmission, fragmentation and amplification design a UDP responder would
+  need; a spoofed source cannot obtain a response. The invite's signed
+  `host:port` string is unchanged; its docs now say TCP.
+- **`Noise_NK_25519_ChaChaPoly_BLAKE2s`**, prologue `net-mesh enrollment session
+  v1`: the device authenticates the responder by the invite's `EnrollmentKey`
+  and stays anonymous at the Noise layer. Protocol name and prologue separate it
+  from mesh `NKpsk0`.
+- **Dedicated responder key**, not the mesh static key: X25519 secret =
+  `blake3::derive_key("net-mesh enrollment responder x25519 v1", issuer seed)`.
+  Stable across restarts with no extra storage; rotation (and its invalidation
+  of unredeemed links) is future work.
+- **Challenge = Noise handshake hash.** It is fresh on both sides and unique to
+  the session, so the device signs `domain ‖ handshake hash ‖ invite digest ‖
+  subject ‖ intent digest` and a captured proof fails on any other session. One
+  request per session; frames are `u16` big-endian length-prefixed.
+- **Service verification order**, all before any ledger mutation: bounded
+  request decode, invite signature, intent against invite, subject signature
+  over this session's transcript, invite issuer = ledger issuer, and presented
+  invite digest = recorded digest (new `EnrollmentLedger::invite_digest`). Then
+  claim → pending / issue via the caller's `BundleIssuer` / recover (gated by
+  `BundleIssuer::may_recover` for current authority). Refusals are coarse
+  (`Invalid` covers unknown invitation, bad invite, mismatched intent and bad
+  proof). The ledger lock is held across `BundleIssuer::issue`, so the issuer
+  must be local and bounded.
+- **Bounds:** 64 concurrent sessions (excess closed, never queued), 10 s session
+  deadline, 128-byte handshake frames, 4 KiB request, 32 KiB bundle. No
+  management operation is exposed remotely; the owner uses `service.ledger()`.
+- **Dependencies:** SDK `net` now enables `dep:snow` (0.10.0, already in the
+  workspace via `net-wire`; the lockfile gains only that edge) and
+  `tokio/net`/`io-util`. No HTTP/TLS stack; `bootstrap_dep_boundary` passes.
+
+Validation (Windows): `enrollment_redeem` **11/11** (default redemption without
+approval, byte-identical recovery with the issuer called once, second-device
+conflict, require-approval pending then approved, wrong pinned key fails the
+handshake with nothing claimed, unrecorded/foreign invites invalid, revocation
+before issue and `may_recover` refusal after, local intent refusal before
+connecting, cross-session proof replay refused with nothing claimed via a raw
+hand-written client, garbage/oversized/malformed input closes only that session,
+capacity + deadline, shutdown). All enrollment binaries plus
+`bootstrap_dep_boundary` **43/43**; SDK lib filter **55/55**; SDK clippy
+lib/all-targets, full-feature rustdoc, rustfmt, `git diff --check` and
+`cargo check -p net-cli` clean. **Inverses** (restored byte-identically): ignoring
+the transcript signature, removing the session semaphore, reissuing instead of
+recovering, skipping `may_recover`, removing the client's local intent check, and
+pinning a different key in the client each failed their named witness. The
+issuer-equality and recorded-digest checks are defense in depth that the public
+API cannot reach (an invite with the same random ID needs the issuer's key), so
+no inverse witnesses them.
+
+Not included: the membership-only bundle format (the bundle is opaque here);
+device-side durable identity/intent persistence and install; `enrollment serve`
+/ `invite` / `join` CLI; release-binary inclusion and CI job for the live path;
+Unix execution. SDK CI auto-discovers the new binary.
+
+**Next:** the membership-only bundle — trust-domain PSK delivery checked against
+the invite's `TrustDomainId`, plus a signed membership-only receipt carrying no
+delegation, invocation or management right — and the device-side install that
+persists identity and intent before redeeming. Lifecycle fencing, selective subnet semantics and V2 exact-head
 acceptance remain open.
 
 Tasks:
