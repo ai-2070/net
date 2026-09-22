@@ -129,7 +129,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=196
+          MIN=275
           out=$(cargo test --locked -p net-mesh-wire --features json 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
                 | grep -oE 'test result: ok\. [0-9]+ passed' \
@@ -949,8 +949,8 @@ jobs:
           ran=$(grep -c '^test .* \.\.\. ok$' /tmp/deck.log || true)
           echo "deck unit tests: $ran"
           # Stage 6 added the ICE column's ledger + rollup tests.
-          if [ "$ran" -lt 31 ]; then
-            echo "::error::net-deck ran $ran tests, floor is 31 — \
+          if [ "$ran" -lt 35 ]; then
+            echo "::error::net-deck ran $ran tests, floor is 35 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
