@@ -23,7 +23,11 @@ Rust SDK contracts. No WebSocket, HTTP or cloud runtime is required by this plan
 
 ## Status
 
-**STAGE 0 ACCEPTED 2026-09-22 (branch `LZL0/org-streaming`); Q1–Q7 RESOLVED;
+**STAGE 1 ACCEPTED 2026-09-22 (independent review round 2.1 at `cc15f4d66`);
+STAGE 2 DISPATCH AUTHORIZED AS WRITTEN ON ITS PINNED BRIEF, with one
+OWNER-PENDING question recorded (the F-S1R-2 terminal-retarget rider — see
+the Review log; a reviewer surfaced it, no ruling implies inclusion);
+STAGE 0 ACCEPTED 2026-09-22 (branch `LZL0/org-streaming`); Q1–Q7 RESOLVED;
 STAGE 1 DISPATCH AUTHORIZED ON THAT ACCEPTANCE AND ITS PINNED BRIEF — source
 specification at head `85ecc77c953443bb6ab579ba7a842520bb3fca21` (`master`),
 revised 2026-09-19 after reviewer HOLD (Kyra). Stage 0 changed no production
@@ -1327,3 +1331,32 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   `a1c518dd…` trimmed-hash framing is unreproducible; the recorded
   `f31eb08e…` procedure reproduces byte-clean). Stage 2+ remains
   unauthorized.
+
+- 2026-09-22, **independent review round 2.1 verdict: ACCEPT**
+  (`S1_REVIEW_PACKET_2.md`, pinned head `cc15f4d66`). All nine HOLD findings
+  F-1…F-9 closed by their verbatim closure properties (F-5 via the
+  amended observable-seam wording plus the discriminating R-A5′ receipt;
+  the A5 green correctly classified as webrtc-gated). The Exit paragraph's
+  first claim **HOLDS** as one executed content-correlated observation per
+  authority mode: body bytes + order, then exactly one `Ok` +
+  `nrpc-streaming: end` terminal at the authenticated receiving endpoint.
+  Estate reproduced (30/30, 219/219, 121/121; roster 30==30); all six prior
+  inverses re-run red at named assertions; 5 repair receipts re-executed
+  verbatim; five fresh lane-unused inverses all red (zero
+  green-under-inverse, zero weakenings). **Stage 1 ACCEPTED.**
+  Adjudications: **F-S1R-2 = documented limitation** (the reviewer's probe:
+  3/3 retire yet 0/3 terminals delivered within 8 s; the NoSession-at-send
+  drop is design-blessed at `mesh_rpc.rs:7893-7897`, consistent with §2.8's
+  "the peer observes interruption or its deadline, not synthetic success")
+  carrying an **OWNER-PENDING Stage-2 rider question**: whether to name the
+  "post-replacement terminal that cannot be silently dropped" enhancement
+  as a Stage 2 item — it must be composed with the receiving-incarnation
+  fence and the exactly-one-terminal rule — together with the never-executed
+  caller-side last mile (the caller fold's local termination after its OWN
+  session replacement) and the delivery-exactly-once composition note. No
+  ruling implies its inclusion: **Stage 2 proceeds as written** and the
+  rider is stated in the Stage 2 brief as owner-pending. **F-S1R-3 resolved
+  for the repair's reproducible `f31eb08e…` procedure** (20 framings refute
+  the packet's `a1c518dd…`); the record is accurate. Stage 2 dispatch
+  authorized as written on its pinned brief; merge is not authorized by any
+  of this.

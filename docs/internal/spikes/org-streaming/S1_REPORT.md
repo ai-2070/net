@@ -131,6 +131,28 @@ source-established label and its receipt per the brief's evidence rules.
   `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
   rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
   strengthened to the owner-approved property, never silently re-pinned).
+- **2026-09-22, STAGE 1 ACCEPTED — independent review round 2.1 (verdict
+  packet `S1_REVIEW_PACKET_2.md`, pinned head `cc15f4d66`).** All nine
+  predecessor findings F-1…F-9 closed by their verbatim closure properties
+  (F-5 via the Main-ruled amended seam wording + R-A5′ red at `:3264:9`;
+  the A5 green correctly classified as webrtc-gated, source-established).
+  The Exit paragraph's first claim now HOLDS as one executed
+  content-correlated observation per authority mode. Estate reproduced
+  (30/30, 219/219, 121/121, roster 30==30); all six prior inverses re-run
+  red at named assertions; 5 repair receipts re-executed verbatim; **five
+  fresh lane-unused inverses all red — zero green-under-inverse, zero
+  weakenings.** Adjudications: **F-S1R-2 = documented limitation** (the
+  reviewer's own probe: 3/3 retire yet 0/3 terminals delivered within 8 s;
+  the NoSession-at-send drop is design-blessed at `mesh_rpc.rs:7893-7897`
+  per §2.8) with a **Stage-2 rider question surfaced for the owner** (the
+  "post-replacement terminal that cannot be silently dropped" enhancement,
+  to be composed with the receiving-incarnation fence and the
+  exactly-one-terminal rule, plus the never-executed caller-side last mile:
+  the caller fold's local termination after its OWN session replacement);
+  **F-S1R-3 resolved for the repair's `f31eb08e…` procedure** — the record
+  is accurate, the packet's `a1c518dd…` is superseded (20 framings refute
+  it). Stage 2 proceeds as written in the plan; the rider is owner-pending
+  (no ruling implies its inclusion).
 - **2026-09-22, repair round (S1_R) verified (executed).** The HOLD closure
   landed over five commits (`60c287d1e` witnesses rows 1–8, `4ab5738cf` six
   Appendix-inverse receipts, `74c9bd99c` §3, `3620fed0b`+`08dd849e2` R-A5'
