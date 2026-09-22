@@ -1,0 +1,36 @@
+net/crates/net/guards/org_api_probe/MANIFEST
+  h_64425bc75e3f3d 39
+net/crates/net/guards/org_api_probe/src/main.rs
+  h_64425bc75e3f3d 231-242,372-378,384-385,388-395,397-398,458,462
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  h_64425bc75e3f3d 59,85-90,92,108-110,112-139,305-307,315-319,363-368,389-402,409-448,500-535,537-562,568,574-575,587,592,624-625,638,668-669,672,675,680-684,690-732,797,799,836-849,854,986-988,1003-1005,1103,1569
+net/crates/net/src/adapter/net/behavior/org_call.rs
+  h_64425bc75e3f3d 56-127,211-214,372,406-695,1047-1219
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  h_64425bc75e3f3d 56-58,1126-1133,1191-1195,5786,6539-6553,6558-6559,6606-6657,6661-6674,8400-8401,8450-8451,8590-8591,8604-8607,9077,9081-9088,9091-9097,9845-9848,9975-9978,11195-11198
+net/crates/net/tests/org_rpc_streaming.rs
+  h_64425bc75e3f3d 1-522
+net/crates/net/tests/org_rpc_streaming/fixture.rs
+  h_64425bc75e3f3d 1-381
+net/crates/net/tests/org_rpc_streaming/frozen_85ecc77c9.rs
+  h_64425bc75e3f3d 1-35
+net/crates/net/tests/org_rpc_streaming/frozen_85ecc77c9/old_org_admission.rs
+  h_64425bc75e3f3d 1-632
+net/crates/net/tests/org_rpc_streaming/frozen_85ecc77c9/old_org_call.rs
+  h_64425bc75e3f3d 1-350
+net/crates/net/tests/org_rpc_streaming/frozen_85ecc77c9/old_serve.rs
+  h_64425bc75e3f3d 1-223
+net/crates/net/tests/subnet_org_boundary.rs
+  h_64425bc75e3f3d 446-449,451-453,457-463
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0ed6ecd2741cd90bb666032eff0c41a489b68798",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
