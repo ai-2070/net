@@ -1629,9 +1629,14 @@ impl ProtectedCallRegistry {
             Phase::Terminal => return Err(Denial::AuthorityChanged),
             Phase::Opening | Phase::Running => return Err(Denial::NotAdmitted),
         }
-        drop(inner);
+        // The guard moves into the transaction instead of being released
+        // here. That is the whole transaction: a retire landing between the
+        // check and the transfer would otherwise win the terminal and
+        // `transfer` would then resurrect the record over an owner that was
+        // never armed. Holding it also keeps the `expect` in `transfer`
+        // sound — no removal can run while this transaction is open.
         Ok(ConfirmTxn {
-            registry: self,
+            inner,
             lease: *lease,
         })
     }
@@ -2075,7 +2080,7 @@ pub enum RetireAttempt {
 
 /// The open check-half of §3 step 5. Holding this holds the registry lock.
 pub struct ConfirmTxn<'a> {
-    registry: &'a ProtectedCallRegistry,
+    inner: MutexGuard<'a, RegistryInner>,
     lease: AdmissionLease,
 }
 
@@ -2095,8 +2100,10 @@ impl ConfirmTxn<'_> {
         if owner.key != self.lease.key || owner.incarnation != self.lease.incarnation {
             return Err(Denial::NotAdmitted);
         }
-        let mut inner = self.registry.inner.lock();
-        let record = inner
+        // Consumes the guard `begin_confirm` opened with. Re-locking here
+        // would reopen the exact window this transaction exists to close.
+        let record = self
+            .inner
             .records
             .get_mut(&self.lease.key)
             .expect("presence validated when this transaction opened");
@@ -2293,7 +2300,7 @@ mod tests {
             h.registry.lifecycle_terminal(k),
             Some(Terminal {
                 reason: TerminalReason::Completed(HandlerResult::Ok),
-                emitted: false,
+                emission: None,
             }),
             "the §2.6 record carries the terminal, unemitted until the supervisor flips it"
         );

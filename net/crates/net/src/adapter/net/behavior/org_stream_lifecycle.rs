@@ -283,13 +283,35 @@ impl TerminalReason {
     }
 }
 
-/// The committed terminal plus its one-shot emission flag.
+/// What the control path actually did with the terminal (§2.8). The four
+/// records are distinct because a `try_send` attempt is **not** peer
+/// receipt: `Queued` means the control queue took the job, `Sent` means
+/// the transport accepted it (a production seam — this model has no
+/// transport), and `Refused`/`Unreachable` are interruption, never
+/// synthetic success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalDisposition {
+    /// The control queue accepted the terminal. Not peer receipt.
+    Queued,
+    /// The transport accepted the terminal job. Recorded at the send
+    /// seam; still not endpoint receipt, which is attributed at the peer.
+    Sent,
+    /// The session or route is gone. The peer will observe interruption
+    /// or its own deadline.
+    Unreachable,
+    /// The control queue refused the terminal. Recorded as interruption;
+    /// ownership is still released.
+    Refused,
+}
+
+/// The committed terminal plus its one-shot emission record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Terminal {
     /// The selected outcome. First writer wins.
     pub reason: TerminalReason,
-    /// Flipped exactly once, by the supervisor, after the pump stopped.
-    pub emitted: bool,
+    /// The control-path disposition, recorded exactly once by the
+    /// supervisor after the pump stopped.
+    pub emission: Option<TerminalDisposition>,
 }
 
 /// A frame arriving for an admitted call.
@@ -453,7 +475,7 @@ impl CallLifecycle {
         };
         self.terminal = Some(Terminal {
             reason: reason.clone(),
-            emitted: false,
+            emission: None,
         });
         Some(reason)
     }
@@ -466,7 +488,7 @@ impl CallLifecycle {
         }
         self.terminal = Some(Terminal {
             reason,
-            emitted: false,
+            emission: None,
         });
         true
     }
@@ -486,12 +508,33 @@ impl CallLifecycle {
         }
     }
 
-    /// Flip the emission flag. Returns `true` exactly once, for the
-    /// supervisor that owns the emission.
-    pub fn mark_emitted(&mut self) -> bool {
+    /// A protected **output** item was refused — unsatisfiable against
+    /// the configured per-call budget, or non-deliverable (§2.7 response
+    /// direction). The refusal latches `ResourceExhausted` and retires
+    /// the call: a refused item is never a metric-only drop followed by a
+    /// successful completion.
+    ///
+    /// Refusals once the output half is no longer `Open` are the
+    /// producer-gate class and must not come here: a stale sink clone
+    /// cannot overwrite the preserved handler result.
+    pub fn output_admission_failed(&mut self) -> Option<TerminalReason> {
+        if self.output != Output::Open {
+            return None;
+        }
+        if self.retire(TerminalReason::ResourceExhausted) {
+            Some(TerminalReason::ResourceExhausted)
+        } else {
+            None
+        }
+    }
+
+    /// Record the terminal's control-path disposition. Returns `true`
+    /// exactly once, for the supervisor that owns the emission; the first
+    /// disposition wins like every other terminal write.
+    pub fn record_emission(&mut self, disposition: TerminalDisposition) -> bool {
         match self.terminal.as_mut() {
-            Some(terminal) if !terminal.emitted => {
-                terminal.emitted = true;
+            Some(terminal) if terminal.emission.is_none() => {
+                terminal.emission = Some(disposition);
                 true
             }
             _ => false,
@@ -522,8 +565,9 @@ pub struct SupervisorOutcome {
     pub terminal: TerminalReason,
     /// Response items actually published before the terminal.
     pub published: usize,
-    /// Whether the terminal was emitted (exactly once).
-    pub emitted: bool,
+    /// The recorded control-path disposition of the terminal (exactly
+    /// once). `Some(TerminalDisposition::Queued)` is NOT peer receipt.
+    pub emission: Option<TerminalDisposition>,
     /// Response items still queued when the call ended (discarded on
     /// every retirement).
     pub discarded: usize,
@@ -588,7 +632,7 @@ impl RetireSignal {
 /// Without this gate a retained clone keeps the queue open, the pump
 /// parks in `recv`, and the call runs to its deadline instead of
 /// completing — which is exactly what the first run of
-/// `a_retained_sink_clone_cannot_extend_the_drain` demonstrated.
+/// `retained_sink_clone_cannot_extend_drain` demonstrated.
 #[derive(Debug, Default)]
 pub struct ProducerGate {
     finished: std::sync::atomic::AtomicBool,
@@ -614,17 +658,35 @@ impl ProducerGate {
     }
 }
 
-/// The sink half a protected handler holds. Refuses after the gate
-/// closes, so a retained clone cannot extend the drain.
+/// The sink half a protected handler holds, with §2.7's two refusal
+/// classes kept apart:
+///
+/// 1. **Producer-gate closed** — refused WITHOUT latching, so a retained
+///    clone cannot extend the drain or change the result the call already
+///    holds (§2.2).
+/// 2. **A refused protected item** — unsatisfiable against `budget`, or
+///    non-deliverable: this LATCHES `ResourceExhausted` and retires the
+///    call (§2.7 response direction). The item is never merely dropped
+///    and counted.
 pub async fn sink_send(
+    state: &parking_lot::Mutex<CallLifecycle>,
     gate: &ProducerGate,
     tx: &mpsc::Sender<usize>,
+    budget: usize,
     len: usize,
 ) -> Result<(), SinkClosed> {
     if gate.is_finished() {
         return Err(SinkClosed);
     }
-    tx.send(len).await.map_err(|_| SinkClosed)
+    if len > budget {
+        state.lock().output_admission_failed();
+        return Err(SinkClosed);
+    }
+    if tx.send(len).await.is_err() {
+        state.lock().output_admission_failed();
+        return Err(SinkClosed);
+    }
+    Ok(())
 }
 
 /// The protected sink's refusal — the model's `RpcSinkClosed`.
@@ -651,6 +713,7 @@ pub async fn run_supervisor(
     retire: Arc<RetireSignal>,
     deadline: Option<(tokio::time::Instant, TerminalReason)>,
     published: Arc<std::sync::atomic::AtomicUsize>,
+    ctl: mpsc::Sender<TerminalReason>,
 ) -> SupervisorOutcome {
     use std::sync::atomic::Ordering;
 
@@ -761,18 +824,33 @@ pub async fn run_supervisor(
         state.lock().pump_exited();
     }
 
-    let mut guard = state.lock();
+    let guard = state.lock();
     let terminal = guard
         .terminal()
         .map(|t| t.reason.clone())
         .unwrap_or(TerminalReason::PumpFailed);
-    let emitted = guard.mark_emitted();
+    drop(guard);
+
+    // §2.8 — record what the control path DID with the terminal, not
+    // that an attempt was made. `Queued` is the bounded control queue
+    // accepting the job; `Sent` (transport accept) has no model transport
+    // and is recorded at that seam in production; a full queue is
+    // `Refused` and a gone session is `Unreachable` — both interruption,
+    // both still release ownership, which is this function returning.
+    let disposition = match ctl.try_send(terminal.clone()) {
+        Ok(()) => TerminalDisposition::Queued,
+        Err(mpsc::error::TrySendError::Full(_)) => TerminalDisposition::Refused,
+        Err(mpsc::error::TrySendError::Closed(_)) => TerminalDisposition::Unreachable,
+    };
+    let mut guard = state.lock();
+    guard.record_emission(disposition);
+    let emission = guard.terminal().and_then(|t| t.emission);
     drop(guard);
 
     SupervisorOutcome {
         terminal,
         published: published.load(Ordering::SeqCst),
-        emitted,
+        emission,
         discarded: 0,
     }
 }
@@ -809,7 +887,9 @@ pub const MODEL_BOUND: Duration = Duration::from_secs(5);
 pub mod pull {
     use std::collections::VecDeque;
 
-    use super::{CallLifecycle, CallShape, HandlerResult, SinkClosed, TerminalReason};
+    use super::{
+        CallLifecycle, CallShape, HandlerResult, SinkClosed, TerminalDisposition, TerminalReason,
+    };
 
     /// What one [`PullCall::advance`] step accomplished.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -839,6 +919,10 @@ pub mod pull {
         published: usize,
         producer_finished: bool,
         deadline: Option<(u64, TerminalReason)>,
+        /// The control path's one reserved slot (§2.8). The runtime-free
+        /// form of "bounded control-path capacity at admission": the
+        /// terminal goes here, and the peer's read of it is receipt.
+        control: Option<TerminalReason>,
     }
 
     impl PullCall {
@@ -859,18 +943,36 @@ pub mod pull {
                 published: 0,
                 producer_finished: false,
                 deadline,
+                control: None,
             }
+        }
+
+        /// The terminal the control path accepted, for the peer side to
+        /// observe. Presence here is `Queued`, not peer receipt.
+        pub fn control(&self) -> Option<&TerminalReason> {
+            self.control.as_ref()
         }
 
         /// The handler's sink. Refuses once the producer half is closed
         /// (the gate) or the call is terminal, and reserves bytes before
-        /// accepting — an item larger than the whole budget can never be
-        /// satisfied and is refused immediately rather than queued.
+        /// accepting. Two refusal classes, as in [`super::sink_send`]:
+        ///
+        /// - unsatisfiable (`len > bytes_total`): prompt refusal that
+        ///   LATCHES `ResourceExhausted` (§2.7) — the item can never be
+        ///   queued, and its drop must not end in success;
+        /// - transient saturation (`len > bytes_free`, within total): the
+        ///   sync driver cannot `send_wait`, so this is a caller-visible
+        ///   backpressure refusal (retry after [`Self::advance`]), not a
+        ///   latch. The async form waits here instead.
         pub fn submit(&mut self, len: usize) -> Result<(), SinkClosed> {
             if self.producer_finished || !self.state.is_live() {
                 return Err(SinkClosed);
             }
-            if len > self.bytes_total || len > self.bytes_free {
+            if len > self.bytes_total {
+                self.state.output_admission_failed();
+                return Err(SinkClosed);
+            }
+            if len > self.bytes_free {
                 return Err(SinkClosed);
             }
             self.bytes_free -= len;
@@ -915,7 +1017,7 @@ pub mod pull {
         /// by a runtime.
         pub fn advance(&mut self, now_ns: u64) -> Progress {
             if let Some(terminal) = self.state.terminal() {
-                if terminal.emitted {
+                if terminal.emission.is_some() {
                     return Progress::Done;
                 }
                 let reason = terminal.reason.clone();
@@ -924,7 +1026,16 @@ pub mod pull {
                 if !reason.drains_queued_output() {
                     self.release_queue();
                 }
-                self.state.mark_emitted();
+                // §2.8 — the one reserved control slot takes the terminal
+                // (`Queued`) or refuses it (`Refused`, interruption).
+                let disposition = match self.control {
+                    None => {
+                        self.control = Some(reason.clone());
+                        TerminalDisposition::Queued
+                    }
+                    Some(_) => TerminalDisposition::Refused,
+                };
+                self.state.record_emission(disposition);
                 return Progress::Terminal(reason);
             }
 
@@ -1248,11 +1359,20 @@ mod tests {
     #[test]
     fn the_terminal_is_emitted_exactly_once() {
         let mut call = ss();
-        assert!(!call.mark_emitted(), "nothing to emit before a terminal");
+        assert!(
+            !call.record_emission(TerminalDisposition::Queued),
+            "nothing to emit before a terminal"
+        );
         call.retire(TerminalReason::Cancelled);
-        assert!(call.mark_emitted());
-        assert!(!call.mark_emitted());
-        assert!(call.terminal().expect("terminal").emitted);
+        assert!(call.record_emission(TerminalDisposition::Queued));
+        assert!(
+            !call.record_emission(TerminalDisposition::Refused),
+            "the first disposition wins like every other terminal write"
+        );
+        assert_eq!(
+            call.terminal().expect("terminal").emission,
+            Some(TerminalDisposition::Queued)
+        );
     }
 
     #[test]
@@ -1296,6 +1416,8 @@ mod tests {
         pump: PumpHandles,
         retire: Arc<RetireSignal>,
         published: Arc<AtomicUsize>,
+        ctl: mpsc::Sender<TerminalReason>,
+        ctl_rx: mpsc::Receiver<TerminalReason>,
     }
 
     impl Rig {
@@ -1311,6 +1433,9 @@ mod tests {
 
     fn rig(shape: CallShape, credit: usize, bytes: usize) -> (Rig, mpsc::Receiver<usize>) {
         let (tx, rx) = mpsc::channel(16);
+        // The control path's capacity reserved at admission: one terminal
+        // slot per call (§2.8).
+        let (ctl, ctl_rx) = mpsc::channel(1);
         (
             Rig {
                 state: Arc::new(parking_lot::Mutex::new(CallLifecycle::new(shape, 1))),
@@ -1319,6 +1444,8 @@ mod tests {
                 pump: pump_handles(credit, bytes),
                 retire: Arc::new(RetireSignal::new()),
                 published: Arc::new(AtomicUsize::new(0)),
+                ctl,
+                ctl_rx,
             },
             rx,
         )
@@ -1347,6 +1474,7 @@ mod tests {
             Arc::clone(&r.retire),
             None,
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1368,7 +1496,7 @@ mod tests {
             .expect("no panic");
         assert_eq!(out.terminal, TerminalReason::Completed(HandlerResult::Ok));
         assert_eq!(out.published, 2);
-        assert!(out.emitted);
+        assert_eq!(out.emission, Some(TerminalDisposition::Queued));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1391,6 +1519,7 @@ mod tests {
             Arc::clone(&r.retire),
             Some((at, TerminalReason::Timeout)),
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
         drop(r.tx);
 
@@ -1400,7 +1529,7 @@ mod tests {
             .expect("no panic");
         assert_eq!(out.terminal, TerminalReason::Timeout);
         assert_eq!(out.published, 0, "queued items are discarded, not drained");
-        assert!(out.emitted);
+        assert_eq!(out.emission, Some(TerminalDisposition::Queued));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1424,6 +1553,7 @@ mod tests {
             Arc::clone(&r.retire),
             None,
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
 
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1435,7 +1565,7 @@ mod tests {
             .expect("no panic");
         assert_eq!(out.terminal, TerminalReason::Revoked);
         assert_eq!(out.published, 0);
-        assert!(out.emitted);
+        assert_eq!(out.emission, Some(TerminalDisposition::Queued));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1459,6 +1589,7 @@ mod tests {
             Arc::clone(&r.retire),
             None,
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
         drop(r.tx);
 
@@ -1471,7 +1602,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_retained_sink_clone_cannot_extend_the_drain() {
+    async fn retained_sink_clone_cannot_extend_drain() {
         // The handler returns but a clone of its sender is still alive,
         // so the queue never closes on its own. The producer-finished
         // gate is what must end the drain: already-admitted items are
@@ -1486,11 +1617,14 @@ mod tests {
         let gate = Arc::clone(&r.gate);
         let retained = r.tx.clone();
         let handler_gate = Arc::clone(&r.gate);
+        let handler_state = Arc::clone(&r.state);
 
         let sup = tokio::spawn(run_supervisor(
             Arc::clone(&r.state),
             async move {
-                sink_send(&handler_gate, &tx, 4).await.expect("admitted");
+                sink_send(&handler_state, &handler_gate, &tx, 1024, 4)
+                    .await
+                    .expect("admitted");
                 HandlerResult::Ok
             },
             rx,
@@ -1504,6 +1638,7 @@ mod tests {
                 TerminalReason::Timeout,
             )),
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
         drop(r.tx);
 
@@ -1519,14 +1654,19 @@ mod tests {
         );
         assert!(gate.is_finished());
         assert_eq!(
-            sink_send(&gate, &retained, 4).await,
+            sink_send(&r.state, &gate, &retained, 1024, 4).await,
             Err(SinkClosed),
             "a retained clone's later send must be refused",
+        );
+        assert_eq!(
+            r.state.lock().terminal().map(|t| t.reason.clone()),
+            Some(TerminalReason::Completed(HandlerResult::Ok)),
+            "a stale clone's refusal must not latch over the preserved handler result",
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn client_streaming_completes_without_a_pump_event_or_a_later_end() {
+    async fn client_stream_single_response_completes_without_pump() {
         // A valid early unary result on the upload shape: no pump, input
         // still open, no END from the caller. It must complete anyway.
         let mut call = CallLifecycle::new(CallShape::ClientStreaming, 1);
@@ -1537,7 +1677,7 @@ mod tests {
             .pump_exited()
             .expect("the single-response emitter supplies the drain-complete event");
         assert_eq!(terminal, TerminalReason::Completed(HandlerResult::Ok));
-        assert!(call.mark_emitted());
+        assert!(call.record_emission(TerminalDisposition::Queued));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1559,6 +1699,7 @@ mod tests {
             Arc::clone(&r.retire),
             None,
             Arc::clone(&r.published),
+            r.ctl.clone(),
         ));
         drop(r.tx);
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1594,6 +1735,192 @@ mod tests {
             call.input_admission_failed(),
             Some(TerminalReason::ResourceExhausted),
             "an unsatisfiable reservation retires the call instead of parking",
+        );
+    }
+
+    /// The plan's `protected_output_refusal_cannot_complete_ok`
+    /// composition check (§2.7 response direction). Leg (a) is the same
+    /// path succeeding — the positive control that keeps a broken harness
+    /// from passing the refusal. Leg (b): an over-budget output item is a
+    /// refused protected item, and the handler returning `Ok` afterwards
+    /// must NOT turn the call into a successful completion.
+    #[tokio::test(start_paused = true)]
+    async fn protected_output_refusal_cannot_complete_ok() {
+        // (a) control: an in-budget item completes and publishes.
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 8);
+        let tx = r.tx.clone();
+        let handler_state = Arc::clone(&r.state);
+        let handler_gate = Arc::clone(&r.gate);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async move {
+                sink_send(&handler_state, &handler_gate, &tx, 8, 8)
+                    .await
+                    .expect("in-budget item is admitted");
+                HandlerResult::Ok
+            },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+        let control = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("control finishes")
+            .expect("no panic");
+        assert_eq!(
+            control.terminal,
+            TerminalReason::Completed(HandlerResult::Ok),
+            "control leg: {control:?}",
+        );
+        assert_eq!(control.published, 1, "control leg: {control:?}");
+
+        // (b) the refusal: one byte over the per-call budget.
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 8);
+        let tx = r.tx.clone();
+        let handler_state = Arc::clone(&r.state);
+        let handler_gate = Arc::clone(&r.gate);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async move {
+                assert_eq!(
+                    sink_send(&handler_state, &handler_gate, &tx, 8, 9).await,
+                    Err(SinkClosed),
+                    "an unsatisfiable item is refused promptly",
+                );
+                // The handler shrugs and reports success anyway.
+                HandlerResult::Ok
+            },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("the refusal retires the call within the bound")
+            .expect("no panic");
+        assert_eq!(
+            out.terminal,
+            TerminalReason::ResourceExhausted,
+            "the refusal latches; `Completed(Ok)` after a dropped item is the defect: {out:?}",
+        );
+        assert_eq!(out.published, 0, "nothing was admitted: {out:?}");
+    }
+
+    /// The plan's `terminal_queue_refusal_is_not_peer_receipt`
+    /// composition check (§2.8). Leg (a) is the positive control: the
+    /// reserved control slot takes the terminal and the RECEIVER observes
+    /// it. Legs (b) and (c): the control queue is full / the session is
+    /// gone — the disposition records interruption (`Refused` /
+    /// `Unreachable`), ownership still completes within the bound, and
+    /// the receiver never observes this call's terminal. A `try_send`
+    /// attempt is not peer receipt.
+    #[tokio::test(start_paused = true)]
+    async fn terminal_queue_refusal_is_not_peer_receipt() {
+        // (a) control: accepted by the control path, observed at the receiver.
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 1024);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async { HandlerResult::Ok },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+        let mut ctl_rx = r.ctl_rx;
+        let control = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("control finishes")
+            .expect("no panic");
+        assert_eq!(
+            control.emission,
+            Some(TerminalDisposition::Queued),
+            "control leg: {control:?}",
+        );
+        assert_eq!(
+            ctl_rx.try_recv().ok(),
+            Some(control.terminal.clone()),
+            "receipt is attributed at the receiver: {control:?}",
+        );
+
+        // (b) the reserved slot is occupied: refusal is interruption.
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 1024);
+        r.ctl
+            .try_send(TerminalReason::Cancelled)
+            .expect("the control path is full");
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async { HandlerResult::Ok },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+        let mut ctl_rx = r.ctl_rx;
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("a refused terminal still completes ownership")
+            .expect("no panic");
+        assert_eq!(
+            out.emission,
+            Some(TerminalDisposition::Refused),
+            "a full control queue is interruption, not receipt: {out:?}",
+        );
+        assert_eq!(
+            ctl_rx.try_recv().ok(),
+            Some(TerminalReason::Cancelled),
+            "the occupant, not this call's terminal: {out:?}",
+        );
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "this call's terminal never reached the peer: {out:?}",
+        );
+
+        // (c) the session is gone: unreachable is interruption too.
+        let (r, rx) = rig(CallShape::ServerStreaming, 8, 1024);
+        let sup = tokio::spawn(run_supervisor(
+            Arc::clone(&r.state),
+            async { HandlerResult::Ok },
+            rx,
+            Arc::clone(&r.gate),
+            r.pump(),
+            Arc::clone(&r.retire),
+            None,
+            Arc::clone(&r.published),
+            r.ctl.clone(),
+        ));
+        drop(r.tx);
+        drop(r.ctl_rx);
+        let out = tokio::time::timeout(MODEL_BOUND, sup)
+            .await
+            .expect("cleanup completes without a route")
+            .expect("no panic");
+        assert_eq!(
+            out.emission,
+            Some(TerminalDisposition::Unreachable),
+            "a gone session is interruption, not synthetic success: {out:?}",
+        );
+        assert_eq!(
+            out.terminal,
+            TerminalReason::Completed(HandlerResult::Ok),
+            "{out:?}"
         );
     }
 
@@ -1668,6 +1995,11 @@ mod tests {
                 Some(TerminalReason::Completed(HandlerResult::Ok)),
             );
             assert_eq!(call.published(), 1);
+            assert_eq!(
+                call.control().cloned(),
+                Some(TerminalReason::Completed(HandlerResult::Ok)),
+                "the reserved control slot delivered the terminal (§2.8)",
+            );
         }
 
         #[test]
@@ -1675,7 +2007,13 @@ mod tests {
             let mut call = PullCall::new(CallShape::ClientStreaming, 8, 1024, None);
             assert_eq!(call.submit(4 * 1024 * 1024), Err(SinkClosed));
             assert_eq!(call.queued(), 0, "it never waits for permits it cannot get");
-            assert!(call.state().is_live());
+            // The refusal is not a metric-only drop: it latches
+            // `ResourceExhausted` and retires the call (§2.7 response
+            // direction), so no later step can complete it `Ok`.
+            assert_eq!(
+                call.run_to_terminal(0, 8),
+                Some(TerminalReason::ResourceExhausted),
+            );
         }
 
         #[test]
