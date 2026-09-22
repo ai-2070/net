@@ -34118,7 +34118,21 @@ impl MeshNode {
         // channel, bare — a wildcard, a token, a queue group or
         // anyone else's channel is refused, not ignored.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 3 FAILS CLOSED when the peer entry is gone. The
+            // endpoint is unresolvable exactly when there is no installed
+            // `PeerInfo` — the state `ingress_admission` documents as
+            // reachable ("frames still queued behind a peer that has
+            // already been removed") and deliberately answers `Denied`.
+            // Guarding this with `if let Some(...)` SKIPPED the gate
+            // entirely in that state, so a Subscribe dispatched
+            // concurrently with the peer-map eviction (deterministic at
+            // the provisional reclaim) landed past §12 and was judged only
+            // by the ordinary ACL. Gate 5 is source-keyed and already
+            // refused here; this is its endpoint-keyed sibling.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                return;
+            };
             let action = match &msg {
                 MembershipMsg::Subscribe {
                     channel,
@@ -39058,7 +39072,16 @@ impl MeshNode {
         // and publish discovery state for a peer that has not
         // enrolled — S0e §3 row 12.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 4 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate.
+            // Skipping it let an announcement dispatched concurrently with
+            // the peer-map eviction be ingested and re-flooded mesh-wide,
+            // reinstating the TOFU identity pin the eviction had just
+            // cleared: gate 4's exact prohibition.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                return;
+            };
             if !Self::admission_gate_announce(&endpoint, ctx) {
                 return;
             }
@@ -39506,7 +39529,14 @@ impl MeshNode {
         // v1 browser scope, but the forwarding gate is not selective
         // about which announcement kind it refuses to carry.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -39650,7 +39680,14 @@ impl MeshNode {
         // the requester. A provisional session does not get to ask
         // this anchor to introduce it to anybody.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -40286,7 +40323,14 @@ impl MeshNode {
         // always checked `from_node`; the two arms are now
         // equivalent.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }

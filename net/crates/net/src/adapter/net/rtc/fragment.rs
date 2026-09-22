@@ -396,6 +396,14 @@ pub struct AbandonedGroup {
     pub held: usize,
     /// Why it was destroyed.
     pub reason: AbandonReason,
+    /// Whether this record holds an obligation slot.
+    ///
+    /// Every destruction owes a record and a fence, including one that
+    /// happened AT the charge — but a group that was refused because
+    /// nothing was left to charge never took a slot, and releasing one for
+    /// it at drain time would drift [`OwnershipCharge`] downward and admit
+    /// more groups than the bound allows.
+    pub charged: bool,
 }
 
 /// One piece of a group, and what it claimed.
@@ -480,6 +488,10 @@ impl Partial {
             pieces: self.pieces.len(),
             held: self.held,
             reason,
+            // Every group a `Partial` represents was OPENED, and opening
+            // is what takes the obligation slot — so its terminal holds
+            // one and the drain gives it back.
+            charged: true,
         }
     }
 }
@@ -874,7 +886,8 @@ impl RtcReassembly {
         };
         // The obligation is the ingress's now: its slot goes back so
         // the next group can be admitted (R4-5).
-        self.charge.release(drained.len());
+        self.charge
+            .release(drained.iter().filter(|group| group.charged).count());
         drained
     }
 
@@ -1230,6 +1243,33 @@ impl RtcReassembly {
                 // caller receives on the piece itself, which is the
                 // one report that cannot be dropped by a queue.
                 if !charge.try_charge() {
+                    // **X11.** Refusing at the charge destroys
+                    // acknowledged bytes exactly as the capacity refusal
+                    // below does — this piece's sequence was recorded and
+                    // its credit returned before reassembly ever saw it —
+                    // and this branch produced neither a record nor a
+                    // fence, contradicting the invariant that every
+                    // destruction produces an `AbandonedGroup` record on
+                    // every path. The consequence was worse than the
+                    // silence: once the charge eased, a TAIL of the
+                    // refused group opened a fresh headless group that
+                    // could never complete.
+                    //
+                    // `charged: false` — no obligation slot was taken
+                    // here, so this terminal must not release one later.
+                    abandoned.push(AbandonedGroup {
+                        session_id,
+                        epoch: piece.epoch,
+                        fragment_id: piece.fragment_id,
+                        provenance: piece.provenance,
+                        first_sequence: piece.sequence,
+                        last_sequence: piece.sequence,
+                        pieces: 1,
+                        held: piece.data.len(),
+                        reason: AbandonReason::Refused,
+                        charged: false,
+                    });
+                    state.fence(piece.fragment_id, piece.epoch, now);
                     return Err(FragmentOutcome::Refused);
                 }
                 if state.groups.len() >= MAX_GROUPS_PER_SESSION
@@ -1256,6 +1296,10 @@ impl RtcReassembly {
                         pieces: 1,
                         held: piece.data.len(),
                         reason: AbandonReason::Refused,
+                        // Its obligation slot WAS taken here — `try_charge`
+                        // succeeded above — so the drain below must give it
+                        // back exactly as it does for any other terminal.
+                        charged: true,
                     });
                     state.fence(piece.fragment_id, piece.epoch, now);
                     return Err(FragmentOutcome::Refused);
@@ -1463,7 +1507,9 @@ impl RtcReassembly {
                     queued.pieces += group.pieces;
                     queued.held += group.held;
                     self.charge.coalesced.fetch_add(1, Ordering::Relaxed);
-                    self.charge.release(1);
+                    if group.charged {
+                        self.charge.release(1);
+                    }
                 }
                 None => terminals.push_back(group.clone()),
             }
