@@ -496,8 +496,7 @@ pub(crate) fn parse_bind_literal(raw: &str) -> Result<SocketAddr, CliError> {
 /// resolution, before any socket or mesh effect. The one implementation,
 /// reached from [`parse_bind_literal`] and [`validate_bind`].
 pub(crate) fn validate_bind_literal(bind: SocketAddr) -> Result<(), CliError> {
-    if bind.ip().is_multicast()
-        || bind.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+    if bind.ip().is_multicast() || bind.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
     {
         return Err(invalid_args(
             "--bind must be a local interface or wildcard, not multicast or broadcast",
