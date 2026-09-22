@@ -185,8 +185,11 @@ array element so the change is visible.
 
 Supported (common subset): primitives + null, arrays, tuples
 (`prefixItems`), objects (`properties` / `required` / `additionalProperties`),
-`enum`, `const`, `oneOf` / `anyOf` (unions), `allOf` (TS intersection /
-Python inheritance for object combinations), local `$ref` to `$defs`,
+`enum`, `const`, `oneOf` / `anyOf` (unions), `allOf` (TS: `A & B`
+wherever it appears; Python: inheritance **only** for a top-level
+`allOf` whose members are all `$ref`s — every other `allOf` (nested,
+property-level, or with inline members) types as `Any`), local `$ref`
+to `$defs`,
 `nullable: true` (OpenAPI dialect), and doc strings from `description` /
 `title`.
 
@@ -208,9 +211,16 @@ generates — its response type is `unknown` (TS) / `Any` (Python).
 
 ## 6. Editing generated code
 
-Don't. Every file starts with an "Auto-generated … Do not edit by hand"
-header. Regenerate instead; commit the snapshot so regeneration is
+Don't. Regenerate instead; commit the snapshot so regeneration is
 reproducible.
+
+Each generated module carries an "Auto-generated … Do not edit by hand"
+header — TS `tools/<base>.ts` and `index.ts`, Python `<base>/models.py`
+(a module docstring) and the package-root `__init__.py`. The auxiliary
+files carry **no** header — TS `meta.json`, Python `_meta.json`,
+`<base>/models.pyi`, `<base>/call.py`, and the per-tool
+`<base>/__init__.py` — but they are generated all the same: regenerate
+rather than hand-editing them.
 
 ---
 
