@@ -256,7 +256,32 @@ fn rpc_carrier_collision(registered_rpc: bool) {
         Some(carrier),
         Some(route as u16),
     );
-    if registered_rpc && admitted.is_err() {
+    if registered_rpc {
+        let refused = match admitted {
+            Err(refused) => refused,
+            Ok(_) => panic!(
+                "the nRPC reply plane's carrier must be refused at registration, not \
+                 silently shadowed by an application stream"
+            ),
+        };
+        assert!(
+            matches!(refused, net_leaf::error::LeafError::Session(_)),
+            "the refusal must be the typed registration conflict, got {refused:?}"
+        );
+        assert!(
+            b.take_outbound().is_empty(),
+            "the conflict refuses at registration: nothing is queued for a refused open"
+        );
+        // And the failure STAGE is the conflict, not a broken table:
+        // an open on an unclaimed id still admits right after it.
+        b.open_stream(
+            a.node_id(),
+            "application-control",
+            Reliability::Reliable,
+            Some(net_leaf::stream::LEAF_STREAM_DISCRIMINATOR | 74),
+            Some(74),
+        )
+        .expect("the refusal must be the carrier conflict, not a corrupted stream table");
         return;
     }
     admitted.unwrap();

@@ -74,6 +74,18 @@ fn code_only(body: &str) -> String {
         .join("\n")
 }
 
+/// The `.rs` module names under `src/`.
+fn source_modules() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(manifest_dir().join("src"))
+        .expect("src/ is readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// The `pub trait ControlPlane { … }` block, code only.
 fn trait_body() -> String {
     let code = code_only(&source("control_plane.rs"));
@@ -86,6 +98,72 @@ fn trait_body() -> String {
         .expect("the trait block must close at column zero");
     tail[..end].to_string()
 }
+
+/// The `impl ControlPlane for NoAnchor { … }` block in this file.
+fn impl_body() -> String {
+    let code = code_only(&std::fs::read_to_string(file!()).expect("this file is readable"));
+    let start = code
+        .find("impl ControlPlane for NoAnchor {")
+        .expect("this file must declare the NoAnchor impl");
+    let tail = &code[start..];
+    let end = tail
+        .find("\n}")
+        .expect("the impl block must close at column zero");
+    tail[..end].to_string()
+}
+
+/// The `fn …{` signatures inside a block, bodies excluded.
+fn signatures(block: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = block;
+    while let Some(at) = rest.find("fn ") {
+        let tail = &rest[at..];
+        let end = tail.find('{').unwrap_or(tail.len());
+        found.push(tail[..end].to_string());
+        rest = &tail[end..];
+    }
+    found
+}
+
+/// Every capitalized identifier in `text` — the type vocabulary a
+/// signature uses.
+fn capitalized_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        if character.is_ascii_uppercase()
+            || (!current.is_empty() && (character.is_ascii_alphanumeric() || character == '_'))
+        {
+            current.push(character);
+        } else if !current.is_empty() {
+            tokens.push(core::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Every type the trait and its implementations may name. Adding one
+/// is a deliberate act here — that is the closure.
+const VOCABULARY: [&str; 15] = [
+    "Sdp",
+    "BootstrapAccepted",
+    "LeafError",
+    "DialogId",
+    "IceCandidate",
+    "SignedAnnouncement",
+    "SignalEnvelope",
+    "ControlEvent",
+    "Vec",
+    "Result",
+    "Future",
+    "Output",
+    "Self",
+    "ControlPlane",
+    "NoAnchor",
+];
 
 /// Rule 1, on the signatures: nothing an anchor owns is nameable in
 /// the trait.
@@ -126,6 +204,50 @@ fn no_anchor_type_is_nameable_in_the_trait() {
              appear only as an opaque string the implementation minted.\n\
              trait body:\n{body}"
         );
+    }
+
+    // The named-half escapes, closed. Two were open here: a
+    // fully-qualified path (`session: crate::session::LeafSession`)
+    // contains no `use crate::session` and no bare `LeafSession`, and
+    // a type neither deny-list has heard of (`AnyTypeAtAll`) matches
+    // nothing at all. So the trait may contain no path separator, and
+    // every capitalized identifier in it must be the known carrier
+    // vocabulary — a new one fails closed until it is added here
+    // consciously.
+    assert!(
+        !body.contains("::"),
+        "`::` appears in the ControlPlane trait: a fully-qualified path is how a \
+         forbidden type gets past a name scan (`crate::session::LeafSession`).\n\
+         trait body:\n{body}"
+    );
+    for token in capitalized_tokens(&body) {
+        assert!(
+            VOCABULARY.contains(&token.as_str()),
+            "`{token}` is a type name the boundary's vocabulary does not know. \
+             Rule 1 is only as strong as its lists; this one is exhaustive over \
+             the names the trait may use.\ntrait body:\n{body}"
+        );
+    }
+
+    // The same two rules on the zero-sized impl's SIGNATURES — the
+    // second escape: an `impl` must name the TYPES its parameters
+    // have, so whatever the trait forces every implementor to write
+    // appears in `NoAnchor`'s signatures and is caught by the same
+    // exhaustive scan (a trait parameter of `AnyTypeAtAll` cannot be
+    // implemented without naming it).
+    for signature in signatures(&impl_body()) {
+        assert!(
+            !signature.contains("::"),
+            "the NoAnchor impl's signature names a path: {signature}"
+        );
+        for token in capitalized_tokens(&signature) {
+            assert!(
+                VOCABULARY.contains(&token.as_str()),
+                "`{token}` appears in a NoAnchor impl signature — a type the trait \
+                 forces every implementor to name, and the vocabulary does not \
+                 know it.\nsignature: {signature}"
+            );
+        }
     }
 }
 
@@ -208,6 +330,12 @@ fn the_bindgen_surface_does_no_transport_of_its_own() {
         "attempt_token",
         "AnchorInfo",
         "OfferAccepted",
+        // The named escape: moving the calls into a helper module —
+        // `gloo_net::http`, an `XMLHttpRequest`, a global `fetch` —
+        // matched none of the spellings above.
+        "gloo_net",
+        "XMLHttpRequest",
+        "EventSource",
     ] {
         assert!(
             !code.contains(forbidden),
@@ -216,6 +344,35 @@ fn the_bindgen_surface_does_no_transport_of_its_own() {
              itself, the trait is decoration and the serverless follow-on is \
              a leaf refactor again"
         );
+    }
+    // And the same rule over EVERY module that is not a transport
+    // owner — the escape this closes: the calls moved to a helper
+    // module `wasm.rs` merely invokes, and a scan of `wasm.rs` alone
+    // saw nothing.
+    for module in source_modules() {
+        if matches!(
+            module.as_str(),
+            "anchor_control_plane.rs" | "bootstrap.rs" | "rtc.rs" | "storage.rs"
+        ) {
+            continue;
+        }
+        let helper = code_only(&source(&module));
+        for forbidden in [
+            "gloo_net",
+            "XMLHttpRequest",
+            "EventSource",
+            "fetch_with_str",
+            "fetch_with_request",
+            ".fetch(",
+            "::fetch(",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "{module} references `{forbidden}`. HTTP belongs to the transport \
+                 owners (`anchor_control_plane`, `bootstrap`); a helper module that \
+                 speaks it is the bindgen surface speaking it"
+            );
+        }
     }
     // And it does drive the trait.
     assert!(
@@ -261,6 +418,18 @@ fn no_control_plane_implementation_touches_the_data_path() {
             "RtcLeafTransport",
             "LeafSession",
             "complete_handshake",
+            // The forwarding escape: an implementation that reaches
+            // the node and forwards publish/call/subscribe through it
+            // names none of the above — but it must name its node, one
+            // way or the other.
+            "LeafNode",
+            "crate::node",
+            "node.publish",
+            "node.call",
+            "node.subscribe",
+            "publish_stream_id",
+            "classify_datagram",
+            "drop_session",
         ] {
             assert!(
                 !implementation.contains(forbidden),

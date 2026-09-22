@@ -114,29 +114,74 @@ fn kyra_retransmitted_fragment_does_not_destroy_acknowledged_partial() {
 fn kyra_fragment_group_cannot_change_stream_or_provenance() {
     use bytes::Bytes;
     use net_leaf::frame::{PieceMeta, FRAG_FRAGMENTED, FRAG_LAST};
+    let meta = |sequence, stream_id, origin_hash, channel_hash| PieceMeta {
+        sequence,
+        stream_id,
+        origin_hash,
+        channel_hash,
+        subprotocol_id: 0x0A00,
+        reliable: true,
+    };
+
+    // One dimension at a time. Co-varying stream, origin AND channel
+    // let a group key binding any ONE of the three stay green while
+    // the other two went unbound — same-stream pieces from a different
+    // origin then complete each other, which is provenance forgery
+    // through reassembly.
+    let second_piece_refused = |second: PieceMeta, why: &str| {
+        let mut r = net_leaf::Reassembler::new();
+        let c = net_leaf::LeafCounters::new();
+        let now = net_leaf::clock::now();
+        assert!(r
+            .accept_piece(
+                1,
+                meta(0, 10, 20, 30),
+                1,
+                0,
+                FRAG_FRAGMENTED,
+                Bytes::from_static(b"a"),
+                now,
+                &c
+            )
+            .is_none());
+        assert!(
+            r.accept_piece(
+                1,
+                second,
+                1,
+                1,
+                FRAG_FRAGMENTED | FRAG_LAST,
+                Bytes::from_static(b"b"),
+                now,
+                &c
+            )
+            .is_none(),
+            "{why}"
+        );
+    };
+    second_piece_refused(
+        meta(1, 11, 20, 30),
+        "one group assembled bytes across different streams",
+    );
+    second_piece_refused(
+        meta(1, 10, 21, 30),
+        "one group assembled bytes across different origins",
+    );
+    second_piece_refused(
+        meta(1, 10, 20, 31),
+        "one group assembled bytes across different channels",
+    );
+
+    // The control: one consistent group completes, so the three
+    // refusals above are the binding — not a reassembler that never
+    // finishes anything.
     let mut r = net_leaf::Reassembler::new();
     let c = net_leaf::LeafCounters::new();
     let now = net_leaf::clock::now();
-    let a = PieceMeta {
-        sequence: 0,
-        stream_id: 10,
-        origin_hash: 20,
-        channel_hash: 30,
-        subprotocol_id: 0x0A00,
-        reliable: true,
-    };
-    let b = PieceMeta {
-        sequence: 1,
-        stream_id: 11,
-        origin_hash: 21,
-        channel_hash: 31,
-        subprotocol_id: 0x0A00,
-        reliable: true,
-    };
     assert!(r
         .accept_piece(
             1,
-            a,
+            meta(0, 10, 20, 30),
             1,
             0,
             FRAG_FRAGMENTED,
@@ -148,7 +193,7 @@ fn kyra_fragment_group_cannot_change_stream_or_provenance() {
     assert!(
         r.accept_piece(
             1,
-            b,
+            meta(1, 10, 20, 30),
             1,
             1,
             FRAG_FRAGMENTED | FRAG_LAST,
@@ -156,8 +201,8 @@ fn kyra_fragment_group_cannot_change_stream_or_provenance() {
             now,
             &c
         )
-        .is_none(),
-        "one group assembled bytes across different streams/origins/channels"
+        .is_some(),
+        "the control: one consistent group must complete"
     );
 }
 #[test]

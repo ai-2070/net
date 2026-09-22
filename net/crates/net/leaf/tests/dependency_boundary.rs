@@ -96,20 +96,31 @@ fn the_leaf_depends_on_the_wire_crate_and_nothing_native() {
     );
 
     // Each of these would either fail to build for wasm32 or defeat
-    // the reason the crate exists.
-    for forbidden in [
-        "net-mesh =",    // the core: tokio, sockets, the route table
-        "net-mesh-sdk",  // likewise
-        "tokio =",       // no runtime in a browser tab
-        "ring =",        // needs a wasm32-targeting clang (S0a)
-        "str0m =",       // the native RTC driver; the leaf uses web_sys
-        "parking_lot =", // the leaf is single-threaded (S0b: main thread)
-    ] {
-        assert!(
-            !manifest.contains(forbidden),
-            "net-mesh-leaf must not depend on `{forbidden}` — see this \
-             file's module docs"
-        );
+    // the reason the crate exists. Scanned over COMMENT-FREE code,
+    // and covering the rename escapes the previous `name =` spellings
+    // missed: `rt = { package = "tokio" }` contains no `tokio =` at
+    // all, so the quoted crate name and the dotted dependency-table
+    // spellings are denied alongside the bare key (spaced and
+    // unspaced).
+    let code: String = manifest
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in ["net-mesh", "net-mesh-sdk", "tokio", "ring", "str0m", "parking_lot"] {
+        for spelling in [
+            format!("{forbidden} ="),
+            format!("{forbidden}="),
+            format!("\"{forbidden}\""),
+            format!("[dependencies.{forbidden}]"),
+            format!("[dependencies.{forbidden}."),
+        ] {
+            assert!(
+                !code.contains(&spelling),
+                "net-mesh-leaf must not depend on `{forbidden}` (found `{spelling}`) — \
+                 see this file's module docs"
+            );
+        }
     }
 }
 

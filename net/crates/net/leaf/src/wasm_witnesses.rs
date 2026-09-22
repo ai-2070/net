@@ -138,8 +138,8 @@ fn pair() -> Pair {
     let sink = Rc::clone(&reaches);
     let transport = RtcLeafTransport::new(Rc::new(move |from, bytes| {
         if let Some(inner) = sink.borrow().upgrade() {
-            if let Ok(mut guard) = inner.try_borrow_mut() {
-                guard.inbox.push_back((from, bytes));
+            if let Ok(guard) = inner.try_borrow_mut() {
+                guard.inbox.borrow_mut().push_back((from, bytes));
             }
         }
     }));
@@ -173,10 +173,12 @@ fn pair() -> Pair {
         // never made would be the inverse of the defect the
         // partition assertion is for.
         bootstrap_settled: true,
-        inbox: VecDeque::new(),
+        inbox: Rc::new(RefCell::new(VecDeque::new())),
         outbox: Vec::new(),
         dispatching: false,
         listeners: Vec::new(),
+        retired: Vec::new(),
+        channel_installations: HashMap::new(),
         next_listener_id: 1,
         closed: false,
         retry: crate::retry::RetryPolicy::new(PEER_ICE_DEADLINE_MS),
@@ -287,7 +289,7 @@ impl Pair {
     /// not landed.
     async fn await_arrival(&self) {
         for _ in 0..80 {
-            if !self.leaf.inner.borrow().inbox.is_empty() {
+            if !self.leaf.inner.borrow().inbox.borrow().is_empty() {
                 return;
             }
             gloo_timer_sleep(TICK_MS).await.ok();
@@ -574,35 +576,61 @@ async fn a_stale_dialog_is_refused_before_it_services_the_replacement() {
     let d2 = p.offer(5_000).await;
     assert_ne!(d1, d2, "a second offer mints its own dialog");
 
-    // What the replacement has sent so far. If the stale request
-    // serviced d2, this moves.
-    let before = p
-        .leaf
-        .service_peer(p.attempt(d2))
-        .await
-        .unwrap_or_else(|_| panic!("the replacement is live"))
-        .sent;
+    // The oracle is the replacement's own state — which the previous
+    // probe never put anything INTO: `AttemptReading.sent` is rebuilt
+    // per `service_peer` call and nothing was pending at either read,
+    // so the two sides compared `0 == 0` and any refusal at any
+    // moment passed. File real work under d2 first — a signed
+    // candidate the stale request could wrongly service.
+    p.deliver(
+        d2,
+        SignalKind::Candidate,
+        candidate_payload(&IceCandidate {
+            candidate: "candidate:1 1 udp 2130706431 192.0.2.10 5000 typ host".to_string(),
+            mid: "0".to_string(),
+        })
+        .into_bytes(),
+    );
+    let queued = || {
+        let inner = p.leaf.inner.borrow();
+        let dialog = inner
+            .peers
+            .get(&p.peer_id)
+            .expect("the replacement attempt is live");
+        (dialog.local.len(), dialog.inbox.len(), dialog.deferred.len())
+    };
+    let before = queued();
+    assert!(
+        before.0 + before.1 + before.2 > 0,
+        "the premise: the live replacement holds queued work the stale request \
+         could wrongly service"
+    );
 
     let peer_hex = format!("{:016x}", p.peer_id);
-    let error = p
-        .leaf
+    p.leaf
         .peer_candidate_in(peer_hex.clone(), format!("{d1:016x}"))
         .await
         .expect_err("a stale dialog is refused");
-    let text = format!("{:?}", JsValue::from(error));
+    // The typed seam. Both refusals here are `Session(_)` strings,
+    // so the claim's discrimination is the live dialog still
+    // resolving — the refusal names a REPLACED attempt rather than
+    // reporting no attempt — and the untouched queues below, not the
+    // sentence in between.
     assert!(
-        text.contains("is not the live attempt"),
-        "the refusal names the replacement rather than reporting no attempt: {text}"
+        matches!(
+            p.leaf.attempt_for(p.peer_id, d1),
+            Err(LeafError::Session(_))
+        ),
+        "the stale request must be refused by the typed replaced-attempt refusal"
     );
-
-    let after = p
-        .leaf
-        .service_peer(p.attempt(d2))
-        .await
-        .unwrap_or_else(|_| panic!("the replacement is still live"))
-        .sent;
+    assert!(
+        p.leaf.attempt_for(p.peer_id, d2).is_ok(),
+        "and the refusal names a replaced attempt rather than reporting no \
+         attempt: the live dialog still resolves"
+    );
     assert_eq!(
-        after, before,
+        queued(),
+        before,
         "the replacement attempt was not serviced by a request issued for its predecessor"
     );
 
@@ -785,6 +813,19 @@ async fn a_candidate_that_arrives_before_the_page_answers_is_applied_once_it_can
          remote description"
     );
     assert_eq!(reading.candidate_error, None);
+    // Read twice: `applied` is a per-call counter, so one read cannot
+    // tell "applied once" from "re-applied on every later service
+    // step".
+    let again = p
+        .leaf
+        .service_peer(p.attempt(dialog))
+        .await
+        .unwrap_or_else(|_| panic!("the attempt is live"));
+    assert_eq!(
+        again.applied, 0,
+        "the retained lines are applied ONCE: a later service step must not \
+         re-apply them"
+    );
     p.leaf.close();
 }
 
@@ -1113,6 +1154,61 @@ async fn a_parked_noise_wait_reports_the_supersession_and_charges_nothing() {
     );
     assert_eq!(p.terminal(), None, "the successor is still live");
     p.leaf.close();
+
+    // Control: the same wait COMPLETES when the peer answers message
+    // 1. Without it, a `run_handshake` that refused on every outcome
+    // after its first await would leave the initiator path dead while
+    // the refusal above stayed green.
+    let c = pair();
+    c.install_session();
+    let dc = c.offer(20_000).await;
+    c.open_channel(dc).await;
+    let done = Rc::new(Cell::new(None));
+    let reported = Rc::clone(&done);
+    let driving = LeafNode {
+        inner: Rc::clone(&c.leaf.inner),
+    };
+    let attempt = c.attempt(dc);
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = driving.run_handshake(attempt).await;
+        reported.set(Some(outcome.is_ok()));
+    });
+    // The peer answers the message 1 that really crossed the channel.
+    for _ in 0..80 {
+        if let Some((from, bytes)) = c.peer_inbox.borrow_mut().pop_front() {
+            let inbound = c.peer.borrow_mut().classify_datagram(from, bytes);
+            let msg2 = match inbound {
+                Inbound::Handshake { from, packet, .. } => c
+                    .peer
+                    .borrow_mut()
+                    .accept_handshake(from, &PSK, &packet, 0)
+                    .expect("message 2 is the peer's real answer"),
+                _ => panic!("run_handshake must have sent a handshake message 1"),
+            };
+            let out = c.peer.borrow().route_outbound(c.us, msg2);
+            c.peer_transport
+                .send(out.peer, out.packet)
+                .expect("the answer rides the channel back");
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    for _ in 0..80 {
+        if done.get().is_some() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        done.get(),
+        Some(true),
+        "run_handshake must complete for a live attempt the peer answered"
+    );
+    assert!(
+        c.leaf.inner.borrow().node.has_session(c.peer_id),
+        "and install the direct session it negotiated"
+    );
+    c.leaf.close();
 }
 
 /// A routed establishment that was retired installs nothing
@@ -1150,14 +1246,62 @@ async fn a_retired_routed_establishment_installs_nothing_afterwards() {
     );
     control.leaf.close();
 
+    // The production failure path itself: `ensure_relayed_session`'s
+    // own 5 s wait over a real open channel with nobody answering
+    // message 1. The previous leg hand-invoked
+    // `revoke_routed_handshake` + `clear_peer_relay` — the wait's
+    // cleanup — instead of driving the path that performs it.
     let p = pair();
-    let (routed, msg2) = routed_exchange(&p, noise_of(&p));
-    // What the failed wait does: revoke the ownership AND clear
-    // the addressing.
+    p.install_session();
+    let d = p.offer(20_000).await;
+    p.open_channel(d).await;
+    // A channel with no session is exactly the routed-establishment
+    // shape this wait exists for.
     with_node(&p.leaf.inner, |guard| {
-        guard.revoke_routed_handshake(p.peer_id, routed);
-        guard.node.clear_peer_relay(p.peer_id);
+        guard
+            .node
+            .drop_session(p.peer_id, "the transport lives; the session does not");
     });
+    assert!(!p.leaf.inner.borrow().node.has_session(p.peer_id));
+    let failed = p
+        .leaf
+        .ensure_relayed_session(p.peer_id, p.peer_id, &PSK, &noise_of(&p))
+        .await;
+    assert!(
+        failed.is_err(),
+        "nobody answered message 1: the wait must fail"
+    );
+    assert!(
+        p.leaf.inner.borrow().handshakes.get(&p.peer_id).is_none(),
+        "the failed wait revoked the routed establishment's ownership"
+    );
+    assert!(
+        p.leaf.inner.borrow().node.peer_relay(p.peer_id).is_none(),
+        "and cleared the relay addressing"
+    );
+    assert!(
+        !p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "and installed nothing"
+    );
+    assert_eq!(p.terms(), 0, "and nothing is counted for it");
+
+    // The delayed arrival — the message 2 the peer really signed for
+    // the message 1 that wait put on the wire, delivered after the
+    // retirement. However valid, it must install nothing.
+    let (from, wrapped) = p
+        .peer_inbox
+        .borrow_mut()
+        .pop_front()
+        .expect("the routed message 1 rode the channel to the peer");
+    let inbound = p.peer.borrow_mut().classify_datagram(from, wrapped);
+    let msg2 = match inbound {
+        Inbound::Handshake { from, packet, .. } => p
+            .peer
+            .borrow_mut()
+            .accept_handshake(from, &PSK, &packet, 0)
+            .expect("message 2 is the peer's real answer"),
+        _ => panic!("the wait's message 1 must arrive as a handshake packet"),
+    };
     with_node(&p.leaf.inner, |guard| {
         guard.on_handshake(p.peer_id, &msg2, true);
     });
@@ -1165,8 +1309,6 @@ async fn a_retired_routed_establishment_installs_nothing_afterwards() {
         !p.leaf.inner.borrow().node.has_session(p.peer_id),
         "a retired routed establishment must install nothing, whatever arrives"
     );
-    assert!(p.leaf.inner.borrow().node.peer_relay(p.peer_id).is_none());
-    assert_eq!(p.terms(), 0, "and nothing is counted for it");
     p.leaf.close();
 }
 
@@ -1291,7 +1433,7 @@ async fn a_promotion_whose_attempt_was_superseded_is_credited_to_nobody() {
     let mut in_flight = false;
     for _ in 0..80 {
         p.pump_peer();
-        if !p.leaf.inner.borrow().inbox.is_empty() {
+        if !p.leaf.inner.borrow().inbox.borrow().is_empty() {
             in_flight = true;
             break;
         }
@@ -1335,6 +1477,18 @@ async fn a_promotion_whose_attempt_was_superseded_is_credited_to_nobody() {
             .is_none(),
         "and the retired establishment's keys went with the attempt"
     );
+    // "Installs nothing" is read off the session table, not off
+    // `provisional_attempt(..).is_none()`: promotion CONSUMES the
+    // provisional keys, so a queued proof that installed a session
+    // would leave that assertion green too.
+    assert!(
+        !p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "the retired establishment's queued proof must install no session"
+    );
+    assert!(
+        p.leaf.inner.borrow().inbox.borrow().is_empty(),
+        "and nothing may be left queued that could still install one"
+    );
     p.leaf.close();
 }
 
@@ -1367,27 +1521,42 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
     for n in 0..over {
         p.deliver(dialog, SignalKind::Candidate, line(n));
     }
+    // The whole kept sequence, not one position plus a cardinality:
+    // a queue that evicted the oldest on overflow (keeping the newest
+    // N) satisfied both of the old assertions and kept exactly the
+    // entries this bound exists to preserve.
     assert_eq!(
         p.leaf
             .inner
             .borrow()
             .offers
             .get(&p.peer_id)
-            .map(|pending| pending.early.len()),
-        Some(HELD_CANDIDATES),
-        "the offer holds at most the bound"
+            .map(|pending| pending.early.iter().cloned().collect::<Vec<_>>()),
+        Some((0..HELD_CANDIDATES).map(line).collect::<Vec<_>>()),
+        "the offer holds at most the bound, keeps the EARLIEST arrivals, and \
+         keeps them in arrival order: host candidates come first and are \
+         what the interval this exists for is about"
     );
-    assert_eq!(
-        p.leaf
-            .inner
-            .borrow()
-            .offers
-            .get(&p.peer_id)
-            .and_then(|pending| pending.early.front().cloned()),
-        Some(line(0)),
-        "and it is the EARLIEST arrivals that are kept: host candidates \
-         come first and are what the interval this exists for is about"
-    );
+
+    // The third claimed fate — the drop is WARNED rather than silent —
+    // counted through a shim over `console.error`, the module's one
+    // console path (`console_error`), for the duration of the
+    // overflow below, and restored afterwards.
+    let console = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("console"))
+        .expect("console");
+    let original_error =
+        js_sys::Reflect::get(&console, &JsValue::from_str("error")).expect("console.error");
+    let warned = Rc::new(Cell::new(0usize));
+    let counting = warned.clone();
+    let shim = Closure::wrap(Box::new(move |_args: JsValue| {
+        counting.set(counting.get() + 1);
+    }) as Box<dyn FnMut(JsValue)>);
+    js_sys::Reflect::set(
+        &console,
+        &JsValue::from_str("error"),
+        shim.as_ref().unchecked_ref::<js_sys::Function>(),
+    )
+    .expect("install the console shim");
 
     // The live attempt's queue: held for want of a remote description.
     let q = pair();
@@ -1408,10 +1577,19 @@ async fn trickled_candidate_retention_is_bounded_in_both_queues() {
             .borrow()
             .peers
             .get(&q.peer_id)
-            .map(|dialog| dialog.deferred.len()),
-        Some(HELD_CANDIDATES),
-        "the attempt holds at most the bound, and the excess is dropped \
-         with a warning rather than queued"
+            .map(|dialog| dialog.deferred.iter().cloned().collect::<Vec<_>>()),
+        Some((0..HELD_CANDIDATES).map(line).collect::<Vec<_>>()),
+        "the attempt holds at most the bound, keeps the earliest arrivals in \
+         arrival order, and the excess is dropped rather than queued"
+    );
+    js_sys::Reflect::set(&console, &JsValue::from_str("error"), &original_error)
+        .expect("restore console.error");
+    drop(shim);
+    assert!(
+        warned.get() >= 1,
+        "the overflow drop must be warned rather than silent; console complaints \
+         counted: {}",
+        warned.get()
     );
     p.leaf.close();
     q.leaf.close();
@@ -1496,10 +1674,38 @@ fn carry_from(p: &Pair, peer_id: NodeId, peer: &mut crate::node::LeafNode) {
     let queued = peer.take_outbound();
     with_node(&p.leaf.inner, |guard| {
         for out in queued {
-            guard.inbox.push_back((peer_id, out.packet));
+            guard.inbox.borrow_mut().push_back((peer_id, out.packet));
         }
         guard.pump();
     });
+}
+
+/// The "absent means the anchor" rule at its PRODUCTION site.
+///
+/// `LeafNode::open_stream` resolves an unnamed open to the anchor
+/// (`options.peer.unwrap_or(guard.anchor)`). The browser witnesses'
+/// own backend repeats that rule by hand, and a fixture that copies a
+/// rule can silently diverge from the one a page actually hits — so
+/// the rule is also read here, off the RESOLVED peer of a real
+/// page-surface stream handle: an unnamed open reports the anchor,
+/// never peer 0.
+#[wasm_bindgen_test]
+fn an_unnamed_open_resolves_to_the_anchor_not_peer_zero() {
+    let p = pair();
+    p.install_session();
+    // Exactly what a page passes when it names no peer.
+    let opts = js_sys::JSON::parse(&format!(
+        "{{\"label\":\"app\",\"reliability\":\"reliable\"}}"
+    ))
+    .expect("a stream options object");
+    let handle = p.leaf.open_stream(opts).expect("an unnamed open is legal");
+    assert_eq!(
+        handle.peer_node_hex(),
+        format!("{:016x}", ANCHOR),
+        "an open that named no peer must report the peer production resolved it \
+         to — the anchor — and never peer 0"
+    );
+    p.leaf.close();
 }
 
 /// A stream options object as a page would pass one.

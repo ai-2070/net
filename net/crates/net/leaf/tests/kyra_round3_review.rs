@@ -148,7 +148,7 @@ fn kyra_reliable_fragment_head_promotes_consumer_before_faf_tail_traffic() {
     b.on_datagram(a.node_id(), pieces[1].packet.clone(), now);
     transfer(&mut b, &mut a);
     let events = b.drain_events();
-    assert!(events.iter().any(|e|matches!(e,LeafEvent::StreamData{payload,..} if payload.as_ref()==body.as_slice()))||events.iter().any(|e|matches!(e,LeafEvent::StreamFailed{..})),
+    assert!(events.iter().any(|e|matches!(e,LeafEvent::StreamData{payload,..} if payload.as_ref()==body.as_slice())),
         "all consistent reliable fragments arrived but consumer lost the message; events={events:?}");
 }
 #[test]

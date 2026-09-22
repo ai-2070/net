@@ -140,6 +140,11 @@ struct Log {
     /// How many times a backend was retired, and how many pending
     /// calls each retirement reported.
     shutdowns: Vec<usize>,
+    /// The event sink the factory was handed — the production surface
+    /// a leader's node events flow out through. Captured so a test
+    /// can drive an event through the real path instead of asserting
+    /// against a source that never fires.
+    sink: Option<EventSink>,
 }
 
 /// A node stand-in: records every request and answers it, unless the
@@ -191,7 +196,10 @@ impl LeaderBackend for TestBackend {
 /// of the moment did — including a leader that was promoted after the
 /// first one went away.
 fn factory(node_id: u64, log: Rc<RefCell<Log>>, hold_calls: bool) -> BackendFactory {
-    Rc::new(move |_opts, _sink, _lease| {
+    Rc::new(move |_opts, sink, _lease| {
+        // Captured before the first await: the sink is the seam a
+        // test drives an event through.
+        log.borrow_mut().sink = Some(sink);
         let log = log.clone();
         Box::pin(async move {
             let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
@@ -320,6 +328,55 @@ fn observed_factory(
                 abandonment.armed.set(false);
                 marks.resumed.set(marks.resumed.get() + 1);
             }
+            let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
+                node_id,
+                log,
+                hold_calls: false,
+            });
+            Ok(backend)
+        })
+    })
+}
+
+/// A factory that parks on `barrier`, then runs `hook` inside the
+/// very poll that resumes it, and only then completes with a real
+/// backend.
+///
+/// L1's seam. The promotion-close claim has exactly one
+/// discriminating schedule: the close lands while the factory is
+/// COMPLETING, so a backend exists and the only thing that can
+/// discard it is the post-await `closed` check. `marks` reports the
+/// same entered/resumed/abandoned triple `observed_factory` does, so
+/// the test can show the future ran past its barrier and was never
+/// dropped there — the discard was a refusal, not a cancellation.
+fn completing_factory(
+    node_id: u64,
+    log: Rc<RefCell<Log>>,
+    barrier: oneshot::Receiver<()>,
+    marks: Rc<BootstrapMarks>,
+    hook: Rc<dyn Fn()>,
+) -> BackendFactory {
+    let barrier = Rc::new(RefCell::new(Some(barrier)));
+    Rc::new(move |_opts, _sink, _lease| {
+        let log = log.clone();
+        let barrier = barrier.clone();
+        let marks = marks.clone();
+        let hook = hook.clone();
+        Box::pin(async move {
+            marks.entered.set(marks.entered.get() + 1);
+            let abandonment = Abandonment {
+                marks: marks.clone(),
+                armed: Cell::new(true),
+            };
+            let parked = barrier.borrow_mut().take();
+            if let Some(parked) = parked {
+                let _ = parked.await;
+            }
+            abandonment.armed.set(false);
+            marks.resumed.set(marks.resumed.get() + 1);
+            // Inside this very poll: whatever the hook does lands in
+            // the same turn as the factory's completion.
+            hook();
             let backend: Box<dyn LeaderBackend> = Box::new(TestBackend {
                 node_id,
                 log,
@@ -1043,9 +1100,17 @@ async fn the_generation_counter_is_monotonic_and_fences_a_stale_holder() {
         "this is the third enforcer of the fence, and the one a resumed tab \
          cannot talk its way past"
     );
-    assert!(
-        vault.fence(5).await.is_err(),
-        "nor a generation from the future"
+    assert_eq!(
+        vault
+            .fence(5)
+            .await
+            .expect_err("nor a generation from the future"),
+        LeafError::NotLeader {
+            presented: 5,
+            current: Some(4)
+        },
+        "a generation from the future is refused by the same typed fence, \
+         naming the one in force"
     );
 }
 
@@ -1195,6 +1260,25 @@ async fn closing_the_leader_promotes_a_follower_fails_its_calls_and_restores_its
         "the call must have reached the leader and be sitting there"
     );
 
+    // The premise the "not resurrected" claim below needs: the
+    // promoted tab DID hold a stream of its own before the handoff.
+    // With none ever opened, `!matches!(StreamOpen)` is true before
+    // and after any restoration logic and the assertion cannot fail.
+    let stream_opts = Object::new();
+    put(&stream_opts, "label", &JsValue::from_str("app"));
+    put(&stream_opts, "streamId", &JsValue::from_str("5"));
+    follower
+        .open_stream(&stream_opts.clone().into())
+        .await
+        .expect("the promoted tab holds a stream of its own before the handoff");
+    assert!(
+        leader_log.borrow().performed.iter().any(|request| matches!(
+            request,
+            LeaderRequest::StreamOpen { .. }
+        )),
+        "the premise: the stream open really happened"
+    );
+
     // The leader goes away. Timed from *before* the close, because
     // D2's budget starts at leader loss — the promoted tab's own
     // measurement can only start at the lock grant, and the
@@ -1309,8 +1393,13 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
     // The successor. Closing the first session is what a tab going
     // away does; the point of the test is what happens to the value
     // the first one still holds.
-    suspended.close();
-    settle().await;
+    // The successor, queued for the lock the resumed tab still holds.
+    // The point of the test is what happens to the value the first
+    // tab still holds after the store has moved on without it — the
+    // exact schedule of a tab frozen while holding its lock. (The
+    // previous takeover was `suspended.close()`, which made the final
+    // refusal leg's `Session(_)` arm a foregone conclusion: a closed
+    // session answers `Session(_)` whatever the fence does.)
     let successor = Lifecycle::open(
         opts(&db, &scope, &["chan"], &[]),
         factory(0x2222, log.clone(), false),
@@ -1318,12 +1407,31 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
     .await
     .expect("successor");
     settle().await;
-    assert_eq!(successor.role(), Role::Leader);
-    assert_eq!(successor.generation(), stale + 1);
+    assert_eq!(successor.role(), Role::Follower);
 
     // Enforcer three: storage refuses the generation the resumed tab
-    // still believes in, and names the one in force.
+    // still believes in, and names the one in force. The store moves
+    // on first — no proxy message reaches this tab, which is the
+    // point — and the fence's own caller (`guard_lease`) is what
+    // stands it down and hands the lock on.
     let vault = IdentityVault::open(&db).await.expect("open");
+    assert_eq!(
+        vault.next_generation().await.expect("the store moved"),
+        2,
+        "the store's generation moves without this tab hearing anything"
+    );
+    // One revalidation interval, plus slack.
+    wait_ms(1_600).await;
+    settle().await;
+    while successor.role() != Role::Leader {
+        settle().await;
+    }
+    settle().await;
+    assert_eq!(
+        successor.generation(),
+        stale + 2,
+        "the store's own move plus the successor's acquisition"
+    );
     let refused = vault
         .fence(stale)
         .await
@@ -1332,33 +1440,53 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
         refused,
         LeafError::NotLeader {
             presented: stale,
-            current: Some(stale + 1)
+            current: Some(successor.generation())
         }
     );
     vault
-        .fence(stale + 1)
+        .fence(successor.generation())
         .await
         .expect("the successor's generation is the one in force");
 
     // Enforcer two: the successor refuses a request stamped with the
-    // stale generation, and never performs it.
-    let before = log.borrow().performed.len();
-    let posted = net_leaf::leader::ProxyEnvelope {
-        generation: stale,
-        from: net_leaf::leader::ProxySide::Follower(0xFEED),
-        body: net_leaf::leader::ProxyBody::Request {
-            correlation: 1,
-            request: LeaderRequest::Call {
-                service: "stale".into(),
-                payload: Bytes::new(),
-                timeout_ms: None,
+    // stale generation, and never performs it. The positive control
+    // first: the same body from the same unregistered sender stamped
+    // with the generation IN FORCE must be served — without it, a
+    // server that dropped unknown senders (or ignored every proxied
+    // request) would keep the refusal leg below green.
+    let post = |generation: u64, service: &str| {
+        net_leaf::leader::ProxyEnvelope {
+            generation,
+            from: net_leaf::leader::ProxySide::Follower(0xFEED),
+            body: net_leaf::leader::ProxyBody::Request {
+                correlation: 1,
+                request: LeaderRequest::Call {
+                    service: service.into(),
+                    payload: Bytes::new(),
+                    timeout_ms: None,
+                },
             },
-        },
-    }
-    .to_json();
+        }
+        .to_json()
+    };
     let channel = web_sys::BroadcastChannel::new(&scope).expect("channel");
+    let before = log.borrow().performed.len();
     channel
-        .post_message(&JsValue::from_str(&posted))
+        .post_message(&JsValue::from_str(&post(
+            successor.generation(),
+            "control",
+        )))
+        .expect("post");
+    settle().await;
+    settle().await;
+    assert_eq!(
+        log.borrow().performed.len(),
+        before + 1,
+        "the control: the same sender stamped with the generation in force is served"
+    );
+    let before = log.borrow().performed.len();
+    channel
+        .post_message(&JsValue::from_str(&post(stale, "stale")))
         .expect("post");
     settle().await;
     settle().await;
@@ -1370,18 +1498,24 @@ async fn a_superseded_session_is_refused_by_the_leader_and_by_storage() {
     channel.close();
 
     // And the resumed session, asked to do anything, is refused
-    // rather than served.
+    // rather than served — by the fence that stood it down, not by a
+    // closed guard. The old disjunction accepted `Session(_)`, which
+    // the old `close()`-based takeover guaranteed: the leg could not
+    // fail on the fence axis at all. `suspended` is OPEN here; it
+    // stopped serving because the store moved past its generation.
+    let before = log.borrow().performed.len();
     let outcome = suspended
         .request(LeaderRequest::Counters)
         .await
-        .expect_err("a closed, superseded session must refuse");
+        .expect_err("a superseded session must refuse");
     assert!(
-        matches!(
-            outcome,
-            ProxyFailure::Typed(LeafError::Session(_))
-                | ProxyFailure::Typed(LeafError::NotLeader { .. })
-        ),
-        "expected a typed refusal, got {outcome:?}"
+        matches!(outcome, ProxyFailure::Typed(LeafError::NotLeader { .. })),
+        "expected the typed fence refusal, got {outcome:?}"
+    );
+    assert_eq!(
+        log.borrow().performed.len(),
+        before,
+        "and nothing may be served while refusing"
     );
 
     successor.close();
@@ -1761,13 +1895,16 @@ async fn an_explicitly_retired_leader_goes_quiet_at_its_peer_while_its_page_stay
 
     // The predecessor is still here, and says so: a retired owner
     // refuses rather than disappears.
-    assert_eq!(
-        leader
-            .request(LeaderRequest::Counters)
-            .await
-            .expect_err("a closed session refuses")
-            .typed(),
-        Some(&LeafError::Session("the session is closed".into())),
+    // The typed refusal, not its prose: a reworded-but-correct
+    // message must not break this witness, and a differently-phrased
+    // wrong refusal must not pass it.
+    let refused = leader.request(LeaderRequest::Counters).await;
+    assert!(
+        matches!(
+            refused.expect_err("a closed session refuses").typed(),
+            Some(&LeafError::Session(_))
+        ),
+        "a retired owner refuses with the typed session refusal"
     );
     assert_eq!(
         leader.generation(),
@@ -1946,6 +2083,18 @@ async fn closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leade
     let scope = unique("promote-close-scope");
     let log = Rc::new(RefCell::new(Log::default()));
     let (release, parked) = oneshot::channel();
+    let marks = Rc::new(BootstrapMarks::default());
+
+    // The hook the completing factory runs in its own completion
+    // turn: close this tab. Bridged through a cell because the
+    // session does not exist when the factory is built.
+    let hook_target: Rc<RefCell<Option<Lifecycle>>> = Rc::new(RefCell::new(None));
+    let closing = hook_target.clone();
+    let hook = Rc::new(move || {
+        if let Some(session) = closing.borrow().as_ref() {
+            session.close();
+        }
+    });
 
     let first = Lifecycle::open(
         opts(&db, &scope, &[], &[]),
@@ -1959,18 +2108,24 @@ async fn closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leade
     // first invocation never happens, because it opens as a follower.
     let second = Lifecycle::open(
         opts(&db, &scope, &[], &[]),
-        delayed_factory(0x2222, log.clone(), 0, Delay::Park, parked),
+        completing_factory(0x2222, log.clone(), parked, marks.clone(), hook),
     )
     .await
     .expect("second tab");
+    *hook_target.borrow_mut() = Some(second.clone());
     settle().await;
     assert_eq!(second.role(), Role::Follower);
 
     first.close();
     settle().await;
     // The promotion is now parked inside the factory, with the lock
-    // granted to this tab.
-    second.close();
+    // granted to this tab. Releasing the barrier lets the factory run
+    // to completion — and the hook closes this tab in that same turn,
+    // so a backend EXISTS when the close lands. The only thing that
+    // can discard it is the post-await `closed` check: deleting that
+    // check leaves the sibling's pure-cancellation mechanism to
+    // explain this same outcome and reintroduces a lock-holding
+    // leader that refuses every operation.
     let _ = release.send(());
     settle().await;
     settle().await;
@@ -1984,6 +2139,22 @@ async fn closing_a_tab_during_its_promotion_never_publishes_a_lock_holding_leade
         log.borrow().performed.is_empty(),
         "and must perform nothing: {:?}",
         log.borrow().performed
+    );
+    // The mechanism, not just the outcome: the factory ran past its
+    // barrier and produced a backend (resumed), and was never dropped
+    // while parked (not abandoned). What happened to that backend is
+    // therefore the post-await refusal, and nothing else.
+    assert_eq!(marks.entered.get(), 1, "the factory was reached");
+    assert_eq!(
+        marks.resumed.get(),
+        1,
+        "the factory future RESUMED and produced a backend — the claim is that \
+         its result was discarded afterwards, not that it never ran"
+    );
+    assert_eq!(
+        marks.abandoned.get(),
+        0,
+        "and it must not be cancelled: the discard is a refusal, not a cancellation"
     );
 
     // The real test of the lock: somebody else can have it.
@@ -2396,6 +2567,24 @@ async fn a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
 
     let events = record_events(&second);
 
+    // The composed work, observed on the WIRE. `performed` alone can
+    // never fail this claim here — `Delay::Fail` never builds a
+    // backend, so nothing could reach `performed` whatever the
+    // promotion composed. The one place a half-built promotion's
+    // composed announcement surfaces is the broadcast channel, and
+    // this listener is it.
+    let wire = web_sys::BroadcastChannel::new(&scope).expect("wire listener");
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let collecting = seen.clone();
+    let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        if let Some(text) = event.data().as_string() {
+            collecting.borrow_mut().push(text);
+        }
+    }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+    wire.set_onmessage(Some(
+        on_message.as_ref().unchecked_ref::<js_sys::Function>(),
+    ));
+
     first.close();
     settle().await;
     let _ = release.send(());
@@ -2417,6 +2606,29 @@ async fn a_promotion_whose_backend_fails_reattaches_instead_of_stranding_the_tab
         "a promotion that failed must have published nothing: {:?}",
         failing_log.borrow().performed
     );
+    // The listener's own positive control: the promotion that DID
+    // succeed announces itself (0x3333 = 13107), so a silent
+    // listener cannot make the refusal below vacuous.
+    assert!(
+        seen.borrow().iter().any(|text| {
+            text.contains("\"kind\":\"leadership\"") && text.contains("\"node_id\":\"13107\"")
+        }),
+        "the wire listener must hear the promotion that succeeded: {:?}",
+        seen.borrow()
+    );
+    // And the failed tab (0x2222 = 8738) published NOTHING — not
+    // even the leadership announcement it was mid-composing.
+    assert!(
+        seen.borrow().iter().all(|text| {
+            !(text.contains("\"kind\":\"leadership\"") && text.contains("\"node_id\":\"8738\""))
+        }),
+        "a promotion that failed must have published nothing, not even the \
+         announcement it was mid-composing: {:?}",
+        seen.borrow()
+    );
+    wire.set_onmessage(None);
+    wire.close();
+    drop(on_message);
     assert_eq!(
         second.role(),
         Role::Follower,
@@ -2522,17 +2734,23 @@ async fn a_retained_stream_handle_cannot_address_a_same_id_successor() {
         .send(Uint8Array::from(&b"stale"[..]))
         .await
         .expect_err("a handle from generation 1 must not send on generation 2");
-    let message = JsValue::from(refused)
+    // Read off the REAL error object. (This used to run
+    // `Reflect::get(&JsValue::from_str(""), …)` — a property read on
+    // an empty string primitive — so the second stage was always
+    // `""` and the assert below accepted every failure at every
+    // stage as "the typed stale-generation one".)
+    let error = JsValue::from(refused);
+    let message = error
         .as_string()
         .or_else(|| {
-            Reflect::get(&JsValue::from_str(""), &JsValue::from_str("message"))
+            Reflect::get(&error, &JsValue::from_str("message"))
                 .ok()
                 .and_then(|value| value.as_string())
         })
         .unwrap_or_default();
     assert!(
-        message.is_empty() || message.contains("not the leader"),
-        "the refusal must be the typed stale-generation one: {message:?}"
+        message.contains("not the leader"),
+        "the refusal must be the typed stale-generation one, not any failure: {message:?}"
     );
     stale.close();
     settle().await;
@@ -2558,6 +2776,45 @@ async fn a_retained_stream_handle_cannot_address_a_same_id_successor() {
             .iter()
             .any(|request| matches!(request, LeaderRequest::StreamSend { .. })),
         "the positive must be restored, not merely the refusal proven"
+    );
+    // The event source, at last: the production sink this promotion's
+    // factory was handed, driven with one `stream_data` event for
+    // this stream's own key. With no event in flight, "the stale
+    // consumer stopped" was true by construction — nothing could
+    // reach either consumer.
+    let fresh_count = Rc::new(Cell::new(0usize));
+    {
+        let counting = fresh_count.clone();
+        let callback = Closure::wrap(Box::new(move |_json: JsValue| {
+            counting.set(counting.get() + 1);
+        }) as Box<dyn FnMut(JsValue)>);
+        fresh.on_message(
+            callback
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        );
+        callback.forget();
+    }
+    // The fixture's reply named the peer 0xfeed and the stream id 9 —
+    // its `unwrap_or` defaults for an open that named neither — and
+    // the filter is decimal, exactly as `to_json` writes it.
+    let event = format!(
+        "{{\"type\":\"stream_data\",\"peer_node\":\"{}\",\"incarnation\":\"1\",\
+         \"stream_id\":\"{}\",\"seq\":\"1\",\"payload\":\"aGk=\"}}",
+        0xfeed, 9
+    );
+    let sink = follower_log
+        .borrow()
+        .sink
+        .clone()
+        .expect("the promotion's factory was handed the production sink");
+    sink(&event);
+    settle().await;
+    assert_eq!(
+        fresh_count.get(),
+        1,
+        "the event source must actually fire for the current generation's consumer"
     );
     assert_eq!(
         delivered.get(),
@@ -2619,15 +2876,17 @@ async fn a_runtime_announcement_is_restored_by_the_promoted_tab() {
     }
     settle().await;
 
-    let performed = follower_log.borrow().performed.clone();
-    assert!(
-        performed.iter().any(|request| matches!(
-            request,
-            LeaderRequest::Announce { capabilities }
-                if capabilities.contains(&"cap:runtime".to_string())
-        )),
+    // The LAST announcement, not a hit somewhere in the log: the
+    // claim is "the announcement that was in force", and a cap
+    // published here and then narrowed away by a later reconcile is
+    // exactly the "silently reverted at the next handoff" defect,
+    // deferred one step.
+    assert_eq!(
+        last_announcement(&follower_log),
+        Some(vec!["cap:runtime".to_string()]),
         "the promoted tab must re-publish the announcement that was in force, \
-         and the application did not ask again: {performed:?}"
+         and the application did not ask again: {:?}",
+        follower_log.borrow().performed
     );
 
     follower.close();
@@ -3153,9 +3412,14 @@ async fn an_aborted_generation_transaction_is_a_typed_failure_and_moves_nothing(
         })
         .await
         .expect_err("an aborted transaction must not report a generation");
+    // The typed variant, not its prose: a reworded-but-correct
+    // message must not break this witness. The claim — a commit
+    // failure, not a success — is carried by the behavioural legs
+    // below: the rolled-back generation is unobservable and the store
+    // still works afterwards.
     assert!(
-        matches!(&aborted, LeafError::Identity(detail) if detail.contains("not committed")),
-        "the abort must arrive as the typed commit failure: {aborted:?}"
+        matches!(&aborted, LeafError::Identity(_)),
+        "the abort must arrive as the typed identity failure: {aborted:?}"
     );
 
     assert_eq!(
@@ -3268,8 +3532,11 @@ async fn a_tampered_identity_record_does_not_decrypt() {
         .load()
         .await
         .expect_err("a tampered record must not decrypt");
+    // The typed variant, not its prose. The claim itself is the
+    // behavioural half: the control above loads an untouched record
+    // through this same call, so what refuses here is the tamper.
     assert!(
-        matches!(&refused, LeafError::Identity(detail) if detail.contains("did not decrypt")),
+        matches!(&refused, LeafError::Identity(_)),
         "expected the typed decrypt refusal, got {refused:?}"
     );
 }
