@@ -763,11 +763,61 @@ device-side durable identity/intent persistence and install; `up --enroll`
 / `invite` / `join` CLI; release-binary inclusion and CI job for the live path;
 Unix execution. SDK CI auto-discovers the new binary.
 
-**Next:** the membership-only bundle — trust-domain PSK delivery checked against
-the invite's `TrustDomainId`, plus a signed membership-only receipt carrying no
-delegation, invocation or management right — and the device-side install that
-persists identity and intent before redeeming. Lifecycle fencing, selective subnet semantics and V2 exact-head
-acceptance remain open.
+**Membership bundle and durable device join (2026-09-23):**
+`sdk/src/enrollment/bundle.rs` and `sdk/src/enrollment/device.rs`, witnesses
+`sdk/tests/enrollment_join.rs`.
+
+- `MembershipReceipt` (`NMP1`, signature domain `net-mesh membership receipt
+  v1`) binds issuer, subject, invite digest, intent digest, trust domain,
+  relations and issue time. It is a record, not authority: no delegation chain,
+  permission token, invocation, management, organization, channel or subnet
+  right, and no gate consumes it.
+- `MembershipBundle` (`NMB1`) = receipt + trust-domain PSK + `MeshContact`
+  (socket address, mesh Noise static key, node id for `Mesh::connect_via`).
+  Delivered only inside the authenticated enrollment session. `verify_for`
+  checks the receipt signature and binds issuer, subject, both digests, trust
+  domain and relations to the device's invite and intent, and refuses a PSK
+  whose `TrustDomainId` is not the one signed into the invite. The contact is
+  not signed; it is authenticated by the session (and by the node's Noise key
+  when attaching). `Debug` redacts the PSK.
+- `MembershipIssuer` is the standard `BundleIssuer`: it refuses to deliver a
+  PSK outside the invite's trust domain (`Unavailable`) and refuses recovery
+  after a transport rotation (`RecoveryClosed`) instead of re-delivering a stale
+  or silently new secret. Membership revocation hooks belong to V3-4.
+- `DeviceJoin` persists the identity seed, signed invite and intent in a new
+  protected directory (core `EnrollmentStorage`, `NMDJ` checksummed snapshot)
+  **before any network use**; `redeem` recovers the same issuance on retry,
+  verifies the bundle, and persists it before reporting `Installed`. `open`
+  refuses corrupt or inconsistent state (checksum, invite signature, intent
+  binding, bundle re-verification) and never resets it. Installed is credential
+  state, not live admission.
+
+Validation (Windows): `enrollment_join` **8/8**, including the end-to-end
+journey: operator mesh started, clean device decodes the link, persists,
+redeems, restarts (service stopped — no network needed), then attaches to the
+running mesh with the delivered PSK via `connect_via` (operator peer count
+rises); the same contact with a different PSK is refused. All enrollment
+binaries plus `bootstrap_dep_boundary` **51/51**; SDK lib filter **55/55**; SDK
+clippy lib/all-targets, full-feature rustdoc, rustfmt and `git diff --check`
+clean. **Inverses** (restored byte-identically): dropping the bundle's
+trust-domain check, the receipt subject check, the receipt signature check, the
+issuer's trust-domain check, the issuer's recovery check, the device snapshot
+checksum (witnessed by altering the unsigned contact node id of an installed
+snapshot), and the device's own install-time verification (witnessed by a
+service that signs a valid receipt but delivers another domain's PSK) each
+failed their named witness. The last one initially passed against the
+honest-issuer journey alone; the dedicated wrong-domain witness was added to
+close that gap.
+
+Not included: CLI `up --enroll` / `invite` / `join`, the local control endpoint,
+profile integration, standing-PSK rotation and membership revocation, Unix
+execution and CI. Loopback single-process evidence only.
+
+**Next (V3-1 CLI):** the `up`-owned node and its owner-only local control
+endpoint, then `up --enroll` hosting `EnrollmentService` + `MembershipIssuer`
+over the node's own PSK and contact, `invite create/revoke/status` through that
+endpoint, and `join` over `DeviceJoin`. Lifecycle fencing, selective subnet
+semantics and V2 exact-head acceptance remain open.
 
 Tasks:
 1. Pin accepted V2 HEAD and verify its real completion evidence; map the final CLI contract into V3 commands.
