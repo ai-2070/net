@@ -1,0 +1,14 @@
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  h_64425bc75e3f3d 4167-4190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0a7491ae68cb160c6c93383fcf183d1f9c6ac7ac",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
