@@ -62,13 +62,17 @@ impl RpcHandler for PausedHandler {
     }
 }
 
-async fn send_first_fragment(server: &MeshNode, caller: &MeshNode, call_id: u64) {
+/// Publish up to `limit` fragments of a 22 000-byte response for `call_id`,
+/// in order, over the real reply path (stream 0xF123).
+/// `send_first_fragment` is `limit == 1`; the delayed-duplicate correlation
+/// sends the complete transfer.
+async fn send_response_fragments(server: &MeshNode, caller: &MeshNode, call_id: u64, limit: usize) {
     let channel = ChannelName::new(&format!(
         "partial.replies.{:016x}",
         caller.identity.entity_id().origin_hash()
     ))
     .unwrap();
-    let mut first = None;
+    let mut pieces = Vec::new();
     large_response::emit(
         RpcResponsePayload {
             status: RpcStatus::Ok,
@@ -76,36 +80,38 @@ async fn send_first_fragment(server: &MeshNode, caller: &MeshNode, call_id: u64)
             body: Bytes::from(vec![b'x'; 22_000]),
         },
         true,
-        |piece| {
-            if first.is_none() {
-                first = Some(piece);
-            }
-        },
+        |piece| pieces.push(piece),
     );
-    let mut frame = EventMeta::new(
-        DISPATCH_RPC_RESPONSE,
-        0,
-        server.identity.entity_id().origin_hash(),
-        call_id,
-        0,
-    )
-    .to_bytes()
-    .to_vec();
-    encode_rpc_route(&mut frame, channel.hash());
-    first.unwrap().encode_into(&mut frame);
-    assert!(matches!(
-        server
-            .try_publish_to_peer_bound(
-                caller.node_id(),
-                channel.hash(),
-                0xF123,
-                true,
-                &[Bytes::from(frame)],
-                server.peer_session_id(caller.node_id()),
-            )
-            .await,
-        PeerPublishOutcome::Sent
-    ));
+    for piece in pieces.into_iter().take(limit) {
+        let mut frame = EventMeta::new(
+            DISPATCH_RPC_RESPONSE,
+            0,
+            server.identity.entity_id().origin_hash(),
+            call_id,
+            0,
+        )
+        .to_bytes()
+        .to_vec();
+        encode_rpc_route(&mut frame, channel.hash());
+        piece.encode_into(&mut frame);
+        assert!(matches!(
+            server
+                .try_publish_to_peer_bound(
+                    caller.node_id(),
+                    channel.hash(),
+                    0xF123,
+                    true,
+                    &[Bytes::from(frame)],
+                    server.peer_session_id(caller.node_id()),
+                )
+                .await,
+            PeerPublishOutcome::Sent
+        ));
+    }
+}
+
+async fn send_first_fragment(server: &MeshNode, caller: &MeshNode, call_id: u64) {
+    send_response_fragments(server, caller, call_id, 1).await;
 }
 
 #[derive(Clone, Copy)]
@@ -288,9 +294,48 @@ async fn partial_call_cleanup(end: End) {
         "all fragment storage must be released"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "no handler retry");
-    // A delayed duplicate cannot recreate a retired pending entry.
+    // A delayed duplicate cannot recreate a retired pending entry. The
+    // duplicate has no state effect to wait on — that IS the property — so
+    // its processing is correlated through a LIVE control call on the same
+    // reply stream (review finding 17). The control call is registered
+    // FIRST, so no later registration can sweep state the duplicate
+    // creates; then the duplicate; then the control's completing fragment
+    // transfer — all on stream 0xF123 in publish order. The control call
+    // resolving with its reassembled 22 000-byte body is the real reply
+    // dispatcher having processed everything ahead of it, duplicate
+    // included, so the final (0, 0) is observed AFTER the duplicate was
+    // processed rather than vacuously before it.
     if matches!(end, End::Deadline | End::Drop | End::Cancel) {
+        let control = {
+            let caller = caller.clone();
+            let server_id = server.node_id();
+            tokio::spawn(async move {
+                caller
+                    .call(server_id, "partial", Bytes::new(), CallOptions::default())
+                    .await
+            })
+        };
+        let control_id = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("control call must reach the handler")
+            .expect("handler reports its call id");
         send_first_fragment(&server, &caller, call_id).await;
+        send_response_fragments(&server, &caller, control_id, usize::MAX).await;
+        let reply = tokio::time::timeout(Duration::from_secs(3), control)
+            .await
+            .expect("control response must be processed in-window")
+            .unwrap()
+            .expect("control call must complete");
+        assert_eq!(
+            reply.body.len(),
+            22_000,
+            "the control must ride the real fragment path"
+        );
+        assert_eq!(
+            pending.retained_for_test(),
+            (0, 0),
+            "a delayed duplicate must not recreate a retired pending entry"
+        );
     }
     release.notify_one();
     caller.shutdown().await.unwrap();
