@@ -447,6 +447,13 @@ impl EnrollmentLedger {
         self.revision
     }
 
+    /// Digest of the complete signed invite recorded for `invitation`, so a
+    /// redemption owner can require the presented invite to be that exact one.
+    pub fn invite_digest(&self, invitation: &InvitationId) -> Result<[u8; 32], LedgerError> {
+        self.fence()?;
+        Ok(self.records[self.by_invitation(invitation)?].invite_digest)
+    }
+
     /// Record a new invitation. Refuses duplicates, expired policy and capacity.
     pub fn offer(&mut self, spec: OfferSpec, now: u64) -> Result<OfferId, LedgerError> {
         self.fence()?;

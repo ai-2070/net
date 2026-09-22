@@ -2,7 +2,7 @@
 //! Signed membership invitation (`net-join:` link) and canonical redemption intent.
 //!
 //! A [`MembershipInvite`] binds, under one issuer signature: the full issuer
-//! identity, a named trust domain and its public [`TrustDomainId`], the UDP
+//! identity, a named trust domain and its public [`TrustDomainId`], the TCP
 //! enrollment endpoint and its Noise static key, a random single-use
 //! [`InvitationId`], the creation-time [`InvitationPolicy`], an optional intended
 //! device identity and the exact authorized [`Relation`] set. It carries **no**
@@ -162,7 +162,7 @@ fn take_relations(r: &mut Reader<'_>) -> Result<Vec<Relation>, InviteError> {
     Ok(out)
 }
 
-/// UDP address of the enrollment listener: `host:port`, where host is a DNS
+/// TCP address of the enrollment listener: `host:port`, where host is a DNS
 /// name, an IPv4 literal or a bracketed IPv6 literal and the port is required.
 /// No scheme, path or whitespace. The exact string is signed; the device resolves
 /// it, and authenticates the responder by [`EnrollmentKey`], never by the name.
@@ -238,7 +238,7 @@ pub struct InviteSpec {
     pub trust_domain_name: String,
     /// Public id of the PSK trust domain the redeemed device will join.
     pub trust_domain: TrustDomainId,
-    /// UDP address of the enrollment listener.
+    /// TCP address of the enrollment listener.
     pub endpoint: EnrollmentEndpoint,
     /// Noise static key the listener at `endpoint` must prove.
     pub enrollment_key: EnrollmentKey,

@@ -69,6 +69,12 @@ pub mod policy;
 // Signed membership invite (`net-join:`) and canonical redemption intent.
 pub mod invite;
 
+// PSK-free Noise enrollment session: protocol, responder key and client.
+pub mod redeem;
+
+// Enrollment redemption listener over the shared ledger.
+pub mod service;
+
 // Durable, issuer-bound invitation ledger for the same V3 path; not a verifier.
 // (Outer `///` docs here would resolve the module's intra-doc links in this scope.)
 pub mod store;

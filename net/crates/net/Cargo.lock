@@ -3368,6 +3368,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "snow",
  "str0m",
  "tempfile",
  "thiserror 2.0.20",
