@@ -280,6 +280,23 @@ impl ProvisionalBudget {
         self.enroll_requests += 1;
         Ok(())
     }
+
+    /// Admit one enrollment REQUEST: reserve its in-flight slot AND
+    /// charge its frame as ONE step (R3-A). A refusal consumes
+    /// NEITHER — a refused REQUEST must not spend one of the four,
+    /// and must not strand an in-flight reservation that nothing
+    /// will release. Composing the two fallible steps at the call
+    /// site (`charge().and_then(reserve())`) incremented the REQUEST
+    /// count even when the reservation then refused, permanently
+    /// burning one of the four the charge's own invariant promises.
+    pub fn admit_enroll_request(&mut self) -> Result<(), AdmissionRefusal> {
+        self.reserve_enrollment()?;
+        if let Err(e) = self.charge_enroll_request() {
+            self.release_enrollment();
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 /// Why an action was refused, by gate. Each variant has its own
@@ -453,6 +470,49 @@ mod tests {
 
     fn reply() -> String {
         enroll_reply_channel(CALLER)
+    }
+
+    /// R3-A: a refused enrollment REQUEST consumes NEITHER one of
+    /// the four frame charges NOR an in-flight reservation. Inverse:
+    /// the old `charge().and_then(reserve())` composition spent one
+    /// of the four on a REQUEST the reservation then refused.
+    #[test]
+    fn a_refused_enrollment_request_consumes_neither_budget() {
+        let mut budget = ProvisionalBudget::default();
+
+        // The one in-flight slot is held by a first admitted call.
+        assert_eq!(budget.admit_enroll_request(), Ok(()));
+        // A second REQUEST while that call is in flight is refused…
+        assert!(budget.admit_enroll_request().is_err());
+        assert_eq!(
+            budget.enroll_requests, 1,
+            "a refused REQUEST does not consume one of the four (R3-A)"
+        );
+        assert_eq!(
+            budget.inflight_enrollments, 1,
+            "the one real call keeps its reservation"
+        );
+
+        // …and a REQUEST past the four rolls back the reservation it
+        // took before charging refused.
+        budget.release_enrollment();
+        for _ in 0..MAX_ENROLL_REQUEST_FRAMES - 1 {
+            assert_eq!(budget.admit_enroll_request(), Ok(()));
+            budget.release_enrollment();
+        }
+        assert_eq!(budget.enroll_requests, MAX_ENROLL_REQUEST_FRAMES);
+        assert!(
+            budget.admit_enroll_request().is_err(),
+            "four REQUEST frames is the whole allowance"
+        );
+        assert_eq!(
+            budget.inflight_enrollments, 0,
+            "the refused call must not strand a reservation nothing will release"
+        );
+        assert_eq!(
+            budget.enroll_requests, MAX_ENROLL_REQUEST_FRAMES,
+            "and must not spend a fifth frame"
+        );
     }
 
     #[test]

@@ -510,6 +510,14 @@ struct Attempt {
     /// accounted against (R2): the token's own incarnation, NOT the
     /// unverified `node_id` the caller claimed.
     budget_id: u64,
+    /// Which trickle socket currently owns this attempt's lifecycle
+    /// (R1): bumped at every authorized upgrade. The token
+    /// re-upgrades — a reconnecting browser reuses it — so "whoever
+    /// retires the token first" is not "whoever abandoned the
+    /// attempt": a stale socket's delayed close must not end its
+    /// successor's live attempt. Only the CURRENT socket generation
+    /// may end the dialog.
+    socket: u64,
 }
 
 /// The live attempts, keyed by token.
@@ -539,6 +547,7 @@ impl Attempts {
                 dialog,
                 incarnation,
                 budget_id,
+                socket: 0,
             },
         );
         Some((token, budget_id))
@@ -547,15 +556,34 @@ impl Attempts {
     /// The attempt this token authorizes, if it names exactly this
     /// `(node, dialog)`. A token for another tuple is as good as no
     /// token.
+    ///
+    /// This upgrade SUPERSEDES any earlier socket's ownership (R1):
+    /// the returned `socket` is this upgrade's generation, and only
+    /// it may retire the attempt when its socket closes.
     fn authorize(&self, token: &str, node_id: u64, dialog: u64) -> Option<Attempt> {
-        let guard = self.by_token.lock();
-        let attempt = guard.get(token)?;
-        (attempt.node_id == node_id && attempt.dialog == dialog).then(|| attempt.clone())
+        let mut guard = self.by_token.lock();
+        let attempt = guard.get_mut(token)?;
+        if attempt.node_id != node_id || attempt.dialog != dialog {
+            return None;
+        }
+        attempt.socket += 1;
+        Some(attempt.clone())
     }
 
     /// Retire a token; `true` when this call owned the removal.
     fn retire(&self, token: &str) -> bool {
         self.by_token.lock().remove(token).is_some()
+    }
+
+    /// Retire a token on behalf of socket generation `socket`;
+    /// `true` when this call owned the removal. Only the CURRENT
+    /// socket generation may end its attempt: a stale socket's
+    /// delayed close used to `retire` first and end its successor's
+    /// live attempt mid-ICE.
+    fn retire_socket(&self, token: &str, socket: u64) -> bool {
+        let mut guard = self.by_token.lock();
+        let owns = guard.get(token).is_some_and(|a| a.socket == socket);
+        owns && guard.remove(token).is_some()
     }
 }
 
@@ -1326,6 +1354,7 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
         node_id,
         dialog,
         incarnation,
+        socket: socket_gen,
         ..
     } = attempt;
     tracing::debug!(
@@ -1397,7 +1426,7 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
                         reason: e.to_string().into(),
                     })))
                     .await;
-                state.attempts.retire(&token);
+                state.attempts.retire_socket(&token, socket_gen);
                 return;
             }
         }
@@ -1405,12 +1434,14 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
     // The browser went away before the channel opened; do not leave
     // the attempt holding a budget slot until its deadline.
     //
-    // **Only the socket that holds the token may do this** (R1).
-    // `retire` returns whether THIS call owned the removal, so a
-    // second socket for the same token — or a late close after the
-    // attempt was already retired — cannot end an attempt twice, and
-    // a socket that never held the token never reaches here at all.
-    if state.attempts.retire(&token) {
+    // **Only the CURRENT socket generation may do this** (R1). The
+    // token re-upgrades — a reconnecting browser reopens the same
+    // attempt over a new socket — so "whoever holds the token" is
+    // not enough: a stale socket's delayed close must not end its
+    // successor's live attempt. `retire_socket` returns whether THIS
+    // call owned the removal, so a superseded socket — or a late
+    // close after the attempt was already retired — ends nothing.
+    if state.attempts.retire_socket(&token, socket_gen) {
         state.node.end_bootstrap_dialog(node_id, dialog).await;
     }
 }

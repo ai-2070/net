@@ -1674,3 +1674,66 @@ async fn a_claimant_is_not_promoted_by_another_peers_enrollment() {
         "exactly one promotion — the caller's"
     );
 }
+
+/// §12: identity proof (`SUBPROTOCOL_IDENTITY_PROOF`, `0x0A01`) is
+/// denied BEFORE effects for a provisional session — the same gate
+/// the `0x0D02` arm runs. The dispatch used to run UNGATED: a
+/// provisional `ChallengeRequest` allocated challenge state and
+/// minted a signed `Challenge`, and its `Proof` installed
+/// `peer_entity_ids[from_node]` — the pinned identity gate 4 exists
+/// to keep a provisional peer from having — which then won over the
+/// session-bound origin in `provisional_reply_origin`, breaking one
+/// session, one identity.
+///
+/// Inverse: drop the gate and the provisional client's proof
+/// COMPLETES below (`Ok`) and installs the pin — both assertions go
+/// red. The admitted pair is the positive control for the absence:
+/// the same exchange succeeds whenever §12 has no objection, so the
+/// refusal is the gate and not an exchange nobody can run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn identity_proof_is_denied_before_effects_for_a_provisional_session() {
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    assert!(
+        anchor.peer_entity_id(client_id).is_none(),
+        "premise: a provisional peer has no pinned identity"
+    );
+    let before = anchor.rtc_stats().admission_refused_deliver();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.prove_identity_to(anchor.node_id()),
+    )
+    .await
+    .expect("the exchange is bounded");
+    assert!(
+        outcome.is_err(),
+        "a provisional session's identity proof must not complete — pre-enrollment \
+         it may mint neither challenges nor pins"
+    );
+    assert!(
+        anchor.rtc_stats().admission_refused_deliver() > before,
+        "the refusal is counted at its named gate"
+    );
+    assert!(
+        anchor.peer_entity_id(client_id).is_none(),
+        "and no identity pin is installed for a provisional session"
+    );
+
+    // Positive control: the same exchange between two admitted
+    // nodes completes and installs exactly the pin the gate above
+    // withholds.
+    let a = node(Some(rtc_config())).await;
+    let b = node(Some(rtc_config())).await;
+    a.start();
+    b.start();
+    let _ = connect_rtc_loopback(&a, &b).await.expect("rtc pair");
+    tokio::time::timeout(Duration::from_secs(15), b.prove_identity_to(a.node_id()))
+        .await
+        .expect("the exchange is bounded")
+        .expect("an admitted peer proves its identity to its peer");
+    assert!(
+        a.peer_entity_id(b.node_id()).is_some(),
+        "the pin is exactly what the gate keeps a provisional session from installing"
+    );
+}

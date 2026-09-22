@@ -162,11 +162,55 @@ async fn rtc_ingress_preserves_per_source_order_through_one_owner() {
     a.send_to_peer_node(b.node_id(), &batch(0, N, "order"))
         .await
         .expect("send_to_peer_node");
-    let seen = drain_until(&b, N, Duration::from_secs(15)).await;
-    assert!(
-        seen >= N,
-        "expected {N} events over one DataChannel, saw {seen}"
+
+    // Ordering is asserted PER INPUT — the doc's claim. The batch
+    // input's own sequence numbers must arrive contiguous and
+    // ascending: exactly 0..N, in order. The previous probe counted
+    // `seen >= N`, which absorbs reordering AND duplicate delivery —
+    // a count says "enough arrived", never "they arrived in sequence".
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut batch_indices = Vec::new();
+    let mut stream_indices = Vec::new();
+    while tokio::time::Instant::now() < deadline && batch_indices.len() < N {
+        let result = b.poll_shard(0, None, 256).await.expect("poll_shard");
+        for event in &result.events {
+            let Ok(text) = event.raw_str() else {
+                continue;
+            };
+            if text.contains("\"order\"") {
+                let value: serde_json::Value =
+                    serde_json::from_str(text).expect("a batch event is JSON");
+                let index = value
+                    .get("index")
+                    .or_else(|| value.pointer("/value/index"))
+                    .and_then(|index| index.as_u64())
+                    .expect("the batch event carries its index");
+                batch_indices.push(index);
+                continue;
+            }
+            // The stream input rides the same channel: sixteen
+            // identical bytes whose value is its sequence number.
+            if event.raw.len() == 16 && event.raw.iter().all(|byte| *byte == event.raw[0]) {
+                stream_indices.push(u64::from(event.raw[0]));
+            }
+        }
+        if result.events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    assert_eq!(
+        batch_indices,
+        (0..N as u64).collect::<Vec<_>>(),
+        "the batch input's sequence numbers must arrive contiguous and ascending \
+         (0..{N}) — per input, not across the two inputs"
     );
+    if !stream_indices.is_empty() {
+        assert_eq!(
+            stream_indices,
+            (0..stream_indices.len() as u64).collect::<Vec<_>>(),
+            "and the stream input's own sequence must be too: {stream_indices:?}"
+        );
+    }
 
     let stats = b.rtc_stats();
     assert_eq!(

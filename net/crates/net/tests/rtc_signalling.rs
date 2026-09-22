@@ -643,10 +643,16 @@ async fn the_full_section_9_sequence_with_the_three_part_witness() {
          left half-working"
     );
     let b_a = a.node_id();
+    // B's own cleanup, asserted instead of disjoined with its own
+    // negation — the previous `is_none() || is_some()` was true by
+    // construction, leaving "B eventually cleans up" with no witness
+    // at all while the roster implied the whole sequence was checked.
+    // The window is the FAILURE budget, not the expected latency: the
+    // RTC driver reports a dead channel to the mesh on close (R3-E),
+    // so a healthy run settles this in milliseconds.
     assert!(
-        wait_for(|| b.peer_endpoint(b_a).is_none(), Duration::from_secs(10)).await
-            || b.peer_endpoint(b_a).is_some(),
-        "B's own cleanup is timeout-driven; either state is acceptable here"
+        wait_for(|| b.peer_endpoint(b_a).is_none(), Duration::from_secs(60)).await,
+        "B must eventually clean its own side up after the direct loss"
     );
 
     // Phase 4 — routed reconnection, and the counter moves again.
@@ -790,6 +796,10 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
     // was allowed to create an owner, so the slot came back and
     // stayed at 1 for ever. Ordering decided whether the run was
     // green; here the late frame is delivered explicitly.
+    // Captured BEFORE the send it bounds: a refusal counted between
+    // the send and the capture would otherwise make the `>` below a
+    // false red.
+    let unknown_before = a.rtc_stats().signal_unknown_dialog();
     b.send_rtc_signal(
         a.node_id(),
         &RtcSignalMsg::Candidate {
@@ -800,7 +810,6 @@ async fn a_reject_for_our_own_offer_correlates_and_releases() {
     )
     .await
     .expect("send a late candidate for the retired dialog");
-    let unknown_before = a.rtc_stats().signal_unknown_dialog();
     assert!(
         wait_for(
             || a.rtc_stats().signal_unknown_dialog() > unknown_before,
@@ -1015,7 +1024,7 @@ async fn kyra_unknown_candidates_cannot_own_dialog_budget() {
     );
     assert_eq!(
         slots, 0,
-        "ignored unknown candidates have no engine owner but retain reservations"
+        "ignored unknown candidates have no engine owner and must not retain reservations"
     );
 }
 #[test]

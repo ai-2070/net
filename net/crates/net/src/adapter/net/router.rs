@@ -663,7 +663,9 @@ pub struct NetRouter {
     packets_received: AtomicU64,
     packets_forwarded: AtomicU64,
     packets_local: AtomicU64,
-    packets_dropped: AtomicU64,
+    /// Shared with the send loop so its drops — including the
+    /// no-RTC-transport wiring-bug branch — stay counted.
+    packets_dropped: Arc<AtomicU64>,
     bytes_received: AtomicU64,
     bytes_forwarded: AtomicU64,
     total_latency_ns: AtomicU64,
@@ -700,11 +702,14 @@ fn submit_rtc_with_one_retry(
     rtc: &arc_swap::ArcSwapOption<super::rtc::RtcTransport>,
     packet: &[u8],
     id: super::rtc::RtcPeerId,
+    dropped: &AtomicU64,
 ) {
     let Some(rtc) = rtc.load_full() else {
         // No admission side installed: this is a wiring bug, not a
         // disposition. Count it rather than returning silently — R1
-        // was exactly this branch being taken in production.
+        // was exactly this branch being taken in production, with
+        // the packets it ate invisible to every counter.
+        dropped.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let first = match rtc.submit(packet, id) {
@@ -738,7 +743,7 @@ impl NetRouter {
             packets_received: AtomicU64::new(0),
             packets_forwarded: AtomicU64::new(0),
             packets_local: AtomicU64::new(0),
-            packets_dropped: AtomicU64::new(0),
+            packets_dropped: Arc::new(AtomicU64::new(0)),
             bytes_received: AtomicU64::new(0),
             bytes_forwarded: AtomicU64::new(0),
             total_latency_ns: AtomicU64::new(0),
@@ -1048,6 +1053,8 @@ impl NetRouter {
         let drop_counter = self.test_drop_counter.clone();
         #[cfg(feature = "webrtc")]
         let rtc = self.rtc.clone();
+        #[cfg(feature = "webrtc")]
+        let dropped = self.packets_dropped.clone();
 
         Some(tokio::spawn(async move {
             // Phase 0 instrument: latch the arm flag once; when armed, count
@@ -1118,7 +1125,7 @@ impl NetRouter {
                                 // counting the drop.
                                 #[cfg(feature = "webrtc")]
                                 PeerAddr::Rtc(id) => {
-                                    submit_rtc_with_one_retry(&rtc, &first.data, id);
+                                    submit_rtc_with_one_retry(&rtc, &first.data, id, &dropped);
                                 }
                             }
                         }
@@ -1166,7 +1173,7 @@ impl NetRouter {
                                 // whole-drain, so the UDP
                                 // measurements remain comparable.
                                 for packet in data {
-                                    submit_rtc_with_one_retry(&rtc, packet, id);
+                                    submit_rtc_with_one_retry(&rtc, packet, id, &dropped);
                                 }
                                 if measure_drain {
                                     record_batch_flush(data.len() as u64);
@@ -1350,6 +1357,32 @@ impl std::error::Error for RouterError {}
 mod tests {
     use super::super::protocol::NetHeader;
     use super::*;
+
+    /// R1's shape again: a queued RTC packet with no admission side
+    /// installed is a WIRING bug, and the drop must leave a count —
+    /// the uncounted version of this branch is how thousands of
+    /// packets disappeared under one reported refusal. Inverse:
+    /// remove the `fetch_add` and the counter stays 0.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_packet_dropped_for_a_missing_rtc_transport_is_counted() {
+        let rtc = arc_swap::ArcSwapOption::from(None);
+        let dropped = AtomicU64::new(0);
+        submit_rtc_with_one_retry(
+            &rtc,
+            b"x",
+            super::super::rtc::RtcPeerId {
+                slot: 0,
+                generation: 0,
+            },
+            &dropped,
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "a drop for a missing RTC transport must be counted, not silent"
+        );
+    }
 
     #[test]
     fn test_fair_scheduler_basic() {

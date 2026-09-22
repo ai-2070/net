@@ -99,14 +99,48 @@ fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(CERT_FILE), dir.join(KEY_FILE))
 }
 
-/// Read a cached pair, **qualified** (R4b): it must parse, cover
-/// `domain`, and be inside its validity window at `now`.
+/// Does `private` belong to `leaf`? (R4, round two.)
+///
+/// The pair on disk is two files published by two renames, so a
+/// crash between the renames can leave a NEW half beside an OLD one.
+/// The reader must reject such a pair — "the leaf will not verify
+/// against the key" was claimed but never checked, so the torn pair
+/// was served and bricked every subsequent start. The public key the
+/// private key derives must equal the leaf's `subjectPublicKeyInfo`
+/// bits; a key that cannot be parsed answers conservatively (`false`)
+/// — an unverifiable pair is a rejected pair.
+fn key_matches_leaf(
+    leaf: &rustls::pki_types::CertificateDer<'_>,
+    private: &rustls::pki_types::PrivateKeyDer<'_>,
+) -> bool {
+    use x509_parser::prelude::*;
+    let Ok((_, parsed)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return false;
+    };
+    let Ok(pair) = rcgen::KeyPair::try_from(private) else {
+        return false;
+    };
+    parsed.public_key().subject_public_key.data == pair.public_key_raw()
+}
+
+/// Read the cached pair, requiring the two halves to MATCH.
+fn read_pair_checked(cert: &PathBuf, key: &PathBuf) -> Option<Chain> {
+    let (chain, private) = read_pem_pair(cert, key).ok()?;
+    if !key_matches_leaf(chain.first()?, &private) {
+        return None;
+    }
+    Some((chain, private))
+}
+
+/// Read a cached pair, **qualified** (R4b): its two halves must
+/// match each other, it must parse, cover `domain`, and be inside
+/// its validity window at `now`.
 fn read_cache(dir: &Path, domain: &str, now: u64) -> Option<Chain> {
     let (cert, key) = cache_paths(dir);
     if !cert.exists() || !key.exists() {
         return None;
     }
-    let (chain, private) = read_pem_pair(&cert, &key).ok()?;
+    let (chain, private) = read_pair_checked(&cert, &key)?;
     let leaf = chain.first()?;
     let (covers, not_before, not_after) = qualify_leaf(leaf, domain)?;
     // **The WHOLE window** (R4, round two): a leaf whose validity
@@ -171,23 +205,31 @@ fn name_matches(name: &str, domain: &str) -> bool {
 /// `not_after - horizon`, or `None` when there is nothing cached.
 pub(crate) fn renew_at(config: &AcmeConfig, horizon: Duration) -> Option<u64> {
     let (cert, key) = cache_paths(&domain_cache_dir(config));
-    let (chain, _) = read_pem_pair(&cert, &key).ok()?;
+    let (chain, _private) = read_pair_checked(&cert, &key)?;
     let (_, _, not_after) = qualify_leaf(chain.first()?, &config.domain)?;
     Some(not_after.saturating_sub(horizon.as_secs()))
 }
 
-/// Publish a new pair **without destroying a usable old one**
-/// (R4, round two).
+/// Publish a new pair, **key first** (R4, round two).
 ///
 /// The old shape wrote the certificate over the live one and then
 /// deleted the key to recreate it: an I/O failure in between left a
 /// new certificate beside a deleted key, and the process could not
 /// restart on either. Both halves are now written to siblings first
 /// — the key created 0600 from inception, as before — and only when
-/// BOTH are on disk are they renamed into place. A crash leaves the
-/// previous pair intact; a crash after the first rename leaves a
-/// mismatched pair, which `read_cache` rejects (the leaf will not
-/// verify against the key) and the next order replaces.
+/// BOTH are on disk is either renamed into place, so an I/O failure
+/// during the writes leaves the previous pair intact.
+///
+/// Two files cannot be renamed in one step, so a CRASH between the
+/// renames still tears the pair — which is why [`read_cache`]
+/// verifies the key against the leaf and REJECTS a torn pair (the
+/// self-healing the previous doc claimed without implementing), so
+/// the next order replaces it. The KEY goes first so the one
+/// unrecoverable tear — a published certificate whose matching key
+/// was then deleted, the old cert-first order's error arm — cannot
+/// occur; on a failed second rename the unpublished certificate
+/// (`cert_tmp`) is kept, being the only file that still matches the
+/// published key.
 fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), BootstrapError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", dir.display())))?;
@@ -198,14 +240,17 @@ fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), Bootstra
     std::fs::write(&cert_tmp, cert_pem)
         .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", cert_tmp.display())))?;
     write_private_key(&key_tmp, key_pem)?;
-    std::fs::rename(&cert_tmp, &cert).map_err(|e| {
+    std::fs::rename(&key_tmp, &key).map_err(|e| {
+        // Nothing was published: the old pair is intact, and the
+        // half-written siblings go away.
         let _ = std::fs::remove_file(&cert_tmp);
         let _ = std::fs::remove_file(&key_tmp);
-        BootstrapError::Acme(format!("publishing {}: {e}", cert.display()))
-    })?;
-    std::fs::rename(&key_tmp, &key).map_err(|e| {
-        let _ = std::fs::remove_file(&key_tmp);
         BootstrapError::Acme(format!("publishing {}: {e}", key.display()))
+    })?;
+    std::fs::rename(&cert_tmp, &cert).map_err(|e| {
+        // The key half is already published and the old pair is
+        // torn. `cert_tmp` is KEPT — it matches the published key.
+        BootstrapError::Acme(format!("publishing {}: {e}", cert.display()))
     })?;
     Ok(())
 }
@@ -702,6 +747,44 @@ mod tests {
         // observation writes the file.
         write_private_key_verified(&key, "PEM", |_| Ok(0o600)).expect("write");
         assert_eq!(std::fs::read_to_string(&key).unwrap(), "PEM");
+    }
+
+    /// R4, round two: the cached pair must MATCH. A crash between
+    /// the two publication renames leaves a mixed pair on disk, and
+    /// the reader must reject it in either direction — that rejection
+    /// is the "next order replaces" self-healing the doc claims. The
+    /// matching pair is the positive control. Inverse: the pre-fix
+    /// `read_cache` never compared key to leaf and served the torn
+    /// pair, bricking every subsequent start.
+    #[test]
+    fn a_torn_pair_is_rejected_in_either_direction_and_a_matching_pair_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cert_a, key_a) = issue_for("pair-check.example", 3600);
+        let (_, cert_b, key_b) = issue_for("pair-check.example", 3600);
+
+        // Control: the pair as issued is accepted.
+        write_cache(dir.path(), &cert_a, &key_a).expect("publish");
+        assert!(
+            read_cache(dir.path(), "pair-check.example", now_unix()).is_some(),
+            "a pair whose halves match must be served"
+        );
+
+        // The cert-first tear (the old publication order): a new
+        // certificate beside the old key.
+        write_cache(dir.path(), &cert_b, &key_a).expect("publish torn");
+        assert!(
+            read_cache(dir.path(), "pair-check.example", now_unix()).is_none(),
+            "a certificate that does not verify against the cached key is a \
+             torn pair and must be rejected, not served"
+        );
+
+        // The key-first tear (the new publication order): a new key
+        // beside the old certificate.
+        write_cache(dir.path(), &cert_a, &key_b).expect("publish torn");
+        assert!(
+            read_cache(dir.path(), "pair-check.example", now_unix()).is_none(),
+            "the other tear shape is rejected the same way"
+        );
     }
 
     /// A self-signed leaf for `name`, valid over an explicit window.

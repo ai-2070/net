@@ -26651,11 +26651,20 @@ impl MeshNode {
         // channel opened, which is `ice_failed` and not
         // `ice_relayed`: the attempt did not run out of time, it
         // lost its peer.
-        if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
-            driver.stats().note_ice_failed();
-            let _ = driver.close(entry.peer).await;
+        //
+        // The budget release is part of that same terminal: it runs
+        // ONLY when this call removed the row. A late close finding
+        // nothing used to `release_signal_budget` anyway — releasing
+        // a reservation the completion owner (or a successor socket
+        // on the same attempt) still owns, and ending the dialog in
+        // the frame budget while its install was in flight.
+        if let Some(entry) = entry {
+            if let Some(driver) = self.rtc_driver.as_ref() {
+                driver.stats().note_ice_failed();
+                let _ = driver.close(entry.peer).await;
+            }
+            self.release_signal_budget(claimed_node_id, dialog);
         }
-        self.release_signal_budget(claimed_node_id, dialog);
     }
 
     /// The §12 global provisional bound this anchor was configured
@@ -29502,6 +29511,26 @@ impl MeshNode {
         // field — every identity decision below keys on it. Each event
         // is one independent leg, so iterating the frame is safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_IDENTITY_PROOF {
+            // **§12: denied before effects for a provisional
+            // session** — the same gate and the same reason as the
+            // `0x0D02` arm's R1. `BootstrapAction` models no
+            // identity-proof frame and this arm used to run UNGATED:
+            // a provisional session's `ChallengeRequest` allocated
+            // challenge state and minted a signed `Challenge`, and a
+            // `Proof` installed `peer_entity_ids[from_node]` — the
+            // pinned identity the §12 invariant says cannot exist
+            // (gate 4 keeps a provisional peer from installing one),
+            // which then WINS over the session-bound origin in
+            // `provisional_reply_origin`, breaking one-session-one-
+            // identity. Identity proof is what an ADMITTED peer uses
+            // to bind its entity to its session; an unenrolled one
+            // has no business minting pins. (The gate is the `webrtc`
+            // admission layer: without the feature there is no
+            // provisional class to refuse.)
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_identity_proof_message(&payload, from_node, ctx);
@@ -37907,10 +37936,7 @@ impl MeshNode {
             else {
                 return true;
             };
-            budget
-                .charge_enroll_request()
-                .and_then(|()| budget.reserve_enrollment())
-                .is_err()
+            budget.admit_enroll_request().is_err()
         };
         if refused {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
@@ -48846,14 +48872,21 @@ impl Adapter for MeshNode {
         // Send to the first connected peer. For a real mesh, this should
         // use the routing table to pick the right peer based on the
         // event's destination. For now, round-robin or first-match.
-        let peer_addr = self
+        //
+        // By NODE ID, through the total `PeerAddr` match — not by a
+        // `udp()` address. After the `PeerAddr` refactor `.udp()` is
+        // `None` for RTC and routed-RTC peers, and DashMap iteration
+        // order is unspecified, so picking by `udp()` failed this
+        // publish flakically ("no peers connected" with peers on the
+        // map) and could never deliver to an RTC peer at all.
+        let node = self
             .peers
             .iter()
             .next()
-            .and_then(|e| e.value().addr().udp())
+            .map(|e| *e.key())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
-        self.send_to_peer(peer_addr, &batch).await
+        self.send_to_peer_node(node, &batch).await
     }
 
     async fn flush(&self) -> Result<(), AdapterError> {
