@@ -33,7 +33,7 @@ import {
   SNAP_ENVELOPE_RESERVE,
 } from '../../src/store/chunker.js';
 import { StoreError } from '../../src/store/errors.js';
-import { decodeMessage, encodeMessage, MAX_SNAPSHOT_CHUNKS } from '../../src/store/wire.js';
+import { decodeMessage, encodeMessage, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_CHUNKS } from '../../src/store/wire.js';
 
 const H = 'a'.repeat(32);
 const INC = 'f'.repeat(16);
@@ -162,6 +162,34 @@ describe('the budget is derived from the transport, not assumed', () => {
     expect(() => assertChunkingFits(0)).toThrow(/no usable event size/);
   });
 
+  it('refuses a chunk size that cannot tile the snapshot bound', () => {
+    // The per-chunk floor alone admitted a transport whose chunks
+    // cannot cover `MAX_SNAPSHOT_BYTES` within `MAX_SNAPSHOT_CHUNKS`:
+    // the store started and then failed on its first large projection.
+    // The guard's own promise is "Refuse to start rather than discover
+    // the numbers later".
+    const floor = Math.ceil(MAX_SNAPSHOT_BYTES / MAX_SNAPSHOT_CHUNKS);
+
+    // 5675 B of event: 4110 B per chunk — above MIN_CHUNK_BYTES, but
+    // 4110 × 255 cannot cover a 1 MiB snapshot.
+    let thrown: unknown;
+    try {
+      assertChunkingFits(5675);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('capacity');
+    // Same shape deep inside the window: the floor passes, the product
+    // does not.
+    expect(() => assertChunkingFits(3000)).toThrow(StoreError);
+
+    // Positive control at the boundary: exactly enough per chunk
+    // starts, and reports the size it derived.
+    expect(assertChunkingFits(5676)).toBe(floor);
+    expect(floor).toBeGreaterThan(MIN_CHUNK_BYTES);
+  });
+
   it('keeps every frame inside the cap at the derived size', () => {
     // The reserve is a bound, so a full chunk plus the largest
     // plausible envelope still fits. `carry` asserts this per frame.
@@ -240,6 +268,42 @@ describe('the chunker refuses rather than truncates', () => {
 
   it('refuses a state that is not JSON', () => {
     expect(() => chunkSnapshot(() => 1, 1024)).toThrow(/not JSON/);
+  });
+
+  it('refuses a snapshot JSON would silently destroy', () => {
+    // `JSON.stringify` renders `NaN`/`Infinity` as `null` and drops an
+    // `undefined`-valued own key — the manifest would ship a document
+    // the owner never held, and the delta-overflow fallback is exactly
+    // this path. The scan that refuses this for `act`/`in`/`res`/
+    // `delta` payloads covers the snapshot document too.
+    const chunk = chunkBytesFor(MAX_EVENT_BYTES);
+    for (const bad of [
+      { n: Number.NaN },
+      { n: Number.POSITIVE_INFINITY },
+      { n: Number.NEGATIVE_INFINITY },
+    ]) {
+      let thrown: unknown;
+      try {
+        chunkSnapshot(bad, chunk);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(StoreError);
+      expect((thrown as StoreError).code).toBe('invalid-data');
+    }
+
+    // The dropped-key half of the same silent loss.
+    let thrown: unknown;
+    try {
+      chunkSnapshot({ u: undefined }, chunk);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StoreError);
+    expect((thrown as StoreError).code).toBe('invalid-data');
+
+    // Positive control: an intentional null is data and still ships.
+    expect(chunkSnapshot({ n: null }, chunk).n).toBe(1);
   });
 });
 
@@ -620,5 +684,131 @@ describe('reclamation', () => {
       expect(outcome).not.toHaveProperty('document');
     }
     expect(open.have).toBe(2);
+  });
+
+  it('refuses a replacement it cannot hold and leaves the predecessor’s reservation intact', () => {
+    // Regression witness (#27) for the non-destructive open refusal:
+    // the ceiling is checked BEFORE the predecessor is touched, with
+    // its reservation excluded from the sum. Reclaiming first
+    // destroyed the very assembly `assembly-too-large` then refused
+    // to replace — its waiting replica went with it, and the table
+    // lost the bytes the refusal was measured against.
+    const table = new AssemblyTable(1000);
+    const predecessor = table.open({ h: H, g: '1', r: '1', n: 2, bytes: '900' }, 0) as Assembly;
+
+    // A REPLACEMENT for the same `(h, g)` whose declared bytes do not
+    // fit even with the predecessor's reservation excluded:
+    // 900 − 900 + 1600 exceeds the 1000 ceiling.
+    const refused = table.open({ h: H, g: '1', r: '2', n: 2, bytes: '1600' }, 0);
+
+    expect((refused as { reason?: string }).reason).toBe('assembly-too-large');
+    // The predecessor is untouched: same instance, same reservation,
+    // and still accepting its chunks. A regression here (reclaim
+    // before the check) leaves `undefined`, 0 reserved, and a
+    // `chunk-wrong-assembly` refusal below.
+    expect(table.get(H, '1')).toBe(predecessor);
+    expect(table.bytesReserved).toBe(900);
+    expect(
+      predecessor.accept({ h: H, g: '1', r: '1', n: 2, i: 0, d: base64(new Uint8Array(300)) }, plainRecord, 0)
+        .ok,
+    ).toBe(true);
+  });
+});
+
+describe('the scan refuses what `stringify` would transform or throw on (#16)', () => {
+  const chunk = chunkBytesFor(MAX_EVENT_BYTES);
+  const Q = 'b'.repeat(16);
+
+  /** The refusal reason a snapshot carries, or null when it shipped. */
+  function refusal(state: unknown): string | null {
+    try {
+      chunkSnapshot(state, chunk);
+      return null;
+    } catch (error) {
+      expect(error).toBeInstanceOf(StoreError);
+      expect((error as StoreError).code).toBe('invalid-data');
+      return (error as StoreError).message;
+    }
+  }
+
+  it('refuses a `toJSON`-transformed value before serialization', () => {
+    // `toJSON` replaces its object wholesale during serialization —
+    // a `Date` ships as a string and an application object can ship
+    // anything at all — so what would leave is not what was held.
+    expect(refusal({ at: new Date(0) })).toMatch(/to-json-transform:state\.at/);
+    expect(refusal({ at: { toJSON: () => 'nothing like the value' } })).toMatch(
+      /to-json-transform:state\.at/,
+    );
+  });
+
+  it('refuses a `Map`/`Set`, whose entries serialize away', () => {
+    // `JSON.stringify(new Map(...))` is `{}`: the entries vanish
+    // silently and the replica installs a world the owner never held.
+    expect(refusal({ index: new Map([['ada', 1]]) })).toMatch(/map-or-set:state\.index/);
+    expect(refusal({ index: new Set([1]) })).toMatch(/map-or-set:state\.index/);
+  });
+
+  it('refuses an own symbol key, which serialization never writes', () => {
+    const keyed: Record<string, unknown> = { ok: 1 };
+    Object.defineProperty(keyed, Symbol('hidden'), { value: 2, enumerable: true });
+    expect(refusal({ keyed })).toMatch(/symbol-key:state\.keyed/);
+  });
+
+  it('refuses a cycle as `StoreError`, not as `stringify`’s `TypeError`', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic['self'] = cyclic;
+    expect(refusal({ cyclic })).toMatch(/circular:state\.cyclic\.self/);
+  });
+
+  it('refuses a `BigInt` as `StoreError` — the pre-scan `TypeError` class', () => {
+    let escaped: unknown;
+    try {
+      JSON.stringify({ n: 1n });
+    } catch (error) {
+      escaped = error;
+    }
+    // The control: the serializer's own escape is a bare `TypeError`.
+    // With the scan on the wrong side of serialization that escaped
+    // the store's error contract; now the named class is refused
+    // first and the serializer never sees it.
+    expect(escaped).toBeInstanceOf(TypeError);
+    expect(refusal({ n: 1n })).toMatch(/not-json:state\.n/);
+  });
+
+  it('refuses the same classes on `act`/`in`/`res`/`delta` payloads', () => {
+    // Parity with the snapshot document: one scan, both directions.
+    // The fixtures are deliberately outside `JsonValue` — the encoder
+    // must refuse them rather than transform them.
+    const aDate = new Date(0) as never;
+    const aMap = new Map([['ada', 1]]) as never;
+    const aSet = new Set([1]) as never;
+    expect(() =>
+      encodeMessage({ k: 'act', q: Q, h: H, s: '1', name: 'fire', in: { at: aDate } }),
+    ).toThrow(/to-json-transform/);
+    expect(() => encodeMessage({ k: 'in', h: H, s: '1', name: 'helm', in: { at: aMap } })).toThrow(
+      /map-or-set/,
+    );
+    expect(() => encodeMessage({ k: 'res', q: Q, h: H, s: '1', out: { at: aSet } })).toThrow(
+      /map-or-set/,
+    );
+    const bigintValue = 1n as unknown as number; // not JsonValue; the encoder must refuse it anyway
+    expect(() =>
+      encodeMessage({
+        k: 'delta',
+        h: H,
+        g: '1',
+        base: '1',
+        r: '2',
+        ops: [{ o: 'r', p: ['at'], val: bigintValue }],
+      }),
+    ).toThrow(/not-json/);
+    // And `chunkSnapshot` refuses the same BigInt the same way.
+    expect(refusal({ n: 1n })).toMatch(/not-json:state\.n/);
+  });
+
+  it('keeps the named NaN/Infinity/undefined refusals and admits null (controls)', () => {
+    expect(refusal({ n: Number.NaN })).toMatch(/non-finite-number:state\.n/);
+    expect(refusal({ u: undefined })).toMatch(/not-json:state\.u/);
+    expect(chunkSnapshot({ n: null }, chunk).n).toBe(1);
   });
 });

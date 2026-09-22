@@ -2056,6 +2056,83 @@ pub(crate) enum ScopedIngestDisposition {
     Retryable,
 }
 
+/// **#11: the endpoint-unresolvable refusal is counted — its own
+/// counter, per §12 gate family.**
+///
+/// A frame refused because its sender (or destination) has no
+/// installed `PeerInfo` — the eviction race `ingress_admission`
+/// documents — used to move NO counter at all: the fail-closed
+/// conversions `return`ed before the admission counters ran, while a
+/// policy refusal on the same arm was counted. `AdmissionRefusal`'s
+/// rule is that a refusal nobody can count is a refusal nobody can
+/// operate on, and the two causes must be attributable in both
+/// directions ("endpoint unresolvable" versus "policy refusal"), so
+/// this is the unresolvable-endpoint reason label with one counter
+/// per gate family — plumbed exactly like the sibling
+/// `note_admission_refused_*` seams on [`super::rtc::RtcStats`], and
+/// held here (mirroring router.rs's no-transport-drop counter)
+/// because every fail-closed `return` lives in this file.
+///
+/// Boundary: the operator surfaces consume `super::rtc::RtcStats`;
+/// promoting these three into `RtcStats` (and its leaf JSON mirror)
+/// is the documented follow-up, see the repair-pass report.
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Default)]
+struct UnresolvableEndpointRefusals {
+    /// Gate 1 family: forwarding (scoped/capability announcement
+    /// re-flood, rendezvous relay) refused for an unresolvable
+    /// sender or destination.
+    forward: AtomicU64,
+    /// Gate 3: subscription mutation from an unresolvable sender.
+    subscribe: AtomicU64,
+    /// Gate 4: announcement ingest from an unresolvable sender.
+    announce: AtomicU64,
+}
+
+#[cfg(feature = "webrtc")]
+impl UnresolvableEndpointRefusals {
+    /// Forwarding refused because the sender or destination has no
+    /// peer entry to gate on (§12 gate 1, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_forward(&self) {
+        self.forward.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_forward`]'s counter.
+    /// Witness-read, like `holds_bootstrap_dialog`; the operator
+    /// surface promotion is a documented boundary follow-up.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_forward(&self) -> u64 {
+        self.forward.load(Ordering::Relaxed)
+    }
+
+    /// Subscription mutation refused because the sender has no peer
+    /// entry to gate on (§12 gate 3, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_subscribe(&self) {
+        self.subscribe.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_subscribe`]'s counter.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_subscribe(&self) -> u64 {
+        self.subscribe.load(Ordering::Relaxed)
+    }
+
+    /// Announcement ingest refused because the sender has no peer
+    /// entry to gate on (§12 gate 4, the eviction race).
+    #[inline]
+    fn note_admission_refused_unresolvable_announce(&self) {
+        self.announce.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_admission_refused_unresolvable_announce`]'s counter.
+    #[cfg(test)]
+    fn admission_refused_unresolvable_announce(&self) -> u64 {
+        self.announce.load(Ordering::Relaxed)
+    }
+}
+
 /// outlives the dispatch call that scheduled it, so it cannot
 /// borrow.
 #[derive(Clone)]
@@ -2083,6 +2160,11 @@ struct DispatchCtx {
     rtc_signal_tx: Option<tokio::sync::mpsc::Sender<(u64, super::rtc::RtcSignalMsg)>>,
     #[cfg(feature = "webrtc")]
     rtc_stats: Option<Arc<super::rtc::RtcStats>>,
+    /// **#11:** the endpoint-unresolvable refusals of every §12 gate
+    /// family, counted where the fail-closed `return` lives. See
+    /// [`UnresolvableEndpointRefusals`].
+    #[cfg(feature = "webrtc")]
+    endpoint_unresolvable_refusals: Arc<UnresolvableEndpointRefusals>,
     #[cfg(feature = "webrtc")]
     forwarded_app_packets: Arc<DashMap<(u32, u64), u64>>,
     #[cfg(feature = "webrtc")]
@@ -11490,6 +11572,11 @@ pub struct MeshNode {
     /// key from here and releases the reservation that was actually
     /// taken.
     rtc_attempt_keys: Arc<DashMap<(u64, u64), u64>>,
+    /// **#11:** the endpoint-unresolvable refusals of every §12 gate
+    /// family, counted where the fail-closed `return` lives. See
+    /// [`UnresolvableEndpointRefusals`].
+    #[cfg(feature = "webrtc")]
+    endpoint_unresolvable_refusals: Arc<UnresolvableEndpointRefusals>,
     /// H3 witness seam: hold the RTC close-notification consumer, so
     /// the bounded channel can actually fill.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -11515,6 +11602,13 @@ pub struct MeshNode {
     /// race.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     rtc_claim_pause: Arc<super::rtc::RtcInstallPause>,
+    /// **#2's witness seam:** park one dialog claim while it holds the
+    /// dialog-table lock, so a witness can queue a competing Offer
+    /// exactly across the claim's remove-and-restore and observe that
+    /// the restore displaces nothing. See
+    /// [`MeshNode::rtc_restore_pause_point`].
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    rtc_restore_pause: Arc<super::rtc::RtcInstallPause>,
     /// §10 part 2: packets this node forwarded per `(src, dst)`
     /// pair, **excluding signalling**. A globally flat forward
     /// counter is not the direct-path witness — signalling,
@@ -14055,6 +14149,8 @@ impl MeshNode {
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
             #[cfg(feature = "webrtc")]
             rtc_attempt_keys: Arc::new(DashMap::new()),
+            #[cfg(feature = "webrtc")]
+            endpoint_unresolvable_refusals: Arc::new(UnresolvableEndpointRefusals::default()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_close_consumer_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -14063,6 +14159,8 @@ impl MeshNode {
             rtc_install_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
             rtc_claim_pause: Arc::new(super::rtc::RtcInstallPause::default()),
+            #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+            rtc_restore_pause: Arc::new(super::rtc::RtcInstallPause::default()),
             #[cfg(feature = "webrtc")]
             forwarded_app_packets: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -23429,6 +23527,35 @@ impl MeshNode {
         }
         // R-B, responder half: same post-publish re-read.
         self.confirm_rtc_install_or_evict(peer_node_id, outcome.session_id, &fence)?;
+        // **#7: the responder's failure-detector arming — the exact
+        // statement `connect`, `accept` and `connect_rtc` all run in
+        // their post-install block and this arm omitted.** Without it
+        // the RESPONDER of a direct RTC session never enters the
+        // failure detector, so `check_all` never reaches a Failed
+        // verdict for the peer, the dead-peer sweep (which walks
+        // `failed_nodes()`) is structurally inert for it, and a
+        // remote-side channel loss — which cannot even be signalled:
+        // a closer's `RtcSignal::Close` drops its `str0m::Rtc` with no
+        // wire teardown, and str0m's `is_alive()` is "not Closed",
+        // which ICE disconnection never sets — leaves the peer entry
+        // installed for the node's lifetime. That is B never cleaning
+        // up after A's forced direct loss, while A's own side settled
+        // in milliseconds through R3-E's close notification.
+        //
+        // The session id is read BACK from the installed entry (the
+        // same rule as `connect`'s block): a concurrent install must
+        // be what the detector stamps, not whatever this call
+        // happened to create.
+        let installed_session_id = self
+            .peers
+            .get(&peer_node_id)
+            .map(|p| p.value().session.session_id())
+            .unwrap_or(0);
+        self.failure_detector.heartbeat_for_incarnation(
+            peer_node_id,
+            peer_addr,
+            installed_session_id,
+        );
         Ok(peer_node_id)
     }
 
@@ -23659,6 +23786,20 @@ impl MeshNode {
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
     pub fn rtc_dialog_claim_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
         &self.rtc_claim_pause
+    }
+
+    /// #2's restore-window pause: armed, the next dialog claim parks
+    /// while it holds the dialog-table lock.
+    #[cfg(feature = "webrtc")]
+    async fn rtc_restore_pause_point(&self) {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.rtc_restore_pause.wait_if_armed().await;
+    }
+
+    /// The dialog-restore pause the #2 displacement witness drives.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub fn rtc_dialog_restore_pause(&self) -> &Arc<super::rtc::RtcInstallPause> {
+        &self.rtc_restore_pause
     }
 
     /// Hold (or release) the RTC close-notification consumer, so a
@@ -26155,6 +26296,8 @@ impl MeshNode {
             subscriber_chains: self.subscriber_chains.clone(),
             auth_guard: self.auth_guard.clone(),
             auth_failures: self.auth_failures.clone(),
+            #[cfg(feature = "webrtc")]
+            endpoint_unresolvable_refusals: self.endpoint_unresolvable_refusals.clone(),
             max_auth_failures_per_window: self.config.max_auth_failures_per_window,
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
@@ -26405,8 +26548,10 @@ impl MeshNode {
             .unwrap_or_else(|| Duration::from_secs(10));
         // The same size bound and the same per-sender budget an
         // over-the-mesh frame spends — one function, two callers
-        // (R2) — charged to `budget_key`.
-        self.admit_signal_frame(
+        // (R2) — charged to `budget_key`. The classification is kept
+        // (#10): it is what lets a non-terminal outcome release
+        // exactly the reservation THIS call took, and no other.
+        let admitted = self.admit_signal_frame_classified(
             budget_key,
             &super::rtc::RtcSignalMsg::Offer {
                 dialog,
@@ -26447,9 +26592,45 @@ impl MeshNode {
                     "the offer was refused: {reason:?}"
                 )))
             }
-            other => Err(AdapterError::Connection(format!(
-                "unexpected outcome for a bootstrap offer: {other:?}"
-            ))),
+            super::rtc::SignalOutcome::Ignored => {
+                // #10: a duplicate Offer for a live dialog. The
+                // reservation THIS call's charge pushed under its
+                // fresh per-attempt `budget_key` is released before
+                // returning: every paired `admit_signal_frame` take
+                // either reaches a named terminal owner (the
+                // completion owner above, the `Reject` arm) or is
+                // released here — so a duplicate Offer leaves
+                // `open_dialogs(key)` at its pre-call value instead
+                // of one leaked slot per repeat.
+                self.release_bootstrap_offer_take(admitted, budget_key, dialog);
+                Err(AdapterError::Connection(
+                    "duplicate offer for a live dialog".into(),
+                ))
+            }
+            other => {
+                self.release_bootstrap_offer_take(admitted, budget_key, dialog);
+                Err(AdapterError::Connection(format!(
+                    "unexpected outcome for a bootstrap offer: {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Release exactly the dialog slot THIS call's
+    /// [`Self::admit_signal_frame`] take booked — and only that one
+    /// (#10). `SignalAdmit::NewDialog` pushed one slot and gets one
+    /// `end_dialog` back; `OpenDialog` booked no slot (the id was
+    /// already in this key's budget), so releasing one there would
+    /// end the LIVE attempt's reservation.
+    #[cfg(feature = "webrtc")]
+    fn release_bootstrap_offer_take(
+        &self,
+        admitted: super::rtc::SignalAdmit,
+        budget_key: u64,
+        dialog: u64,
+    ) {
+        if matches!(admitted, super::rtc::SignalAdmit::NewDialog) {
+            self.rtc_signal_budget.lock().end_dialog(budget_key, dialog);
         }
     }
 
@@ -26472,6 +26653,22 @@ impl MeshNode {
         budget_key: u64,
         msg: &super::rtc::RtcSignalMsg,
     ) -> Result<(), AdapterError> {
+        self.admit_signal_frame_classified(budget_key, msg)
+            .map(|_| ())
+    }
+
+    /// [`Self::admit_signal_frame`], reporting what the budget DID
+    /// (#10): `NewDialog` means this call pushed a dialog slot under
+    /// `budget_key` and owns its release; `OpenDialog` took no slot
+    /// and must release none. The bootstrap offer path needs the
+    /// distinction to release exactly its own take on a
+    /// non-terminal outcome.
+    #[cfg(feature = "webrtc")]
+    fn admit_signal_frame_classified(
+        &self,
+        budget_key: u64,
+        msg: &super::rtc::RtcSignalMsg,
+    ) -> Result<super::rtc::SignalAdmit, AdapterError> {
         let stats = self.rtc_stats_opt().cloned();
         if let Err(e) = msg.validate_size() {
             if let Some(stats) = stats.as_ref() {
@@ -26505,7 +26702,7 @@ impl MeshNode {
                     "signalling frame over budget: {e}"
                 )))
             }
-            _ => Ok(()),
+            _ => Ok(admitted),
         }
     }
 
@@ -26680,11 +26877,20 @@ impl MeshNode {
         // channel opened, which is `ice_failed` and not
         // `ice_relayed`: the attempt did not run out of time, it
         // lost its peer.
-        if let (Some(entry), Some(driver)) = (entry, self.rtc_driver.as_ref()) {
-            driver.stats().note_ice_failed();
-            let _ = driver.close(entry.peer).await;
+        //
+        // The budget release is part of that same terminal: it runs
+        // ONLY when this call removed the row. A late close finding
+        // nothing used to `release_signal_budget` anyway — releasing
+        // a reservation the completion owner (or a successor socket
+        // on the same attempt) still owns, and ending the dialog in
+        // the frame budget while its install was in flight.
+        if let Some(entry) = entry {
+            if let Some(driver) = self.rtc_driver.as_ref() {
+                driver.stats().note_ice_failed();
+                let _ = driver.close(entry.peer).await;
+            }
+            self.release_signal_budget(claimed_node_id, dialog);
         }
-        self.release_signal_budget(claimed_node_id, dialog);
     }
 
     /// The §12 global provisional bound this anchor was configured
@@ -27027,31 +27233,61 @@ impl MeshNode {
             //    live attempt and answered 404 — which a page can
             //    only read as a bare `1006`. The attempt is retired
             //    below, when it is genuinely terminal.
-            let claimed = {
+            let (claimed_mine, displaced) = {
                 let mut table = dialogs.lock().await;
-                table.remove(peer_node_id, dialog)
-            };
-            match claimed {
-                Some(entry) if entry.peer == peer => {}
-                other => {
-                    // Lost the claim. `other` is `None` (another
-                    // terminal owner took the row) or a successor's
-                    // endpoint under the same dialog id — and a
-                    // successor's row must go back, because it is
-                    // still live and its own owner will claim it.
-                    if let Some(entry) = other {
-                        let mut table = dialogs.lock().await;
-                        table.insert(peer_node_id, dialog, entry);
+                let claimed = table.remove(peer_node_id, dialog);
+                // **#2's witness seam.** Armed, THIS claim parks while
+                // still holding the dialog-table lock — which is the
+                // point: a witness can queue a competing Offer exactly
+                // across the remove-and-restore below and observe that
+                // it cannot be displaced. Unarmed — every production
+                // path — one relaxed load.
+                node.rtc_restore_pause_point().await;
+                match claimed {
+                    Some(entry) if entry.peer == peer => (true, None),
+                    other => {
+                        // Lost the claim. `other` is `None` (another
+                        // terminal owner took the row) or a successor's
+                        // endpoint under the same dialog id — and a
+                        // successor's row must go back, because it is
+                        // still live and its own owner will claim it.
+                        //
+                        // **The restore shares THIS lock hold with the
+                        // `remove` above (#2).** Across two acquisitions
+                        // an `Offer` for the same `(peer, dialog)` could
+                        // land in between, see no row, mint a session and
+                        // install its row — which the re-insert then
+                        // silently displaced: the displaced `Option`
+                        // dropped, its ICE session leaked and its attempt
+                        // stranded with no dialog row, so `ice_pending()`
+                        // stayed above zero for the process lifetime. One
+                        // hold makes the key provably vacant at the
+                        // insert, so no row can be displaced.
+                        (
+                            false,
+                            other.and_then(|entry| table.insert(peer_node_id, dialog, entry)),
+                        )
                     }
-                    tracing::debug!(
-                        peer = format!("{peer_node_id:#x}"),
-                        "rtc upgrade: the attempt was already terminal elsewhere; \
-                         not installing and not charging a second terminal term"
-                    );
-                    // This endpoint is ours and nothing will use it.
-                    let _ = driver.close(peer).await;
-                    return;
                 }
+            };
+            if let Some(displaced) = displaced {
+                // Unreachable while the restore shares the claim's lock
+                // hold — but a displaced row is a LIVE attempt, never an
+                // `Option` to drop (#2): its endpoint is closed and its
+                // attempt terminal-charged here, so no attempt can be
+                // left with no terminal owner.
+                driver.stats().note_ice_failed();
+                let _ = driver.close(displaced.peer).await;
+            }
+            if !claimed_mine {
+                tracing::debug!(
+                    peer = format!("{peer_node_id:#x}"),
+                    "rtc upgrade: the attempt was already terminal elsewhere; \
+                     not installing and not charging a second terminal term"
+                );
+                // This endpoint is ours and nothing will use it.
+                let _ = driver.close(peer).await;
+                return;
             }
             // 3. Noise over it, in this dialog's role. The offerer
             //    initiates, so both sides do not send msg1.
@@ -29531,6 +29767,26 @@ impl MeshNode {
         // field — every identity decision below keys on it. Each event
         // is one independent leg, so iterating the frame is safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_IDENTITY_PROOF {
+            // **§12: denied before effects for a provisional
+            // session** — the same gate and the same reason as the
+            // `0x0D02` arm's R1. `BootstrapAction` models no
+            // identity-proof frame and this arm used to run UNGATED:
+            // a provisional session's `ChallengeRequest` allocated
+            // challenge state and minted a signed `Challenge`, and a
+            // `Proof` installed `peer_entity_ids[from_node]` — the
+            // pinned identity the §12 invariant says cannot exist
+            // (gate 4 keeps a provisional peer from installing one),
+            // which then WINS over the session-bound origin in
+            // `provisional_reply_origin`, breaking one-session-one-
+            // identity. Identity proof is what an ADMITTED peer uses
+            // to bind its entity to its session; an unenrolled one
+            // has no business minting pins. (The gate is the `webrtc`
+            // admission layer: without the feature there is no
+            // provisional class to refuse.)
+            #[cfg(feature = "webrtc")]
+            if !Self::admission_gate_deliver_source(&parsed.source, ctx) {
+                return;
+            }
             let events = EventFrame::read_events(decrypted, parsed.header.event_count);
             for payload in events {
                 Self::handle_identity_proof_message(&payload, from_node, ctx);
@@ -31457,6 +31713,23 @@ impl MeshNode {
         // it's 9 s, still comfortably longer than typical test
         // partition-heal windows).
         let dead_peer_timeout = self.config.session_timeout.saturating_mul(30);
+        // **#7: a direct RTC endpoint runs on its own dead-peer
+        // budget — the failure detector's** (`miss_threshold` is 3,
+        // the value `MeshNode::new` builds the detector with, so this
+        // is one full detector budget of no observed traffic past the
+        // last packet). The 30× UDP grace is a partition-heal story —
+        // "the SAME session resumes when the partition heals, so keep
+        // the keys warm". A `PeerAddr::Rtc` endpoint is a CHANNEL, and
+        // a lost channel cannot even be signalled (see `accept_rtc`'s
+        // #7 note): this sweep and the local close notifier are its
+        // only removal paths, and 30× (150 s at the §9 harness's 5 s
+        // `session_timeout`) is past any failure budget a lost direct
+        // session may hold its peer entry — a stale entry being
+        // exactly the eviction race §12's gates must distrust. Any
+        // received packet still recovers the detector (and refreshes
+        // activity), so a partition that heals before the budget ends
+        // keeps its entry, as below.
+        let rtc_dead_peer_timeout = self.config.session_timeout.saturating_mul(3);
         // Stream lifecycle: drop idle streams past `stream_idle_timeout`
         // and enforce `max_streams` cap via LRU.
         let stream_idle_timeout = self.config.stream_idle_timeout;
@@ -32093,12 +32366,39 @@ impl MeshNode {
                         let failed = failure_detector.failed_nodes();
                         for node_id in failed {
                             // Capture WHICH incarnation looked dead, not
-                            // merely that one did.
+                            // merely that one did. The inactivity budget
+                            // is per endpoint class (#7): a direct RTC
+                            // endpoint gets the failure detector's own
+                            // budget, everything else the partition-heal
+                            // grace above.
                             let observed = match peers.get(&node_id) {
-                                Some(e) if e.value().session.is_timed_out(dead_peer_timeout) => {
-                                    Some(e.value().session.session_id())
+                                Some(e) => {
+                                    let info = e.value();
+                                    // `PeerAddr::Rtc` exists only under
+                                    // `webrtc`; a non-webrtc build has
+                                    // only the grace budget (and the
+                                    // `let _ =` keeps that graph
+                                    // warning-free).
+                                    let timeout = {
+                                        #[cfg(feature = "webrtc")]
+                                        {
+                                            if matches!(info.addr(), PeerAddr::Rtc(_)) {
+                                                rtc_dead_peer_timeout
+                                            } else {
+                                                dead_peer_timeout
+                                            }
+                                        }
+                                        #[cfg(not(feature = "webrtc"))]
+                                        {
+                                            let _ = rtc_dead_peer_timeout;
+                                            dead_peer_timeout
+                                        }
+                                    };
+                                    info.session
+                                        .is_timed_out(timeout)
+                                        .then(|| info.session.session_id())
                                 }
-                                _ => None,
+                                None => None,
                             };
                             let Some(observed_session_id) = observed else {
                                 continue;
@@ -34183,7 +34483,25 @@ impl MeshNode {
         // channel, bare — a wildcard, a token, a queue group or
         // anyone else's channel is refused, not ignored.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 3 FAILS CLOSED when the peer entry is gone. The
+            // endpoint is unresolvable exactly when there is no installed
+            // `PeerInfo` — the state `ingress_admission` documents as
+            // reachable ("frames still queued behind a peer that has
+            // already been removed") and deliberately answers `Denied`.
+            // Guarding this with `if let Some(...)` SKIPPED the gate
+            // entirely in that state, so a Subscribe dispatched
+            // concurrently with the peer-map eviction (deterministic at
+            // the provisional reclaim) landed past §12 and was judged only
+            // by the ordinary ACL. Gate 5 is source-keyed and already
+            // refused here; this is its endpoint-keyed sibling. Counted
+            // under its own reason (#11) — "endpoint unresolvable" must
+            // not share a counter with the policy refusal below.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_subscribe();
+                return;
+            };
             let action = match &msg {
                 MembershipMsg::Subscribe {
                     channel,
@@ -37880,6 +38198,57 @@ impl MeshNode {
             .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
     }
 
+    /// Test-only: a transit probe whose INNER is sealed with the
+    /// session this node shares with `dest_node_id` (#20's leg (d)).
+    ///
+    /// [`Self::send_transit_probe_for_test`] seals with the VIA
+    /// session, so a relayed probe is undecryptable at the third
+    /// party and "an acted-on transit probe is relayed" has no
+    /// RECEIPT observable there. This form keeps the identical
+    /// routed shape — sent over the `via_node_id` session's address,
+    /// `dest_node_id` in the routing header — but seals the inner
+    /// with the destination session, so an acted-on relay produces a
+    /// real third-party receipt the witness can assert, and refute.
+    #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
+    pub async fn send_deliverable_transit_probe_for_test(
+        &self,
+        via_node_id: u64,
+        dest_node_id: u64,
+    ) -> Result<(), AdapterError> {
+        let addr = self
+            .peers
+            .get(&via_node_id)
+            .map(|e| e.value().addr())
+            .ok_or_else(|| AdapterError::Connection("no session with the anchor".into()))?;
+        let session = self
+            .peers
+            .get(&dest_node_id)
+            .map(|e| e.value().session.clone())
+            .ok_or_else(|| AdapterError::Connection("no session with the destination".into()))?;
+        let stream_id = 0x0F00u64;
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let inner = builder.build(
+            stream_id,
+            seq,
+            &[Bytes::from_static(b"transit")],
+            PacketFlags::NONE,
+        );
+        let routing = RoutingHeader::new(dest_node_id, self.node_id as u32, 8);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&routing.to_bytes());
+        routed.extend_from_slice(&inner);
+        self.sink
+            .send(&routed, addr)
+            .await
+            .map(|_| ())
+            .map_err(|e| AdapterError::Connection(format!("transit probe failed: {e}")))
+    }
+
     /// Test-only view of the corrective-announce claim, so the
     /// §12 witness can assert the guard rather than the flood.
     #[cfg(all(feature = "webrtc", any(test, feature = "fixtures")))]
@@ -37958,10 +38327,7 @@ impl MeshNode {
             else {
                 return true;
             };
-            budget
-                .charge_enroll_request()
-                .and_then(|()| budget.reserve_enrollment())
-                .is_err()
+            budget.admit_enroll_request().is_err()
         };
         if refused {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
@@ -39123,7 +39489,19 @@ impl MeshNode {
         // and publish discovery state for a peer that has not
         // enrolled — S0e §3 row 12.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 4 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate.
+            // Skipping it let an announcement dispatched concurrently with
+            // the peer-map eviction be ingested and re-flooded mesh-wide,
+            // reinstating the TOFU identity pin the eviction had just
+            // cleared: gate 4's exact prohibition. Counted under its own
+            // reason (#11).
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_announce();
+                return;
+            };
             if !Self::admission_gate_announce(&endpoint, ctx) {
                 return;
             }
@@ -39571,7 +39949,19 @@ impl MeshNode {
         // v1 browser scope, but the forwarding gate is not selective
         // about which announcement kind it refuses to carry.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -39625,7 +40015,20 @@ impl MeshNode {
         // Gate 4 already refuses to ingest it; this refuses to be
         // its megaphone.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. A sender
+            // entry vanishing between gate 4's `endpoint_of` and this
+            // flood gate's lookup must not re-flood the announcement to
+            // every peer (§12 F5's megaphone). Counted under its own
+            // reason (#11).
+            let Some(endpoint) = Self::endpoint_of(sender_node_id, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -39715,7 +40118,19 @@ impl MeshNode {
         // the requester. A provisional session does not get to ask
         // this anchor to introduce it to anybody.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -40351,15 +40766,36 @@ impl MeshNode {
         // always checked `from_node`; the two arms are now
         // equivalent.
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(from_node, ctx) {
+        {
+            // §12 gate 1 FAILS CLOSED when the peer entry is gone — the
+            // same shape and the same reason as the subscribe gate: an
+            // unresolvable endpoint is the eviction race, and skipping the
+            // gate is exactly what the gate exists to prevent. The refusal
+            // is counted under its own reason (#11): a frame refused here
+            // and a frame refused by the policy below are different
+            // operational facts.
+            let Some(endpoint) = Self::endpoint_of(from_node, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
         }
         // The destination's own admission still applies: an
-        // unenrolled peer is not a relay *target* either.
+        // unenrolled peer is not a relay *target* either — and an
+        // entry-absent-at-check/present-at-get destination must not
+        // become a relay to a just-installed unenrolled target, so
+        // this arm FAILS CLOSED exactly like the sender arm above
+        // (#1). Counted under its own reason (#11).
         #[cfg(feature = "webrtc")]
-        if let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) {
+        {
+            let Some(endpoint) = Self::endpoint_of(ack.to_peer, ctx) else {
+                ctx.endpoint_unresolvable_refusals
+                    .note_admission_refused_unresolvable_forward();
+                return;
+            };
             if !Self::admission_gate_forward(&endpoint, ctx) {
                 return;
             }
@@ -48945,14 +49381,21 @@ impl Adapter for MeshNode {
         // Send to the first connected peer. For a real mesh, this should
         // use the routing table to pick the right peer based on the
         // event's destination. For now, round-robin or first-match.
-        let peer_addr = self
+        //
+        // By NODE ID, through the total `PeerAddr` match — not by a
+        // `udp()` address. After the `PeerAddr` refactor `.udp()` is
+        // `None` for RTC and routed-RTC peers, and DashMap iteration
+        // order is unspecified, so picking by `udp()` failed this
+        // publish flakically ("no peers connected" with peers on the
+        // map) and could never deliver to an RTC peer at all.
+        let node = self
             .peers
             .iter()
             .next()
-            .and_then(|e| e.value().addr().udp())
+            .map(|e| *e.key())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
-        self.send_to_peer(peer_addr, &batch).await
+        self.send_to_peer_node(node, &batch).await
     }
 
     async fn flush(&self) -> Result<(), AdapterError> {
@@ -59883,6 +60326,46 @@ mod membership_failure_tests {
         })
     }
 
+    /// A **resolvable** sender: the peer entry the membership
+    /// witnesses are now required to model (#8). The §12 gate-3
+    /// fail-closed arm refuses an entry-less sender's message — that
+    /// state is the documented eviction race — while these
+    /// witnesses' claims (per-request charge dedupe; accepted
+    /// reprocess-not-replay) are about the membership logic BELOW
+    /// the gate and must be witnessed against a sender the gate
+    /// admits. A legacy UDP endpoint: admission is invisible to
+    /// native peers, in both feature graphs.
+    fn install_resolvable_peer(ctx: &DispatchCtx, peer: u64) {
+        use crate::adapter::net::crypto::SessionKeys;
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
     fn failures_for(ctx: &DispatchCtx, node: u64) -> u16 {
         ctx.auth_failures.get(&node).map_or(0, |e| e.failures)
     }
@@ -59902,6 +60385,11 @@ mod membership_failure_tests {
 
         let (node, channel) = node_with_gated_channel().await;
         let ctx = node.dispatch_ctx();
+        // #8: the sender models a RESOLVABLE peer — the bare 0xBEEF
+        // with no peer entry is the §12 gate-3 fail-closed arm's
+        // eviction race, which refuses before the ACL and would make
+        // this witness about the gate rather than its claim.
+        install_resolvable_peer(&ctx, PEER);
         let payload = subscribe_bytes(&channel, 0x1234_5678);
 
         MeshNode::handle_membership_message(&payload, PEER, &ctx);
@@ -59949,6 +60437,9 @@ mod membership_failure_tests {
             .await
             .expect("MeshNode::new");
         let ctx = node.dispatch_ctx();
+        // #8: the sender models a RESOLVABLE peer — see the note in
+        // `retransmitted_subscribe_is_charged_to_the_auth_budget_once`.
+        install_resolvable_peer(&ctx, PEER);
         let channel = ChannelName::new("open/plain").unwrap();
         let id = ChannelId::new(channel.clone());
         let payload = subscribe_bytes(&channel, 0xAAAA);
@@ -59966,6 +60457,69 @@ mod membership_failure_tests {
         assert!(
             ctx.membership_dedupe.is_empty(),
             "accepted requests must not occupy the rejection cache"
+        );
+    }
+
+    /// **#8's gate contract, pinned.** A membership message from a
+    /// sender with NO peer entry is refused at §12 gate 3's
+    /// fail-closed arm — the documented eviction race — AND counted
+    /// under its own reason (#11); it never lands in the roster and
+    /// never charges the sender's auth-failure budget. The positive
+    /// control is the same payload from the same sender once it has
+    /// a resolvable peer entry: the same path then succeeds, so the
+    /// refusal is the entry absence and nothing else.
+    ///
+    /// Inverse: guard the gate with `if let Some(…)` (skip shape)
+    /// and the entry-less Subscribe lands in the roster while its
+    /// counter stays at zero — the first assertion fails on the
+    /// count, the second on the roster.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_membership_message_from_an_entry_less_sender_is_refused_and_counted() {
+        const PEER: u64 = 0xDEAD;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let channel = ChannelName::new("open/plain").unwrap();
+        let id = ChannelId::new(channel.clone());
+        let payload = subscribe_bytes(&channel, 0x1234_5678);
+
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_subscribe(),
+            1,
+            "the entry-less refusal must move its own counter (#11): a refusal that \
+             is not counted is a refusal nobody can operate on"
+        );
+        assert!(
+            !ctx.roster.is_subscribed(PEER, &id),
+            "an entry-less sender's Subscribe must never land in the roster"
+        );
+        assert_eq!(
+            failures_for(&ctx, PEER),
+            0,
+            "and must not charge the auth-failure budget — the request never \
+             reached the ACL"
+        );
+
+        // Positive control: the SAME path and sender with a
+        // resolvable peer entry — the refusal above is the entry
+        // absence, not a broken subscribe path.
+        install_resolvable_peer(&ctx, PEER);
+        MeshNode::handle_membership_message(&payload, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "with a resolvable peer entry the same Subscribe lands"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_subscribe(),
+            1,
+            "a landed Subscribe is not an unresolvable refusal"
         );
     }
 
@@ -61407,6 +61961,208 @@ mod lifecycle_regression_tests {
             node.pending_identity_proofs.is_empty(),
             "a dropped leg must release its nonce — otherwise a cancelled \
              or retried caller grows this map for the node's lifetime"
+        );
+    }
+}
+
+// NOTE: like `membership_failure_tests`, kept at the END of the file
+// on purpose — see that module's header note about the heartbeat
+// drift check's production/test boundary scan.
+/// **#1 / #11: the §12 gate-1 and gate-4 fail-closed refusals, and
+/// their counters.** On every gate-1/3/4 path an unresolvable
+/// endpoint REFUSES (and is counted under its own reason) instead of
+/// skipping: no announcement frame is flooded and no punch relay is
+/// emitted for a sender or destination with no peer entry at any
+/// check on that path.
+#[cfg(test)]
+mod unresolvable_endpoint_gate_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// A resolvable, admitted peer seated at `addr`, with a real
+    /// session the forwarding paths can build packets on.
+    fn install_peer_at(ctx: &DispatchCtx, peer: u64, addr: SocketAddr) {
+        use crate::adapter::net::crypto::SessionKeys;
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
+    async fn node_ctx() -> MeshNode {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        MeshNode::new(
+            EntityKeypair::generate(),
+            MeshNodeConfig::new(addr, [0x61u8; 32]),
+        )
+        .await
+        .expect("MeshNode::new")
+    }
+
+    /// **#1's first site + #11 (forward and announce families).**
+    /// `forward_capability_announcement` FAILS CLOSED for an
+    /// unresolvable sender: before, the `if let Some(…)` skip
+    /// re-flooded the announcement to every peer — §12 F5's
+    /// megaphone — for exactly the eviction-race state the gate
+    /// exists to stop. Gate 4's sibling refusal counts on its own
+    /// family's counter.
+    ///
+    /// Inverse: convert the sender gate back to the skip shape — the
+    /// flood ARRIVES at the target's socket (first assertion fails)
+    /// and the unresolvable counter stays at zero (second fails).
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_unresolvable_sender_floods_no_announcement_and_is_counted() {
+        const SENDER: u64 = 0x5EED;
+        const TARGET: u64 = 0x7A26;
+        let node = node_ctx().await;
+        let ctx = node.dispatch_ctx();
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let target_addr = rx.local_addr().expect("local_addr");
+        install_peer_at(&ctx, TARGET, target_addr);
+
+        // The refusal: an entry-less sender's announcement must not
+        // become the megaphone's hand.
+        MeshNode::forward_capability_announcement(b"ann".to_vec(), 0x0A, SENDER, &ctx);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            rx.try_recv(&mut buf).is_err(),
+            "no announcement frame may be flooded on behalf of an unresolvable sender"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "the flood-gate refusal is counted under its own reason (#11)"
+        );
+
+        // Gate 4's sibling on the same state: the announce family's
+        // own counter, so the two causes stay attributable.
+        MeshNode::handle_capability_announcement(b"ann", 0x0C, &ctx);
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_announce(),
+            1,
+            "gate 4's unresolvable refusal moves the announce family's own counter"
+        );
+
+        // Positive control: a resolvable sender's announcement IS
+        // flooded to the target — the observable above is a real
+        // flood path, not a dead one — and no unresolvable refusal
+        // is counted for it.
+        install_peer_at(&ctx, SENDER, "127.0.0.1:9".parse().unwrap());
+        MeshNode::forward_capability_announcement(b"ann".to_vec(), 0x0B, SENDER, &ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .is_ok(),
+            "a resolvable sender's announcement floods to the target"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "a resolvable sender is not an unresolvable refusal"
+        );
+    }
+
+    /// **#1's second site + #11 (forward family, destination arm).**
+    /// `forward_punch_ack` FAILS CLOSED for an unresolvable
+    /// destination: the skip shape let an
+    /// entry-absent-at-check/present-at-get destination become a
+    /// relay to a just-installed unenrolled target, and the
+    /// entry-absent-at-get case fell to a silent drop that moved no
+    /// counter at all.
+    ///
+    /// Inverse: convert the destination gate back to the skip shape
+    /// — the unresolvable counter stays at zero and the first
+    /// assertion fails.
+    #[cfg(all(feature = "webrtc", feature = "nat-traversal"))]
+    #[tokio::test]
+    async fn an_unresolvable_punch_ack_destination_relays_nothing_and_is_counted() {
+        use crate::adapter::net::traversal::rendezvous::PunchAck;
+        const SENDER: u64 = 0x5EED;
+        const DEST: u64 = 0xDE57;
+        let node = node_ctx().await;
+        let ctx = node.dispatch_ctx();
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dest_addr = rx.local_addr().expect("local_addr");
+        // The SENDER is resolvable, so only the destination gate can
+        // refuse this relay.
+        install_peer_at(&ctx, SENDER, "127.0.0.1:9".parse().unwrap());
+
+        MeshNode::forward_punch_ack(
+            PunchAck {
+                from_peer: SENDER,
+                to_peer: DEST,
+                punch_id: 0,
+            },
+            SENDER,
+            &ctx,
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            rx.try_recv(&mut buf).is_err(),
+            "no punch relay may be emitted for an unresolvable destination"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "the destination-gate refusal is counted under its own reason (#11)"
+        );
+
+        // Positive control: a resolvable, admitted destination IS
+        // relayed the ack.
+        install_peer_at(&ctx, DEST, dest_addr);
+        MeshNode::forward_punch_ack(
+            PunchAck {
+                from_peer: SENDER,
+                to_peer: DEST,
+                punch_id: 0,
+            },
+            SENDER,
+            &ctx,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .is_ok(),
+            "a resolvable destination gets the relay"
+        );
+        assert_eq!(
+            ctx.endpoint_unresolvable_refusals
+                .admission_refused_unresolvable_forward(),
+            1,
+            "a resolvable destination is not an unresolvable refusal"
         );
     }
 }

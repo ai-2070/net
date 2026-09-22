@@ -573,12 +573,21 @@ fn hex16(bytes: &[u8; 32]) -> String {
 /// A browser can only fetch `https://`, with `http://localhost` (and
 /// the loopback literals) as the development exception browsers
 /// themselves make for secure contexts.
+///
+/// The loopback decision must name the host a WHATWG browser would
+/// actually connect to. `http://127.0.0.1:8080@evil.example/…` and
+/// `http://localhost:@evil.example/…` have host `evil.example` in
+/// every browser (the last `@` splits userinfo from host), so the
+/// old `rest.split(['/', ':']).next()` host read admitted both — and
+/// this type then POSTed the whole bearer credential (PSK, invite
+/// nonce, issuer signature) over cleartext HTTP to the attacker
+/// (MR#15's class, review #13). Parsing delegates to
+/// [`is_loopback_bootstrap_url`].
 fn check_browser_url(url: &str) -> Result<(), BootstrapCredentialError> {
     let rest = if let Some(rest) = url.strip_prefix("https://") {
         rest
     } else if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split(['/', ':']).next().unwrap_or("");
-        if host != "localhost" && host != "127.0.0.1" && host != "[::1]" {
+        if !is_loopback_bootstrap_url(url) {
             return Err(BootstrapCredentialError::BadUrl(
                 "plain http is only a secure context on localhost",
             ));
@@ -591,6 +600,75 @@ fn check_browser_url(url: &str) -> Result<(), BootstrapCredentialError> {
         return Err(BootstrapCredentialError::BadUrl("no host"));
     }
     Ok(())
+}
+
+/// The loopback host matcher behind [`check_browser_url`]'s
+/// `http://` arm — **duplicated from `leaf/src/bootstrap.rs`'s
+/// `is_loopback_bootstrap_url`** (MR#15's repair, whose 20-shape
+/// attack table and independent probe found no leak-direction
+/// divergence). Sharing one matcher would mean moving it across the
+/// two crates' dependency graph; until that happens, **keep the two
+/// copies in sync** — this crate's attack-table witness must keep
+/// agreeing with the leaf's.
+///
+/// The parsing deliberately mirrors what a browser does with the
+/// authority:
+///
+/// - the authority ends at `/`, `?`, `#` — **and `\`**, which the
+///   WHATWG URL parser every browser runs folds into `/`. Without
+///   that delimiter `http://evil\@localhost/` would read as host
+///   `localhost` here while the browser connects to `evil`;
+/// - userinfo runs to the LAST `@`, exactly as a browser splits it,
+///   so `http://localhost@evil.example/` names host `evil.example`;
+/// - the host must be `localhost`, `127.0.0.1` or `[::1]` — the
+///   literal `[::1]` only, so a bracketed spelling of another
+///   address, or an unbracketed IPv6, is refused rather than guessed
+///   at. A percent-encoded spelling the gate cannot read is refused
+///   too: the exception never widens on a guess.
+///
+/// **Port policy: any well-formed port, or none.** An absent port is
+/// the scheme default (80); a named port must be decimal digits
+/// within `u16`. The port cannot widen the exception — every port on
+/// a loopback host is one trust domain, because the cleartext never
+/// leaves the machine — so `http://localhost:8080/rtc` and
+/// `http://localhost` are both admitted while
+/// `http://localhost:8080@evil.example/` is not (its host is
+/// `evil.example`).
+fn is_loopback_bootstrap_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = if host.starts_with('[') {
+        let Some(end) = host.find(']') else {
+            return false;
+        };
+        let tail = &host[end + 1..];
+        let port = if tail.is_empty() {
+            None
+        } else {
+            let Some(port) = tail.strip_prefix(':') else {
+                return false;
+            };
+            Some(port)
+        };
+        (&host[..=end], port)
+    } else {
+        match host.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host, None),
+        }
+    };
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+    }
+    matches!(host, "[::1]") || host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
 }
 
 /// Append a `u32`-length-prefixed byte field (the crate's wire idiom).
@@ -838,6 +916,150 @@ mod tests {
         let mut local = credential.clone();
         local.bootstrap_url = "http://localhost:8443/rtc".to_string();
         BrowserBootstrapCredential::from_bytes(&local.to_bytes()).expect("localhost is allowed");
+    }
+
+    /// Review #13's witness: the `http://` development exception must
+    /// name the host a WHATWG browser would actually connect to.
+    /// Every row is named; `admits` is the gate's required verdict —
+    /// attacker shapes (the lookalikes and userinfo/port/percent/
+    /// backslash shapes a browser routes to another host) refused,
+    /// loopback controls admitted. Two rows refuse where a browser
+    /// would admit (`localhost:` with an empty port, and a
+    /// percent-encoded `localhost`): refusing is the safe direction
+    /// and never leaks the credential; the exception is never widened
+    /// on a guess.
+    #[test]
+    fn the_url_gate_refuses_every_attacker_shape_and_admits_every_loopback_control() {
+        let credential = credential_at(T0);
+        let table: &[(&str, &str, bool)] = &[
+            // --- attacker shapes: refused ---
+            (
+                "host is a lookalike domain",
+                "http://localhost.attacker.example/rtc",
+                false,
+            ),
+            (
+                "host is a lookalike ip",
+                "http://127.0.0.1.attacker.example/rtc",
+                false,
+            ),
+            (
+                "localhost is only userinfo",
+                "http://localhost@evil.example/",
+                false,
+            ),
+            (
+                "userinfo carries a port lookalike",
+                "http://localhost:8080@evil.example/",
+                false,
+            ),
+            (
+                "ip:port then userinfo (MR#15 shape)",
+                "http://127.0.0.1:8080@evil.example/rtc",
+                false,
+            ),
+            (
+                "empty port then userinfo (MR#15 shape)",
+                "http://localhost:@evil.example/rtc",
+                false,
+            ),
+            (
+                "empty port then userinfo (ip)",
+                "http://127.0.0.1:@evil.example/",
+                false,
+            ),
+            (
+                "two @ split at the last, host evil",
+                "http://user@localhost@evil.example/",
+                false,
+            ),
+            (
+                "backslash folds to a slash, host evil",
+                "http://evil\\@localhost/",
+                false,
+            ),
+            (
+                "percent-encoded dot in the host",
+                "http://localhost%2eevil.example/",
+                false,
+            ),
+            (
+                "percent-encoded colon before userinfo",
+                "http://127.0.0.1%3a8080@evil.example/",
+                false,
+            ),
+            ("port above u16", "http://localhost:99999/", false),
+            (
+                "port past the u16 boundary",
+                "http://localhost:65536/",
+                false,
+            ),
+            ("empty port, refused closed", "http://localhost:/", false),
+            ("unbracketed ipv6", "http://::1/", false),
+            ("bracketed non-loopback ipv6", "http://[fe80::1]/", false),
+            (
+                "bracketed loopback is only userinfo",
+                "http://[::1]@evil.example/",
+                false,
+            ),
+            ("no host at all", "http:///rtc", false),
+            (
+                "percent-encoded localhost, refused closed",
+                "http://localhos%74/",
+                false,
+            ),
+            // --- loopback controls: admitted ---
+            ("localhost", "http://localhost/", true),
+            ("localhost with a port", "http://localhost:8080/rtc", true),
+            ("localhost uppercase", "http://LOCALHOST/", true),
+            (
+                "localhost mixed case at the u16 edge",
+                "http://LoCaLhOsT:65535/",
+                true,
+            ),
+            ("port zero is well-formed", "http://localhost:0/", true),
+            ("loopback ip", "http://127.0.0.1/", true),
+            ("loopback ip with a port", "http://127.0.0.1:8080/rtc", true),
+            ("bracketed ipv6 loopback", "http://[::1]/", true),
+            (
+                "bracketed ipv6 loopback with a port",
+                "http://[::1]:8080/",
+                true,
+            ),
+            ("userinfo is not the host", "http://user@localhost/", true),
+            (
+                "two @ split at the last, host localhost",
+                "http://user@evil@localhost/",
+                true,
+            ),
+            (
+                "backslash after the authority is a path",
+                "http://localhost\\@evil/",
+                true,
+            ),
+            (
+                "query after the loopback host",
+                "http://localhost?x=1",
+                true,
+            ),
+            (
+                "https remains the always-fetched scheme",
+                "https://anchor.example/rtc",
+                true,
+            ),
+        ];
+        for &(name, url, admits) in table {
+            let mut c = credential.clone();
+            c.bootstrap_url = url.to_string();
+            let result = BrowserBootstrapCredential::from_bytes(&c.to_bytes());
+            assert_eq!(
+                result.is_ok(),
+                admits,
+                "{name}: {url} must be {} — a browser connects to the host its \
+                 WHATWG parser names here",
+                if admits { "admitted" } else { "refused" }
+            );
+        }
     }
 
     #[test]

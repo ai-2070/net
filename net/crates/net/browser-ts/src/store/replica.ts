@@ -617,7 +617,22 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
       this.#behind = true;
       return this.#drop('not-ready');
     }
-    if (this.#installed === null || decimalValue(message.g) !== this.#installed) {
+    const g = decimalValue(message.g);
+    const installed = this.#installed;
+    if (installed === null || g !== installed) {
+      // A delta for a generation this replica never installed. BELOW the
+      // installed one is a genuinely stale frame and is dropped. ABOVE it
+      // means the owner-initiated manifest that would have installed that
+      // generation never arrived — the lost-datagram case §1.8 names, and
+      // the owner's own overflow fallback emits exactly such a manifest —
+      // and every later delta carries the same new `g`. Dropping without
+      // asking strands this replica at the old generation for good while
+      // `getStatus()` keeps reporting `ready`, because `tick`'s ladder runs
+      // only in `joining`/`installing` and this check fires before the
+      // `base` gap check below that would otherwise have asked.
+      if (installed !== null && g > installed) {
+        return { out: this.#resync('generation-ahead'), dropped: 'generation-ahead' };
+      }
       return this.#drop('stale-generation');
     }
     if (this.#revision === null || decimalValue(message.base) !== this.#revision) {
@@ -648,15 +663,19 @@ export class StoreReplica<S extends object, A extends ActionSpec, I extends Inpu
     }
 
     if (code === 'closed') {
-      // The handle is unusable — but only if this refusal is about the
-      // handle NOW. An unsolicited `no {closed}` is the expiry notice
-      // (§1.7a), and one correlated to the live slot refuses the
-      // request in flight. A refusal carrying the `q` of a request
-      // this replica has already finished or abandoned is news about
-      // nothing: tearing down a healthy view on it discards an
-      // installed document, the watermark and the handle because a
-      // late frame answered a dead question.
-      if (q !== undefined && q !== this.#slot) return this.#drop('stale-correlation');
+      // The handle is dead, and this is handle news however it was
+      // provoked. `errors.ts` defines `closed` as terminal for the handle
+      // AND for any action in flight on it, and `receive`'s foreign-handle
+      // gate has already discarded any `closed` naming a different handle —
+      // so one reaching here is always about THIS handle. The
+      // `q`-of-a-dead-question guard below protects refusals that answer a
+      // request; it cannot apply here, because every owner-side handle-death
+      // answer carries the provoking request's `q` (`owner.ts` answers an
+      // `alive` or `act` on a swept handle with `no {q: <that request>, …,
+      // closed}`) and a 20 s keepalive's `q` is never the live slot.
+      // Dropping that as `stale-correlation` holds a dead handle forever:
+      // every later `alive` is answered the same way and counted the same
+      // way, the view stays published as `ready`, and no rejoin ever runs.
       const wasFenced = this.#state === 'fenced';
       this.#reset();
       if (wasFenced) {

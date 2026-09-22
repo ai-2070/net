@@ -1832,7 +1832,14 @@ async function execute(step) {
       const node = nodes.get(step.session);
       if (!node) return { ok: false, error: 'no such session ' + step.session };
       try {
-        await node.signal(step.peer_hex, 0, 'offer', new Uint8Array([]));
+        // The dialog is the reserved no-attempt sentinel 0 in the
+        // seam's 16-hex spelling: this call asserts the PEER parse
+        // and drives no attempt. It was the bare NUMBER 0 — the
+        // f64-seam shape — which `wasm-bindgen`'s String marshaling
+        // cannot carry (it panics `assert!(old_size > 0)` in
+        // `passStringToWasm0`, killing the call before any parser
+        // runs, for every peer spelling alike).
+        await node.signal(step.peer_hex, '0000000000000000', 'offer', new Uint8Array([]));
         return { ok: true, stats: { parsed: true, detail: '' } };
       } catch (e) {
         const out = typedFailure(e);

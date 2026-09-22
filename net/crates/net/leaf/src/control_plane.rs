@@ -37,6 +37,11 @@ pub type NodeId = u64;
 
 /// One signalling exchange between two nodes, numbered by the side
 /// that started it. The same value the native `0x0D02` frames carry.
+///
+/// **0 is reserved** as the driver's no-attempt sentinel (`if dialog
+/// != 0 { end_attempt(dialog) }`), so the one parser that mints
+/// dialogs from a listener response refuses it at parse rather than
+/// handing the driver a dialog it will silently never end.
 pub type DialogId = u64;
 
 /// An SDP blob. Opaque to the control plane: it is carried, never
@@ -129,7 +134,8 @@ pub struct SignedAnnouncement(pub Vec<u8>);
 ///   announcement the receiver already holds for `from` (§5 Layer 1
 ///   — key discovery precedes signalling in both worlds);
 /// - `not_after` bounds replay to a window, and the receiver keeps a
-///   `(from, dialog, kind)` seen-set for that window;
+///   `(from, dialog, kind, payload digest)` seen-set for that
+///   window — only a byte-identical re-send is a replay;
 /// - the carrier — an anchor, a room object, a mock — learns nothing
 ///   and can tamper with nothing that verifies.
 ///
@@ -190,7 +196,9 @@ impl SignalEnvelope {
     /// envelopes share a signing input: a signature for one dialog,
     /// kind or recipient cannot be replayed onto another.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 8 + 8 + 1 + 8 + 4 + self.payload.len());
+        // 14 = the `net.signal.v1\0` magic; then from, to, dialog,
+        // kind, not_after, the payload length, and the payload.
+        let mut out = Vec::with_capacity(14 + 8 + 8 + 8 + 1 + 8 + 4 + self.payload.len());
         out.extend_from_slice(b"net.signal.v1\0");
         out.extend_from_slice(&self.from.to_le_bytes());
         out.extend_from_slice(&self.to.to_le_bytes());

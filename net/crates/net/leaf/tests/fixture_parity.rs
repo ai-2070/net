@@ -79,6 +79,56 @@ fn every_package_vector_mirrors_its_repository_original() {
         test_vectors::ALL.len(),
         "this is a repository checkout, so every vector must have been compared"
     );
+
+    // The parity above walks the ALL registry — a hand-maintained
+    // list. A vector added to either tree but never registered is
+    // invisible to it (the defect this leg exists for: the walk
+    // followed the list rather than the directories), so the two
+    // directories are walked too and their contents must be exactly
+    // the registry's names.
+    let registered: std::collections::BTreeSet<&str> =
+        test_vectors::ALL.iter().map(|(name, _)| *name).collect();
+    let names: Vec<String> = registered.iter().map(|name| name.to_string()).collect();
+    let mut packaged =
+        json_names(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test_vectors"));
+    packaged.sort();
+    assert_eq!(
+        packaged, names,
+        "src/test_vectors/ and the ALL registry disagree — a vector added but \
+         unregistered is invisible to the parity above"
+    );
+    let mut repository: Vec<String> =
+        json_names(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/cross_lang_wire"))
+            .into_iter()
+            .filter(|name| !REPOSITORY_ONLY.contains(&name.as_str()))
+            .collect();
+    repository.sort();
+    if !repository.is_empty() {
+        assert_eq!(
+            repository, names,
+            "../tests/cross_lang_wire/ and the ALL registry disagree (minus the \
+             files another crate's registry owns)"
+        );
+    }
+}
+
+/// Files in the shared `cross_lang_wire/` tree that another crate's
+/// registry owns — the wire crate's shared AEAD vector, packaged by
+/// [`net_wire::test_vectors`], not by the leaf's constants. Nothing
+/// else may live in either tree unregistered.
+const REPOSITORY_ONLY: [&str; 1] = ["aead_vector.json"];
+
+/// The `.json` file names in a directory; empty when it is absent
+/// (an unpacked `.crate` has no repository tree).
+fn json_names(dir: &PathBuf) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".json"))
+        .collect()
 }
 
 /// The leaf's announcement encoder, pinned.

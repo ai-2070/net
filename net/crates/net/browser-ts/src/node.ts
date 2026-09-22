@@ -34,6 +34,7 @@ import {
   type StunProbeOutcome,
 } from './udp-probe.js';
 import {
+  idArg,
   loadLeafWasm,
   type LeafWasmConnectOptions,
   type LeafWasmNode,
@@ -456,10 +457,21 @@ export class BrowserNode {
   /**
    * Sign and send a `0x0D02` signalling envelope to `peer` — the
    * session-independent path, so no session with `peer` is needed.
+   *
+   * `dialogHex` is the attempt's id, 16 lowercase hex digits — the
+   * same value {@link BrowserNode.offerPeer} resolves to. Never a
+   * number: a `u64` dialog through a JS number comes back rounded,
+   * and an envelope signed for a dialog that names no attempt kills
+   * the attempt at its ICE deadline.
    */
-  async signal(peerHex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void> {
+  async signal(peerHex: string, dialogHex: string, kind: string, payload: Uint8Array): Promise<void> {
     try {
-      await this.inner.signal(peerHex, dialog, kind, payload);
+      // Both ids cross as strings, verbatim, and a non-string is
+      // refused "is not a peer id" / "is not a dialog id" — peer
+      // first, the order `LeafNode::signal` parses in — before the
+      // wasm seam, whose String marshaling corrupts on a number
+      // (finding #52).
+      await this.inner.signal(idArg(peerHex, 'peer'), idArg(dialogHex, 'dialog'), kind, payload);
     } catch (error) {
       throw fromWasmError(error);
     }

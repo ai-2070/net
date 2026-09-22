@@ -31,9 +31,9 @@ A stream is identified by `(peer_node_id, stream_id)`. Both are `u64`; `stream_i
 
 Reliability mode is per-stream and chosen at `open_stream`:
 - `FireAndForget` — no NACKs, no retransmit, lowest latency. **Default** (`net/crates/net/wire/src/stream.rs:117`).
-- `Reliable` — selective NACKs, retransmit on loss, congestion-windowed. **No-loss, not in-order**: the substrate delivers events in *arrival* order plus a per-stream `seq`; a consumer that needs ordering reorders by `seq` itself (the blob-transfer engine does exactly this). `Reliable` means "every byte arrives", not "bytes arrive in send order" — the docstring at `stream.rs:49` states it: *"Reliable here means 'no loss', not 'delivered in order'."*
+- `Reliable` — selective NACKs, retransmit on loss, congestion-windowed. **No-loss and in-order**: the receive path reorders, so delivery is FIFO within the stream (`docs/TRANSPORT.md:134`) — a consumer that needs ordering takes it as delivered; it does not reorder by `seq` itself. `Reliable` means "every byte arrives", and bytes arrive in send order — the docstring at `stream.rs:41-49` states it: *"Reliable here means 'no loss', and delivery is in-order."*
 
-Credit window is in **bytes**, defaulting to `DEFAULT_STREAM_WINDOW_BYTES = 65_536` (64 KB) per stream (`net/crates/net/wire/src/stream.rs:79`). `StreamConfig` exposes **four** knobs: `reliability`, `window_bytes`, `fairness_weight`, and `scheduled` (`stream.rs:87-112`). `scheduled: false` (the default) sends each packet straight to the socket; `scheduled: true` routes *originating* sends through the router's fair scheduler so `set_stream_weight` actually applies on this stream — use it for bulk transfers that shouldn't monopolize the link against other scheduled streams (it's what the blob-transfer engine rides). Pass `window_bytes = 0` to disable backpressure entirely on that one stream — there are valid reasons (small bursty control channels) but it's an escape hatch.
+Credit window is in **bytes**, defaulting to `DEFAULT_STREAM_WINDOW_BYTES = 65_536` (64 KB) per stream (`net/crates/net/wire/src/stream.rs:79`). `StreamConfig` exposes **five** knobs: `reliability`, `window_bytes`, `fairness_weight`, `scheduled`, and `close_behavior` (`stream.rs:87-112`) — `close_behavior` decides whether pending outbound packets are drained (`DrainThenClose`) or dropped (`DropAndClose`, the default) at close. `scheduled: false` (the default) sends each packet straight to the socket; `scheduled: true` routes *originating* sends through the router's fair scheduler so `set_stream_weight` actually applies on this stream — use it for bulk transfers that shouldn't monopolize the link against other scheduled streams (it's what the blob-transfer engine rides). Pass `window_bytes = 0` to disable backpressure entirely on that one stream — there are valid reasons (small bursty control channels) but it's an escape hatch.
 
 Streams hang off the **mesh** transport's `MeshNode`. They are not a feature of the `Net` (event-bus) handle — `Net::builder()...build()` does not produce a `Mesh`. Calls to `open_stream` go through `Mesh` (Rust SDK) / `MeshNode` (TS / Python).
 
@@ -63,7 +63,7 @@ let stream = mesh.open_stream(
 
 **Key facts:**
 - `Mesh::open_stream(peer, stream_id, StreamConfig) -> Result<Stream>` (`net/crates/net/sdk/src/mesh.rs:752-761`). Handle type is `net::adapter::net::Stream`, re-exported.
-- `StreamConfig::default()` = `{ reliability: FireAndForget, window_bytes: 65_536, fairness_weight: 1, scheduled: false }`. **Default reliability is `FireAndForget`** — opt into `Reliable` explicitly for NACKs + retransmit. Chain `.with_scheduled(true)` for fair-scheduled bulk sends.
+- `StreamConfig::default()` = `{ reliability: FireAndForget, window_bytes: 65_536, fairness_weight: 1, scheduled: false, close_behavior: DropAndClose }`. **Default reliability is `FireAndForget`** — opt into `Reliable` explicitly for NACKs + retransmit. Chain `.with_scheduled(true)` for fair-scheduled bulk sends.
 - `open_stream` is sync (does not await). The SDK's `Mesh` is the wrapper around the core `MeshNode`; both share the same signature.
 
 ### TypeScript
@@ -251,7 +251,7 @@ The receiver controls flow. The sender does not negotiate. If `tx_credit_remaini
 
 **Diagnostic implication:** persistent `Backpressure` means the receiver is slow or gone, not that the network is congested. The credit window is receiver-driven flow control, not congestion control — but a `Reliable` stream *also* paces itself to a Reno-style congestion window (slow-start, multiplicative decrease on NACK loss, reset-to-floor on timeout) gated by `can_send`, plus an adaptive RTO (RFC 6298 SRTT/RTTVAR with Karn's algorithm, clamped to `[10 ms, 2 s]`) (`net/crates/net/wire/src/reliability.rs`). So under loss a reliable sender back-pressures even with credit available; `FireAndForget` has no congestion state. If you see `Backpressure` for many seconds, look at the receiver, not the link.
 
-`StreamStats` exposes the relevant counters (`net/crates/net/wire/src/stream.rs:194-228`):
+`StreamStats` exposes the relevant counters (`net/crates/net/wire/src/stream.rs:255`):
 
 | Field | Meaning |
 |---|---|
@@ -270,11 +270,11 @@ Pull these on a timer alongside `node.stats()` if you're tuning a sustained tran
 | Mode | NACKs | Retransmit | Ordering | Use when |
 |---|---|---|---|---|
 | `FireAndForget` (default) | no | no | best-effort | telemetry, periodic heartbeats — drops are fine |
-| `Reliable` | selective | yes | arrival-order + `seq` (no-loss, **not** reordered) | RPC-shaped requests, bulk transfer, anything where loss matters |
+| `Reliable` | selective | yes | FIFO per stream (no-loss, **reordered** into sequence) | RPC-shaped requests, bulk transfer, anything where loss matters |
 
 The choice is per-stream and locked in at `open_stream`. Two streams to the same peer can have different modes — that's a feature, not a quirk.
 
-**`Reliable` is not in-order.** The substrate delivers events in arrival order plus a per-stream `seq`, and the consumer reorders if it cares (the blob-transfer engine sorts by `seq`; nRPC frames its own order and is fire-and-forget). There is no general in-order delivery buffer. If your application assumes "Reliable ⇒ events arrive in send order", that assumption is wrong: sort by `seq` yourself.
+**`Reliable` is in-order.** The receive path reorders — out-of-order arrivals and retransmits are held until the sequences before them land — so delivery is FIFO within the stream (`docs/TRANSPORT.md:134`), each event tagged with its per-stream `seq`. If your application assumes "Reliable ⇒ events arrive in send order", that assumption holds: take them as delivered and do not sort by `seq` yourself.
 
 ---
 

@@ -86,7 +86,7 @@ redex.enableGreedyDataforts(mesh, {
 ### Operational notes
 
 - **Admission rejections are one counter with a `reason` label**, not a counter per reason: `dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity|bandwidth"}`. Watch the label, not a metric name per cause.
-- **`reason` does not cleanly separate "NIC saturated" from "cache full."** The admission gate's bandwidth axis bumps `reason="bandwidth"` (a mis-set `nic_peak_bytes_per_s` looks like a reject storm there), but a *post-admission* bandwidth-budget refusal is `BandwidthExhausted`, which bumps the **`capacity`** reason. So `capacity` mixes cache-full with budget-exhausted. Correlate with `bandwidth_budget_fraction` and the NIC-peak override before concluding the cache is full.
+- **`reason` separates "NIC saturated" from "cache full" at the labels the runtime emits.** The admission gate's bandwidth axis and the *post-admission* bandwidth-budget refusal both bump `reason="bandwidth"` (`BandwidthExhausted` increments `AdmitRejectReason::Bandwidth`, `runtime.rs:793-795`; its witness pins `admit_rejected_bandwidth_total == 1` with `admit_rejected_capacity_total == 0`), so a mis-set `nic_peak_bytes_per_s` looks like a reject storm on the same label as budget exhaustion. `reason="capacity"` is disjoint: admission would have landed but the cluster cap refused the write. Correlate `bandwidth` with `bandwidth_budget_fraction` and the NIC-peak override before concluding the NIC is the limit.
 - **Cluster-cap eviction withdraws chain announcements inline.** Peers see the `causal:<hex>` advertisement drop in the same tick.
 - **`upsert` on reopen subtracts old bytes from `total_bytes`.** The cluster-cap budget stays accurate across reopens.
 - **`observer_inflight_cap` is the spawn fan-out bound.** A flooding peer can't pile up unbounded outstanding tasks; on saturation the event drops and the counter bumps.
@@ -164,7 +164,7 @@ Content-addressed reference whose bytes live in the caller's existing storage (S
 version: u8               // 0x01 V1, 0x02 V2_MANIFEST, 0x03 V3_TREE; chunked send-blob / send-dir refs encode 2
 hash:    [u8; 32]         // BLAKE3
 size:    u64              // bytes; bounded by BLOB_REF_MAX_SIZE = 16 GiB
-uri:     [u8]             // to end of ref; adapter dispatch key
+uri:     [u8]             // to end of ref, no length prefix (the enclosing event payload is already framed); adapter dispatch key
 ```
 
 Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter::accepted_schemes() -> &[&str]` declares which URI schemes an adapter handles (`["s3", "s3+https"]`, `["file"]`, etc.); the registry routes by scheme. Because the channel config does not select the adapter, an attacker who can write to a channel can't route their `BlobRef` URI through an arbitrary registered adapter.
@@ -215,7 +215,7 @@ Each binding lets you write adapters in the host language:
 
 - **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
-- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_BACKEND`.
+- **C / cgo** — no host-language adapter registration is exposed. The C headers (`include/net.h`, `include/net_transport.h`) and `go/` reach only the substrate-owned adapter over the opaque `net_mesh_blob_adapter_t` (`net_mesh_blob_adapter_new/store/publish/fetch/exists`, plus `net_blob_ref_hash` and the transfer surface in `net_transport.h`). The vtable registration — `net_blob_register_callback_adapter` with `NetBlobAdapterVtable`, per-field null-check at registration, partial vtables returning `NET_ERR_BLOB_BACKEND` — is **Rust FFI only** (`src/ffi/blob.rs`) and is declared in no C header.
 
 ---
 

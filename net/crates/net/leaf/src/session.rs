@@ -149,13 +149,20 @@ pub fn rtc_addr(slot: u32, generation: u32) -> PeerAddr {
 
 /// An initiator handshake in flight.
 ///
-/// Consumed by [`Self::read_msg2`]: a handshake cannot be read twice,
-/// and the type system says so rather than a runtime flag.
+/// [`Self::read_msg2`] takes the Noise state only once it has built
+/// the session, so an owner that keeps this entry in flight across a
+/// message 2 that fails to validate still holds a handshake the real
+/// message 2 can complete. A handshake is nonetheless read **at most
+/// once**: the state is taken on success, and a later read is refused
+/// rather than producing a second session. The take is behind `&self`
+/// deliberately — the whole point is that a failed read must not
+/// require ownership to have been surrendered.
 ///
 /// No `Debug`: `NoiseHandshake` has none, and a derived one would be
 /// a formatter over live handshake state.
 pub struct PendingHandshake {
-    handshake: NoiseHandshake,
+    /// `None` once [`Self::read_msg2`] built the session.
+    handshake: RefCell<Option<NoiseHandshake>>,
     peer: NodeId,
     addr: PeerAddr,
 }
@@ -186,7 +193,7 @@ impl PendingHandshake {
         let packet = builder.build_handshake(&msg1);
         Ok((
             Self {
-                handshake,
+                handshake: RefCell::new(Some(handshake)),
                 peer: peer_node,
                 addr,
             },
@@ -200,9 +207,22 @@ impl PendingHandshake {
         self.peer
     }
 
-    /// Consume the peer's Noise message 2 — delivered as a Net
-    /// handshake packet — and install the session.
-    pub fn read_msg2(mut self, raw: &[u8]) -> Result<LeafSession> {
+    /// Read the peer's Noise message 2 — delivered as a Net
+    /// handshake packet — and build the session it completes.
+    ///
+    /// **A failed read takes nothing.** The shape checks run before
+    /// the state is touched and the state itself is taken only once
+    /// the session is built, so a message that does not complete this
+    /// handshake leaves the pending alive for the one that does —
+    /// `CallTable::deliver`'s rule that a frame which is not ours
+    /// neither completes the attempt nor takes its slot. The one
+    /// caveat is the wire crate's: Noise `read_message` is not
+    /// rollback-safe, so a *well-formed* message that fails its tag
+    /// check has already mixed its ephemeral into the transcript and
+    /// cannot be followed by another message 2. What never happens
+    /// anymore is the entry itself dying — and the mis-routing that
+    /// used to follow it — as a side effect of an error return.
+    pub fn read_msg2(&self, raw: &[u8]) -> Result<LeafSession> {
         let parsed = ParsedPacket::parse(Bytes::copy_from_slice(raw), self.addr)
             .ok_or_else(|| LeafError::Wire("message 2 did not parse as a packet".into()))?;
         if !parsed.header.flags.is_handshake() {
@@ -210,10 +230,14 @@ impl PendingHandshake {
                 "expected a handshake packet for message 2".into(),
             ));
         }
-        self.handshake
+        let mut slot = self.handshake.borrow_mut();
+        let handshake = slot
+            .as_mut()
+            .ok_or_else(|| LeafError::Session("message 2 was already read".into()))?;
+        handshake
             .read_message(&parsed.payload)
             .map_err(|e| LeafError::Session(format!("noise message 2: {e}")))?;
-        if !self.handshake.is_finished() {
+        if !handshake.is_finished() {
             return Err(LeafError::Session(
                 "handshake did not complete after message 2".into(),
             ));
@@ -222,12 +246,13 @@ impl PendingHandshake {
         // is the transcript an establishment proof is signed over
         // (`crate::establish`), and the only projection the session
         // keys publish is an eight-byte session name.
-        let handshake_hash = self
-            .handshake
+        let handshake_hash = handshake
             .handshake_hash()
             .map_err(|e| LeafError::Session(format!("handshake transcript: {e}")))?;
-        let keys = self
-            .handshake
+        // The state is taken exactly here — on success.
+        let keys = slot
+            .take()
+            .ok_or_else(|| LeafError::Session("message 2 was already read".into()))?
             .into_session_keys()
             .map_err(|e| LeafError::Session(format!("session keys: {e}")))?;
         Ok(LeafSession::install(
@@ -949,9 +974,7 @@ impl LeafSession {
             .decrypt_to_bytes(counter, &aad, parsed.payload.clone())
             .map_err(|e| LeafError::Wire(format!("decrypt: {e}")))?;
         if !rx.try_admit_rx_counter(counter) {
-            return Err(LeafError::Wire(
-                "the anti-replay window refused the AEAD counter".into(),
-            ));
+            return Err(LeafError::Replay);
         }
         Ok(OpenedPacket {
             subprotocol_id: parsed.header.subprotocol_id,

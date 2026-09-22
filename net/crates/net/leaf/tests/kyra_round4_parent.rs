@@ -6,6 +6,22 @@
 //! establishment-proof plumbing in `pair()`, applied exactly as
 //! `76c2ca8cc` applied it to the four earlier reviewer suites: no
 //! probe name, assertion or message is changed.
+//!
+//! One further change, `36cb4c0d6`, which supersedes that closing
+//! claim: the `registered_rpc` branch of `rpc_carrier_collision`
+//! (this file's :261-289), driven by
+//! `kyra_rpc_carrier_cannot_silently_shadow_admitted_stream`, is no
+//! longer the reviewer's body. The refusal is now pinned three ways
+//! — the typed registration conflict (`LeafError::Session(_)`, "the
+//! refusal must be the typed registration conflict"), the empty
+//! outbound queue ("the conflict refuses at registration: nothing is
+//! queued for a refused open"), and a follow-up open on an unclaimed
+//! carrier that must still admit ("the refusal must be the carrier
+//! conflict, not a corrupted stream table"), so the failure STAGE is
+//! the collision rather than a broken table. No probe name changed
+//! and every other body in this file is still Kyra's verbatim — but
+//! "no probe name, assertion or message is changed" is true only up
+//! to `36cb4c0d6`.
 use net_leaf::{LeafEvent, LeafIdentity, LeafNode, Reliability, StreamHandle};
 fn pair() -> (LeafNode, LeafNode) {
     let mut a = LeafNode::new(LeafIdentity::generate().unwrap(), 100);
@@ -256,7 +272,32 @@ fn rpc_carrier_collision(registered_rpc: bool) {
         Some(carrier),
         Some(route as u16),
     );
-    if registered_rpc && admitted.is_err() {
+    if registered_rpc {
+        let refused = match admitted {
+            Err(refused) => refused,
+            Ok(_) => panic!(
+                "the nRPC reply plane's carrier must be refused at registration, not \
+                 silently shadowed by an application stream"
+            ),
+        };
+        assert!(
+            matches!(refused, net_leaf::error::LeafError::Session(_)),
+            "the refusal must be the typed registration conflict, got {refused:?}"
+        );
+        assert!(
+            b.take_outbound().is_empty(),
+            "the conflict refuses at registration: nothing is queued for a refused open"
+        );
+        // And the failure STAGE is the conflict, not a broken table:
+        // an open on an unclaimed id still admits right after it.
+        b.open_stream(
+            a.node_id(),
+            "application-control",
+            Reliability::Reliable,
+            Some(net_leaf::stream::LEAF_STREAM_DISCRIMINATOR | 74),
+            Some(74),
+        )
+        .expect("the refusal must be the carrier conflict, not a corrupted stream table");
         return;
     }
     admitted.unwrap();

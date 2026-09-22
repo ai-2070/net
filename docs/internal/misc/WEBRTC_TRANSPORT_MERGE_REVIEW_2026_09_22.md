@@ -25,42 +25,133 @@ It is nonetheless **incorrect as merged**. Three classes of defect run through i
 
 | # | Finding | Severity | Area | Status |
 |---|---|---|---|---|
-| 1 | Lost owner-initiated MANIFEST wedges a replica that reports `ready` | High | store | Open |
-| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | High | store | Open |
-| 3 | Read revocation never reaches the delta feed | High | store | Open |
-| 4 | A failed reply-stream open is cached as a permanent rejection | High | store | Open |
-| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | High | anchor | Open |
-| 6 | The `§12` provisional-signalling witness cannot fail | High | anchor | Open |
-| 7 | Ownership-charge refusal drops acknowledged fragment bytes | High | rtc | Open |
-| 8 | A pending handshake is destroyed before msg2 validates | High | leaf | Open |
-| 9 | Pending handshakes have no deadline and no release on retirement | High | leaf | Open |
-| 10 | A registered call is leaked on the request-encode error path | High | leaf | Open |
-| 11 | `unsubscribe` destroys the nRPC plane's membership it does not own | High | leaf | Open |
-| 12 | The reply-carrier fence covers Stream owners but not Channel owners | High | leaf | Open |
-| 13 | Peer sessions are never released when their transport dies | High | leaf | Open |
-| 14 | The membership Ack is decoded and discarded | High | leaf | Open |
-| 15 | The credential's `http://localhost` exception is a prefix match | High | leaf | Open |
-| 16 | The redacting `Credential` Debug prints the invite nonce | High | leaf | Open |
-| 17 | Buffered trickle frames flush with no dialog fence | High | leaf | Open |
-| 18 | The inbound sink drops the datagram on borrow conflict | High | leaf | Open |
-| 19 | An inbound message 1 destroys our own pending handshake | High | leaf | Open |
-| 20 | A post-`close()` attempt registration leaves an orphan ICE agent | High | leaf | Open |
-| 21 | `mark_remote_ready` strands the answerer's deferred candidates | High | leaf | Open |
-| 22 | The Reject handler tears down a Direct-terminal attempt | High | leaf | Open |
-| 23 | `settle_peer_deadline` publishes `iceTimeout` over an installed attempt | High | leaf | Open |
-| 24 | `RxStream::promote`'s span-blind handoff stalls a reliable stream | High | leaf | Open |
-| 25 | Two opens of one identity alias one node stream | High | leaf | Open |
-| 26 | The signal dialog is carried as `f64`, corrupting ~511/512 of minted dialogs | High | leaf | Open |
-| 27 | `stand_down` never re-attaches; the tab becomes a permanent zombie | High | leaf | Open |
-| 28 | The per-source-order witness never asserts order | High | tests | Open |
-| 29–60 | Robustness, lifecycle and contract-drift defects (32) | Medium | mixed | Open |
-| 61–91 | Witness non-discrimination (31) | Medium | tests | Open |
-| 92–96 | Bindings, ABI and documentation contracts (5) | Medium | mixed | Open |
-| 97–119 | Accounting, allocation, stale-doc and nit defects (23) | Low | mixed | Open |
-| 120–121 | CI floors and witness pins (2) | High | ci | Open |
-| 122–130 | CI selection, checkers and fixture contracts (9) | Medium/Low | ci | Open |
+| 1 | Lost owner-initiated MANIFEST wedges a replica that reports `ready` | High | store | Closed |
+| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | High | store | Closed |
+| 3 | Read revocation never reaches the delta feed | High | store | Closed |
+| 4 | A failed reply-stream open is cached as a permanent rejection | High | store | Closed |
+| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | High | anchor | Closed |
+| 6 | The `§12` provisional-signalling witness cannot fail | High | anchor | Closed |
+| 7 | Ownership-charge refusal drops acknowledged fragment bytes | High | rtc | Closed |
+| 8 | A pending handshake is destroyed before msg2 validates | High | leaf | Closed |
+| 9 | Pending handshakes have no deadline and no release on retirement | High | leaf | Closed |
+| 10 | A registered call is leaked on the request-encode error path | High | leaf | Closed |
+| 11 | `unsubscribe` destroys the nRPC plane's membership it does not own | High | leaf | Closed |
+| 12 | The reply-carrier fence covers Stream owners but not Channel owners | High | leaf | Closed |
+| 13 | Peer sessions are never released when their transport dies | High | leaf | Closed |
+| 14 | The membership Ack is decoded and discarded | High | leaf | Closed |
+| 15 | The credential's `http://localhost` exception is a prefix match | High | leaf | Closed |
+| 16 | The redacting `Credential` Debug prints the invite nonce | High | leaf | Closed |
+| 17 | Buffered trickle frames flush with no dialog fence | High | leaf | Closed |
+| 18 | The inbound sink drops the datagram on borrow conflict | High | leaf | Closed |
+| 19 | An inbound message 1 destroys our own pending handshake | High | leaf | Closed |
+| 20 | A post-`close()` attempt registration leaves an orphan ICE agent | High | leaf | Closed |
+| 21 | `mark_remote_ready` strands the answerer's deferred candidates | High | leaf | Closed |
+| 22 | The Reject handler tears down a Direct-terminal attempt | High | leaf | Closed |
+| 23 | `settle_peer_deadline` publishes `iceTimeout` over an installed attempt | High | leaf | Closed |
+| 24 | `RxStream::promote`'s span-blind handoff stalls a reliable stream | High | leaf | Closed |
+| 25 | Two opens of one identity alias one node stream | High | leaf | Closed |
+| 26 | The signal dialog is carried as `f64`, corrupting ~511/512 of minted dialogs | High | leaf | Closed |
+| 27 | `stand_down` never re-attaches; the tab becomes a permanent zombie | High | leaf | Closed |
+| 28 | The per-source-order witness never asserts order | High | tests | Closed |
+| 29–60 | Robustness, lifecycle and contract-drift defects (32) | Medium | mixed | Closed |
+| 61–91 | Witness non-discrimination (31) | Medium | tests | Closed |
+| 92–96 | Bindings, ABI and documentation contracts (5) | Medium | mixed | Closed |
+| 97–119 | Accounting, allocation, stale-doc and nit defects (23) | Low | mixed | Closed |
+| 120 | Five floor steps pin witnesses by unanchored substring | High | ci | Closed |
+| 121 | Stale floors: `MIN=196` (wire) and 31 (deck) | High | ci | Deferred |
+| 122–125, 127–130 | CI selection, checkers and fixture contracts (8) | Medium/Low | ci | Closed |
+| 126 | `enroll_exchange.json` is a one-directional pin over the production codec | Medium | leaf | Noted |
 
 **Severity.** *High* = a shipped contract breaks, a security boundary fails open, or a security gate's witness cannot fail. *Medium* = robustness and lifecycle defects, contract drift, and witnesses that cannot discriminate their claimed outcome. *Low* = accounting, allocation, stale-doc and wording defects.
+
+---
+
+## Resolution status
+
+**Repair pass in progress** on `LZL0/webrtc-fixes` (branched from `0efc4ab39`). The findings below are unedited — they record what was true at the reviewed commit `801ae18c7`, and the values and line numbers they quote are evidence, not claims. This table is updated at each batch boundary.
+
+| # | Finding | Status | Commit |
+|---|---|---|---|
+| 1 | Lost owner-initiated MANIFEST wedges a replica | Closed | `89f1ed53f` |
+| 2 | A correlated `no {closed}` is dropped; a dead handle is held forever | Closed | `89f1ed53f` |
+| 3 | Read revocation never reaches the delta feed | Closed | `b0f6ae11c` |
+| 4 | A failed reply-stream open is cached as a permanent rejection | Closed | `078e72a41` |
+| 5 | `§12` gates 3/4 skip their check when the peer entry is unresolvable | Closed | `f52edc4cf` |
+| 6 | The `§12` provisional-signalling witness cannot fail | Closed | `db6dd0a20` |
+| 7 | Ownership-charge refusal drops acknowledged fragment bytes | Closed | `f52edc4cf` |
+| 120 | Five floor steps pin witnesses by unanchored substring | Closed | `47fb57694` |
+| 121 | Stale floors: `MIN=196` (wire) and 31 (deck) | **Deferred** — wire 196→275 and deck 31→35 re-measured in the repair tree (`78880312c`); leaf 308 and `sensing_org_lease_wire --min 9` deferred to a measured run, because those two count a different surface (the lib plus its integration binaries) than the attribute scan used here | `78880312c` |
+| 126 | `enroll_exchange.json` is a one-directional pin over the production codec | **Noted** — no pin landed. `enroll.rs:44-49` already names the gap (the SDK-side half of the pin needs a test in `sdk/tests/`; the core crate cannot dev-depend on the SDK) and `f9fc217aa` narrowed `cross_lang_wire/README.md` to what `fixture_parity.rs` actually enforces — the leaf's own mirror codecs. The named gap is the disposition | — (no closing commit) |
+| 8–14, 57–59, 108–109, 111 | Leaf teardown, membership and handshake release | Closed | `89c47ead7` |
+| 15–17, 47–50, 60, 106–107 | Credential and signalling leaks | Closed | `3769ad697` |
+| 18–27, 51–56, 110 | wasm effect fencing and the `f64` dialog | Closed | `67c32d25c` |
+| 28, 61–88, 91, 112–113 | Witnesses that could not discriminate | Closed | `36cb4c0d6` |
+| 29–33, 35–36, 97–100, 104–105 | Browser store convergence | Closed | `f2827a081` |
+| 37–46, 101–103 | Reassembly budget and idempotent signalling | Closed | `4be9d419f` |
+| 116 | The Go backpressure guard | Closed | `dea3a2c81` |
+| 89–90, 94, 118, 122–125, 128 | CI selection and the checkers | Closed | `f9fc217aa` |
+| 34, 92–93, 95–96, 114–115, 117, 119, 127, 129–130 | Documentation claims contradicted by code | Closed | `f9fc217aa` |
+
+**The tally: 128 closed + 1 deferred + 1 noted = 130.** *Closed* = the required closure is established at the finding level; six of those (#8, #17, #47, #50, #94, #107) carry a named deferred sub-part and two (#10, #122) carry a recorded note — neither makes the finding open. *Deferred* (#121) = the closure landed for two of its four floors; the other two are deferred to a measured run, with cause named at the row. *Noted* (#126) = no closure landed and none is claimed; the gap is named in the source and at the row. Every finding is named exactly once with its commit (or, at #126, with the statement that no commit closed it); rows group by repair commit because each row's findings share a file set and one verification run.
+
+Two numbering notes so the mapping above is auditable. `47fb57694`'s body says "Report #29" and `78880312c`'s "Report #30" — those are findings **120** and **121** (the pins and the floors); the repair pass carried the CI-gates slice's own numbering into the commit bodies, and this table places each finding by its text. Likewise `f9fc217aa`'s "documentation items 4–6" are not findings #4–#6: #4–#6 are reported and fixed file for file by `078e72a41` (#4), `f52edc4cf` (#5, #7) and `db6dd0a20` (#6), and `f9fc217aa` touches none of the files their texts name. Finally, `89c47ead7`'s finding list runs 108, 109, 111 — #110 is `67c32d25c`'s alone.
+
+### Deferred sub-parts (closed at the finding level, with one named residual each)
+
+Four repairs are complete for the defect the finding names and carry a residual the repair itself identified rather than papered over. None of these is an open finding; each is a boundary the fix could not cross from inside its own files.
+
+1. **#8 — a well-formed forged message 2 can still poison live crypto state.** `complete_handshake` no longer destroys the pending (garbage and delayed stale message 2 are both fully non-destructive, and the superseded attempt is kept as a one-slot classifier), but `snow`'s `read_message` mixes `e`/`ee` before the payload tag check, so one crafted 48-byte forged message 2 has already advanced the state when the tag fails. The entry survives to the deadline sweep and the attempt fails cleanly rather than being mis-routed — the difference between "fails safely" and "settles the wrong attempt as Failed", which is what the finding was about. A full fix needs a failure-atomic read/checkpoint seam in `net-mesh-wire`'s `NoiseHandshake`.
+2. **#94 — `exports.baseline` is a `test-helpers` build.** The check now *concludes* single-carrier rather than assuming it (it scans the build directory, opens every candidate, and names and rejects a second carrier). What remains is that the baseline was generated from a `net-ffi/test-helpers` build, so fixtures-only `#[no_mangle]` symbols sit in the required set: a default build always fails the comparison, and a test seam leaking into shipped builds cannot be detected. Closing it needs a fixture-regeneration policy (default-build baseline, test-helpers extras), which the finding scoped out.
+3. **#50 — zeroization has no runtime witness.** `Credential` now zeroizes psk, the encoded bearer and the invite nonce on drop. Proving that would require reading freed memory, so the evidence is compile + implementation review (with the same volatile-write caveat `IdentitySecrets` states honestly).
+4. **#17 / #47 / #107 — wasm-only runtime behaviour.** The trickle-buffer fencing, `end_attempt` closing the socket it names, and the probe closure lifetime are compile-verified on `wasm32-unknown-unknown` but were not executed in a browser. The browser matrix is the lane that runs them.
+
+Two smaller notes recorded rather than hidden: `#122`'s brief described a three-arm union including `enrollment_storage`; that arm does not exist at this base (it is new in the `net-cli` branch), so the two real arms were split and the discrepancy named instead of inventing a third. And `#10`'s service-name trigger is unreachable through `call()` (the derived reply name is refused first), so its witness drives the live trigger — a body over 4 MiB.
+
+### Validation at the merged tree
+
+| Check | Result |
+|---|---|
+| net `--lib --features "net cortex webrtc"` | clean |
+| net `--lib` (default, no `webrtc`) | clean |
+| leaf `--tests` (host) | clean |
+| leaf `--tests` (wasm32) | clean |
+| leaf lib unit tests | 253 passed, 0 failed |
+| `control_plane_boundary` / `dependency_boundary` / `fixture_parity` | 8 / 5 / 4 passed |
+| RTC `::` / router / sdk acme / `rtc_bootstrap_listener` | 66 / 22 / 12 / 25 passed, 0 failed |
+| `npx tsc -p tsconfig.test.json` | clean |
+| `npx vitest run` (browser-ts) | 23 files, 695 passed (686 baseline + 9 new) |
+
+New witnesses across the pass: 9 in the browser store (each proven red against the unfixed code first), 3 for the credential and dialog-zero defects, 11 in `node.rs`, 12 in the RTC/adapter surface, 1 for the `§12` gate, and 32 witness repairs in the test corpus. Three existing witnesses were **inverted** rather than extended — see below.
+
+### Repair commits
+
+`89f1ed53f` `b0f6ae11c` `078e72a41` `47fb57694` `f52edc4cf` `78880312c` `db6dd0a20` `fc1503437` `f2827a081` `3769ad697` `89c47ead7` `67c32d25c` `36cb4c0d6` `4be9d419f` `dea3a2c81` `f9fc217aa`
+
+`fc1503437` is this record's own commit: it documented the closures of #1–#7 and #120/#121 in the sections above ("What the closures changed", "Witnesses inverted", "Process notes") and closes no finding of its own — the finding each closure belongs to is named once, with its closing commit, in the table above. `91ae37473` and `193f8affe` are later updates to this ledger for the same purpose.
+
+### What the closures changed, and how they are witnessed
+
+- **#1** A delta for a generation the replica never installed is now split by direction: *below* the installed one is still dropped (`stale-generation`, a retransmission of a document already moved past), *above* it provokes `resync` through the existing `#behind` machinery, coalesced so a flood of deltas for the missed generation asks once. Witness: `replica.test.ts` observes the ask, the coalescing, and that nothing was applied.
+- **#2** `closed` is now handle news however it was provoked — `errors.ts` makes it terminal for the handle and for any action in flight on it, and `receive`'s foreign-handle gate already discards any `closed` naming a different handle. The `q`-of-a-dead-question guard is kept for the request refusals, which do answer a question.
+- **#3** `propagate` re-consults `permitsRead` per handle per commit and forgets the handle on refusal. The feed *is* the read delivered fresh, so leaving the handle alive would let `alive` renew the lease of a peer the policy now forbids.
+- **#4** `replyStream` (host) and `stream()` (join) clear their cached open on failure as well as on success, so a transient `openStream` failure is a retry rather than a verdict on the peer.
+- **#5** All three `§12` gate families — forward (1), subscribe (3), announce (4) — now `let Some(endpoint) = … else { return; }`: an unresolvable endpoint is the eviction race the ingress documents as reachable, and gate 5 already failed closed there. `cargo check --lib --features "net cortex webrtc"` clean.
+- **#6** The signalling leg's `after >= before` (monotone counters — cannot fail) is now a `wait_for` on a strict `>`, plus the absence the claim is really about: no `ice_pending()` and no `admission_promoted()` movement across the whole witness. Counting a refusal is not the same as not participating, and the absence covers legs (a)–(d) too. Verified: `cargo nextest run --test rtc_admission --features "webrtc fixtures cortex" --no-tests=fail --retries 0` → 1 test run, 1 passed.
+- **#7** The charge refusal now emits the `AbandonedGroup` record and the fence the capacity refusal twelve lines below already had. The record carries `charged: false` — no obligation slot was taken there — and `take_terminals` and the coalesce path release only for records that hold one; `Partial::abandoned` and the capacity refusal's record carry `charged: true`. Without that distinction every charge refusal drifted `OwnershipCharge` downward and admitted more groups than the bound allows.
+- **#120** All five pins require the witness name as a complete identifier token (not preceded or followed by `[A-Za-z0-9_]`), which defeats the `<required>_extra` and renamed-supersets shapes the file itself documents as spoofable. Anchored by token rather than by line shape because the five steps read three different output formats. (This bullet was numbered **#29** when first recorded — the same CI-gates numbering slip as the two commit bodies above; #29 is the store finding `f2827a081` closes.)
+
+### Witnesses inverted rather than extended
+
+Three existing witnesses encoded the old buggy behavior and had to change sides, which is worth recording because each is now a regression guard against a repair being reverted:
+
+1. `review_repairs.test.ts` — *"does not let a stale refusal tear down a healthy view"* pinned the `closed` drop that **#2** reports as the defect. Its property belongs to `forbidden` (a request refusal answering a dead question), and the `closed` case is now asserted to tear down and rejoin.
+2. `replica.test.ts` — *"drops a delta for a generation other than the installed one"* asserted exactly the behaviour **#1** reports as a bug. It is now two tests, one per direction.
+3. `hosted.test.ts` — the adoption witness's `successor.counts().handles === 0` was an *incidental* consequence of the replica never recovering from handle death. The claim it was written for — the successor never adopted the stale handle, and its write was not applied — is asserted directly above; the count is now `=== 1`, a handle the successor minted for the replica's rejoin.
+
+### Process notes from the repair pass
+
+- **The silent-no-op trap is real and it bit.** `tests/rtc_admission.rs` is `#![cfg(all(feature = "webrtc", feature = "fixtures"))]`; under `--features "net cortex webrtc"` it compiles to **zero tests**, and `nextest` reported `0 tests run: no tests to run`. Only `--no-tests=fail` turned that into a failure instead of a green. The same feature gap also made an early `cargo check` "pass" without compiling `rtc/fragment.rs` or any `#[cfg(feature = "webrtc")]` gate at all. Every verification in this pass names the feature set it ran under.
+- **An early green was retracted.** A 686-test `vitest` run was reported as covering two new witnesses before anyone noticed the edits had landed in the wrong worktree (relative paths resolve to `net-cli`; the repair tree is `webrtc-fixes`). The work was relocated, the claim corrected, and all file access since has used absolute paths. The second run — same 686, then 688 with the new tests — is the one that counts.
 
 ---
 

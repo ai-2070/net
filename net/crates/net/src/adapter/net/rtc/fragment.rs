@@ -39,11 +39,14 @@
 //! pieces are disjoint, all inside the declared total, and together
 //! cover `[0, total)` exactly. Concurrency and memory are bounded
 //! **per session**: at most [`MAX_GROUPS_PER_SESSION`] open groups,
-//! and at most [`MAX_PROVISIONAL_STREAM_BYTES`] of held bytes — the
-//! same whole-session byte budget `ProvisionalBudget` already
-//! enforces on receive-stream allocation, reused rather than
-//! re-invented so one number governs how much unenrolled receive
-//! state a session can pin. A group that sits incomplete past
+//! and at most [`MAX_HELD_BYTES_PER_SESSION`] of held bytes — sized
+//! to the full concurrency this module admits, so the byte budget
+//! can never refuse a set of groups the group budget admits. (It
+//! used to reuse `MAX_PROVISIONAL_STREAM_BYTES`, a 64 KiB number
+//! scoped in its own doc to *provisional* sessions' receive-stream
+//! allocation — smaller than ONE full group plus slack, so a second
+//! concurrent near-full group was refused and its stream reset.) A
+//! group that sits incomplete past
 //! [`GROUP_TTL`] is reaped — on every piece, not only when some
 //! unrelated new group needs a slot.
 //!
@@ -116,8 +119,6 @@ use net_wire::protocol::{
     NetHeader, FRAG_FRAGMENTED, FRAG_LAST, MAX_FRAGMENTED_EVENT_SIZE, MAX_FRAGMENTS_PER_GROUP,
 };
 
-use super::MAX_PROVISIONAL_STREAM_BYTES;
-
 /// Concurrent incomplete groups one session may hold.
 ///
 /// The leaf's own fragmentation ceiling is eight pieces per group;
@@ -140,6 +141,23 @@ pub const MAX_PIECES_PER_GROUP: usize = MAX_FRAGMENTS_PER_GROUP;
 /// producer could reach, so the receiver and the two senders were
 /// carrying two different numbers for one bound.
 pub const MAX_REASSEMBLED_BYTES: usize = MAX_FRAGMENTED_EVENT_SIZE;
+
+/// Held bytes one session may pin across its open groups: every
+/// group it may hold at once ([`MAX_GROUPS_PER_SESSION`]) at its own
+/// ceiling ([`MAX_REASSEMBLED_BYTES`]).
+///
+/// Sized to the admitted concurrency ON PURPOSE. The previous bound
+/// (`MAX_PROVISIONAL_STREAM_BYTES`, 64 KiB) was smaller than two
+/// half-full groups, so an honest peer whose two legitimate messages
+/// overlapped had its second refused and `reset_rx_stream` kill its
+/// stream — while [`MAX_GROUPS_PER_SESSION`] documented 8
+/// concurrent groups as reachable by an honest peer. A per-session
+/// byte budget that under-funds the group budget contradicts it;
+/// the provisional class keeps its own, tighter
+/// `MAX_PROVISIONAL_STREAM_BYTES` at the admission layer
+/// (`ProvisionalBudget`), which is where that number is scoped.
+pub const MAX_HELD_BYTES_PER_SESSION: u64 =
+    MAX_GROUPS_PER_SESSION as u64 * MAX_REASSEMBLED_BYTES as u64;
 
 /// How long an incomplete group may sit before it is reaped, and how
 /// long a retirement marker or an abandonment fence is kept.
@@ -396,6 +414,14 @@ pub struct AbandonedGroup {
     pub held: usize,
     /// Why it was destroyed.
     pub reason: AbandonReason,
+    /// Whether this record holds an obligation slot.
+    ///
+    /// Every destruction owes a record and a fence, including one that
+    /// happened AT the charge — but a group that was refused because
+    /// nothing was left to charge never took a slot, and releasing one for
+    /// it at drain time would drift `OwnershipCharge` downward and admit
+    /// more groups than the bound allows.
+    pub charged: bool,
 }
 
 /// One piece of a group, and what it claimed.
@@ -480,6 +506,10 @@ impl Partial {
             pieces: self.pieces.len(),
             held: self.held,
             reason,
+            // Every group a `Partial` represents was OPENED, and opening
+            // is what takes the obligation slot — so its terminal holds
+            // one and the drain gives it back.
+            charged: true,
         }
     }
 }
@@ -874,7 +904,8 @@ impl RtcReassembly {
         };
         // The obligation is the ingress's now: its slot goes back so
         // the next group can be admitted (R4-5).
-        self.charge.release(drained.len());
+        self.charge
+            .release(drained.iter().filter(|group| group.charged).count());
         drained
     }
 
@@ -1215,7 +1246,7 @@ impl RtcReassembly {
                 }) {
                     return Err(FragmentOutcome::Duplicate);
                 }
-                if held.saturating_add(piece.data.len() as u64) > MAX_PROVISIONAL_STREAM_BYTES {
+                if held.saturating_add(piece.data.len() as u64) > MAX_HELD_BYTES_PER_SESSION {
                     state.abandon(slot, session_id, now, AbandonReason::Refused, abandoned);
                     return Err(FragmentOutcome::Refused);
                 }
@@ -1230,10 +1261,37 @@ impl RtcReassembly {
                 // caller receives on the piece itself, which is the
                 // one report that cannot be dropped by a queue.
                 if !charge.try_charge() {
+                    // **X11.** Refusing at the charge destroys
+                    // acknowledged bytes exactly as the capacity refusal
+                    // below does — this piece's sequence was recorded and
+                    // its credit returned before reassembly ever saw it —
+                    // and this branch produced neither a record nor a
+                    // fence, contradicting the invariant that every
+                    // destruction produces an `AbandonedGroup` record on
+                    // every path. The consequence was worse than the
+                    // silence: once the charge eased, a TAIL of the
+                    // refused group opened a fresh headless group that
+                    // could never complete.
+                    //
+                    // `charged: false` — no obligation slot was taken
+                    // here, so this terminal must not release one later.
+                    abandoned.push(AbandonedGroup {
+                        session_id,
+                        epoch: piece.epoch,
+                        fragment_id: piece.fragment_id,
+                        provenance: piece.provenance,
+                        first_sequence: piece.sequence,
+                        last_sequence: piece.sequence,
+                        pieces: 1,
+                        held: piece.data.len(),
+                        reason: AbandonReason::Refused,
+                        charged: false,
+                    });
+                    state.fence(piece.fragment_id, piece.epoch, now);
                     return Err(FragmentOutcome::Refused);
                 }
                 if state.groups.len() >= MAX_GROUPS_PER_SESSION
-                    || held.saturating_add(piece.data.len() as u64) > MAX_PROVISIONAL_STREAM_BYTES
+                    || held.saturating_add(piece.data.len() as u64) > MAX_HELD_BYTES_PER_SESSION
                 {
                     // **NR2.** This piece's sequence was recorded and
                     // its credit returned before reassembly ever saw
@@ -1256,6 +1314,10 @@ impl RtcReassembly {
                         pieces: 1,
                         held: piece.data.len(),
                         reason: AbandonReason::Refused,
+                        // Its obligation slot WAS taken here — `try_charge`
+                        // succeeded above — so the drain below must give it
+                        // back exactly as it does for any other terminal.
+                        charged: true,
                     });
                     state.fence(piece.fragment_id, piece.epoch, now);
                     return Err(FragmentOutcome::Refused);
@@ -1463,7 +1525,9 @@ impl RtcReassembly {
                     queued.pieces += group.pieces;
                     queued.held += group.held;
                     self.charge.coalesced.fetch_add(1, Ordering::Relaxed);
-                    self.charge.release(1);
+                    if group.charged {
+                        self.charge.release(1);
+                    }
                 }
                 None => terminals.push_back(group.clone()),
             }
@@ -1652,7 +1716,7 @@ mod tests {
             }
         }
         assert!(
-            r.held_bytes(SESSION) <= MAX_PROVISIONAL_STREAM_BYTES,
+            r.held_bytes(SESSION) <= MAX_HELD_BYTES_PER_SESSION,
             "held {} bytes past the session budget",
             r.held_bytes(SESSION)
         );
@@ -1662,6 +1726,41 @@ mod tests {
             Err(FragmentOutcome::Refused),
             "past the budget every new group is refused"
         );
+    }
+
+    /// The per-session byte budget must FUND the concurrency the
+    /// group budget admits: two concurrent groups bigger than the old
+    /// 64 KiB `MAX_PROVISIONAL_STREAM_BYTES` used to have the second
+    /// refused (and its stream reset) although
+    /// [`MAX_GROUPS_PER_SESSION`] documents 8 concurrent groups as
+    /// reachable by an honest peer. Inverse: shrink the budget back
+    /// below `2 * chunk` and the second accept returns `Refused`.
+    #[test]
+    fn a_second_concurrent_group_is_not_refused_by_the_session_byte_budget() {
+        let r = RtcReassembly::new();
+        let now = Instant::now();
+        // Two groups whose held bytes TOGETHER exceed the old budget
+        // but each stay well inside one group's own ceiling.
+        let chunk = 40 * 1024;
+        assert!(
+            2 * chunk as u64 > 64 * 1024 && chunk <= MAX_REASSEMBLED_BYTES,
+            "the probe must span the defect: two pieces together over the old \
+             budget, each inside one group's own ceiling"
+        );
+        assert_eq!(
+            r.accept(part(SESSION, 1, 0, FRAG_FRAGMENTED, piece(chunk)), now),
+            Err(FragmentOutcome::Buffered),
+            "the first group opens"
+        );
+        assert_eq!(
+            r.accept(part(SESSION, 2, 0, FRAG_FRAGMENTED, piece(chunk)), now),
+            Err(FragmentOutcome::Buffered),
+            "a second concurrent group is honest-peer concurrency and must \
+             be admitted — the per-session byte budget covers every group the \
+             group budget admits at once"
+        );
+        assert_eq!(r.held_bytes(SESSION), 2 * chunk as u64);
+        assert_eq!(r.outstanding(), 2, "both groups are held, neither fenced");
     }
 
     /// A reconnect cannot inherit a predecessor's partial group:
@@ -1959,42 +2058,61 @@ mod tests {
     }
 
     /// Capacity refusal destroys a group holding acknowledged bytes,
-    /// so it reports the same terminal disposition expiry does.
+    /// so it reports the same terminal disposition expiry does. The
+    /// capacity here is the GROUP COUNT: the whole-session byte
+    /// ceiling is implied by the per-group end cap plus this count
+    /// (disjoint pieces inside one group's `MAX_REASSEMBLED_BYTES`
+    /// cannot sum past it), and both refusals run the same
+    /// record-and-fence arm.
     #[test]
     fn a_capacity_refusal_reports_the_group_it_destroyed() {
         let r = RtcReassembly::new();
         let now = Instant::now();
         let chunk = MAX_PAYLOAD_SIZE - 1;
-        let mut last_open = 0u16;
         for id in 1..=MAX_GROUPS_PER_SESSION as u16 {
-            match r.accept(part(SESSION, id, 0, FRAG_FRAGMENTED, piece(chunk)), now) {
-                Err(FragmentOutcome::Buffered) => last_open = id,
-                Err(FragmentOutcome::Refused) => break,
-                other => panic!("unexpected {other:?}"),
-            }
+            assert_eq!(
+                r.accept(part(SESSION, id, 0, FRAG_FRAGMENTED, piece(chunk)), now),
+                Err(FragmentOutcome::Buffered),
+                "the count must admit the full honest concurrency"
+            );
         }
-        assert!(last_open > 0, "the budget must admit real traffic");
-        let _ = r.take_abandoned();
-        // A second piece for an OPEN group, with the session's byte
-        // budget exhausted: the group cannot grow and cannot ever
-        // complete, so it is abandoned rather than silently dropped.
         assert_eq!(
-            r.accept(
-                part(
-                    SESSION,
-                    last_open,
-                    chunk as u16,
-                    FRAG_FRAGMENTED,
-                    piece(chunk)
-                ),
-                now
-            ),
+            r.held_bytes(SESSION),
+            MAX_GROUPS_PER_SESSION as u64 * chunk as u64
+        );
+        let _ = r.take_abandoned();
+        // One group past the count, carrying a first piece. Those
+        // bytes were acknowledged before reassembly saw them, so
+        // refusing to open the group loses them — and must report the
+        // loss and fence the group rather than drop it silently.
+        assert_eq!(
+            r.accept(part(SESSION, 99, 0, FRAG_FRAGMENTED, piece(chunk)), now),
             Err(FragmentOutcome::Refused)
         );
         let records = r.take_abandoned();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].reason, AbandonReason::Refused);
-        assert_eq!(records[0].fragment_id, last_open);
+        assert_eq!(records[0].fragment_id, 99);
+        assert_eq!(
+            records[0].held, chunk,
+            "the record names the acknowledged bytes the refusal destroyed"
+        );
+        // …and the fence refuses the group's tail rather than letting
+        // it open a headless successor once a slot frees.
+        assert_eq!(
+            r.accept(
+                part(
+                    SESSION,
+                    99,
+                    chunk as u16,
+                    FRAG_FRAGMENTED | FRAG_LAST,
+                    piece(chunk)
+                ),
+                now
+            ),
+            Err(FragmentOutcome::Abandoned),
+            "the refused group is fenced"
+        );
     }
 
     /// X9: retirement and ingress are serialized on the session, so

@@ -905,8 +905,9 @@ Finding 5 in [`NAT_TRAVERSAL_V2_PLAN.md`](NAT_TRAVERSAL_V2_PLAN.md)
 prescribes; rejections are typed and fast.
 
 Anchors advertise `rtc-anchor` plus `rtc_bootstrap: Option<String>` (URL)
-and `rtc_addr: Option<SocketAddr>` (their public RTC/STUN socket, UDP-only,
-omitted by browsers) on the announcement, same wire-compat pattern.
+and `rtc_addr: Option<SocketAddr>` (their public RTC/diagnostic socket, UDP-only,
+omitted by browsers) on the announcement, same wire-compat pattern. The
+announced STUN gathering endpoint is a distinct `rtc_stun_addr` (Stage 6).
 
 ### 6. A dedicated RTC UDP socket, STUN served there, no shared-socket demux; UDP-blocked browsers are unsupported in v1
 
@@ -929,9 +930,10 @@ publish a working `rtc_addr`.
 
 **STUN.** A ~200-line RFC 5389 *binding request/response only* responder
 answers unsolicited requests on the RTC socket; str0m handles the
-credentialed ICE checks itself. Browsers get the anchor's `rtc_addr` as
-their `iceServers` entry from the invite (bootstrap) or, for other anchors,
-from announcements.
+credentialed ICE checks itself. Browsers get the anchor's `rtc_stun_addr`
+as their `iceServers` entry from the invite (bootstrap) or, for other
+anchors, from announcements — `rtc_addr` is the RTC/diagnostic endpoint
+and deliberately not the STUN one.
 
 **mDNS host candidates (S0b).** Chromium publishes host candidates as
 `<uuid>.local` names by default (`WebRtcHideLocalIpsWithMdns`);
@@ -2019,8 +2021,8 @@ SDK-pin-only consumer diff.
 
 - `noise_pubkey` / `rtc_bootstrap` / `rtc_addr` on the announcement, added to
   the **hand-maintained canonical signer** `SignedPayloadCanonical`
-  (`behavior/capability.rs:2402–2463`; signed via `serde_json::to_vec` at
-  `:2634`) — **not** merely to the derived `Serialize`. That serializer is
+  (`behavior/capability.rs:2527`; signed via `serde_json::to_vec` at
+  `:2816`) — **not** merely to the derived `Serialize`. That serializer is
   where the signature preimage is actually produced, and its own doc warns
   that field order, names and `skip_serializing_if` must match the struct
   declaration exactly; adding a field to one and not the other silently

@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""The single libnet cdylib exports exactly the pinned symbol set.
+"""Exactly one built cdylib carries the libnet C-ABI surface, and it matches
+the pinned export set.
 
 WHY THIS EXISTS. The browser-native WebRTC plan
 (`docs/internal/plans/BROWSER_NATIVE_WEBRTC_TRANSPORT_PLAN.md`, Stage 1)
 generalizes every peer endpoint in the core from `SocketAddr` to `PeerAddr`
 and threads a submission seam under ~50 send sites. Its compatibility
 guarantee is that the default build's exported C-ABI symbol set is
-unchanged — every Go, Python and C consumer links `libnet` and nothing
-else, so a symbol that appears or disappears there is a break for all of
-them at once. That guarantee was unfalsifiable until this check existed:
+unchanged — every Go and C consumer links `libnet` and nothing else, so a
+symbol that appears or disappears there is a break for both at once. (The
+Python and Node bindings compile the `net` crate in-process — PyO3 and
+napi — and never load `libnet`; their contract is the Rust API, not this
+export set.) That guarantee was unfalsifiable until this check existed:
 nothing compared the artifact against anything. The plan's authorization
 made this job the first Stage 1 commit, pinned to the pre-refactor head,
 so the criterion can actually fail.
 
 WHAT IT PROVES, AND WHAT IT DOES NOT. The set of names the built cdylib
-exports equals the set recorded in the baseline file. It says nothing about
+exports equals the set recorded in the baseline file, AND that cdylib is the
+ONLY shared library in its build directory exporting any pinned name.
+"The single libnet cdylib" is a conclusion of this check, not a premise: a
+second artifact carrying `net::ffi`'s `#[no_mangle]` set puts two copies of
+`net::ffi` in the Go process — the `announce_mu` hang. So every shared
+library on the directory's top level is opened and its real export table
+read (`deps/` holds hashed copies of the same artifacts and is not
+scanned). It says nothing about
 signatures, calling convention, struct layout or behaviour — the Go
 `abi_stability_*_test.go` suite and the binding tests own those. An
 unchanged symbol set complements them; it does not replace them.
@@ -55,6 +65,8 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[2]
 CRATE = ROOT / "net" / "crates" / "net"
 BASELINE = CRATE / "bindings" / "go" / "net-ffi" / "exports.baseline"
+# These names only pick the DEFAULT artifact; the check itself covers every
+# shared library built beside it (see `shared_libraries`).
 CANDIDATES = [
     CRATE / "target" / "release" / "libnet.so",
     CRATE / "target" / "release" / "net.dll",
@@ -86,7 +98,8 @@ def _llvm_tool(name: str) -> str | None:
     return shutil.which(name)
 
 
-def _magic(path: Path) -> str:
+def _magic_kind(path: Path) -> str | None:
+    """`elf` / `pe` / `macho`, or None when the file is not a binary artifact."""
     head = path.read_bytes()[:4]
     if head.startswith(b"\x7fELF"):
         return "elf"
@@ -94,7 +107,14 @@ def _magic(path: Path) -> str:
         return "pe"
     if head[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"):
         return "macho"
-    raise SystemExit(f"FAIL  {path}: not an ELF, PE or Mach-O artifact")
+    return None
+
+
+def _magic(path: Path) -> str:
+    kind = _magic_kind(path)
+    if kind is None:
+        raise SystemExit(f"FAIL  {path}: not an ELF, PE or Mach-O artifact")
+    return kind
 
 
 def exports_of(path: Path) -> set[str]:
@@ -157,6 +177,33 @@ def read_baseline(path: Path) -> tuple[list[str], set[str]]:
 def compare(baseline: set[str], current: set[str]) -> tuple[list[str], list[str]]:
     """(added, removed) relative to the baseline, each sorted."""
     return sorted(current - baseline), sorted(baseline - current)
+
+
+def shared_libraries(directory: Path) -> list[Path]:
+    """Every shared library built into `directory`'s top level, sorted.
+
+    One row per BUILT artifact: cargo also leaves hashed pre-images under
+    `deps/`, which are the same libraries and must not be double-counted.
+    Non-binary files that merely share a suffix are skipped.
+    """
+    out = {
+        p
+        for pat in ("*.so", "*.dylib", "*.dll")
+        for p in directory.glob(pat)
+        if p.is_file() and _magic_kind(p) is not None
+    }
+    return sorted(out)
+
+
+def carriers_of(surface: set[str], exports_by_artifact: dict[str, set[str]]) -> list[str]:
+    """Artifacts whose export table intersects `surface`, sorted.
+
+    The pinned C-ABI names may live in EXACTLY ONE artifact. A subset carrier
+    (a wrapper re-exporting part of `net::ffi`) and a superset carrier (the
+    surface plus more) both intersect and are both reported; an artifact
+    sharing no pinned name is by definition not carrying this surface.
+    """
+    return sorted(name for name, names in exports_by_artifact.items() if names & surface)
 
 
 def report(added: list[str], removed: list[str], artifact: str) -> bool:
@@ -249,12 +296,36 @@ def self_test(baseline_path: Path) -> int:
         print("✗ self-test: rename not caught")
         failures += 1
 
+    surface = {"net_alpha", "net_beta"}
+    one = carriers_of(surface, {"libnet.so": {"net_alpha"}, "libother.so": {"other_fn"}})
+    if one == ["libnet.so"]:
+        print("✓ self-test: one carrier of the surface passes")
+    else:
+        print(f"✗ self-test: single carrier mis-reported (carriers={one})")
+        failures += 1
+    two = carriers_of(surface, {"libnet2.so": {"net_beta"}, "libnet.so": {"net_alpha"}})
+    if two == ["libnet.so", "libnet2.so"]:
+        print("✓ self-test: a second carrier of the surface is named and rejected")
+    else:
+        print(f"✗ self-test: second carrier not caught (carriers={two})")
+        failures += 1
+    if carriers_of(surface, {"libother.so": {"other_fn"}}) == []:
+        print("✓ self-test: an unrelated shared library is not a carrier")
+    else:
+        print("✗ self-test: unrelated library reported as a carrier")
+        failures += 1
+
     return 1 if failures else 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--artifact", type=Path, help="built cdylib; default: first of target/release/{libnet.so,net.dll,libnet.dylib}")
+    ap.add_argument(
+        "--artifact",
+        type=Path,
+        help="built cdylib; default: first of target/release/{libnet.so,net.dll,"
+        " libnet.dylib}. Every shared library beside it is scanned for the surface",
+    )
     ap.add_argument("--baseline", type=Path, default=BASELINE)
     ap.add_argument("--update", action="store_true", help="rewrite the baseline from the artifact")
     ap.add_argument("--pin", help="with --update: record this SHA as the baseline's pin; refused if net/ differs from HEAD")
@@ -274,6 +345,36 @@ def main() -> int:
     if not current:
         print(f"✗ {artifact}: no exports read — wrong artifact or unsupported tool output")
         return 1
+
+    # "The single libnet cdylib" must be CONCLUDED, not assumed: open every
+    # shared library beside the artifact and require the pinned surface to
+    # live in exactly this one.
+    scanned = shared_libraries(artifact.parent)
+    exports_by_artifact: dict[str, set[str]] = {}
+    for sibling in scanned:
+        exports_by_artifact[sibling.name] = (
+            current if sibling == artifact else exports_of(sibling)
+        )
+    carriers = carriers_of(current, exports_by_artifact)
+    if carriers != [artifact.name]:
+        print(
+            f"✗ {len(carriers)} artifact(s) in {artifact.parent} export pinned "
+            "C-ABI names: " + ", ".join(carriers)
+        )
+        others = [n for n in carriers if n != artifact.name]
+        if others:
+            print(f"  besides {artifact.name}: {', '.join(others)}")
+            print(
+                "\n  A second cdylib carrying net::ffi's #[no_mangle] set puts two\n"
+                "  copies of net::ffi in the Go process — the announce_mu hang.\n"
+                "  Fold the surface into libnet via bindings/go/net-ffi, or make\n"
+                "  the sibling crate rlib-only again."
+            )
+        return 1
+    print(
+        f"✓ {len(scanned)} shared librar(ies) in {artifact.parent.name}/ read; "
+        f"only {artifact.name} carries the C-ABI surface"
+    )
 
     if args.update:
         write_baseline(args.baseline, current, artifact, args.pin)

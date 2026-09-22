@@ -239,8 +239,24 @@ export interface LeafWasmNode {
   /**
    * Sign and send a `0x0D02` signalling envelope to `peer` through the
    * control plane — no session with `peer` needed.
+   *
+   * `dialog_hex` is the attempt's id, 16 lowercase hex digits — the
+   * same spelling {@link LeafWasmNode.peer_offer} resolves to and the
+   * `*_in` forms take. A number would not do: `DialogId` is a `u64`
+   * minted from the full CSPRNG range, and one carried through a JS
+   * number comes back rounded (`as f64 as u64`), so ~511 of every 512
+   * minted dialogs would name no attempt at all.
+   *
+   * Both id arguments cross as STRINGS, verbatim — {@link idArg} is
+   * the marshaling. A non-string is refused
+   * "is not a peer id" / "is not a dialog id" at the binding rather
+   * than coerced, and rather than reaching `wasm-bindgen`'s String
+   * marshaling at all: a JS number here corrupts `passStringToWasm0`
+   * (panicking `assert!(old_size > 0)` in `__wbindgen_realloc`) and
+   * kills the call before any parser runs — finding #52's
+   * engine-marshaling failure, on every peer spelling alike.
    */
-  signal(peer_hex: string, dialog: number, kind: string, payload: Uint8Array): Promise<void>;
+  signal(peer_hex: string, dialog_hex: string, kind: string, payload: Uint8Array): Promise<void>;
   /**
    * Offer a direct browser ↔ browser connection to `peer` (plan §9
    * steps 2–3). Resolves to the dialog id, 16 lowercase hex digits.
@@ -481,4 +497,35 @@ function asLeafWasmModule(loaded: unknown, specifier: string): LeafWasmModule {
   // `connect` is callable. Its argument and return types are
   // `wasm-bindgen`'s contract, not something JS can inspect.
   return loaded as unknown as LeafWasmModule;
+}
+
+/**
+ * One id argument of {@link LeafWasmNode.signal} as it crosses the
+ * wasm seam: a string passes through VERBATIM, and anything else is
+ * refused by the parsers' own names before it can reach the boundary.
+ *
+ * Refused, never coerced, and either alternative is fatal. A JS
+ * number cannot carry a `u64` id losslessly (`as f64 as u64`
+ * re-spells 511 of every 512 minted dialogs) — and a non-string must
+ * never reach `wasm-bindgen`'s String marshaling at all: it corrupts
+ * there, panicking `assert!(old_size > 0)` inside
+ * `passStringToWasm0`'s `__wbindgen_realloc`, and the call dies
+ * before `parse_peer_id` runs (finding #52's repro, on every peer
+ * spelling alike). The refusal carries the parser's name — "is not a
+ * peer id" / "is not a dialog id", as `name` picks — so a page that
+ * classifies a refusal by its text reads this one as the refusal it
+ * is. Peer before dialog at the call sites, the order
+ * `LeafNode::signal` parses in.
+ */
+export function idArg(value: unknown, name: 'peer' | 'dialog'): string {
+  if (typeof value === 'string') return value;
+  // `String(value)` on a null-prototype object throws, and a refusal
+  // that dies is not a refusal.
+  const shown =
+    typeof value === 'object' && value !== null ? Object.prototype.toString.call(value) : String(value);
+  throw new TypeError(
+    `${shown} is not a ${name} id: a ${name} id crosses this boundary as 16 hex digits as a ` +
+      `STRING — the spelling this boundary hands out; a ${typeof value} is refused rather than ` +
+      `coerced, because a number cannot carry a u64 id`,
+  );
 }

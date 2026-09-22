@@ -211,23 +211,28 @@ pub fn decode(subprotocol: Subprotocol, payload: Bytes) -> Result<Decoded> {
 /// Classify and decode in one step, counting what it refuses.
 ///
 /// This is the arm the node calls per event. A subprotocol with no
-/// arm and a payload that does not decode are both `None` **with a
-/// counter** — the S0c lesson applied one layer up: a leaf that
-/// dropped either silently would look dead to the peer that sent it.
+/// arm and a payload that does not decode both come back `Err` **with
+/// the classification that refused them** and with a counter — the
+/// S0c lesson applied one layer up: a leaf that dropped either
+/// silently would look dead to the peer that sent it, and one that
+/// reported every refusal under one name could not tell mixed-version
+/// degradation from corruption. The reason is returned, not
+/// re-derived by the caller: the event surface must name the
+/// classification that was actually made.
 pub fn dispatch_event(
     subprotocol_id: u16,
     payload: Bytes,
     counters: &LeafCounters,
-) -> Option<Decoded> {
+) -> Result<Decoded, DropReason> {
     let Some(subprotocol) = Subprotocol::from_wire(subprotocol_id) else {
         counters.drop_for(DropReason::UnknownSubprotocol);
-        return None;
+        return Err(DropReason::UnknownSubprotocol);
     };
     match decode(subprotocol, payload) {
-        Ok(decoded) => Some(decoded),
+        Ok(decoded) => Ok(decoded),
         Err(_) => {
             counters.drop_for(DropReason::Unparsable);
-            None
+            Err(DropReason::Unparsable)
         }
     }
 }
@@ -292,7 +297,17 @@ mod tests {
     #[test]
     fn an_unknown_subprotocol_is_dropped_and_counted() {
         let c = LeafCounters::new();
-        assert!(dispatch_event(0x0F00, Bytes::from_static(b"whatever"), &c).is_none());
+        // The refusal must NAME the classification it made — the same
+        // pin the unparsable arm carries. `is_err()` plus the counter
+        // passed even if the returned `Err` said `Unparsable` while
+        // the counter moved `UnknownSubprotocol`, and
+        // `handle_event` publishes the RETURNED value as the event
+        // reason — mislabelling the event exactly as one name for
+        // both refusals would.
+        assert_eq!(
+            dispatch_event(0x0F00, Bytes::from_static(b"whatever"), &c),
+            Err(DropReason::UnknownSubprotocol)
+        );
         assert_eq!(c.drops(DropReason::UnknownSubprotocol), 1);
         assert_eq!(
             c.total_drops(),
@@ -304,8 +319,13 @@ mod tests {
     #[test]
     fn a_payload_that_does_not_decode_is_dropped_and_counted_separately() {
         let c = LeafCounters::new();
-        // 0x0B00 has a fixed 24-byte wire form; 5 bytes cannot be one.
-        assert!(dispatch_event(0x0B00, Bytes::from_static(b"short"), &c).is_none());
+        // 0x0B00 has a fixed 24-byte wire form; 5 bytes cannot be
+        // one — and the refusal must NAME the classification it made,
+        // or the caller cannot tell degradation from corruption.
+        assert_eq!(
+            dispatch_event(0x0B00, Bytes::from_static(b"short"), &c),
+            Err(DropReason::Unparsable)
+        );
         assert_eq!(c.drops(DropReason::Unparsable), 1);
         assert_eq!(c.drops(DropReason::UnknownSubprotocol), 0);
     }
@@ -379,7 +399,7 @@ mod tests {
             queue_group: None,
         });
         match dispatch_event(0x0A00, Bytes::from(subscribe), &c) {
-            Some(Decoded::Membership(MembershipMsg::Subscribe { channel, nonce, .. })) => {
+            Ok(Decoded::Membership(MembershipMsg::Subscribe { channel, nonce, .. })) => {
                 assert_eq!(channel.as_str(), "sensors/lidar");
                 assert_eq!(nonce, 0x99);
             }
@@ -393,7 +413,7 @@ mod tests {
         };
         assert_eq!(
             dispatch_event(0x0B00, Bytes::copy_from_slice(&grant.encode()), &c),
-            Some(Decoded::StreamWindow(grant))
+            Ok(Decoded::StreamWindow(grant))
         );
 
         let nack = StreamNack {
@@ -403,13 +423,13 @@ mod tests {
         };
         assert_eq!(
             dispatch_event(0x0B01, Bytes::copy_from_slice(&nack.encode()), &c),
-            Some(Decoded::StreamNack(nack))
+            Ok(Decoded::StreamNack(nack))
         );
 
         let reset = StreamReset { stream_id: 9 };
         assert_eq!(
             dispatch_event(0x0B02, Bytes::copy_from_slice(&reset.encode()), &c),
-            Some(Decoded::StreamReset(reset))
+            Ok(Decoded::StreamReset(reset))
         );
 
         let ack = StreamAckRanges {
@@ -419,7 +439,7 @@ mod tests {
         };
         assert_eq!(
             dispatch_event(0x0B03, Bytes::from(ack.encode()), &c),
-            Some(Decoded::StreamAck(ack))
+            Ok(Decoded::StreamAck(ack))
         );
 
         assert_eq!(c.total_drops(), 0, "nothing legitimate may be dropped");
@@ -440,7 +460,7 @@ mod tests {
         let bytes = signal::encode(&envelope).expect("encode");
         assert_eq!(
             dispatch_event(0x0D02, Bytes::from(bytes), &c),
-            Some(Decoded::Signal(envelope))
+            Ok(Decoded::Signal(envelope))
         );
         assert_eq!(c.total_drops(), 0);
     }
@@ -451,12 +471,12 @@ mod tests {
         let bytes = Bytes::from_static(b"{\"node_id\":1}");
         assert_eq!(
             dispatch_event(0x0C00, bytes.clone(), &c),
-            Some(Decoded::Announcement(bytes.clone())),
+            Ok(Decoded::Announcement(bytes.clone())),
             "the dispatcher must not verify — the store does"
         );
         assert_eq!(
             dispatch_event(0x1000, bytes.clone(), &c),
-            Some(Decoded::Fold(bytes))
+            Ok(Decoded::Fold(bytes))
         );
     }
 }

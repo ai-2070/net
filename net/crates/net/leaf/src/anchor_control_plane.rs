@@ -96,9 +96,34 @@ struct State {
     anchor_stun_addr: Option<String>,
     /// The dialog `POST /rtc/offer` allocated, once it has.
     dialog: Cell<Option<DialogId>>,
-    /// The trickle socket for that dialog.
-    trickle: RefCell<Option<WebSocket>>,
-    /// Frames minted before that socket finished opening.
+    /// The trickle socket for that dialog, with everything that dies
+    /// with it.
+    trickle: RefCell<Option<Trickle>>,
+    /// What arrived on it, waiting for `drain_events`.
+    events: Rc<RefCell<VecDeque<ControlEvent>>>,
+}
+
+/// One trickle socket, the dialog it serves, and everything that
+/// dies with it (M17/M47).
+///
+/// The dialog-scoped state lives **with the socket** rather than in
+/// `State` — the buffered-frames queue most of all. One shared queue,
+/// flushed by whichever `on_open` ran next, had no dialog fence at
+/// the flush: a successor's socket trickled its predecessor's stale
+/// candidates, or an abandoned socket drained a successor's fresh
+/// ones onto the wrong dialog, which is an ICE failure with nothing
+/// naming the cause. Keyed like this, a flush can only ever carry
+/// this dialog's frames, and dropping the `Trickle` drops the queue
+/// with it — the drain-and-discard `end_attempt` owes a dialog.
+struct Trickle {
+    /// The dialog this socket serves. The socket is addressed by
+    /// this, never by whatever dialog the state currently names: a
+    /// superseded attempt's socket must still be closeable by the
+    /// `end_attempt` that names it, and a stale `end_attempt` must
+    /// not close its successor's socket.
+    dialog: DialogId,
+    socket: WebSocket,
+    /// Frames minted before the socket finished opening.
     ///
     /// `WebSocket.send` THROWS while the socket is `CONNECTING`, and
     /// the frame is then gone: the browser does not queue it and the
@@ -107,11 +132,10 @@ struct State {
     /// NAT the frames lost in it are the server-reflexive candidates,
     /// and ICE then fails with nothing naming the cause. Frames wait
     /// here and `onopen` flushes them in order.
-    pending_flush: Rc<RefCell<Vec<String>>>,
-    /// What arrived on it, waiting for `drain_events`.
-    events: Rc<RefCell<VecDeque<ControlEvent>>>,
-    /// The socket's handlers, kept alive for the socket's lifetime.
-    handlers: RefCell<Vec<JsValue>>,
+    pending: Rc<RefCell<Vec<String>>>,
+    /// The socket's handler `Closure`s, kept alive for the socket's
+    /// lifetime and detached before the socket is dropped.
+    handlers: Vec<JsValue>,
 }
 
 /// The anchor-backed control plane.
@@ -166,9 +190,7 @@ impl AnchorControlPlane {
                 anchor_stun_addr: info.stun_addr.clone(),
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
-                pending_flush: Rc::new(RefCell::new(Vec::new())),
                 events: Rc::new(RefCell::new(VecDeque::new())),
-                handlers: RefCell::new(Vec::new()),
             }),
         })
     }
@@ -210,10 +232,51 @@ impl AnchorControlPlane {
         self.state.anchor_stun_addr.clone()
     }
 
+    /// Take the held trickle socket — the one `names`, or whatever is
+    /// held when `names` is `None` (which is what a superseding
+    /// offer retires).
+    fn take_trickle(state: &State, names: Option<DialogId>) -> Option<Trickle> {
+        let mut slot = state.trickle.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|held| names.is_none_or(|dialog| dialog == held.dialog))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Retire a trickle socket for good: detach the handlers so a
+    /// queued event cannot reach a dropped `Closure`, then close the
+    /// socket — closing it is what hands the anchor's attempt back,
+    /// which is what `ControlPlane::end_attempt` means on this
+    /// carrier. The handler `Closure`s and any buffered frames drop
+    /// with the `Trickle`.
+    fn retire(trickle: Trickle) {
+        trickle.socket.set_onopen(None);
+        trickle.socket.set_onmessage(None);
+        trickle.socket.set_onclose(None);
+        let _ = trickle.socket.close();
+        // The handler `Closure`s drop only after they are detached
+        // from the socket; `pending`'s buffered frames drop with the
+        // `Trickle`.
+        drop(trickle.handlers);
+    }
+
     /// Open `GET /rtc/trickle`, presenting the attempt token as the
     /// WebSocket subprotocol the listener requires.
     fn open_trickle(&self, dialog: DialogId, attempt_token: &str) -> Result<()> {
         let state = &self.state;
+        // A new dialog supersedes whatever came before, and closing
+        // the old socket is exactly what `end_attempt` does — it is
+        // what hands the anchor's superseded attempt back. Left open
+        // (the M47 shape), a replaced dialog's socket keeps pushing
+        // `ControlEvent`s for a dialog this leaf no longer tracks
+        // while the anchor holds the old attempt to its own deadline.
+        if let Some(stale) = Self::take_trickle(state, None) {
+            Self::retire(stale);
+        }
         let ws_url = format!(
             "{}/rtc/trickle?dialog={dialog}&node_id={:#x}",
             state
@@ -258,11 +321,14 @@ impl AnchorControlPlane {
         // CONNECTING goes out here, in order, before anything else
         // this leaf sends — a candidate delivered late is still a
         // candidate, but a candidate dropped is an ICE failure with
-        // no cause in any log.
-        let pending = Rc::clone(&state.pending_flush);
+        // no cause in any log. The queue is this `Trickle`'s own, so
+        // the flush is dialog-fenced by construction: no other
+        // dialog's frames can be sitting in it.
+        let pending: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let pending_on_open = Rc::clone(&pending);
         let sock = socket.clone();
         let on_open = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-            for frame in pending.borrow_mut().drain(..) {
+            for frame in pending_on_open.borrow_mut().drain(..) {
                 // Nothing to do about a failure here that the close
                 // handler does not already report: the socket is open,
                 // so a refusal is the listener's, not a race.
@@ -270,11 +336,17 @@ impl AnchorControlPlane {
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-        state.handlers.borrow_mut().push(on_open.into_js_value());
 
-        state.handlers.borrow_mut().push(on_message.into_js_value());
-        state.handlers.borrow_mut().push(on_close.into_js_value());
-        *state.trickle.borrow_mut() = Some(socket);
+        *state.trickle.borrow_mut() = Some(Trickle {
+            dialog,
+            socket,
+            pending,
+            handlers: vec![
+                on_open.into_js_value(),
+                on_message.into_js_value(),
+                on_close.into_js_value(),
+            ],
+        });
         Ok(())
     }
 
@@ -285,18 +357,22 @@ impl AnchorControlPlane {
                 "dialog {dialog} is not this control plane's bootstrap dialog"
             )));
         }
-        let socket = self.state.trickle.borrow();
-        let socket = socket
+        let trickle = self.state.trickle.borrow();
+        let trickle = trickle
             .as_ref()
+            .filter(|held| held.dialog == dialog)
             .ok_or_else(|| refused("the bootstrap dialog has no trickle socket"))?;
         let text = frame.to_string();
         // CONNECTING is not a failure, it is a race with the socket's
-        // own handshake. Buffer; `onopen` flushes in order.
-        if socket.ready_state() == WebSocket::CONNECTING {
-            self.state.pending_flush.borrow_mut().push(text);
+        // own handshake. Buffer into THIS dialog's queue — so the
+        // flush that later sends it cannot carry another dialog's
+        // frames — and its own `onopen` flushes in order.
+        if trickle.socket.ready_state() == WebSocket::CONNECTING {
+            trickle.pending.borrow_mut().push(text);
             return Ok(());
         }
-        socket
+        trickle
+            .socket
             .send_with_str(&text)
             .map_err(|e| refused(&format!("the trickle socket refused a frame: {e:?}")))
     }
@@ -318,9 +394,11 @@ impl ControlPlane for AnchorControlPlane {
         // The socket opens before the leaf installs the answer: the
         // anchor's own candidate is the socket's FIRST frame, and it
         // is what lets the browser start connectivity checks while
-        // it is still gathering.
-        state.dialog.set(Some(accepted.dialog));
+        // it is still gathering. The dialog slot moves only once its
+        // socket exists, so `state.dialog` never names an attempt
+        // with no socket behind it.
         self.open_trickle(accepted.dialog, &accepted.attempt_token)?;
+        state.dialog.set(Some(accepted.dialog));
 
         Ok(BootstrapAccepted {
             dialog: accepted.dialog,
@@ -348,38 +426,41 @@ impl ControlPlane for AnchorControlPlane {
     }
 
     async fn end_attempt(&self, dialog: DialogId) -> Result<()> {
-        if self.state.dialog.get() != Some(dialog) {
-            // Idempotent by contract: an attempt that is already
-            // gone is not an error.
-            return Ok(());
+        // Idempotent by contract: an attempt that is already gone is
+        // not an error. But "already gone" and "replaced" are not the
+        // same thing (M47): the socket is addressed by the dialog it
+        // was opened for, so THIS call closes the socket it names
+        // even when the state has moved on to a successor — and the
+        // successor's socket is never in reach of a stale call.
+        if self.state.dialog.get() == Some(dialog) {
+            self.state.dialog.set(None);
         }
-        self.state.dialog.set(None);
-        self.state.pending_flush.borrow_mut().clear();
-        let socket = self.state.trickle.borrow_mut().take();
-        if let Some(socket) = socket {
-            // Closing CONNECTING aborts the upgrade: the anchor never gets
-            // a socket whose close can retire the accepted offer. Firefox
-            // can delay upgrades after earlier aborted connections, so even
-            // a seconds-long failed connect can still be in this state.
-            // Keep the handback alive for a bounded establishment window;
-            // RTC resources have already been closed by the caller.
-            for _ in 0..150 {
-                if socket.ready_state() != WebSocket::CONNECTING {
-                    break;
-                }
-                if crate::bootstrap::gloo_timer_sleep(100).await.is_err() {
-                    break;
-                }
+        // Taken out of the state before the await below, so no
+        // `RefCell` borrow is held across it.
+        let Some(trickle) = Self::take_trickle(&self.state, Some(dialog)) else {
+            return Ok(());
+        };
+        // The attempt is over: frames buffered for it must not be
+        // flushed by an `onopen` that fires during the wait below.
+        trickle.pending.borrow_mut().clear();
+        // Closing CONNECTING aborts the upgrade: the anchor never gets
+        // a socket whose close can retire the accepted offer. Firefox
+        // can delay upgrades after earlier aborted connections, so even
+        // a seconds-long failed connect can still be in this state.
+        // Keep the handback alive for a bounded establishment window;
+        // RTC resources have already been closed by the caller.
+        for _ in 0..150 {
+            if trickle.socket.ready_state() != WebSocket::CONNECTING {
+                break;
             }
-            let established = socket.ready_state() == WebSocket::OPEN;
-            socket.set_onopen(None);
-            socket.set_onmessage(None);
-            socket.set_onclose(None);
-            let _ = socket.close();
-            self.state.handlers.borrow_mut().clear();
-            if !established {
-                return Err(refused("the trickle socket did not open before attempt handback; the anchor must expire the dialog"));
+            if crate::bootstrap::gloo_timer_sleep(100).await.is_err() {
+                break;
             }
+        }
+        let established = trickle.socket.ready_state() == WebSocket::OPEN;
+        Self::retire(trickle);
+        if !established {
+            return Err(refused("the trickle socket did not open before attempt handback; the anchor must expire the dialog"));
         }
         Ok(())
     }
