@@ -68,7 +68,10 @@ async fn boot_holder() -> (Mesh, transport::ServeHandle) {
 
 fn cli_cmd(home_dir: &TempDir) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("net-mesh").expect("cargo_bin");
-    cmd.env("HOME", home_dir.path())
+    // Do not inherit a developer's exported mesh config or profile.
+    cmd.env_remove("NET_MESH_CONFIG")
+        .env_remove("NET_MESH_PROFILE")
+        .env("HOME", home_dir.path())
         .env("XDG_CONFIG_HOME", home_dir.path())
         .env("USERPROFILE", home_dir.path());
     cmd

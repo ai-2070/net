@@ -91,7 +91,10 @@ async fn remote_effect_occurs_once_despite_timeout_and_late_response() {
             .unwrap()
     };
     let child = spawn();
-    tokio::time::timeout(Duration::from_secs(2), handler.entered.notified())
+    // Harness slack (~10 s) for process spawn, config parse, mesh build and
+    // routed handshake — matching sibling harness budgets around the same
+    // deadline under test. The CLI's `--timeout 2s` budget above is unchanged.
+    tokio::time::timeout(Duration::from_secs(10), handler.entered.notified())
         .await
         .unwrap();
     assert_eq!(handler.effects.load(Ordering::SeqCst), 1);
