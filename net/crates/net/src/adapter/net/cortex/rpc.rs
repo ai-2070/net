@@ -3947,6 +3947,10 @@ impl ByteBudgets {
         self.unsettled_drops.load(Ordering::Relaxed)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: byte permits release exactly once; a miss is a double-release ownership bug the accounting exists to surface"
+    )]
     fn release_charge(&self, charge: ByteCharge) {
         let mut state = self.state.lock();
         let call_slot = (charge.key.clone(), charge.incarnation, charge.direction);
@@ -4769,6 +4773,10 @@ impl ProtectedCallRegistry {
     /// against THIS record's member generation and refreshes the captured
     /// generation on success); the now-verified acting-org quota is
     /// reserved atomically with the transition, rolling back on refusal.
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: record presence and verified facts are validated under this same lock; None here means the lock discipline is broken and must surface, not be papered over"
+    )]
     pub fn install(
         self: &Arc<Self>,
         reservation: &mut ReservationGuard,
@@ -4864,9 +4872,7 @@ impl ProtectedCallRegistry {
             );
             return Err(AdmissionDenied::ActiveStreamCapacity);
         };
-        inner
-            .active_per_org
-            .insert(facts.acting_org.clone(), org_next);
+        inner.active_per_org.insert(facts.acting_org, org_next);
 
         let record = inner
             .records
@@ -4874,14 +4880,7 @@ impl ProtectedCallRegistry {
             .expect("record presence checked under this same lock");
         record.captured = live;
         record.facts = Some(facts);
-        record.charged_org = Some(
-            record
-                .facts
-                .as_ref()
-                .expect("just filled")
-                .acting_org
-                .clone(),
-        );
+        record.charged_org = Some(record.facts.as_ref().expect("just filled").acting_org);
         record.phase = RegistryPhase::Admitted;
         let registration = record.registration;
         let session = record.session.clone();
@@ -4971,6 +4970,10 @@ impl ProtectedCallRegistry {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: record presence is validated under this same lock"
+    )]
     fn commit_check_locked(
         &self,
         inner: &mut RegistryInner,
@@ -5119,6 +5122,10 @@ impl ProtectedCallRegistry {
         self.remove(key, incarnation, CleanupOwner::Supervisor)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: the record and its counters are validated under this same lock; a miss is a double-release ownership bug"
+    )]
     fn remove(&self, key: &ProtectedCallKey, incarnation: u64, expected: CleanupOwner) -> bool {
         let mut inner = self.inner.lock();
         let matches = inner
@@ -5265,6 +5272,10 @@ impl CommitTxn<'_> {
     /// the caller's queue-admission closure WHILE this transaction still
     /// holds the registry lock — so the §2.3 check and the enqueue are
     /// one ownership operation.
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: record presence is validated when the transaction opened, with the guard held across it"
+    )]
     pub fn commit_with(
         mut self,
         permit: ItemPermit,
@@ -5294,6 +5305,10 @@ static PROTECTED_CALL_REGISTRIES: std::sync::LazyLock<DashMap<u64, Arc<Protected
 
 /// The node's protected-call registry, created on first use with the Q1
 /// defaults (validated at construction).
+#[expect(
+    clippy::expect_used,
+    reason = "the Q1 limits validate by construction (startup validation per Q1); a panic here is a constant defect, not a runtime contingency"
+)]
 pub fn protected_call_registry_for(node_id: u64) -> Arc<ProtectedCallRegistry> {
     if let Some(existing) = PROTECTED_CALL_REGISTRIES.get(&node_id) {
         return existing.value().clone();

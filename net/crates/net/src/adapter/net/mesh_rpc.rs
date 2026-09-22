@@ -1244,10 +1244,10 @@ pub fn admit_protected_opening(
     // order, preserved verbatim). The coarse reason deliberately does
     // not disclose WHICH term failed.
     let subnet_export_facts = match reg.subnet_export() {
-        Some(binding) => match gate::verify_subnet_export(mesh, binding, &clock) {
-            Ok(facts) => Some(facts),
-            Err(denied) => return Err(denied.into()),
-        },
+        Some(binding) => {
+            let facts = gate::verify_subnet_export(mesh, binding, &clock)?;
+            Some(facts)
+        }
         None => None,
     };
 
@@ -1365,7 +1365,7 @@ pub fn admit_protected_opening(
     let lease = registry.install(
         &mut reservation,
         fold::VerifiedCallFacts {
-            acting_org: admitted.acting_org.clone(),
+            acting_org: admitted.acting_org,
             member: admitted.caller.clone(),
             member_generation,
             // The §2.1 deadline lives at the fold (`StreamCallLifetime`);

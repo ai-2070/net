@@ -3433,7 +3433,10 @@ mod tests {
         // before finalization consumes the handshake state.
         let init_transcript = initiator.handshake_hash().unwrap();
         let resp_transcript = responder.handshake_hash().unwrap();
-        assert_eq!(init_transcript, resp_transcript, "one transcript, both sides");
+        assert_eq!(
+            init_transcript, resp_transcript,
+            "one transcript, both sides"
+        );
 
         let (init_keys, init_binding) = initiator.into_session_keys_with_binding().unwrap();
         let (resp_keys, resp_binding) = responder.into_session_keys_with_binding().unwrap();
