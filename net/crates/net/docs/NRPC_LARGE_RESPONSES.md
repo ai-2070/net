@@ -38,8 +38,12 @@ route. Each credit-admission attempt checks shutdown and receive-lifetime
 retirement, so a credit refund cannot revive a retired session's blocked send.
 Large native replies do not enqueue individual fragments. The existing handler
 task owns one response pump, with at most eight admitted pumps across all
-services on a node. Admission failure sends a bounded Internal diagnostic
-before any fragment is emitted. Small replies retain the existing bounded
+services on a node, carried by the `LARGE_RESPONSE_PUMP_SLOTS` constant. A
+pump slot waits for transmit credit with a bounded exponential backoff (1 ms
+to 32 ms). Pump exhaustion refuses the whole response with `Backpressure`
+("sender capacity exhausted; no fragments sent") — distinguishable from a
+handler failure — before any fragment is emitted, though the handler may
+already have completed. Small replies retain the existing bounded
 drainer and do not consume these slots. Each admitted response retains at most
 1 MiB of encoded fragment backing storage; encoding temporarily also holds the
 handler's original response. This is not a bound on application-handler memory.
