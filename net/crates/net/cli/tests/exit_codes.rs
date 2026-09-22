@@ -123,7 +123,7 @@ fn code_2_on_malformed_bind_literal_for_listen_and_attach() {
     // (usage error) on `wrap --listen` but slip past the attach-side
     // bind validation and die later as exit 6 (connection failure). Both
     // verbs must now reject it as InvalidArgs during argument resolution,
-    // before any connection — and therefore before any child spawn.
+    // before any connection.
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "").unwrap();
