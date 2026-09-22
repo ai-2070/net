@@ -1,0 +1,37 @@
+go/nrpc_large_response_vectors_test.go
+  s_38828de26a56bb::t_360d8fff388322 25,49-55
+net/crates/net/bindings/node/test/large_response_vectors.test.ts
+  s_38828de26a56bb::t_3d01c77c68a960 17-20
+net/crates/net/bindings/python/tests/test_large_response_vectors.py
+  s_38828de26a56bb::t_33c22ad1bd0464 17-19
+net/crates/net/docs/NRPC_LARGE_RESPONSES.md
+  s_38828de26a56bb::t_ffe7275da179dd 64-70
+net/crates/net/src/adapter/net/cortex/rpc_large_response.rs
+  s_eb3d90fdf51c44::t_5135f7bc390f7d 228-234
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_large_response.json
+  s_38828de26a56bb::t_35e20e1cc43c34 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "62560b51c0cc771f55cb19a7588765ab1e8db931",
+  "prompts": {},
+  "sessions": {
+    "s_38828de26a56bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bd78-0b51-7800-ad71-1adebb011a2c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_eb3d90fdf51c44": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0bfae-f163-7301-ac99-f0cd8300e4be",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
