@@ -1318,7 +1318,7 @@ async fn a_retired_routed_establishment_installs_nothing_afterwards() {
         "nobody answered message 1: the wait must fail"
     );
     assert!(
-        p.leaf.inner.borrow().handshakes.get(&p.peer_id).is_none(),
+        !p.leaf.inner.borrow().handshakes.contains_key(&p.peer_id),
         "the failed wait revoked the routed establishment's ownership"
     );
     assert!(
@@ -1810,10 +1810,8 @@ fn an_unnamed_open_resolves_to_the_anchor_not_peer_zero() {
     let p = pair();
     p.install_session();
     // Exactly what a page passes when it names no peer.
-    let opts = js_sys::JSON::parse(&format!(
-        "{{\"label\":\"app\",\"reliability\":\"reliable\"}}"
-    ))
-    .expect("a stream options object");
+    let opts = js_sys::JSON::parse("{\"label\":\"app\",\"reliability\":\"reliable\"}")
+        .expect("a stream options object");
     let handle = p.leaf.open_stream(opts).expect("an unnamed open is legal");
     assert_eq!(
         handle.peer_node_hex(),

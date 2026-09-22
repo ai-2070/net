@@ -239,7 +239,7 @@ impl AnchorControlPlane {
         let mut slot = state.trickle.borrow_mut();
         if slot
             .as_ref()
-            .is_some_and(|held| names.map_or(true, |dialog| dialog == held.dialog))
+            .is_some_and(|held| names.is_none_or(|dialog| dialog == held.dialog))
         {
             slot.take()
         } else {

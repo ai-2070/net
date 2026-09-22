@@ -5182,6 +5182,7 @@ jobs:
       #     the other arm's tests, which is exactly how `org_admission_gate`
       #     got silently excluded in the first place.
       - name: Org + authority unit tests
+        shell: bash
         run: |
           set -euo pipefail
           cargo nextest run --features net --lib --no-tests=fail \
