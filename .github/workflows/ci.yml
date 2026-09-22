@@ -1740,7 +1740,7 @@ jobs:
           # the three bridge/routing witnesses). Raised with each slice that
           # lands witnesses; REQUIRED names extended in the same commit as
           # the witnesses.
-          run_binary org_rpc_streaming 27 \
+          run_binary org_rpc_streaming 30 \
             stream_opening_admits_same_org \
             stream_opening_admits_cross_org \
             unary_context_proof_is_binding_invalid_on_stream_registration \
@@ -1767,7 +1767,10 @@ jobs:
             node_shutdown_retires_live_protected_streams \
             forbidden_stream_opening_causes_zero_handler_effects \
             streaming_denial_is_not_fanned_out_to_the_reply_roster \
-            provider_policy_veto_denies_before_effects || exit 1
+            provider_policy_veto_denies_before_effects \
+            completed_stream_drains_queued_items_in_order_with_content_and_end_terminal \
+            cross_org_completed_stream_drains_correlated_items_with_end_terminal \
+            response_after_session_replacement_reaches_only_the_live_session || exit 1
 
       # === The fixtures-off DARKNESS probe (external consumer) =============
       # No test inside this workspace can observe a fixtures-off build of the
