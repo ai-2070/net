@@ -1,0 +1,14 @@
+docs/internal/plans/NET_CLI_PLAN_V3.md
+  h_64425bc75e3f3d 6,8,28,31,36,53,55,65-68,70,74,87,91,100-103,117,128,144,256,260-261,300,618-622,638,679-696,698,702,704,708,712,716,744,761-762,766,773-774,776,780-783,795,802,822
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7735a8a9fe1cae96cf495f8a959a7f5f8ce0a80f",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
