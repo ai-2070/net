@@ -1,0 +1,18 @@
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  h_64425bc75e3f3d 26-30,1334-1362
+docs/internal/spikes/org-streaming/S1_REPORT.md
+  h_64425bc75e3f3d 134-155
+docs/internal/spikes/org-streaming/S1_REVIEW_PACKET_2.md
+  h_64425bc75e3f3d 1-669
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "809e01fba33b6302d204b6b0bfc6cd9690b7879a",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
