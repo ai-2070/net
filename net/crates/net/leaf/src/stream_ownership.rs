@@ -118,12 +118,15 @@ pub trait StreamBackend {
 }
 
 /// Why [`StreamOwnership::adopt`] refused a stream — with the stream
-/// itself handed back in every case, for the caller to close.
+/// itself handed back in every case, and a **refusal-specific
+/// disposition** for it (see [`AdoptRefusal::dispose`]).
 ///
 /// Three refusals, three dispositions on the reply: "your open did
 /// not resolve", "this identity is already open" and "the handle
 /// space is done" send an operator to different places, so one
-/// message for all three would be a lie for two of them.
+/// message for all three would be a lie for two of them. The
+/// dispositions differ just as much: one of the three must NOT be
+/// closed.
 #[derive(Debug)]
 pub enum AdoptRefusal<T> {
     /// The stream did not report a readable identity.
@@ -137,12 +140,32 @@ pub enum AdoptRefusal<T> {
 }
 
 impl<T> AdoptRefusal<T> {
-    /// The refused stream, for the caller to close.
-    pub fn into_stream(self) -> T {
+    /// Dispose of the refused stream the way **this** refusal
+    /// requires.
+    ///
+    /// [`Self::Unreadable`] and [`Self::Exhausted`] name a fresh open
+    /// nothing else references: its node registration is its own to
+    /// give back, so it goes to `close` (the backend's
+    /// [`StreamBackend::close`]).
+    ///
+    /// [`Self::Duplicate`] must **not** close. The refused stream is
+    /// a second wrapper on the SURVIVOR's one node stream — identity
+    /// is `(wire id, peer, incarnation)` and the veto fired because a
+    /// live open already holds exactly that — while the close chain
+    /// is shared: `close` reaches `LeafNode::close_stream`, whose
+    /// `rx_closed` insert and `stream_kinds` remove are keyed on the
+    /// shared `(incarnation, stream id)`. Closing the refused wrapper
+    /// is therefore the exact failure mode the veto exists to
+    /// prevent, re-created by its own refusal: the survivor's receive
+    /// half dies on a duplicate attempt that returned `Err`, counted
+    /// `StreamClosed` while `stream_send` keeps working. The wrapper
+    /// is discarded instead — it owns nothing the survivor's own
+    /// close will not give back (a refused open is disposed before
+    /// any handle is handed out, so its listener list is empty).
+    pub fn dispose(self, close: impl FnOnce(T)) {
         match self {
-            Self::Unreadable(stream)
-            | Self::Duplicate(_, stream)
-            | Self::Exhausted(stream) => stream,
+            Self::Unreadable(stream) | Self::Exhausted(stream) => close(stream),
+            Self::Duplicate(_, stream) => drop(stream),
         }
     }
 }
@@ -195,12 +218,19 @@ where
                     }
                     Err(refusal) => {
                         // Fail closed either way: a refused stream is
-                        // given back to be closed, never handed over
-                        // half-identified or left aliasing a live open.
-                        // Each refusal says which it was — "your open
-                        // did not resolve", "this identity is already
-                        // open" and "the handle space is done" are
-                        // three different things to act on.
+                        // never handed over half-identified or left
+                        // aliasing a live open. Each refusal says
+                        // which it was — "your open did not resolve",
+                        // "this identity is already open" and "the
+                        // handle space is done" are three different
+                        // things to act on — and the disposal differs
+                        // too, which is why it lives in
+                        // `AdoptRefusal::dispose`: a duplicate's
+                        // wrapper is an alias of the SURVIVOR's one
+                        // node stream and is discarded WITHOUT the
+                        // shared close chain, whose `rx_closed`/
+                        // `stream_kinds` writes would take the
+                        // survivor's receive half with it.
                         let message = match &refusal {
                             AdoptRefusal::Unreadable(_) => {
                                 "opened stream did not report a readable identity".to_string()
@@ -215,7 +245,7 @@ where
                                 "the stream handle space is exhausted".to_string()
                             }
                         };
-                        backend.close(refusal.into_stream());
+                        refusal.dispose(|stream| backend.close(stream));
                         reply.fail(ProxyFailure::Typed(LeafError::Session(message)));
                     }
                 },
@@ -301,10 +331,12 @@ impl<T> StreamOwnership<T> {
     /// consumers receive every payload of the one wire stream, and
     /// closing either one kills the survivor's receive half — the
     /// node's `stream_kinds` and `rx_closed` are keyed on the shared
-    /// `(peer, stream_id)`. The second open is refused and handed
-    /// back to be closed; the survivor is untouched. The identity is
-    /// released when the handle is, so an open-close-open sequence of
-    /// the same stream is two opens, as it should be.
+    /// `(peer, stream_id)`. The second open is refused and its
+    /// wrapper disposed **without** the shared close chain
+    /// ([`AdoptRefusal::dispose`]); the survivor is untouched,
+    /// receive state included. The identity is released when the
+    /// handle is, so an open-close-open sequence of the same stream
+    /// is two opens, as it should be.
     pub fn adopt(&self, stream: T) -> Result<(u64, ResolvedIdentity), AdoptRefusal<T>>
     where
         T: StreamIdentity,
@@ -349,7 +381,9 @@ impl<T> StreamOwnership<T> {
         // the identity map is a veto on ADOPTION, so a value inserted
         // without one (`insert`) has nothing to clear and must not
         // need a bound this method does not otherwise want.
-        self.identities.borrow_mut().retain(|_, owner| *owner != handle);
+        self.identities
+            .borrow_mut()
+            .retain(|_, owner| *owner != handle);
         Some(stream)
     }
 
@@ -373,7 +407,14 @@ impl<T> StreamOwnership<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::rc::Rc;
+
+    /// The identity every spy stream resolves to — one peer, one
+    /// incarnation, wire ids minted per open. Fixed so two opens can
+    /// share an identity on purpose (by rewinding `next_wire`).
+    const SPY_PEER: u64 = 0xaa;
+    const SPY_INCARNATION: u64 = 1;
 
     /// Two opens sharing a wire id are two opens.
     ///
@@ -537,6 +578,21 @@ mod tests {
         /// straight back in: `(the table to re-enter, the handle to
         /// close)`.
         reenter: RefCell<Option<(Rc<StreamOwnership<SpyStream>>, u64)>>,
+        /// The node-level receive state the production open/close
+        /// chain reaches, modeled with the node's own keys:
+        /// `LeafNode::rx_closed` is `(incarnation, stream id)` and
+        /// `LeafNode::stream_kinds` is `(peer, stream id)` — both
+        /// **shared** by every wrapper of one identity, because one
+        /// `(wire id, peer, incarnation)` is ONE node stream. `open`
+        /// and `close` below perform exactly the writes
+        /// `LeafNode::open_stream` / `LeafNode::close_stream` perform,
+        /// so an oracle reading these after a refused open sees what
+        /// the refusal's disposition really does to the SURVIVOR's
+        /// receive half — a spy whose `close` only bumps an
+        /// identity-private counter cannot tell "disposed the refused
+        /// wrapper" from "closed the shared stream".
+        rx_closed: RefCell<HashSet<(u64, u64)>>,
+        stream_kinds: RefCell<HashSet<(u64, u64)>>,
     }
 
     /// A stream that can be made unresolvable, over an identity the
@@ -551,8 +607,8 @@ mod tests {
         fn identity(&self) -> Option<ResolvedIdentity> {
             self.resolvable.then_some(ResolvedIdentity {
                 wire_id: self.wire_id,
-                peer: 0xaa,
-                incarnation: 1,
+                peer: SPY_PEER,
+                incarnation: SPY_INCARNATION,
             })
         }
     }
@@ -570,6 +626,16 @@ mod tests {
         ) -> Result<Self::Stream, crate::leader::ProxyFailure> {
             let wire_id = self.next_wire.get();
             self.next_wire.set(wire_id.wrapping_add(1));
+            // `LeafNode::open_stream`'s two shared writes: the id is
+            // registered as a stream, and reopening un-closes the
+            // receive half. Idempotent for a duplicate identity —
+            // which is why the OPEN of a duplicate attempt is
+            // harmless and only the refusal's disposition can hurt
+            // the survivor.
+            self.stream_kinds.borrow_mut().insert((SPY_PEER, wire_id));
+            self.rx_closed
+                .borrow_mut()
+                .remove(&(SPY_INCARNATION, wire_id));
             Ok(SpyStream {
                 resolvable: self.resolvable,
                 wire_id,
@@ -597,8 +663,19 @@ mod tests {
             Ok(())
         }
 
-        fn close(&self, _stream: Self::Stream) {
+        fn close(&self, stream: Self::Stream) {
             self.closed.set(self.closed.get() + 1);
+            // `LeafNode::close_stream`'s two shared writes: the
+            // receive half is marked closed and the registration
+            // given up — keyed on the SHARED identity, so this hits
+            // every wrapper of the one node stream, exactly as the
+            // production chain does.
+            self.rx_closed
+                .borrow_mut()
+                .insert((SPY_INCARNATION, stream.wire_id));
+            self.stream_kinds
+                .borrow_mut()
+                .remove(&(SPY_PEER, stream.wire_id));
         }
     }
 
@@ -609,6 +686,8 @@ mod tests {
             sent: RefCell::new(Vec::new()),
             next_wire: Cell::new(9),
             reenter: RefCell::new(None),
+            rx_closed: RefCell::new(HashSet::new()),
+            stream_kinds: RefCell::new(HashSet::new()),
         }
     }
 
@@ -783,13 +862,43 @@ mod tests {
     }
 
     /// One identity is one open: a second open of a live `(wire_id,
-    /// peer, incarnation)` is refused.
+    /// peer, incarnation)` is refused — and the survivor's RECEIVE
+    /// state is exactly as before the refused open.
     ///
     /// Two opens sharing all three were two handles over ONE node
     /// stream — both consumers received every payload of the one wire
     /// stream, and closing either one removed the shared
     /// `(peer, stream_id)` state out from under the survivor's
-    /// receive half.
+    /// receive half. The veto prevents the alias; what this oracle
+    /// additionally watches is what the REFUSAL's disposition does to
+    /// the survivor — the defect the repair-pass review found in the
+    /// repair itself: the refused wrapper used to go to
+    /// `backend.close`, whose chain (`LeafStream::close` →
+    /// `LeafNode::close_stream`) inserts `rx_closed` and removes
+    /// `stream_kinds` under the SHARED identity, destroying the
+    /// survivor's node-level receive half on a mere duplicate attempt
+    /// that returned `Err`.
+    ///
+    /// So `SpyBackend`'s `open`/`close` perform exactly the shared
+    /// writes the production pair performs, and the assertions below
+    /// read that shared state directly. The shape this test had —
+    /// a `SpyStream::close` counter and an ownership-map check —
+    /// cannot distinguish "disposed the refused wrapper" from "closed
+    /// the shared stream": either way the counter moves and the map
+    /// is untouched.
+    ///
+    /// One disposition inversion, forced by the repair the reviewer
+    /// specified. The repair-pass review requires "a refused open
+    /// leaves the survivor's node-level receive state exactly as it
+    /// was — dispose of the refused wrapper without the shared close
+    /// path", so this test's `closed` count changed from `1` ("the
+    /// refused stream is given back and closed, not leaked open") to
+    /// `0`: the old assertion pinned the very disposition the repair
+    /// removes. The refusal assertions and the survivor assertions
+    /// are unchanged, the receive-state oracle is what the review
+    /// asked for, and the survivor's own close at the end moves the
+    /// shared state — so the oracle discriminates exactly what its
+    /// name and its failure messages name.
     #[test]
     fn a_second_open_of_one_identity_is_refused_and_the_survivor_is_untouched() {
         let owned = StreamOwnership::default();
@@ -799,14 +908,30 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
+        // The survivor's node-level receive state BEFORE the refused
+        // open: registered and not closed.
+        assert!(backend.stream_kinds.borrow().contains(&(SPY_PEER, 9)));
+        assert!(!backend.rx_closed.borrow().contains(&(SPY_INCARNATION, 9)));
+
         // The same identity again: the same wire stream, opened twice.
         backend.next_wire.set(9);
         answer(&owned, &backend, open_request(Some(0xbbbb)))
             .expect_err("a duplicate identity must be refused");
+        assert!(
+            !backend.rx_closed.borrow().contains(&(SPY_INCARNATION, 9)),
+            "the survivor's receive half is exactly as before the refused open: not closed"
+        );
+        assert!(
+            backend.stream_kinds.borrow().contains(&(SPY_PEER, 9)),
+            "and its stream registration is still claimed"
+        );
         assert_eq!(
             backend.closed.get(),
-            1,
-            "the refused stream is given back and closed, not leaked open"
+            0,
+            "the refused wrapper is disposed WITHOUT the shared close: `close` runs the \
+             production close chain (`LeafStream::close` → `LeafNode::close_stream`), whose \
+             `rx_closed`/`stream_kinds` writes are keyed on the SHARED identity and would take \
+             the SURVIVOR's receive half with it"
         );
         assert_eq!(
             owned.with(first, |s| s.wire_id),
@@ -816,17 +941,58 @@ mod tests {
         assert_eq!(owned.len(), 1, "the duplicate took no slot");
 
         // The identity is released with its handle: after the survivor        // closes, the same identity is openable again.
+        assert!(answer(
+            &owned,
+            &backend,
+            crate::leader::LeaderRequest::StreamClose { handle: first }
+        )
+        .is_ok());
+        // The positive control the oracle needs: the survivor's own
+        // close DOES run the shared close chain, so the silence above
+        // is the refusal's disposition and not a dead model.
+        assert_eq!(backend.closed.get(), 1, "the survivor's close ran");
         assert!(
-            answer(
-                &owned,
-                &backend,
-                crate::leader::LeaderRequest::StreamClose { handle: first }
-            )
-            .is_ok()
+            backend.rx_closed.borrow().contains(&(SPY_INCARNATION, 9)),
+            "the survivor's own close gives the shared receive state back"
         );
+        assert!(!backend.stream_kinds.borrow().contains(&(SPY_PEER, 9)));
         backend.next_wire.set(9);
         answer(&owned, &backend, open_request(None))
             .expect("a closed identity may be opened again");
+    }
+
+    /// The refused wrapper's disposal is refusal-specific, and the
+    /// alias case is the one that must not close.
+    ///
+    /// The rule under test is [`AdoptRefusal::dispose`]'s own: a
+    /// fresh open nothing else references is given back to `close`,
+    /// while a duplicate's wrapper — an alias of the survivor's one
+    /// node stream — is DISCARDED, because the shared close chain
+    /// would take the survivor's receive half with it. The two
+    /// fresh-open arms are the positive control: the rule is "never
+    /// close the alias", not "never close a refusal".
+    #[test]
+    fn a_duplicate_refusal_disposes_the_wrapper_without_closing_the_shared_stream() {
+        let identity = ResolvedIdentity {
+            wire_id: 9,
+            peer: SPY_PEER,
+            incarnation: SPY_INCARNATION,
+        };
+        let mut closed = 0u64;
+
+        AdoptRefusal::Duplicate(identity, 7).dispose(|_| closed += 1);
+        assert_eq!(
+            closed, 0,
+            "a duplicate wrapper must be discarded, never closed: close runs the shared \
+             close chain over the SURVIVOR's identity"
+        );
+
+        AdoptRefusal::Unreadable(7).dispose(|_| closed += 1);
+        AdoptRefusal::Exhausted(7).dispose(|_| closed += 1);
+        assert_eq!(
+            closed, 2,
+            "a fresh open nothing else references is still given back to close"
+        );
     }
 
     /// A send whose dispatch calls straight back in may close another
@@ -894,6 +1060,9 @@ mod tests {
             owned.insert(1).is_err(),
             "the counter's end must refuse, not wrap"
         );
-        assert!(owned.is_empty(), "a refusal must not overwrite a live entry");
+        assert!(
+            owned.is_empty(),
+            "a refusal must not overwrite a live entry"
+        );
     }
 }

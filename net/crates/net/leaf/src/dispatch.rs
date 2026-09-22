@@ -297,7 +297,17 @@ mod tests {
     #[test]
     fn an_unknown_subprotocol_is_dropped_and_counted() {
         let c = LeafCounters::new();
-        assert!(dispatch_event(0x0F00, Bytes::from_static(b"whatever"), &c).is_err());
+        // The refusal must NAME the classification it made — the same
+        // pin the unparsable arm carries. `is_err()` plus the counter
+        // passed even if the returned `Err` said `Unparsable` while
+        // the counter moved `UnknownSubprotocol`, and
+        // `handle_event` publishes the RETURNED value as the event
+        // reason — mislabelling the event exactly as one name for
+        // both refusals would.
+        assert_eq!(
+            dispatch_event(0x0F00, Bytes::from_static(b"whatever"), &c),
+            Err(DropReason::UnknownSubprotocol)
+        );
         assert_eq!(c.drops(DropReason::UnknownSubprotocol), 1);
         assert_eq!(
             c.total_drops(),

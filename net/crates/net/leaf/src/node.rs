@@ -502,6 +502,28 @@ pub struct LeafNode {
     calls: CallTable,
     /// What this leaf has registered each `(peer, stream id)` as.
     stream_kinds: HashMap<(NodeId, u64), StreamKind>,
+    /// `(peer, stream id)` → the nonce of the `0x0A00` request whose
+    /// registration is the one now in `stream_kinds`, so a refusal
+    /// rolls back only the registration **its own request** created.
+    ///
+    /// Kept in step with `stream_kinds`'s registrations at every
+    /// writer: `subscribe` stamps the registration with its own
+    /// nonce, and anything that replaces or removes a registration
+    /// (`publish`'s re-registration, `unsubscribe`, `open_stream`'s
+    /// overwrite, `close_stream`, session teardown) retires the
+    /// stamp. An entry is therefore absent exactly when the current
+    /// registration is not one a membership request created.
+    ///
+    /// Rollback keyed by `(peer, stream id)` alone removed the
+    /// **later** registration's claim when two registrations of one
+    /// channel id overlapped — `subscribe` called twice for one name
+    /// (it does not dedup), or a `publish` re-registering the id
+    /// between a subscribe and its Ack — and the earlier request's
+    /// Ack was a refusal: the anchor admitted the surviving
+    /// Subscribe while the local claim was gone, and the same keying
+    /// could retire an nRPC reply-carrier reservation re-established
+    /// after an earlier refusal.
+    channel_claims: HashMap<(NodeId, u64), u64>,
     /// `(incarnation, stream id)` → the receiver's cumulative
     /// consumed-byte count as of the last stream-window frame this
     /// leaf sent, so *credit* is granted on a volume threshold
@@ -655,6 +677,7 @@ impl LeafNode {
             rx_streams: HashMap::new(),
             calls: CallTable::with_seed(call_id_seed),
             stream_kinds: HashMap::new(),
+            channel_claims: HashMap::new(),
             grants_sent: HashMap::new(),
             acks_sent: HashMap::new(),
             announcements: AnnouncementStore::new(),
@@ -1312,6 +1335,7 @@ impl LeafNode {
             self.reply_subscriptions.retain(|(p, _)| *p != peer);
             self.rpc_reply_carriers.retain(|(p, _)| *p != peer);
             self.stream_kinds.retain(|(p, _), _| *p != peer);
+            self.channel_claims.retain(|(p, _), _| *p != peer);
             // In-flight membership requests rode the predecessor and
             // cannot be answered for the successor.
             self.pending_memberships.retain(|_, m| m.peer != peer);
@@ -1406,6 +1430,7 @@ impl LeafNode {
         // for those.
         self.calls.fail_peer(peer);
         self.stream_kinds.retain(|(p, _), _| *p != peer);
+        self.channel_claims.retain(|(p, _), _| *p != peer);
         // The anchor's roster entry died with the session, so a
         // reconnect must re-subscribe or its replies strand again.
         self.reply_subscriptions.retain(|(p, _)| *p != peer);
@@ -1517,6 +1542,26 @@ impl LeafNode {
             let failed = session.wire().take_failed_stream_ids();
             let nacks = session.gap_nacks();
             let incarnation = session.incarnation();
+            // One terminal per stream, by the `send_failed` latch —
+            // exactly the rule `end_receive_half` states for the
+            // receive half ("the consumer is told once"). The wire's
+            // give-up flag is take-and-clear and re-set by EVERY
+            // later give-up pass, and a stream whose descriptors are
+            // born over a span wider than one sweep cadence splits
+            // its retry ladder: one wave exhausts and the next wave
+            // runs a sweep behind it for its whole life, so the wire
+            // gives up on the ONE stream in two passes. Without the
+            // latch each later wave was a second `StreamFailed`, a
+            // second `StreamReset` at a peer that had already reset
+            // — and may have reopened — the id, a second
+            // `DropReason::StreamFailed` count, and a second
+            // `retire_stream_stamps` against stamps the terminal
+            // already gave back. The first flag IS the terminal; a
+            // later one is a straggler of the same death.
+            let failed: Vec<u64> = failed
+                .into_iter()
+                .filter(|stream_id| self.send_failed.insert((incarnation, *stream_id)))
+                .collect();
             let origin = self.identity.origin_hash();
             for stream_id in &failed {
                 if let Ok(packets) = session.build_packets(
@@ -1567,9 +1612,9 @@ impl LeafNode {
                 // `ReliableWindowFull` — exactly the recovery that
                 // error tells the caller to attempt. Retiring by the
                 // exact owner keeps the cap intact and evicts nothing
-                // live.
+                // live. (`failed` is already the fresh-terminals
+                // list, latched above: one retire, one report.)
                 session.retire_stream_stamps(stream_id);
-                self.send_failed.insert((incarnation, stream_id));
                 self.counters.drop_for(DropReason::StreamFailed);
                 self.events.push(LeafEvent::StreamFailed {
                     peer_node: peer,
@@ -1727,6 +1772,12 @@ impl LeafNode {
         // leaf failed to subscribe to is not a channel it knows.
         self.stream_kinds
             .insert((peer, channel.publish_stream_id()), StreamKind::Channel);
+        // The registration is THIS request's claim (see
+        // `LeafNode::channel_claims`): a later registration replaces
+        // the stamp, so a refusal rolls back only a stamp that is
+        // still its own.
+        self.channel_claims
+            .insert((peer, channel.publish_stream_id()), nonce);
         self.note_membership(peer, nonce, &channel, MembershipKind::Subscribe);
         Ok(nonce)
     }
@@ -1793,6 +1844,8 @@ impl LeafNode {
         if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
             self.stream_kinds.remove(&key);
         }
+        // The claim goes with the registration it named.
+        self.channel_claims.remove(&key);
         self.note_membership(peer, nonce, &channel, MembershipKind::Unsubscribe);
         Ok(nonce)
     }
@@ -1827,6 +1880,11 @@ impl LeafNode {
         )?;
         self.stream_kinds
             .insert((peer, channel.publish_stream_id()), StreamKind::Channel);
+        // A publish re-registers the id without a membership request:
+        // the new registration is nobody's claim, so any earlier
+        // request's refusal must not reach it.
+        self.channel_claims
+            .remove(&(peer, channel.publish_stream_id()));
         Ok(())
     }
 
@@ -1914,9 +1972,12 @@ impl LeafNode {
         }
         // The registry is what the receive path classifies on: an
         // id this leaf opened as a stream is a stream, whatever
-        // bits its hash happens to carry.
+        // bits its hash happens to carry. The overwrite is no
+        // membership request's claim either, so a stale refusal
+        // cannot reach it.
         self.stream_kinds
             .insert((peer, stream_id), StreamKind::Stream);
+        self.channel_claims.remove(&(peer, stream_id));
         // Reopening is what un-closes the receive half. The cursor
         // a previous `close_stream` left in place is deliberately
         // still there, at the peer's next sequence, so this
@@ -1980,6 +2041,7 @@ impl LeafNode {
         self.rx_closed
             .insert((handle.incarnation, handle.stream_id));
         self.stream_kinds.remove(&(handle.peer, handle.stream_id));
+        self.channel_claims.remove(&(handle.peer, handle.stream_id));
         Ok(())
     }
 
@@ -2895,14 +2957,14 @@ impl LeafNode {
         // degradations, and one event name for both contradicts the
         // counter that was just moved — a field report could not be
         // reconciled with a snapshot.
-        let decoded =
-            match dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters) {
-                Ok(decoded) => decoded,
-                Err(reason) => {
-                    self.events.push(LeafEvent::Dropped { reason });
-                    return;
-                }
-            };
+        let decoded = match dispatch::dispatch_event(record.subprotocol_id, payload, &self.counters)
+        {
+            Ok(decoded) => decoded,
+            Err(reason) => {
+                self.events.push(LeafEvent::Dropped { reason });
+                return;
+            }
+        };
         match decoded {
             Decoded::Event(payload) => {
                 self.handle_event_plane(peer, incarnation, record, payload);
@@ -3053,13 +3115,27 @@ impl LeafNode {
         });
         if pending.kind == MembershipKind::Subscribe {
             // The anchor refused the membership, so the claim is not
-            // one this leaf holds.
+            // one this leaf holds — but only the claim THIS request
+            // created. The registration is stamped with the nonce of
+            // the request that created it
+            // (`LeafNode::channel_claims`), so when two registrations
+            // of one channel id overlap and the earlier request's Ack
+            // is the refusal, the earlier refusal finds a newer stamp
+            // and takes back nothing: rolling back by key alone
+            // removed the LATER registration's claim — and could
+            // retire an nRPC reply-carrier reservation re-established
+            // after an earlier refusal — while the anchor admitted
+            // the surviving Subscribe, leaving the channel's later
+            // payloads to dispatch `Dropped { UnknownCall }`.
             let key = (from, pending.stream_id);
-            if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
-                self.stream_kinds.remove(&key);
-            }
-            if self.rpc_reply_carriers.remove(&key) {
-                self.reply_subscriptions.remove(&(from, pending.canonical));
+            if self.channel_claims.get(&key).copied() == Some(nonce) {
+                self.channel_claims.remove(&key);
+                if self.stream_kinds.get(&key) == Some(&StreamKind::Channel) {
+                    self.stream_kinds.remove(&key);
+                }
+                if self.rpc_reply_carriers.remove(&key) {
+                    self.reply_subscriptions.remove(&(from, pending.canonical));
+                }
             }
         }
     }
@@ -5983,6 +6059,80 @@ mod tests {
         );
     }
 
+    /// **A send half's terminal is reported ONCE**, however its
+    /// retry ladder ends.
+    ///
+    /// `end_receive_half`'s doctrine — "the consumer is told once" —
+    /// held only for the receive half. The wire's give-up flag is
+    /// take-and-clear and re-set by **every** later give-up pass, and
+    /// a stream whose descriptors are born over a span wider than one
+    /// sweep cadence splits its ladder: one wave exhausts while the
+    /// next wave runs a sweep behind it for its whole life, so the
+    /// wire gives up on the one stream in TWO passes. Each later wave
+    /// was a second `StreamFailed`, a second `StreamReset` at a peer
+    /// that had already reset — and may have reopened — the id, a
+    /// second `DropReason::StreamFailed` count, and a second
+    /// `retire_stream_stamps` against stamps the terminal already
+    /// gave back.
+    ///
+    /// The split is constructed, not waited for: two sends, a gap far
+    /// wider than one sweep cadence, two more sends. The collection
+    /// window outlives BOTH give-ups (`give_up_horizon` per wave, the
+    /// second born late), so "once" is observed against the whole
+    /// death and not just its first half. The positive control is the
+    /// terminal itself: the handle's send is refused typed
+    /// afterwards, so one report is "one of at least one", not
+    /// silence.
+    #[test]
+    fn a_send_half_that_gives_up_in_two_waves_is_reported_once() {
+        let (mut a, b) = pair();
+        let bid = b.node_id();
+        let stream = crate::stream::LEAF_STREAM_DISCRIMINATOR | 0x27;
+        let handle = a
+            .open_stream(bid, "", Reliability::Reliable, Some(stream), None)
+            .expect("open");
+
+        // Wave one.
+        a.stream_send(handle, b"w1").expect("send");
+        a.stream_send(handle, b"w2").expect("send");
+        a.take_outbound();
+        // Far wider than one sweep cadence (the 30 ms tick below), so
+        // the two waves' ladders never share a sweep.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Wave two.
+        a.stream_send(handle, b"w3").expect("send");
+        a.stream_send(handle, b"w4").expect("send");
+        a.take_outbound();
+
+        let horizon = net_wire::reliability::ReliableStream::give_up_horizon(
+            net_wire::reliability::ReliableStream::DEFAULT_RTO,
+            net_wire::reliability::ReliableStream::DEFAULT_MAX_RETRIES,
+        );
+        let started = clock::now();
+        let mut terminals = 0u64;
+        // Outliving BOTH waves: wave two is born 500 ms late and
+        // gives up `give_up_horizon` after that.
+        while started.elapsed() < horizon + std::time::Duration::from_millis(1_500) {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            a.tick(clock::now());
+            a.take_outbound();
+            for (stream_id, reason) in drained(&mut a).1 {
+                if stream_id == stream && reason == StreamFailure::RetransmitsExhausted {
+                    terminals += 1;
+                }
+            }
+        }
+        assert_eq!(
+            terminals, 1,
+            "the consumer is told the send half died ONCE, however many waves its retry \
+             ladder ended in"
+        );
+        assert!(
+            matches!(a.stream_send(handle, b"after"), Err(LeafError::Session(_))),
+            "the one report names a real terminal: the handle's send is refused typed"
+        );
+    }
+
     /// **After promotion, a still-open fire-and-forget handle's
     /// send is delivered under the reliable contract.** Kyra's R3-3
     /// closure is disjunctive — older producers inherit the stream's
@@ -6282,14 +6432,20 @@ mod tests {
     /// Install a session with `peer` on `node`, the way `connected()`
     /// does for the anchor — no announcement, so no establishment
     /// proof is owed and `complete_handshake` installs directly.
-    fn connect_peer(node: &mut LeafNode, peer: NodeId, slot: u32) {
+    ///
+    /// Returns the peer's own [`NetSession`], like `connected()` —
+    /// so a witness can have the peer SEND. A control that must
+    /// arrive "from the wrong peer" needs a real second session to
+    /// arrive on; a packet naming a peer with no session is refused
+    /// `NoSession` before anything above the transport sees it.
+    fn connect_peer(node: &mut LeafNode, peer: NodeId, slot: u32) -> NetSession {
         let anchor_key = anchor_static();
         let prologue = handshake_prologue(
             crate::session::routing_id(node.node_id()),
             crate::session::routing_id(peer),
         );
-        let mut responder =
-            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+        let mut responder = NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue)
+            .expect("responder");
         let msg1 = node
             .begin_handshake(peer, &PSK, anchor_key.public_key(), slot)
             .expect("msg1");
@@ -6297,7 +6453,10 @@ mod tests {
         responder.read_message(&parsed.payload).expect("reads msg1");
         let msg2 = responder.write_message(&[]).expect("msg2");
         let msg2_packet = PacketBuilder::new(&[0u8; 32], 0).build_handshake(&msg2);
-        node.complete_handshake(peer, &msg2_packet).expect("install");
+        node.complete_handshake(peer, &msg2_packet)
+            .expect("install");
+        let keys = responder.into_session_keys().expect("keys");
+        NetSession::new(keys, rtc_addr(slot, 1), 2, false)
     }
 
     /// **#8.** A message 2 that fails to validate must not destroy
@@ -6321,7 +6480,8 @@ mod tests {
         // Attempt one: answered by the peer, but its message 2 is
         // delayed in flight.
         let mut responder_one =
-            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue)
+                .expect("responder");
         let msg1 = node
             .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
             .expect("msg1");
@@ -6334,7 +6494,8 @@ mod tests {
 
         // Attempt two supersedes it.
         let mut responder_two =
-            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue).expect("responder");
+            NoiseHandshake::responder_with_prologue(&PSK, &anchor_key, &prologue)
+                .expect("responder");
         let msg1 = node
             .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
             .expect("msg1");
@@ -6394,8 +6555,18 @@ mod tests {
             .begin_handshake(ANCHOR, &PSK, anchor_key.public_key(), 0)
             .expect("msg1");
         assert!(node.is_handshaking(ANCHOR));
-        let later =
-            clock::now() + core::time::Duration::from_millis(HANDSHAKE_DEADLINE_MS + 1_000);
+        // The pre-deadline control: one tick BEFORE the deadline must
+        // leave the handshake in flight. A single post-deadline tick
+        // cannot tell a deadline sweep from an unconditional reaper —
+        // which would kill every in-flight handshake on unrelated
+        // traffic — so the sweep is driven on both sides of the
+        // deadline and only the far side reaps.
+        node.tick(clock::now());
+        assert!(
+            node.is_handshaking(ANCHOR),
+            "a tick before the deadline must not reap an in-flight handshake"
+        );
+        let later = clock::now() + core::time::Duration::from_millis(HANDSHAKE_DEADLINE_MS + 1_000);
         node.tick(later);
         assert!(
             !node.is_handshaking(ANCHOR),
@@ -6468,7 +6639,8 @@ mod tests {
         // nothing is queued.
         let (mut node, _anchor) = connected();
         let name = node.reply_channel_for("app.orders").expect("name");
-        node.subscribe(ANCHOR, &name).expect("application subscribe");
+        node.subscribe(ANCHOR, &name)
+            .expect("application subscribe");
         node.take_outbound();
         node.call(ANCHOR, "app.orders", b"a", Some(60_000))
             .expect_err("a call cannot take a carrier an application channel already owns");
@@ -6522,11 +6694,7 @@ mod tests {
             .call(PEER, "app.orders", b"a", Some(60_000))
             .expect("call");
         node.take_outbound();
-        assert!(node.drop_session_if_incarnation(
-            PEER,
-            incarnation,
-            "the DataChannel closed"
-        ));
+        assert!(node.drop_session_if_incarnation(PEER, incarnation, "the DataChannel closed"));
         assert!(!node.has_session(PEER));
         assert_eq!(
             rx.try_recv().expect("alive").expect("resolved"),
@@ -6542,6 +6710,19 @@ mod tests {
     /// raises no alarm. The pre-fix arm decoded the Ack and dropped
     /// it on the floor, making an anchor-side refusal
     /// indistinguishable from success.
+    ///
+    /// **Correlation controls.** The injected controls below make
+    /// CORRELATION observable rather than assumed: each phase here
+    /// used to carry the only live nonce, so a nonce-blind
+    /// implementation passed. An Ack with a foreign nonce (right
+    /// peer) fails peer-only matching; the live nonce from the WRONG
+    /// peer fails nonce-only matching. Both are admissions — "an
+    /// uncorrelated admission is stale good news and is ignored" — so
+    /// any movement at all is a matcher answering a request the Ack
+    /// does not belong to: both must leave the pending's claim, the
+    /// counters and the event stream unmoved, and the real refusal
+    /// below then still correlates and rolls back, so a control that
+    /// consumed the pending is caught twice over.
     #[test]
     fn a_membership_ack_is_correlated_and_surfaces_admission_and_refusal_distinctly() {
         use net_wire::channel::membership::{encode, AckReason};
@@ -6553,6 +6734,88 @@ mod tests {
         // The anchor refuses a Subscribe.
         let nonce = node.subscribe(ANCHOR, "app.telemetry").expect("subscribe");
         node.take_outbound();
+
+        // A foreign nonce, from the peer the request went to.
+        const FOREIGN_NONCE: u64 = 0x0000_DEAD_BEEF;
+        let foreign = encode(&MembershipMsg::Ack {
+            nonce: FOREIGN_NONCE,
+            accepted: true,
+            reason: None,
+        });
+        let drops_before = node.counters().total_drops();
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                refused_channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                refused_channel.wire_hash(),
+                true,
+                &foreign,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().membership_admissions(),
+            0,
+            "a foreign nonce is nobody's answer: it must not admit this pending"
+        );
+        assert_eq!(
+            node.counters().total_drops(),
+            drops_before,
+            "and it moves no drop counter"
+        );
+        assert!(node.drain_events().is_empty(), "and raises no event");
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, refused_channel.publish_stream_id())),
+            Some(&StreamKind::Channel),
+            "and leaves the pending's claim unmoved"
+        );
+
+        // The live nonce, from a peer the request never went to.
+        const STRANGER: NodeId = 0x1111_2222_3333_4444;
+        let stranger = connect_peer(&mut node, STRANGER, 7);
+        node.drain_events();
+        let wrong_peer = encode(&MembershipMsg::Ack {
+            nonce,
+            accepted: true,
+            reason: None,
+        });
+        let drops_before = node.counters().total_drops();
+        node.on_datagram(
+            STRANGER,
+            anchor_packet(
+                &stranger,
+                refused_channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                refused_channel.wire_hash(),
+                true,
+                &wrong_peer,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().membership_admissions(),
+            0,
+            "an Ack from the wrong peer answers nothing: a request is answered by the peer \
+             it was made TO"
+        );
+        assert_eq!(
+            node.counters().total_drops(),
+            drops_before,
+            "and it moves no drop counter"
+        );
+        assert!(node.drain_events().is_empty(), "and raises no event");
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, refused_channel.publish_stream_id())),
+            Some(&StreamKind::Channel),
+            "and leaves the pending's claim unmoved"
+        );
+
+        // The real refusal: correlated, and the pending survived both
+        // controls — its claim is still the one taken back below.
         let ack = encode(&MembershipMsg::Ack {
             nonce,
             accepted: false,
@@ -6575,7 +6838,11 @@ mod tests {
             1,
             "a refusal is counted, not discarded"
         );
-        assert_eq!(node.counters().membership_admissions(), 0, "not an admission");
+        assert_eq!(
+            node.counters().membership_admissions(),
+            0,
+            "not an admission"
+        );
         assert!(
             matches!(
                 node.drain_events().as_slice(),
@@ -6632,6 +6899,202 @@ mod tests {
                 .get(&(ANCHOR, admitted_channel.publish_stream_id())),
             Some(&StreamKind::Channel),
             "and the admitted claim stands"
+        );
+    }
+
+    /// A refusal rolls back only the registration **its own request**
+    /// created.
+    ///
+    /// Two registrations of one channel id may overlap — `subscribe`
+    /// called twice for one name (it does not dedup), or a `publish`
+    /// re-registering the id between a subscribe and its Ack — and
+    /// the EARLIER request's Ack may be the refusal. Rollback keyed
+    /// by `(peer, stream id)` then removed the LATER registration's
+    /// claim: the anchor admitted the surviving Subscribe while the
+    /// local claim was gone, so a later `call` whose reply channel is
+    /// this id took the carrier out from under the channel and its
+    /// payloads came back `Dropped { UnknownCall }`. The gate is the
+    /// registration stamp (`LeafNode::channel_claims`): a refusal
+    /// takes a registration back only when that registration still
+    /// carries its own nonce — a newer request's claim or an
+    /// admission survives.
+    #[test]
+    fn a_refusal_rolls_back_only_the_registration_its_own_request_created() {
+        use net_wire::channel::membership::{encode, AckReason};
+
+        // Overlapping registrations of one channel id, the later one
+        // ADMITTED and the earlier one refused afterwards: the
+        // admitted claim survives the stale refusal in every
+        // observable the consumer has.
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        let name = node.reply_channel_for("app.orders").expect("name");
+        let channel = Channel::new(&name).expect("valid");
+        let stale = node.subscribe(ANCHOR, &name).expect("first subscribe");
+        let admitted = node.subscribe(ANCHOR, &name).expect("second subscribe");
+        assert_ne!(stale, admitted, "two requests, two nonces");
+        node.take_outbound();
+
+        let ok = encode(&MembershipMsg::Ack {
+            nonce: admitted,
+            accepted: true,
+            reason: None,
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                channel.wire_hash(),
+                true,
+                &ok,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().membership_admissions(),
+            1,
+            "the later request is admitted"
+        );
+
+        let refusal = encode(&MembershipMsg::Ack {
+            nonce: stale,
+            accepted: false,
+            reason: Some(AckReason::Unauthorized),
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                channel.wire_hash(),
+                true,
+                &refusal,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.counters().drops(DropReason::MembershipRefused),
+            1,
+            "the stale refusal is still news"
+        );
+        assert!(
+            matches!(
+                node.drain_events().as_slice(),
+                [LeafEvent::Dropped {
+                    reason: DropReason::MembershipRefused
+                }]
+            ),
+            "and is still surfaced"
+        );
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, channel.publish_stream_id())),
+            Some(&StreamKind::Channel),
+            "the ADMITTED claim must survive the earlier request's refusal"
+        );
+        // The claim keeps working for the consumer …
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                0,
+                channel.wire_hash(),
+                true,
+                b"payload",
+            ),
+            clock::now(),
+        );
+        assert!(
+            matches!(
+                node.drain_events().as_slice(),
+                [LeafEvent::ChannelMessage { .. }]
+            ),
+            "and the channel's payloads still reach the consumer"
+        );
+        // The delivery's own ack/window frames, cleared so the
+        // "queues nothing" below is the CALL's disposition alone.
+        node.take_outbound();
+        // … and keeps fencing the reply plane off the id: a call
+        // whose replies would ride this channel is refused BECAUSE
+        // the application's claim stands. Claim gone — the pre-gate
+        // rollback — the call is admitted, steals the carrier, and
+        // the channel's later payloads dispatch `Dropped {
+        // UnknownCall }`.
+        node.call(ANCHOR, "app.orders", b"a", Some(60_000))
+            .expect_err("a call cannot take a carrier the surviving claim still owns");
+        assert!(
+            node.take_outbound().is_empty(),
+            "a refused call queues nothing: no membership frame, no request"
+        );
+
+        // A `publish` re-registering the id is a newer registration
+        // all the same: the earlier request's refusal must not reach
+        // it either.
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        let channel = Channel::new("app.telemetry").expect("valid");
+        let stale = node.subscribe(ANCHOR, "app.telemetry").expect("subscribe");
+        node.publish(ANCHOR, "app.telemetry", b"x")
+            .expect("publish");
+        node.take_outbound();
+        let refusal = encode(&MembershipMsg::Ack {
+            nonce: stale,
+            accepted: false,
+            reason: Some(AckReason::Unauthorized),
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                channel.wire_hash(),
+                true,
+                &refusal,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, channel.publish_stream_id())),
+            Some(&StreamKind::Channel),
+            "the publish's re-registration must survive the earlier request's refusal"
+        );
+
+        // The positive control: a refusal that names the registration
+        // its OWN request created still rolls it back — the gate is
+        // "only mine", not "never".
+        let (mut node, anchor) = connected();
+        node.drain_events();
+        let channel = Channel::new("app.telemetry").expect("valid");
+        let current = node.subscribe(ANCHOR, "app.telemetry").expect("subscribe");
+        node.take_outbound();
+        let refusal = encode(&MembershipMsg::Ack {
+            nonce: current,
+            accepted: false,
+            reason: Some(AckReason::Unauthorized),
+        });
+        node.on_datagram(
+            ANCHOR,
+            anchor_packet(
+                &anchor,
+                channel.publish_stream_id(),
+                SUBPROTOCOL_MEMBERSHIP,
+                channel.wire_hash(),
+                true,
+                &refusal,
+            ),
+            clock::now(),
+        );
+        assert_eq!(
+            node.stream_kinds
+                .get(&(ANCHOR, channel.publish_stream_id())),
+            None,
+            "the claim its own request created is taken back"
         );
     }
 
@@ -6693,7 +7156,9 @@ mod tests {
                 .entry((incarnation, FAILED))
                 .or_insert_with(|| RxStream::new(Reliability::Reliable));
             for seq in 1..=crate::stream::MAX_REORDER_HELD as u64 {
-                assert!(stream.accept(rec(FAILED, seq, b"x"), &node.counters).is_ok());
+                assert!(stream
+                    .accept(rec(FAILED, seq, b"x"), &node.counters)
+                    .is_ok());
             }
         }
 
@@ -6805,7 +7270,10 @@ mod tests {
         let packet = anchor_packet(&anchor, 7, 0, 0, true, b"hello");
         {
             let session = node.sessions.get(ANCHOR).expect("session");
-            assert!(session.open_packet(&packet).is_ok(), "the first arrival opens");
+            assert!(
+                session.open_packet(&packet).is_ok(),
+                "the first arrival opens"
+            );
             assert!(
                 matches!(session.open_packet(&packet), Err(LeafError::Replay)),
                 "a duplicate counter must be the typed Replay refusal, not error prose"
