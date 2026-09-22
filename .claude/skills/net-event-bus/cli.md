@@ -97,7 +97,7 @@ Before dispatch, every **explicitly selected** config file / profile is validate
 net-mesh aggregator ls --profile prod --inspect-target --output json
 net-mesh netdb restore --store ./state --from ./backup.bin --clear --inspect-target
 net-mesh typegen generate --language ts --from-snapshot ./tools.json --out ./generated --inspect-target
-net-mesh wrap journey --listen --inspect-target   # resolves without binding the port
+net-mesh wrap journey --listen --psk-hex <HEX> --inspect-target -- <COMMAND>   # resolves without binding the port; the `-- <COMMAND>` trailer is required by the parser even under inspection
 ```
 
 It is available on:
