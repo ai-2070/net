@@ -100,6 +100,37 @@ source-established label and its receipt per the brief's evidence rules.
   `0d4bbfb24` (`git diff --quiet`), restored run green (278-test wire suite
   unaffected). Slice 1.1 accepted at coordinator level pending stage-end
   validation; slice 1.1a (F1 migration) in flight.
+- **2026-09-22, slice 1.4 accepted (executed verification).** Landed
+  `62f4358bc` + `bd5de3b5d` via worker `S1Core.S14RegistryRevocation` (its
+  parent's run ended mid-stage; the handoff is recorded in its final result).
+  Verified: paper audit of report §2.3 (24/24 in `org_rpc_streaming`,
+  preserved+controls 89/89, in-source 216/216 with the Stage 0 models green
+  and byte-untouched, frozen-decoder provenance hashes unchanged,
+  step10/step11 byte-unmodified with the unary pins green) plus an
+  **independent coordinator reproduction of the node-shutdown carve receipt**
+  in the between-lanes window: removing the `org_registry_retire_all` call at
+  `mesh.rs:48938` reddened `node_shutdown_retires_live_protected_streams`
+  with the named assertion ("the live protected stream must be retired by
+  node shutdown", bounded 30.2 s timeout — `:2310:5` observed under this
+  coordinator's −1-line mutation; the worker's receipt quotes `:2268:5`
+  under its own mutation's delta; assertion text identical), restore proven
+  `RESTORED_BYTE_IDENTICAL`, restored run green. The worker's R6 disclosure
+  (a partial-inverse green, then the true inverse red — the four-weakenings
+  rule honored) is credited as the evidence discipline working as designed.
+  CI floor re-pinned 15 → **24** at `8ad588171` (roster checker: 24 names
+  exist in source).
+- **2026-09-22, ruling — F-S1.4-1 (model-vs-C4 `Revoked` mapping).** Plan
+  §4.3 governs: "midstream retirement arrives as the stream's final
+  `Err(AdmissionDenied(Denied))` (revocation)" — a revocation refusal shares
+  the frozen `Denied` coarse byte. The Stage 0 model's
+  `Denial::coarse()` mapped `Revoked → Unavailable`, contradicting §4.3 —
+  a Stage 0 acceptance defect (same class as F1, caught here by slice 1.4's
+  contract audit). Production followed §4.3 throughout and is unchanged. The
+  model is corrected at `org_stream_registry.rs` (mapping moved to the
+  `Denied` arm with the ruling cited) and the pinned assertion in
+  `raise_between_reserve_and_install_denies_with_zero_effects` is a **named
+  rewrite** (it pinned the mapping the ruling corrected — F1 precedent:
+  strengthened to the owner-approved property, never silently re-pinned).
 
 ## 1. S1Session — slice 1.1
 

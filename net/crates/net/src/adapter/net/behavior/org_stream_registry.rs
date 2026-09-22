@@ -985,11 +985,16 @@ impl Denial {
             | Denial::Replay
             | Denial::CallIdCollision
             | Denial::PolicyVetoed
-            | Denial::NotAdmitted => CoarseDenial::Denied,
+            | Denial::NotAdmitted
+            // Plan §4.3 / C4 (Main ruling 2026-09-22, finding F-S1.4-1): a
+            // revocation refusal shares the `Denied` coarse byte — midstream
+            // retirement arrives as `Err(AdmissionDenied(Denied))`
+            // (revocation). The 2026-09-19 model draft mapped this
+            // `Unavailable`; production followed §4.3 all along.
+            | Denial::Revoked => CoarseDenial::Denied,
             Denial::ActiveStreamCapacity(_)
             | Denial::AuthorityChanged
             | Denial::AuthorityUnavailable
-            | Denial::Revoked
             | Denial::SessionCurrentnessExhausted
             | Denial::VerificationDeadlineExpired
             | Denial::ResourceExhausted(_)
@@ -2350,7 +2355,10 @@ mod tests {
             .install(&reservation, facts(7, 70, 3), T0)
             .expect_err("install must deny");
         assert_eq!(denial, Denial::Revoked);
-        assert_eq!(denial.coarse(), CoarseDenial::Unavailable);
+        // Rewritten 2026-09-22 (Main ruling, F-S1.4-1): plan §4.3 pins a
+        // revocation refusal to the `Denied` coarse byte. The original
+        // assertion pinned `Unavailable` — the mapping the ruling corrected.
+        assert_eq!(denial.coarse(), CoarseDenial::Denied);
         assert_eq!(h.effects.admitted(), 0, "zero fold effects");
         assert_eq!(h.registry.phase(k), Some(Phase::Terminal));
         assert_eq!(h.registry.active_for_org(7), 0, "org quota never charged");
