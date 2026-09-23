@@ -1,0 +1,18 @@
+.github/workflows/ci.yml
+  h_64425bc75e3f3d 2971-2986,3658-3688,4057-4086,4434-4456
+docs/internal/plans/ORG_SCOPED_STREAMING_PLAN.md
+  h_64425bc75e3f3d 1623-1646
+docs/internal/spikes/org-streaming/S1_REPORT.md
+  h_64425bc75e3f3d 167-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6874926e0690215a03e7f3b4d13bba95ff0cbf84",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
