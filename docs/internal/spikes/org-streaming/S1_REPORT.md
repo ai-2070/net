@@ -4893,8 +4893,10 @@ CARGO_PROFILE_TEST_DEBUG=0`, from `net/crates/net/`:
 The gate (plan wording): *"every SDK × shape × role cell executed from a
 packaged or CI-built artifact. A missing cell blocks the release"* — plus
 exact-head CI green, artifact/declaration/header/error parity, and unary
-compatibility. **Current verdict: BLOCKED on 1 named cell (cell 1, sdk-py);
-cell 2 (the mixed non-Rust pair) is EXECUTED GREEN** — the verbatim row
+compatibility. **Current verdict: RELEASE ACCEPTED — every cell green.**
+Cell 1 (sdk-py) closed at `85723f9ed` (the Main takeover run: 15 passed /
+24.13s + the R1/R3/R2 receipts + the F-S4PySdk-5/6 fixes + the pin); cell 2
+(the mixed non-Rust pair) is EXECUTED GREEN** — the verbatim row
 `--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider`
 with the two-sided `RESULT ok calls=1 chunks=3` (exact-matched at
 `go:711-714`, Fatalf otherwise), chunks byte-for-byte + eof terminal +

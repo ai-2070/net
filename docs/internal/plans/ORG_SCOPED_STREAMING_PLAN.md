@@ -1695,3 +1695,26 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   unified release acceptance stands at ONE blocking cell (sdk-py —
   `S4PySdk`'s live rows + receipts); the verdict flips green at its
   close.**
+
+- 2026-09-22, **STAGE 4 CLOSED — UNIFIED RELEASE ACCEPTANCE: RELEASE
+  ACCEPTED.** The plan's exit gate holds on every clause: **every SDK ×
+  shape × role cell executed from a packaged or CI-built artifact** (the
+  six facade rows — Node, Python, Go/C, browser/leaf on real Chromium AND
+  Firefox, sdk-ts, sdk-py — plus the cross-language rows incl. the mixed
+  non-Rust pair green 3-deep, plus the artifact/declaration/header/error
+  parity rows and unary compatibility; the evidence matrix is §9 of
+  `S1_REPORT.md`); exact-head evidence at each lane's committed head. The
+  final cell (sdk-py) closed at `85723f9ed` — the Main takeover run (the
+  owner's "do the remaining run" order): 15 passed / 24.13s, the three
+  pinned receipts R1/R3/R2 executed red→restored-green, the F-S4PySdk-5
+  envelope fix and the F-S4PySdk-6 re-inducement (the deadline-retirement
+  variant blocked by the F-S4B-7 core gap), the F-S4PySdk-4 flake
+  confirmed isolated-green twice, and the sdk-py pin (9 names + the
+  `same_org`/`granted` literals + floor 15). **THE PLAN IS COMPLETE.**
+  Release-notes material (verbatim per lane in the records): the
+  never-executed boundaries, the three-defect cross-process harness
+  contract set (serve-handle lifetime; teardown after the caller's drain;
+  no uncompletable accept arms), F-S4PySdk-4/5/6, the audience-secret ACL
+  trap, the nine harness invocation classes, and finding 8
+  (`MeshNode::start()`'s fail-open refusal — owner-bound at release, two
+  alternatives laid out).
