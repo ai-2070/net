@@ -2968,6 +2968,22 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros fixtures"
 
+      # === S4: the streaming-opening fixture authority (S4Vectors) ======
+      # The generator IS the Rust-side conformance verifier for
+      # tests/cross_lang_org/streaming_opening_vectors.json (--check:
+      # deterministic-regeneration drift guard + all 120 conformance rows).
+      # A fixture that stops regenerating identically or a row that stops
+      # conforming fails here — the authority every other runtime consumes.
+      - name: streaming-opening fixture authority (cross-lang vectors)
+        run: |
+          set -o pipefail
+          out=$(cargo run -p net-mesh-sdk --features net,cortex,fixtures \
+                  --example gen_org_error_fixtures -- --check 2>&1 | tee /dev/stderr)
+          printf '%s\n' "$out" | grep -q "== 120 rows, 0 failed" || {
+            echo "::error::the streaming-opening fixture authority did not report 120 rows 0 failed"
+            exit 1
+          }
+
       # === Stage 4a: the SDK's RTC enrollment binary ======================
       #
       # `enrollment_over_rtc` is gated on the SDK's OWN `webrtc` feature,
@@ -3639,6 +3655,37 @@ jobs:
             --source net/crates/net/bindings/node/test/consumer_compile.test.ts \
             a_consumer_program_compiles_against_the_shipped_org_surface || exit 1
 
+      # === S4: the Node cross-language vectors rows (S4Vectors) =========
+      # The npm test run above EXECUTED these 119 rows; this step runs the
+      # file scoped (it is native-free) and PINS it: the count floor + the
+      # structural roster (the describe, the seven it.each family anchors,
+      # the three standalone names), fail-closed.
+      - name: Witness roster + floor — Node cross-lang vectors (119)
+        working-directory: net/crates/net/bindings/node
+        run: |
+          set -o pipefail
+          python3 ../../../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode literal \
+            --source test/org_streaming_opening_vectors.test.ts \
+            'org streaming opening vectors (cross-language fixture)' \
+            'loads the fixture with the expected shape' \
+            'it.each(byteRows)' \
+            'it.each(callerRows)' \
+            'it.each(providerRows)' \
+            'it.each(rejectRows)' \
+            'it.each(classifyRows)' \
+            'it.each(grammarRows)' \
+            'it.each(unclassifiedRows)' \
+            'narrowed ids never match a full id' \
+            'u64 strings round-trip exactly' || exit 1
+          out=$(npx vitest run test/org_streaming_opening_vectors.test.ts 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '^ *Tests +[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "node cross-lang vectors: ${n:-0} (floor 119)"
+          if [ -z "$n" ] || [ "$n" -lt 119 ]; then
+            echo "::error::the node cross-lang vectors ran ${n:-0} rows, floor is 119 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       # The tool-serving cleanup journey needs a real mesh: the property
       # under test is that closing every handle the SDK hands you releases
       # the node's last reference, and a fake `ServeHandle` cannot fail to
@@ -4007,6 +4054,36 @@ jobs:
             test_live_cross_org_call_from_a_generated_scenario \
             '"same_org"' '"granted"' || exit 1
 
+      # === S4: the Python cross-language vectors rows (S4Vectors) =======
+      # The pytest run above EXECUTED these (119 items: the byte pins, the
+      # opening role rows, the reject-reality rows, the vocabulary
+      # declaration + grammar rows, the never-success rows, narrowed ids,
+      # u64 exactness); this step PINS them: the 9 function names lexically
+      # (fail-closed) plus the scoped count floor (the run itself).
+      - name: Witness roster + floor — Python cross-lang vectors (119)
+        run: |
+          set -uo pipefail
+          python3 ".github/scripts/check-roster.py" --label test_org_streaming_opening_vectors --mode literal \
+            --source net/crates/net/bindings/python/tests/test_org_streaming_opening_vectors.py \
+            test_fixture_has_the_expected_shape \
+            test_wire_bytes_pin \
+            test_opening_wire_as_caller \
+            test_reject_mutation_is_real_against_the_base_wire \
+            test_vocabulary_row_classifies_back_to_declared_domain_and_kind \
+            test_vocabulary_wire_grammar \
+            test_unclassified_case_never_becomes_success \
+            test_narrowed_ids_never_match_a_full_id \
+            test_u64_strings_round_trip_exactly || exit 1
+          out=$(cd net/crates/net/bindings/python && python -m pytest -q \
+                  tests/test_org_streaming_opening_vectors.py 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+          echo "python cross-lang vectors: ${n:-0} (floor 119)"
+          if [ -z "$n" ] || [ "$n" -lt 119 ]; then
+            echo "::error::the python cross-lang vectors ran ${n:-0} rows, floor is 119 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+
       # The skill examples import `net_sdk`, the ergonomic wrapper, which sits
       # on the binding `maturin develop` just built. This is the only job with
       # both layers: sdk-py-tests installs the wrapper `--no-deps` on purpose
@@ -4353,6 +4430,29 @@ jobs:
             TestLiveGrantedStreamingFromAGeneratedScenario \
             TestLiveGrantedClientStreamFromAGeneratedScenario \
             TestLiveGrantedDuplexFromAGeneratedScenario || exit 1
+
+      # === S4: the Go cross-language vectors rows (S4Vectors) ===========
+      # The go test run above EXECUTED the 8 TestStreamingOpeningVectors_*
+      # funcs (124 rows: byte pins, opening roles, rejects, vocabulary,
+      # unclassified, narrowed ids, u64 exact — plus the mixed-pair row
+      # skip-gated fail-closed behind RUN_MIXED_CROSS_PROCESS=1,
+      # F-S4Vectors-1); this step PINS them: lexical name-existence,
+      # fail-closed.
+      - name: Witness roster — Go cross-lang vectors (Stage 4 Wave 2, 9)
+        working-directory: go
+        run: |
+          set -uo pipefail
+          python3 ../.github/scripts/check-roster.py --label org_streaming_opening_vectors --mode literal \
+            --source org_streaming_opening_vectors_test.go \
+            TestStreamingOpeningVectors_Shape \
+            TestStreamingOpeningVectors_BytePins \
+            TestStreamingOpeningVectors_OpeningRoles \
+            TestStreamingOpeningVectors_Rejects \
+            TestStreamingOpeningVectors_Vocabulary \
+            TestStreamingOpeningVectors_Unclassified \
+            TestStreamingOpeningVectors_NarrowedIds \
+            TestStreamingOpeningVectors_U64Exact \
+            TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider || exit 1
 
       # Run again with `-tags test_helpers` so the test-only files
       # (`groups_testhelpers.go`, `groups_test.go`,

@@ -1620,3 +1620,27 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   F-S4TsSdk-2 recorded (the skill-example EXECUTE phase not
   Windows-portable — never-executed boundary, type-check green). CI: the
   sdk-ts pin (floor 567 + the 11-name roster) landed with this close.
+
+- 2026-09-22, **Wave 2 lane 3/3 delivered: `S4Vectors`** at `5da931259` +
+  `8adc9fc86` + `baa79cf1f` (`S4_VECTORS.md`): the
+  `streaming_opening_vectors.json` fixture (the frozen error vocabulary +
+  6 byte-exact OPENING wire forms + rejects + the mixed-pair scenario) via
+  the `gen_org_error_fixtures` pattern, consumed by all four runtimes —
+  **Rust authority 120 rows 0 failed / Node 119 / Python 119 / Go 124 +
+  1 gated** — each runtime against Rust in both roles. Receipts: the
+  REQUIRED one-byte-flip inverse (named rows RED verbatim in all four →
+  sha-identical restore → green) + the four-property inverse cycle. The
+  rows caught two wrong brief constants (24 vocab not 25; `0x40` not
+  `0x41`) — discriminating evidence. **The mixed non-Rust pair row is
+  EXECUTED but RED-attributable to F-S4Vectors-1 (HIGH): scoped/private
+  discovery does not cross OS-process boundaries** (localized to
+  `mesh.rs:22095` / `org_scoped_store.rs:733` / `mesh.rs:22453`; four
+  hypotheses + the runtime mix experimentally exonerated). **Ruled (A):
+  the bounded core fix** — the `R4CoreFix` lane dispatched at the three
+  sites with the verbatim one-command pair re-run as its named acceptance
+  (the row is skip-gated fail-closed behind `RUN_MIXED_CROSS_PROCESS=1`
+  meanwhile); the owner-only waiver is the documented fallback if the
+  defect proves unbounded. The four cross-lang pins landed with this
+  entry (Go 9; Python 9 + 119; Node 11 + 119; the Rust `--check` "== 120
+  rows, 0 failed" step). One plan-named cell remains open behind the
+  repair: the mixed non-Rust pair's green.

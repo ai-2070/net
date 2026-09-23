@@ -164,6 +164,51 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, S4Vectors delivered (executed)** — Wave 2 lane 3/3, one row
+  gated on R4CoreFix. Landed at `5da931259` (the vectors + the
+  `gen_org_error_fixtures` generator extension), `8adc9fc86` (the
+  per-runtime consumers + the mixed-pair harness), `baa79cf1f`
+  (`S4_VECTORS.md`, 23306 B, sha `c7052770…`). The fixture
+  (`tests/cross_lang_org/streaming_opening_vectors.json`, 85972 B, sha
+  `0b601de6…`): the frozen org:error vocabulary (24 vectors + 4
+  unclassified) + 6 byte-exact streaming OPENING envelope wire forms (kind
+  1/2/3 × granted/owner_delegated, dual hex+base64 byte pins,
+  transcript-domain separation) + 8 decoder rejects + 1 signature reject +
+  the mixed-pair scenario vector; u64s as decimal strings; plus the
+  one-time `--mint-frozen` credentials chain. Estate — all four runtimes
+  green at exact head: **Rust authority `--check` == 120 rows, 0 failed;
+  Node 119 passed; Python 119 passed; Go 124 rows PASS + 1 skip-gated**
+  (8 `TestStreamingOpeningVectors_*` funcs; `go vet` + `gofmt` clean).
+  Receipts: the REQUIRED inverse (one `wire_hex` byte flipped on the
+  ASSERTED field → named rows RED verbatim in ALL FOUR runtimes →
+  deterministic-regeneration restore sha-identical `0b601de6…` → all four
+  green) + the per-property inverse (4 asserted fields in one cycle:
+  never-success, reject-reality, u64 exactness, vocabulary declaration →
+  named REDs → green). The rows themselves caught two wrong brief
+  constants (vocab vectors are 24 not 25; the postcard signature length
+  prefix is `0x40` not `0x41`) — evidence the rows discriminate. **The
+  mixed-pair row (Go caller ↔ Python provider): EXECUTED, RED-attributable
+  to F-S4Vectors-1**, named + skip-gated fail-closed behind
+  `RUN_MIXED_CROSS_PROCESS=1`. **F-S4Vectors-1 (HIGH): scoped/private
+  discovery does not cross OS-process boundaries** (public discovery +
+  sessions cross fine; `discovered_nodes=1` while the private plane logs
+  "0 private candidate(s) considered"; reproduced Python↔Python
+  cross-process = runtime-mix exonerated; num_shards mismatch, serve
+  order, construction drift, announce hammering, double-accept all
+  experimentally exonerated; localized to the SendEmission.scoped cache
+  (`mesh.rs:22095`) / scoped ingest `verify_refused`
+  (`org_scoped_store.rs:733`) / consumer-grant query (`mesh.rs:22453`)).
+  **Main's ruling: (A) — a bounded core-repair lane `R4CoreFix` dispatched**
+  at the three localized sites with the verbatim mixed-pair re-run as its
+  acceptance (the two-sided PASS signature: `--- PASS: …` +
+  `RESULT ok calls=1 chunks=3`, byte-for-byte chunk pin + `expect_handler`
+  + the manifest/id cross-check); the waiver option recorded as the
+  owner-only fallback if the defect proves unbounded. F-S4Vectors-2
+  (informational, the fixture-name ruling) recorded. CI: the four pins
+  landed (Go 9 names; Python 9 names + floor 119; Node 11 structural
+  names + floor 119; the Rust fixture-authority `--check` step, "== 120
+  rows, 0 failed"). Coordination: the Option-A new-files-only placement
+  held; the `S4PySdk`/`S4TsSdk` boundaries confirmed both ways.
 - **2026-09-22, S4TsSdk verified (executed)** — Wave 2 lane 1/3. Landed at
   `c9cebf5cc` (7 files, +1893, explicit-path staged; `S4_TSSDK.md`
   F16-ledgered; the brief cited as `spikes/org-streaming/S4_BRIEF.md` via
