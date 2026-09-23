@@ -1,0 +1,49 @@
+R4CoreFix — ROUND-3 DIAGNOSTIC AGGREGATE (the defect-3 localization)
+Command: python net/crates/net/tests/cross_lang_org/mixed_pair/caller.py
+         --manifest <FRESH %TEMP% scenario> --vectors <fixture>
+         2>&1 | grep -E "recv-head|send_emission_to|SCOPED SEND FAILED|frames
+         received|capture_cold|CALLER|emission built: scoped=0" | sort |
+         uniq -c | sort -rn
+Wheel: probe build (XPROC-DIAG probes at the three named sites + send_emission_to
++ process_local_packet receive head + the scoped-send error path; all temporary,
+fully reverted after this cycle).
+Subprotocol constants (behavior/broadcast.rs): SUBPROTOCOL_CAPABILITY_ANN =
+0x0C00 (public), SUBPROTOCOL_ROUTE_WITHDRAW = 0x0C01, 0x0C02/0x0C03 sensing,
+SUBPROTOCOL_SCOPED_CAPABILITY_ANN = 0x0C04 (scoped).
+
+=== verbatim aggregate ===
+     59 [xproc-diag] capture_cold rows for grant pinned=true installed=1
+      8 [xproc-diag] send_emission_to node=0x2cb5fa683e11dfe1 scoped=1
+      7 [xproc-diag] send_emission_to node=0x47785a06eb370a63 scoped=0
+      7 [xproc-diag] recv-head subprotocol=0xc00 from=0x2cb5fa683e11dfe1
+      1 CALLER FAIL the call never converged: OrgDiscoveryError('org:discovery:no_authorized_provider: org discovery: no authorized provider for capability 96dd6b947a2ed4c4129fc663b526a6ffd9495521ec57c76c617b6cc76b28c209 (0 private candidate(s) considered)')
+Wall time: 71.10 seconds
+=== end verbatim aggregate ===
+
+Direction map (established from the emission asymmetry — only the provider
+builds scoped envelopes, `emission built: scoped=1 granted_svc=1`; the caller's
+catalog is empty so its emission takes the early arm and prints nothing):
+  0x2cb5fa683e11dfe1 = the CALLER's node id (the provider's send target, scoped=1)
+  0x47785a06eb370a63 = the PROVIDER's node id (the caller's send target, scoped=0)
+  `recv-head … from=0x2cb5…` lines are printed by the PROVIDER (packets FROM the
+  caller); the CALLER printed ZERO recv-head lines.
+
+Reading (receipt-grade):
+| direction                  | sent | received |
+|----------------------------|------|----------|
+| caller -> provider (0xc00) | 7    | 7        |
+| provider -> caller (0xc00) | 8*   | 0        |
+| provider -> caller (0xc04) | 8    | 0        |
+(*each provider send_emission_to ships public+scoped in one call)
+
+- The CALLER processes NO inbound packet of ANY subprotocol id.
+- No `SCOPED SEND FAILED` anywhere: every send_subprotocol_to_node returned Ok.
+- 59 planning passes: `capture_cold … pinned=true installed=1`, 0 rows each.
+- Therefore the drop is receiver-side before process_local_packet: the caller's
+  receive/dispatch loop was never spawned — `MeshNode::start_inner` refused the
+  start because `accept_in_flight > 0` (caller.py's spurious double-accept arm
+  `mesh.accept(provider_node)` — its `t.join(timeout=10)` times out silently,
+  unlike provider.py's fail-closed `t.is_alive()` check) and rolled back with a
+  `tracing::warn!` only, while `NetMesh.start()` returned Ok.
+- `discovered_nodes=1` in the original failure probes was the caller's
+  SELF-index (index_self_with_local_services), not a received announcement.

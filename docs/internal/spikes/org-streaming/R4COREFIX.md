@@ -291,10 +291,48 @@ the 0x0005) while the handler's three chunk publishes and the automatic eof
 terminal are still draining toward the caller. Same bug CLASS as the first
 defect: registration lifetime vs call lifetime, masked in-process because
 `test_org_live.py`'s single script sequence consumes `list(stream)` before its
-`finally: handle.close()`. Referred to S4Vectors with the deterministic options
-(reverse `DRAINED` line over stdin and close only after it; or gate process
-exit on stdin EOF; or a drain-complete observable). Round 2 receipts land
-below when their fix is in.
+`finally: handle.close()`. S4Vectors fixed it with the DRAINED stdin handshake
+(option a): `DRAINED\n` after the caller's recv loop reaches clean eof;
+provider.py blocks on that line (120 s watchdog, fail-closed) before printing
+`RESULT ok` and closing the handle — provider.py sha `22ce91e0…`, caller.py
+`2c0963ba…`, go row `1840f4b1…`.
+
+### 3.3 Round 2 exposed the real Python-pair killer — the silent start refusal
+(finding 8)
+
+Round 2's Go row reached the streaming exchange (`0x0006: response pump failed`
+at recv — see finding 9) but the Python↔Python pair stayed red at discovery with
+the ORIGINAL signature. The instrumented probe wheel (fresh scenario) produced
+the receipt-grade aggregate that closes the case
+(`r4corefix-diag-round3.log`):
+
+```
+8  send_emission_to node=<caller-id>  scoped=1     (provider shipping envelopes)
+7  send_emission_to node=<provider-id> scoped=0    (caller shipping public-only)
+7  recv-head subprotocol=0xc00 from=<caller-id>   (the PROVIDER receives all 7)
+0  recv-head … (the CALLER receives NOTHING — no id at all)
+0  frames received / SCOPED SEND FAILED           (no send errors anywhere)
+59 capture_cold rows pinned=true installed=1      (59 plans, 0 rows, every time)
+```
+
+One-way traffic: the caller's receive loop never processes a single packet. The
+mechanism (`mesh.rs` `start_inner`, ~24335): caller.py arms a spurious
+`mesh.accept(provider_node)` thread (the double-accept arm) while also
+connecting out; the provider never initiates, so the accept never completes;
+`caller.py`'s `t.join(timeout=10)` TIMES OUT SILENTLY (it lacks provider.py's
+`t.is_alive()` fail-closed check) and leaves `accept_in_flight > 0` — and
+`start_inner` then rolls back and REFUSES to spawn the receive/dispatch loop
+("MeshNode::start() called while an accept() is in flight"), surfacing the
+refusal only as `tracing::warn!` while the binding's `NetMesh.start()` returns
+`Ok(())`. The caller consequently processes zero inbound packets: the scoped
+envelope never ingests, `capture_cold`'s granted rows stay 0 under an
+installed, pinned consumer grant — exactly the observed
+`0 private candidate(s) considered` — and `discovered_nodes=1` was the caller's
+SELF-index all along. Cross-checks: the Go row (connect-only) converges
+discovery; the Rust witness (connect-only) is green; `test_org_live.py` arms
+accept only on the provider. Referred to S4Vectors (remove the arm, or
+fail-closed on the join) with the visibility soft-spot escalated to Main
+(finding 8). Round 3 receipts land below.
 
 ## 4. Findings
 
@@ -339,6 +377,55 @@ below when their fix is in.
    which is why the in-process harnesses (one sequence owns both sides:
    consume-then-close) never see either. Cross-process harnesses must sequence
    teardown AFTER the caller's drain; S4Vectors owns that shape (see §3.2).
+7. **Diagnostic trap: an aged scenario dir reproduces the ORIGINAL signature.**
+   `gen_org_scenario`'s chain has `SCENARIO_TTL_SECS = 3600`; once the dir is
+   older than its TTL, `grant_active_for_emission` skips the born-expired grant
+   at every emission, so the provider seals nothing and the caller reports the
+   exact `no_authorized_provider … (0 private candidate(s) considered)` —
+   indistinguishable from the discarded-handle defect at the terminal. A
+   re-run against a >1h-old scenario hit exactly this (70.7 s red) and was
+   cleared by regenerating. Operational rule for every future co-run: mint the
+   scenario FRESH inside the run (the Go row already does; ad-hoc repros must
+   too).
+8. **`MeshNode::start()` can return success while starting NOTHING** (Main's
+   ruling ledger: finding 7). When an `accept()` is in flight, `start_inner`
+   rolls the `started` flag back and refuses to spawn the receive/dispatch
+   loop — surfacing the refusal only as `tracing::warn!`, while the bindings'
+   `NetMesh.start()` returns `Ok(())`. A node in that state processes zero
+   inbound packets while its sends work perfectly — one-way invisibility that
+   hid defect #3 for the whole saga and required probe wheels to find; it is
+   the fail-open API surface behind all three harness defects misreading as
+   core. **Ruled FILED, NOT fixed in this stage** (Main, round-2 ruling): the
+   zero-core-change freeze stands and a public-surface change is
+   compatibility-ledger territory (C1–C12: additive alternatives + approval
+   status) — an OWNER decision, as with the F-S3.2-1 carve. The two
+   alternatives, for the owner:
+
+   - **Breaking:** `MeshNode::start()` returns `Result<(), …>` and the bindings
+     raise on the refusal (Python `NetMesh.start()` → `PyResult<()>` already
+     has the error channel). Cleanest semantics — "start" must never silently
+     no-op — but it changes the public signature in every language binding and
+     the compatibility ledger must carry it.
+   - **Additive (recommended for this cycle):** keep `start()`'s signature and
+     idempotent semantics; add `try_start()` / `start_with_report()` beside it
+     returning the refusal, and document the silent-refusal caveat on `start()`
+     as a known limitation until the next major. Zero breakage; the harnesses
+     that need liveness guarantees adopt the additive door immediately.
+
+   The documentation-level statement (start() preconditions + the silent-refusal
+   caveat) is Main's release-notes task and lands at stage close; the owner
+   recommendation rides the release acceptance verdict. NOT touched here.
+9. **Third latent defect (round 2 exposure): streaming pump completion race.**
+   With the DRAINED handshake in place, the row reached the streaming exchange
+   and failed at the first recv with `0x0006: response pump failed`
+   (`StreamCallOutput::Open → PumpFailed`, cortex/rpc.rs:3231/3616): the `def`
+   handler's completion (`handler_returned`) is raced by the pump task's exit
+   (the biased select's `pump_done` break shadows a ready handler arm once the
+   sink's mpsc sender drops at blocking-task end), and `RpcResponseSink::send`
+   silently drops chunks on a finished gate or a closed receiver (rpc.rs:2274).
+   Visible only in the cross-process row so far; the in-process cells order
+   consume-then-close on one sequence and never race it. Referred to S4Vectors'
+   coordination queue alongside the `0x0006` row evidence.
 
 ## 5. Coordination record
 
@@ -358,8 +445,18 @@ below when their fix is in.
   §3.3 green receipt. Their message supplied the C-ABI
   `ChannelConfigRegistry` note (exonerated as THE mechanism by their own
   permissive-both isolation, Go-row background only).
+- `Main` (round-2 ruling): the row green awaits S4Vectors' caller.py fix
+  (remove the double-accept arm or fail-closed `is_alive` on the join); my
+  three-defect diagnostic chain (handle discard → teardown race → double-accept
+  + silent start) confirmed receipt-grade complete; the `start()` fail-open
+  surface FILED as their finding 7 = my finding 8 with the two alternatives
+  laid out for the OWNER (breaking vs additive; compatibility-ledger C1–C12
+  territory) — NOT fixed this stage under the zero-core-change freeze; the
+  documentation statement is Main's release-notes task; the recommendation
+  rides the release acceptance verdict. "Your discipline (no core touch without
+  my word) was correct and is credited."
 - Binding/SDK trees, `ci.yml`, `sdk/examples/**`, `tests/cross_lang_org/**`
-  (beyond the coordinated provider.py fix): untouched by me.
+  (beyond the coordinated provider.py/caller.py fixes): untouched by me.
 
 ## 6. Never executed here
 
