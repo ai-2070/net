@@ -1,0 +1,20 @@
+net/crates/net/browser-ts/src/errors.ts
+  h_64425bc75e3f3d 467-474,599-603
+net/crates/net/browser-ts/src/index.ts
+  h_64425bc75e3f3d 120
+net/crates/net/browser-ts/src/org.ts
+  h_64425bc75e3f3d 37,192-195,576,586
+net/crates/net/browser-ts/test/org.test.ts
+  h_64425bc75e3f3d 27,402-404,406-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "380f8d1d54e314a28065046550c9577e7ee9f257",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
