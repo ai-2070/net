@@ -164,6 +164,45 @@ source-established label and its receipt per the brief's evidence rules.
   count, the dataforts-ENABLED build of the ungated declarations,
   typecheck:tests/release/check-ts-consumer.sh/CI themselves, non-Windows
   hosts.
+- **2026-09-22, S4TsSdk verified (executed)** — Wave 2 lane 1/3. Landed at
+  `c9cebf5cc` (7 files, +1893, explicit-path staged; `S4_TSSDK.md`
+  F16-ledgered; the brief cited as `spikes/org-streaming/S4_BRIEF.md` via
+  the `local://S4_BRIEF.md` byte-identical copy — md5 `0adc61d3…` — after
+  the worktree-staleness blocker). The `@net-mesh/sdk` org facade
+  (`src/org/index.ts`): the §4.4 verbs as thin pass-through over the
+  LANDED `@net-mesh/core/org` typed wrappers (the no-new-stream-wrapper
+  rule instanceof-witnessed), the `classifyOrgError` mirror, the seam
+  contract documented at the call surfaces, the F-S3.1-2 handler-drop
+  contract at the SDK's handler surfaces, the ONE `projectVerifiedCaller`
+  projection (pass-through by design — it exists to be the named seam),
+  and `package.json` `./org` exports (S0_MAPPING obstacle 8). Estate: the
+  sdk-ts-tests toolchain sequence exactly — **31 files / 567 tests passed
+  (556 + 11 new), 0 failed, 0 skipped**; the 11 cells = the careful-
+  consumer compile (`skipLibCheck:false` over staged packaged copies, the
+  same compile emitting the executable) + 8 shape × authority cells (all
+  four shapes incl. the preserved unary, call AND serve, instanceof the
+  existing typed wrappers + empty stream metadata — never origin) + the
+  midstream org-vocabulary pin (`OrgError{rpc,server_error}` from `next()`,
+  never a false clean null EOF, with the mirror round-trip) + strict
+  disposal. Coverage: every shape × call AND serve × same-org AND granted
+  through the executable consumer against staged copies of the shipped
+  dist — the release gate's CI-built-artifact level. The REQUIRED receipt
+  R-S4TsSdk-projection: the five-id-field + `isSameOrg` forgery at
+  `projectVerifiedCaller` (+14/−1) → **4 failed | 7 skipped** at
+  `'verified caller entity: expected … but the handler saw eeeeee…'` with
+  zero test-side delta (witness shas locked) → sha `ad3ce24a…`
+  byte-identical restore + rebuilt-GREEN 4/4. **Coordinator spot-check
+  SCR-TSSDK reproduced it (executed):** the minimal entity forgery at the
+  same projection → the named assertion RED across the shape siblings
+  (incl. `granted_streaming_call_and_serve`) → restore + rebuild → **11
+  passed (11)**. Extra gates green: `check-ts-consumer.sh` + the
+  skill-example type-check phase (all 9). Findings: F-S4TsSdk-1 (the
+  core build-list mismatch vs the sdk-ts-tests list — resolved in-lane,
+  artifacts rebuilt with `ci.yml:3749`'s list) and F-S4TsSdk-2
+  (`check-skill-example-ts.sh`'s EXECUTE phase not Windows-portable —
+  WinError 2 at spawn, all 9; its type-check phase green — the stated
+  never-executed boundary). CI: the sdk-ts pin landed (vitest floor 567 +
+  the 11-name lexical roster beside `Run vitest`).
 - **2026-09-22, S4Python verified (executed).** Landed at `9ea5e64c8`
   (impl, 9 files, explicit-path staged) + `S4_PYTHON.md` §8.4 (F16 19255 B,
   sha `5b5a1554…`). The §4.4 Python surface (sync + `AsyncOrgClient` call

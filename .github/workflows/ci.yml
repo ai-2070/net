@@ -3797,7 +3797,35 @@ jobs:
       #     misconfigured --features list (missing `deck`) above
       #     fails loudly rather than silently skipping.
       - name: Run vitest
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/sdk-ts-tests.log
+          n=$(grep -oE '^ *Tests +[0-9]+ passed' /tmp/sdk-ts-tests.log | grep -oE '[0-9]+' | tail -1)
+          echo "sdk-ts tests passed: ${n:-0} (floor 567)"
+          if [ -z "$n" ] || [ "$n" -lt 567 ]; then
+            echo "::error::sdk-ts ran ${n:-0} tests, floor is 567 — \
+          lower the floor deliberately or restore the witness"
+            exit 1
+          fi
+          # === S4: the sdk-ts org facade witnesses (ORG_SCOPED_STREAMING_PLAN)
+          # The vitest run above EXECUTED these 11 (the executable consumer
+          # + 8 shape x authority cells over all four shapes + the midstream
+          # org-vocabulary pin + strict disposal); this step PINS them: lexical
+          # name-existence, fail-closed.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-roster.py" \
+            --label org_live.test --mode literal \
+            --source net/crates/net/sdk-ts/test/org_live.test.ts \
+            consumer_program_compiles_against_the_shipped_org_surface \
+            same_org_unary_call_and_serve \
+            same_org_streaming_call_and_serve \
+            same_org_client_stream_call_and_serve \
+            same_org_duplex_call_and_serve \
+            granted_unary_call_and_serve \
+            granted_streaming_call_and_serve \
+            granted_client_stream_call_and_serve \
+            granted_duplex_call_and_serve \
+            midstream_outcomes_surface_an_org_error_never_a_false_clean_eof \
+            closing_client_and_serve_handle_lets_both_meshes_shut_down_cleanly || exit 1
 
   python-tests:
     name: Python bindings tests (pytest)

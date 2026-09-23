@@ -1601,4 +1601,22 @@ authority is the resolved Q1–Q7 table, not those superseded proposals.
   the cross-language vectors) is dispatched at `S4_BRIEF.md` @ `02f2d6c9c`
   (redistributed verbatim via `local://S4_BRIEF.md` after a worktree-
   staleness blocker; the brief lives at repo-root `spikes/org-streaming/`,
-  not `docs/internal/spikes/`).**
+  not `docs/internal/spikes/`).
+
+- 2026-09-22, **Wave 2 lane 1/3 closed: `S4TsSdk` verified (executed)** at
+  `c9cebf5cc` (`S4_TSSDK.md` F16-ledgered): the `@net-mesh/sdk` org facade
+  as thin pass-through over the landed `@net-mesh/core/org` typed wrappers
+  (no new stream wrapper — instanceof-witnessed), the ONE
+  `projectVerifiedCaller` projection, the `classifyOrgError` mirror, the
+  F-S3.1-2 contract at the SDK handler surfaces, and the `./org` exports
+  entry (S0_MAPPING obstacle 8). Estate: 567/567 through the executable
+  consumer program at the CI-built-artifact level (the careful-consumer
+  compile with `skipLibCheck:false` + 8 shape×authority cells over all
+  four shapes + the midstream vocabulary pin + strict disposal). The
+  REQUIRED receipt (the five-field + isSameOrg forgery at the projection →
+  4 failed | 7 skipped at `'verified caller entity'` → sha `ad3ce24a…`
+  byte-identical restore → green) + coordinator SCR-TSSDK (the minimal
+  entity forgery → the named red across the shape siblings → 11/11 green).
+  F-S4TsSdk-2 recorded (the skill-example EXECUTE phase not
+  Windows-portable — never-executed boundary, type-check green). CI: the
+  sdk-ts pin (floor 567 + the 11-name roster) landed with this close.
