@@ -55,7 +55,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
+#include <windows.h>
 #include <process.h>
 #define getpid _getpid
 #else
@@ -105,6 +107,15 @@ static void json_str(char* out, size_t cap, const char* json, const char* from,
 
 static void join2(char* out, size_t cap, const char* dir, const char* rel) {
     if (snprintf(out, cap, "%s/%s", dir, rel) >= (int)cap) die("path too long", rel);
+}
+
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((unsigned long)ms);
+#else
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+#endif
 }
 
 /* ------------------------------------------------------- handler + facts */
@@ -193,8 +204,13 @@ int main(void) {
     snprintf(scenario, sizeof scenario, "%s/net-org-streaming-%ld", tmp, (long)getpid());
 
     char cmd[1024];
+    /* The example runs from the repo root (the skill-examples runner's
+     * cwd): `--manifest-path` pins the net workspace explicitly so the
+     * invocation does not depend on cargo finding it from cwd. */
     snprintf(cmd, sizeof cmd,
-             "cargo run -q --release -p net-mesh-sdk "
+             "cargo run -q --release "
+             "--manifest-path net/crates/net/Cargo.toml "
+             "-p net-mesh-sdk "
              "--features net,cortex,fixtures "
              "--example gen_org_scenario -- %s", scenario);
     if (system(cmd) != 0) {
@@ -324,8 +340,12 @@ int main(void) {
         pthread_join(th, NULL);
         if (args.rc != 0) die("net_mesh_accept", NULL);
     }
-    if (net_mesh_start(provider) != 0) die("net_mesh_start (provider)", NULL);
+    /* Start the CALLER first: the scoped envelope ships on the announce
+     * path, and the provider's start-time announcement must not race the
+     * caller's receive loop coming up (a dropped first announce waits a
+     * whole re-announce window to recover). */
     if (net_mesh_start(caller) != 0) die("net_mesh_start (caller)", NULL);
+    if (net_mesh_start(provider) != 0) die("net_mesh_start (provider)", NULL);
 
     /* 7. Serve. Callback-buffer ownership first (the library refuses
      *    dispatchers without a deallocator — the allocator that creates a
@@ -344,13 +364,34 @@ int main(void) {
         die("net_org_serve_streaming", err);
 
     /* 8. Call — one request in (the signed opening binds it), chunks out
-     *    through the SHARED handle. */
+     *    through the SHARED handle. The opening call rides a bounded
+     *    discovery-convergence retry — the language harnesses' precondition
+     *    (tests_live.rs `converge_discovery`; go/org_test.go
+     *    `convergeOrgCall`): the scoped/private announcements ride the
+     *    announce path at the core's re-announce cadence, and the first call
+     *    must not race their arrival. A `no_authorized_provider` refusal is
+     *    LOCAL — nothing was sent and no proof was minted — so retrying it
+     *    cannot resend a signed proof (the no-retry rule binds ISSUED
+     *    proofs). Every other outcome is immediate. */
     RpcStreamHandleC* stream = NULL;
     const char* req = "{\"n\":1}";
-    if (net_org_call_streaming(client, service, strlen(service),
-                               (const uint8_t*)req, strlen(req),
-                               0, 0, &stream, &err) != 0)
-        die("net_org_call_streaming", err);
+    for (int attempt = 0;; attempt++) {
+        err = NULL;
+        int rc = net_org_call_streaming(client, service, strlen(service),
+                                        (const uint8_t*)req, strlen(req),
+                                        0, 0, &stream, &err);
+        if (rc == 0) break;
+        int retryable = (rc == NET_ORG_ERR_DISCOVERY) && err != NULL &&
+            strncmp(err, "org:discovery:no_authorized_provider", 36) == 0;
+        if (!retryable) die("net_org_call_streaming", err);
+        if (err) net_org_free_cstring(err);
+        stream = NULL;
+        if (attempt >= 120) {
+            die("discovery did not converge",
+                "org:discovery:no_authorized_provider persisted for 60s");
+        }
+        sleep_ms(500);
+    }
 
     int received = 0;
     for (;;) {

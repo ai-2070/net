@@ -59,6 +59,12 @@ net = { package = "net-mesh", version = "0.36.0", path = "../../..", features = 
 # surface. `compute-ffi` already carries this same `net-mesh-sdk`
 # dependency, so org-ffi is not the first Go FFI crate to take it.
 net-sdk = { package = "net-mesh-sdk", version = "0.36.0", path = "../../../sdk", features = ["net", "cortex"] }
+# The SHARED C-ABI streaming handle types (§4.4: "types move to a module both
+# `rpc-ffi` and `org-ffi` can name"). `net_org_call_streaming/_client_stream/
+# _duplex` hand out exactly the handles `net_rpc_stream_next` / … drive and
+# free — same rlib, same `libnet` cdylib, one type. NOT a second library: this
+# is an rlib dependency of this rlib, linked into `bindings/go/net-ffi`.
+net-rpc-ffi = { version = "0.36.0", path = "../rpc-ffi" }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
 parking_lot = "0.12"

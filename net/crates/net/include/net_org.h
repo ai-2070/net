@@ -11,9 +11,9 @@
  * rlib linked into it and emits no library of its own — there is no
  * `libnet_org` to build or link.
  *
- * This is the organization verb facade — the same two verbs (call,
- * serve), five concepts, and four error domains the Rust, Node, and
- * Python SDKs expose. It wraps `net_sdk::org`; every authority
+ * This is the organization verb facade — the same verbs (call: unary and the
+ * three streaming shapes; serve), five concepts, and four error domains the
+ * Rust, Node, and Python SDKs expose. It wraps `net_sdk::org`; every authority
  * decision already happened in Rust. C code here is marshaling.
  *
  * # Build
@@ -111,8 +111,18 @@ extern "C" {
  * ABI version.
  * ==================================================================== */
 
-/* The ABI this header describes. Independent of NET_RPC_ABI_VERSION. */
-#define NET_ORG_ABI_VERSION 0x0001
+/* The ABI this header describes. Independent of NET_RPC_ABI_VERSION.
+ *
+ *   0x0001 — the unary surface (credentials / bind / call / call_exported /
+ *            serve + provisioning + the net_subnet.h authority entry points).
+ *   0x0002 — ORG_SCOPED_STREAMING_PLAN Stage 4 (§4.4): the streaming call
+ *            verbs (net_org_call_streaming / _client_stream / _duplex — the
+ *            SHARED net_rpc.h handle types), the shape handler dispatchers
+ *            (net_org_set_{streaming,client_streaming,duplex}_handler_
+ *            dispatcher), and net_org_serve_{streaming,client_stream,duplex}.
+ *            ADDITIVE — every 0x0001 symbol keeps its signature.
+ */
+#define NET_ORG_ABI_VERSION 0x0002
 
 /* Returns the ABI version the loaded library was built with. */
 uint32_t net_org_abi_version(void);
@@ -164,10 +174,32 @@ typedef struct NetOrgCredentials NetOrgCredentials;
 typedef struct NetOrgClient      NetOrgClient;
 typedef struct NetOrgServeHandle NetOrgServeHandle;
 
+/* The SHARED streaming handle types (ABI 0x0002) — the exact types net_rpc.h
+ * declares and its net_rpc_stream_* / net_rpc_client_stream_* /
+ * net_rpc_duplex_* entry points take. net_org_call_streaming /
+ * _client_stream / _duplex hand these out; drive and free them with net_rpc.h
+ * (one libnet, one handle vocabulary). Declared here the same way
+ * net_compute_mesh_arc_t is — forward-typedefed so this header is
+ * self-contained; a translation unit including both headers sees the same
+ * typedef twice, which is the established shape (C11-compatible) of these
+ * sibling headers. */
+typedef struct RpcStreamHandleC        RpcStreamHandleC;
+typedef struct ClientStreamCallHandleC ClientStreamCallHandleC;
+typedef struct DuplexCallHandleC       DuplexCallHandleC;
+/* The per-call handles the shape handler dispatchers borrow across one
+ * callback (net_org_set_*_handler_dispatcher below): drain the request
+ * stream with net_rpc_request_stream_next, emit through
+ * net_rpc_response_sink_send. Same sharing rule as above. */
+typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
+typedef struct RpcResponseSinkHandleC  RpcResponseSinkHandleC;
+
 /* The Arc<MeshNode> handle minted by the base libnet. Declared there
- * as `net_compute_mesh_arc_t`; forward-declared here so this header is
- * self-contained. The same underlying pointer. */
-typedef struct net_compute_mesh_arc_t net_compute_mesh_arc_t;
+ * (`net.go.h`) as `net_compute_mesh_arc_t` over the tag
+ * `net_compute_mesh_arc_s`; forward-declared here with the SAME tag so this
+ * header is self-contained AND a translation unit including both headers
+ * sees one compatible typedef (the same C11-compatible shape the shared
+ * streaming handles below use). The same underlying pointer. */
+typedef struct net_compute_mesh_arc_s net_compute_mesh_arc_t;
 
 /* ======================================================================
  * net_org_caller_t — the provider-verified facts about an admitted call.
@@ -297,6 +329,54 @@ uint64_t net_org_reserve_cancel_token(NetOrgClient* client);
 int net_org_cancel_call(NetOrgClient* client, uint64_t cancel_token);
 
 /* ======================================================================
+ * Streaming calls (ABI 0x0002, §4.4) — the three protected shapes.
+ *
+ * All three return the SHARED net_rpc.h handle types: drive them with
+ * net_rpc_stream_next / net_rpc_client_stream_send / net_rpc_duplex_* and
+ * free them with the matching net_rpc_*_free. There is deliberately no
+ * second stream wrapper on this surface (one libnet, one handle
+ * vocabulary), so code that drains a public stream drains an org stream
+ * unchanged.
+ *
+ * `deadline_ms == 0` is the facade's default 300 s protected-call lifetime
+ * (Owner Q1) and NEVER "no deadline" — a protected call's lifetime is
+ * finite by contract. `cancel_token == 0` means uncancellable; a non-zero
+ * token (from net_org_reserve_cancel_token) lets net_org_cancel_call drop
+ * the in-flight construction or a parked chunk wait. Neither argument is an
+ * authorization input.
+ *
+ * Opening failures return the domain code and write the
+ * `org:<domain>:<kind>` wire to `*out_err` (exactly like net_org_call).
+ * MIDSTREAM failures arrive through the handle operations' `out_err` in the
+ * SAME `org:` vocabulary — an org stream never speaks the bare nRPC
+ * `<kind>:` shape — so one parser (the `org:` wire) classifies both.
+ *
+ * On success `*out_stream` / `*out_handle` receives an owned handle. */
+
+/* One request in (the signed opening binds it), raw chunks out. */
+int net_org_call_streaming(NetOrgClient* client,
+                           const char* service_ptr, size_t service_len,
+                           const uint8_t* req_ptr, size_t req_len,
+                           uint64_t deadline_ms, uint64_t cancel_token,
+                           RpcStreamHandleC** out_stream, char** out_err);
+
+/* A stream of requests in, one terminal response out. The wire opening
+ * rides the first net_rpc_client_stream_send (the signed opening binds the
+ * finalized first chunk) or _finish for the zero-item path. */
+int net_org_call_client_stream(NetOrgClient* client,
+                               const char* service_ptr, size_t service_len,
+                               uint64_t deadline_ms, uint64_t cancel_token,
+                               ClientStreamCallHandleC** out_handle,
+                               char** out_err);
+
+/* Bidirectional: request chunks in, response chunks out (auto-split at
+ * construction, like the public handle). */
+int net_org_call_duplex(NetOrgClient* client,
+                        const char* service_ptr, size_t service_len,
+                        uint64_t deadline_ms, uint64_t cancel_token,
+                        DuplexCallHandleC** out_handle, char** out_err);
+
+/* ======================================================================
  * serve — register a protected handler.
  * ==================================================================== */
 
@@ -340,6 +420,66 @@ int net_org_set_callback_free(NetOrgCallbackFreeFn free_fn);
  * refusing here beats corrupting a heap at the first call. */
 int net_org_set_handler_dispatcher(NetOrgHandlerFn dispatcher);
 
+/* ======================================================================
+ * Streaming handler dispatch + serve (ABI 0x0002, §4.4).
+ *
+ * The fn types are net_rpc.h's handler fn types plus a leading
+ * `const net_org_caller_t*` — the provider-verified admission facts ride
+ * the same per-call handles (RpcRequestStreamHandleC /
+ * RpcResponseSinkHandleC) the nRPC shape dispatchers hand out. Each
+ * dispatcher is process-wide, first-call-wins, and refuses registration
+ * until net_org_set_callback_free has been called (same rule as
+ * net_org_set_handler_dispatcher — callback-buffer ownership).
+ *
+ * # Handler-drop contract (spec §2.2; the F-S3.1-2 level, stated for this
+ * surface)
+ *
+ * The retire supervisor may drop the handler future WITHOUT a final poll.
+ * At this callback boundary: a handler still executing when a deadline,
+ * cancel, revocation, or service teardown retires the call is NOT
+ * interrupted at a library-visible point and will NOT receive a
+ * cancellation callback or any final-polled notification. Cancellation is
+ * observed ONLY through the retirement observables —
+ * net_rpc_request_stream_next returning NET_RPC_ERR_STREAM_DONE and
+ * net_rpc_response_sink_send returning NET_RPC_ERR_STREAM_DONE — and a
+ * handler MUST exit cooperatively when they fire. Never block past them
+ * waiting for an event the retired fold can no longer produce; never
+ * assume a final poll will run cleanup.
+ * ==================================================================== */
+
+/* Server-streaming: one request in, chunks out via the sink. The terminal
+ * frame is the substrate fold's, emitted after the handler returns. To
+ * signal a typed application status, write an
+ * "nrpc:app_error:0x<code>:<body>" message to `*out_err`. */
+typedef int (*NetOrgStreamingHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
+
+/* Client-streaming: drain the request stream, return one terminal response
+ * the callback allocated with malloc (released through the registered
+ * deallocator). */
+typedef int (*NetOrgClientStreamingHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+
+/* Duplex: drain the request stream AND emit through the sink. No terminal
+ * response body — the response stream's terminal frame terminates the
+ * call. */
+typedef int (*NetOrgDuplexHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
+
+/* Register the process-wide shape dispatchers. First call wins. Each
+ * refuses (NET_ORG_ERR_NULL + a loud diagnostic) until
+ * net_org_set_callback_free has been called. */
+int net_org_set_streaming_handler_dispatcher(NetOrgStreamingHandlerFn dispatcher);
+int net_org_set_client_streaming_handler_dispatcher(
+    NetOrgClientStreamingHandlerFn dispatcher);
+int net_org_set_duplex_handler_dispatcher(NetOrgDuplexHandlerFn dispatcher);
+
 /* Reserve a fresh handler id. Reserve the id, store the callable under it
  * in the language-side registry, THEN call net_org_serve — pre-registration
  * closes the request-arrives-before-store race. */
@@ -357,6 +497,25 @@ int net_org_serve(net_compute_mesh_arc_t* mesh_arc,
                   const char* service_ptr, size_t service_len,
                   int access, uint64_t handler_id,
                   NetOrgServeHandle** out_handle, char** out_err);
+
+/* Register a protected streaming service per shape (ABI 0x0002, §4.4).
+ * Identical contract to net_org_serve — `mesh_arc` CONSUMED, `access` is
+ * NET_ORG_ACCESS_SAME_ORG / _GRANTED, `handler_id` already reserved AND
+ * stored, the returned handle freed with net_org_serve_handle_free — with
+ * each shape's dispatcher required first (NET_ORG_ERR_NO_DISPATCHER
+ * otherwise). The handler-drop contract above binds these handlers. */
+int net_org_serve_streaming(net_compute_mesh_arc_t* mesh_arc,
+                            const char* service_ptr, size_t service_len,
+                            int access, uint64_t handler_id,
+                            NetOrgServeHandle** out_handle, char** out_err);
+int net_org_serve_client_stream(net_compute_mesh_arc_t* mesh_arc,
+                                const char* service_ptr, size_t service_len,
+                                int access, uint64_t handler_id,
+                                NetOrgServeHandle** out_handle, char** out_err);
+int net_org_serve_duplex(net_compute_mesh_arc_t* mesh_arc,
+                         const char* service_ptr, size_t service_len,
+                         int access, uint64_t handler_id,
+                         NetOrgServeHandle** out_handle, char** out_err);
 
 /* Diagnostic: the handler_id of this ServeHandle. 0 on NULL. */
 uint64_t net_org_serve_handle_id(const NetOrgServeHandle* handle);

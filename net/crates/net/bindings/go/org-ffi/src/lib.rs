@@ -76,12 +76,20 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use net::adapter::net::cortex::{RequestStream, RpcResponseSink};
 use net::adapter::net::identity::EntityId;
-use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
+use net::adapter::net::mesh_rpc::{RpcError, ServeError, ServeHandle};
 use net::adapter::net::MeshNode;
 use net_sdk::org::{
     install_org_authority_node, install_provider_grant_audience_node, OrgAccess, OrgCaller,
     OrgClient, OrgCredentials, OrgErrorDomain, OrgHandlerError, OrgSdkError,
+};
+// The shared streaming handle types — the SAME types `rpc-ffi`'s `net_rpc_*`
+// operations take (and the same ones the Go wrapper's `*RpcStream` /
+// `*ClientStreamCall` / `*DuplexCall` wrap). See `rpc-ffi/src/handles.rs`.
+use net_rpc::{
+    spawn_handler_thread, ClientStreamCallHandleC, DuplexCallHandleC, RpcRequestStreamHandleC,
+    RpcResponseSinkHandleC, RpcStreamHandleC,
 };
 // SSDK S4c — the subnet AUTHORITY surface rides libnet_org (it already
 // depends on net-sdk; the base libnet FFI lives inside the `net` crate
@@ -189,9 +197,22 @@ fn org_error_code(e: &OrgSdkError) -> c_int {
 // =========================================================================
 
 /// ABI version of this cdylib. Starts at `0x0001` — a fresh stamp for the org
-/// surface, versioned independently of `net_rpc`'s ABI. Bump on any
+/// surface, versioned independently of `net_rpc`'s. Bump on any
 /// signature/layout change to a `net_org_*` symbol or `net_org_caller_t`.
-pub const NET_ORG_ABI_VERSION: u32 = 0x0001;
+///
+///   - **0x0001** — the unary surface: credentials / bind / call /
+///     call_exported / serve + provisioning + the subnet authority entry
+///     points.
+///   - **0x0002** — ORG_SCOPED_STREAMING_PLAN Stage 4 (§4.4): the streaming
+///     verbs `net_org_call_streaming/_client_stream/_duplex` (returning the
+///     SHARED `RpcStreamHandleC` / `ClientStreamCallHandleC` /
+///     `DuplexCallHandleC` — the same handles `rpc-ffi`'s `net_rpc_*`
+///     operations drive), the shape dispatchers
+///     `net_org_set_{streaming,client_streaming,duplex}_handler_dispatcher`
+///     (`rpc-ffi`'s fn types plus a leading `*const NetOrgCaller`), and
+///     `net_org_serve_{streaming,client_stream,duplex}`. ADDITIVE — every
+///     0x0001 symbol keeps its signature and semantics.
+pub const NET_ORG_ABI_VERSION: u32 = 0x0002;
 
 /// Return the ABI version this cdylib was built with.
 #[unsafe(no_mangle)]
@@ -591,7 +612,7 @@ async fn org_dispatch(
 
     let join = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        spawn_handler_thread(move || -> Result<Vec<u8>, String> {
             let mut resp_ptr: *mut u8 = std::ptr::null_mut();
             let mut resp_len: usize = 0;
             let mut err_ptr: *mut c_char = std::ptr::null_mut();
@@ -640,7 +661,7 @@ async fn org_dispatch(
         Ok(Ok(Ok(body))) => Ok(Bytes::from(body)),
         Ok(Ok(Err(msg))) => Err(org_handler_error_from_msg(msg)),
         Ok(Err(join_err)) => Err(OrgHandlerError::Internal(format!(
-            "Go org handler blocking task panicked: {join_err}"
+            "Go org handler handler thread ended without a result: {join_err}"
         ))),
         Err(_) => Err(OrgHandlerError::Internal(format!(
             "Go org handler did not respond within {} ms",
@@ -1183,6 +1204,813 @@ pub extern "C" fn net_org_serve_handle_free(handle: *mut *mut NetOrgServeHandle)
 }
 
 // =========================================================================
+// Streaming calls (§4.4, ORG_SCOPED_STREAMING_PLAN Stage 4).
+//
+// `net_org_call_streaming/_client_stream/_duplex` return the SHARED handle
+// types (`rpc-ffi/src/handles.rs`) — the exact types `net_rpc_stream_next` /
+// `net_rpc_client_stream_*` / `net_rpc_duplex_*` operate on and free. No
+// second stream wrapper exists for this surface: one `libnet`, one handle
+// vocabulary (the single-cdylib rule), so a Go `*RpcStream` built by
+// `OrgClient.CallStreaming` is driven by the very methods a public
+// `MeshRpc.CallStreaming` stream is.
+// =========================================================================
+
+/// The `org:` error-wire formatter the shared handles carry for this surface
+/// (see `rpc-ffi/src/handles.rs` — [`net_rpc::ErrWireFn`]).
+///
+/// [`OrgSdkError::to_wire`] is the SINGLE source of that vocabulary, so an
+/// org stream's midstream `out_err` is byte-for-byte the wire this crate's
+/// unary failure paths write: Go's `parseOrgError` classifies both
+/// identically (domain `rpc`, the frozen nRPC kind), and an unfamiliar
+/// future vocabulary classifies `unknown` rather than being guessed at.
+fn org_stream_err_wire(e: RpcError) -> String {
+    OrgSdkError::Rpc(e).to_wire()
+}
+
+/// Call a protected service whose response is a STREAM (§4.4).
+///
+/// One request in — the signed opening binds it — and raw chunks out. The
+/// provider is pinned for the whole stream by the facade (one plan, one
+/// exact-target opening, never re-resolved). Returns the EXISTING
+/// [`RpcStreamHandleC`] (`*mut` — caller frees with `net_rpc_stream_free`,
+/// drains with `net_rpc_stream_next`, grants with `net_rpc_stream_grant`).
+///
+/// `deadline_ms == 0` is the facade's default 300 s lifetime (Owner Q1) and
+/// NEVER "no deadline" (D3); `cancel_token == 0` means uncancellable.
+/// Neither is an authorization input. On failure returns the org domain code
+/// and writes the `org:<domain>:<kind>` wire to `out_err`.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_call_streaming(
+    client: *mut NetOrgClient,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        let Some(h) = (unsafe { client.as_ref() }) else {
+            return NET_ORG_ERR_NULL;
+        };
+        if out_stream.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let Some(req) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_ORG_ERR_NULL;
+        };
+        let result = block_on(async {
+            h.inner
+                .call_streaming_bytes_deadline(&service, req, deadline_ms, cancel_token)
+                .await
+        });
+        match result {
+            Ok(stream) => {
+                unsafe {
+                    *out_stream =
+                        Box::into_raw(Box::new(RpcStreamHandleC::new(stream, org_stream_err_wire)));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = org_error_code(&e);
+                write_err(out_err, e.to_wire());
+                code
+            }
+        }
+    })
+}
+
+/// Call a protected service with a STREAM OF REQUESTS and one terminal
+/// response (§4.4). Returns the EXISTING [`ClientStreamCallHandleC`] —
+/// `net_rpc_client_stream_send` / `_finish` / `_free` drive it. The wire
+/// opening rides the first `send` (core's lazy initial REQUEST — the signed
+/// opening binds the finalized first chunk) or `finish` for the zero-item
+/// path, against the facade's ONE pinned provider.
+///
+/// `deadline_ms == 0` ⇒ the facade default; `cancel_token == 0` ⇒
+/// uncancellable (see [`net_org_call_streaming`]).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_call_client_stream(
+    client: *mut NetOrgClient,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    out_handle: *mut *mut ClientStreamCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        let Some(h) = (unsafe { client.as_ref() }) else {
+            return NET_ORG_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let result = block_on(async {
+            h.inner
+                .call_client_stream_bytes_deadline(&service, deadline_ms, cancel_token)
+                .await
+        });
+        match result {
+            Ok(call) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(ClientStreamCallHandleC::new(
+                        call,
+                        org_stream_err_wire,
+                    )));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = org_error_code(&e);
+                write_err(out_err, e.to_wire());
+                code
+            }
+        }
+    })
+}
+
+/// Call a protected service BIDIRECTIONALLY (§4.4). Returns the EXISTING
+/// [`DuplexCallHandleC`] — `net_rpc_duplex_send` / `_finish_sending` /
+/// `_next` / `_into_split` / `_free` drive it (auto-split at construction,
+/// like the public handle).
+///
+/// `deadline_ms == 0` ⇒ the facade default; `cancel_token == 0` ⇒
+/// uncancellable (see [`net_org_call_streaming`]).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_call_duplex(
+    client: *mut NetOrgClient,
+    service_ptr: *const c_char,
+    service_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    out_handle: *mut *mut DuplexCallHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        let Some(h) = (unsafe { client.as_ref() }) else {
+            return NET_ORG_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let result = block_on(async {
+            h.inner
+                .call_duplex_bytes_deadline(&service, deadline_ms, cancel_token)
+                .await
+        });
+        match result {
+            Ok(call) => {
+                unsafe {
+                    *out_handle =
+                        Box::into_raw(Box::new(DuplexCallHandleC::new(call, org_stream_err_wire)));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = org_error_code(&e);
+                write_err(out_err, e.to_wire());
+                code
+            }
+        }
+    })
+}
+
+// =========================================================================
+// Streaming + shape handler dispatch (serve).
+//
+// The fn types are `rpc-ffi`'s handler fn types plus a leading
+// `*const NetOrgCaller` (§4.4) — the verified admission facts ride the same
+// per-call handles (`RpcRequestStreamHandleC` / `RpcResponseSinkHandleC`)
+// the nRPC shape dispatchers hand out. Each dispatcher is process-wide and
+// first-call-wins, exactly like [`net_org_set_handler_dispatcher`].
+//
+// # Handler-drop contract (§2.2 — the F-S3.1-2 level, stated for THIS surface)
+//
+// The retire supervisor may drop the handler future WITHOUT a final poll.
+// At this callback boundary that lands as: a handler still executing when a
+// deadline / cancel / revocation / service teardown retires the call is NOT
+// interrupted at a Rust-visible point and will NOT receive a cancellation
+// callback or any final-polled drop notification. Cancellation is observed
+// ONLY through the retirement observables — `net_rpc_request_stream_next`
+// returning `NET_RPC_ERR_STREAM_DONE`, `net_rpc_response_sink_send` returning
+// `NET_RPC_ERR_STREAM_DONE` — and a handler MUST exit cooperatively when
+// they fire. Never block past them waiting for an event that the retired
+// fold can no longer produce; never assume a final poll will run cleanup.
+// =========================================================================
+
+/// Function pointer the Go side registers via
+/// [`net_org_set_streaming_handler_dispatcher`] — `rpc-ffi`'s
+/// `RpcStreamingHandlerFn` plus the leading verified caller.
+///
+/// Called once per admitted server-streaming REQUEST. The Go side emits
+/// response chunks via [`net_rpc_response_sink_send`] and returns
+/// `NET_ORG_OK` on clean close. The terminal frame is the substrate fold's,
+/// emitted after the handler returns. To signal a typed application status,
+/// write an `nrpc:app_error:0x<code>:<body>` message to `out_err`.
+pub type NetOrgStreamingHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    caller: *const NetOrgCaller,
+    req_ptr: *const u8,
+    req_len: usize,
+    response_sink: *mut RpcResponseSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Function pointer the Go side registers via
+/// [`net_org_set_client_streaming_handler_dispatcher`] — `rpc-ffi`'s
+/// `RpcClientStreamingHandlerFn` plus the leading verified caller.
+///
+/// Called once per admitted client-streaming REQUEST. The Go side drains the
+/// request stream via [`net_rpc_request_stream_next`] and returns one
+/// terminal response body (Go-`malloc`'d; released through the registered
+/// deallocator) or an error.
+pub type NetOrgClientStreamingHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    caller: *const NetOrgCaller,
+    request_stream: *mut RpcRequestStreamHandleC,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Function pointer the Go side registers via
+/// [`net_org_set_duplex_handler_dispatcher`] — `rpc-ffi`'s
+/// `RpcDuplexHandlerFn` plus the leading verified caller.
+///
+/// Called once per admitted duplex REQUEST. The Go side drains the request
+/// stream AND pushes response chunks via the sink. There is NO terminal
+/// response body — the response stream's terminal frame is the call's
+/// terminator.
+pub type NetOrgDuplexHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    caller: *const NetOrgCaller,
+    request_stream: *mut RpcRequestStreamHandleC,
+    response_sink: *mut RpcResponseSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Process-wide Go-side dispatcher for server-streaming org handlers.
+static ORG_STREAMING_DISPATCHER: OnceLock<NetOrgStreamingHandlerFn> = OnceLock::new();
+/// Process-wide Go-side dispatcher for client-streaming org handlers.
+static ORG_CLIENT_STREAMING_DISPATCHER: OnceLock<NetOrgClientStreamingHandlerFn> = OnceLock::new();
+/// Process-wide Go-side dispatcher for duplex org handlers.
+static ORG_DUPLEX_DISPATCHER: OnceLock<NetOrgDuplexHandlerFn> = OnceLock::new();
+
+/// Register the process-wide server-streaming org handler dispatcher.
+/// Idempotent — first call takes effect. **Fails closed** (with the loud
+/// one-shot diagnostic) when no deallocator has been registered, on every
+/// platform — the same refusal [`net_org_set_handler_dispatcher`] makes, for
+/// the same callback-buffer-ownership reason.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_set_streaming_handler_dispatcher(
+    dispatcher: NetOrgStreamingHandlerFn,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if ORG_CALLBACK_FREE.get().is_none() {
+            warn_org_missing_callback_free("the streaming handler dispatcher");
+            return NET_ORG_ERR_NULL;
+        }
+        let _ = ORG_STREAMING_DISPATCHER.set(dispatcher);
+        NET_ORG_OK
+    })
+}
+
+/// Register the process-wide client-streaming org handler dispatcher.
+/// Idempotent — first call takes effect. Fails closed without a registered
+/// deallocator (see [`net_org_set_streaming_handler_dispatcher`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_set_client_streaming_handler_dispatcher(
+    dispatcher: NetOrgClientStreamingHandlerFn,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if ORG_CALLBACK_FREE.get().is_none() {
+            warn_org_missing_callback_free("the client-streaming handler dispatcher");
+            return NET_ORG_ERR_NULL;
+        }
+        let _ = ORG_CLIENT_STREAMING_DISPATCHER.set(dispatcher);
+        NET_ORG_OK
+    })
+}
+
+/// Register the process-wide duplex org handler dispatcher. Idempotent —
+/// first call takes effect. Fails closed without a registered deallocator
+/// (see [`net_org_set_streaming_handler_dispatcher`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_set_duplex_handler_dispatcher(
+    dispatcher: NetOrgDuplexHandlerFn,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if ORG_CALLBACK_FREE.get().is_none() {
+            warn_org_missing_callback_free("the duplex handler dispatcher");
+            return NET_ORG_ERR_NULL;
+        }
+        let _ = ORG_DUPLEX_DISPATCHER.set(dispatcher);
+        NET_ORG_OK
+    })
+}
+
+/// The message a refused shape-dispatcher registration prints. Same text
+/// discipline as `net_org_set_handler_dispatcher`'s inline refusal: the
+/// invariant is platform-independent (the allocator that creates a buffer
+/// releases it), so the enforcement is too. Factored for the three shape
+/// setters; the unary setter keeps its own copy of the same refusal.
+fn warn_org_missing_callback_free(what: &str) {
+    eprintln!(
+        "net-org-ffi: refusing to register {what} before net_org_set_callback_free. \
+         This library releases Go-allocated callback buffers only through that \
+         deallocator — on Windows because freeing them here corrupts a different \
+         CRT heap, and everywhere because it otherwise cannot free them at all and \
+         would leak one per callback. Update the Go wrapper to match this library."
+    );
+}
+
+/// Pull the Go dispatcher's `out_err` message (releasing its buffer through
+/// the Go-registered deallocator) into the `Err` arm's message string.
+///
+/// # Safety
+///
+/// `err_ptr` must be a buffer the Go callback layer allocated (or NULL).
+unsafe fn take_callback_err(err_ptr: *mut c_char, what: &str, code: c_int) -> String {
+    if err_ptr.is_null() {
+        return format!("{what} returned code {code} with no error message");
+    }
+    let s = std::ffi::CStr::from_ptr(err_ptr)
+        .to_string_lossy()
+        .into_owned();
+    free_callback_buffer(err_ptr as *mut std::ffi::c_void);
+    s
+}
+
+/// Drive one admitted server-streaming request through the Go dispatcher on
+/// a blocking thread, bounded by `timeout` — the closure body
+/// `serve_org_streaming_bytes_node` registers. The single place this shape's
+/// org admission facts are projected to C.
+async fn org_streaming_dispatch(
+    handler_id: u64,
+    caller: NetOrgCaller,
+    body: Bytes,
+    responses: RpcResponseSink,
+    timeout: Duration,
+) -> Result<(), OrgHandlerError> {
+    let Some(dispatcher) = ORG_STREAMING_DISPATCHER.get().copied() else {
+        return Err(OrgHandlerError::Internal(
+            "net_org_set_streaming_handler_dispatcher never called".into(),
+        ));
+    };
+    // The per-call sink handle lives for the dispatcher call only; Rust
+    // frees it here (the Go side MUST NOT `_free` it).
+    let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC::new(responses)));
+    // `*mut T` is not `Send` — smuggle the address through the closure as a
+    // `usize` (the pattern `rpc-ffi`'s shape bridges use).
+    let sink_addr = sink_handle as usize;
+
+    let join = tokio::time::timeout(
+        timeout,
+        spawn_handler_thread(move || -> Result<(), String> {
+            let sink_handle = sink_addr as *mut RpcResponseSinkHandleC;
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let code = unsafe {
+                dispatcher(
+                    handler_id,
+                    &caller as *const NetOrgCaller,
+                    body.as_ptr(),
+                    body.len(),
+                    sink_handle,
+                    &mut err_ptr,
+                )
+            };
+            // Dropping the sink handle closes the response mpsc — the fold's
+            // pump drains any final chunks then emits the terminal frame.
+            unsafe { drop(Box::from_raw(sink_handle)) };
+            if code == NET_ORG_OK {
+                Ok(())
+            } else {
+                Err(unsafe { take_callback_err(err_ptr, "Go org streaming handler", code) })
+            }
+        }),
+    )
+    .await;
+
+    match join {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(msg))) => Err(org_handler_error_from_msg(msg)),
+        Ok(Err(join_err)) => Err(OrgHandlerError::Internal(format!(
+            "Go org streaming handler handler thread ended without a result: {join_err}"
+        ))),
+        Err(_) => Err(OrgHandlerError::Internal(format!(
+            "Go org streaming handler did not respond within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+/// Drive one admitted client-streaming request through the Go dispatcher —
+/// the closure body `serve_org_client_stream_bytes_node` registers. Same
+/// spawn_blocking lifecycle as [`org_streaming_dispatch`].
+async fn org_client_streaming_dispatch(
+    handler_id: u64,
+    caller: NetOrgCaller,
+    requests: RequestStream,
+    timeout: Duration,
+) -> Result<Bytes, OrgHandlerError> {
+    let Some(dispatcher) = ORG_CLIENT_STREAMING_DISPATCHER.get().copied() else {
+        return Err(OrgHandlerError::Internal(
+            "net_org_set_client_streaming_handler_dispatcher never called".into(),
+        ));
+    };
+    let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC::new(requests)));
+    let stream_addr = stream_handle as usize;
+
+    let join = tokio::time::timeout(
+        timeout,
+        spawn_handler_thread(move || -> Result<Vec<u8>, String> {
+            let stream_handle = stream_addr as *mut RpcRequestStreamHandleC;
+            let mut resp_ptr: *mut u8 = std::ptr::null_mut();
+            let mut resp_len: usize = 0;
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let code = unsafe {
+                dispatcher(
+                    handler_id,
+                    &caller as *const NetOrgCaller,
+                    stream_handle,
+                    &mut resp_ptr,
+                    &mut resp_len,
+                    &mut err_ptr,
+                )
+            };
+            // Free the per-call request-stream handle. Dropping any
+            // unconsumed stream is the fold's CANCEL business, not ours.
+            unsafe { drop(Box::from_raw(stream_handle)) };
+            if code == NET_ORG_OK {
+                if resp_ptr.is_null() {
+                    return Ok(Vec::new());
+                }
+                if resp_len > isize::MAX as usize {
+                    free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
+                    return Err(
+                        "Go org client-streaming handler response length exceeds isize::MAX"
+                            .to_string(),
+                    );
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
+                free_callback_buffer(resp_ptr as *mut std::ffi::c_void);
+                Ok(bytes)
+            } else {
+                Err(unsafe { take_callback_err(err_ptr, "Go org client-streaming handler", code) })
+            }
+        }),
+    )
+    .await;
+
+    match join {
+        Ok(Ok(Ok(body))) => Ok(Bytes::from(body)),
+        Ok(Ok(Err(msg))) => Err(org_handler_error_from_msg(msg)),
+        Ok(Err(join_err)) => Err(OrgHandlerError::Internal(format!(
+            "Go org client-streaming handler handler thread ended without a result: {join_err}"
+        ))),
+        Err(_) => Err(OrgHandlerError::Internal(format!(
+            "Go org client-streaming handler did not respond within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+/// Drive one admitted duplex request through the Go dispatcher — the closure
+/// body `serve_org_duplex_bytes_node` registers. Same spawn_blocking
+/// lifecycle as [`org_streaming_dispatch`]; both per-call handles are freed
+/// when the dispatcher returns.
+async fn org_duplex_dispatch(
+    handler_id: u64,
+    caller: NetOrgCaller,
+    requests: RequestStream,
+    responses: RpcResponseSink,
+    timeout: Duration,
+) -> Result<(), OrgHandlerError> {
+    let Some(dispatcher) = ORG_DUPLEX_DISPATCHER.get().copied() else {
+        return Err(OrgHandlerError::Internal(
+            "net_org_set_duplex_handler_dispatcher never called".into(),
+        ));
+    };
+    let stream_handle = Box::into_raw(Box::new(RpcRequestStreamHandleC::new(requests)));
+    let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC::new(responses)));
+    let stream_addr = stream_handle as usize;
+    let sink_addr = sink_handle as usize;
+
+    let join = tokio::time::timeout(
+        timeout,
+        spawn_handler_thread(move || -> Result<(), String> {
+            let stream_handle = stream_addr as *mut RpcRequestStreamHandleC;
+            let sink_handle = sink_addr as *mut RpcResponseSinkHandleC;
+            let mut err_ptr: *mut c_char = std::ptr::null_mut();
+            let code = unsafe {
+                dispatcher(
+                    handler_id,
+                    &caller as *const NetOrgCaller,
+                    stream_handle,
+                    sink_handle,
+                    &mut err_ptr,
+                )
+            };
+            unsafe { drop(Box::from_raw(stream_handle)) };
+            unsafe { drop(Box::from_raw(sink_handle)) };
+            if code == NET_ORG_OK {
+                Ok(())
+            } else {
+                Err(unsafe { take_callback_err(err_ptr, "Go org duplex handler", code) })
+            }
+        }),
+    )
+    .await;
+
+    match join {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(msg))) => Err(org_handler_error_from_msg(msg)),
+        Ok(Err(join_err)) => Err(OrgHandlerError::Internal(format!(
+            "Go org duplex handler handler thread ended without a result: {join_err}"
+        ))),
+        Err(_) => Err(OrgHandlerError::Internal(format!(
+            "Go org duplex handler did not respond within {} ms",
+            timeout.as_millis()
+        ))),
+    }
+}
+
+/// Register a protected server-streaming service (§4). Same contract as
+/// [`net_org_serve`]: `mesh_arc` is **consumed**, `access` is
+/// `NET_ORG_ACCESS_SAME_ORG` / `_GRANTED`, `handler_id` MUST already be
+/// reserved AND stored in the Go registry before this call. Requires the
+/// streaming dispatcher (`net_org_set_streaming_handler_dispatcher`).
+///
+/// # Handler-drop contract (§2.2 / F-S3.1-2)
+///
+/// The retire supervisor may drop the handler's future WITHOUT a final poll:
+/// a handler mid-emission when the call retires observes the retirement ONLY
+/// through `net_rpc_response_sink_send` returning `NET_RPC_ERR_STREAM_DONE`
+/// (and, for the other shapes, `net_rpc_request_stream_next` returning
+/// `NET_RPC_ERR_STREAM_DONE`). There is no cancellation callback and no
+/// guaranteed final poll — exit cooperatively on those observables. See the
+/// dispatch section's contract note above.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_serve_streaming(
+    mesh_arc: *mut Arc<MeshNode>,
+    service_ptr: *const c_char,
+    service_len: usize,
+    access: c_int,
+    handler_id: u64,
+    out_handle: *mut *mut NetOrgServeHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        // Own the mesh arc immediately (Go does not free it) so every early
+        // validation return below drops the node rather than leaking it.
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(out_err, "out_handle must be non-NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        if ORG_STREAMING_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_org_set_streaming_handler_dispatcher must be called before \
+                 net_org_serve_streaming"
+                    .into(),
+            );
+            return NET_ORG_ERR_NO_DISPATCHER;
+        }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_org_reserve_handler_id)".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
+        let access = match access {
+            NET_ORG_ACCESS_SAME_ORG => OrgAccess::SameOrg,
+            NET_ORG_ACCESS_GRANTED => OrgAccess::Granted,
+            other => {
+                write_err(out_err, format!("invalid access mode {other}"));
+                return NET_ORG_ERR_NULL;
+            }
+        };
+        let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
+        let handler = move |caller: OrgCaller, body: Bytes, responses: RpcResponseSink| {
+            let caller_c = NetOrgCaller::from(&caller);
+            async move { org_streaming_dispatch(handler_id, caller_c, body, responses, timeout).await }
+        };
+        // See `net_org_serve`: registration spawns an inbound-event bridge
+        // with a bare `tokio::spawn`, and cgo calls this on a Go-owned C
+        // thread with no runtime. Enter ours for the registration.
+        let _rt_guard = runtime().enter();
+        match net_sdk::org::serve_org_streaming_bytes_node(node, &service, access, handler) {
+            Ok(inner) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(NetOrgServeHandle {
+                        inner: Arc::new(Mutex::new(Some(inner))),
+                        handler_id,
+                    }));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = match e {
+                    ServeError::AlreadyServing(_) => NET_ORG_ERR_ALREADY_SERVING,
+                    _ => NET_ORG_ERR_SERVE,
+                };
+                write_err(out_err, format!("serve failed: {e}"));
+                code
+            }
+        }
+    })
+}
+
+/// Register a protected client-streaming service (§4). Same contract as
+/// [`net_org_serve_streaming`] — including the §2.2 / F-S3.1-2 handler-drop
+/// level stated there — with `net_org_set_client_streaming_handler_dispatcher`
+/// as its dispatcher.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_serve_client_stream(
+    mesh_arc: *mut Arc<MeshNode>,
+    service_ptr: *const c_char,
+    service_len: usize,
+    access: c_int,
+    handler_id: u64,
+    out_handle: *mut *mut NetOrgServeHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(out_err, "out_handle must be non-NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        if ORG_CLIENT_STREAMING_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_org_set_client_streaming_handler_dispatcher must be called before \
+                 net_org_serve_client_stream"
+                    .into(),
+            );
+            return NET_ORG_ERR_NO_DISPATCHER;
+        }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_org_reserve_handler_id)".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
+        let access = match access {
+            NET_ORG_ACCESS_SAME_ORG => OrgAccess::SameOrg,
+            NET_ORG_ACCESS_GRANTED => OrgAccess::Granted,
+            other => {
+                write_err(out_err, format!("invalid access mode {other}"));
+                return NET_ORG_ERR_NULL;
+            }
+        };
+        let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
+        let handler = move |caller: OrgCaller, requests: RequestStream| {
+            let caller_c = NetOrgCaller::from(&caller);
+            async move { org_client_streaming_dispatch(handler_id, caller_c, requests, timeout).await }
+        };
+        let _rt_guard = runtime().enter();
+        match net_sdk::org::serve_org_client_stream_bytes_node(node, &service, access, handler) {
+            Ok(inner) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(NetOrgServeHandle {
+                        inner: Arc::new(Mutex::new(Some(inner))),
+                        handler_id,
+                    }));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = match e {
+                    ServeError::AlreadyServing(_) => NET_ORG_ERR_ALREADY_SERVING,
+                    _ => NET_ORG_ERR_SERVE,
+                };
+                write_err(out_err, format!("serve failed: {e}"));
+                code
+            }
+        }
+    })
+}
+
+/// Register a protected duplex service (§4). Same contract as
+/// [`net_org_serve_streaming`] — including the §2.2 / F-S3.1-2 handler-drop
+/// level stated there — with `net_org_set_duplex_handler_dispatcher` as its
+/// dispatcher.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_serve_duplex(
+    mesh_arc: *mut Arc<MeshNode>,
+    service_ptr: *const c_char,
+    service_len: usize,
+    access: c_int,
+    handler_id: u64,
+    out_handle: *mut *mut NetOrgServeHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(out_err, "out_handle must be non-NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        if ORG_DUPLEX_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_org_set_duplex_handler_dispatcher must be called before \
+                 net_org_serve_duplex"
+                    .into(),
+            );
+            return NET_ORG_ERR_NO_DISPATCHER;
+        }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_org_reserve_handler_id)".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
+        let access = match access {
+            NET_ORG_ACCESS_SAME_ORG => OrgAccess::SameOrg,
+            NET_ORG_ACCESS_GRANTED => OrgAccess::Granted,
+            other => {
+                write_err(out_err, format!("invalid access mode {other}"));
+                return NET_ORG_ERR_NULL;
+            }
+        };
+        let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
+        let handler = move |caller: OrgCaller,
+                            requests: RequestStream,
+                            responses: RpcResponseSink| {
+            let caller_c = NetOrgCaller::from(&caller);
+            async move { org_duplex_dispatch(handler_id, caller_c, requests, responses, timeout).await }
+        };
+        let _rt_guard = runtime().enter();
+        match net_sdk::org::serve_org_duplex_bytes_node(node, &service, access, handler) {
+            Ok(inner) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(NetOrgServeHandle {
+                        inner: Arc::new(Mutex::new(Some(inner))),
+                        handler_id,
+                    }));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = match e {
+                    ServeError::AlreadyServing(_) => NET_ORG_ERR_ALREADY_SERVING,
+                    _ => NET_ORG_ERR_SERVE,
+                };
+                write_err(out_err, format!("serve failed: {e}"));
+                code
+            }
+        }
+    })
+}
+
+// =========================================================================
 // Provisioning (§D9) — install the node authority + provider grant audiences.
 // =========================================================================
 
@@ -1654,13 +2482,21 @@ mod tests {
         assert_eq!(offset_of!(NetOrgCaller, capability), 128);
     }
 
-    /// The ABI stamp is the org surface's own, starting at `0x0001`, and the
-    /// checker is forward-compatible (a newer lib satisfies an older header).
+    /// The ABI stamp is the org surface's OWN — versioned independently of
+    /// `net_rpc`'s — and the checker requires EXACT equality (its own inverse
+    /// test pins why: `check_abi_version_requires_exact_equality`).
+    ///
+    ///   - 0x0001 — the unary surface (credentials / bind / call / serve +
+    ///     the subnet + provisioning entry points).
+    ///   - 0x0002 — the streaming shapes (Stage 4, §4.4). ADDITIVE — every
+    ///     0x0001 symbol kept its signature and semantics.
     #[test]
-    fn abi_version_is_independent_and_forward_compatible() {
-        assert_eq!(net_org_abi_version(), 0x0001);
-        assert_eq!(net_org_check_abi_version(0x0001), NET_ORG_OK);
-        assert_eq!(net_org_check_abi_version(0x0002), NET_ORG_ERR_NULL);
+    fn abi_version_is_independent_and_exact() {
+        assert_eq!(net_org_abi_version(), 0x0002);
+        assert_eq!(net_org_check_abi_version(0x0002), NET_ORG_OK);
+        // The additive bump still requires consumers to rebuild against the
+        // current headers: an older expectation is refused, never waved on.
+        assert_eq!(net_org_check_abi_version(0x0001), NET_ORG_ERR_NULL);
     }
 
     /// `net_subnet_path_t` layout is part of the ABI: a reorder or retype

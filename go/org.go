@@ -130,6 +130,72 @@ extern int net_org_install_provider_grant_audience(
     const char* secret_path_ptr, size_t secret_path_len,
     char** out_err);
 
+// ---- Streaming shapes (ABI 0x0002, §4.4).
+//
+// The shared handle typedefs — the same opaque types mesh_rpc.go's TU
+// declares (each cgo file is its own translation unit, so they are
+// re-declared per file and the pointers cross as unsafe.Pointer, the
+// convention newOrgServeHandleFromPtr established). The handles themselves
+// are the shared ones: net_org_call_streaming hands out what
+// net_rpc_stream_next drives, so *RpcStream / *ClientStreamCall /
+// *DuplexCall wrap them unchanged (streamHandleGuard + ctx-cancel watcher
+// reused verbatim).
+typedef struct RpcStreamHandleC        RpcStreamHandleC;
+typedef struct ClientStreamCallHandleC ClientStreamCallHandleC;
+typedef struct DuplexCallHandleC       DuplexCallHandleC;
+typedef struct RpcRequestStreamHandleC RpcRequestStreamHandleC;
+typedef struct RpcResponseSinkHandleC  RpcResponseSinkHandleC;
+
+extern int net_org_call_streaming(
+    NetOrgClient* client,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms, uint64_t cancel_token,
+    RpcStreamHandleC** out_stream, char** out_err);
+extern int net_org_call_client_stream(
+    NetOrgClient* client,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms, uint64_t cancel_token,
+    ClientStreamCallHandleC** out_handle, char** out_err);
+extern int net_org_call_duplex(
+    NetOrgClient* client,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms, uint64_t cancel_token,
+    DuplexCallHandleC** out_handle, char** out_err);
+
+// Shape handler dispatchers — net_rpc.h's fn types plus a leading verified
+// caller. Register BEFORE the matching net_org_serve_* (which refuses with
+// NET_ORG_ERR_NO_DISPATCHER otherwise). Same callback-buffer-ownership
+// gate as the unary dispatcher: net_org_set_callback_free first.
+typedef int (*NetOrgStreamingHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
+typedef int (*NetOrgClientStreamingHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+typedef int (*NetOrgDuplexHandlerFn)(
+    uint64_t handler_id, const net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
+
+extern int net_org_set_streaming_handler_dispatcher(NetOrgStreamingHandlerFn dispatcher);
+extern int net_org_set_client_streaming_handler_dispatcher(NetOrgClientStreamingHandlerFn dispatcher);
+extern int net_org_set_duplex_handler_dispatcher(NetOrgDuplexHandlerFn dispatcher);
+extern int net_org_serve_streaming(void* mesh_arc,
+                              const char* service_ptr, size_t service_len,
+                              int access, uint64_t handler_id,
+                              NetOrgServeHandle** out_handle, char** out_err);
+extern int net_org_serve_client_stream(void* mesh_arc,
+                              const char* service_ptr, size_t service_len,
+                              int access, uint64_t handler_id,
+                              NetOrgServeHandle** out_handle, char** out_err);
+extern int net_org_serve_duplex(void* mesh_arc,
+                              const char* service_ptr, size_t service_len,
+                              int access, uint64_t handler_id,
+                              NetOrgServeHandle** out_handle, char** out_err);
+
 // Trampoline Rust calls back through. Defined below as a Go //export function
 // and registered via net_org_set_handler_dispatcher. cgo's auto-generated
 // header from the //export pragma drops C `const` qualifiers (Go has no const),
@@ -139,6 +205,19 @@ int go_net_org_handler_trampoline(
     uint64_t handler_id, net_org_caller_t* caller,
     uint8_t* req_ptr, size_t req_len,
     uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+// The three shape trampolines — same const-dropping rule as above.
+int go_net_org_streaming_trampoline(
+    uint64_t handler_id, net_org_caller_t* caller,
+    uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
+int go_net_org_client_streaming_trampoline(
+    uint64_t handler_id, net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+int go_net_org_duplex_trampoline(
+    uint64_t handler_id, net_org_caller_t* caller,
+    RpcRequestStreamHandleC* request_stream,
+    RpcResponseSinkHandleC* response_sink, char** out_err);
 */
 import "C"
 
@@ -156,7 +235,14 @@ import (
 
 // orgABIVersion is the ABI this file was written against. init() hard-fails if
 // the loaded libnet_org is older (X3 drift guard).
-const orgABIVersion uint32 = 0x0001
+//
+//   - 0x0001: the unary surface (credentials / bind / call / serve + the
+//     subnet-exported and provisioning entry points).
+//   - 0x0002: the streaming shapes (§4.4) — CallStreaming / CallClientStream
+//     / CallDuplex over the shared net_rpc.h handles, the shape handler
+//     dispatchers + trampolines, and ServeOrgStreaming / ServeOrgClientStream
+//     / ServeOrgDuplex. ADDITIVE.
+const orgABIVersion uint32 = 0x0002
 
 func init() {
 	if C.net_org_check_abi_version(C.uint32_t(orgABIVersion)) != C.NET_ORG_OK {
@@ -721,6 +807,116 @@ func OrgCall[Req, Resp any](ctx context.Context, c *OrgClient, service string, r
 }
 
 // =========================================================================
+// Streaming shapes (ABI 0x0002, §4.4) — callers.
+//
+// CallStreaming / CallClientStream / CallDuplex return the EXISTING handles
+// (*RpcStream / *ClientStreamCall / *DuplexCall) — the C handle types are
+// shared with the nRPC surface (one libnet), so streamHandleGuard, the
+// ctx-cancel watcher, Recv/Send/Finish/Close and the GC backstop are
+// literally the public methods. The one difference is error vocabulary:
+// midstream failures classify through parseOrgError (the `org:` wire — see
+// RpcStream.orgErrors and parseStreamError), never the bare nRPC shape.
+//
+// ctx carries the call deadline and cancellation exactly like CallBytes:
+// the deadline becomes the call's hard deadline (0 ⇒ the facade's 300 s
+// protected-call default — never "no deadline", by contract), and ctx
+// cancel tears the stream down (one best-effort CANCEL; never a retry — a
+// signed proof is never resent).
+// =========================================================================
+
+// CallStreaming opens a protected streaming-response call: one request in
+// (the signed opening binds it), raw chunks out. The returned *RpcStream
+// MUST be Closed (defer is fine).
+func (c *OrgClient) CallStreaming(ctx context.Context, service string, req []byte) (*RpcStream, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	cReq, freeReq := bytesToCBytes(req)
+	defer freeReq()
+
+	var outStream *C.RpcStreamHandleC
+	var outErr *C.char
+	var code C.int
+	if err := c.withHandle(func(h *C.NetOrgClient) {
+		code = C.net_org_call_streaming(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs), C.uint64_t(0), // 0 = uncancellable construction
+			&outStream, &outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if err := orgErrorFromCall(code, outErr); err != nil {
+		return nil, err
+	}
+	stream := newRpcStreamFromOrg(unsafe.Pointer(outStream))
+	stream.cancel, stream.watcherDone = spawnCtxCancelWatcher(ctx, stream.guard)
+	return stream, nil
+}
+
+// CallClientStream opens a protected client-streaming call: a stream of
+// requests in, one terminal response out. The wire opening rides the first
+// Send (the signed opening binds the finalized first chunk) or Finish for
+// the zero-item path, against the facade's ONE pinned provider. The
+// returned *ClientStreamCall MUST be Finished or Closed.
+func (c *OrgClient) CallClientStream(ctx context.Context, service string) (*ClientStreamCall, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var outHandle *C.ClientStreamCallHandleC
+	var outErr *C.char
+	var code C.int
+	if err := c.withHandle(func(h *C.NetOrgClient) {
+		code = C.net_org_call_client_stream(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(deadlineMs), C.uint64_t(0),
+			&outHandle, &outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if err := orgErrorFromCall(code, outErr); err != nil {
+		return nil, err
+	}
+	call := newClientStreamCallFromOrg(unsafe.Pointer(outHandle))
+	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)
+	return call, nil
+}
+
+// CallDuplex opens a protected duplex call: request chunks in, response
+// chunks out. The returned *DuplexCall MUST be Closed (or Split and both
+// halves closed).
+func (c *OrgClient) CallDuplex(ctx context.Context, service string) (*DuplexCall, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var outHandle *C.DuplexCallHandleC
+	var outErr *C.char
+	var code C.int
+	if err := c.withHandle(func(h *C.NetOrgClient) {
+		code = C.net_org_call_duplex(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(deadlineMs), C.uint64_t(0),
+			&outHandle, &outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if err := orgErrorFromCall(code, outErr); err != nil {
+		return nil, err
+	}
+	call := newDuplexCallFromOrg(unsafe.Pointer(outHandle))
+	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)
+	return call, nil
+}
+
+// =========================================================================
 // OrgCaller + OrgAccess (G5).
 // =========================================================================
 
@@ -967,6 +1163,449 @@ func (s *OrgServeHandle) Close() {
 }
 
 func (s *OrgServeHandle) finalize() { s.Close() }
+
+// =========================================================================
+// Streaming shapes (ABI 0x0002, §4.4) — serve.
+//
+// One handler registry and one reserve → store → serve discipline as the
+// unary surface (the ids share net_org_reserve_handler_id's monotonic
+// counter); each shape registers its own process-wide dispatcher before
+// crossing the FFI. Every handler receives the provider-verified caller
+// first — never caller-claimed data.
+//
+// HANDLER-DROP CONTRACT (spec §2.2; the F-S3.1-2 level, stated for THIS
+// binding): the retire supervisor may drop the handler's future WITHOUT a
+// final poll. At this callback boundary: a handler still executing when a
+// deadline, ctx-cancel, revocation, or serve-handle close retires the call
+// is NOT interrupted and receives NO cancellation callback and NO
+// final-polled notification. Retirement is observed ONLY through the
+// retirement observables — RequestStreamRecv.Recv and ResponseSinkSend.Send
+// returning ErrStreamDone — and a handler MUST exit cooperatively when they
+// fire. Never block past them waiting for an event the retired fold can no
+// longer produce; never assume a final poll will run cleanup. (The wrappers
+// are additionally invalidated when the callback returns, so a goroutine
+// that captured one sees ErrStreamDone, never a freed C handle.)
+// =========================================================================
+
+// OrgStreamingHandler answers an admitted server-streaming request,
+// receiving the verified caller. Emit chunks via sink.Send; return nil for
+// clean close (the substrate fold emits the terminal frame) or an error.
+// Return AppError(code, body) for a typed application status; any other
+// error becomes an internal server error. See the handler-drop contract
+// above.
+type OrgStreamingHandler func(caller OrgCaller, req []byte, sink *ResponseSinkSend) error
+
+// OrgClientStreamingHandler answers an admitted client-streaming request:
+// drain the stream, return one terminal response body (or an error). See
+// the handler-drop contract above.
+type OrgClientStreamingHandler func(caller OrgCaller, stream *RequestStreamRecv) ([]byte, error)
+
+// OrgDuplexHandler answers an admitted duplex request: drain the stream AND
+// emit chunks via the sink. Return nil for clean close. See the
+// handler-drop contract above.
+type OrgDuplexHandler func(caller OrgCaller, stream *RequestStreamRecv, sink *ResponseSinkSend) error
+
+var (
+	orgStreamingDispatcherOnce       sync.Once
+	orgClientStreamingDispatcherOnce sync.Once
+	orgDuplexDispatcherOnce          sync.Once
+)
+
+func registerOrgStreamingDispatcher() {
+	orgStreamingDispatcherOnce.Do(func() {
+		// The deallocator must be registered first — see callback_free.go.
+		registerCallbackFree()
+		if code := C.net_org_set_streaming_handler_dispatcher(
+			(C.NetOrgStreamingHandlerFn)(C.go_net_org_streaming_trampoline),
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the org streaming handler dispatcher (code %d); this "+
+					"Go wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
+	})
+}
+
+func registerOrgClientStreamingDispatcher() {
+	orgClientStreamingDispatcherOnce.Do(func() {
+		registerCallbackFree()
+		if code := C.net_org_set_client_streaming_handler_dispatcher(
+			(C.NetOrgClientStreamingHandlerFn)(C.go_net_org_client_streaming_trampoline),
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the org client-streaming handler dispatcher (code %d); this "+
+					"Go wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
+	})
+}
+
+func registerOrgDuplexDispatcher() {
+	orgDuplexDispatcherOnce.Do(func() {
+		registerCallbackFree()
+		if code := C.net_org_set_duplex_handler_dispatcher(
+			(C.NetOrgDuplexHandlerFn)(C.go_net_org_duplex_trampoline),
+		); code != 0 {
+			panic(fmt.Sprintf(
+				"net: libnet refused the org duplex handler dispatcher (code %d); this "+
+					"Go wrapper and libnet disagree about callback-buffer "+
+					"ownership", int(code)))
+		}
+	})
+}
+
+//export go_net_org_streaming_trampoline
+func go_net_org_streaming_trampoline(
+	handlerID C.uint64_t,
+	caller *C.net_org_caller_t,
+	reqPtr *C.uint8_t,
+	reqLen C.size_t,
+	responseSink *C.RpcResponseSinkHandleC,
+	outErr **C.char,
+) (code C.int) {
+	// FFI-01: a Go panic crossing the cgo boundary KILLS the process (Rust's
+	// catch_unwind cannot translate a Go unwind). Contained here as the FIRST
+	// statement so the registry lookup and payload conversion — the frames
+	// peer-shaped input reaches — are covered too. `code` is the named return:
+	// a contained panic returns the failure status with *out_err unset (Rust
+	// reports "returned code -1 with no error message" — correct, since the
+	// panic carries no ABI-safe detail).
+	defer func() {
+		if recoverCallback("net.OrgStreamingHandler", recover()) {
+			code = -1
+		}
+	}()
+	val, ok := orgHandlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no org streaming handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(OrgStreamingHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not an OrgStreamingHandler", uint64(handlerID)))
+		return -1
+	}
+	req, okLen := goBytesChecked(reqPtr, reqLen)
+	if !okLen {
+		writeCError(outErr, fmt.Sprintf("request body length %d exceeds the maximum", uint64(reqLen)))
+		return -1
+	}
+	sink := newResponseSinkSendFromPtr(unsafe.Pointer(responseSink))
+	err := safeCallOrgStreamingHandler(handler, orgCallerFromC(caller), req, sink)
+	// Invalidate the wrapper BEFORE returning to Rust — anything the
+	// handler captured into a goroutine sees ErrStreamDone on Send, never
+	// the C handle Rust is about to free.
+	sink.invalidated.Store(1)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	return 0
+}
+
+func safeCallOrgStreamingHandler(h OrgStreamingHandler, caller OrgCaller, req []byte, sk *ResponseSinkSend) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("org streaming handler panicked: %v", r)
+		}
+	}()
+	return h(caller, req, sk)
+}
+
+//export go_net_org_client_streaming_trampoline
+func go_net_org_client_streaming_trampoline(
+	handlerID C.uint64_t,
+	caller *C.net_org_caller_t,
+	requestStream *C.RpcRequestStreamHandleC,
+	outRespPtr **C.uint8_t,
+	outRespLen *C.size_t,
+	outErr **C.char,
+) (code C.int) {
+	// FFI-01: see go_net_org_streaming_trampoline's guard. The response
+	// out-params are re-initialized inside the recovery so a contained panic
+	// still returns a fully-written ABI result.
+	defer func() {
+		if recoverCallback("net.OrgClientStreamingHandler", recover()) {
+			if outRespPtr != nil {
+				*outRespPtr = nil
+			}
+			if outRespLen != nil {
+				*outRespLen = 0
+			}
+			code = -1
+		}
+	}()
+	val, ok := orgHandlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no org client-streaming handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(OrgClientStreamingHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not an OrgClientStreamingHandler", uint64(handlerID)))
+		return -1
+	}
+	stream := newRequestStreamRecvFromPtr(unsafe.Pointer(requestStream))
+	resp, err := safeCallOrgClientStreamingHandler(handler, orgCallerFromC(caller), stream)
+	stream.invalidated.Store(1)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	if len(resp) == 0 {
+		*outRespPtr = nil
+		*outRespLen = 0
+		return 0
+	}
+	respBuf := C.malloc(C.size_t(len(resp)))
+	if respBuf == nil {
+		writeCError(outErr, "C.malloc returned NULL for org client-streaming response buffer")
+		return -1
+	}
+	C.memmove(respBuf, unsafe.Pointer(&resp[0]), C.size_t(len(resp)))
+	*outRespPtr = (*C.uint8_t)(respBuf)
+	*outRespLen = C.size_t(len(resp))
+	return 0
+}
+
+func safeCallOrgClientStreamingHandler(h OrgClientStreamingHandler, caller OrgCaller, s *RequestStreamRecv) (resp []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("org client-streaming handler panicked: %v", r)
+		}
+	}()
+	return h(caller, s)
+}
+
+//export go_net_org_duplex_trampoline
+func go_net_org_duplex_trampoline(
+	handlerID C.uint64_t,
+	caller *C.net_org_caller_t,
+	requestStream *C.RpcRequestStreamHandleC,
+	responseSink *C.RpcResponseSinkHandleC,
+	outErr **C.char,
+) (code C.int) {
+	// FFI-01: see go_net_org_streaming_trampoline's guard.
+	defer func() {
+		if recoverCallback("net.OrgDuplexHandler", recover()) {
+			code = -1
+		}
+	}()
+	val, ok := orgHandlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no org duplex handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(OrgDuplexHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not an OrgDuplexHandler", uint64(handlerID)))
+		return -1
+	}
+	stream := newRequestStreamRecvFromPtr(unsafe.Pointer(requestStream))
+	sink := newResponseSinkSendFromPtr(unsafe.Pointer(responseSink))
+	err := safeCallOrgDuplexHandler(handler, orgCallerFromC(caller), stream, sink)
+	// Invalidate BOTH wrappers before returning — Rust is about to free
+	// the underlying handles.
+	stream.invalidated.Store(1)
+	sink.invalidated.Store(1)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	return 0
+}
+
+func safeCallOrgDuplexHandler(h OrgDuplexHandler, caller OrgCaller, s *RequestStreamRecv, sk *ResponseSinkSend) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("org duplex handler panicked: %v", r)
+		}
+	}()
+	return h(caller, s, sk)
+}
+
+// ServeOrgStreamingBytes registers a protected server-streaming service
+// with a raw byte handler. The typed ServeOrgStreaming wraps this with
+// JSON. Same contract as ServeOrgBytes (node authority required; a Granted
+// service also needs its provider grant audience), plus the handler-drop
+// contract documented above.
+func ServeOrgStreamingBytes(node *MeshNode, service string, access OrgAccess, handler OrgStreamingHandler) (*OrgServeHandle, error) {
+	if node == nil {
+		return nil, errors.New("net.ServeOrgStreamingBytes: node must be non-nil")
+	}
+	if handler == nil {
+		return nil, errors.New("net.ServeOrgStreamingBytes: handler must be non-nil")
+	}
+	registerOrgStreamingDispatcher()
+
+	arcPtr := node.arcClonePtr()
+	if arcPtr == nil {
+		return nil, errors.New("net.ServeOrgStreamingBytes: node is shutting down or freed")
+	}
+
+	// Reserve + store BEFORE serving — pre-registration closes the
+	// request-arrives-before-store race (the unary surface's discipline).
+	hID := uint64(C.net_org_reserve_handler_id())
+	orgHandlerRegistry.Store(hID, handler)
+
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var out *C.NetOrgServeHandle
+	var errPtr *C.char
+	code := C.net_org_serve_streaming(
+		arcPtr,
+		(*C.char)(cService.ptr), cService.len,
+		C.int(access), C.uint64_t(hID),
+		&out, &errPtr,
+	)
+	if err := orgErrorFromCall(code, errPtr); err != nil {
+		orgHandlerRegistry.Delete(hID)
+		return nil, err
+	}
+	sh := &OrgServeHandle{handle: out, handlerID: hID}
+	runtime.SetFinalizer(sh, (*OrgServeHandle).finalize)
+	return sh, nil
+}
+
+// ServeOrgClientStreamBytes registers a protected client-streaming service
+// with a raw byte handler. See ServeOrgStreamingBytes.
+func ServeOrgClientStreamBytes(node *MeshNode, service string, access OrgAccess, handler OrgClientStreamingHandler) (*OrgServeHandle, error) {
+	if node == nil {
+		return nil, errors.New("net.ServeOrgClientStreamBytes: node must be non-nil")
+	}
+	if handler == nil {
+		return nil, errors.New("net.ServeOrgClientStreamBytes: handler must be non-nil")
+	}
+	registerOrgClientStreamingDispatcher()
+
+	arcPtr := node.arcClonePtr()
+	if arcPtr == nil {
+		return nil, errors.New("net.ServeOrgClientStreamBytes: node is shutting down or freed")
+	}
+
+	hID := uint64(C.net_org_reserve_handler_id())
+	orgHandlerRegistry.Store(hID, handler)
+
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var out *C.NetOrgServeHandle
+	var errPtr *C.char
+	code := C.net_org_serve_client_stream(
+		arcPtr,
+		(*C.char)(cService.ptr), cService.len,
+		C.int(access), C.uint64_t(hID),
+		&out, &errPtr,
+	)
+	if err := orgErrorFromCall(code, errPtr); err != nil {
+		orgHandlerRegistry.Delete(hID)
+		return nil, err
+	}
+	sh := &OrgServeHandle{handle: out, handlerID: hID}
+	runtime.SetFinalizer(sh, (*OrgServeHandle).finalize)
+	return sh, nil
+}
+
+// ServeOrgDuplexBytes registers a protected duplex service with a raw byte
+// handler. See ServeOrgStreamingBytes.
+func ServeOrgDuplexBytes(node *MeshNode, service string, access OrgAccess, handler OrgDuplexHandler) (*OrgServeHandle, error) {
+	if node == nil {
+		return nil, errors.New("net.ServeOrgDuplexBytes: node must be non-nil")
+	}
+	if handler == nil {
+		return nil, errors.New("net.ServeOrgDuplexBytes: handler must be non-nil")
+	}
+	registerOrgDuplexDispatcher()
+
+	arcPtr := node.arcClonePtr()
+	if arcPtr == nil {
+		return nil, errors.New("net.ServeOrgDuplexBytes: node is shutting down or freed")
+	}
+
+	hID := uint64(C.net_org_reserve_handler_id())
+	orgHandlerRegistry.Store(hID, handler)
+
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+
+	var out *C.NetOrgServeHandle
+	var errPtr *C.char
+	code := C.net_org_serve_duplex(
+		arcPtr,
+		(*C.char)(cService.ptr), cService.len,
+		C.int(access), C.uint64_t(hID),
+		&out, &errPtr,
+	)
+	if err := orgErrorFromCall(code, errPtr); err != nil {
+		orgHandlerRegistry.Delete(hID)
+		return nil, err
+	}
+	sh := &OrgServeHandle{handle: out, handlerID: hID}
+	runtime.SetFinalizer(sh, (*OrgServeHandle).finalize)
+	return sh, nil
+}
+
+// ServeOrgStreaming registers a protected server-streaming service with a
+// JSON-typed handler — ServeOrg's streaming sibling (§4.4). JSON
+// decode/encode happens at the binding boundary over the EXISTING typed
+// views (TypedResponseSink), so no new stream wrapper exists for org.
+func ServeOrgStreaming[Req, Resp any](
+	node *MeshNode,
+	service string,
+	access OrgAccess,
+	handler func(caller OrgCaller, req Req, sink *TypedResponseSink[Resp]) error,
+) (*OrgServeHandle, error) {
+	shim := func(caller OrgCaller, reqBytes []byte, sink *ResponseSinkSend) error {
+		req, err := jsonDecodeTyped[Req](reqBytes)
+		if err != nil {
+			body := mustMarshalBody(struct {
+				Err    string `json:"error"`
+				Detail string `json:"detail"`
+			}{Err: "invalid_request", Detail: err.Error()})
+			return AppError(NrpcTypedBadRequest, body)
+		}
+		return handler(caller, req, &TypedResponseSink[Resp]{raw: sink})
+	}
+	return ServeOrgStreamingBytes(node, service, access, shim)
+}
+
+// ServeOrgClientStream registers a protected client-streaming service with
+// a JSON-typed handler (drain TypedRequestStream.Recv, return the typed
+// terminal response).
+func ServeOrgClientStream[Req, Resp any](
+	node *MeshNode,
+	service string,
+	access OrgAccess,
+	handler func(caller OrgCaller, stream *TypedRequestStream[Req]) (Resp, error),
+) (*OrgServeHandle, error) {
+	shim := func(caller OrgCaller, stream *RequestStreamRecv) ([]byte, error) {
+		resp, err := handler(caller, &TypedRequestStream[Req]{raw: stream})
+		if err != nil {
+			return nil, err
+		}
+		return jsonEncodeTyped(resp)
+	}
+	return ServeOrgClientStreamBytes(node, service, access, shim)
+}
+
+// ServeOrgDuplex registers a protected duplex service with a JSON-typed
+// handler (drain TypedRequestStream, emit through TypedResponseSink).
+func ServeOrgDuplex[Req, Resp any](
+	node *MeshNode,
+	service string,
+	access OrgAccess,
+	handler func(caller OrgCaller, stream *TypedRequestStream[Req], sink *TypedResponseSink[Resp]) error,
+) (*OrgServeHandle, error) {
+	shim := func(caller OrgCaller, stream *RequestStreamRecv, sink *ResponseSinkSend) error {
+		return handler(
+			caller,
+			&TypedRequestStream[Req]{raw: stream},
+			&TypedResponseSink[Resp]{raw: sink},
+		)
+	}
+	return ServeOrgDuplexBytes(node, service, access, shim)
+}
 
 // =========================================================================
 // Provisioning (G-prov2 / §D9) — node startup, distinct from adoption/issuance.

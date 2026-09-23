@@ -3457,6 +3457,7 @@ dependencies = [
  "libc",
  "net-mesh",
  "net-mesh-sdk",
+ "net-rpc-ffi",
  "parking_lot 0.12.5",
  "serde_json",
  "tokio",
