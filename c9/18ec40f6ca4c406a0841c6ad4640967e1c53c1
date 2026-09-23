@@ -1,0 +1,23 @@
+docs/internal/spikes/org-streaming/S4_VECTORS.md
+  s_3f3d4c91f992be::t_0226f4d4bea0ce 278-342,374-382,391-394
+go/org_streaming_opening_vectors_test.go
+  s_3f3d4c91f992be::t_bed658d4988715 712
+net/crates/net/tests/cross_lang_org/mixed_pair/caller.py
+  s_3f3d4c91f992be::t_d4d3b7b91bc32d 168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c918ec40f6ca4c406a0841c6ad4640967e1c53c1",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
