@@ -1,0 +1,32 @@
+net/crates/net/wire/src/session.rs
+  s_3f3d4c91f992be::t_cb678a1d4729ad 96-100,252-253,1860,1864-1878
+  s_3f3d4c91f992be::t_5cb29a9fc9b850 1879
+net/crates/net/src/adapter/net/mod.rs
+  s_3f3d4c91f992be::t_c070332c236384 1234
+net/crates/net/src/adapter/net/mesh.rs
+  s_3f3d4c91f992be::t_049d0dddf7f9d7 53538,53558-53611
+  s_3f3d4c91f992be::t_20c3d62f1987ae 20011
+  s_3f3d4c91f992be::t_cb678a1d4729ad 1957,1967-1980,2493-2496,26729-26733,29330,29751
+  s_3f3d4c91f992be::t_e7e019709944ef 53355-53361,53390-53396,53426-53432,53464-53470,53499-53505,53550,53684-53690
+  s_3f3d4c91f992be::t_2433f8feb0e4fe 53612-53613
+net/crates/net/cli/tests/subnet_join.rs
+  s_3f3d4c91f992be::t_fbd8e446a12408 398-401,422
+net/crates/net/tests/integration_nrpc_streaming.rs
+  s_3f3d4c91f992be::t_7c58e69759d961 668-737
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8baeed7f431882643986011f4261b30ee0cfe18a",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
