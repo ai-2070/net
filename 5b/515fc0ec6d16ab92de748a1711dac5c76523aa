@@ -1,0 +1,26 @@
+.github/workflows/natsim-enroll.yml
+  s_3f3d4c91f992be::t_9eaeb6f21af8ed 12-16,31,41,100-144
+  s_3f3d4c91f992be::t_7e2ffeefad1277 145
+net/crates/net/tests/natsim/enroll/run_enroll_relay.sh
+  s_3f3d4c91f992be::t_a9d37026f93e88 1-268
+net/crates/net/cli/src/commands/relay.rs
+  s_3f3d4c91f992be::t_c370f5b08653d9 87-89
+  s_3f3d4c91f992be::t_4a11256fb41259 71,94-108
+  s_3f3d4c91f992be::t_0d44da9aac4d02 109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5b515fc0ec6d16ab92de748a1711dac5c76523aa",
+  "prompts": {},
+  "sessions": {
+    "s_3f3d4c91f992be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b99747d4-5f3e-47dd-868a-2f197cd0fb5f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
