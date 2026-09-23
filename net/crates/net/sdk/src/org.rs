@@ -82,6 +82,10 @@ pub use client::OrgClient;
 #[cfg(feature = "cortex")]
 mod call;
 #[cfg(feature = "cortex")]
+pub use call::{
+    OrgClientStreamCall, OrgDuplexCall, OrgDuplexSink, OrgDuplexStream, OrgStream, OrgStreamRaw,
+};
+#[cfg(feature = "cortex")]
 mod serve;
 #[cfg(feature = "cortex")]
 pub use serve::{serve_org_bytes_node, OrgAccess, OrgCaller, OrgHandlerError};
