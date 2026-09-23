@@ -4212,3 +4212,86 @@ no new findings at this row.
 - A wire-level duplicate-CANCEL discrimination (§6.1's stated limit, unchanged).
 - The `serve_org_*` rows against a non-`fixtures` build — the suite's runs use
   the plan's named feature set.
+
+### 6.3 Row 3.3 — docs + probe (S3.3), and the stage exit
+
+**Landed (executed):** `020afe614` — `S3.3: the full org verb set in
+ORGANIZATIONS.md and the probe's Stage 3 pins` (5 files, +261/−19) on
+`LZL0/org-streaming`; this record rides in the following `S3.3:` commit.
+
+**What landed (source-established):**
+
+- `docs/ORGANIZATIONS.md`'s "two verbs" text (the `:124-135` band) becomes
+  **the full verb set** — bind + the four call shapes + the four provider
+  verbs — with the per-handle error vocabulary (opening refusal
+  `AdmissionDenied(coarse)`; midstream revocation the stream's final
+  `AdmissionDenied(Denied)`; deadline/cancel retirement `Rpc(Timeout)`/
+  `Rpc(Cancelled)`; drop = one CANCEL) and **the deadline rule** verbatim from
+  Owner Q1: the `*_bytes_deadline` seams' `deadline_ms == 0` is the facade
+  default **300 s**, never "no deadline"; `cancel_token == 0` is
+  uncancellable; neither is an authorization input. The stale "ride the SDK
+  release train" sentence is gone — the verbs are the shipped surface now.
+- `guards/org_api_probe` compiles the new verbs AND still the unary ones:
+  MANIFEST grows by **exactly** the 22 new pins (7 `OrgClient::call_*` rows +
+  seams, 6 `Mesh::serve_org_*` verbs, 3 `serve_org_*_bytes_node` seams, 6
+  wrapping types) grouped beside their families; `main.rs` gains four pin
+  functions (`pin_org_streaming_calls`, `pin_org_streaming_serves`,
+  `pin_org_streaming_node_seams`, `pin_org_stream_wrappers`) that reference
+  each verb as a value AND apply it with fully annotated handler closures —
+  `OrgCaller` FIRST in every one — and pin the stream handles' ITEM vocabulary
+  (`Result<_, OrgSdkError>`) by annotated `next()` awaits. **No exhaustive
+  match arm deleted** (`pin_org_sdk_error`, `pin_org_access`,
+  `pin_org_handler_error`, `pin_coarse_admission_reason`,
+  `pin_admission_denied`, `pin_org_admission` untouched) and the
+  `#[non_exhaustive]` fallback arm (`_ => "future_variant"`) stays. One dep
+  edge (`futures = "0.3"` with its own `[dependencies]` section) joins the
+  probe's graph so an external consumer's stream-drain is expressible; the
+  crate is already in the lock through `net_sdk`, so `Cargo.lock`'s growth is
+  the probe's own package edge only (regenerated, then pinned by `--locked`).
+
+**The row's witness (executed) — the probe's own green build at its exact
+commands, at `020afe614`'s tree:**
+
+```sh
+cd net/crates/net/guards/org_api_probe
+cargo metadata --locked --format-version 1    # exit 0
+cargo check --locked                          # exit 0
+```
+
+The probe is the witness: it compiles the seven caller verbs, the six serve
+verbs, the three node seams and the six wrapping types from OUTSIDE the
+workspace, so any signature/context/enum break in the frozen surface (the
+probe's unchanged pins included) fails this exact run.
+
+**Stage 3 exit (the plan's wording, mapped to executed evidence).** Real Rust
+caller AND provider through the public facade for all four shapes (unary +
+the three streaming), same-org and granted, with revocation/cancellation/
+ownership witnesses — `org_streaming` **10/10**: the six `live_*` witnesses
+(same-org and granted × streaming/client-stream/duplex), the pin witness
+(mid-call second-provider resolution), `facade_stream_against_unary_only_provider_is_not_supported`,
+`dropping_org_stream_emits_one_cancel` (ownership: one record retired, once),
+`handler_receives_verified_org_caller_not_origin` (the verified projection,
+all three serve rows), and
+`revocation_surfaces_as_final_admission_denied_item` (the frozen `Revoked →
+Denied`). The probe catches unary/public API breakage (this row). Regressions
+at the stage's final head: the 42-roster **42/42** and the SDK org estate
+**338/338** (both at `c69d69761`'s tree; rows 3.3's five files are one
+non-compiled doc + the probe's own workspace — the sdk/net trees are
+byte-identical since, verified by `git diff --stat` scope), `org_streaming`
+re-run **10/10** at the final head, `cargo fmt -p net-mesh-sdk -- --check`
+exit 0.
+
+**CI floor note (Main pins, never a lane):** `--suite org_streaming` floor =
+**10** with the ten names, and the `org_rpc_streaming` floor stays **42**.
+
+**Findings (state, not decide):** none new at Row 3.3. Stage-wide: F-S3.2-1
+(raised and resolved by Main's ruling, §6.2) and F-S3.1-2 (the protected
+handler is not a sound cancel-observer; the retirement observables are the
+contract, §6.1).
+
+**Never executed here (complete):**
+
+- `ci.yml`/`.config/nextest.toml` floor re-pins (Main's by contract).
+- The probe on any toolchain/OS but this workstation's; the `webrtc`/wasm
+  graphs, the benches, and every binding (Stage 4's rows by contract).
+- A wire-level duplicate-CANCEL-frame count (§6.1's stated limit).
