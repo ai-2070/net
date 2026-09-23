@@ -1,0 +1,16 @@
+net/crates/net/browser-ts/src/org.ts
+  h_64425bc75e3f3d 94-99,101-104
+net/crates/net/browser-ts/src/wasm.ts
+  h_64425bc75e3f3d 227-229,231-235,237-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2701a17c9e9bdf314a446c80e9b8e013734961f2",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
