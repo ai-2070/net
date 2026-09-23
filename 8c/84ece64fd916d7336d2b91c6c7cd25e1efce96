@@ -1,0 +1,14 @@
+net/crates/net/tests/rtc_browser/runner/src/org_stream.rs
+  h_64425bc75e3f3d 439-497,3702-3716,3743-3745,4081-4086,4088-4093,4104,4114-4115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8c84ece64fd916d7336d2b91c6c7cd25e1efce96",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
