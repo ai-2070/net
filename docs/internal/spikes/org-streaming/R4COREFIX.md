@@ -32,8 +32,12 @@ runs.
 
 **No core change is required or made** (`git diff --stat net/crates/net/src/`
 empty at report time — the core is byte-identical to `LZL0/org-streaming` HEAD).
-The fix is one line in `tests/cross_lang_org/mixed_pair/provider.py`, owned by
-`S4Vectors`, applied by them on my request and co-run with me.
+The full fix turned out to be THREE consumer-side lifetime corrections in the
+harness stack, all owned and applied by `S4Vectors` (`a919a26f0` + their
+provider.py handle fix): (1) the discarded `ServeHandle`, (2) the teardown
+race (DRAINED handshake), (3) the spurious double-accept arm + the silent
+`start()` refusal it tripped. The acceptance row is GREEN two-sided (§3.4) and
+the two-OS-process witness is green with its inverse (§2.4).
 
 ## 1. Root-cause analysis — why the scoped chain "lost" candidates
 
@@ -330,9 +334,55 @@ installed, pinned consumer grant — exactly the observed
 `0 private candidate(s) considered` — and `discovered_nodes=1` was the caller's
 SELF-index all along. Cross-checks: the Go row (connect-only) converges
 discovery; the Rust witness (connect-only) is green; `test_org_live.py` arms
-accept only on the provider. Referred to S4Vectors (remove the arm, or
-fail-closed on the join) with the visibility soft-spot escalated to Main
-(finding 8). Round 3 receipts land below.
+accept only on the provider. S4Vectors fixed it in `a919a26f0` (caller.py
+sha `0dd156c0…`, connect-only — the arm removed, the mechanism quoted in the
+code comment where it used to be).
+
+### 3.4 ROUND 3 — the acceptance row GREEN, two-sided PASS
+
+With all three harness fixes in (S4Vectors: `a919a26f0` caller.py `0dd156c0…`
+connect-only; provider.py `22ce91e0…` handle held + DRAINED teardown; go row
+`1840f4b1…` DRAINED writer) and clean artifacts rebuilt inside the cycle
+(probe-free core, `git diff --stat net/crates/net/src/` empty; fresh wheel
+installed), the verbatim command from the acceptance contract:
+
+```
+cd go && RUN_INTEGRATION_TESTS=1 RUN_MIXED_CROSS_PROCESS=1 go test -run 'TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider' -v -timeout 15m
+```
+
+produced (`r4corefix-row-round3-green.log`, verbatim):
+
+```
+=== RUN   TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider
+provider: handshake done, starting mesh + announce loop
+provider: serving, announcing
+provider: awaiting DRAINED
+--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider (19.35s)
+PASS
+ok  	github.com/ai-2070/net/go	19.760s
+```
+
+**TWO-SIDED PASS SIGNATURE:**
+- the Go line `--- PASS: TestStreamingOpeningVectors_MixedPair_GoCallerPythonProvider`
+  ✓ (above);
+- the provider's `RESULT ok calls=1 chunks=3` — consumed and EXACTLY matched by
+  the row itself at `org_streaming_opening_vectors_test.go:711-714`
+  (`result != "RESULT ok calls=1 chunks=…"` is a `t.Fatalf`), and the row's
+  `cmd.Wait()` returned clean — so the provider line held verbatim; it travels
+  on the pipe to the orchestrator and does not echo to the parent terminal.
+
+The row's own asserts also held along the way: the chunk bytes ==
+`scenarios.mixed_pair.chunks_hex` byte-for-byte, `expect_terminal == eof`, and
+provider.py's handler facts == `expect_handler` (it exits non-zero on any
+mismatch or handler-never-fires). 19.35 s — discovery, admission, three
+chunks, clean eof, and the DRAINED teardown all inside one budget.
+
+**Acceptance witness #1: GREEN. Acceptance witness #2: GREEN (§2.4). The
+retraction of F-S4Vectors-1 stands on the executed record: the scoped chain
+never had a cross-process defect; three consumer-side lifetime bugs in the
+harness stack (discarded serve handle → teardown race → double-accept +
+silent start) each masqueraded as one, and each is now fixed at its owner with
+receipts above.**
 
 ## 4. Findings
 
@@ -502,3 +552,8 @@ Consumer artifacts referenced by the receipts: pre-fix `net.dll`
 `c8f8a062c99acdb1e263d73e000cc0e43da83f5677bf2e778ae0ff4e130750da`; post-fix
 `go/net.dll` `003d2de7909b444c8c3faa0744c06ee8fbcc011e94a1bdc3043d55cb9ea482a5`
 (same clean core source — `git diff --stat net/crates/net/src/` empty).
+
+Follow-up commit `86d2212b9` (finding 8 + round-3 receipts) carried at ITS
+commit time: `R4COREFIX.md` 29604 `92f1b7fdc9f0a0ad05ce0e713f7f82de6000a31817e447f2d06f6b9f843bedd1`,
+`r4corefix-diag-round3.log` 3127
+`c3d08d0212f3861845b27d9cd8e8bf4e151ee58c8e3e528c8263d04caf260fe7`.
